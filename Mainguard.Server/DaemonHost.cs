@@ -343,9 +343,21 @@ public static class DaemonHost
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
             // Loopback only. HTTP/2 cleartext (h2c) — the session token, not TLS, is the
-            // loopback trust boundary.
+            // loopback trust boundary. The CONTROL PLANE is never bound anywhere else.
             kestrel.Listen(IPAddress.Loopback, options.Port,
                 listen => listen.Protocols = HttpProtocols.Http2);
+
+            // MG-13/MG-4: the model gateway is the one listener allowed off loopback, because the
+            // agent jail is on an Internal=true network where 127.0.0.1 is the container itself, so a
+            // loopback gateway is unreachable by the agents it fronts. Disabled unless explicitly
+            // configured, and GatewayBindPolicy refuses a wildcard or public bind outright — a
+            // misconfigured value fails startup loudly rather than quietly exposing the gateway.
+            // HTTP/1.1 because model-API clients speak it; the per-agent token is its authentication.
+            if (TryResolveGatewayBind(options, out var gatewayAddress))
+            {
+                kestrel.Listen(gatewayAddress, options.GatewayPort,
+                    listen => listen.Protocols = HttpProtocols.Http1);
+            }
         });
 
         ConfigureServices(builder, options);
@@ -353,6 +365,35 @@ public static class DaemonHost
         MapServices(app);
         RegisterLifecycleLogging(app, options);
         return app;
+    }
+
+    /// <summary>
+    /// Resolves the model-gateway bind address, or false when the gateway is disabled (the default).
+    /// A CONFIGURED but impermissible address throws: silently falling back to loopback would leave
+    /// the gateway unreachable by agents and the operator none the wiser, and silently binding it
+    /// anyway is the exposure <see cref="Gateway.GatewayBindPolicy"/> exists to prevent.
+    /// </summary>
+    private static bool TryResolveGatewayBind(DaemonOptions options, out IPAddress address)
+    {
+        address = IPAddress.None;
+        if (string.IsNullOrWhiteSpace(options.GatewayBindAddress))
+        {
+            return false; // gateway disabled — nothing is bound beyond loopback gRPC.
+        }
+
+        if (!IPAddress.TryParse(options.GatewayBindAddress, out var parsed))
+        {
+            throw new ArgumentException(
+                $"Gateway bind address '{options.GatewayBindAddress}' is not a valid IP address.");
+        }
+
+        if (!Gateway.GatewayBindPolicy.IsPermitted(parsed, out var reason))
+        {
+            throw new ArgumentException($"Refusing to bind the model gateway: {reason}");
+        }
+
+        address = parsed;
+        return true;
     }
 
     /// <summary>

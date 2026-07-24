@@ -42,6 +42,29 @@ public sealed record DaemonOptions
     public string? TerminalEngine { get; init; }
         = Environment.GetEnvironmentVariable("MAINGUARD_TERMINAL_ENGINE");
 
+    /// <summary>
+    /// MG-13/MG-4: the address the MODEL GATEWAY listener binds, or null (default) to leave it
+    /// disabled. The gRPC control plane is always loopback-only and is unaffected by this.
+    ///
+    /// <para>The gateway needs its own listener because the agent jail sits on an
+    /// <c>Internal=true</c> Docker network where <c>127.0.0.1</c> is the container itself — a gateway
+    /// on loopback is unreachable by the agents it exists to front, so MG-4's key confinement cannot
+    /// work without one. <see cref="Gateway.GatewayBindPolicy"/> constrains this to loopback or a
+    /// private address and refuses a wildcard or public bind.</para>
+    ///
+    /// <para>Disabled by default, deliberately: with no gateway there is nothing to redirect a CLI to,
+    /// so the spawn path keeps injecting the provider key exactly as before. Enabling the gateway is
+    /// what turns on the confinement.</para>
+    /// </summary>
+    public string? GatewayBindAddress { get; init; }
+        = Environment.GetEnvironmentVariable("MAINGUARD_GATEWAY_BIND");
+
+    /// <summary>The model-gateway listener port (only used when <see cref="GatewayBindAddress"/> is set).</summary>
+    public int GatewayPort { get; init; } = DefaultGatewayPort;
+
+    /// <summary>Default model-gateway port — distinct from the gRPC control port.</summary>
+    public const int DefaultGatewayPort = 5251;
+
     public static DaemonOptions Parse(string[] args)
     {
         var options = new DaemonOptions();
