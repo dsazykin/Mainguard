@@ -74,7 +74,13 @@ public static class GatewayServiceRegistration
         services.AddSingleton(sp =>
         {
             var stored = sp.GetRequiredService<IBudgetStore>().Get();
-            var caps = new BudgetCaps(stored.TokenCap, stored.UsdMicrosCap, 0, 0);
+            // MG-21: the per-day caps (3rd/4th args) were hardcoded to literal 0 — which BudgetCaps
+            // defines as UNLIMITED — so a daily budget the user had set silently stopped being enforced
+            // the moment the daemon restarted, while GetBudgets kept reporting the persisted value. Only
+            // the per-agent lifetime caps survived. SetBudgets at runtime always set all four correctly;
+            // the defect was isolated to this boot path, which is exactly where it is least visible.
+            var caps = new BudgetCaps(
+                stored.TokenCap, stored.UsdMicrosCap, stored.TokenCapPerDay, stored.UsdMicrosCapPerDay);
             return new BudgetLedger(sp.GetRequiredService<ISpendStore>(), clock, caps);
         });
 
