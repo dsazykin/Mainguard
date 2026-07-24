@@ -216,16 +216,18 @@ public class ForegroundMergeServiceTests : IDisposable
         Assert.Null(service.BeginMerge(request));
 
         // Boot reconcile: replay the journal, synthesize the missing ConfirmMerge, fire NotifyMainMoved.
-        var reconciled = new List<(string, string)>();
+        var reconciled = new List<(string RepoHash, string AgentId, string Sha)>();
         var reconcile = new MergeReconcileTask(
             leases, journal,
             resolveRepoPath: _ => repo.RepoPath,
-            onMerged: (a, s) => reconciled.Add((a, s)));
+            onMerged: (h, a, s) => reconciled.Add((h, a, s)));
         await reconcile.RunAsync(CancellationToken.None);
 
         Assert.Null(leases.GetOutstanding(repo.RepoHash));       // lease released (confirmed)
         Assert.Single(reconciled);                                // exactly once
-        Assert.Equal(("x", postSha), reconciled[0]);
+        // MG-29: the callback carries the lease's repo hash so the daemon can resolve the queue
+        // that owns this agent and fire the stale cascade on it.
+        Assert.Equal((repo.RepoHash, "x", postSha), reconciled[0]);
         Assert.NotNull(service.BeginMerge(request));             // a new merge is now accepted
     }
 
@@ -240,12 +242,12 @@ public class ForegroundMergeServiceTests : IDisposable
         var lease = service.BeginMerge(request);
         Assert.NotNull(lease);
 
-        var merged = new List<(string, string)>();
+        var merged = new List<(string, string, string)>();
         var interrupted = new List<(string, string)>();
         var reconcile = new MergeReconcileTask(
             leases, journal,
             resolveRepoPath: _ => repo.RepoPath,
-            onMerged: (a, s) => merged.Add((a, s)),
+            onMerged: (h, a, s) => merged.Add((h, a, s)),
             onInterrupted: (h, r) => interrupted.Add((h, r)));
         await reconcile.RunAsync(CancellationToken.None);
 

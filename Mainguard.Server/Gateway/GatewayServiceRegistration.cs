@@ -124,13 +124,14 @@ public static class GatewayServiceRegistration
                     ? new Mainguard.Git.Services.NullOperationJournal()
                     : new Mainguard.Git.Services.OperationJournal(dbFactory),
                 resolveRepoPath: _ => null, // repos map in as their swarms come up; none at boot.
-                onMerged: (agentId, postSha) =>
+                onMerged: (repoHash, agentId, postSha) =>
                 {
-                    // Fire the stale cascade on whichever active queue owns this agent (best-effort).
-                    foreach (var handle in Array.Empty<string>())
-                    {
-                        registry.Resolve(handle)?.Queue.ConfirmHumanMerge(agentId, postSha);
-                    }
+                    // MG-29: this was `foreach (var handle in Array.Empty<string>())` — a hardcoded
+                    // no-op, so a merge replayed at boot NEVER fired the stale cascade and a co-tenant
+                    // branch stayed "Verified" against a main that had already moved. The reconcile task
+                    // now hands us the lease's repo hash, so the owning queue is a direct lookup.
+                    // Best-effort: a repo whose swarm has not come up yet simply has no queue to notify.
+                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(agentId, postSha);
                 });
 
             return DaemonBootSequence.Build(

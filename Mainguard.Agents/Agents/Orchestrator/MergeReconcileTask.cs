@@ -29,19 +29,22 @@ public sealed class MergeReconcileTask : IBootTask
     private readonly IMergeLeaseStore _leases;
     private readonly IOperationJournal _journal;
     private readonly Func<string, string?> _resolveRepoPath;
-    private readonly Action<string, string> _onMerged;
+    private readonly Action<string, string, string> _onMerged;
     private readonly Action<string, string>? _onInterrupted;
 
     /// <param name="leases">The RT-D1 lease store (outstanding leases are the reconcile input).</param>
     /// <param name="journal">The T-19 journal, replayed to detect a committed-but-unrecorded merge.</param>
     /// <param name="resolveRepoPath">Maps a repo hash → Windows repo path (null → cannot reconcile that repo yet).</param>
-    /// <param name="onMerged">Fired for a synthesized confirm: (agentId, postMergeSha) → <c>ConfirmHumanMerge</c>/<c>NotifyMainMoved</c>.</param>
+    /// <param name="onMerged">Fired for a synthesized confirm: <b>(repoHash, agentId, postMergeSha)</b> →
+    /// <c>ConfirmHumanMerge</c>/<c>NotifyMainMoved</c>. MG-29: the repo hash is part of the callback because
+    /// the cascade must be fired on the queue that actually OWNS this agent; without it the daemon had no
+    /// way to resolve the owning queue and the wiring degenerated into a hardcoded no-op.</param>
     /// <param name="onInterrupted">Fired for a never-committed attempt: (repoHash, reason) → surfaced to the UI.</param>
     public MergeReconcileTask(
         IMergeLeaseStore leases,
         IOperationJournal journal,
         Func<string, string?> resolveRepoPath,
-        Action<string, string> onMerged,
+        Action<string, string, string> onMerged,
         Action<string, string>? onInterrupted = null)
     {
         _leases = leases ?? throw new ArgumentNullException(nameof(leases));
@@ -85,7 +88,7 @@ public sealed class MergeReconcileTask : IBootTask
         {
             // Committed but not confirmed → synthesize the confirm exactly once, then fire the cascade.
             _leases.Confirm(lease.RepoHash, lease.LeaseId, currentMain);
-            _onMerged(lease.AgentId, currentMain);
+            _onMerged(lease.RepoHash, lease.AgentId, currentMain);
         }
         else
         {
