@@ -578,6 +578,45 @@ public sealed class DaemonBackedOrchestrator :
         catch (Exception) { /* daemon unreachable — surfaced via ConnectionState, not an app crash. */ }
     }
 
+    /// <summary>
+    /// Pulls the CURRENT login state of every live agent into the host OS keychain, without stopping
+    /// anything. Call this periodically while agents run and on app shutdown: harvest otherwise only
+    /// happens on an explicit StopAgent, so a daemon shutdown / VM stop / crash lost the login
+    /// entirely and the user had to sign in again on every launch.
+    ///
+    /// <para>Best-effort by design — a daemon that is down or an agent that has not signed in yet
+    /// simply yields nothing, and an empty harvest never clobbers a good keychain entry
+    /// (<see cref="PersistHarvestedLogin"/> ignores it).</para>
+    /// </summary>
+    public async Task PersistLiveAgentLoginsAsync(CancellationToken ct = default)
+    {
+        List<string> agentIds;
+        try
+        {
+            agentIds = (await _client.ListAgentsAsync(ct).ConfigureAwait(false))
+                .Select(a => a.AgentId)
+                .Where(id => !string.IsNullOrWhiteSpace(id))
+                .ToList();
+        }
+        catch (Exception)
+        {
+            return; // daemon unreachable — surfaced via ConnectionState, never an app crash.
+        }
+
+        foreach (var agentId in agentIds)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                PersistHarvestedLogin(await _client.HarvestAgentCredentialsAsync(agentId, ct).ConfigureAwait(false));
+            }
+            catch (Exception)
+            {
+                // One agent failing to harvest must never stop the others from being persisted.
+            }
+        }
+    }
+
     /// <summary>Folds the login-state files a stop harvested from the jail into the host OS
     /// keychain (<c>cli_login_&lt;kind&gt;</c>) — the durable half of the login round-trip; the
     /// next spawn of this kind restores them so the CLI boots signed in.</summary>

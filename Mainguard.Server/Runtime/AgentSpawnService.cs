@@ -224,6 +224,46 @@ public sealed class AgentSpawnService
         }
     }
 
+    /// <summary>
+    /// Harvests a LIVE agent's CLI login-state without stopping it.
+    ///
+    /// <para>The jail's <c>$HOME</c> is tmpfs and the durable store is the host OS keychain, but
+    /// harvest previously ran ONLY inside <see cref="StopAsync"/>. So a daemon shutdown, VM stop, or
+    /// crash never harvested at all — the tmpfs home died with the container and the user had to sign
+    /// in again on every launch. This lets the client pull the current login while the agent keeps
+    /// running, then persist it exactly as it does for a stop.</para>
+    ///
+    /// <para>Read-only: nothing is torn down, nothing is wiped, and the agent is untouched. An agent
+    /// with no jail (session-only), no declared credentialPaths, or one that has not logged in yet
+    /// yields an EMPTY result — which is normal and must never clobber a good keychain entry.</para>
+    /// </summary>
+    public async Task<AgentStopResult> HarvestCredentialsAsync(string agentId, CancellationToken ct)
+    {
+        var session = _store.Find(agentId);
+        if (session?.ContainerId is not { Length: > 0 } containerId)
+        {
+            return new AgentStopResult(
+                false, session?.Kind ?? string.Empty,
+                Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>());
+        }
+
+        var credentials = await _launcher.HarvestCliCredentialsAsync(
+            containerId, session.Kind, ct).ConfigureAwait(false);
+
+        // Same in-memory cache StopAsync refreshes, so a worker spawned by a coordinator later in this
+        // daemon session (no client in the loop) boots with the login the user just performed (MG-6
+        // scoping: per repo + kind). Only remember a NON-empty harvest — caching an empty result would
+        // erase a good cached login for every later worker of this kind.
+        if (credentials.Count > 0)
+        {
+            _keys.RememberCliCredentials(session.RepoHash ?? string.Empty, session.Kind, credentials);
+        }
+
+        _spawnLog.LogInformation(
+            "harvest: agent={Agent} credentialFiles={Files} (agent left running)", agentId, credentials.Count);
+        return new AgentStopResult(false, session.Kind, credentials);
+    }
+
     /// <summary>Stops one agent: session record, CLI PTY, IPC endpoint, input lock, jail + worktree.
     /// The jail's tmpfs $HOME dies with the teardown, so the CLI's login-state files (the adapter's
     /// declared <c>credentialPaths</c>) are harvested FIRST and handed back in the result — the
