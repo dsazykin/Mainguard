@@ -10,6 +10,12 @@ option csharp_namespace = "Mainguard.Protos.V1";
 service AgentService {
   rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
   rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+  // Harvest a LIVE agent's CLI login-state WITHOUT stopping it. The jail's $HOME is tmpfs and the
+  // durable store is the host OS keychain, but harvest previously ran only inside StopAgent — so a
+  // daemon shutdown, VM stop, or crash lost the login and the user had to sign in again on every
+  // launch. The client polls this while an agent runs and on app shutdown, then persists to the
+  // keychain exactly as it does for a stop. Read-only: the agent keeps running and nothing is wiped.
+  rpc HarvestAgentCredentials(HarvestAgentCredentialsRequest) returns (HarvestAgentCredentialsResponse);
   rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
   rpc StreamAgentEvents(StreamAgentEventsRequest) returns (stream AgentEvent);
   // The dynamically installed agent CLIs the daemon can launch (the VM-side
@@ -71,6 +77,19 @@ message StopAgentResponse {
   repeated CliCredentialFile cli_credentials = 2;
   // The stopped session's adapter kind, so the client knows which keychain entry to update.
   string agent_kind = 3;
+}
+
+message HarvestAgentCredentialsRequest {
+  string agent_id = 1;
+}
+
+message HarvestAgentCredentialsResponse {
+  // The CLI's CURRENT login-state files (the adapter's declared credentialPaths), read out of the
+  // live jail. Empty when the agent has no jail, no declared credential paths, or has not logged in
+  // yet — an empty result is normal and must never clobber a good keychain entry. SECRET contents.
+  repeated CliCredentialFile cli_credentials = 1;
+  // The adapter kind, so the client knows which keychain entry to update.
+  string agent_kind = 2;
 }
 
 message ListAgentsRequest {}
