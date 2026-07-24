@@ -195,6 +195,26 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new AgentStopOutcome(response.Stopped, response.AgentKind, credentials);
     }
 
+    /// <summary>
+    /// Harvests a LIVE agent's CLI login-state without stopping it, so the host keychain can be kept
+    /// current while the agent runs. Harvest used to happen only inside <see cref="StopAgentAsync"/>,
+    /// so a daemon shutdown, VM stop or crash lost the login and the user signed in again every
+    /// launch. An empty result is normal (no jail, nothing declared, or not signed in yet) and the
+    /// caller must treat it as "nothing new", never as "clear the keychain".
+    /// </summary>
+    public async Task<AgentStopOutcome> HarvestAgentCredentialsAsync(
+        string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        var response = await client.HarvestAgentCredentialsAsync(
+            new HarvestAgentCredentialsRequest { AgentId = agentId }, CallOptions(ct, deadline));
+        var credentials = response.CliCredentials
+            .Select(f => new CliLoginFile(f.Path, f.Content.ToByteArray()))
+            .ToArray();
+        // Stopped:false — the agent is still running; only the credential payload matters here.
+        return new AgentStopOutcome(false, response.AgentKind, credentials);
+    }
+
     /// <summary>Reads the daemon-owned egress allowlist (P2-07).</summary>
     public async Task<IReadOnlyList<AllowlistEntry>> ListAllowlistAsync(CancellationToken ct, TimeSpan? deadline = null)
     {

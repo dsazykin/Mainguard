@@ -136,6 +136,35 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         return response;
     }
 
+    /// <summary>
+    /// Harvests a live agent's CLI login-state WITHOUT stopping it, so the client can keep the host
+    /// keychain current while the agent runs. Harvest used to happen only on StopAgent, so a daemon
+    /// shutdown or crash lost the login entirely and the user re-authenticated on every launch.
+    /// </summary>
+    public override async Task<HarvestAgentCredentialsResponse> HarvestAgentCredentials(
+        HarvestAgentCredentialsRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "agent_id is required."));
+        }
+
+        var result = await _spawns.HarvestCredentialsAsync(request.AgentId, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        var response = new HarvestAgentCredentialsResponse { AgentKind = result.AgentKind };
+        foreach (var file in result.CliCredentials)
+        {
+            response.CliCredentials.Add(new CliCredentialFile
+            {
+                Path = file.HomeRelativePath,
+                Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+            });
+        }
+
+        return response;
+    }
+
     public override Task<ListAgentsResponse> ListAgents(ListAgentsRequest request, ServerCallContext context)
     {
         var response = new ListAgentsResponse();

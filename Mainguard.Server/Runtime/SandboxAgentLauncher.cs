@@ -201,7 +201,8 @@ public sealed class SandboxAgentLauncher
     internal static SandboxSecrets BuildSecrets(
         string? modelApiKey, InstalledAdapterMarker? adapter,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        GatewayConfinement? gateway = null)
     {
         var agentEnv = new Dictionary<string, string>(StringComparer.Ordinal);
         if (extraEnv is not null)
@@ -220,7 +221,22 @@ public sealed class SandboxAgentLauncher
             var envVar = adapter is null ? "ANTHROPIC_API_KEY" : adapter.ApiKeyEnvVar;
             if (envVar is { Length: > 0 })
             {
-                agentEnv[envVar] = modelApiKey;
+                // MG-4: when the gateway is available AND this CLI declares a base-URL variable, the
+                // jail receives the Mainguard SESSION TOKEN and is pointed at the gateway — the real
+                // provider key never enters the container and is injected daemon-side at the network
+                // hop. Both conditions are required: without a base-URL variable the CLI would still
+                // call the provider directly, and handing it a token there would simply break it.
+                if (gateway is not null && adapter?.BaseUrlEnvVar is { Length: > 0 } baseUrlVar)
+                {
+                    agentEnv[envVar] = gateway.SessionToken;
+                    agentEnv[baseUrlVar] = gateway.BaseUrl;
+                }
+                else
+                {
+                    // No gateway (the default) or a CLI that cannot be redirected — unchanged
+                    // behaviour: the real key goes into the jail, as documented by MG-4.
+                    agentEnv[envVar] = modelApiKey;
+                }
             }
         }
 
@@ -304,3 +320,18 @@ public sealed class SandboxAgentLauncher
         return harvested;
     }
 }
+
+/// <summary>
+/// MG-4 — what the jail is given INSTEAD of the real provider key when the model gateway is
+/// available: an opaque Mainguard session token, plus the gateway's base URL to send requests to.
+///
+/// <para>The gateway maps the token back to the agent, swaps in the real provider key it holds
+/// daemon-side, and forwards upstream — so the key never has to exist inside the container.</para>
+///
+/// <para>This applies to the BYOK/api-key path ONLY. A CLI that authenticates by interactive OAuth
+/// owns its own login and refresh lifecycle, so its token files must remain in the jail; those are
+/// handled by the credentialPaths restore/harvest round-trip instead.</para>
+/// </summary>
+/// <param name="BaseUrl">The gateway URL the CLI's base-URL variable is set to.</param>
+/// <param name="SessionToken">The per-agent <c>mg_sess_</c> token that replaces the provider key.</param>
+internal sealed record GatewayConfinement(string BaseUrl, string SessionToken);

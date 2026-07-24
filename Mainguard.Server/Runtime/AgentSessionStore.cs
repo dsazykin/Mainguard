@@ -14,9 +14,13 @@ namespace Mainguard.Server.Runtime;
 /// tear the real jail + worktree down. <see cref="Role"/> is the orchestration role
 /// (<see cref="Mainguard.Agents.Agents.AgentRoles"/>): "", "coordinator", or "managed".
 /// </summary>
+/// <param name="ParentAgentId">MG-37: the coordinator that spawned this agent, or null for an
+/// operator-initiated spawn. Daemon-side only (never serialized). This is what lets the in-jail
+/// <c>mainguard-agent list</c> be scoped to the caller's own workers instead of every session on the
+/// daemon.</param>
 public sealed record AgentSession(
     string Id, string Kind, string State, string? ContainerId = null, string? RepoHash = null,
-    string Role = "");
+    string Role = "", string? ParentAgentId = null);
 
 /// <summary>A single agent-stream delta the store fans out to subscribers. <paramref name="Reason"/>
 /// is the human-readable why of a state transition when there is one (e.g. a Dead CLI's exit tail).</summary>
@@ -53,9 +57,10 @@ public sealed class AgentSessionStore
         }
     }
 
-    public AgentSession Spawn(string kind, string role = "")
+    public AgentSession Spawn(string kind, string role = "", string? parentAgentId = null)
     {
-        var session = new AgentSession(Guid.NewGuid().ToString("N"), kind, "Starting", Role: role ?? "");
+        var session = new AgentSession(
+            Guid.NewGuid().ToString("N"), kind, "Starting", Role: role ?? "", ParentAgentId: parentAgentId);
         lock (_gate)
         {
             _sessions[session.Id] = session;

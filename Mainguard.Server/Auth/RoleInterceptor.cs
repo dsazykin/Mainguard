@@ -34,17 +34,27 @@ public sealed class RoleInterceptor : Interceptor
         "/mainguard.v1.MergeQueueService/ConfirmMerge",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
+        // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per
+        // page) with no ownership scoping — a coordinator could read a worker's whole session, which
+        // is exactly the read the coordinator surface is not supposed to have. The operator token
+        // legitimately reads every agent (it drives the UI), so the boundary is the role, and this is
+        // the same gate the merge/plan RPCs use. Now genuinely enforced: MG-12 (same change) makes a
+        // coordinator token authenticate, so this check is reached instead of being dead code.
+        // Per-agent ownership scoping (one connection ↔ its own agents) remains a separate concern.
+        "/mainguard.v1.TerminalService/GetScrollback",
     };
 
     private const string AttachMethod = "/mainguard.v1.TerminalService/Attach";
 
     private readonly ConnectionRoleRegistry _roles;
     private readonly TerminalLockRegistry _locks;
+    private readonly SessionTokenFile _tokenFile;
 
-    public RoleInterceptor(ConnectionRoleRegistry roles, TerminalLockRegistry locks)
+    public RoleInterceptor(ConnectionRoleRegistry roles, TerminalLockRegistry locks, SessionTokenFile tokenFile)
     {
         _roles = roles ?? throw new ArgumentNullException(nameof(roles));
         _locks = locks ?? throw new ArgumentNullException(nameof(locks));
+        _tokenFile = tokenFile ?? throw new ArgumentNullException(nameof(tokenFile));
     }
 
     public override Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
@@ -95,7 +105,7 @@ public sealed class RoleInterceptor : Interceptor
         }
 
         var token = ExtractBearer(context);
-        if (_roles.Resolve(token) == ConnectionRole.Coordinator)
+        if (_roles.Resolve(token, _tokenFile.Token) == ConnectionRole.Coordinator)
         {
             throw new RpcException(new Status(StatusCode.PermissionDenied,
                 "The coordinator role cannot invoke merge or plan-approval RPCs — chat + capped tools only."));
@@ -115,7 +125,10 @@ public sealed class RoleInterceptor : Interceptor
     /// subsequent <c>data</c> (input) frame toward a locked agent throws <see cref="StatusCode.PermissionDenied"/>.
     /// Resize frames are harmless (window geometry) and pass through; the output stream is untouched.
     /// </summary>
-    private sealed class LockedInputReader : IAsyncStreamReader<TerminalInput>
+    // internal (not private) so the MG-31 regression test can drive this reader directly. A gRPC-level
+    // test cannot prove this layer: TerminalGrpcService re-checks the lock, so an end-to-end assertion
+    // passes whether or not the interceptor tracks the Attach oneof.
+    internal sealed class LockedInputReader : IAsyncStreamReader<TerminalInput>
     {
         private readonly IAsyncStreamReader<TerminalInput> _inner;
         private readonly TerminalLockRegistry _locks;
@@ -141,6 +154,16 @@ public sealed class RoleInterceptor : Interceptor
             if (frame.InputCase == TerminalInput.InputOneofCase.AgentId)
             {
                 _agentId = frame.AgentId;
+            }
+            else if (frame.InputCase == TerminalInput.InputOneofCase.Attach)
+            {
+                // MG-31: a P2-18 grid-capable client selects its agent with the Attach handshake
+                // instead of the bare agent_id frame. Tracking only AgentId left `_agentId` null for
+                // those clients, so every later Data frame sailed past this gate and the input-lock
+                // layer was a no-op for them. TerminalGrpcService re-checks the lock (it reads both
+                // oneofs), so this was defense-in-depth rather than a live bypass — but the
+                // interceptor is the layer that is supposed to sever input, so it must see both.
+                _agentId = frame.Attach.AgentId;
             }
             else if (frame.InputCase == TerminalInput.InputOneofCase.Data
                      && _agentId is not null && _locks.IsLocked(_agentId))

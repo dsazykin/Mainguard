@@ -74,7 +74,13 @@ public static class GatewayServiceRegistration
         services.AddSingleton(sp =>
         {
             var stored = sp.GetRequiredService<IBudgetStore>().Get();
-            var caps = new BudgetCaps(stored.TokenCap, stored.UsdMicrosCap, 0, 0);
+            // MG-21: the per-day caps (3rd/4th args) were hardcoded to literal 0 — which BudgetCaps
+            // defines as UNLIMITED — so a daily budget the user had set silently stopped being enforced
+            // the moment the daemon restarted, while GetBudgets kept reporting the persisted value. Only
+            // the per-agent lifetime caps survived. SetBudgets at runtime always set all four correctly;
+            // the defect was isolated to this boot path, which is exactly where it is least visible.
+            var caps = new BudgetCaps(
+                stored.TokenCap, stored.UsdMicrosCap, stored.TokenCapPerDay, stored.UsdMicrosCapPerDay);
             return new BudgetLedger(sp.GetRequiredService<ISpendStore>(), clock, caps);
         });
 
@@ -118,13 +124,14 @@ public static class GatewayServiceRegistration
                     ? new Mainguard.Git.Services.NullOperationJournal()
                     : new Mainguard.Git.Services.OperationJournal(dbFactory),
                 resolveRepoPath: _ => null, // repos map in as their swarms come up; none at boot.
-                onMerged: (agentId, postSha) =>
+                onMerged: (repoHash, agentId, postSha) =>
                 {
-                    // Fire the stale cascade on whichever active queue owns this agent (best-effort).
-                    foreach (var handle in Array.Empty<string>())
-                    {
-                        registry.Resolve(handle)?.Queue.ConfirmHumanMerge(agentId, postSha);
-                    }
+                    // MG-29: this was `foreach (var handle in Array.Empty<string>())` — a hardcoded
+                    // no-op, so a merge replayed at boot NEVER fired the stale cascade and a co-tenant
+                    // branch stayed "Verified" against a main that had already moved. The reconcile task
+                    // now hands us the lease's repo hash, so the owning queue is a direct lookup.
+                    // Best-effort: a repo whose swarm has not come up yet simply has no queue to notify.
+                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(agentId, postSha);
                 });
 
             return DaemonBootSequence.Build(

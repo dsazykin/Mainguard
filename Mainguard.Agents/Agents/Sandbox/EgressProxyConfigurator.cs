@@ -42,6 +42,13 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// doing work — fail fast instead of blocking forever, even when the caller passed no deadline.</summary>
     private static readonly TimeSpan ExecTimeout = TimeSpan.FromSeconds(60);
 
+    /// <summary>How long to wait for a started proxy container to actually report Running before
+    /// treating it as unstartable. Docker's start call is asynchronous, so "started" != "running".</summary>
+    private static readonly TimeSpan RunningWaitTimeout = TimeSpan.FromSeconds(30);
+
+    /// <summary>Poll gap while waiting for Running — short enough to add no perceptible latency.</summary>
+    private static readonly TimeSpan RunningPollInterval = TimeSpan.FromMilliseconds(100);
+
     private readonly IDockerClient _docker;
     private readonly string _proxyImageRef;
     private readonly string? _gatewayUpstream;
@@ -108,18 +115,34 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             try
             {
                 await _docker.Containers.StartContainerAsync(proxyId!, new ContainerStartParameters(), ct).ConfigureAwait(false);
-                revived = true;
+                // StartContainerAsync returning does NOT mean the container is up — it may still be
+                // starting, or have exited again immediately. Confirm before anything execs into it.
+                revived = await WaitUntilRunningAsync(proxyId!, ct).ConfigureAwait(false);
+                if (!revived)
+                {
+                    throw new DockerContainerNotRunningException(proxyId!);
+                }
             }
-            catch (DockerApiException)
+            catch (Exception ex) when (ex is DockerApiException or DockerContainerNotRunningException)
             {
                 // Unstartable corpse — replace it with a fresh container below.
                 await _docker.Containers.RemoveContainerAsync(proxyId!,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
                 proxyId = null;
+                revived = false;
             }
         }
 
         proxyId ??= await CreateAndStartProxyAsync(egressId, ct).ConfigureAwait(false);
+
+        // The config exec 409s ("container … is not running") against anything not fully up. Every path
+        // above ends in a start, so verify the postcondition ONCE here rather than assuming it — this is
+        // what made the suite flaky: a container that had not finished starting (or had already died)
+        // produced an opaque Docker conflict from deep inside the exec instead of a real diagnosis.
+        if (!await WaitUntilRunningAsync(proxyId, ct).ConfigureAwait(false))
+        {
+            throw new DockerContainerNotRunningException(proxyId);
+        }
 
         try
         {
@@ -189,6 +212,84 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             Labels = new Dictionary<string, string> { ["mainguard.role"] = isInternal ? "agent-net" : "egress-net" },
         }, ct).ConfigureAwait(false);
         return created.ID;
+    }
+
+    /// <summary>
+    /// Polls until the container reports <c>State.Running</c>, or the deadline passes. Condition-based
+    /// rather than a fixed sleep: Docker's start call is asynchronous, so "started" and "running" are
+    /// different facts, and a container that dies on boot never becomes running at all. Returns false
+    /// instead of throwing so callers can choose between recreating and surfacing.
+    /// </summary>
+    private async Task<bool> WaitUntilRunningAsync(string containerId, CancellationToken ct)
+    {
+        var deadline = DateTimeOffset.UtcNow + RunningWaitTimeout;
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+                switch (ClassifyReadiness(inspect.State))
+                {
+                    case ContainerReadiness.Running:
+                        return true;
+                    case ContainerReadiness.Terminal:
+                        return false; // a corpse never becomes running — don't wait out the deadline
+                }
+            }
+            catch (DockerContainerNotFoundException)
+            {
+                return false; // removed underneath us — the caller recreates.
+            }
+
+            if (DateTimeOffset.UtcNow >= deadline)
+            {
+                return false;
+            }
+
+            await Task.Delay(RunningPollInterval, ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>What a container's inspected state means for readiness. Pure so the decision is unit
+    /// testable without a Docker daemon — the RequiresDocker integration leg cannot run on every
+    /// developer machine, and this classification is where the flake actually lived.</summary>
+    internal enum ContainerReadiness
+    {
+        /// <summary>Up and serving — safe to exec into.</summary>
+        Running,
+
+        /// <summary>Not up yet, but may still become running (created/starting/restarting).</summary>
+        Pending,
+
+        /// <summary>Exited or dead — it will never become running without being recreated.</summary>
+        Terminal,
+    }
+
+    /// <summary>Classifies an inspected container state (see <see cref="ContainerReadiness"/>).</summary>
+    internal static ContainerReadiness ClassifyReadiness(ContainerState? state)
+    {
+        if (state is null)
+        {
+            return ContainerReadiness.Pending;
+        }
+
+        if (state.Running)
+        {
+            return ContainerReadiness.Running;
+        }
+
+        // Restarting is transient by definition — keep waiting rather than recreating underneath it.
+        if (state.Restarting)
+        {
+            return ContainerReadiness.Pending;
+        }
+
+        // Dead, or a finished run: a start was attempted and ended. "Created" has never run and has no
+        // FinishedAt, so it stays Pending while the start we just issued takes effect.
+        var finished = !string.IsNullOrEmpty(state.FinishedAt)
+                       && !state.FinishedAt.StartsWith("0001-01-01", StringComparison.Ordinal);
+        return state.Dead || finished ? ContainerReadiness.Terminal : ContainerReadiness.Pending;
     }
 
     private async Task<ContainerListResponse?> FindContainerAsync(string name, CancellationToken ct)
@@ -262,4 +363,22 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
         await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
     }
+}
+
+/// <summary>
+/// The proxy container was started but never reached a Running state (it died on boot, or was removed
+/// underneath us). Raised instead of letting the config exec fail with Docker's opaque
+/// <c>409 "container … is not running"</c> from deep inside <c>ExecCreateContainerAsync</c>, which is
+/// what made this path hard to diagnose and the CI suite intermittently red.
+/// </summary>
+public sealed class DockerContainerNotRunningException : Exception
+{
+    public DockerContainerNotRunningException(string containerId)
+        : base($"The egress proxy container '{containerId}' was started but never reached a running state. "
+             + "It most likely exited during boot — inspect its logs (docker logs mainguard-egress-proxy).")
+    {
+        ContainerId = containerId;
+    }
+
+    public string ContainerId { get; }
 }

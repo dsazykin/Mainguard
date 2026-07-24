@@ -42,9 +42,34 @@ public sealed class ConnectionRoleRegistry
         }
     }
 
-    /// <summary>Resolves the role for a presented bearer token (unknown/primary → <see cref="ConnectionRole.Operator"/>).</summary>
-    public ConnectionRole Resolve(string? bearerToken) =>
-        bearerToken is not null && _coordinatorTokens.ContainsKey(bearerToken)
-            ? ConnectionRole.Coordinator
-            : ConnectionRole.Operator;
+    /// <summary>True when this token has been registered as a coordinator credential.</summary>
+    public bool IsCoordinatorToken(string? bearerToken) =>
+        bearerToken is not null && _coordinatorTokens.ContainsKey(bearerToken);
+
+    /// <summary>
+    /// Resolves the role for a presented bearer token. <b>Fail-closed (MG-12):</b> only a token that
+    /// constant-time matches the operator session token resolves to <see cref="ConnectionRole.Operator"/>;
+    /// a registered coordinator token resolves to <see cref="ConnectionRole.Coordinator"/>, and anything
+    /// else (null, unknown, malformed) resolves to the <b>least-privileged</b> role rather than falling
+    /// open to Operator as it previously did.
+    /// </summary>
+    /// <param name="operatorToken">The primary session token, supplied by the caller that holds it.</param>
+    public ConnectionRole Resolve(string? bearerToken, string operatorToken)
+    {
+        if (bearerToken is null)
+        {
+            return ConnectionRole.Coordinator;
+        }
+
+        if (_coordinatorTokens.ContainsKey(bearerToken))
+        {
+            return ConnectionRole.Coordinator;
+        }
+
+        var presented = System.Text.Encoding.UTF8.GetBytes(bearerToken);
+        var expected = System.Text.Encoding.UTF8.GetBytes(operatorToken ?? string.Empty);
+        return CryptographicOperations.FixedTimeEquals(presented, expected)
+            ? ConnectionRole.Operator
+            : ConnectionRole.Coordinator; // unknown → least privilege, never Operator
+    }
 }

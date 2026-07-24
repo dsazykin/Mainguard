@@ -21,10 +21,12 @@ public sealed class BearerTokenInterceptor : Interceptor
     private const string Scheme = "bearer ";
 
     private readonly byte[] _expected;
+    private readonly ConnectionRoleRegistry _roles;
 
-    public BearerTokenInterceptor(SessionTokenFile tokenFile)
+    public BearerTokenInterceptor(SessionTokenFile tokenFile, ConnectionRoleRegistry roles)
     {
         _expected = Encoding.UTF8.GetBytes(tokenFile.Token);
+        _roles = roles ?? throw new ArgumentNullException(nameof(roles));
     }
 
     public override Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
@@ -73,11 +75,24 @@ public sealed class BearerTokenInterceptor : Interceptor
             throw new RpcException(new Status(StatusCode.PermissionDenied, "Missing or malformed bearer token."));
         }
 
-        var presented = Encoding.UTF8.GetBytes(header[Scheme.Length..]);
+        var token = header[Scheme.Length..];
+        var presented = Encoding.UTF8.GetBytes(token);
         // FixedTimeEquals already short-circuits on length mismatch without leaking timing.
-        if (!System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(presented, _expected))
+        if (System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(presented, _expected))
         {
-            throw new RpcException(new Status(StatusCode.PermissionDenied, "Invalid bearer token."));
+            return;
         }
+
+        // MG-12: a role-scoped coordinator credential is a VALID authentication — it simply carries
+        // fewer privileges, which RoleInterceptor enforces next. Previously only the operator token
+        // authenticated, so a coordinator token died here and the role layer was unreachable dead
+        // code (and the role tests passed for the wrong reason, asserting this interceptor's
+        // PermissionDenied rather than the role gate's).
+        if (_roles.IsCoordinatorToken(token))
+        {
+            return;
+        }
+
+        throw new RpcException(new Status(StatusCode.PermissionDenied, "Invalid bearer token."));
     }
 }

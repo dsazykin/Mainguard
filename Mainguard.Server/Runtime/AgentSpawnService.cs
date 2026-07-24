@@ -88,7 +88,8 @@ public sealed class AgentSpawnService
     public async Task<string> SpawnAsync(
         string repoHandle, string agentKind, string? modelApiKey, string role, CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null,
+        string? parentAgentId = null)
     {
         // Custom env entries travel to the same 0400 tmpfs env-file as the model key; a malformed
         // name would corrupt it for every entry, so reject the whole spawn up front (typed →
@@ -130,7 +131,7 @@ public sealed class AgentSpawnService
         // Record the session first (its id names the worktree + container), then run the real
         // P2-06/P2-07 spawn chain. A provisioned repo takes the real-jail path; an unprovisioned
         // handle degrades to a session-only record (no fabricated jail).
-        var session = _store.Spawn(agentKind, role);
+        var session = _store.Spawn(agentKind, role, parentAgentId);
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
         // renders as (agentId) in the file format, so one grep follows the whole chain.
@@ -223,6 +224,46 @@ public sealed class AgentSpawnService
         }
     }
 
+    /// <summary>
+    /// Harvests a LIVE agent's CLI login-state without stopping it.
+    ///
+    /// <para>The jail's <c>$HOME</c> is tmpfs and the durable store is the host OS keychain, but
+    /// harvest previously ran ONLY inside <see cref="StopAsync"/>. So a daemon shutdown, VM stop, or
+    /// crash never harvested at all — the tmpfs home died with the container and the user had to sign
+    /// in again on every launch. This lets the client pull the current login while the agent keeps
+    /// running, then persist it exactly as it does for a stop.</para>
+    ///
+    /// <para>Read-only: nothing is torn down, nothing is wiped, and the agent is untouched. An agent
+    /// with no jail (session-only), no declared credentialPaths, or one that has not logged in yet
+    /// yields an EMPTY result — which is normal and must never clobber a good keychain entry.</para>
+    /// </summary>
+    public async Task<AgentStopResult> HarvestCredentialsAsync(string agentId, CancellationToken ct)
+    {
+        var session = _store.Find(agentId);
+        if (session?.ContainerId is not { Length: > 0 } containerId)
+        {
+            return new AgentStopResult(
+                false, session?.Kind ?? string.Empty,
+                Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>());
+        }
+
+        var credentials = await _launcher.HarvestCliCredentialsAsync(
+            containerId, session.Kind, ct).ConfigureAwait(false);
+
+        // Same in-memory cache StopAsync refreshes, so a worker spawned by a coordinator later in this
+        // daemon session (no client in the loop) boots with the login the user just performed (MG-6
+        // scoping: per repo + kind). Only remember a NON-empty harvest — caching an empty result would
+        // erase a good cached login for every later worker of this kind.
+        if (credentials.Count > 0)
+        {
+            _keys.RememberCliCredentials(session.RepoHash ?? string.Empty, session.Kind, credentials);
+        }
+
+        _spawnLog.LogInformation(
+            "harvest: agent={Agent} credentialFiles={Files} (agent left running)", agentId, credentials.Count);
+        return new AgentStopResult(false, session.Kind, credentials);
+    }
+
     /// <summary>Stops one agent: session record, CLI PTY, IPC endpoint, input lock, jail + worktree.
     /// The jail's tmpfs $HOME dies with the teardown, so the CLI's login-state files (the adapter's
     /// declared <c>credentialPaths</c>) are harvested FIRST and handed back in the result — the
@@ -311,7 +352,8 @@ public sealed class AgentSpawnService
                 {
                     var agentId = await SpawnAsync(
                         repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
-                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle)).ConfigureAwait(false);
+                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
+                        parentAgentId: coordinatorAgentId).ConfigureAwait(false);
                     return new AgentIpcResponse(Ok: true, AgentId: agentId);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -320,7 +362,12 @@ public sealed class AgentSpawnService
                 }
 
             case AgentIpcRequest.ListOp:
+                // MG-37: this returned EVERY session on the daemon — a coordinator could enumerate other
+                // coordinators' workers (and other repos' agents) through its own jail's IPC socket.
+                // Scope it to the sessions this coordinator actually spawned. Only coordinators get an IPC
+                // endpoint, so managed workers never spawn and "children" is the full descendant set.
                 var agents = _store.List()
+                    .Where(s => string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal))
                     .Select(s => $"{s.Id}\t{s.Kind}\t{s.State}\t{s.Role}")
                     .ToArray();
                 return new AgentIpcResponse(Ok: true, Agents: agents);
