@@ -5,61 +5,90 @@ namespace Mainguard.Server.Runtime;
 
 /// <summary>
 /// A memory-only cache of the model API keys the client has handed this daemon session, keyed by
-/// agent kind. The BYOK keystore is host-side (P2-01 — the daemon has no keyring), so keys only ever
-/// arrive on <c>SpawnAgent</c>; a coordinator-initiated worker spawn (the in-jail IPC channel) has
-/// no client in the loop and reuses the key last supplied for that kind. Never persisted, never
-/// logged (the value is write-only until consumed by the sandbox secret injector), gone with the
-/// daemon process.
+/// <b>(repo handle, agent kind)</b>. The BYOK keystore is host-side (P2-01 — the daemon has no
+/// keyring), so keys only ever arrive on <c>SpawnAgent</c>; a coordinator-initiated worker spawn (the
+/// in-jail IPC channel) has no client in the loop and reuses the key last supplied for that repo and
+/// kind. Never persisted, never logged (the value is write-only until consumed by the sandbox secret
+/// injector), gone with the daemon process.
+///
+/// <para><b>MG-6.</b> This was previously keyed by <i>agent kind alone</i> and shared across every
+/// repo and session for the daemon's process lifetime, so a coordinator's shim spawn could pull
+/// whatever model key or harvested CLI OAuth files were last cached for that kind — potentially
+/// supplied by a <i>different repo</i>. Scoping to the repo confines credentials to the repo they
+/// were supplied for while preserving the intended reuse within it. A miss returns null and the
+/// worker simply spawns without the credential (the CLI then takes its own unauthenticated path) —
+/// the same behaviour as before, never a silent cross-repo substitution.</para>
 /// </summary>
 public sealed class SessionKeyCache
 {
-    private readonly ConcurrentDictionary<string, string> _byKind = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<ScopedKey, string> _keys = new();
+    private readonly ConcurrentDictionary<string, System.Collections.Generic.IReadOnlyDictionary<string, string>> _extraEnvByRepo =
+        new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<ScopedKey, System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>>
+        _cliCredentials = new();
 
-    /// <summary>Records the key supplied for <paramref name="agentKind"/> (empty values are ignored).</summary>
-    public void Remember(string agentKind, string? modelApiKey)
+    /// <summary>Records the key supplied for <paramref name="agentKind"/> in <paramref name="repoHandle"/>
+    /// (empty repo/kind/value are ignored).</summary>
+    public void Remember(string repoHandle, string agentKind, string? modelApiKey)
     {
-        if (!string.IsNullOrWhiteSpace(agentKind) && !string.IsNullOrWhiteSpace(modelApiKey))
+        if (TryScope(repoHandle, agentKind, out var scope) && !string.IsNullOrWhiteSpace(modelApiKey))
         {
-            _byKind[agentKind] = modelApiKey;
+            _keys[scope] = modelApiKey;
         }
     }
 
-    /// <summary>The last key supplied for <paramref name="agentKind"/>, or null when none was.</summary>
-    public string? TryGet(string agentKind) =>
-        agentKind is not null && _byKind.TryGetValue(agentKind, out var key) ? key : null;
+    /// <summary>The last key supplied for this repo + kind, or null when none was.</summary>
+    public string? TryGet(string repoHandle, string agentKind) =>
+        TryScope(repoHandle, agentKind, out var scope) && _keys.TryGetValue(scope, out var key) ? key : null;
 
-    private volatile System.Collections.Generic.IReadOnlyDictionary<string, string>? _extraEnv;
-
-    /// <summary>Records the custom env-var keys supplied on a client spawn (llm_env_* — they are
-    /// global, not per-kind), so a coordinator-initiated worker spawn injects them too.</summary>
-    public void RememberExtraEnv(System.Collections.Generic.IReadOnlyDictionary<string, string>? extraEnv)
+    /// <summary>Records the custom env-var keys supplied on a client spawn (llm_env_* — they are not
+    /// per-kind, but they ARE per-repo), so a coordinator-initiated worker spawn injects them too.</summary>
+    public void RememberExtraEnv(string repoHandle, System.Collections.Generic.IReadOnlyDictionary<string, string>? extraEnv)
     {
-        if (extraEnv is { Count: > 0 })
+        if (!string.IsNullOrWhiteSpace(repoHandle) && extraEnv is { Count: > 0 })
         {
-            _extraEnv = extraEnv;
+            _extraEnvByRepo[repoHandle] = extraEnv;
         }
     }
 
-    /// <summary>The custom env-var keys last supplied by a client spawn, or null.</summary>
-    public System.Collections.Generic.IReadOnlyDictionary<string, string>? TryGetExtraEnv() => _extraEnv;
-
-    private readonly ConcurrentDictionary<string, System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>>
-        _cliCredentialsByKind = new(StringComparer.Ordinal);
+    /// <summary>The custom env-var keys last supplied for this repo, or null.</summary>
+    public System.Collections.Generic.IReadOnlyDictionary<string, string>? TryGetExtraEnv(string repoHandle) =>
+        !string.IsNullOrWhiteSpace(repoHandle) && _extraEnvByRepo.TryGetValue(repoHandle, out var env) ? env : null;
 
     /// <summary>Records the CLI login-state files the client restored on a spawn of
-    /// <paramref name="agentKind"/>, so a coordinator-initiated worker of the same kind (no client
-    /// in the loop) boots logged in too. Memory-only, same lifetime rules as the model keys — the
-    /// durable store is the host OS keychain, never the daemon.</summary>
+    /// <paramref name="agentKind"/> in <paramref name="repoHandle"/>, so a coordinator-initiated worker
+    /// of the same kind in the same repo (no client in the loop) boots logged in too. Memory-only, same
+    /// lifetime rules as the model keys — the durable store is the host OS keychain, never the daemon.</summary>
     public void RememberCliCredentials(
-        string agentKind, System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? files)
+        string repoHandle,
+        string agentKind,
+        System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? files)
     {
-        if (!string.IsNullOrWhiteSpace(agentKind) && files is { Count: > 0 })
+        if (TryScope(repoHandle, agentKind, out var scope) && files is { Count: > 0 })
         {
-            _cliCredentialsByKind[agentKind] = files;
+            _cliCredentials[scope] = files;
         }
     }
 
-    /// <summary>The CLI login-state files last supplied for <paramref name="agentKind"/>, or null.</summary>
-    public System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? TryGetCliCredentials(string agentKind) =>
-        agentKind is not null && _cliCredentialsByKind.TryGetValue(agentKind, out var files) ? files : null;
+    /// <summary>The CLI login-state files last supplied for this repo + kind, or null.</summary>
+    public System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? TryGetCliCredentials(
+        string repoHandle, string agentKind) =>
+        TryScope(repoHandle, agentKind, out var scope) && _cliCredentials.TryGetValue(scope, out var files) ? files : null;
+
+    // A blank repo handle or kind can never form a scope — that would collapse distinct repos into one
+    // shared bucket, which is exactly the MG-6 defect. Such calls are dropped (write) / miss (read).
+    private static bool TryScope(string? repoHandle, string? agentKind, out ScopedKey scope)
+    {
+        if (string.IsNullOrWhiteSpace(repoHandle) || string.IsNullOrWhiteSpace(agentKind))
+        {
+            scope = default;
+            return false;
+        }
+
+        scope = new ScopedKey(repoHandle, agentKind);
+        return true;
+    }
+
+    /// <summary>The cache scope: credentials belong to one repo + one agent kind, never to a kind globally.</summary>
+    private readonly record struct ScopedKey(string RepoHandle, string AgentKind);
 }
