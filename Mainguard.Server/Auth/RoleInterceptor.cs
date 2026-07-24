@@ -115,7 +115,10 @@ public sealed class RoleInterceptor : Interceptor
     /// subsequent <c>data</c> (input) frame toward a locked agent throws <see cref="StatusCode.PermissionDenied"/>.
     /// Resize frames are harmless (window geometry) and pass through; the output stream is untouched.
     /// </summary>
-    private sealed class LockedInputReader : IAsyncStreamReader<TerminalInput>
+    // internal (not private) so the MG-31 regression test can drive this reader directly. A gRPC-level
+    // test cannot prove this layer: TerminalGrpcService re-checks the lock, so an end-to-end assertion
+    // passes whether or not the interceptor tracks the Attach oneof.
+    internal sealed class LockedInputReader : IAsyncStreamReader<TerminalInput>
     {
         private readonly IAsyncStreamReader<TerminalInput> _inner;
         private readonly TerminalLockRegistry _locks;
@@ -141,6 +144,16 @@ public sealed class RoleInterceptor : Interceptor
             if (frame.InputCase == TerminalInput.InputOneofCase.AgentId)
             {
                 _agentId = frame.AgentId;
+            }
+            else if (frame.InputCase == TerminalInput.InputOneofCase.Attach)
+            {
+                // MG-31: a P2-18 grid-capable client selects its agent with the Attach handshake
+                // instead of the bare agent_id frame. Tracking only AgentId left `_agentId` null for
+                // those clients, so every later Data frame sailed past this gate and the input-lock
+                // layer was a no-op for them. TerminalGrpcService re-checks the lock (it reads both
+                // oneofs), so this was defense-in-depth rather than a live bypass — but the
+                // interceptor is the layer that is supposed to sever input, so it must see both.
+                _agentId = frame.Attach.AgentId;
             }
             else if (frame.InputCase == TerminalInput.InputOneofCase.Data
                      && _agentId is not null && _locks.IsLocked(_agentId))
