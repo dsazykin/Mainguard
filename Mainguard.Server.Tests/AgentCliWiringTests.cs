@@ -406,6 +406,59 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
     }
 
     [Fact]
+    public async Task ShimList_IsScopedToTheCallersOwnWorkers()
+    {
+        using var rig = WiringRig.Create(_daemon);
+        var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
+
+        // Two independent coordinators, each spawning a worker through its OWN shim socket.
+        var coordA = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
+        var coordB = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
+
+        var a = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordA, default);
+        var b = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordB, default);
+        Assert.True(a.Ok, a.Error);
+        Assert.True(b.Ok, b.Error);
+
+        var listA = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("list"), coordA, default);
+        Assert.True(listA.Ok);
+
+        // A sees only its own worker — not B's worker, not B, not itself.
+        var idsA = listA.Agents!.Select(line => line.Split('\t')[0]).ToArray();
+        Assert.Equal(new[] { a.AgentId }, idsA);
+        Assert.DoesNotContain(b.AgentId!, idsA);
+        Assert.DoesNotContain(coordB, idsA);
+
+        // ...and symmetrically for B.
+        var listB = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("list"), coordB, default);
+        Assert.Equal(new[] { b.AgentId }, listB.Agents!.Select(line => line.Split('\t')[0]).ToArray());
+    }
+
+    [Fact]
+    public async Task ShimList_ForACoordinatorWithNoWorkers_IsEmpty_NotEveryAgent()
+    {
+        using var rig = WiringRig.Create(_daemon);
+        var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
+
+        // Another coordinator with a worker exists on this daemon...
+        var other = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
+        await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), other, default);
+
+        // ...but a coordinator that has spawned nothing must see nothing (previously it saw everything).
+        var idle = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
+        var list = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("list"), idle, default);
+
+        Assert.True(list.Ok);
+        Assert.Empty(list.Agents!);
+    }
+
+    [Fact]
     public async Task ShimSpawn_AtWorkerCap_IsRefused()
     {
         // A small cap so the test fills it quickly; the base graph enforces the real default (6).
