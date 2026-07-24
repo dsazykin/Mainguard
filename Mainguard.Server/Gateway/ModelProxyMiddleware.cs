@@ -208,17 +208,20 @@ public sealed class ModelProxyMiddleware
     private readonly GatewayForwarder _forwarder;
     private readonly IAgentPortMap _portMap;
     private readonly IReadOnlyCollection<string> _modelHosts;
+    private readonly AgentGatewayCredentials _credentials;
 
     public ModelProxyMiddleware(
         RequestDelegate next,
         GatewayForwarder forwarder,
         IAgentPortMap portMap,
-        IReadOnlyCollection<string> modelHosts)
+        IReadOnlyCollection<string> modelHosts,
+        AgentGatewayCredentials credentials)
     {
         _next = next ?? throw new ArgumentNullException(nameof(next));
         _forwarder = forwarder ?? throw new ArgumentNullException(nameof(forwarder));
         _portMap = portMap ?? throw new ArgumentNullException(nameof(portMap));
         _modelHosts = modelHosts ?? Array.Empty<string>();
+        _credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
     }
 
     public async Task InvokeAsync(HttpContext context)
@@ -230,17 +233,21 @@ public sealed class ModelProxyMiddleware
             return;
         }
 
-        var agentId = context.Connection.LocalPort is var port && _portMap.AgentForPort(port) is { } byPort
-            ? byPort
-            : context.Request.Headers["x-mainguard-agent"].FirstOrDefault();
+        // MG-20: identity comes from the agent's own Mainguard gateway token (presented as its API key),
+        // or from a per-agent listener port. The client-supplied `x-mainguard-agent` header is NEVER
+        // trusted — an agent could set it to another agent's id to dodge its own budget or attribute
+        // spend and 429-pauses to a victim. An unauthenticated caller is refused outright.
+        var presentedToken = ExtractPresentedToken(context);
+        var agentId = _credentials.ResolveAgent(presentedToken)
+                      ?? _portMap.AgentForPort(context.Connection.LocalPort);
 
         if (string.IsNullOrEmpty(agentId))
         {
-            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             return;
         }
 
-        using var request = BuildUpstreamRequest(context, host);
+        using var request = BuildUpstreamRequest(context, host, _credentials.ProviderKeyFor(agentId));
         int? estimate = TryReadEstimate(context);
 
         try
@@ -259,7 +266,33 @@ public sealed class ModelProxyMiddleware
     private bool IsModelHost(string host) =>
         _modelHosts.Any(h => string.Equals(h, host, StringComparison.OrdinalIgnoreCase));
 
-    private static HttpRequestMessage BuildUpstreamRequest(HttpContext context, string host)
+    /// <summary>Credential-bearing headers the agent may present. They are always DROPPED and replaced
+    /// by the daemon-held provider key — the jail's copy is only ever a Mainguard token.</summary>
+    private static readonly string[] CredentialHeaders =
+    {
+        "authorization", "x-api-key", "api-key", "anthropic-api-key", "openai-api-key",
+    };
+
+    /// <summary>Mainguard's own control headers — internal, never forwarded to the provider.</summary>
+    private static readonly string[] MainguardHeaders =
+    {
+        "x-mainguard-agent", "x-mainguard-token-estimate",
+    };
+
+    /// <summary>Hop-by-hop headers that must not be relayed (RFC 9110 §7.6.1).</summary>
+    private static readonly string[] HopByHopHeaders =
+    {
+        "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+        "te", "trailer", "transfer-encoding", "upgrade", "host",
+    };
+
+    /// <summary>
+    /// MG-4: builds the upstream request with the agent's credential <b>replaced</b> by the real
+    /// provider key held daemon-side. The agent presents only its Mainguard token, so the provider key
+    /// never has to exist inside the jail. MG-38: the agent's headers are filtered rather than relayed
+    /// verbatim — credential, Mainguard-internal, and hop-by-hop headers are all dropped.
+    /// </summary>
+    private static HttpRequestMessage BuildUpstreamRequest(HttpContext context, string host, string? providerKey)
     {
         var uri = new UriBuilder("https", host)
         {
@@ -275,13 +308,60 @@ public sealed class ModelProxyMiddleware
 
         foreach (var header in context.Request.Headers)
         {
+            if (IsDropped(header.Key))
+            {
+                continue;
+            }
+
             if (!request.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray()) && request.Content is not null)
             {
                 request.Content.Headers.TryAddWithoutValidation(header.Key, header.Value.ToArray());
             }
         }
 
+        // Inject the real key at the network hop, in the shape the provider expects. Anthropic reads
+        // `x-api-key`; the bearer form covers OpenAI-style providers. Absent a key in custody (an
+        // interactive-login CLI rather than BYOK) nothing is injected and the call goes out unauthenticated,
+        // which the provider rejects — never a silent fallback to whatever the agent sent.
+        if (!string.IsNullOrEmpty(providerKey))
+        {
+            if (IsAnthropicHost(host))
+            {
+                request.Headers.TryAddWithoutValidation("x-api-key", providerKey);
+            }
+            else
+            {
+                request.Headers.TryAddWithoutValidation("authorization", "Bearer " + providerKey);
+            }
+        }
+
         return request;
+    }
+
+    private static bool IsDropped(string name) =>
+        CredentialHeaders.Contains(name, StringComparer.OrdinalIgnoreCase)
+        || MainguardHeaders.Contains(name, StringComparer.OrdinalIgnoreCase)
+        || HopByHopHeaders.Contains(name, StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsAnthropicHost(string host) =>
+        host.EndsWith("anthropic.com", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>The Mainguard token the agent presents as its API key (either header shape).</summary>
+    private static string? ExtractPresentedToken(HttpContext context)
+    {
+        var apiKey = context.Request.Headers["x-api-key"].FirstOrDefault();
+        if (!string.IsNullOrEmpty(apiKey))
+        {
+            return apiKey;
+        }
+
+        var auth = context.Request.Headers["authorization"].FirstOrDefault();
+        if (auth is not null && auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+        {
+            return auth["Bearer ".Length..];
+        }
+
+        return auth;
     }
 
     private static int? TryReadEstimate(HttpContext context) =>
@@ -292,12 +372,19 @@ public sealed class ModelProxyMiddleware
         context.Response.StatusCode = (int)upstream.StatusCode;
         foreach (var header in upstream.Headers)
         {
-            context.Response.Headers[header.Key] = header.Value.ToArray();
+            // MG-38: hop-by-hop headers are per-connection and must not be relayed to the agent.
+            if (!HopByHopHeaders.Contains(header.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                context.Response.Headers[header.Key] = header.Value.ToArray();
+            }
         }
 
         foreach (var header in upstream.Content.Headers)
         {
-            context.Response.Headers[header.Key] = header.Value.ToArray();
+            if (!HopByHopHeaders.Contains(header.Key, StringComparer.OrdinalIgnoreCase))
+            {
+                context.Response.Headers[header.Key] = header.Value.ToArray();
+            }
         }
 
         context.Response.Headers.Remove("transfer-encoding");
