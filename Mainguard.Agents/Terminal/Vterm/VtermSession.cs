@@ -79,12 +79,34 @@ public sealed class VtermSession : IDisposable
     /// by design). Never throws.</summary>
     public static bool IsSupported => VtermNative.IsAvailable;
 
+    /// <summary>
+    /// MG-22 — the administrative ceiling on either grid dimension, applied immediately before the
+    /// native call. Upstream libvterm 0.3.3's <c>vterm_set_size</c>/<c>alloc_buffer</c> allocates
+    /// <c>sizeof(ScreenCell) * rows * cols</c> with <b>no overflow or upper-bound check</b> and
+    /// dereferences the result unconditionally, so a caller-supplied dimension anywhere in
+    /// <c>[1, 2^31-1]</c> (the proto carries <c>uint32</c>, cast to <c>int</c>) reached it after passing
+    /// every managed check — only <c>&lt;= 0</c> was rejected. An inflated <c>cols</c> also multiplies the
+    /// 10 000-line scrollback ring's footprint. 1000×1000 is far beyond any real display (a 4K monitor at
+    /// a tiny font is ~500 columns) while bounding the allocation.
+    /// </summary>
+    public const int MaxDimension = 1000;
+
+    /// <summary>Clamps a grid dimension into <c>[1, <see cref="MaxDimension"/>]</c>. Public because
+    /// callers that drive the PTY and this grid together must clamp identically (see
+    /// <c>BoundTerminalSession.Resize</c>) or the two sizes diverge.</summary>
+    public static int ClampDimension(int value) => value < 1 ? 1 : (value > MaxDimension ? MaxDimension : value);
+
     public VtermSession(int cols, int rows)
     {
         if (cols <= 0 || rows <= 0)
         {
             throw new ArgumentOutOfRangeException(cols <= 0 ? nameof(cols) : nameof(rows));
         }
+
+        // Oversized geometry is clamped rather than rejected: construction must not fail on a large
+        // request, but nothing above the ceiling may reach the native allocator.
+        cols = ClampDimension(cols);
+        rows = ClampDimension(rows);
 
         VtermNative.EnsureResolver();
         _cols = cols;
@@ -181,7 +203,17 @@ public sealed class VtermSession : IDisposable
     /// </summary>
     public void Resize(int cols, int rows)
     {
-        if (cols <= 0 || rows <= 0 || (cols == _cols && rows == _rows))
+        if (cols <= 0 || rows <= 0)
+        {
+            return;
+        }
+
+        // MG-22: clamp before the native call — see MaxDimension. Done after the <=0 guard and before
+        // the no-op comparison so a repeated oversized request still settles at the ceiling exactly once.
+        cols = ClampDimension(cols);
+        rows = ClampDimension(rows);
+
+        if (cols == _cols && rows == _rows)
         {
             return;
         }
