@@ -88,7 +88,8 @@ public sealed class AgentSpawnService
     public async Task<string> SpawnAsync(
         string repoHandle, string agentKind, string? modelApiKey, string role, CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null,
+        string? parentAgentId = null)
     {
         // Custom env entries travel to the same 0400 tmpfs env-file as the model key; a malformed
         // name would corrupt it for every entry, so reject the whole spawn up front (typed →
@@ -130,7 +131,7 @@ public sealed class AgentSpawnService
         // Record the session first (its id names the worktree + container), then run the real
         // P2-06/P2-07 spawn chain. A provisioned repo takes the real-jail path; an unprovisioned
         // handle degrades to a session-only record (no fabricated jail).
-        var session = _store.Spawn(agentKind, role);
+        var session = _store.Spawn(agentKind, role, parentAgentId);
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
         // renders as (agentId) in the file format, so one grep follows the whole chain.
@@ -311,7 +312,8 @@ public sealed class AgentSpawnService
                 {
                     var agentId = await SpawnAsync(
                         repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
-                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle)).ConfigureAwait(false);
+                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
+                        parentAgentId: coordinatorAgentId).ConfigureAwait(false);
                     return new AgentIpcResponse(Ok: true, AgentId: agentId);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
@@ -320,7 +322,12 @@ public sealed class AgentSpawnService
                 }
 
             case AgentIpcRequest.ListOp:
+                // MG-37: this returned EVERY session on the daemon — a coordinator could enumerate other
+                // coordinators' workers (and other repos' agents) through its own jail's IPC socket.
+                // Scope it to the sessions this coordinator actually spawned. Only coordinators get an IPC
+                // endpoint, so managed workers never spawn and "children" is the full descendant set.
                 var agents = _store.List()
+                    .Where(s => string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal))
                     .Select(s => $"{s.Id}\t{s.Kind}\t{s.State}\t{s.Role}")
                     .ToArray();
                 return new AgentIpcResponse(Ok: true, Agents: agents);
