@@ -28,7 +28,12 @@ public sealed record InstalledAdapterMarker(
     /// <see cref="AdapterSpec.CredentialPaths"/>) — the ONLY paths the daemon will restore into /
     /// harvest from the jail's tmpfs home (client-supplied paths are filtered against this list).
     /// Null on markers written before this field existed — re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null)
+    [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null,
+    /// <summary>The env var this CLI reads its API BASE URL from (see
+    /// <see cref="AdapterSpec.BaseUrlEnvVar"/>), carried across the host/VM boundary so the spawn path
+    /// can point the CLI at the daemon's model gateway (MG-4). Null on markers written before this
+    /// field existed — re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 

@@ -80,7 +80,14 @@ public sealed record AdapterSpec(
     /// keychain and the client harvests them back on stop — the login round-trip that stops every
     /// launch from demanding a fresh sign-in. Files only, relative, no <c>..</c>; null = this CLI
     /// has no persistable login state (API-key-only).</summary>
-    [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null);
+    [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null,
+    /// <summary>The environment variable this CLI reads its API BASE URL from (e.g.
+    /// <c>ANTHROPIC_BASE_URL</c> for claude-code, <c>OPENAI_BASE_URL</c> for codex). MG-4: pointing the
+    /// CLI at the daemon's model gateway is what lets the jail hold only a Mainguard session token while
+    /// the real provider key stays daemon-side and is injected at the network hop. Null = this CLI
+    /// cannot be redirected, so it must talk to the provider directly and BYOK confinement does not
+    /// apply to it.</summary>
+    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null);
 
 /// <summary>The <c>adapters.json</c> channel manifest: the full set of pinned agent CLIs.
 /// <para><c>_comment</c> is the ONE tolerated free-form field (JSON has no comment syntax, and the
@@ -154,6 +161,9 @@ public sealed record AdapterManifest(
             if (a.ApiKeyEnvVar is not null && !IsEnvVarName(a.ApiKeyEnvVar))
                 throw new AdapterManifestException(AdapterManifestError.Malformed,
                     $"Adapter '{a.Id}' apiKeyEnvVar '{a.ApiKeyEnvVar}' is not a valid environment variable name.");
+            if (a.BaseUrlEnvVar is not null && !IsEnvVarName(a.BaseUrlEnvVar))
+                throw new AdapterManifestException(AdapterManifestError.Malformed,
+                    $"Adapter '{a.Id}' baseUrlEnvVar '{a.BaseUrlEnvVar}' is not a valid environment variable name.");
             if (a.CredentialPaths is not null)
             {
                 foreach (var path in a.CredentialPaths)
