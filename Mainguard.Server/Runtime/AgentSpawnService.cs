@@ -119,11 +119,13 @@ public sealed class AgentSpawnService
             throw new ArgumentException("agent_kind is required.");
         }
 
-        // Memory-only, per-kind: lets a coordinator-initiated worker of the same kind reuse the key
-        // the client last supplied (the daemon has no keystore of its own — P2-01 is host-side).
-        _keys.Remember(agentKind, modelApiKey);
-        _keys.RememberExtraEnv(extraEnv);
-        _keys.RememberCliCredentials(agentKind, cliCredentials);
+        // Memory-only, per (repo, kind): lets a coordinator-initiated worker of the same kind IN THE
+        // SAME REPO reuse the key the client last supplied (the daemon has no keystore of its own —
+        // P2-01 is host-side). MG-6: scoping by repo keeps one repo's credentials out of another's
+        // spawns; a miss simply yields no key rather than substituting a stranger's.
+        _keys.Remember(repoHandle, agentKind, modelApiKey);
+        _keys.RememberExtraEnv(repoHandle, extraEnv);
+        _keys.RememberCliCredentials(repoHandle, agentKind, cliCredentials);
 
         // Record the session first (its id names the worktree + container), then run the real
         // P2-06/P2-07 spawn chain. A provisioned repo takes the real-jail path; an unprovisioned
@@ -164,8 +166,8 @@ public sealed class AgentSpawnService
 
             var launch = await _launcher.TryLaunchAsync(
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
-                extraEnv: extraEnv ?? _keys.TryGetExtraEnv(),
-                cliCredentials: cliCredentials ?? _keys.TryGetCliCredentials(agentKind)).ConfigureAwait(false);
+                extraEnv: extraEnv ?? _keys.TryGetExtraEnv(repoHandle),
+                cliCredentials: cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind)).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -242,10 +244,11 @@ public sealed class AgentSpawnService
         {
             credentials = await _launcher.HarvestCliCredentialsAsync(
                 containerId, session.Kind, ct).ConfigureAwait(false);
-            // Keep the memory-only per-kind cache current too, so a worker of this kind spawned
-            // later in THIS daemon session (coordinator IPC — no client in the loop) boots with the
-            // login the user just performed in the stopped jail.
-            _keys.RememberCliCredentials(session.Kind, credentials);
+            // Keep the memory-only per (repo, kind) cache current too, so a worker of this kind spawned
+            // later in THIS daemon session against THE SAME REPO (coordinator IPC — no client in the
+            // loop) boots with the login the user just performed in the stopped jail. A session with no
+            // repo hash caches nothing rather than leaking into a repo-less bucket (MG-6).
+            _keys.RememberCliCredentials(session.RepoHash ?? string.Empty, session.Kind, credentials);
             await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
         }
 
@@ -307,8 +310,8 @@ public sealed class AgentSpawnService
                 try
                 {
                     var agentId = await SpawnAsync(
-                        repoHandle, request.AgentKind, _keys.TryGet(request.AgentKind),
-                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv()).ConfigureAwait(false);
+                        repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
+                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle)).ConfigureAwait(false);
                     return new AgentIpcResponse(Ok: true, AgentId: agentId);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
