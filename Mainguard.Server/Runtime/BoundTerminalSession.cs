@@ -199,6 +199,12 @@ public sealed class BoundTerminalSession : IDisposable
             return;
         }
 
+        // MG-22: clamp HERE, before either half of the resize, so the PTY and the vterm grid can never
+        // be driven to different sizes — the one-authoritative-size rule. VtermSession clamps again at
+        // the native boundary; this is what keeps the two consistent.
+        cols = VtermSession.ClampDimension(cols);
+        rows = VtermSession.ClampDimension(rows);
+
         _session.Resize(cols, rows);
         if (_vterm is null)
         {
