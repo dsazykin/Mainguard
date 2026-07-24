@@ -34,17 +34,27 @@ public sealed class RoleInterceptor : Interceptor
         "/mainguard.v1.MergeQueueService/ConfirmMerge",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
+        // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per
+        // page) with no ownership scoping — a coordinator could read a worker's whole session, which
+        // is exactly the read the coordinator surface is not supposed to have. The operator token
+        // legitimately reads every agent (it drives the UI), so the boundary is the role, and this is
+        // the same gate the merge/plan RPCs use. Now genuinely enforced: MG-12 (same change) makes a
+        // coordinator token authenticate, so this check is reached instead of being dead code.
+        // Per-agent ownership scoping (one connection ↔ its own agents) remains a separate concern.
+        "/mainguard.v1.TerminalService/GetScrollback",
     };
 
     private const string AttachMethod = "/mainguard.v1.TerminalService/Attach";
 
     private readonly ConnectionRoleRegistry _roles;
     private readonly TerminalLockRegistry _locks;
+    private readonly SessionTokenFile _tokenFile;
 
-    public RoleInterceptor(ConnectionRoleRegistry roles, TerminalLockRegistry locks)
+    public RoleInterceptor(ConnectionRoleRegistry roles, TerminalLockRegistry locks, SessionTokenFile tokenFile)
     {
         _roles = roles ?? throw new ArgumentNullException(nameof(roles));
         _locks = locks ?? throw new ArgumentNullException(nameof(locks));
+        _tokenFile = tokenFile ?? throw new ArgumentNullException(nameof(tokenFile));
     }
 
     public override Task<TResponse> UnaryServerHandler<TRequest, TResponse>(
@@ -95,7 +105,7 @@ public sealed class RoleInterceptor : Interceptor
         }
 
         var token = ExtractBearer(context);
-        if (_roles.Resolve(token) == ConnectionRole.Coordinator)
+        if (_roles.Resolve(token, _tokenFile.Token) == ConnectionRole.Coordinator)
         {
             throw new RpcException(new Status(StatusCode.PermissionDenied,
                 "The coordinator role cannot invoke merge or plan-approval RPCs — chat + capped tools only."));
