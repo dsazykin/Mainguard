@@ -64,27 +64,44 @@ public sealed class GatewayForwarder
 
         var lease = await _gateway.AcquireAsync(agentId, estimate, ct).ConfigureAwait(false);
 
-        for (var attempt = 1; ; attempt++)
+        // MG-24: the lease now carries a provisional budget debit, so EVERY exit from here has to
+        // discharge it. Settle does that on the happy path; the finally covers the ones that don't
+        // return normally — the upstream send throwing, the client aborting mid-backoff, the retry loop
+        // being cancelled. A lease dropped on the floor would charge the agent for a request that never
+        // happened, permanently, which is a worse failure than the overshoot the reservation prevents.
+        var settled = false;
+        try
         {
-            using var outbound = Clone(request, bodyBytes, contentHeaders);
-            var response = await _upstream.SendAsync(outbound, ct).ConfigureAwait(false);
-
-            if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < _maxAttempts)
+            for (var attempt = 1; ; attempt++)
             {
-                var retryAfter = ParseRetryAfter(response);
-                response.Dispose();
-                _gateway.Report429(agentId, retryAfter);       // pauses PTY input, marks RateLimited
-                await _delay(_gateway.RemainingBackoff(agentId), ct).ConfigureAwait(false);
-                continue;                                       // retry — the CLI still waits on one call
-            }
+                using var outbound = Clone(request, bodyBytes, contentHeaders);
+                var response = await _upstream.SendAsync(outbound, ct).ConfigureAwait(false);
 
-            // Terminal response: buffer it so we can read usage AND still hand it to the caller intact.
-            await response.Content.LoadIntoBufferAsync().ConfigureAwait(false);
-            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-            var (tokens, model) = ModelUsageParser.Parse(body);
-            _gateway.Settle(lease, tokens ?? estimate, model);
-            _gateway.ClearRateLimit(agentId);                   // resumes PTY input, marks Running
-            return response;
+                if (response.StatusCode == HttpStatusCode.TooManyRequests && attempt < _maxAttempts)
+                {
+                    var retryAfter = ParseRetryAfter(response);
+                    response.Dispose();
+                    _gateway.Report429(agentId, retryAfter);       // pauses PTY input, marks RateLimited
+                    await _delay(_gateway.RemainingBackoff(agentId), ct).ConfigureAwait(false);
+                    continue;                                       // retry — the CLI still waits on one call
+                }
+
+                // Terminal response: buffer it so we can read usage AND still hand it to the caller intact.
+                await response.Content.LoadIntoBufferAsync().ConfigureAwait(false);
+                var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                var (tokens, model) = ModelUsageParser.Parse(body);
+                _gateway.Settle(lease, tokens ?? estimate, model);
+                settled = true;
+                _gateway.ClearRateLimit(agentId);                   // resumes PTY input, marks Running
+                return response;
+            }
+        }
+        finally
+        {
+            if (!settled)
+            {
+                _gateway.Abandon(lease);
+            }
         }
     }
 
