@@ -12,7 +12,13 @@ using Mainguard.Git.Security;
 namespace Mainguard.Agents.Agents.Sandbox;
 
 /// <summary>Daemon-side config for <see cref="DockerSandboxEngine"/> (network + proxy + userns).</summary>
-public sealed record SandboxEngineOptions(string NetworkName, string ProxyUrl, string UsernsMode = "");
+/// <param name="ProxyContainerName">The egress proxy whose dnsmasq every jail pins as its resolver
+/// (MG-7). Named here rather than hard-coded so a test substrate can point at its own proxy.</param>
+public sealed record SandboxEngineOptions(
+    string NetworkName,
+    string ProxyUrl,
+    string UsernsMode = "",
+    string ProxyContainerName = EgressProxyConfigurator.ProxyContainerName);
 
 /// <summary>
 /// The Docker implementation of <see cref="ISandboxEngine"/> (P2-07). Builds the hardened create
@@ -41,6 +47,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         ArgumentNullException.ThrowIfNull(request);
         var name = ContainerSpecBuilder.ContainerName(request.RepoHash, request.AgentId);
 
+        // MG-7: the resolver pin is the proxy's CURRENT address on the agent network, so it is resolved
+        // per spawn rather than captured at construction — the proxy is recreated on image upgrade and
+        // on corpse replacement, and Docker hands out a new address each time.
+        var dnsServer = await ResolveDnsServerAsync(ct).ConfigureAwait(false);
+
         var existing = await FindByNameAsync(name, ct).ConfigureAwait(false);
         if (existing is not null)
         {
@@ -49,7 +60,12 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // worktree's gitdir pointer dangles and every in-jail git command fails).
             var missingBareMount = !string.IsNullOrEmpty(request.BareRepoPath)
                 && (existing.Mounts is null || existing.Mounts.All(m => m.Destination != request.BareRepoPath));
-            if (!string.Equals(existing.Image, request.ImageRef, StringComparison.Ordinal) || missingBareMount)
+            // MG-7: HostConfig.Dns is fixed at create, so a jail that outlived a proxy recreate is
+            // pinned to an address that no longer answers — every name in it would fail to resolve.
+            // Recreating is the only way to re-pin; the alternative is a jail with no working DNS.
+            var stalePin = dnsServer is not null
+                && !await PinnedDnsMatchesAsync(existing.ID, dnsServer, ct).ConfigureAwait(false);
+            if (!string.Equals(existing.Image, request.ImageRef, StringComparison.Ordinal) || missingBareMount || stalePin)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -70,7 +86,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, _options.NetworkName, credentials, _options.ProxyUrl, _options.UsernsMode,
-            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath);
+            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
@@ -142,6 +158,47 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
     public Task RemoveAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.RemoveContainerAsync(containerId, new ContainerRemoveParameters { Force = true }, ct);
+
+    /// <summary>
+    /// MG-7 — the address of the proxy's dnsmasq on the default-deny network, which every jail there
+    /// pins as its ONLY resolver. Returns null (no pin) for engines that are not on that network: the
+    /// merge-queue and lifecycle harnesses run jails on <c>bridge</c> with no proxy at all, and pinning
+    /// them at an address that does not exist would break them for no security gain. On the agent
+    /// network the absence of an address is fatal — <see cref="ContainerSpecBuilder"/> refuses to build
+    /// an unpinned spec there, which is the fail-closed half of this control.
+    /// </summary>
+    private async Task<string?> ResolveDnsServerAsync(CancellationToken ct)
+    {
+        if (!string.Equals(_options.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal))
+            return null;
+
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(_options.ProxyContainerName, ct).ConfigureAwait(false);
+            return EgressProxyConfigurator.ProxyAddressOf(inspect);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>True when a reusable jail is already pinned at <paramref name="dnsServer"/>. A container
+    /// that vanished under us counts as matching so the caller's own recreate path — not this probe —
+    /// decides what to do about it.</summary>
+    private async Task<bool> PinnedDnsMatchesAsync(string containerId, string dnsServer, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            var pinned = inspect.HostConfig?.DNS;
+            return pinned is { Count: 1 } && string.Equals(pinned[0], dnsServer, StringComparison.Ordinal);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return true;
+        }
+    }
 
     private async Task<ContainerListResponse?> FindByNameAsync(string name, CancellationToken ct)
     {

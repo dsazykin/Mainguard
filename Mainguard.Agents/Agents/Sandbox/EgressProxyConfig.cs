@@ -77,13 +77,34 @@ public static class EgressProxyConfig
         return sb.ToString();
     }
 
-    /// <summary>dnsmasq config: resolve ONLY allowlisted names; everything else NXDOMAIN.</summary>
-    public static string RenderDnsmasqConfig(EgressAllowlist allowlist)
+    /// <summary>
+    /// dnsmasq config: resolve ONLY allowlisted names; everything else NXDOMAIN.
+    ///
+    /// <para>MG-7 — with the jail's resolver now PINNED here (<c>HostConfig.Dns</c>), this file is the
+    /// jail's whole view of DNS: Docker's embedded resolver at <c>127.0.0.11</c> is no longer in the
+    /// jail's <c>resolv.conf</c>, so the container-name resolution it used to provide is gone too. The
+    /// one name the jail still has to resolve is the proxy itself — <c>HTTP_PROXY</c> is
+    /// <c>http://mainguard-egress-proxy:8888</c> — and without an explicit record for it the catch-all
+    /// below would answer <c>0.0.0.0</c> and every proxied request would die. Hence
+    /// <paramref name="proxyAddress"/>: pinning the resolver and forgetting this record turns
+    /// "default-deny egress" into "no egress at all".</para>
+    /// </summary>
+    /// <param name="proxyAddress">The proxy's own IPv4 on the agent network. Null/empty only on the
+    /// pre-MG-7 paths that render policy without a live proxy (pure tests).</param>
+    public static string RenderDnsmasqConfig(EgressAllowlist allowlist, string? proxyAddress = null)
     {
         var sb = new StringBuilder();
         sb.Append("# mainguard pinned DNS — answer allowlisted names only; all else NXDOMAIN\n");
         sb.Append("no-resolv\n");
         sb.Append("bogus-priv\n");
+        if (!string.IsNullOrWhiteSpace(proxyAddress))
+        {
+            // MUST precede the catch-all: the jail's HTTP_PROXY names this host and nothing else can
+            // answer for it once 127.0.0.11 is out of the jail's resolv.conf (see the summary).
+            sb.Append("address=/").Append(EgressProxyConfigurator.ProxyContainerName).Append('/')
+              .Append(proxyAddress.Trim()).Append('\n');
+        }
+
         // Only the allowlisted names are forwarded to the upstream resolver; the catch-all
         // address=/#/ returns NXDOMAIN-equivalent (0.0.0.0) for everything not explicitly served.
         foreach (var host in HostsOf(allowlist))
@@ -93,22 +114,50 @@ public static class EgressProxyConfig
     }
 
     /// <summary>
-    /// iptables backstop: DROP all egress from the agent network except to the proxy's listener.
-    /// This is the control that makes direct-IP egress (bypassing HTTP_PROXY) fail — the named
-    /// rejection trigger is enforcing egress by proxy env alone, without this.
+    /// The proxy-namespace iptables backstop.
+    ///
+    /// <para>MG-18 — this script runs inside the <b>proxy container's</b> network namespace, so be
+    /// precise about what it can and cannot enforce. It does <b>not</b> stop agent egress: an agent's
+    /// packets are routed by the host-side bridge for <c>mainguard-agents</c> and never transit this
+    /// namespace, so a <c>FORWARD</c> policy here has nothing to filter. What actually contains the
+    /// agents is the network being <c>Internal</c> — which is now asserted on every reuse
+    /// (<c>EgressProxyConfigurator.AssertNetworkMatchesPolicy</c>) instead of assumed.</para>
+    ///
+    /// <para>What this namespace CAN enforce is what reaches the proxy, and that is what the backstop
+    /// is now written to do: a default-deny <c>INPUT</c> chain admitting only tinyproxy's CONNECT port
+    /// and dnsmasq's 53, <b>and only at the proxy's own address</b>. Previously the ACCEPTs were
+    /// <c>--dport</c>-only with no destination, i.e. "to anywhere" — which is not a restriction at all
+    /// on a forwarding path and would admit any future listener in this container on those ports.
+    /// The <c>FORWARD</c> policy is retained purely as defence in depth for the day someone gives this
+    /// container a routing role; it is explicitly not the control keeping agents in.</para>
     /// </summary>
-    public static string RenderIptablesScript(int proxyPort)
+    /// <param name="proxyAddress">The proxy's own IPv4 on the agent network — the only legitimate
+    /// destination for agent traffic. Null/empty falls back to port-only rules (pure tests).</param>
+    public static string RenderIptablesScript(int proxyPort, string? proxyAddress = null)
     {
+        var to = string.IsNullOrWhiteSpace(proxyAddress) ? string.Empty : $" -d {proxyAddress.Trim()}";
+
         var sb = new StringBuilder();
         sb.Append("#!/bin/sh\n");
-        sb.Append("# mainguard egress backstop — DROP non-proxy egress (proxy-env-only is a rejection trigger)\n");
+        sb.Append("# mainguard egress backstop (MG-18) — default-deny INPUT in the PROXY netns.\n");
+        sb.Append("# Agent containment is the Internal network, asserted daemon-side; this chain bounds\n");
+        sb.Append("# what an agent may reach INSIDE the proxy: tinyproxy + dnsmasq at the proxy's own\n");
+        sb.Append("# address, nothing else. FORWARD stays default-deny as defence in depth only.\n");
         sb.Append("set -eu\n");
+
+        sb.Append("iptables -P INPUT DROP\n");
+        sb.Append("iptables -A INPUT -i lo -j ACCEPT\n");
+        sb.Append("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
+        sb.Append($"iptables -A INPUT -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+        sb.Append($"iptables -A INPUT -p udp{to} --dport 53 -j ACCEPT\n");
+        sb.Append($"iptables -A INPUT -p tcp{to} --dport 53 -j ACCEPT\n");
+        sb.Append("iptables -A INPUT -j DROP\n");
+
         sb.Append("iptables -P FORWARD DROP\n");
         sb.Append("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-        // Allow only traffic destined for the proxy's CONNECT/DNS listeners; drop the rest.
-        sb.Append($"iptables -A FORWARD -p tcp --dport {proxyPort} -j ACCEPT\n");
-        sb.Append("iptables -A FORWARD -p udp --dport 53 -j ACCEPT\n");
-        sb.Append("iptables -A FORWARD -p tcp --dport 53 -j ACCEPT\n");
+        sb.Append($"iptables -A FORWARD -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+        sb.Append($"iptables -A FORWARD -p udp{to} --dport 53 -j ACCEPT\n");
+        sb.Append($"iptables -A FORWARD -p tcp{to} --dport 53 -j ACCEPT\n");
         sb.Append("iptables -A FORWARD -j DROP\n");
         return sb.ToString();
     }

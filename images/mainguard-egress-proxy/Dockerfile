@@ -6,10 +6,11 @@
 # backstop that DROPs non-proxy egress (proxy-env-only enforcement is a rejection trigger).
 #
 # The daemon (EgressProxyConfigurator) renders the allowlist to the three config artefacts at runtime
-# and calls /etc/mainguard/reload.sh:
-#   /etc/mainguard/tinyproxy-filter  — the CONNECT allow-filter (default-deny)
-#   /etc/mainguard/dnsmasq.conf      — pinned DNS (allowlisted names only)
-#   /etc/mainguard/backstop.sh       — iptables DROP for non-proxy egress
+# and calls /etc/mainguard/reload.sh. MG-25: the container runs with a READ-ONLY rootfs, so the rendered
+# artefacts live on the /run tmpfs while the scripts stay on the immutable image layer:
+#   /run/mainguard/tinyproxy-filter  — the CONNECT allow-filter (default-deny)
+#   /run/mainguard/dnsmasq.conf      — pinned DNS (allowlisted names only; MG-7: the agents' ONLY resolver)
+#   /run/mainguard/backstop.sh       — the proxy-namespace INPUT backstop
 
 FROM debian:bookworm-slim
 
@@ -23,5 +24,9 @@ COPY reload.sh /etc/mainguard/reload.sh
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /etc/mainguard/reload.sh /entrypoint.sh
 
-# NET_ADMIN/NET_RAW (added by the daemon at create time) are required for the iptables backstop only.
+# Capabilities the daemon adds at create time, and why (MG-25):
+#   NET_ADMIN        — the iptables backstop. Debian bookworm's `iptables` is the nft variant, which
+#                      drives nftables over netlink, so NET_RAW (needed only by iptables-legacy's
+#                      AF_INET/SOCK_RAW libiptc socket) is NOT required and is no longer granted.
+#   NET_BIND_SERVICE — dnsmasq's port 53. Under CapDrop ALL even root cannot bind below 1024.
 ENTRYPOINT ["/entrypoint.sh"]

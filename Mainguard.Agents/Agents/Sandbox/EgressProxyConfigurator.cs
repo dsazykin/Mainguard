@@ -32,6 +32,17 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// <summary>The tinyproxy CONNECT listener port.</summary>
     public const int ProxyPort = 8888;
 
+    /// <summary>The docker label both mainguard networks carry, keyed to their role.</summary>
+    public const string NetworkRoleLabel = "mainguard.role";
+
+    /// <summary>MG-25 — resource ceilings for the proxy container. It runs two small daemons (tinyproxy
+    /// + dnsmasq) and an iptables invocation; anything beyond this is a runaway, and the proxy sits on
+    /// the ONE path every agent's egress takes, so it must not be able to starve the VM either.</summary>
+    private const long ProxyMemoryBytes = 256L * 1024 * 1024;
+    private const long ProxyPidsLimit = 128;
+    private const long ProxyNanoCpus = 1_000_000_000; // 1 core
+    private const long ProxyNoFile = 4096;
+
     /// <summary>The proxy image the shipped daemon runs (overridable per-instance for tests only) —
     /// the spawn preflight checks THIS ref so an absent egress image fails as one actionable typed
     /// error instead of an opaque create failure inside <see cref="EnsureReadyAsync"/>.</summary>
@@ -178,20 +189,99 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             Hostname = ProxyContainerName,
             Image = _proxyImageRef,
             Labels = new Dictionary<string, string> { ["mainguard.role"] = "egress-proxy" },
-            HostConfig = new HostConfig
-            {
-                NetworkMode = AgentNetworkName,
-                // The proxy needs NET_ADMIN to install the iptables backstop; nothing else.
-                CapDrop = new List<string> { "ALL" },
-                CapAdd = new List<string> { "NET_ADMIN", "NET_RAW" },
-                SecurityOpt = new List<string> { "no-new-privileges" },
-            },
+            HostConfig = ProxyHostConfig(),
         }, ct).ConfigureAwait(false);
 
         // Second leg onto the egress-capable network so the proxy — and only the proxy — can reach upstreams.
+
         await _docker.Networks.ConnectNetworkAsync(egressNetworkId, new NetworkConnectParameters { Container = created.ID }, ct).ConfigureAwait(false);
         await _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
         return created.ID;
+    }
+
+    /// <summary>
+    /// MG-25 — the proxy's hardened <see cref="HostConfig"/>. Built here (and asserted by the pure
+    /// tests) rather than inline so the posture is one auditable surface.
+    ///
+    /// <para>The proxy is the single chokepoint every agent's egress crosses, and it was the least
+    /// hardened container in the system: two extra capabilities, no seccomp, a writable rootfs and no
+    /// resource ceilings. It now carries the same class of controls as the jails it fronts, minus the
+    /// one capability it genuinely needs.</para>
+    ///
+    /// <para><b>Capabilities.</b> <c>NET_ADMIN</c> stays — the iptables backstop cannot be installed
+    /// without it. <c>NET_RAW</c> is dropped: it exists for raw/packet sockets, and the only consumer
+    /// that would have needed it is <c>iptables-legacy</c> (libiptc drives the classic tables over an
+    /// <c>AF_INET/SOCK_RAW</c> socket). Debian bookworm — this image's base — ships
+    /// <c>iptables-nft</c> as the <c>iptables</c> alternative, which speaks netlink to nftables and is
+    /// gated on <c>NET_ADMIN</c> alone. Nothing else in the image opens a raw socket (tinyproxy and
+    /// dnsmasq are pure UDP/TCP; dnsmasq's raw-socket paths are DHCP-only and DHCP is off).
+    /// <c>NET_BIND_SERVICE</c> is ADDED, not spurious: under <c>CapDrop ALL</c> even root cannot bind
+    /// below 1024, so dnsmasq could not have taken port 53 — latent until MG-7 made anything actually
+    /// query it.</para>
+    ///
+    /// <para><b>Read-only rootfs.</b> Every writable surface the two daemons need is a tmpfs: the
+    /// daemon-rendered policy and the generated tinyproxy config live under <c>/run/mainguard</c>
+    /// (which is why the image's <c>CONF_DIR</c> moved off <c>/etc</c>), pid files under <c>/run</c>,
+    /// scratch under <c>/tmp</c>. The image's own scripts stay on the read-only layer where an agent
+    /// that somehow reached this container cannot rewrite the policy that contains it.</para>
+    /// </summary>
+    internal static HostConfig ProxyHostConfig() => new()
+    {
+        NetworkMode = AgentNetworkName,
+
+        // NET_ADMIN: the iptables backstop. NET_BIND_SERVICE: dnsmasq's port 53. Nothing else.
+        CapDrop = new List<string> { "ALL" },
+        CapAdd = new List<string> { "NET_ADMIN", "NET_BIND_SERVICE" },
+
+        // The same default-deny seccomp profile the jails run (a custom seccomp= REPLACES Docker's
+        // default, so this is the moby default plus the ptrace/process_vm_* denials — not a loosening).
+        SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
+
+        ReadonlyRootfs = true,
+        Tmpfs = new Dictionary<string, string>
+        {
+            // /var/run is a symlink to /run on debian, so this covers both daemons' pid files as well
+            // as /run/mainguard, where the daemon writes the rendered policy.
+            ["/run"] = "size=16m,mode=0755",
+            ["/tmp"] = "size=16m,mode=1777",
+        },
+
+        Memory = ProxyMemoryBytes,
+        PidsLimit = ProxyPidsLimit,
+        NanoCPUs = ProxyNanoCpus,
+        Ulimits = new List<Ulimit>
+        {
+            new() { Name = "nofile", Soft = ProxyNoFile, Hard = ProxyNoFile },
+        },
+
+        Privileged = false,
+    };
+
+    /// <summary>
+    /// The proxy's IPv4 on the internal agent network — the address every jail pins as its resolver
+    /// (MG-7) and the only destination the backstop admits (MG-18). Null when the proxy is absent or
+    /// not yet attached; callers decide whether that is fatal (spawning is).
+    /// </summary>
+    public async Task<string?> ResolveProxyAddressAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(ProxyContainerName, ct).ConfigureAwait(false);
+            return ProxyAddressOf(inspect);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>Pure extraction of the proxy's agent-network IPv4 from an inspect response.</summary>
+    internal static string? ProxyAddressOf(ContainerInspectResponse? inspect)
+    {
+        var networks = inspect?.NetworkSettings?.Networks;
+        if (networks is null || !networks.TryGetValue(AgentNetworkName, out var endpoint))
+            return null;
+        return string.IsNullOrWhiteSpace(endpoint?.IPAddress) ? null : endpoint.IPAddress;
     }
 
     private async Task<string> EnsureNetworkAsync(string name, bool isInternal, CancellationToken ct)
@@ -202,16 +292,58 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
                 Filters = new Dictionary<string, IDictionary<string, bool>> { ["name"] = new Dictionary<string, bool> { [name] = true } },
             }, ct).ConfigureAwait(false);
         var match = existing.FirstOrDefault(n => n.Name == name);
-        if (match is not null) return match.ID;
+        if (match is not null)
+        {
+            // MG-18: reuse by NAME only was the whole hole. `mainguard-agents` being Internal is the
+            // control that keeps agents off the outside world — not the proxy, not the env vars — and
+            // a network by that name that is NOT internal silently gives every jail unrestricted
+            // egress with no error anywhere. Verify the property on every reuse.
+            AssertNetworkMatchesPolicy(match, name, isInternal);
+            return match.ID;
+        }
 
         var created = await _docker.Networks.CreateNetworkAsync(new NetworksCreateParameters
         {
             Name = name,
             Driver = "bridge",
             Internal = isInternal,
-            Labels = new Dictionary<string, string> { ["mainguard.role"] = isInternal ? "agent-net" : "egress-net" },
+            Labels = new Dictionary<string, string> { [NetworkRoleLabel] = RoleFor(isInternal) },
         }, ct).ConfigureAwait(false);
         return created.ID;
+    }
+
+    /// <summary>The <see cref="NetworkRoleLabel"/> value a mainguard network of this kind carries — the
+    /// stamp that says mainguard created it, and half of what the MG-18 reuse gate checks.</summary>
+    public static string RoleFor(bool isInternal) => isInternal ? "agent-net" : "egress-net";
+
+    /// <summary>
+    /// MG-18 — asserts a pre-existing network we are about to reuse still encodes the egress posture we
+    /// created it with. Pure (no Docker client) so the drift cases are unit-assertable.
+    ///
+    /// <para>Fails <b>closed</b>: it throws rather than deleting and recreating. A drifted network can
+    /// have live containers attached, and removing it out from under them is a destructive act taken on
+    /// the basis of an ambiguous signal; refusing to spawn is the conservative answer, and the message
+    /// names the exact remediation. The label is checked alongside <c>Internal</c> because a foreign
+    /// network that merely happens to share the name is the same class of surprise — we only ever want
+    /// to reuse a network mainguard itself stamped.</para>
+    /// </summary>
+    internal static void AssertNetworkMatchesPolicy(NetworkResponse match, string name, bool isInternal)
+    {
+        ArgumentNullException.ThrowIfNull(match);
+
+        if (match.Internal != isInternal)
+            throw new EgressNetworkDriftException(name,
+                $"expected Internal={isInternal} but the existing network reports Internal={match.Internal}. "
+                + (isInternal
+                    ? "A non-internal 'agent' network gives every jail unrestricted egress — the default-deny posture is off."
+                    : "An internal 'egress' network cuts the proxy off from every upstream — nothing can leave."));
+
+        var actualRole = match.Labels is not null && match.Labels.TryGetValue(NetworkRoleLabel, out var found) ? found : null;
+        var expectedRole = RoleFor(isInternal);
+        if (!string.Equals(actualRole, expectedRole, StringComparison.Ordinal))
+            throw new EgressNetworkDriftException(name,
+                $"expected the label {NetworkRoleLabel}={expectedRole} but found {(actualRole is null ? "no such label" : $"'{actualRole}'")}. "
+                + "Mainguard only reuses networks it stamped; an unstamped network of the same name was created by something else.");
     }
 
     /// <summary>
@@ -302,6 +434,14 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         return list.FirstOrDefault(c => c.Names.Any(n => n == "/" + name));
     }
 
+    /// <summary>The tmpfs directory the daemon renders policy into. It moved off <c>/etc/mainguard</c>
+    /// when the proxy gained a read-only rootfs (MG-25): the image's scripts stay on the immutable
+    /// layer, only the rendered policy is writable.</summary>
+    private const string ConfDir = "/run/mainguard";
+
+    /// <summary>The reload entrypoint, still on the read-only image layer.</summary>
+    private const string ReloadScript = "/etc/mainguard/reload.sh";
+
     /// <summary>Renders the allowlist to the proxy's config files + backstop script and applies them live.</summary>
     private async Task PushConfigAsync(string proxyId, CancellationToken ct)
     {
@@ -312,18 +452,23 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             ? Allowlist
             : Allowlist.CombinedWith(_installedAdapterHosts(), EgressEntryKind.AgentService, "Agent CLI");
 
-        await WriteFileAsync(proxyId, "/etc/mainguard/tinyproxy-filter", EgressProxyConfig.RenderTinyproxyFilter(effective), ct).ConfigureAwait(false);
+        // MG-7/MG-18: both the pinned-DNS self-record and the backstop's destination constraint need
+        // the proxy's own address on the agent network. Resolved here, after the container is up and
+        // attached, because Docker assigns it at attach time.
+        var proxyAddress = await ResolveProxyAddressAsync(ct).ConfigureAwait(false);
+
+        await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-filter", EgressProxyConfig.RenderTinyproxyFilter(effective), ct).ConfigureAwait(false);
         // P2-08: front the model-API hosts through the AI gateway (token bucket + budgets + no-raw-429).
         if (_gatewayUpstream is not null)
         {
-            await WriteFileAsync(proxyId, "/etc/mainguard/tinyproxy-upstreams",
+            await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-upstreams",
                 EgressProxyConfig.RenderTinyproxyUpstreams(effective, _gatewayUpstream), ct).ConfigureAwait(false);
         }
 
-        await WriteFileAsync(proxyId, "/etc/mainguard/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective), ct).ConfigureAwait(false);
-        await WriteFileAsync(proxyId, "/etc/mainguard/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort), ct).ConfigureAwait(false);
+        await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress), ct).ConfigureAwait(false);
+        await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddress), ct).ConfigureAwait(false);
         // The image's entrypoint reloads tinyproxy/dnsmasq and (re)applies the backstop from these paths.
-        await ExecAsync(proxyId, new[] { "sh", "/etc/mainguard/reload.sh" }, ct).ConfigureAwait(false);
+        await ExecAsync(proxyId, new[] { "sh", ReloadScript }, ct).ConfigureAwait(false);
     }
 
     private async Task WriteFileAsync(string containerId, string path, string content, CancellationToken ct)
@@ -363,6 +508,26 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
         await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
     }
+}
+
+/// <summary>
+/// MG-18 — a docker network with a mainguard name exists but no longer encodes the egress posture we
+/// created it with (most importantly: <c>mainguard-agents</c> is not <c>Internal</c>). Raised INSTEAD of
+/// reusing it, because reuse-by-name silently disables default-deny egress for every jail on it and
+/// produces no error anywhere: the proxy still starts, the allowlist still renders, and the agents are
+/// simply on the open internet. Fails closed and names the remediation.
+/// </summary>
+public sealed class EgressNetworkDriftException : Exception
+{
+    public EgressNetworkDriftException(string networkName, string detail)
+        : base($"Refusing to reuse the docker network '{networkName}': {detail} "
+             + $"Remove it and let mainguard recreate it (docker network rm {networkName}) — "
+             + "note that any container still attached must be stopped first.")
+    {
+        NetworkName = networkName;
+    }
+
+    public string NetworkName { get; }
 }
 
 /// <summary>

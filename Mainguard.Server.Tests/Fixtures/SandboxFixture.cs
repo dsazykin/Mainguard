@@ -116,13 +116,7 @@ public sealed class SandboxFixture : IAsyncDisposable
         // behind let one test/feature's Docker state bleed into the next — the root of the "works alone,
         // fails when other Docker tests run in the same job" flakiness. Serial execution (assembly
         // DisableTestParallelization) means the next test recreates them cleanly via EnsureEgressReadyAsync.
-        try { await Docker.Containers.RemoveContainerAsync(EgressProxyConfigurator.ProxyContainerName, new ContainerRemoveParameters { Force = true }); }
-        catch { /* best effort */ }
-        foreach (var network in new[] { EgressProxyConfigurator.AgentNetworkName, EgressProxyConfigurator.EgressNetworkName })
-        {
-            try { await RemoveNetworkByNameAsync(network); }
-            catch { /* best effort */ }
-        }
+        await ForceRemoveProxyAndNetworksAsync();
 
         foreach (var dir in _tempWorktrees)
         {
@@ -131,6 +125,22 @@ public sealed class SandboxFixture : IAsyncDisposable
         }
 
         Docker.Dispose();
+    }
+
+    /// <summary>
+    /// Removes the SHARED egress proxy + both mainguard networks, best-effort. Used by teardown and by
+    /// the MG-18 drift test, which has to plant a deliberately-wrong network under the agent network's
+    /// name and therefore needs whatever a previous test left attached to be gone first.
+    /// </summary>
+    public async Task ForceRemoveProxyAndNetworksAsync()
+    {
+        try { await Docker.Containers.RemoveContainerAsync(EgressProxyConfigurator.ProxyContainerName, new ContainerRemoveParameters { Force = true }); }
+        catch { /* best effort */ }
+        foreach (var network in new[] { EgressProxyConfigurator.AgentNetworkName, EgressProxyConfigurator.EgressNetworkName })
+        {
+            try { await RemoveNetworkByNameAsync(network); }
+            catch { /* best effort */ }
+        }
     }
 
     private async Task RemoveNetworkByNameAsync(string name)
