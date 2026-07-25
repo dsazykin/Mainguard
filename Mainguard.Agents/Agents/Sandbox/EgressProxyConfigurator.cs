@@ -497,7 +497,53 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await ExecAsync(proxyId, new[] { "sh", ReloadScript }, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// The largest rendered artefact delivered as an exec argument. Linux caps ONE argv entry at
+    /// <c>MAX_ARG_STRLEN</c> = 32 pages = 128 KiB; this leaves generous headroom. Rendered policy is
+    /// ~1 KiB (ten allowlist entries), so the fallback below is effectively unreachable — it exists so
+    /// that an absurdly long allowlist degrades to the old transport instead of failing.
+    /// </summary>
+    private const int MaxArgvContentBytes = 64 * 1024;
+
+    /// <summary>
+    /// Writes one rendered POLICY artefact into the proxy container.
+    ///
+    /// <para>The content travels as an exec <b>argument</b>, not over the exec's stdin. Stdin here means
+    /// a hijacked HTTP stream, and it has two failure modes that both end in a silently WRONG policy
+    /// rather than an error: the reader (<c>cat</c>) only terminates on a socket half-close, which not
+    /// every Docker endpoint propagates, and the upstream bytes themselves are not delivered at all by
+    /// some socket proxies (Docker Desktop's WSL2 proxy delivers zero, verified). Either way the push
+    /// stalls until <see cref="ExecTimeout"/> and the file is left holding whatever arrived first — a
+    /// tinyproxy filter truncated to its header comment is a default-deny proxy that permits NOTHING,
+    /// and a half-written backstop is worse. An argument is delivered by the same mechanism as the
+    /// command itself, so there is no partial-write state to land in.</para>
+    ///
+    /// <para>This is for policy ONLY and must never carry a secret: an exec argument is visible in the
+    /// target container's process table for the life of the call. That is fine here — the allowlist is
+    /// user-visible policy, and this container is the proxy, which no agent can reach. Agent
+    /// credentials go through a different path for exactly this reason (<c>DockerSandboxEngine</c>
+    /// writes them over stdin, never argv/env — G-13).</para>
+    ///
+    /// <para><c>printf '%s'</c> with the content as a positional parameter, so the bytes are never
+    /// interpolated into the script text: no quoting, no expansion, and a <c>%</c> in the content is
+    /// data rather than a format directive. The result is byte-exact.</para>
+    /// </summary>
     private async Task WriteFileAsync(string containerId, string path, string content, CancellationToken ct)
+    {
+        if (Encoding.UTF8.GetByteCount(content) <= MaxArgvContentBytes)
+        {
+            await ExecAsync(
+                containerId,
+                new[] { "sh", "-c", "mkdir -p \"$(dirname \"$1\")\"; printf '%s' \"$2\" > \"$1\"", "sh", path, content },
+                ct).ConfigureAwait(false);
+            return;
+        }
+
+        await WriteFileOverStdinAsync(containerId, path, content, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>The pre-existing stdin transport, kept only for content too large for an argv entry.</summary>
+    private async Task WriteFileOverStdinAsync(string containerId, string path, string content, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(ExecTimeout);
@@ -505,15 +551,8 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
 
         var bytes = Encoding.UTF8.GetBytes(content);
 
-        // `head -c <n>` rather than `cat`, because `cat` reads until EOF and the ONLY way to signal EOF
-        // on a hijacked exec stream is a socket half-close (CloseWrite below). Not every Docker endpoint
-        // propagates that half-close — Docker Desktop's WSL2 socket proxy notably does not — and when it
-        // is lost the reader blocks forever: the exec stalls until ExecTimeout and the policy file is
-        // left holding whatever bytes arrived first. That is not a hypothetical: it renders a
-        // TRUNCATED tinyproxy filter (header only, no allowlist entries), i.e. a default-deny proxy that
-        // silently permits nothing, or a half-written backstop. Reading an exact byte count is
-        // self-terminating, so the write no longer depends on transport-level half-close semantics at
-        // all. CloseWrite is still sent as a courtesy for the reader that wants it.
+        // `head -c <n>` rather than `cat`: reading an exact byte count is self-terminating, so at least
+        // this path does not additionally depend on the half-close arriving.
         var length = bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
         var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters

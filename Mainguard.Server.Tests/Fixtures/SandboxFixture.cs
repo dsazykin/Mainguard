@@ -151,10 +151,28 @@ public sealed class SandboxFixture : IAsyncDisposable
         }).ConfigureAwait(false);
         foreach (var net in matches)
         {
-            if (net.Name == name)
+            if (net.Name != name)
             {
-                await Docker.Networks.DeleteNetworkAsync(net.ID).ConfigureAwait(false);
+                continue;
             }
+
+            // Docker refuses to delete a network that still has endpoints, so a jail a previous test
+            // left behind silently pins the network in place — and the next test then reuses the OLD
+            // network instead of the one it meant to create. That is invisible until a test depends on
+            // the network's properties (the MG-18 drift test does), at which point it fails for a
+            // reason that has nothing to do with what it is testing. Evict the endpoints first.
+            var inspect = await Docker.Networks.InspectNetworkAsync(net.ID).ConfigureAwait(false);
+            foreach (var endpoint in inspect.Containers ?? new Dictionary<string, EndpointResource>())
+            {
+                try
+                {
+                    await Docker.Networks.DisconnectNetworkAsync(net.ID,
+                        new NetworkDisconnectParameters { Container = endpoint.Key, Force = true }).ConfigureAwait(false);
+                }
+                catch { /* best effort — the delete below reports the real problem */ }
+            }
+
+            await Docker.Networks.DeleteNetworkAsync(net.ID).ConfigureAwait(false);
         }
     }
 }
