@@ -1,0 +1,32 @@
+<Project>
+
+  <!--
+    MG-35 : reproducible .NET restores (supply-chain pinning).
+
+    Every PackageReference in this repo already carries an exact version, but an exact DIRECT
+    version says nothing about the TRANSITIVE graph: NuGet resolves those at restore time, so a
+    republished package, a newly published patch of a dependency, or a different feed ordering can
+    silently hand CI a different closure than the one that was reviewed and tested. That is the
+    same unpinned-dependency hazard the adapter manifest refuses, and the MainguardOS rootfs build
+    already closes on the Linux side (pinned base digest + packages.pinned.txt + deterministic
+    repack, sha256-stamped and double-built in CI). This file closes the .NET half.
+
+    RestorePackagesWithLockFile makes `dotnet restore` write a packages.lock.json next to each
+    project, recording the FULL resolved graph (direct + transitive) with content hashes. Those
+    files are COMMITTED. CI then restores in locked mode, which refuses to resolve anything the
+    lockfile does not already name, so a drifting dependency FAILS the build instead of silently
+    entering the product.
+
+    Workflow when you intentionally change a package version: bump the PackageReference, run a
+    plain `dotnet restore Mainguard.slnx` (no locked-mode flag) to regenerate the lockfiles, and
+    commit the packages.lock.json churn alongside the .csproj edit. A CI restore that fails with
+    NU1004 / NU1403 means the lockfile was not regenerated: that failure is the feature.
+
+    Locked mode is opt-in per invocation (the CI flag) rather than forced here, so a local restore
+    after a deliberate bump still refreshes the lockfiles.
+  -->
+  <PropertyGroup>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+
+</Project>
