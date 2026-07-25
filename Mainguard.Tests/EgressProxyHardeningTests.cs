@@ -43,9 +43,32 @@ public sealed class EgressProxyHardeningTests
         // NET_ADMIN alone. Nothing else in the image opens a raw socket.
         Assert.DoesNotContain("NET_RAW", host.CapAdd);
 
-        // NET_BIND_SERVICE is not a loosening — under CapDrop ALL even root cannot bind below 1024, so
-        // dnsmasq could never have taken port 53. Latent until MG-7 made anything actually query it.
+        // The additions are each load-bearing, and their absence is why dnsmasq had NEVER started in
+        // this container (verified against a real daemon). NET_BIND_SERVICE: under CapDrop ALL even
+        // root cannot bind below 1024, so port 53 was unreachable. SETGID/SETUID: dnsmasq
+        // unconditionally calls setgroups()/setgid()/setuid() to drop to its own unprivileged user and
+        // exits 5 without them (--user=root does not help — setgroups() needs CAP_SETGID even for the
+        // gid already held). KILL: once dnsmasq is no longer root, restarting it on a policy reload
+        // needs CAP_KILL, and without it the reload leaves the OLD policy serving.
+        // Net effect is LESS privilege, not more: dnsmasq ends up unprivileged instead of root.
         Assert.Contains("NET_BIND_SERVICE", host.CapAdd);
+        Assert.Contains("SETGID", host.CapAdd);
+        Assert.Contains("SETUID", host.CapAdd);
+        Assert.Contains("KILL", host.CapAdd);
+
+        // The set is still closed — no capability beyond the five that are individually justified.
+        Assert.Equal(5, host.CapAdd.Count);
+    }
+
+    [Fact]
+    public void ProxyHostConfig_RunsARealInit_SoOrphanedDaemonsAreReaped()
+    {
+        // Both daemons are backgrounded from a docker-exec shell that exits immediately, orphaning them
+        // onto pid 1 — which is the image's `sleep infinity` and never calls wait(). Without a reaper
+        // every policy reload leaks a zombie: they accumulate against PidsLimit, and a dead daemon
+        // keeps its name in /proc, so "is it still running?" answers yes forever (which is how a
+        // successful stop reads as a failed one, and a CRASHED dnsmasq reads as healthy).
+        Assert.True(EgressProxyConfigurator.ProxyHostConfig().Init);
     }
 
     [Fact]

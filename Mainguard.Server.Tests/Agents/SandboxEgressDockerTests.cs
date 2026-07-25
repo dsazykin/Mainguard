@@ -89,11 +89,20 @@ public class SandboxEgressDockerTests
             + $"resolver, so pinned DNS is not in the resolution path. getent said: '{answer}'");
     }
 
+    // The structural half of MG-7, read off the live container.
+    //
+    // NOTE ON WHAT IS *NOT* ASSERTED: not `/etc/resolv.conf` naming the proxy. On a user-defined
+    // network Docker ALWAYS writes `nameserver 127.0.0.11` into the container's resolv.conf and routes
+    // HostConfig.Dns in as that embedded resolver's UPSTREAM ("ExtServers: [<proxy ip>]"). So the
+    // textual assertion is unsatisfiable by construction no matter how correct the pin is — an earlier
+    // revision of this test asserted it and failed against real Docker for that reason alone. The
+    // control still holds: Docker's resolver answers container names from its own tables and forwards
+    // everything else to our dnsmasq, and the agent network is Internal so no other resolver is
+    // reachable. What is asserted here is therefore the pin itself (on the container's HostConfig)
+    // plus, in the two tests below, the behaviour that only a live pinned dnsmasq can produce.
     [RequiresDockerFact]
-    public async Task JailResolver_ShouldBeTheProxy_NotDockersEmbeddedResolver()
+    public async Task JailResolver_ShouldBePinnedAtTheProxy()
     {
-        // The structural half of MG-7, read off the live container: /etc/resolv.conf must name the
-        // proxy's dnsmasq and must NOT name Docker's embedded 127.0.0.11.
         await using var fx = new SandboxFixture();
         await fx.EnsureEgressReadyAsync();
         var handle = await fx.SpawnAsync();
@@ -101,9 +110,16 @@ public class SandboxEgressDockerTests
         var proxyAddress = await fx.Egress.ResolveProxyAddressAsync();
         Assert.False(string.IsNullOrEmpty(proxyAddress), "the egress proxy has no address on the agent network");
 
-        var resolv = await fx.ExecAsync(handle.ContainerId, "cat", "/etc/resolv.conf");
-        Assert.Contains("nameserver " + proxyAddress, resolv.Stdout, StringComparison.Ordinal);
-        Assert.DoesNotContain("127.0.0.11", resolv.Stdout, StringComparison.Ordinal);
+        var inspect = await fx.InspectAsync(handle.ContainerId);
+        var pinned = Assert.Single(inspect.HostConfig.DNS);
+        Assert.Equal(proxyAddress, pinned);
+
+        // And the pin is load-bearing rather than decorative: dnsmasq is actually up behind it. A dead
+        // dnsmasq (the state this container shipped in before MG-25 granted it the capabilities it
+        // needs to start) would leave the pin pointing at nothing.
+        var status = await fx.Engine.ExecAsync(
+            EgressProxyConfigurator.ProxyContainerName, new[] { "cat", "/run/mainguard/dnsmasq.status" });
+        Assert.Equal("ok", status.Stdout.Trim());
     }
 
     [RequiresDockerFact]
@@ -194,9 +210,45 @@ public class SandboxEgressDockerTests
         // The read-only rootfs must not have broken the proxy: both daemons are up and the policy the
         // daemon rendered is on the /run tmpfs where reload.sh reads it.
         Assert.True(inspect.State.Running);
+
         var filter = await fx.Engine.ExecAsync(inspect.ID, new[] { "cat", "/run/mainguard/tinyproxy-filter" });
         Assert.Equal(0, filter.ExitCode);
-        Assert.Contains("api.anthropic.com", filter.Stdout, StringComparison.Ordinal);
+
+        // Compare against the RENDERER, not against a hand-written hostname. The filter is a list of
+        // anchored regexes, so the literal "api.anthropic.com" never appears in it — the file says
+        // `^api\.anthropic\.com$`. An earlier revision of this test asserted the bare hostname and
+        // failed against real Docker for that reason alone, while the file was perfectly correct.
+        var expected = EgressProxyConfig.RenderTinyproxyFilter(fx.Egress.Allowlist);
+        Assert.Equal(expected.Trim(), filter.Stdout.Trim());
+
+        // Both daemons came up under the read-only rootfs and the reduced capability set.
+        var dns = await fx.Engine.ExecAsync(inspect.ID, new[] { "cat", "/run/mainguard/dnsmasq.status" });
+        Assert.Equal("ok", dns.Stdout.Trim());
+        var tp = await fx.Engine.ExecAsync(inspect.ID, new[] { "cat", "/run/mainguard/tinyproxy.status" });
+        Assert.Equal("ok", tp.Stdout.Trim());
+    }
+
+    // A reload must actually REPLACE the running daemons. `pkill` was absent from the image (procps was
+    // never installed) and, once dnsmasq drops privileges, killing it also needs CAP_KILL — so every
+    // reload after the first silently left the ORIGINAL processes serving the ORIGINAL policy. An
+    // allowlist edit, including REMOVING a host, therefore never reached a running proxy.
+    [RequiresDockerFact]
+    public async Task RepeatedConfigPush_ShouldRestartTheDaemons_NotLeaveStalePolicyRunning()
+    {
+        await using var fx = new SandboxFixture();
+        await fx.EnsureEgressReadyAsync();
+
+        // A second and third push exercise exactly the path that used to go stale.
+        await fx.EnsureEgressReadyAsync();
+        await fx.EnsureEgressReadyAsync();
+
+        var proxy = EgressProxyConfigurator.ProxyContainerName;
+        var dns = await fx.Engine.ExecAsync(proxy, new[] { "cat", "/run/mainguard/dnsmasq.status" });
+        var tp = await fx.Engine.ExecAsync(proxy, new[] { "cat", "/run/mainguard/tinyproxy.status" });
+
+        // "stale" is the verdict reload.sh writes when it could not stop the predecessor.
+        Assert.Equal("ok", dns.Stdout.Trim());
+        Assert.Equal("ok", tp.Stdout.Trim());
     }
 
     [RequiresDockerFact]

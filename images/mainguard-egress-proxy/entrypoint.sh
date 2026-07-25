@@ -7,9 +7,13 @@ set -eu
 
 CONF_DIR=/run/mainguard
 
-# Wait for the daemon's first config push (EgressProxyConfigurator.PushConfigAsync).
+# Wait for the daemon's first config push (EgressProxyConfigurator.PushConfigAsync) to COMPLETE.
+# backstop.sh is the LAST artefact the daemon writes, so waiting on it (rather than on the first file,
+# tinyproxy-filter) is what makes this a wait for a whole config instead of a race against a partial
+# one: `> file` creates the path the instant the write begins, so the old condition fired while the
+# allowlist was still arriving and started tinyproxy against an empty — i.e. deny-everything — filter.
 i=0
-while [ ! -f "$CONF_DIR/tinyproxy-filter" ] && [ "$i" -lt 60 ]; do
+while [ ! -f "$CONF_DIR/backstop.sh" ] && [ "$i" -lt 60 ]; do
     sleep 1
     i=$((i + 1))
 done

@@ -37,7 +37,7 @@ public static class SandboxImageVersions
 
     /// <summary>Source hash of <c>images/mainguard-egress-proxy/</c> (curated inputs: Dockerfile,
     /// entrypoint.sh, reload.sh).</summary>
-    public const string EgressProxy = "8ea0398a015e562154c87c770c37660597a87e81a89c6ca37fe5c3f51e19ef56";
+    public const string EgressProxy = "9494707ff497db5d4e26f21d477ce3317b4c600471af85bae839aa9beed825d7";
 
     private static readonly IReadOnlyDictionary<string, string> ByName =
         new Dictionary<string, string>(StringComparer.Ordinal)

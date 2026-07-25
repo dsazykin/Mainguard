@@ -14,9 +14,14 @@
 
 FROM debian:bookworm-slim
 
+# procps is NOT optional: reload.sh has always ended each daemon with `pkill` before restarting it, and
+# `pkill` lives in procps, which was never installed. Every one of those calls was a silent no-op
+# (`|| true` swallowed the "not found"), so on the SECOND and later reloads the fresh dnsmasq/tinyproxy
+# could not bind their already-taken ports and died, leaving the ORIGINAL processes serving the ORIGINAL
+# policy. In other words an allowlist edit — including removing a host — never reached a running proxy.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        tinyproxy dnsmasq iptables ca-certificates \
+        tinyproxy dnsmasq iptables ca-certificates procps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /etc/mainguard
@@ -29,4 +34,7 @@ RUN chmod +x /etc/mainguard/reload.sh /entrypoint.sh
 #                      drives nftables over netlink, so NET_RAW (needed only by iptables-legacy's
 #                      AF_INET/SOCK_RAW libiptc socket) is NOT required and is no longer granted.
 #   NET_BIND_SERVICE — dnsmasq's port 53. Under CapDrop ALL even root cannot bind below 1024.
+#   SETGID/SETUID    — dnsmasq's own privilege drop: it calls setgroups()/setgid()/setuid() at startup
+#                      unconditionally and exits 5 without them. Granting these is what lets dnsmasq
+#                      run UNPRIVILEGED; without them it did not run at all.
 ENTRYPOINT ["/entrypoint.sh"]

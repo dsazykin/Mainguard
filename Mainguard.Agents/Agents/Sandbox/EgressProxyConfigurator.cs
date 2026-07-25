@@ -208,16 +208,32 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// resource ceilings. It now carries the same class of controls as the jails it fronts, minus the
     /// one capability it genuinely needs.</para>
     ///
-    /// <para><b>Capabilities.</b> <c>NET_ADMIN</c> stays — the iptables backstop cannot be installed
-    /// without it. <c>NET_RAW</c> is dropped: it exists for raw/packet sockets, and the only consumer
-    /// that would have needed it is <c>iptables-legacy</c> (libiptc drives the classic tables over an
-    /// <c>AF_INET/SOCK_RAW</c> socket). Debian bookworm — this image's base — ships
+    /// <para><b>Capabilities.</b> The list got LONGER while the privilege got SMALLER; the old
+    /// two-item set was not lean, it was broken. <c>NET_ADMIN</c> stays — the iptables backstop cannot
+    /// be installed without it. <c>NET_RAW</c> is dropped: it exists for raw/packet sockets, and the
+    /// only consumer that would have needed it is <c>iptables-legacy</c> (libiptc drives the classic
+    /// tables over an <c>AF_INET/SOCK_RAW</c> socket). Debian bookworm — this image's base — ships
     /// <c>iptables-nft</c> as the <c>iptables</c> alternative, which speaks netlink to nftables and is
-    /// gated on <c>NET_ADMIN</c> alone. Nothing else in the image opens a raw socket (tinyproxy and
-    /// dnsmasq are pure UDP/TCP; dnsmasq's raw-socket paths are DHCP-only and DHCP is off).
-    /// <c>NET_BIND_SERVICE</c> is ADDED, not spurious: under <c>CapDrop ALL</c> even root cannot bind
-    /// below 1024, so dnsmasq could not have taken port 53 — latent until MG-7 made anything actually
-    /// query it.</para>
+    /// gated on <c>NET_ADMIN</c> alone. Nothing else in the image opens a raw socket.</para>
+    ///
+    /// <para>The three additions are each something dnsmasq cannot start without, and their absence is
+    /// why <b>dnsmasq had never once run in this container</b> — verified against a real daemon, not
+    /// reasoned about. <c>NET_BIND_SERVICE</c>: under <c>CapDrop ALL</c> even root cannot bind below
+    /// 1024, so port 53 was unreachable. <c>SETGID</c>/<c>SETUID</c>: dnsmasq unconditionally calls
+    /// <c>setgroups()</c>/<c>setgid()</c>/<c>setuid()</c> at startup to drop to its own unprivileged
+    /// user, and without those capabilities the call fails and dnsmasq exits 5 (<c>failed to change
+    /// group-id to dip: Operation not permitted</c>). <c>--user=root</c> does not avoid this —
+    /// <c>setgroups()</c> needs <c>CAP_SETGID</c> even when the target gid is the one already held, and
+    /// it was tried and observed to fail identically. Granting them is therefore the LOWER-privilege
+    /// outcome: dnsmasq ends up running as an unprivileged uid rather than as root. The whole thing
+    /// stayed invisible because the old exfil probe queried a name that NXDOMAINs everywhere, so a dead
+    /// dnsmasq passed it exactly as well as a live one.</para>
+    ///
+    /// <para><c>KILL</c> is the consequence of that privilege drop: signalling a process owned by a
+    /// DIFFERENT uid needs <c>CAP_KILL</c>, so without it the reload's <c>pkill</c> fails with
+    /// <c>Operation not permitted</c> and the old daemon keeps serving the OLD policy — an allowlist
+    /// edit, including REMOVING a host, would never reach a running proxy. Its scope is signalling
+    /// inside this container's pid namespace, which holds two daemons and nothing else.</para>
     ///
     /// <para><b>Read-only rootfs.</b> Every writable surface the two daemons need is a tmpfs: the
     /// daemon-rendered policy and the generated tinyproxy config live under <c>/run/mainguard</c>
@@ -229,13 +245,23 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     {
         NetworkMode = AgentNetworkName,
 
-        // NET_ADMIN: the iptables backstop. NET_BIND_SERVICE: dnsmasq's port 53. Nothing else.
+        // NET_ADMIN: the iptables backstop. NET_BIND_SERVICE: dnsmasq's port 53. SETGID/SETUID:
+        // dnsmasq's own privilege drop. KILL: restarting those daemons on a policy reload, once they
+        // are no longer running as root. Nothing else. (See the summary for why each is load-bearing —
+        // this set is smaller in privilege than the old one despite being longer.)
         CapDrop = new List<string> { "ALL" },
-        CapAdd = new List<string> { "NET_ADMIN", "NET_BIND_SERVICE" },
+        CapAdd = new List<string> { "NET_ADMIN", "NET_BIND_SERVICE", "SETGID", "SETUID", "KILL" },
 
         // The same default-deny seccomp profile the jails run (a custom seccomp= REPLACES Docker's
         // default, so this is the moby default plus the ptrace/process_vm_* denials — not a loosening).
         SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
+
+        // A real init as pid 1 (Docker injects tini). The image's entrypoint ends in `sleep infinity`,
+        // which never calls wait() — and both daemons are started in the background from a docker-exec
+        // shell that immediately exits, so they are orphaned onto pid 1. Without a reaper every policy
+        // reload leaves a zombie behind: they accumulate against PidsLimit, and a dead daemon keeps its
+        // name in /proc, which makes "is it still running?" answer yes forever.
+        Init = true,
 
         ReadonlyRootfs = true,
         Tmpfs = new Dictionary<string, string>
@@ -477,16 +503,28 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         timeout.CancelAfter(ExecTimeout);
         var bounded = timeout.Token;
 
+        var bytes = Encoding.UTF8.GetBytes(content);
+
+        // `head -c <n>` rather than `cat`, because `cat` reads until EOF and the ONLY way to signal EOF
+        // on a hijacked exec stream is a socket half-close (CloseWrite below). Not every Docker endpoint
+        // propagates that half-close — Docker Desktop's WSL2 socket proxy notably does not — and when it
+        // is lost the reader blocks forever: the exec stalls until ExecTimeout and the policy file is
+        // left holding whatever bytes arrived first. That is not a hypothetical: it renders a
+        // TRUNCATED tinyproxy filter (header only, no allowlist entries), i.e. a default-deny proxy that
+        // silently permits nothing, or a half-written backstop. Reading an exact byte count is
+        // self-terminating, so the write no longer depends on transport-level half-close semantics at
+        // all. CloseWrite is still sent as a courtesy for the reader that wants it.
+        var length = bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
         var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
         {
             User = "0",
             AttachStdin = true,
             AttachStdout = true,
             AttachStderr = true,
-            Cmd = new List<string> { "sh", "-c", "mkdir -p \"$(dirname \"$1\")\"; cat > \"$1\"", "sh", path },
+            Cmd = new List<string> { "sh", "-c", "mkdir -p \"$(dirname \"$1\")\"; head -c \"$2\" > \"$1\"", "sh", path, length },
         }, bounded).ConfigureAwait(false);
         using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
-        var bytes = Encoding.UTF8.GetBytes(content);
         await stream.WriteAsync(bytes, 0, bytes.Length, bounded).ConfigureAwait(false);
         stream.CloseWrite();
         await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
