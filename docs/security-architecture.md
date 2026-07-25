@@ -38,6 +38,17 @@ is closed structurally by (3)+(4) alone; (1) closes the file path; (2) is defens
 container-spec builder asserts (1),(3),(4) on **every** create request; dropping any is a typed builder
 error.
 
+**Control (2) is machine-wide, by necessity (MG-33).** WSL2 runs every distro on ONE shared kernel and
+`kernel.yama.ptrace_scope` is not namespaced, so the value `FirstBootStep` writes at first boot applies
+to the user's *other* WSL2 distros too for as long as the WSL VM is up. It is strictly a hardening (it
+restricts ptrace to admin-capable processes), never a weakening, but it is a real side effect outside
+Mainguard's distro: a debugger/profiler attaching to an already-running pid in another distro may start
+needing `sudo`. It is bounded and reversible — the live value resets on the next full `wsl --shutdown`,
+and the persisted `/etc/sysctl.d/99-mainguard-sandbox.conf` drop-in lives *inside* `MainguardEnv`, so it
+goes away with the distro at uninstall. Per-distro scoping is impossible (non-namespaced sysctl) and
+Docker rejects it as a per-container `--sysctl`, which is why it is boot-provisioned VM-wide and
+disclosed in the OOBE progress log rather than narrowed.
+
 The shipped seccomp profile is the **canonical moby/containerd default-deny profile**
 (`defaultAction: SCMP_ACT_ERRNO`, the standard `archMap` and ~300-syscall allowlist) with the three
 memory-inspection syscalls removed from every allow rule and explicitly denied — so the agent keeps the
