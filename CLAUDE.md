@@ -39,7 +39,9 @@ dotnet test --filter "FullyQualifiedName~CommitGraphRouterTests"
 dotnet test --filter "FullyQualifiedName~GitServicesTests&Name=<MethodName>"
 ```
 
-The SDK is pinned to `10.0.100` (`global.json`, `latestFeature` roll-forward) so `dotnet` picks the right toolchain automatically.
+The SDK is pinned to `10.0.301` (`global.json`, `latestPatch` roll-forward) so `dotnet` picks the right toolchain automatically — later patches of the same `10.0.3xx` feature band are accepted, a different feature band is not.
+
+NuGet **lockfiles are on** (`Directory.Build.props` sets `RestorePackagesWithLockFile`), and every project's `packages.lock.json` is committed. CI restores with `--locked-mode`, so an unrecorded transitive fails the build. After you intentionally change a `PackageReference` version, run a plain `dotnet restore Mainguard.slnx` and commit the regenerated lockfiles with the `.csproj` edit.
 
 Docker wrappers reproduce the exact toolchain for **build/test/EF only** (not the GUI): `docker compose run --rm build|test|shell`.
 
