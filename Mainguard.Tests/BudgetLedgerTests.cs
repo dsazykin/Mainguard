@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -134,5 +135,172 @@ public class BudgetLedgerTests
 
         cts.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+    }
+
+    // ---- MG-24: the cap is enforced against spend in flight, not just spend already settled ----
+
+    /// <summary>A gateway with a bucket far too large to be the thing that limits anything — so the only
+    /// gate under test is the budget one.</summary>
+    private static AiGateway UnthrottledGateway(BudgetCaps caps, out BudgetLedger ledger)
+    {
+        var at = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        ledger = new BudgetLedger(new InMemorySpendStore(), FrozenClock(at), caps);
+        return new AiGateway(new TokenBucket(1_000_000, 1_000_000_000, FrozenClock(at)), ledger);
+    }
+
+    /// <summary>
+    /// MG-24 (the race itself). N genuinely parallel acquires for one agent at the cap boundary. The old
+    /// gate read <c>IsExhausted</c> and only debited in <c>Settle</c> — after the upstream round-trip —
+    /// so every one of the N read "under cap" and every one was admitted; the cap was enforced against
+    /// spend that had already been committed, never against spend in flight, and the only thing bounding
+    /// the overshoot was the shared 60 req/min bucket. With the estimate reserved at acquire time the
+    /// admitted count is exactly what fits: 1000-token cap / 100-token estimate = 10, and the other 40
+    /// are refused.
+    /// </summary>
+    [Fact]
+    public async Task AcquireAsync_ConcurrentRequestsAtTheCap_CannotOvershoot()
+    {
+        const int cap = 1000, estimate = 100, parallel = 50;
+        var gateway = UnthrottledGateway(new BudgetCaps(PerAgentTokenCap: cap, 0, 0, 0), out var ledger);
+
+        // All 50 threads pile into the gate at once — the window the old check-then-act code lost.
+        using var start = new ManualResetEventSlim(false);
+        var attempts = Enumerable.Range(0, parallel).Select(_ => Task.Run(async () =>
+        {
+            start.Wait();
+            try
+            {
+                return await gateway.AcquireAsync("agent-1", estimate, CancellationToken.None);
+            }
+            catch (BudgetExhaustedException)
+            {
+                return null;
+            }
+        })).ToArray();
+
+        start.Set();
+        var leases = await Task.WhenAll(attempts);
+
+        var granted = leases.Where(l => l is not null).ToArray();
+        Assert.Equal(cap / estimate, granted.Length);                   // exactly what fits — no overshoot
+        Assert.Equal(cap, ledger.GetReserved("agent-1").Tokens);        // all of it held as provisional debit
+        Assert.Equal(granted.Length, ledger.OutstandingReservations);
+
+        // The reservations are estimates, not charges: settling them for less frees the difference and
+        // the agent can spend again. A reservation that stuck would be a permanent phantom debit.
+        foreach (var lease in granted)
+        {
+            gateway.Settle(lease!, actualTokens: 50, "claude-3-5-haiku");
+        }
+
+        Assert.Equal(0, ledger.OutstandingReservations);
+        Assert.Equal(granted.Length * 50, ledger.GetTotals("agent-1").Tokens);
+        Assert.False(ledger.IsExhausted("agent-1", out _));
+        Assert.NotNull(await gateway.AcquireAsync("agent-1", estimate, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// MG-24 (the failure mode the fix must not introduce). A reservation that survives a failed request
+    /// is worse than the overshoot it prevents: it charges an agent forever for spend that never
+    /// happened. Every non-settling exit — a cancelled bucket wait, an abandoned lease — hands it back,
+    /// and a hundred failed requests against a ten-request budget leave the agent untouched.
+    /// </summary>
+    [Fact]
+    public async Task AcquireAsync_ReleasesTheReservation_OnEveryFailedExitPath()
+    {
+        var at = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var ledger = new BudgetLedger(new InMemorySpendStore(), FrozenClock(at),
+            new BudgetCaps(PerAgentTokenCap: 1000, 0, 0, 0));
+
+        // A one-request bucket so the second acquire is forced to queue, then cancelled while waiting.
+        var gateway = new AiGateway(new TokenBucket(1, 1_000_000, FrozenClock(at)), ledger);
+
+        var first = await gateway.AcquireAsync("agent-1", 100, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        var queued = gateway.AcquireAsync("agent-1", 100, cts.Token);
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => queued);
+
+        // The cancelled acquire left nothing behind; only the granted lease still holds its estimate.
+        Assert.Equal(1, ledger.OutstandingReservations);
+        Assert.Equal(100, ledger.GetReserved("agent-1").Tokens);
+
+        gateway.Abandon(first);
+        Assert.Equal(0, ledger.OutstandingReservations);
+        Assert.Equal(0, ledger.GetReserved("agent-1").Tokens);
+        Assert.Empty(ledger.AllRows());                                  // abandoning records no spend
+
+        // 100 failed requests against a budget that fits 10 — with a leak, the agent is dead after 10.
+        var wide = new AiGateway(new TokenBucket(1_000_000, 1_000_000_000, FrozenClock(at)), ledger);
+        for (var i = 0; i < 100; i++)
+        {
+            wide.Abandon(await wide.AcquireAsync("agent-1", 100, CancellationToken.None));
+        }
+
+        Assert.Equal(0, ledger.OutstandingReservations);
+        Assert.False(ledger.IsExhausted("agent-1", out _));
+        Assert.NotNull(await wide.AcquireAsync("agent-1", 100, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// MG-24 (reconciliation). Settling swaps the provisional debit for the real, model-priced row in one
+    /// step: the agent is charged the ACTUAL usage, never the estimate, and the ledger's committed totals
+    /// stay exactly the sum of its rows (what the snapshot and the cost-per-merged-change join read).
+    /// </summary>
+    [Fact]
+    public async Task Settle_ReconcilesTheReservation_ToActualUsage()
+    {
+        var gateway = UnthrottledGateway(BudgetCaps.Unlimited, out var ledger);
+
+        var lease = await gateway.AcquireAsync("agent-1", estimatedTokens: 5000, CancellationToken.None);
+        Assert.Equal(5000, ledger.GetReserved("agent-1").Tokens);
+        Assert.Equal(0, ledger.GetTotals("agent-1").Tokens);              // nothing charged while in flight
+
+        var totals = gateway.Settle(lease, actualTokens: 12, "claude-3-5-haiku");
+
+        Assert.Equal(12, totals.Tokens);                                   // actuals, not the estimate
+        Assert.Equal(0, ledger.GetReserved("agent-1").Tokens);
+        Assert.Equal(ledger.AllRows().Sum(r => r.Tokens), ledger.GetTotals("agent-1").Tokens);
+    }
+
+    /// <summary>
+    /// MG-24 (honest pausing). Settled spend at the cap is durable — it pauses the worker and audits, as
+    /// P2-08 requires. A refusal caused only by requests still in flight is transient back-pressure: the
+    /// request is refused, but the worker is NOT paused for spend that has not happened and may never
+    /// settle, because nothing would clear that pause if the estimates came back smaller.
+    /// </summary>
+    [Fact]
+    public async Task InFlightRefusal_DoesNotPauseTheWorker_ButSettledExhaustionDoes()
+    {
+        var at = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var supervisor = new FakeAgentSupervisor();
+        var audit = new InMemoryAuditLog();
+        var ledger = new BudgetLedger(new InMemorySpendStore(), FrozenClock(at),
+            new BudgetCaps(PerAgentTokenCap: 1000, 0, 0, 0));
+        var gateway = new AiGateway(
+            new TokenBucket(1_000_000, 1_000_000_000, FrozenClock(at)), ledger, supervisor, audit, FrozenClock(at));
+
+        // Fill the cap with reservations only — no settled spend at all.
+        var held = new List<GatewayLease>();
+        for (var i = 0; i < 10; i++)
+        {
+            held.Add(await gateway.AcquireAsync("agent-1", 100, CancellationToken.None));
+        }
+
+        await Assert.ThrowsAsync<BudgetExhaustedException>(
+            () => gateway.AcquireAsync("agent-1", 100, CancellationToken.None));
+        Assert.Empty(supervisor.Paused);                                   // transient — no pause, no audit
+        Assert.Empty(audit.Read().Where(e => e.Type == "budget_exceeded").ToArray());
+
+        // Now let them settle at full estimate: the spend is real, so the next refusal IS a pause.
+        foreach (var lease in held)
+        {
+            gateway.Settle(lease, actualTokens: 100, "claude-3-5-haiku");
+        }
+
+        await Assert.ThrowsAsync<BudgetExhaustedException>(
+            () => gateway.AcquireAsync("agent-1", 100, CancellationToken.None));
+        Assert.Contains("agent-1", supervisor.Paused);
+        Assert.Single(audit.Read().Where(e => e.Type == "budget_exceeded").ToArray());
     }
 }
