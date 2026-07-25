@@ -193,10 +193,10 @@ public sealed class DaemonBackedOrchestrator :
     /// proxy — the "unblock" action behind the block-notification prompt. Throws the daemon's reason on
     /// failure (the caller surfaces it).</summary>
     public async Task AddAllowlistHostAsync(
-        string host, Mainguard.Agents.Agents.Sandbox.EgressEntryKind kind, string who, CancellationToken ct)
+        string host, Mainguard.Agents.Agents.Sandbox.EgressEntryKind kind, CancellationToken ct)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
-        await _client.AddAllowlistHostAsync(name: host, hostPattern: host, kind: kind.ToString(), who: who, cts.Token)
+        await _client.AddAllowlistHostAsync(name: host, hostPattern: host, kind: kind.ToString(), cts.Token)
             .ConfigureAwait(false);
     }
 

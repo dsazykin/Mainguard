@@ -4,6 +4,7 @@ using Grpc.Core;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Protos.V1;
+using Mainguard.Server.Auth;
 
 namespace Mainguard.Server.Services;
 
@@ -14,15 +15,23 @@ namespace Mainguard.Server.Services;
 /// change takes effect immediately. Transport only — the policy lives behind <see cref="IEgressPolicy"/>.
 /// This is what makes the block-notification prompt's "unblock" affordance (Fix 2) actually take effect,
 /// and it wires the App's egress editor to the daemon (replacing the in-memory stand-in).
+///
+/// <para><b>SA-1/F2 (binding):</b> the actor recorded on every <c>allowlist_changed</c> event is resolved
+/// <b>daemon-side</b> from the authenticated connection via <see cref="IApproverIdentityResolver"/> — the
+/// same resolver plan approval uses, and the requests carry no actor field (the proto reserves it). A
+/// client-supplied <c>who</c> is self-asserted: token-holding host malware could widen the default-deny
+/// egress and sign the change with any name it liked, which makes the change log unusable as evidence.</para>
 /// </summary>
 public sealed class EgressGrpcService : EgressService.EgressServiceBase
 {
     private readonly IEgressPolicy _egress;
+    private readonly IApproverIdentityResolver _identity;
 
-    public EgressGrpcService(IAgentEnvironment environment)
+    public EgressGrpcService(IAgentEnvironment environment, IApproverIdentityResolver identity)
     {
         ArgumentNullException.ThrowIfNull(environment);
         _egress = environment.Egress;
+        _identity = identity ?? throw new ArgumentNullException(nameof(identity));
     }
 
     public override Task<ListAllowlistResponse> ListAllowlist(ListAllowlistRequest request, ServerCallContext context)
@@ -53,7 +62,8 @@ public sealed class EgressGrpcService : EgressService.EgressServiceBase
 
         var kind = Enum.TryParse<EgressEntryKind>(request.Kind, ignoreCase: true, out var k) ? k : EgressEntryKind.Custom;
         var name = string.IsNullOrWhiteSpace(request.Name) ? host : request.Name.Trim();
-        var who = string.IsNullOrWhiteSpace(request.Who) ? "operator" : request.Who;
+        // The audit actor comes from the connection, never from the message (SA-1/F2).
+        var who = _identity.Resolve(context);
 
         var alreadyAllowed = _egress.Allowlist.Allows(host);
         var entry = new EgressAllowlistEntry(name, host, kind);
@@ -71,7 +81,7 @@ public sealed class EgressGrpcService : EgressService.EgressServiceBase
     {
         var host = request.HostPattern?.Trim() ?? string.Empty;
         var wasAllowed = _egress.Allowlist.Allows(host);
-        _egress.Allowlist.Remove(host, string.IsNullOrWhiteSpace(request.Who) ? "operator" : request.Who);
+        _egress.Allowlist.Remove(host, _identity.Resolve(context)); // daemon-derived actor (SA-1/F2)
         await TryReRenderAsync(context.CancellationToken).ConfigureAwait(false);
         return new RemoveAllowlistHostResponse { Removed = wasAllowed };
     }

@@ -224,9 +224,11 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     }
 
     /// <summary>Adds a host to the egress allowlist and re-renders the running proxy. Returns whether the
-    /// host was newly added and whether it re-opens a direct git-host route (A6).</summary>
+    /// host was newly added and whether it re-opens a direct git-host route (A6). No actor is sent: the
+    /// daemon derives the <c>allowlist_changed</c> actor from the authenticated connection (SA-1/F2), so
+    /// the change log records who the daemon SAW, not who the caller claimed to be.</summary>
     public async Task<(bool Added, bool DefeatsA6)> AddAllowlistHostAsync(
-        string name, string hostPattern, string kind, string who, CancellationToken ct, TimeSpan? deadline = null)
+        string name, string hostPattern, string kind, CancellationToken ct, TimeSpan? deadline = null)
     {
         var client = new EgressService.EgressServiceClient(Channel());
         var response = await client.AddAllowlistHostAsync(new AddAllowlistHostRequest
@@ -234,19 +236,18 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             Name = name ?? string.Empty,
             HostPattern = hostPattern ?? string.Empty,
             Kind = kind ?? string.Empty,
-            Who = who ?? string.Empty,
         }, CallOptions(ct, deadline));
         return (response.Added, response.DefeatsA6);
     }
 
-    /// <summary>Removes a host from the egress allowlist and re-renders the running proxy.</summary>
-    public async Task<bool> RemoveAllowlistHostAsync(string hostPattern, string who, CancellationToken ct, TimeSpan? deadline = null)
+    /// <summary>Removes a host from the egress allowlist and re-renders the running proxy. The audit actor
+    /// is daemon-derived (see <see cref="AddAllowlistHostAsync"/>).</summary>
+    public async Task<bool> RemoveAllowlistHostAsync(string hostPattern, CancellationToken ct, TimeSpan? deadline = null)
     {
         var client = new EgressService.EgressServiceClient(Channel());
         var response = await client.RemoveAllowlistHostAsync(new RemoveAllowlistHostRequest
         {
             HostPattern = hostPattern ?? string.Empty,
-            Who = who ?? string.Empty,
         }, CallOptions(ct, deadline));
         return response.Removed;
     }
