@@ -45,16 +45,11 @@ public sealed class InMemoryEgressAllowlistGateway : IEgressAllowlistGateway
     public void Remove(string hostPattern)
         => _items.RemoveAll(i => string.Equals(i.HostPattern, hostPattern, StringComparison.OrdinalIgnoreCase));
 
-    // Client-side mirror of the daemon's git-host heuristic — only to render the warning marker.
+    // The daemon's own git-host heuristic, called rather than re-implemented: this used to be a
+    // hand-copied mirror that had already drifted (its Azure arm was a substring `Contains`, so
+    // `dev.azure.com.evil.net` rendered as a git host). One implementation cannot drift from itself.
     private static bool LooksLikeGitHost(string host)
-    {
-        var h = (host ?? string.Empty).Trim().ToLowerInvariant();
-        return h is "github.com" or "gitlab.com" or "bitbucket.org"
-            || h.Contains("dev.azure.com")
-            || h.StartsWith("git.", StringComparison.Ordinal)
-            || h.EndsWith(".github.com", StringComparison.Ordinal)
-            || h.EndsWith(".gitlab.com", StringComparison.Ordinal);
-    }
+        => Mainguard.Agents.Agents.Sandbox.EgressAllowlistEntry.LooksLikeGitHost(host ?? string.Empty);
 
     private static readonly IReadOnlyList<EgressAllowlistItem> DefaultSeed = new[]
     {

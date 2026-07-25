@@ -25,16 +25,26 @@ message AllowlistEntry {
 message ListAllowlistRequest {}
 message ListAllowlistResponse { repeated AllowlistEntry entries = 1; }
 
+// The audit actor is deliberately ABSENT from both mutation requests (SA-1/F2, same rule as
+// ApprovePlanRequest): the daemon derives `who` for the allowlist_changed event from the authenticated
+// connection via IApproverIdentityResolver. A client-supplied actor is self-asserted — token-holding host
+// malware could widen the default-deny egress and sign the audit line with someone else's name — so the
+// field numbers stay reserved rather than being recycled for anything else.
 message AddAllowlistHostRequest {
+  reserved 4;
+  reserved "who";
   string name = 1;
   string host_pattern = 2;
   string kind = 3;          // EgressEntryKind name; empty defaults to Custom
-  string who = 4;           // operator identity for the audit line
 }
 message AddAllowlistHostResponse {
   bool added = 1;           // false when the host was already present (a no-op)
   bool defeats_a6 = 2;      // the added entry re-opens a git-host route (surfaced with a warning)
 }
 
-message RemoveAllowlistHostRequest { string host_pattern = 1; string who = 2; }
+message RemoveAllowlistHostRequest {
+  reserved 2;
+  reserved "who";
+  string host_pattern = 1;
+}
 message RemoveAllowlistHostResponse { bool removed = 1; }

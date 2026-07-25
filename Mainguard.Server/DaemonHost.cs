@@ -94,7 +94,19 @@ public static class DaemonHost
         builder.Services.AddSingleton(_ => new Mainguard.Agents.Agents.Orchestrator.CoordinatorConversationService());
 
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.KillSwitchGate>();
-        builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.IKillTarget, Runtime.SessionStoreKillTarget>();
+        // MG-8: the wired kill target must CONTAIN, not relabel. SandboxKillTarget severs terminal input
+        // (TerminalLockRegistry + SessionLeader) and docker-pauses the jail through the substrate's sandbox
+        // engine, then marks the state — the state mark alone (the old SessionStoreKillTarget) left every
+        // worker executing and every terminal typeable after the emergency stop. Resolved via a factory so
+        // the target takes the ISandboxEngine directly (unit-testable with a fake engine) while production
+        // still gets the one substrate facade's engine.
+        builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.IKillTarget>(sp =>
+            new Runtime.SandboxKillTarget(
+                store: sp.GetRequiredService<AgentSessionStore>(),
+                sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
+                leader: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.SessionLeader>(),
+                locks: sp.GetRequiredService<Auth.TerminalLockRegistry>(),
+                loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.KillSwitch(
             gate: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.KillSwitchGate>(),
             target: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IKillTarget>(),

@@ -100,4 +100,45 @@ public class Fake429EndpointTests
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal(3, fake.ServedCount);
     }
+
+    /// <summary>Fails every send, standing in for a dropped connection / DNS failure / TLS error.</summary>
+    private sealed class ThrowingHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
+            throw new HttpRequestException("upstream unreachable");
+    }
+
+    /// <summary>
+    /// MG-24: the forwarder acquires a lease that now carries a provisional budget debit, so an upstream
+    /// call that throws must still discharge it. Without the release, every failed forward would charge
+    /// the agent its estimate forever — a handful of network blips would permanently exhaust a budget
+    /// nothing was ever spent against, which is strictly worse than the overshoot the reservation fixes.
+    /// </summary>
+    [Fact]
+    public async Task UpstreamFailure_ReleasesTheBudgetReservation_SoTheAgentIsNotChargedForever()
+    {
+        var now = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        Func<DateTimeOffset> clock = () => now;
+
+        // A budget that fits exactly two 500-token requests — five failures would kill it if they leaked.
+        var gateway = AiGateway.Create(
+            new KeyHealth { RequestsPerMinute = 10_000, TokensPerMinute = 10_000_000 },
+            clock,
+            caps: new BudgetCaps(PerAgentTokenCap: 1000, 0, 0, 0));
+
+        using var http = new HttpMessageInvoker(new ThrowingHandler());
+        var forwarder = new GatewayForwarder(gateway, http);
+
+        for (var i = 0; i < 5; i++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.anthropic.com/v1/messages");
+            await Assert.ThrowsAsync<HttpRequestException>(
+                () => forwarder.ForwardAsync("agent-1", request, estimatedTokens: 500, CancellationToken.None));
+        }
+
+        Assert.Equal(0, gateway.Ledger.OutstandingReservations);
+        Assert.Equal(0, gateway.Ledger.GetReserved("agent-1").Tokens);
+        Assert.Equal(0, gateway.Ledger.GetTotals("agent-1").Tokens);   // nothing was spent, nothing charged
+        Assert.False(gateway.Ledger.IsExhausted("agent-1", out _));
+    }
 }

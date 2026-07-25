@@ -89,6 +89,13 @@ public class AdapterManifestTests
     [InlineData("latest")]
     [InlineData("^1.0.0")]
     [InlineData("*")]
+    // MG-40: a wildcard dot-segment is a RANGE — `1.x` resolves to whatever the registry serves at
+    // install time, so the manifest's sha256 would stop describing the bytes that land. These parsed
+    // as pinned because the old wildcard guard only fired when the version carried no digit at all.
+    [InlineData("1.x")]
+    [InlineData("1.X")]
+    [InlineData("1.2.x")]
+    [InlineData("1.x.x")]
     public void UnpinnedVersion_ShouldBeRejected(string version)
     {
         var body = $$"""
@@ -98,6 +105,20 @@ public class AdapterManifestTests
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
         Assert.Equal(AdapterManifestError.UnpinnedVersion, ex.Error);
     }
+
+    /// <summary>MG-40, both directions: a range is not a pin, and a concrete tag that merely contains an
+    /// <c>x</c> still is (the fix must not start refusing real releases like <c>1.0.0-hotfix</c>).</summary>
+    [Theory]
+    [InlineData("1.2.3", true)]
+    [InlineData("0.2.71", true)]
+    [InlineData("1.0.0-hotfix", true)]
+    [InlineData("2.1.0-linux-x64", true)]
+    [InlineData("1.x", false)]
+    [InlineData("1.2.X", false)]
+    [InlineData("x", false)]
+    [InlineData("~1.2.3", false)]
+    public void IsPinnedVersion_TreatsRangesAsUnpinned(string version, bool pinned)
+        => Assert.Equal(pinned, AdapterManifest.IsPinnedVersion(version));
 
     [Fact]
     public void InstallCmdWithAtLatest_ShouldBeRejected()
