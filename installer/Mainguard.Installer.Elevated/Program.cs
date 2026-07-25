@@ -37,6 +37,35 @@ internal static class Program
             return (int)ElevatedHelperExitCode.BadArguments;
         }
 
+        // MG-9: we are ALREADY ELEVATED at this point, and --resume-target came straight off argv. It
+        // used to be handed to schtasks unchecked, which turned "can invoke this helper" into "can
+        // register any executable on the machine as an ONLOGON task running as administrator with no
+        // UAC prompt" — a permanent, silent privilege escalation from a single argument. Validate
+        // before anything privileged happens, and refuse loudly rather than proceeding: an argument we
+        // cannot vouch for is the one case where doing nothing is unambiguously correct.
+        //
+        // The install root is THIS helper's own directory: the packaged build co-locates the helper
+        // with the exe it resumes, so a legitimate target is always a sibling. (Honest limit: an
+        // attacker who can write to that directory can replace the sibling in place and this check
+        // still passes — see TrustedExecutablePath. On the per-user install layout that directory is
+        // writable by the user, so this bounds the target, it does not authenticate it.)
+        if (!TrustedExecutablePath.TryValidate(
+                resumeTarget, AppContext.BaseDirectory, out var validatedResumeTarget, out var refusal))
+        {
+            var message = $"refusing --resume-target '{resumeTarget}': {refusal}.";
+            Console.Error.WriteLine(message);
+            WriteResult(resultPath, new ElevatedHelperResult
+            {
+                FeaturesEnabled = false,
+                RebootRequired = false,
+                ResumeTaskRegistered = false,
+                Error = message,
+            });
+            return (int)ElevatedHelperExitCode.BadArguments;
+        }
+
+        resumeTarget = validatedResumeTarget;
+
         // Action 1: enable the two features. The raw command was surfaced to the user before the UAC prompt.
         // DISM's own RestartNeeded flag (read back from the script's marker line) decides the reboot — a
         // machine that already has WSL2 enabled reports RestartNeeded=false and is never rebooted again.
@@ -123,8 +152,22 @@ internal static class Program
         return true;
     }
 
-    private static bool TryRegisterResumeTask(string resumeTarget, out string? error) =>
-        TryRun("schtasks.exe", InstallerCommands.RegisterResumeTask(resumeTarget), out error, out _);
+    /// <summary>Registers the resume task. The builder re-validates the target against this helper's
+    /// own directory (MG-9) — a second check on an already-checked value, deliberately, so the
+    /// privileged shape is safe no matter which path reaches it.</summary>
+    private static bool TryRegisterResumeTask(string resumeTarget, out string? error)
+    {
+        try
+        {
+            var args = InstallerCommands.RegisterResumeTask(resumeTarget, AppContext.BaseDirectory);
+            return TryRun("schtasks.exe", args, out error, out _);
+        }
+        catch (ArgumentException ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
 
     private static bool TryRun(string exe, IReadOnlyList<string> args, out string? error, out string stdout)
     {

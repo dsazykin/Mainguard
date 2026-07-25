@@ -59,18 +59,35 @@ public static class InstallerCommands
     /// The <c>schtasks.exe</c> argument list that registers the elevated, ONLOGON, run-as-highest
     /// resume task. <b>Never <c>RunOnce</c></b> (plan §7 rejection trigger) — a Scheduled Task
     /// survives the reboot and elevation cleanly where a <c>RunOnce</c> registry value would run
-    /// unelevated. <paramref name="resumeExePath"/> is the OOBE exe relaunched in resume mode.
+    /// unelevated. <paramref name="resumeExePath"/> is the OOBE exe relaunched in resume mode;
+    /// <paramref name="installRoot"/> is the directory that install was launched from (the helper's
+    /// own <c>AppContext.BaseDirectory</c>, where the packaged build co-locates every Mainguard exe).
+    ///
+    /// <para><b>MG-9: the path is validated here, in the builder, not at the call site.</b> This
+    /// registration creates a task that runs <c>/RL HIGHEST</c> at <c>ONLOGON</c> — elevated, at every
+    /// logon, <b>with no UAC prompt</b>. It used to interpolate whatever string it was handed, so any
+    /// caller that could reach the elevated helper could name any executable on the machine and have
+    /// Windows run it as administrator forever. Validating in the builder means no future caller can
+    /// forget to; see <see cref="TrustedExecutablePath"/> for exactly how far that protection goes
+    /// (it stops an ARBITRARY exe — it does not stop a REPLACED one at the legitimate path).</para>
     /// </summary>
-    public static IReadOnlyList<string> RegisterResumeTask(string resumeExePath) => new[]
+    /// <exception cref="ArgumentException">The resume target is not a canonical, fully-qualified
+    /// executable inside <paramref name="installRoot"/>. Callers must surface this, never swallow it.</exception>
+    public static IReadOnlyList<string> RegisterResumeTask(string resumeExePath, string installRoot)
     {
-        "/Create",
-        "/TN", ResumeTaskName,
-        // The task runs the OOBE exe in resume mode.
-        "/TR", $"\"{resumeExePath}\" --resume",
-        "/SC", "ONLOGON",
-        "/RL", "HIGHEST",   // elevated — feature-enablement completion + VM import need it
-        "/F",               // overwrite any stale registration (idempotent re-run)
-    };
+        var target = TrustedExecutablePath.Require(resumeExePath, installRoot, "resume target");
+        return new[]
+        {
+            "/Create",
+            "/TN", ResumeTaskName,
+            // The task runs the OOBE exe in resume mode. `target` is the validated canonical form:
+            // it cannot contain a quote, so it cannot break out of this quoted /TR string.
+            "/TR", $"\"{target}\" --resume",
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",   // elevated — feature-enablement completion + VM import need it
+            "/F",               // overwrite any stale registration (idempotent re-run)
+        };
+    }
 
     /// <summary>The <c>schtasks.exe</c> argument list that deletes the resume task — the helper/OOBE
     /// runs this once the resume completes, so the task is self-deleting (never lingers).</summary>
