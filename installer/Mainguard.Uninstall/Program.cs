@@ -63,10 +63,15 @@ internal static class Program
 
     private static async Task StopDaemonAsync(CancellationToken ct)
     {
-        // Best-effort: ask the daemon inside the distro to stop before we terminate the distro.
+        // Best-effort: ask the daemon inside the distro to stop before we terminate the distro. The
+        // sequence itself (systemd stop, then an EXACT-name kill — never the fuzzy `pkill -f`, audit
+        // MG-34) lives in Core so its shape is unit-tested; this only runs it.
         var wsl = new WslRunner();
-        try { await wsl.RunAsync(WslCommands.InDistroAsRoot("pkill", "-f", "mainguardd"), null, ct).ConfigureAwait(false); }
-        catch { /* distro may already be gone */ }
+        foreach (var command in UninstallDaemonCommands.StopSequence())
+        {
+            try { await wsl.RunAsync(command, null, ct).ConfigureAwait(false); }
+            catch { /* distro may already be gone — every step here is best-effort */ }
+        }
     }
 
     private static async Task RemoveScheduledTasksAsync(CancellationToken ct)

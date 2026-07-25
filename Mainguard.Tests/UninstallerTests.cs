@@ -191,4 +191,36 @@ public class UninstallerTests
         Assert.Equal(1, invocations);
         Assert.Contains("remove-sync-remote", onReport.StepsRun);
     }
+
+    // MG-34: the daemon-stop step must prefer systemd and, when it falls back to killing the process,
+    // match the process NAME exactly. `pkill -f mainguardd` matched any command line merely CONTAINING
+    // the string — an editor holding mainguardd.service open, a `tail -f` on its log, a grep — and it
+    // runs as root inside the distro, so a fuzzy match killed the user's unrelated processes during an
+    // uninstall. Same rule the presence probes already follow (`pgrep -x`, audit fix #10).
+    [Fact]
+    public void StopDaemonSequence_ShouldPreferSystemd_AndNeverFuzzyMatchProcessCommandLines()
+    {
+        var sequence = UninstallDaemonCommands.StopSequence();
+        Assert.Equal(2, sequence.Count);
+
+        // 1. systemd first — the clean stop that also reaps anything in the unit's cgroup.
+        Assert.Equal(DaemonUpdateCommands.StopUnit(), sequence[0]);
+        Assert.Contains("systemctl", sequence[0]);
+        Assert.Contains("stop", sequence[0]);
+
+        // 2. Only then the last-resort kill, EXACT-name matched.
+        var kill = sequence[1];
+        Assert.Contains("pkill", kill);
+        Assert.Contains("-x", kill);
+        Assert.DoesNotContain("-f", kill);
+        Assert.Equal(DaemonUpdateCommands.UnitName, kill[^1]);
+
+        // G-12 still holds: every command is scoped to our distro, and the VM-wide shutdown verb is
+        // never emitted (it would stop the user's personal distros too).
+        Assert.All(sequence, c =>
+        {
+            Assert.Contains(WslCommands.DistroName, c);
+            Assert.All(c, a => Assert.NotEqual("--shutdown", a));
+        });
+    }
 }

@@ -12,6 +12,33 @@ namespace Mainguard.Agents.Agents.Bootstrap;
 /// it never touches repo working trees, only removes the one added remote).</param>
 public sealed record UninstallOptions(bool KeepSettings = false, bool RemoveSyncRemote = false);
 
+/// <summary>
+/// The in-VM commands the uninstaller's <c>stop-daemon</c> step runs, in order. Pure argument-list
+/// builders (the exe only supplies the runner) so the SHAPE is unit-testable without a process — the
+/// same discipline as <see cref="WslCommands"/>/<see cref="InstallerCommands"/>.
+/// </summary>
+public static class UninstallDaemonCommands
+{
+    /// <summary>
+    /// Stop <c>mainguardd</c> before the distro is terminated: ask systemd first, then a last-resort
+    /// process kill for a daemon that is running outside its unit (hand-started, or a unit systemd has
+    /// already given up on). Both are best-effort — the caller ignores failures, and the distro is
+    /// terminated immediately afterwards regardless.
+    /// <para><b>Audit MG-34:</b> the kill matches the process NAME exactly (<c>pkill -x mainguardd</c>),
+    /// never <c>pkill -f mainguardd</c>. <c>-f</c> matches any process whose full command line merely
+    /// CONTAINS the string — an editor with <c>mainguardd.service</c> open, a <c>tail -f</c> on its log,
+    /// a <c>grep mainguardd</c> — and this runs as root inside the distro, so a fuzzy match kills the
+    /// user's unrelated processes during an uninstall. The presence probes already use the exact form
+    /// (<c>pgrep -x</c>, audit fix #10); the payload renames the apphost to <c>mainguardd</c> precisely
+    /// so that exact match works.</para>
+    /// </summary>
+    public static IReadOnlyList<IReadOnlyList<string>> StopSequence() => new[]
+    {
+        DaemonUpdateCommands.StopUnit(),
+        WslCommands.InDistroAsRoot("pkill", "-x", DaemonUpdateCommands.UnitName),
+    };
+}
+
 /// <summary>The ordered, failure-tolerant uninstall report. <see cref="Clean"/> iff nothing errored.</summary>
 public sealed record UninstallReport(
     IReadOnlyList<string> StepsRun,
