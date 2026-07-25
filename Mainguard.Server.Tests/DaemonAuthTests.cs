@@ -6,7 +6,6 @@ using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Google.Protobuf;
-using Google.Protobuf.Reflection;
 using Grpc.Core;
 using Grpc.Net.Client;
 using Mainguard.Protos.V1;
@@ -16,9 +15,9 @@ using Mainguard.Server.Tests.Fixtures;
 namespace Mainguard.Server.Tests;
 
 /// <summary>
-/// TI-P2-02 §1/§2/§6/§10 + plan §6 rows 1,2,6,6(loopback),7,8. Auth coverage (every
-/// method by reflection), loopback bind, unimplemented stubs, token-file permissions,
-/// port-already-bound.
+/// TI-P2-02 §1/§2/§6/§10 + plan §6 rows 1,2,6,6(loopback),7,8. Auth coverage (every RPC the daemon
+/// maps, discovered from its own routing table), loopback bind, unimplemented stubs, token-file
+/// permissions, port-already-bound.
 /// </summary>
 public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
 {
@@ -70,25 +69,35 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
         Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
     }
 
-    // TI.1 / §6.6 — AuthCoverage_EveryMethodByReflection. Every service/method pair
-    // reflected from the proto descriptor set is denied with a wrong token — new RPCs are
-    // covered automatically, and a "public method" allowlist appearing later fails here.
-    public static IEnumerable<object[]> EveryMethod()
-        => ProtoServices()
-            .SelectMany(s => s.Methods.Select(m => new object[] { s.FullName, m.Name }));
-
-    [Theory]
-    [MemberData(nameof(EveryMethod))]
-    public async Task AuthCoverage_EveryMethodByReflection_WrongToken_Denied(string serviceFullName, string methodName)
+    // TI.1 / §6.6 — AuthCoverage_EveryMethodByReflection. Every RPC the daemon actually MAPS is denied
+    // with a wrong token. The set comes from the running host's routing table (MappedGrpcRpcs), not from
+    // a list kept here: this test used to reflect over four proto assemblies while DaemonHost mapped
+    // NINE services, so merge-queue, plan-approval, kill-switch, coordinator and egress RPCs were never
+    // checked at all — and a tenth service could have shipped unauthenticated with this test still green.
+    // Driving off the map means coverage cannot drift: mapped is covered, unmapped is unreachable.
+    [Fact]
+    public async Task AuthCoverage_EveryMappedRpc_WrongToken_Denied()
     {
-        var descriptor = ProtoServices().Single(s => s.FullName == serviceFullName)
-            .Methods.Single(m => m.Name == methodName);
+        var rpcs = MappedGrpcRpcs.Discover(_daemon.Services);
         var invoker = _daemon.CreateChannel().CreateCallInvoker();
+        var notDenied = new List<string>();
 
-        var ex = await Record.ExceptionAsync(() => InvokeDeniedAsync(invoker, descriptor, _daemon.WrongTokenHeaders()));
+        foreach (var rpc in rpcs)
+        {
+            var ex = await Record.ExceptionAsync(() => InvokeDeniedAsync(invoker, rpc, _daemon.WrongTokenHeaders()));
+            if (ex is not RpcException { StatusCode: StatusCode.PermissionDenied })
+            {
+                notDenied.Add($"{rpc} → {(ex as RpcException)?.StatusCode.ToString() ?? ex?.GetType().Name ?? "no exception"}");
+            }
+        }
 
-        var rpc = Assert.IsType<RpcException>(ex);
-        Assert.Equal(StatusCode.PermissionDenied, rpc.StatusCode);
+        Assert.Empty(notDenied);
+
+        // Every mapped service is represented — a service whose RPCs vanished from the set would
+        // otherwise pass this test by not being tested.
+        Assert.Equal(
+            MappedGrpcRpcs.ServiceTypes(_daemon.Services).Count,
+            rpcs.Select(r => r.ServiceName).Distinct().Count());
     }
 
     // §6.6(loopback) / TI.2 — the real host binds loopback only (127.0.0.1), never AnyIP.
@@ -191,31 +200,15 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
         }
     }
 
-    private static IReadOnlyList<ServiceDescriptor> ProtoServices() => new[]
-    {
-        AgentReflection.Descriptor.Services.Single(),
-        TerminalReflection.Descriptor.Services.Single(),
-        ReposyncReflection.Descriptor.Services.Single(),
-        GatewayReflection.Descriptor.Services.Single(),
-    };
-
     private static readonly MethodInfo GenericInvoke = typeof(DaemonAuthTests)
         .GetMethod(nameof(InvokeDeniedGeneric), BindingFlags.NonPublic | BindingFlags.Static)!;
 
-    private static Task InvokeDeniedAsync(CallInvoker invoker, MethodDescriptor descriptor, Metadata headers)
+    private static Task InvokeDeniedAsync(CallInvoker invoker, MappedRpc rpc, Metadata headers)
     {
-        var type = descriptor switch
-        {
-            { IsClientStreaming: false, IsServerStreaming: false } => MethodType.Unary,
-            { IsClientStreaming: false, IsServerStreaming: true } => MethodType.ServerStreaming,
-            { IsClientStreaming: true, IsServerStreaming: false } => MethodType.ClientStreaming,
-            _ => MethodType.DuplexStreaming,
-        };
-
-        var generic = GenericInvoke.MakeGenericMethod(descriptor.InputType.ClrType, descriptor.OutputType.ClrType);
+        var generic = GenericInvoke.MakeGenericMethod(rpc.RequestType, rpc.ResponseType);
         return (Task)generic.Invoke(null, new object[]
         {
-            invoker, descriptor.Service.FullName, descriptor.Name, type, headers,
+            invoker, rpc.ServiceName, rpc.MethodName, rpc.MethodType, headers,
         })!;
     }
 
