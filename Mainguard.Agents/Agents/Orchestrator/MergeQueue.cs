@@ -362,24 +362,83 @@ public sealed class MergeQueue : IMergeQueue
 
     /// <summary>
     /// Records the human foreground merge outcome (the ONLY path to <see cref="WorkerMergeState.Merged"/>).
-    /// Called by the RT-D1 <c>ConfirmMerge</c> step AFTER the Windows-side journaled merge commits — never
-    /// reachable through <see cref="IMergeQueue"/>. Fires the stale cascade for the new main sha.
+    /// Never reachable through <see cref="IMergeQueue"/>. Fires the stale cascade for the new main sha.
+    ///
+    /// <para><b>Unconditional by design — this is the RECONCILE entry point.</b> It records a merge that has
+    /// already landed on a ref (the RT-D1 boot replay finds main advanced past the lease's expected sha with
+    /// a T-19 <c>Merge</c> journal entry, and must reflect that fact whatever the queue currently believes).
+    /// Refusing there would leave the queue permanently disagreeing with git. Every path where the merge has
+    /// NOT yet landed — i.e. every path that is still ASKING for permission — must call
+    /// <see cref="TryConfirmHumanMerge"/> instead (MG-11).</para>
     /// </summary>
     public void ConfirmHumanMerge(string agentId, string newMainSha)
     {
         lock (_gate)
         {
-            var current = GetStateLocked(agentId);
-            // Allow the human merge from a fresh Verified or an opened AwaitingReview.
-            if (current == WorkerMergeState.Verified)
-            {
-                SetStateLocked(agentId, WorkerMergeState.AwaitingReview);
-            }
-
-            SetStateLocked(agentId, WorkerMergeState.Merged);
+            MarkMergedLocked(agentId);
         }
 
         NotifyMainMoved(newMainSha);
+    }
+
+    /// <summary>
+    /// MG-11 — the <b>gated</b> human-merge confirmation: the merge gate and the <c>Merged</c> transition
+    /// are evaluated and applied under ONE hold of the queue lock, so nothing can move main between the
+    /// check and the commit.
+    ///
+    /// <para>The old <c>ConfirmMerge</c> RPC called <see cref="ConfirmHumanMerge"/> directly, which meant the
+    /// daemon enforced <i>nothing</i>: no <see cref="CanMerge"/>, no freshness compare, and no gate — a
+    /// branch that was <c>Verified@old</c>, or whose flagged/RT-D2 items were unacknowledged, went straight
+    /// to <c>Merged</c> because every one of those checks lived in the client cockpit. A cockpit is a
+    /// renderer; a hand-written client that skips it (or a cockpit racing a co-tenant's merge) simply
+    /// bypassed the entire merge contract. The gates now decide here, daemon-side, or the merge is refused.</para>
+    ///
+    /// <para><paramref name="expectedMainSha"/> is the caller's compare-and-swap old-OID: the main this
+    /// merge was authorized against (the lease's <c>ExpectedMainSha</c>). It is compared to the queue's
+    /// authoritative current main <i>inside</i> the lock — a co-tenant merge that landed since
+    /// <c>BeginMerge</c> is exactly the stale cascade this refusal exists to respect. Pass null to skip only
+    /// that compare (the record-vs-main staleness check inside <see cref="CanMerge"/> still applies).</para>
+    /// </summary>
+    /// <returns>True when the branch moved to <see cref="WorkerMergeState.Merged"/>; false with a
+    /// render-verbatim <paramref name="reason"/> (§3.4 vocabulary) when the gate refused.</returns>
+    public bool TryConfirmHumanMerge(string agentId, string newMainSha, string? expectedMainSha, out string reason)
+    {
+        lock (_gate)
+        {
+            // The CAS old-OID compare comes first so a lost race reports "main moved" rather than whatever
+            // downstream symptom (stale record, re-queued state) the cascade has already produced.
+            if (!string.IsNullOrEmpty(expectedMainSha)
+                && !string.Equals(expectedMainSha, _currentMainSha, StringComparison.Ordinal))
+            {
+                reason = "verification is stale — main moved; re-verifying";
+                return false;
+            }
+
+            // Freeze + state + record-vs-main freshness + every composable gate, in one place.
+            if (!CanMergeLocked(agentId, out reason))
+            {
+                return false;
+            }
+
+            MarkMergedLocked(agentId);
+        }
+
+        // Outside the lock: the cascade re-queues co-tenants and raises Changed.
+        NotifyMainMoved(newMainSha);
+        reason = "";
+        return true;
+    }
+
+    // The Verified → AwaitingReview → Merged walk shared by both confirm entry points. Caller holds _gate.
+    private void MarkMergedLocked(string agentId)
+    {
+        // Allow the human merge from a fresh Verified or an opened AwaitingReview.
+        if (GetStateLocked(agentId) == WorkerMergeState.Verified)
+        {
+            SetStateLocked(agentId, WorkerMergeState.AwaitingReview);
+        }
+
+        SetStateLocked(agentId, WorkerMergeState.Merged);
     }
 
     /// <summary>Rejects a branch (AwaitingReview → Rejected); teardown follows per policy.</summary>

@@ -10,6 +10,14 @@ using Mainguard.Git.Services;
 namespace Mainguard.Agents.Services;
 
 /// <summary>
+/// The merge-gate probe the foreground merge consults before it touches a ref — shaped exactly like
+/// <see cref="IMergeQueue.CanMerge"/> so the daemon can hand it the live queue's method and nothing
+/// re-implements the gate. MG-11: without this the Windows-side merge ran with no gate at all, so
+/// staleness and every unacknowledged flagged item were enforced only by whichever UI happened to call it.
+/// </summary>
+public delegate bool MergeGateCheck(string agentId, out string reason);
+
+/// <summary>
 /// The Windows-side human-gated foreground merge (P2-10 §3.5). See <see cref="IForegroundMergeService"/>.
 ///
 /// <para><b>A5 freshness is a ref-level compare-and-swap on <c>refs/heads/main</c>.</b> Because P2-09
@@ -30,6 +38,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService
     private readonly IAgentEnvironment _environment;
     private readonly IOperationJournal _journal;
     private readonly IMergeLeaseStore _leases;
+    private readonly MergeGateCheck? _canMerge;
     private readonly Action<string, string>? _onMerged;
     private readonly Action<string, string>? _onStaleOverride;
     private readonly Func<string, IReadOnlyList<string>, int> _depsRefreshRunner;
@@ -37,6 +46,8 @@ public sealed class ForegroundMergeService : IForegroundMergeService
     /// <param name="environment">Substrate facade — resolves the SC-2 sync remote name (never a literal).</param>
     /// <param name="journal">The T-19 operation journal (the merge is one undoable op).</param>
     /// <param name="leases">The RT-D1 merge-lease store.</param>
+    /// <param name="canMerge">The live queue's merge gate, evaluated UNDER the lease. Null leaves the merge
+    /// ungated — which is only ever correct for a caller that has no queue at all.</param>
     /// <param name="onMerged">Fired after a confirmed merge: (agentId, newMainSha) → daemon <c>ConfirmHumanMerge</c>/<c>NotifyMainMoved</c>.</param>
     /// <param name="onStaleOverride">Fired when the loud override path is used: (agentId, reason) → <c>stale_override_used</c> audit.</param>
     /// <param name="depsRefreshRunner">Runs the post-merge dependency refresh (workingDir, args) → exit; default uses the package manager.</param>
@@ -44,6 +55,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService
         IAgentEnvironment environment,
         IOperationJournal journal,
         IMergeLeaseStore leases,
+        MergeGateCheck? canMerge = null,
         Action<string, string>? onMerged = null,
         Action<string, string>? onStaleOverride = null,
         Func<string, IReadOnlyList<string>, int>? depsRefreshRunner = null)
@@ -51,6 +63,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService
         _environment = environment ?? throw new ArgumentNullException(nameof(environment));
         _journal = journal ?? throw new ArgumentNullException(nameof(journal));
         _leases = leases ?? throw new ArgumentNullException(nameof(leases));
+        _canMerge = canMerge;
         _onMerged = onMerged;
         _onStaleOverride = onStaleOverride;
         _depsRefreshRunner = depsRefreshRunner ?? DefaultDepsRefreshRunner;
@@ -67,6 +80,18 @@ public sealed class ForegroundMergeService : IForegroundMergeService
 
         try
         {
+            // MG-11: the gate is read UNDER the lease, never before it — a gate read outside the lease is
+            // only a snapshot of a repo somebody else may still be merging into (the MG-23 ordering the
+            // external dispatch already uses). The loud stale-override path deliberately bypasses it: the
+            // override IS the documented, audited "CanMerge is false and the human accepted it" route, and
+            // routing it through the gate would make it unreachable.
+            if (!request.AllowStaleOverride && _canMerge is not null
+                && !_canMerge(request.AgentId, out var gateReason))
+            {
+                _leases.Release(request.RepoHash, lease.LeaseId);
+                return new ForegroundMergeResult(false, null, CasLost: false, gateReason);
+            }
+
             var result = PerformJournaledMerge(request, lease);
             if (result.Merged && result.NewMainSha is not null)
             {

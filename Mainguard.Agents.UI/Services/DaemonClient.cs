@@ -429,6 +429,21 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.Confirmed;
     }
 
+    /// <summary>P2-11 step 4: acknowledge ONE must-acknowledge flagged item daemon-side, and read the gate
+    /// back in the same round trip. The daemon owns the acknowledgment ledger the merge gate consults — a
+    /// client-side ack alone never unblocked anything.</summary>
+    public async Task<AcknowledgeFlaggedChangeResponse> AcknowledgeFlaggedChangeAsync(
+        string repoHandle, string agentId, string itemId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.AcknowledgeFlaggedChangeAsync(new AcknowledgeFlaggedChangeRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            ItemId = itemId,
+        }, CallOptions(ct, deadline));
+    }
+
     /// <summary>P2-47 #7: the agent-branch-vs-main diff for the review cockpit, parsed into <see cref="FilePatch"/>
     /// via the pure T-06 <c>PatchParser</c> on the client. Returns the resolved branch + main + patch list.</summary>
     public async Task<(string Branch, string MainBranch, IReadOnlyList<Mainguard.Git.Models.FilePatch> Files)> GetMergeDiffAsync(

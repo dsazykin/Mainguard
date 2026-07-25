@@ -699,8 +699,26 @@ public sealed class DaemonBackedOrchestrator :
         await _client.ConfirmMergeAsync(repoHandle, agentId, begun.LeaseId, mainSha, cts.Token).ConfigureAwait(false);
     }
 
-    // No flagged-change ack RPC on the StreamQueue contract — a genuine gap, not a wired surface.
-    public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId) => Task.CompletedTask;
+    /// <summary>P2-11 step 4 — acknowledge one flagged item on the DAEMON, which is where the merge gate
+    /// reads acknowledgments from. This was <c>Task.CompletedTask</c>: the cockpit's acks lived only in its
+    /// own in-process store, so nothing a human acknowledged ever reached the gate. No active repo → nothing
+    /// to acknowledge against; a transport failure surfaces through ConnectionState like every other call.</summary>
+    public async Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        await _client.AcknowledgeFlaggedChangeAsync(repoHandle!, agentId, itemId, cts.Token).ConfigureAwait(false);
+    }
 
     /// <summary>P2-47 #7: fetch the agent-branch-vs-main diff (over the new GetMergeDiff RPC) so the review
     /// cockpit can build its <c>ReviewCockpitContext.MergeDiff</c> — which the queue stream doesn't carry.
