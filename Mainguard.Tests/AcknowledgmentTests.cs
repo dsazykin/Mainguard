@@ -81,6 +81,26 @@ public class AcknowledgmentTests
         Assert.Equal(3, events.Count);
     }
 
+    /// <summary>
+    /// MG-40: the gate fails CLOSED. An agent with no acknowledgment store has not been through the
+    /// flagged-change review at all — which is not the same thing as having been reviewed and found
+    /// clean — so it must not merge. The gate used to return true for any id it did not recognise, so a
+    /// review that never ran (or an id that never matched) was indistinguishable from a clean bill of
+    /// health.
+    /// </summary>
+    [Fact]
+    public void UnknownAgent_IsDenied_NotWavedThrough()
+    {
+        var gate = new FlaggedChangeGate();
+
+        Assert.False(gate.Allows("never-reviewed", out var reason));
+        Assert.False(string.IsNullOrWhiteSpace(reason));
+
+        // Registering the branch with an empty flagged set IS a review that came back clean — allowed.
+        gate.StoreFor("never-reviewed").SetFlagged(new List<FlaggedChange>());
+        Assert.True(gate.Allows("never-reviewed", out _));
+    }
+
     [Fact]
     public void GlobalAcknowledgeAll_IsImpossibleByConstruction()
     {
