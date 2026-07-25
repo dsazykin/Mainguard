@@ -197,11 +197,18 @@ public sealed record AdapterManifest(
         if (string.IsNullOrWhiteSpace(version)) return false;
         var v = version.Trim();
         if (v.Contains("latest", StringComparison.OrdinalIgnoreCase)) return false;
-        if (v.Contains('*') || v.Contains('x') && !v.Any(char.IsDigit)) return false;
+        if (v.Contains('*')) return false;
         // Range / wildcard operators disqualify a pin.
         if (v.StartsWith('^') || v.StartsWith('~') || v.StartsWith('>') || v.StartsWith('<') || v.StartsWith('='))
             return false;
         if (v.Contains("||", StringComparison.Ordinal) || v.Contains(" - ", StringComparison.Ordinal)) return false;
+        // An `x`/`X` occupying a WHOLE dot-segment is npm's wildcard range (`1.x`, `1.x.x`, `1.2.X`): it
+        // names "whatever the registry serves today", which is exactly the drift the sha256 pin exists to
+        // stop — the resolved bytes would change under a manifest that never did. The old guard only
+        // rejected an `x` when the string ALSO had no digit, so every real range form (`1.x`) passed as a
+        // pin. Matching whole segments (not any `x` in the string) keeps concrete tags that merely contain
+        // the letter — `1.0.0-hotfix`, `2.1.0-linux` — pinned.
+        if (v.Split('.').Any(s => s.Equals("x", StringComparison.OrdinalIgnoreCase))) return false;
         return v.Any(char.IsDigit);
     }
 
