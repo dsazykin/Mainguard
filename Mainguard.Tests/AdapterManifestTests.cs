@@ -224,6 +224,43 @@ public class AdapterManifestTests
         Assert.Equal(AdapterManifestError.Malformed, ex.Error);
     }
 
+    // ---- MG-9: every shipped install runs script-free ------------------------------------------
+
+    [Fact]
+    public void BundledStarterCatalog_EveryInstallCommand_IsScriptFree()
+    {
+        // `npm install <tarball>` runs the preinstall/install/postinstall lifecycle scripts of the
+        // pinned package AND of every dependency npm resolves for it — arbitrary upstream code
+        // executing inside MainguardEnv at install time, before any health probe or sandbox boundary
+        // applies. The sha256 pin does not help: it proves the tarball is the one we chose, not that
+        // running the code inside it is safe.
+        //
+        // This is a structural guard, so a future adapter cannot be added without the flag. See
+        // AdapterChannelTests' poison canary for the behavioural half.
+        foreach (var adapter in AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters)
+        {
+            var manager = adapter.InstallCmd[0];
+            if (manager is not ("npm" or "pnpm" or "yarn"))
+                continue; // a non-JS installer has no lifecycle-script surface to close
+
+            Assert.True(
+                adapter.InstallCmd.Contains("--ignore-scripts"),
+                $"'{adapter.Id}' installs with {manager} but without --ignore-scripts: an upstream "
+                + "postinstall (its own, or any transitive dependency's) would execute in the VM.");
+        }
+    }
+
+    [Fact]
+    public void BundledStarterCatalog_StillConsumesTheHashVerifiedPayload()
+    {
+        // --ignore-scripts must not have been bought by loosening anything else: every install still
+        // consumes the staged {payload} file the pin covers, rather than re-resolving from a registry.
+        foreach (var adapter in AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters)
+        {
+            Assert.Contains(AdapterChannel.PayloadToken, adapter.InstallCmd);
+        }
+    }
+
     [Fact]
     public void BundledStarterCatalog_CredentialPaths_AllPassTheHomeRelativeGate()
     {
