@@ -66,7 +66,9 @@ public interface IBootstrapFileSystem
     /// No-op when the file does not exist. Never clobbers an existing backup (timestamped name).</summary>
     void BackupWslConfig();
 
-    /// <summary>Writes the merged <c>.wslconfig</c> content.</summary>
+    /// <summary>Writes the merged <c>.wslconfig</c> content. MUST be atomic (temp file + swap): the file
+    /// is the machine's GLOBAL WSL2 config, so an interrupted in-place truncate would leave every distro
+    /// — not just Mainguard's — reading a half-written file (audit MG-32).</summary>
     void WriteWslConfig(string content);
 
     /// <summary>Whether an arbitrary file (e.g. the distro tarball) exists.</summary>

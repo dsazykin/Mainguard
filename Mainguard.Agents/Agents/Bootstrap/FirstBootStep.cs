@@ -17,6 +17,22 @@ namespace Mainguard.Agents.Agents.Bootstrap;
 /// <c>/etc/sysctl.d/</c>, and its <b>check</b> phase asserts the current value is ≥ 2 so a regressed
 /// VM re-provisions. P2-07's key-custody guarantee names this check as its dependency.
 /// </para>
+/// <para>
+/// <b>Known machine-wide side effect (audit MG-33) — deliberate, documented, not a defect.</b> WSL2
+/// runs ALL distros on ONE shared kernel, and neither of these sysctls is namespaced, so "VM-wide"
+/// literally means <i>every WSL2 distro on the machine</i>, not just <c>MainguardEnv</c>: while the WSL
+/// VM is up, the user's Ubuntu (etc.) also sees <c>ptrace_scope=2</c> and the raised inotify limit.
+/// Both directions are HARDENING or a raised ceiling — ptrace_scope=2 restricts ptrace to admin-capable
+/// processes, so nothing another distro relied on becomes less safe — but a debugger/profiler run in
+/// another distro (gdb attaching to an already-running pid, perf, some sanitizers) can start needing
+/// sudo. The blast radius is bounded and reversible: the value lives in the shared kernel's memory
+/// only, so it resets the next time the whole WSL VM is shut down (the VM-wide <c>wsl</c> shutdown
+/// verb — which Mainguard itself never emits, G-12), and the persisted drop-in
+/// (<see cref="SysctlDropInPath"/>) is written INSIDE <c>MainguardEnv</c> only — it disappears with the
+/// distro at uninstall and never re-applies afterwards. Scoping this per-distro is not possible
+/// (non-namespaced sysctl), and weakening it would break the G2 key-custody chain, so the fix is to
+/// state the side effect here and in the OOBE log line rather than to change the security posture.
+/// </para>
 /// </summary>
 public sealed class FirstBootStep : IBootstrapStep
 {
@@ -82,14 +98,22 @@ public sealed class FirstBootStep : IBootstrapStep
     {
         // Apply live by writing /proc/sys directly (no `sysctl` binary in the payload). ptrace_scope's
         // write is best-effort: a kernel without Yama has no such file and the tee simply no-ops.
-        log.Report("Raising fs.inotify.max_user_watches…");
+        //
+        // MG-33: BOTH writes land in the SHARED WSL2 kernel (one kernel for every distro; neither sysctl
+        // is namespaced), so both are machine-wide for as long as the WSL VM is up and reset on the next
+        // WSL VM shutdown — see the side-effect paragraph on the class. The log lines below say so
+        // out loud, because the OOBE progress log is the only place the user sees this happen.
+        log.Report("Raising fs.inotify.max_user_watches (shared WSL2 kernel — affects all distros while WSL runs)…");
         await WriteProcSysctlAsync(InotifyKey, RequiredWatches.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
 
-        log.Report("Hardening kernel.yama.ptrace_scope=2 (G2)…");
+        log.Report("Hardening kernel.yama.ptrace_scope=2 (G2; shared WSL2 kernel — applies to all WSL2 distros until the WSL VM is fully shut down)…");
         await WriteProcSysctlAsync(PtraceKey, RequiredPtraceScope.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
 
         // Persist BOTH to /etc/sysctl.d/ so they survive a VM restart — applied on boot by systemd's
-        // systemd-sysctl.service (part of systemd, independent of the missing `sysctl` binary).
+        // systemd-sysctl.service (part of systemd, independent of the missing `sysctl` binary). The
+        // drop-in lives INSIDE MainguardEnv, so the persistence is scoped to our distro even though the
+        // effect of applying it is not: uninstalling (unregistering the distro) removes the file with it,
+        // and nothing re-applies the sysctls to the shared kernel afterwards.
         log.Report($"Persisting sysctls to {SysctlDropInPath}…");
         var dropIn = $"{InotifyWatches}\n{PtraceScope}\n";
         await _wsl.RunAsync(WslCommands.InDistroAsRoot("tee", SysctlDropInPath), stdin: dropIn, ct).ConfigureAwait(false);
