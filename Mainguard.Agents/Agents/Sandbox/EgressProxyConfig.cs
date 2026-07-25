@@ -20,9 +20,37 @@ public static class EgressProxyConfig
         var sb = new StringBuilder();
         sb.Append("# mainguard egress allowlist — default-deny (tinyproxy FilterDefaultDeny Yes)\n");
         foreach (var host in HostsOf(allowlist))
-            sb.Append('^').Append(host.Replace(".", "\\.")).Append('$').Append('\n');
+            sb.Append(RenderHostPattern(host)).Append('\n');
         return sb.ToString();
     }
+
+    /// <summary>
+    /// MG-28 — renders ONE allowlist host as an anchored tinyproxy filter regex.
+    ///
+    /// <para>Previously every entry was rendered as <c>^{host with dots escaped}$</c>, which produces
+    /// an <b>invalid regex</b> for a wildcard entry: <c>*.example.com</c> became
+    /// <c>^*\.example\.com$</c>, whose leading <c>*</c> is a quantifier with nothing to repeat. The
+    /// policy the UI shows and the filter tinyproxy actually enforces therefore diverged for exactly
+    /// the entries a user is most likely to add by hand.</para>
+    ///
+    /// <para>The rendering now mirrors <c>EgressAllowlist.HostMatches</c>: <c>*.example.com</c> allows
+    /// any subdomain AND the apex, so it becomes <c>^([a-z0-9-]+\.)*example\.com$</c>. A non-wildcard
+    /// entry stays an exact anchored match.</para>
+    /// </summary>
+    internal static string RenderHostPattern(string host)
+    {
+        var h = host.Trim().ToLowerInvariant();
+        if (h.StartsWith("*.", System.StringComparison.Ordinal))
+        {
+            // "*.example.com" -> apex + any depth of subdomain, matching HostMatches exactly.
+            return "^([a-z0-9-]+\\.)*" + Escape(h[2..]) + "$";
+        }
+
+        return "^" + Escape(h) + "$";
+    }
+
+    // Hostnames are [a-z0-9.-]; only the dot is a regex metacharacter among those.
+    private static string Escape(string host) => host.Replace(".", "\\.");
 
     /// <summary>
     /// tinyproxy <c>upstream</c> directives that route every <b>model-API</b> host through the P2-08
