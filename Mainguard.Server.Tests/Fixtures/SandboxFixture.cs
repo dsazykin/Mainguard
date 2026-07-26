@@ -206,7 +206,7 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// route) and 28 when nothing came back at all; every other failure happens after a connection
     /// exists and therefore proves reachability.
     /// </summary>
-    private static bool ConnectCompleted(string writeOut, int exitCode)
+    internal static bool ConnectCompleted(string writeOut, int exitCode)
     {
         var connects = MatchNumber(writeOut, "connects=");
         var timeConnect = MatchNumber(writeOut, "tconnect=");

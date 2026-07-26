@@ -92,12 +92,21 @@ public class SandboxNetworkIsolationDockerTests
     /// "the jail cannot reach the proxy", pointing the next investigation at the wrong leg.</para>
     ///
     /// <para>A probe that only ever returns one answer is not measuring anything, and the only way to
-    /// catch that is to assert the answer it is supposed to give when the thing works. All three
-    /// answers are pinned here, because the second version of this probe got the middle one wrong:
-    /// it classified on "did I receive a valid HTTP status", so a peer that accepted the connection and
-    /// then reset it — which is what CI saw, <c>curl: (56) Recv failure: Connection reset by peer</c> —
-    /// was reported UNREACHABLE even though the reset is proof the handshake completed. The verdict is
-    /// now the TCP handshake itself.</para>
+    /// catch that is to assert the answer it is supposed to give in every case. All four are pinned
+    /// here, because the second version of this probe got one of them wrong: it classified on "did I
+    /// receive a valid HTTP status", so a peer that accepted the connection and then reset it — which
+    /// is what CI saw, <c>curl: (56) Recv failure: Connection reset by peer</c> — was reported
+    /// UNREACHABLE even though the reset is proof the handshake completed. The verdict is now the TCP
+    /// handshake itself.</para>
+    ///
+    /// <para><b>Every peer here is one the test stands up.</b> The positive case used to be the real
+    /// jail→proxy hop, and CI failed it with <c>rc=7 t=0.000000</c> — by this file's own signature
+    /// table, the closed-port/daemon-restart signature, at 2.66 s into the suite, which is exactly where
+    /// the image entrypoint's unsynchronised <c>reload.sh</c> lands. The test was really asserting "the
+    /// shared proxy happens to be up right now", which is a different proposition from "the classifier
+    /// works" and is currently a false one (see <c>ReapplyingTheBackstop_NeverDropsAPacket</c> for that
+    /// defect). Owning every peer removes a dependency that has nothing to do with the subject; the
+    /// property under test is unchanged and no branch is dropped.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply()
@@ -107,15 +116,20 @@ public class SandboxNetworkIsolationDockerTests
         var repo = "mg36" + Guid.NewGuid().ToString("N")[..8];
         var (jail, segment) = await fx.CreateJailOnSegmentAsync(repo, "agent-a");
 
-        // 1. A healthy hop that answers HTTP.
-        var live = await fx.TcpProbeAsync(jail, $"{segment.ProxyAddress}:{EgressProxyConfigurator.ProxyPort}");
-        Assert.True(live.Reached,
-            $"the probe cannot report success against a healthy jail->proxy hop, so it cannot diagnose "
-            + $"anything. {live.Detail}");
+        // 1. REACHABLE — a peer that accepts and serves normally.
+        const int servingPort = 9097;
+        await fx.ExecAsync(jail, "sh", "-c",
+            $"(python3 -m http.server {servingPort} --bind 127.0.0.1 </dev/null >/dev/null 2>&1 &) ; exit 0");
+        await WaitForListenerAsync(fx, jail, servingPort);
 
-        // 2. A peer that accepts and immediately RSTs — CI's exact symptom, reproduced deterministically
-        //    with SO_LINGER(1,0) so the close sends a reset instead of a FIN. curl fails with 56, and
-        //    the connection it failed on is precisely what makes the peer reachable.
+        var serving = await fx.TcpProbeAsync(jail, $"127.0.0.1:{servingPort}");
+        Assert.True(serving.Reached,
+            $"the probe cannot report success against a peer that accepted and answered, so it cannot "
+            + $"diagnose anything. {serving.Detail}");
+
+        // 2. REACHABLE — a peer that accepts and immediately RSTs. CI's exact symptom, reproduced
+        //    deterministically with SO_LINGER(1,0) so the close sends a reset instead of a FIN. curl
+        //    fails with 56, and the connection it failed on is precisely what makes the peer reachable.
         const int resetPort = 9098;
         await fx.ExecAsync(jail, "sh", "-c",
             "(python3 -c \"import socket,struct\n"
@@ -133,10 +147,24 @@ public class SandboxNetworkIsolationDockerTests
             + $"the CI false negative, and it means the probe is still judging the reply rather than the "
             + $"handshake. {reset.Detail}");
 
-        // 3. Nothing listening / dropped: the handshake never completes, so this must read UNREACHABLE
-        //    or the probe is simply saying yes to everything.
-        var closed = await fx.TcpProbeAsync(jail, $"{segment.ProxyAddress}:9");
-        Assert.False(closed.Reached, $"the probe reported a dead port as reachable. {closed.Detail}");
+        // 3. UNREACHABLE — a port nothing is listening on. The kernel RSTs the SYN, so no handshake
+        //    ever completes. Without this the probe could simply be saying yes to everything.
+        var closed = await fx.TcpProbeAsync(jail, "127.0.0.1:9101");
+        Assert.False(closed.Reached, $"the probe reported a closed port as reachable. {closed.Detail}");
+
+        // 4. UNREACHABLE — an address with no route off this segment (TEST-NET-3, RFC 5737, which is
+        //    unroutable by definition and needs no second container to arrange). This is the branch the
+        //    isolation assertions rest on, so it is pinned in the classifier's own test too.
+        var unrouted = await fx.TcpProbeAsync(jail, "203.0.113.9:80");
+        Assert.False(unrouted.Reached,
+            $"the probe reported an unroutable address as reachable — the isolation assertions all rest "
+            + $"on this branch. {unrouted.Detail}");
+
+        // Diagnostic only, never the verdict: the real jail->proxy hop. Useful context when reading a
+        // CI log, but it depends on the shared proxy being up at this instant, which is precisely the
+        // dependency that made this test flap.
+        var live = await fx.TcpProbeAsync(jail, $"{segment.ProxyAddress}:{EgressProxyConfigurator.ProxyPort}");
+        _output.WriteLine("real jail->proxy hop (diagnostic, not asserted): " + live.Detail);
     }
 
     // The other half of the containment claim, restated on the segmented topology: a jail must still
