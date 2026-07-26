@@ -323,6 +323,31 @@ public sealed class DaemonPayloadManifest
     /// in oobe.log after the fact.</summary>
     public long TotalBytes { get; }
 
+    /// <summary>
+    /// The canonical text form of this manifest: <c>&lt;sha256&gt;  &lt;relative path&gt;</c> per line,
+    /// sorted ordinally by path, LF-terminated. Byte-stable by construction (fixed order, fixed
+    /// separator, fixed newline) so the same payload always produces the same bytes on any machine.
+    ///
+    /// <para><b>This is the artifact CI attests.</b> The daemon payload is a directory and
+    /// <c>gh attestation verify</c> takes a file, so the build writes exactly this text to
+    /// <see cref="DaemonUpdater.AttestedManifestPathFor"/> and attests THAT. The app then rebuilds the
+    /// manifest from the payload on disk and requires it to reproduce these bytes — which is what makes
+    /// a build-time attestation say something about the directory a user actually has.</para>
+    /// </summary>
+    public string ToCanonicalText()
+    {
+        var builder = new System.Text.StringBuilder();
+        foreach (var (relative, hash) in FileHashes.OrderBy(p => p.Key, StringComparer.Ordinal))
+            builder.Append(hash).Append("  ").Append(relative).Append('\n');
+        return builder.ToString();
+    }
+
+    /// <summary>SHA-256 of <see cref="ToCanonicalText"/> — the digest an attestation over the manifest
+    /// file names as its subject.</summary>
+    public string CanonicalDigest() =>
+        Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(ToCanonicalText())))
+            .ToLowerInvariant();
+
     /// <summary>Hashes every regular file under <paramref name="payloadDirectory"/>.</summary>
     /// <exception cref="DaemonPayloadException">The directory is missing, empty, unreadable, or does not
     /// contain <see cref="RequiredAssembly"/>.</exception>
@@ -446,11 +471,23 @@ public interface IDaemonUpdater
 public sealed class DaemonUpdater : IDaemonUpdater
 {
     private readonly IWslRunner _wsl;
+    private readonly BuildProvenanceGate _provenance;
 
-    public DaemonUpdater(IWslRunner wsl)
+    /// <param name="provenance">The MG-9 build-provenance gate. Null → the compiled-in policy, which is
+    /// a no-op on any build that is not a stamped attested release.</param>
+    public DaemonUpdater(IWslRunner wsl, BuildProvenanceGate? provenance = null)
     {
         _wsl = wsl ?? throw new ArgumentNullException(nameof(wsl));
+        _provenance = provenance ?? new BuildProvenanceGate();
     }
+
+    /// <summary>
+    /// Where the attesting release build writes the payload's canonical sha256 manifest — a sibling of
+    /// the payload directory (<c>…/payload/daemon</c> → <c>…/payload/daemon.manifest</c>), deliberately
+    /// OUTSIDE the directory so it never has to hash itself.
+    /// </summary>
+    public static string AttestedManifestPathFor(string payloadDirectory) =>
+        payloadDirectory.TrimEnd('/', '\\') + ".manifest";
 
     /// <summary>Where the packaged app ships the daemon payload (the MSBuild
     /// <c>$(MainguardDaemonPayload)</c> copy step in Mainguard.Pro.App.csproj) — mirrors how
@@ -500,6 +537,19 @@ public sealed class DaemonUpdater : IDaemonUpdater
                     $"refusing to promote the daemon payload: {signature.Reason}");
             }
 
+            // MG-9, our-own-artifact half: the manifest above proves the COPY is faithful, and both its
+            // sides come from the same directory, so it says nothing about whether that directory is
+            // ours. Build provenance is what says so — the attestation originates from the CI run that
+            // produced the payload, not from the same place the payload is being read from. Fail-closed
+            // on a stamped release build; an explicit, logged no-op on a developer build.
+            var provenance = await VerifyBuildProvenanceAsync(payloadDirectory, manifest, ct)
+                .ConfigureAwait(false);
+            if (provenance.MustRefuse)
+            {
+                throw new DaemonRefreshStepException(
+                    $"refusing to promote the daemon payload: {provenance.Reason}");
+            }
+
             await RequireAsync(DaemonUpdateCommands.StopUnit(), "stop the mainguardd unit", ct).ConfigureAwait(false);
             await RequireAsync(DaemonUpdateCommands.RemoveStaging(), "clear stale staging", ct).ConfigureAwait(false);
             await RequireAsync(DaemonUpdateCommands.CreateStaging(), "create the staging dir", ct).ConfigureAwait(false);
@@ -541,7 +591,7 @@ public sealed class DaemonUpdater : IDaemonUpdater
                 true,
                 $"daemon refreshed from '{payloadDirectory}' ({manifest.FileHashes.Count} files, "
                 + $"{manifest.TotalBytes} bytes, all sha256-verified in the VM; rollback kept at "
-                + $"{DaemonUpdateCommands.RollbackDir}). {signature.Reason}");
+                + $"{DaemonUpdateCommands.RollbackDir}). {signature.Reason} {provenance.Reason}");
         }
         catch (DaemonRefreshStepException ex)
         {
@@ -556,6 +606,58 @@ public sealed class DaemonUpdater : IDaemonUpdater
             await TryRunAsync(DaemonUpdateCommands.StartUnit(), ct).ConfigureAwait(false);
             return new DaemonRefreshResult(false, ex.Message);
         }
+    }
+
+    /// <summary>
+    /// The MG-9 build-provenance check for the daemon payload.
+    ///
+    /// <para>The payload is a DIRECTORY, and <c>gh attestation verify</c> attests files — so the
+    /// attesting release build writes the payload's canonical sha256 manifest to
+    /// <see cref="AttestedManifestPathFor"/> and attests that file. Here we (1) recompute the canonical
+    /// text from the payload directory as it exists on this machine, (2) require the sidecar manifest to
+    /// equal it byte for byte, and (3) require an attestation over the sidecar. Tampering with the
+    /// payload breaks (2); tampering with both breaks (3); deleting the sidecar breaks (2) as well —
+    /// there is no arrangement of deletions that turns the check into a skip, because the REQUIREMENT is
+    /// compiled into the app rather than read from beside the artifact.</para>
+    /// </summary>
+    private async Task<BuildProvenanceVerdict> VerifyBuildProvenanceAsync(
+        string payloadDirectory, DaemonPayloadManifest manifest, CancellationToken ct)
+    {
+        var attestedManifest = AttestedManifestPathFor(payloadDirectory);
+        var expected = manifest.ToCanonicalText();
+
+        string? onDisk = null;
+        try
+        {
+            if (File.Exists(attestedManifest))
+                onDisk = await File.ReadAllTextAsync(attestedManifest, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            onDisk = null;
+        }
+
+        if (onDisk is null || !string.Equals(onDisk.Replace("\r\n", "\n"), expected, StringComparison.Ordinal))
+        {
+            // Hand the gate a digest that cannot match anything, so a non-attested build still gets its
+            // honest NotAttestedBuild verdict while an attested one refuses with the reason below.
+            var verdict = await _provenance.VerifyDigestAsync(
+                BuildArtifactKind.DaemonPayload, attestedManifest, string.Empty, ct).ConfigureAwait(false);
+            if (verdict.Outcome == BuildProvenanceOutcome.NotAttestedBuild)
+                return verdict;
+
+            return new BuildProvenanceVerdict(BuildProvenanceOutcome.Refused,
+                onDisk is null
+                    ? $"the attested payload manifest '{attestedManifest}' is missing or unreadable, so "
+                      + "the build-time attestation cannot be tied to the payload on disk. Refusing."
+                    : $"the payload on disk does not reproduce the attested manifest "
+                      + $"'{attestedManifest}' — the daemon build has been altered since it was attested. "
+                      + "Refusing.");
+        }
+
+        return await _provenance.VerifyDigestAsync(
+            BuildArtifactKind.DaemonPayload, attestedManifest, manifest.CanonicalDigest(), ct)
+            .ConfigureAwait(false);
     }
 
     /// <summary>

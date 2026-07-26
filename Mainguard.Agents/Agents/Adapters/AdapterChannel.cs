@@ -35,6 +35,13 @@ public enum AdapterChannelError
     /// signature. Never produced by the default verifier, which has no signing identity to check
     /// against and answers <see cref="SignatureVerdictKind.NotAvailable"/> instead.</summary>
     SignatureRejected,
+
+    /// <summary>MG-9: the adapter's declared <see cref="AdapterProvenanceLevel"/> could not be met — no
+    /// registry signature under a pinned npm key, bytes that do not hash to the signed integrity, or a
+    /// missing/mis-bound build-provenance attestation. Distinct from
+    /// <see cref="HashMismatch"/> (which only ever compares against a pin we ourselves wrote) because
+    /// this is the check that establishes ORIGIN rather than sameness.</summary>
+    ProvenanceRejected,
 }
 
 /// <summary>The typed refusal/failure of an adapter operation.</summary>

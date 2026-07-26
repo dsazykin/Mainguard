@@ -10,7 +10,8 @@ namespace Mainguard.Tests;
 
 // TI-17 (integration): Git LFS end-to-end over a LOCAL fixture — no network is needed for
 // track/commit/ls-files/prune. These need a real git-lfs (the SAME git the service shells out to),
-// so they are gated RequiresGitLfs and Assert.Skip cleanly when git-lfs is absent.
+// so they are gated [RequiresGitLfsFact] and report a genuine Skipped (not a failure) when
+// git-lfs is absent.
 //
 // Committing an LFS-tracked file MUST go through the git CLI (git add/commit) so git-lfs's clean
 // filter converts the content to a pointer — libgit2 would store the raw bytes. That is exactly why
@@ -28,13 +29,6 @@ public sealed class GitServiceLfsTests : IDisposable
     }
 
     public void Dispose() => _fx.Dispose();
-
-    // git-lfs 3.5.1 ships with Git-for-Windows here; skip only if it is genuinely unavailable.
-    private void RequireLfs()
-    {
-        if (!_lfs.IsAvailable(_fx.RepoPath))
-            throw Xunit.Sdk.SkipException.ForSkip("git-lfs is not available in this environment.");
-    }
 
     // Runs raw git in the fixture repo (setup / verification), asserting success unless told otherwise.
     private (int Code, string Out, string Err) Git(params string[] args)
@@ -54,10 +48,9 @@ public sealed class GitServiceLfsTests : IDisposable
 
     private static byte[] SampleBinary() => new byte[] { 0x42, 0x49, 0x4E, 0x00, 0x01, 0x02, 0xFF, 0xFE };
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void LfsTrack_ShouldWriteGitattributes_AndCommitPointer()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
 
@@ -73,10 +66,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.True(LfsPointer.IsPointer(show.Out), $"HEAD:asset.bin was not a pointer:\n{show.Out}");
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void LfsLsFiles_ShouldListTrackedObject()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
         CommitBinaryViaCli("asset.bin", SampleBinary());
@@ -90,10 +82,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.Contains("asset.bin", _lfs.ListFiles(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void Untrack_ShouldRoundTrip()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
         Assert.Contains("*.bin", _lfs.ListTrackedPatterns(_fx.RepoPath));
@@ -102,10 +93,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.DoesNotContain("*.bin", _lfs.ListTrackedPatterns(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void ListLfsFiles_TrackedPatternWithNoMatchingFiles_ShouldBeEmpty()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
         // Commit the .gitattributes but no *.bin file exists.
@@ -116,10 +106,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.Contains("*.bin", _lfs.ListTrackedPatterns(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void Track_WithExistingGitattributes_ShouldAppendNotClobber()
     {
-        RequireLfs();
         // A pre-existing, non-LFS .gitattributes.
         File.WriteAllText(Path.Combine(_fx.RepoPath, ".gitattributes"), "*.txt text\n");
         _lfs.Install(_fx.RepoPath);
@@ -133,10 +122,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.Equal(new[] { "*.bin" }, _lfs.ListTrackedPatterns(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void Track_PathWithSpaces_ShouldCommitPointer_AndListWithSpaces()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
         CommitBinaryViaCli("my asset.bin", SampleBinary());
@@ -150,10 +138,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.Equal("my asset.bin", files[0].Path);   // space preserved through the parser
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void IsEnabledForRepo_ShouldReflectInstallAndUninstall()
     {
-        RequireLfs();
         Assert.False(_lfs.IsEnabledForRepo(_fx.RepoPath));   // fresh repo: no lfs filters
         _lfs.Install(_fx.RepoPath);
         Assert.True(_lfs.IsEnabledForRepo(_fx.RepoPath));
@@ -161,10 +148,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.False(_lfs.IsEnabledForRepo(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void Prune_DryRun_ShouldReturnSummary_WithoutDeleting()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         _lfs.Track(_fx.RepoPath, "*.bin");
         CommitBinaryViaCli("asset.bin", SampleBinary());
@@ -177,10 +163,9 @@ public sealed class GitServiceLfsTests : IDisposable
         Assert.Single(_lfs.ListLfsFiles(_fx.RepoPath));
     }
 
-    [Fact]
+    [RequiresGitLfsFact]
     public void Pull_WithNoRemote_ShouldThrowTyped_NotHang()
     {
-        RequireLfs();
         _lfs.Install(_fx.RepoPath);
         // No remote configured → remote resolution throws a typed Mainguard exception (never a hang,
         // and never a secret on any URL — the authenticated path is not even reached).

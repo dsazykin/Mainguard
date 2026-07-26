@@ -159,14 +159,16 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task TokenFileDeletedWhileRunning_ShouldNotBreakExistingChannels()
     {
-        AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
         var tokenPath = TempToken();
         var port = FreePort();
         await using var app = await DaemonHost.StartAsync(new DaemonOptions { Port = port, LocalDev = true, TokenPath = tokenPath });
         var token = Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions
             .GetRequiredService<Mainguard.Server.Auth.SessionTokenFile>(app.Services).Token;
 
-        using var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{port}");
+        // MG-19: the control plane is mutually-authenticated TLS, so this goes through the real
+        // pinned transport. The credentials are loaded BEFORE the token file is deleted below —
+        // exactly like a live client that connected while the daemon was healthy.
+        using var channel = Fixtures.PinnedDaemonChannel.Pinned(port, tokenPath);
         var client = new AgentService.AgentServiceClient(channel);
         var headers = new Metadata { { "authorization", $"bearer {token}" } };
 

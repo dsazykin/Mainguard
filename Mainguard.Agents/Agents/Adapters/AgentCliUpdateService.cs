@@ -31,21 +31,27 @@ public sealed class AgentCliUpdateService
     private readonly IAdapterPinOverrideStore _pins;
     private readonly HttpClient _http;
     private readonly Action<string>? _log;
+    private readonly INpmProvenanceGate _provenance;
 
     /// <param name="handler">Injected transport for offline tests; null → a real handler.</param>
     /// <param name="log">Where a REFUSED update goes (MG-14). A refusal that only manifests as "nothing
     /// happened" is indistinguishable from "already current", which is precisely how a registry moving
     /// its tag backwards would stay invisible; the callers that have a log pass one.</param>
+    /// <param name="provenance">The MG-9 gate. Null → the real registry-backed gate over the same
+    /// transport (so a test that already stubs <paramref name="handler"/> keeps a coherent world), with
+    /// the npm keys pinned inside it.</param>
     public AgentCliUpdateService(
         AdapterChannel channel,
         IAdapterPinOverrideStore pins,
         HttpMessageHandler? handler = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        INpmProvenanceGate? provenance = null)
     {
         _channel = channel ?? throw new ArgumentNullException(nameof(channel));
         _pins = pins ?? throw new ArgumentNullException(nameof(pins));
         _http = new HttpClient(handler ?? new SocketsHttpHandler(), disposeHandler: true);
         _log = log;
+        _provenance = provenance ?? new NpmProvenanceGate(new HttpNpmProvenanceSource(_http));
     }
 
     /// <summary>
@@ -165,15 +171,28 @@ public sealed class AgentCliUpdateService
     /// below. Revert deliberately does NOT come through here (it writes the previous pin directly), so
     /// the one legitimate backwards move keeps working.</para>
     ///
-    /// <para><b>What the sha256 below is and is NOT.</b> It is computed from the bytes we just
-    /// downloaded, so it pins THOSE bytes for every later install/reinstall of this version — that is
-    /// real, and it is what stops a second fetch from installing something different. It is <b>not</b>
-    /// authenticity: a registry (or anything able to impersonate it on this hop) that serves a
-    /// malicious tarball has its tarball hashed and pinned, and the pin then verifies against itself.
-    /// This is trust-on-first-use and cannot be closed here — closing it needs an independently-known
-    /// good hash (a signature over the version, or an npm provenance attestation verified against a
-    /// trusted root). <see cref="IPayloadSignatureVerifier"/> is where that plugs in when it exists;
-    /// today it reports <see cref="SignatureVerdictKind.NotAvailable"/> and nothing is authenticated.</para>
+    /// <para><b>MG-9 — the circularity is closed HERE.</b> The sha256 stored below is still computed
+    /// from the bytes just downloaded, and on its own that would be trust-on-first-use: whoever served
+    /// the tarball would also be choosing the hash that later "verifies" it. So the pin is no longer
+    /// written on the strength of its own arithmetic. Before it is stored, the bytes must clear
+    /// <see cref="NpmProvenancePolicy"/> at the rung the adapter declares in the manifest — at minimum an
+    /// npm registry ECDSA signature over <c>{name}@{version}:{integrity}</c> verified against a public
+    /// key <b>compiled into this app</b> (<see cref="NpmSigningKeys"/>), with the downloaded tarball
+    /// required to hash to that signed integrity. The expected digest therefore arrives inside something
+    /// only npm's private key can produce, not out of the same response as the artifact. For an adapter
+    /// declaring <see cref="AdapterProvenanceLevel.NpmBuildProvenance"/> a SLSA build-provenance
+    /// attestation whose in-toto subject binds to those exact bytes is required on top.</para>
+    ///
+    /// <para><b>Fail-closed:</b> a refused verdict throws
+    /// <see cref="AdapterChannelError.ProvenanceRejected"/> and the pin is never moved. There is no
+    /// warn-and-continue and no fallback to the self-derived hash. The one rung that proceeds without
+    /// verification is <see cref="AdapterProvenanceLevel.None"/>, which a maintainer must write into the
+    /// manifest deliberately and which reports itself as unverified on every install.</para>
+    ///
+    /// <para><b>What is still NOT established:</b> that the <i>publisher</i> built the bytes, for the
+    /// four CLIs that publish no build provenance; and the Sigstore chain behind the one that does is
+    /// not validated in-process. See <see cref="AdapterProvenanceLevel"/> for the exact limits of each
+    /// rung, and <c>adapters.starter.json</c> for who sits where.</para>
     /// </summary>
     public async Task ApplyUpdateAsync(string adapterId, string version, CancellationToken ct = default)
     {
@@ -199,6 +218,24 @@ public sealed class AgentCliUpdateService
         }
 
         var (tarballUrl, bytes) = await FetchTarballAsync(package, version, ct).ConfigureAwait(false);
+
+        // MG-9: establish ORIGIN before the pin is written, so the hash below is a record of bytes that
+        // already cleared an externally-anchored check rather than a self-signed certificate of their own
+        // correctness. This runs on the bytes in hand — moving it after the pin write would let a refused
+        // payload leave a pin behind for EnsureAsync to install.
+        // The declared rung comes from the MANIFEST spec, never from the pin override: an override is a
+        // user-writable file, and letting it carry the requirement would let it lower the requirement.
+        var provenance = await _provenance
+            .EvaluateAsync(adapterId, current.ProvenanceLevel, package, version, bytes, ct)
+            .ConfigureAwait(false);
+        if (provenance.MustRefuse)
+        {
+            Refuse($"update refused: {provenance.Reason}");
+            throw new AdapterChannelException(AdapterChannelError.ProvenanceRejected, provenance.Reason);
+        }
+
+        _log?.Invoke(provenance.Reason);
+
         var sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
 
         var before = _pins.TryGet(adapterId);
@@ -267,7 +304,22 @@ public sealed class AgentCliUpdateService
             return;
         }
 
-        await ApplyUpdateAsync(adapterId, latest, ct).ConfigureAwait(false);
+        try
+        {
+            await ApplyUpdateAsync(adapterId, latest, ct).ConfigureAwait(false);
+        }
+        catch (AdapterChannelException ex) when (ex.Error == AdapterChannelError.ProvenanceRejected)
+        {
+            // MG-9, install side. The registry's `latest` did NOT clear its provenance rung, so those
+            // bytes are refused outright — that part is fail-closed and non-negotiable. What we then do
+            // is install the SHIPPED pin instead, and this is not a weakening: the bundled sha256 is a
+            // constant reviewed into this repository, so falling back lands on bytes a human vouched
+            // for rather than on bytes an attacker chose. Throwing here would instead let anyone who can
+            // interfere with the metadata request deny the user an agent entirely.
+            Refuse($"'{adapterId}': the registry's latest ({latest}) failed its provenance check — "
+                + $"{ex.Message} Installing the shipped pin {current.Version} instead.");
+            await _channel.EnsureAsync(adapterId, ct).ConfigureAwait(false);
+        }
     }
 
     /// <summary>The version "Revert" would restore for <paramref name="adapterId"/>, or null when

@@ -16,6 +16,7 @@ using Mainguard.Server.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -33,7 +34,8 @@ public static class DaemonHost
     /// Configures services + interceptors + the gRPC service map on an existing builder.
     /// Shared by the entry point and by <see cref="WebApplicationFactory"/>-based tests.
     /// </summary>
-    public static void ConfigureServices(WebApplicationBuilder builder, DaemonOptions options)
+    public static SessionTransportCertificates ConfigureServices(
+        WebApplicationBuilder builder, DaemonOptions options)
     {
         // Wipe the framework's default providers, then (unless --smoke) install the daemon's two-sink
         // pipeline: a single-line journald-friendly console (systemd captures stdout under -u mainguardd)
@@ -73,6 +75,13 @@ public static class DaemonHost
         var tokenFile = SessionTokenFile.Create(tokenPath);
         builder.Services.AddSingleton(tokenFile);
         lifecycle.LogInformation("session token ready");
+
+        // MG-19: the peer-authentication layer. Fresh per-session mTLS material is written beside the
+        // token with the same user-only permissions, so the bearer token is no longer the sole gate on
+        // the control plane. Returned to Build so the Kestrel listener can present/pin it.
+        var transportCertificates = SessionTransportCertificates.Create(tokenFile.Path);
+        builder.Services.AddSingleton(transportCertificates);
+        lifecycle.LogInformation("session transport credentials ready (mutual TLS, pinned)");
 
         builder.Services.AddSingleton<IAuditLog, InMemoryAuditLog>();
         builder.Services.AddSingleton<AgentSessionStore>();
@@ -197,6 +206,7 @@ public static class DaemonHost
         });
 
         lifecycle.LogInformation("gRPC pipeline configured; services mapping next");
+        return transportCertificates;
     }
 
     /// <summary>
@@ -352,12 +362,34 @@ public static class DaemonHost
     public static WebApplication Build(DaemonOptions options)
     {
         var builder = WebApplication.CreateBuilder();
+
+        // Services first: the session mTLS material must exist before the listener that presents it.
+        var certificates = ConfigureServices(builder, options);
+
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
-            // Loopback only. HTTP/2 cleartext (h2c) — the session token, not TLS, is the
-            // loopback trust boundary. The CONTROL PLANE is never bound anywhere else.
-            kestrel.Listen(IPAddress.Loopback, options.Port,
-                listen => listen.Protocols = HttpProtocols.Http2);
+            // Loopback only, and MUTUALLY AUTHENTICATED (MG-19). "Loopback" is not an isolation
+            // boundary here: under WSL2 localhostForwarding this in-VM listener is reachable from any
+            // process in the Windows user's session (measured — docs/security-architecture.md), so the
+            // bearer token used to be the entire gate and crossed the wire in cleartext. The listener now
+            // requires a client certificate pinned to this session and is rejected at the TLS handshake
+            // without one — before HTTP/2, gRPC, or the bearer interceptor. There is deliberately NO
+            // plaintext fallback: a downgrade knob is a downgrade attack.
+            kestrel.Listen(IPAddress.Loopback, options.Port, listen =>
+            {
+                listen.Protocols = HttpProtocols.Http2;
+                listen.UseHttps(https =>
+                {
+                    https.ServerCertificate = certificates.ServerCertificate;
+                    https.ClientCertificateMode = ClientCertificateMode.RequireCertificate;
+                    // Self-signed and session-scoped: there is no chain to build and no CRL to fetch.
+                    // Exact-fingerprint pinning replaces both, and setting this callback overrides
+                    // Kestrel's default chain validation (which would reject the untrusted issuer).
+                    https.CheckCertificateRevocation = false;
+                    https.ClientCertificateValidation =
+                        (certificate, _, _) => certificates.IsPinnedClientCertificate(certificate);
+                });
+            });
 
             // MG-13/MG-4: the model gateway is the one listener allowed off loopback, because the
             // agent jail is on an Internal=true network where 127.0.0.1 is the container itself, so a
@@ -372,7 +404,6 @@ public static class DaemonHost
             }
         });
 
-        ConfigureServices(builder, options);
         var app = builder.Build();
         MapServices(app);
         RegisterLifecycleLogging(app, options);
@@ -454,13 +485,22 @@ public static class DaemonHost
     /// </summary>
     public static async Task<int> RunSmokeAsync(DaemonOptions options)
     {
-        // h2c client support for the loopback probe.
-        AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
-
         await using var app = await StartAsync(options);
         var tokenFile = app.Services.GetRequiredService<SessionTokenFile>();
 
-        using var channel = GrpcChannel.ForAddress($"http://127.0.0.1:{options.Port}");
+        // MG-19: the self-probe goes through the same mutually-authenticated, pinned transport a real
+        // client uses — reading the credentials off disk exactly as the client does, so the smoke fails
+        // if the daemon ever stops writing usable material.
+        using var credentials = DaemonTransportCredentials.Load(
+            Path.GetDirectoryName(Path.GetFullPath(tokenFile.Path))!);
+        using var handler = new System.Net.Http.SocketsHttpHandler
+        {
+            SslOptions = credentials.BuildSslOptions(),
+        };
+
+        using var channel = GrpcChannel.ForAddress(
+            $"https://127.0.0.1:{options.Port}",
+            new GrpcChannelOptions { HttpHandler = handler });
         var client = new AgentService.AgentServiceClient(channel);
         var metadata = new Grpc.Core.Metadata { { "authorization", $"bearer {tokenFile.Token}" } };
         var deadline = DateTime.UtcNow.AddSeconds(10);

@@ -30,19 +30,23 @@ public sealed class DaemonClientReconnectTests
     [Fact]
     public async Task StreamAgentEvents_ShouldResume_AfterDaemonRestart_AndTransitionStates()
     {
-        AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
-
         var port1 = FreePort();
         var port2 = FreePort();
-        var host1 = await DaemonHost.StartAsync(new DaemonOptions { Port = port1, LocalDev = true, TokenPath = TempToken() });
-        var host2 = await DaemonHost.StartAsync(new DaemonOptions { Port = port2, LocalDev = true, TokenPath = TempToken() });
+        var tokenPath1 = TempToken();
+        var tokenPath2 = TempToken();
+        var host1 = await DaemonHost.StartAsync(new DaemonOptions { Port = port1, LocalDev = true, TokenPath = tokenPath1 });
+        var host2 = await DaemonHost.StartAsync(new DaemonOptions { Port = port2, LocalDev = true, TokenPath = tokenPath2 });
 
         var currentPort = port1;
+        var currentTokenPath = tokenPath1;
         var currentToken = host1.Services.GetRequiredService<SessionTokenFile>().Token;
         var token2 = host2.Services.GetRequiredService<SessionTokenFile>().Token;
 
+        // MG-19: the control plane is pinned mutual TLS, so reconnecting means re-reading the TARGET
+        // daemon's credentials as well as its token — each host mints its own session material.
         var client = new DaemonClient(
-            () => GrpcChannel.ForAddress($"http://127.0.0.1:{Volatile.Read(ref currentPort)}"),
+            () => Fixtures.PinnedDaemonChannel.Pinned(
+                Volatile.Read(ref currentPort), Volatile.Read(ref currentTokenPath)!),
             () => Volatile.Read(ref currentToken)!,
             FastBackoff);
 
@@ -83,6 +87,7 @@ public sealed class DaemonClientReconnectTests
             await host1.StopAsync();
             await host1.DisposeAsync();
             Volatile.Write(ref currentToken, token2);
+            Volatile.Write(ref currentTokenPath, tokenPath2);
             Volatile.Write(ref currentPort, port2);
 
             // Reconnect + fresh snapshot from host2 (resume).
