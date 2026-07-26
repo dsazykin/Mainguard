@@ -142,6 +142,82 @@ public sealed class ContainerReadinessTests
             EgressProxyConfigurator.ClassifyReadiness(state));
     }
 
+    // ---- telling "something stopped it" apart from "it crashed on boot" ----
+
+    // The CI failure that produced this: a proxy that lived 340ms, exited 143, and logged nothing. The
+    // message said "it most likely exited during boot", which is the one thing it definitely had NOT
+    // done — 143 is 128+15, i.e. SIGTERM. That wording sent repeated investigations after a boot bug
+    // that never existed, so the verdict is now derived from the state rather than assumed.
+    [Theory]
+    [InlineData(143)] // SIGTERM — docker stop
+    [InlineData(137)] // SIGKILL — docker kill / force-remove
+    [InlineData(130)] // SIGINT
+    public void SignalExits_AreClassifiedAsExternalStops(long exitCode)
+    {
+        Assert.True(EgressProxyConfigurator.IsExternalStopExit(exitCode));
+
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = exitCode },
+            System.TimeSpan.FromMilliseconds(340));
+
+        Assert.Contains("STOPPED EXTERNALLY", verdict, System.StringComparison.Ordinal);
+        Assert.Contains("did NOT fail to boot", verdict, System.StringComparison.Ordinal);
+        // The phrase that misled must not appear for a signalled container.
+        Assert.DoesNotContain("exited on its own", verdict, System.StringComparison.Ordinal);
+    }
+
+    // A container that really did crash must still say so plainly — the fix must not make every
+    // failure look like someone else's fault.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(127)]
+    public void OrdinaryExits_AreClassifiedAsRealBootFailures(long exitCode)
+    {
+        Assert.False(EgressProxyConfigurator.IsExternalStopExit(exitCode));
+
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = exitCode }, lifetime: null);
+
+        Assert.Contains("genuine boot failure", verdict, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("STOPPED EXTERNALLY", verdict, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OomKill_IsCalledOutSeparately()
+    {
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, OOMKilled = true, ExitCode = 137 }, lifetime: null);
+
+        Assert.Contains("OOM-killed", verdict, System.StringComparison.Ordinal);
+    }
+
+    // A sub-second lifetime is the tell that separates "signalled right after starting" from a
+    // deliberate shutdown, so it has to reach the reader.
+    [Fact]
+    public void ShortLifetime_IsReported()
+    {
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = 143 },
+            System.TimeSpan.FromMilliseconds(340));
+
+        Assert.Contains("lived only 340ms", verdict, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Lifetime_IsTheSpanBetweenStartAndFinish()
+    {
+        var span = EgressProxyConfigurator.Lifetime(new ContainerState
+        {
+            StartedAt = "2026-07-26T01:28:35.972667175Z",
+            FinishedAt = "2026-07-26T01:28:36.312258351Z",
+        });
+
+        // The real CI numbers, to sub-millisecond precision: 339.59ms.
+        Assert.NotNull(span);
+        Assert.InRange(span!.Value.TotalMilliseconds, 339.0, 340.0);
+    }
+
     [Fact]
     public void NullState_IsPending_NeverReady()
     {

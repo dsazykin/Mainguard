@@ -101,14 +101,27 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         Allowlist.Allows(host) ? EgressVerdict.Allowed : EgressVerdict.Denied;
 
     /// <summary>
-    /// The proxy we were adopting disappeared mid-sequence. Internal control flow, never surfaced:
-    /// <see cref="EnsureReadyAsync"/> answers it by starting over and creating a fresh proxy.
+    /// Something outside this call disturbed the proxy while we were adopting it — it was removed, or
+    /// stopped/killed by a signal. Internal control flow, never surfaced: <see cref="EnsureReadyAsync"/>
+    /// answers it by starting the whole sequence over.
     /// </summary>
-    private sealed class ProxyVanishedException : Exception
+    private sealed class ProxyDisturbedException : Exception
     {
-        public ProxyVanishedException(string containerId)
-            : base($"The egress proxy '{containerId}' was removed while EnsureReadyAsync was adopting it.") { }
+        public ProxyDisturbedException(string containerId, string what)
+            : base($"The egress proxy '{containerId}' was {what} while EnsureReadyAsync was adopting it.") { }
     }
+
+    /// <summary>Exit codes that mean "a signal ended this", i.e. 128+N. A container that exits this way
+    /// did not fail — something stopped it, and for a SHARED singleton that is a routine race, not an
+    /// error. 143 = SIGTERM (docker stop), 137 = SIGKILL (docker kill / force-remove), 130 = SIGINT.</summary>
+    internal static bool IsExternalStopExit(long exitCode) => exitCode is 143 or 137 or 130;
+
+    /// <summary>How many times the adopt-or-create sequence is attempted before a failure is real.</summary>
+    private const int MaxAdoptionAttempts = 3;
+
+    /// <summary>Breathing room before re-attempting, so a retry does not re-enter the same race Docker
+    /// is still resolving (a stop that is mid-flight completes in well under this).</summary>
+    private static readonly TimeSpan AdoptionRetryDelay = TimeSpan.FromMilliseconds(400);
 
     public async Task EnsureReadyAsync(CancellationToken ct = default)
     {
@@ -116,26 +129,31 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         var internalId = await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
         var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
 
-        // The proxy is a SHARED, singleton container: every SandboxFixture teardown removes it, an
-        // operator may remove it, and a second daemon may be racing us. So it can disappear at ANY
-        // point between finding it and finishing with it — and the correct answer to that is simply
-        // "create a fresh one", which is already the fall-through. Retrying the whole adopt-or-create
-        // sequence once is what makes that true; patching each individual call is not, because the
-        // window exists before every one of them.
+        // The proxy is a SHARED, singleton container. Every SandboxFixture teardown removes it, the VM
+        // shutdown path stops it, an operator may do either, and Docker itself can still be finishing a
+        // stop when the next start arrives. So between finding it and finishing with it, it can be
+        // removed OR signalled out from under us at ANY point — and neither is a failure. The right
+        // answer to both is the same: start the sequence over.
         //
-        // This is the flake: reproduced locally at 3 failures in 10 runs of the revive test, where the
-        // RECOVERY path itself threw — the catch below called RemoveContainerAsync on a container that
-        // a previous test's teardown had already removed, and that 404 escaped uncaught.
-        for (var attempt = 0; ; attempt++)
+        // Retrying at the SEQUENCE level is deliberate. The window exists before every individual call,
+        // so hardening call sites one at a time only moves it. Two distinct instances of this bug have
+        // now been fixed by widening this loop rather than by patching a call:
+        //   * the container REMOVED mid-adoption — the recovery path's own RemoveContainerAsync raised
+        //     a 404 that escaped uncaught (reproduced locally: 3 failures in 10 runs);
+        //   * the container SIGTERM'd mid-adoption — CI caught a proxy that lived 340ms and exited 143
+        //     with empty logs, because a rapid stop→start let our start land inside a stop Docker was
+        //     still completing, which then signalled the process we had just started.
+        for (var attempt = 1; ; attempt++)
         {
             try
             {
                 await EnsureProxyReadyOnceAsync(egressId, ct).ConfigureAwait(false);
                 return;
             }
-            catch (ProxyVanishedException) when (attempt == 0)
+            catch (ProxyDisturbedException) when (attempt < MaxAdoptionAttempts)
             {
-                // Gone underneath us — go around once more and create it fresh.
+                // Removed or signalled underneath us. Let Docker settle, then go around again.
+                await Task.Delay(AdoptionRetryDelay, ct).ConfigureAwait(false);
             }
         }
     }
@@ -188,15 +206,26 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // produced an opaque Docker conflict from deep inside the exec instead of a real diagnosis.
         if (!await WaitUntilRunningAsync(proxyId, ct).ConfigureAwait(false))
         {
-            // "Not running" and "no longer exists" are different diagnoses with different answers. A
-            // container removed underneath us is a concurrent teardown, not a boot failure, and the
-            // right response is to create a fresh one — reporting it as "it exited during boot" sent
-            // three CI investigations after a boot bug that was never there.
-            if (!await ContainerExistsAsync(proxyId, ct).ConfigureAwait(false))
+            // Three different states hide behind "not running", with three different answers, and
+            // conflating them is what sent repeated CI investigations after a boot bug that was never
+            // there. Only the third is a real failure.
+            var state = await TryInspectStateAsync(proxyId, ct).ConfigureAwait(false);
+
+            // 1. Removed underneath us — a concurrent teardown. Start over and create a fresh one.
+            if (state is null)
             {
-                throw new ProxyVanishedException(proxyId);
+                throw new ProxyDisturbedException(proxyId, "removed");
             }
 
+            // 2. Signalled underneath us — `docker stop`/`kill`, or a stop Docker was still completing
+            //    when our start landed. The container did not fail; something ended it. Start over.
+            if (!state.Running && IsExternalStopExit(state.ExitCode))
+            {
+                throw new ProxyDisturbedException(
+                    proxyId, $"stopped externally (exit {state.ExitCode} = 128+{state.ExitCode - 128})");
+            }
+
+            // 3. It genuinely came up wrong. THIS is a boot failure, and it reports as one.
             throw new DockerContainerNotRunningException(
                 proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
@@ -552,10 +581,22 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
                   .Append(" oomKilled=").Append(state?.OOMKilled)
                   .Append(" startedAt=").Append(state?.StartedAt)
                   .Append(" finishedAt=").Append(state?.FinishedAt);
+
+            var lifetime = Lifetime(state);
+            if (lifetime is not null)
+            {
+                report.Append(" lifetime=").Append((long)lifetime.Value.TotalMilliseconds).Append("ms");
+            }
+
             if (!string.IsNullOrWhiteSpace(state?.Error))
             {
                 report.Append(" dockerError='").Append(state!.Error).Append('\'');
             }
+
+            // Name the verdict rather than leaving the reader to decode 128+N. An exit of 143 with an
+            // empty log and a sub-second lifetime is NOT a boot failure, and saying "it exited during
+            // boot" about it actively misdirects — that wording cost several investigations.
+            report.Append("\nverdict: ").Append(Verdict(state, lifetime));
         }
         catch (Exception ex)
         {
@@ -582,6 +623,53 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         return report.ToString();
     }
 
+    /// <summary>How long the container's last run lasted, when both timestamps are known.</summary>
+    internal static TimeSpan? Lifetime(ContainerState? state)
+    {
+        var started = ParseDockerTime(state?.StartedAt);
+        var finished = ParseDockerTime(state?.FinishedAt);
+        return started is not null && finished is not null && finished > started
+            ? finished - started
+            : null;
+    }
+
+    /// <summary>
+    /// A plain-language reading of why the container is not running. The exit code alone is not
+    /// self-explanatory to whoever reads a CI log at 3am, and the difference that matters most —
+    /// "something stopped this" versus "this crashed" — is invisible unless you know 128+N by heart.
+    /// </summary>
+    internal static string Verdict(ContainerState? state, TimeSpan? lifetime)
+    {
+        if (state is null)
+        {
+            return "the container could not be inspected.";
+        }
+
+        if (state.Running)
+        {
+            return "the container reports Running (it came up after the wait expired).";
+        }
+
+        if (state.OOMKilled)
+        {
+            return "the kernel OOM-killed it — raise the memory ceiling or find the leak.";
+        }
+
+        if (IsExternalStopExit(state.ExitCode))
+        {
+            var signal = state.ExitCode - 128;
+            var name = signal switch { 15 => "SIGTERM", 9 => "SIGKILL", 2 => "SIGINT", _ => "a signal" };
+            var brief = lifetime is not null && lifetime.Value < TimeSpan.FromSeconds(2)
+                ? $" It lived only {(long)lifetime.Value.TotalMilliseconds}ms, so it was ended almost immediately after starting."
+                : string.Empty;
+            return $"STOPPED EXTERNALLY — exit {state.ExitCode} is 128+{signal} ({name}), i.e. something "
+                 + $"signalled this container; it did NOT fail to boot.{brief} Look for a concurrent "
+                 + "`docker stop`/`kill`, a teardown racing this call, or a stop Docker was still completing.";
+        }
+
+        return $"it exited on its own with code {state.ExitCode} — a genuine boot failure; the logs below say why.";
+    }
+
     /// <summary>Force-removes a container, treating "already gone" as success. Used on every teardown
     /// path here: the proxy is shared, so something else removing it first is a normal outcome, not an
     /// error — and a cleanup that throws its own 404 masks whatever we were actually recovering from.</summary>
@@ -598,17 +686,18 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         }
     }
 
-    /// <summary>Whether the container still exists at all (as opposed to existing but not running).</summary>
-    private async Task<bool> ContainerExistsAsync(string containerId, CancellationToken ct)
+    /// <summary>The container's state, or null when it no longer exists — the distinction the caller
+    /// needs to tell "removed" apart from "still here but not running".</summary>
+    private async Task<ContainerState?> TryInspectStateAsync(string containerId, CancellationToken ct)
     {
         try
         {
-            await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
-            return true;
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            return inspect.State;
         }
         catch (DockerContainerNotFoundException)
         {
-            return false;
+            return null;
         }
     }
 
@@ -783,8 +872,11 @@ public sealed class DockerContainerNotRunningException : Exception
     /// — what the container printed on its way out — was never recoverable. Empty only if the
     /// diagnostic itself could not run.</param>
     public DockerContainerNotRunningException(string containerId, string diagnostics = "")
-        : base($"The egress proxy container '{containerId}' was started but never reached a running state. "
-             + "It most likely exited during boot."
+        // NOTE: no guess about the cause in this sentence. It used to assert "it most likely exited
+        // during boot", which was wrong for every externally-stopped container and sent readers hunting
+        // a boot bug that did not exist. The verdict is derived from the container's actual state and
+        // carried in the diagnostics below.
+        : base($"The egress proxy container '{containerId}' was started but never reached a running state."
              + (string.IsNullOrWhiteSpace(diagnostics) ? string.Empty : diagnostics))
     {
         ContainerId = containerId;

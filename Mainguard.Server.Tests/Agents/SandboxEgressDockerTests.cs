@@ -188,6 +188,35 @@ public class SandboxEgressDockerTests
         Assert.Equal(EgressProxyConfigurator.AgentNetworkName, ex.NetworkName);
     }
 
+    // The proxy is a SHARED singleton, so it can be stopped or removed while EnsureReadyAsync is in the
+    // middle of adopting it — by a fixture teardown, by the VM-shutdown path, or by Docker still
+    // completing a stop when the next start lands. CI caught the last of those: a proxy that lived
+    // 340ms and exited 143 (128+15, SIGTERM) with empty logs, reported as "it exited during boot".
+    // Neither removal nor a signal is a failure; both must resolve by starting the sequence over.
+    [RequiresDockerFact]
+    public async Task EnsureReady_WhenTheProxyIsStoppedUnderneathIt_RecoversInsteadOfFailing()
+    {
+        await using var fx = new SandboxFixture();
+        await fx.EnsureEgressReadyAsync();
+
+        for (var i = 0; i < 4; i++)
+        {
+            // Deliberately race a stop against an adopt — the exact interleaving CI hit.
+            var stop = fx.Docker.Containers.StopContainerAsync(
+                EgressProxyConfigurator.ProxyContainerName, new ContainerStopParameters());
+            var ensure = fx.EnsureEgressReadyAsync();
+            await Task.WhenAll(stop, ensure);
+        }
+
+        var inspect = await fx.Docker.Containers.InspectContainerAsync(EgressProxyConfigurator.ProxyContainerName);
+        Assert.True(inspect.State.Running, "the proxy must end up running despite being stopped mid-adoption");
+
+        // And it must be a WORKING proxy, not merely a running one — the recovery has to re-push policy.
+        var status = await fx.Engine.ExecAsync(
+            EgressProxyConfigurator.ProxyContainerName, new[] { "cat", "/run/mainguard/dnsmasq.status" });
+        Assert.Equal("ok", status.Stdout.Trim());
+    }
+
     [RequiresDockerFact]
     public async Task ProxyContainer_ShouldRunHardened_NoNetRaw_SeccompAndReadOnlyRootfs()
     {
