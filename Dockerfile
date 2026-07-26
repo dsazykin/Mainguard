@@ -51,25 +51,28 @@ WORKDIR /src
 
 # --- Layer-cache the restore -------------------------------------------------
 # Copy only the project graph first so `dotnet restore` is cached until a
-# .csproj / solution actually changes.
-COPY global.json Mainguard.slnx dotnet-tools.json ./
-COPY Mainguard.Git/Mainguard.Git.csproj                                       Mainguard.Git/
-COPY Mainguard.Agents/Mainguard.Agents.csproj                                 Mainguard.Agents/
-COPY Mainguard.UI/Mainguard.UI.csproj                                         Mainguard.UI/
-COPY Mainguard.Agents.UI/Mainguard.Agents.UI.csproj                           Mainguard.Agents.UI/
-COPY Mainguard.App.Shell/Mainguard.App.Shell.csproj                           Mainguard.App.Shell/
-COPY Mainguard.Client.App/Mainguard.Client.App.csproj                         Mainguard.Client.App/
-COPY Mainguard.Pro.App/Mainguard.Pro.App.csproj                               Mainguard.Pro.App/
-COPY Mainguard.Protos/Mainguard.Protos.csproj                                 Mainguard.Protos/
-COPY Mainguard.Server/Mainguard.Server.csproj                                 Mainguard.Server/
-COPY Mainguard.Server.Tests/Mainguard.Server.Tests.csproj                     Mainguard.Server.Tests/
-COPY Mainguard.Tests/Mainguard.Tests.csproj                                   Mainguard.Tests/
+# .csproj / solution actually changes. Each project's packages.lock.json rides along with its
+# .csproj, and Directory.Build.props (which turns lockfiles on) with the solution — without them
+# this layer would resolve an UNLOCKED graph and the container toolchain would stop reproducing
+# what CI builds, which is the whole point of the wrapper (MG-35).
+COPY global.json Mainguard.slnx dotnet-tools.json Directory.Build.props ./
+COPY Mainguard.Git/Mainguard.Git.csproj                     Mainguard.Git/packages.lock.json                     Mainguard.Git/
+COPY Mainguard.Agents/Mainguard.Agents.csproj               Mainguard.Agents/packages.lock.json                   Mainguard.Agents/
+COPY Mainguard.UI/Mainguard.UI.csproj                       Mainguard.UI/packages.lock.json                       Mainguard.UI/
+COPY Mainguard.Agents.UI/Mainguard.Agents.UI.csproj         Mainguard.Agents.UI/packages.lock.json                 Mainguard.Agents.UI/
+COPY Mainguard.App.Shell/Mainguard.App.Shell.csproj         Mainguard.App.Shell/packages.lock.json                 Mainguard.App.Shell/
+COPY Mainguard.Client.App/Mainguard.Client.App.csproj       Mainguard.Client.App/packages.lock.json               Mainguard.Client.App/
+COPY Mainguard.Pro.App/Mainguard.Pro.App.csproj             Mainguard.Pro.App/packages.lock.json                   Mainguard.Pro.App/
+COPY Mainguard.Protos/Mainguard.Protos.csproj               Mainguard.Protos/packages.lock.json                   Mainguard.Protos/
+COPY Mainguard.Server/Mainguard.Server.csproj               Mainguard.Server/packages.lock.json                   Mainguard.Server/
+COPY Mainguard.Server.Tests/Mainguard.Server.Tests.csproj   Mainguard.Server.Tests/packages.lock.json             Mainguard.Server.Tests/
+COPY Mainguard.Tests/Mainguard.Tests.csproj                 Mainguard.Tests/packages.lock.json                     Mainguard.Tests/
 # Mainguard.Tests ProjectReferences this nested harness, so restore needs its csproj too.
-COPY Mainguard.Tests/TestTools/ScriptedAgent/ScriptedAgentHarness.csproj      Mainguard.Tests/TestTools/ScriptedAgent/
-COPY installer/Mainguard.Installer/Mainguard.Installer.csproj                 installer/Mainguard.Installer/
-COPY installer/Mainguard.Installer.Elevated/Mainguard.Installer.Elevated.csproj installer/Mainguard.Installer.Elevated/
-COPY installer/Mainguard.Uninstall/Mainguard.Uninstall.csproj                 installer/Mainguard.Uninstall/
-RUN dotnet tool restore && dotnet restore Mainguard.slnx
+COPY Mainguard.Tests/TestTools/ScriptedAgent/ScriptedAgentHarness.csproj Mainguard.Tests/TestTools/ScriptedAgent/packages.lock.json Mainguard.Tests/TestTools/ScriptedAgent/
+COPY installer/Mainguard.Installer/Mainguard.Installer.csproj                   installer/Mainguard.Installer/packages.lock.json           installer/Mainguard.Installer/
+COPY installer/Mainguard.Installer.Elevated/Mainguard.Installer.Elevated.csproj installer/Mainguard.Installer.Elevated/packages.lock.json  installer/Mainguard.Installer.Elevated/
+COPY installer/Mainguard.Uninstall/Mainguard.Uninstall.csproj                   installer/Mainguard.Uninstall/packages.lock.json           installer/Mainguard.Uninstall/
+RUN dotnet tool restore && dotnet restore Mainguard.slnx --locked-mode
 
 # --- Copy the rest & build ---------------------------------------------------
 COPY . .
