@@ -14,10 +14,15 @@
          the App refreshes the in-VM daemon when it differs from the App's own. Keep these in
          lockstep with Mainguard.App.Shell.csproj's Version — a drifted pair makes every install look
          permanently skewed. Bumped 0.2.4 → 0.2.5 in step 2g: the gRPC package rename (mainguard.v1 →
-         mainguard.v1) changes the wire service paths, so the skew check must read as changed. -->
-    <Version>0.2.5</Version>
-    <FileVersion>0.2.5.0</FileVersion>
-    <InformationalVersion>0.2.5</InformationalVersion>
+         mainguard.v1) changes the wire service paths, so the skew check must read as changed.
+         Bumped 0.2.5 → 0.2.6 for MG-27/MG-36: the jail-image sources changed (a new
+         SandboxImageVersions constant the DAEMON preflight compares — versioning-discipline rule 3),
+         and the daemon spawn chain itself changed (digest-pinned image ref + per-agent network
+         segments). No `build/mainguardos/VERSION` cut: the images ship beside the app, not inside the
+         MainguardOS tarball. -->
+    <Version>0.2.6</Version>
+    <FileVersion>0.2.6.0</FileVersion>
+    <InformationalVersion>0.2.6</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

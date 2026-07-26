@@ -12,7 +12,10 @@
 #   /run/mainguard/dnsmasq.conf      — pinned DNS (allowlisted names only; MG-7: the agents' ONLY resolver)
 #   /run/mainguard/backstop.sh       — the proxy-namespace INPUT backstop
 
-FROM debian:bookworm-slim
+# MG-27: pinned by DIGEST, not by the floating `bookworm-slim` tag — see the identical note in
+# images/mainguard-agent-base/Dockerfile. Both images share the base, so both digests are refreshed
+# together (and a refresh moves the mainguard.image.version constants, which the guard test enforces).
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 # procps is NOT optional: reload.sh has always ended each daemon with `pkill` before restarting it, and
 # `pkill` lives in procps, which was never installed. Every one of those calls was a silent no-op

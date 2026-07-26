@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -133,9 +134,36 @@ public static class EgressProxyConfig
     /// </summary>
     /// <param name="proxyAddress">The proxy's own IPv4 on the agent network — the only legitimate
     /// destination for agent traffic. Null/empty falls back to port-only rules (pure tests).</param>
-    public static string RenderIptablesScript(int proxyPort, string? proxyAddress = null)
+    public static string RenderIptablesScript(int proxyPort, string? proxyAddress = null) =>
+        RenderIptablesScript(
+            proxyPort,
+            string.IsNullOrWhiteSpace(proxyAddress) ? Array.Empty<string>() : new[] { proxyAddress });
+
+    /// <summary>
+    /// MG-36 — the same backstop for a proxy that holds SEVERAL addresses, one per per-agent segment.
+    ///
+    /// <para>Segmenting the agents (one internal network each) necessarily gives the proxy a new
+    /// interface, and therefore a new address, on every segment it fronts. The MG-18 destination
+    /// constraint is what makes the ACCEPTs meaningful — "port 53 to anywhere" is not a restriction —
+    /// so it has to be re-rendered as the segment set grows rather than dropped. Every admitted
+    /// address gets its own rule; the chain stays default-deny and everything not named is DROPped,
+    /// which is exactly the property the single-address form had.</para>
+    /// </summary>
+    /// <param name="proxyAddresses">Every address the proxy answers on across the agent segments.
+    /// Empty falls back to port-only rules (the pure tests and the pre-MG-7 paths).</param>
+    public static string RenderIptablesScript(int proxyPort, IReadOnlyCollection<string> proxyAddresses)
     {
-        var to = string.IsNullOrWhiteSpace(proxyAddress) ? string.Empty : $" -d {proxyAddress.Trim()}";
+        var destinations = (proxyAddresses ?? Array.Empty<string>())
+            .Where(a => !string.IsNullOrWhiteSpace(a))
+            .Select(a => a.Trim())
+            .Distinct(System.StringComparer.Ordinal)
+            .OrderBy(a => a, System.StringComparer.Ordinal)
+            .Select(a => " -d " + a)
+            .ToList();
+        if (destinations.Count == 0)
+        {
+            destinations.Add(string.Empty); // port-only fallback
+        }
 
         var sb = new StringBuilder();
         sb.Append("#!/bin/sh\n");
@@ -143,6 +171,7 @@ public static class EgressProxyConfig
         sb.Append("# Agent containment is the Internal network, asserted daemon-side; this chain bounds\n");
         sb.Append("# what an agent may reach INSIDE the proxy: tinyproxy + dnsmasq at the proxy's own\n");
         sb.Append("# address, nothing else. FORWARD stays default-deny as defence in depth only.\n");
+        sb.Append("# MG-36: one rule per address — the proxy answers on every per-agent segment it fronts.\n");
         sb.Append("set -eu\n");
 
         // Flush first. Every reload used to APPEND, so the chain grew a fresh copy of every rule each
@@ -155,16 +184,24 @@ public static class EgressProxyConfig
         sb.Append("iptables -P INPUT DROP\n");
         sb.Append("iptables -A INPUT -i lo -j ACCEPT\n");
         sb.Append("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p udp{to} --dport 53 -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p tcp{to} --dport 53 -j ACCEPT\n");
+        foreach (var to in destinations)
+        {
+            sb.Append($"iptables -A INPUT -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+            sb.Append($"iptables -A INPUT -p udp{to} --dport 53 -j ACCEPT\n");
+            sb.Append($"iptables -A INPUT -p tcp{to} --dport 53 -j ACCEPT\n");
+        }
+
         sb.Append("iptables -A INPUT -j DROP\n");
 
         sb.Append("iptables -P FORWARD DROP\n");
         sb.Append("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p udp{to} --dport 53 -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p tcp{to} --dport 53 -j ACCEPT\n");
+        foreach (var to in destinations)
+        {
+            sb.Append($"iptables -A FORWARD -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+            sb.Append($"iptables -A FORWARD -p udp{to} --dport 53 -j ACCEPT\n");
+            sb.Append($"iptables -A FORWARD -p tcp{to} --dport 53 -j ACCEPT\n");
+        }
+
         sb.Append("iptables -A FORWARD -j DROP\n");
         return sb.ToString();
     }

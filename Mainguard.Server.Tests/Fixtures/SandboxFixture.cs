@@ -24,6 +24,11 @@ public sealed class SandboxFixture : IAsyncDisposable
     private readonly List<string> _containerIds = new();
     private readonly List<string> _tempWorktrees = new();
 
+    /// <summary>MG-36 — the per-agent segments this fixture asked for, so teardown reclaims them.
+    /// Docker's default local bridge pool is only ~32 networks deep; a suite that leaked one per test
+    /// would eventually fail every subsequent create with an address-pool error.</summary>
+    private readonly List<(string RepoHash, string AgentId)> _segments = new();
+
     public IDockerClient Docker { get; }
     public DockerSandboxEngine Engine { get; }
     public EgressProxyConfigurator Egress { get; }
@@ -80,6 +85,51 @@ public sealed class SandboxFixture : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// MG-36 — creates and starts a hardened jail on <b>this agent's own default-deny segment</b>,
+    /// building the create request with the production <see cref="ContainerSpecBuilder"/>.
+    ///
+    /// <para>Deliberately NOT <see cref="SpawnAsync"/>: that path delivers secrets over an exec's
+    /// stdin, and a hijacked-stream stdin exec is exactly what some Docker endpoints (Docker Desktop's
+    /// WSL2 socket proxy, verified) do not deliver — which would make a NETWORK test fail for reasons
+    /// that have nothing to do with the network. What this test needs from a jail is that it is a real
+    /// hardened container sitting on a real segment; it needs no credentials at all. Everything about
+    /// the spec — capabilities, seccomp, read-only rootfs, the MG-7 resolver pin, the segment — comes
+    /// from the same builder the daemon uses.</para>
+    /// </summary>
+    public async Task<(string ContainerId, AgentSegment Segment)> CreateJailOnSegmentAsync(
+        string repoHash, string agentId, CancellationToken ct = default)
+    {
+        await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
+        var segment = await Egress.EnsureAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false);
+
+        var create = ContainerSpecBuilder.Build(new ContainerSpecRequest(
+            RepoHash: repoHash,
+            AgentId: agentId,
+            WorktreePath: NewTempWorktree(),
+            ImageRef: ImageRef,
+            Limits: new SandboxLimits(1L * 1024 * 1024 * 1024, 256),
+            NetworkName: segment.NetworkName,
+            Credentials: CredTmpfsSpec.Create(1000, 1001),
+            ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)!,
+            DnsServerAddress: segment.ProxyAddress));
+
+        var created = await Docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
+        _containerIds.Add(created.ID);
+        _segments.Add((repoHash, agentId));
+        await Docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+        return (created.ID, segment);
+    }
+
+    /// <summary>The container's IPv4 on <paramref name="networkName"/> (its segment).</summary>
+    public async Task<string?> AddressOnAsync(string containerId, string networkName, CancellationToken ct = default)
+    {
+        var inspect = await Docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+        return inspect.NetworkSettings?.Networks is { } nets && nets.TryGetValue(networkName, out var ep)
+            ? ep?.IPAddress
+            : null;
+    }
+
     /// <summary>Runs a command in a live sandbox and returns exit + output.</summary>
     public Task<SandboxExecResult> ExecAsync(string containerId, params string[] command)
         => Engine.ExecAsync(containerId, command);
@@ -112,6 +162,14 @@ public sealed class SandboxFixture : IAsyncDisposable
             catch { /* never fail a test from cleanup */ }
         }
 
+        // MG-36: reclaim this test's per-agent segments before the shared teardown (the proxy has to
+        // still exist for the disconnect leg to be meaningful).
+        foreach (var (repoHash, agentId) in _segments)
+        {
+            try { await Egress.RemoveAgentSegmentAsync(repoHash, agentId); }
+            catch { /* never fail a test from cleanup */ }
+        }
+
         // Tear down the SHARED egress proxy + networks this fixture (idempotently) created. Leaving them
         // behind let one test/feature's Docker state bleed into the next — the root of the "works alone,
         // fails when other Docker tests run in the same job" flakiness. Serial execution (assembly
@@ -141,6 +199,23 @@ public sealed class SandboxFixture : IAsyncDisposable
             try { await RemoveNetworkByNameAsync(network); }
             catch { /* best effort */ }
         }
+
+        // MG-36: sweep every per-agent segment, including ones a failed/aborted test never registered.
+        // A segment left behind is a bridge-pool slot left behind, and the pool is small.
+        try
+        {
+            var all = await Docker.Networks.ListNetworksAsync();
+            foreach (var net in all)
+            {
+                if (net.Name is not null
+                    && net.Name.StartsWith(EgressProxyConfigurator.AgentSegmentPrefix, StringComparison.Ordinal))
+                {
+                    try { await RemoveNetworkByNameAsync(net.Name); }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+        catch { /* best effort */ }
     }
 
     private async Task RemoveNetworkByNameAsync(string name)
