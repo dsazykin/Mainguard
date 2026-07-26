@@ -20,6 +20,7 @@ using Mainguard.Server.Tests.Fixtures;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Xunit;
 
 namespace Mainguard.Server.Tests;
@@ -436,6 +437,61 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var listB = await spawns.HandleShimRequestAsync(
             new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("list"), coordB, default);
         Assert.Equal(new[] { b.AgentId }, listB.Agents!.Select(line => line.Split('\t')[0]).ToArray());
+    }
+
+    /// <summary>
+    /// MG-37 flake — the in-proc daemon graph must read an INJECTED memory sample, never the box's
+    /// <c>/proc/meminfo</c>.
+    ///
+    /// <para>This is the fix's own regression test, and it is deterministic on every platform because
+    /// the asserted total is a sentinel no real machine reports: unfixed it fails on Linux (the real
+    /// <c>MemTotal</c>) and on Windows alike (no <c>/proc/meminfo</c> → the sampler returns a zeroed
+    /// sample). It does not depend on the box actually being under pressure, which is precisely what
+    /// made the original failure unreproducible.</para>
+    /// </summary>
+    [Fact]
+    public void InProcDaemonGraph_ReadsAnInjectedMemorySample_NotTheHostsProcMeminfo()
+    {
+        using var rig = WiringRig.Create(_daemon);
+        var sample = rig.Host.Services.GetRequiredService<AdmissionController>().CurrentSample();
+
+        Assert.Equal(DaemonFixture.RoomySample.MemTotalKb, sample.MemTotalKb);
+        Assert.True(sample.UsedFraction < AdmissionController.DefaultUsedThreshold,
+            $"the in-proc tier is admitting against a {sample.UsedFraction:P0}-used sample — a shim spawn "
+            + "will be refused whenever the machine happens to be busy, which is the MG-37 flake.");
+    }
+
+    /// <summary>
+    /// MG-37 flake, the mechanism — what a memory refusal actually does to
+    /// <see cref="ShimList_IsScopedToTheCallersOwnWorkers"/>, pinned deterministically.
+    ///
+    /// <para>Admission is consulted on the wired shim-spawn path (MG-2), so a machine over the 85%
+    /// threshold turns the worker spawn into <c>Ok:false</c> and the coordinator's own list into an
+    /// EMPTY one — the exact shape the flake produced. Kept as a test rather than a comment because it
+    /// is the evidence that the refusal is a legitimate, correctly-reported production behaviour and
+    /// not something to be softened: the bug was letting a test tier take that input from the machine,
+    /// not the refusal itself.</para>
+    /// </summary>
+    [Fact]
+    public async Task ShimSpawn_UnderMemoryPressure_IsRefused_AndLeavesTheCallersListEmpty()
+    {
+        using var rig = WiringRig.Create(_daemon, services => services.Replace(
+            ServiceDescriptor.Singleton(new AdmissionController(
+                // ~94% used — over AdmissionController.DefaultUsedThreshold.
+                sampler: () => new MemorySample(MemTotalKb: 16_000_000, MemAvailableKb: 1_000_000)))));
+        var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
+
+        var coord = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
+
+        var refused = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coord, default);
+        Assert.False(refused.Ok);
+        Assert.Contains("memory", refused.Error!, StringComparison.OrdinalIgnoreCase);
+
+        var list = await spawns.HandleShimRequestAsync(
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("list"), coord, default);
+        Assert.True(list.Ok);
+        Assert.Empty(list.Agents!);
     }
 
     [Fact]
