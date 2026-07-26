@@ -24,6 +24,17 @@ public enum AdapterChannelError
     ProbeFailed,
     /// <summary>The health probe ran but did not report the pinned version (wrong version installed).</summary>
     VersionMismatch,
+
+    /// <summary>The requested update did not move the pin strictly FORWARD (MG-14) — it was older than,
+    /// equal to, or not orderable against the version currently pinned, so it was refused rather than
+    /// applied. A distinct code because callers must not present it as an install failure: nothing
+    /// broke, an unsafe or pointless move was declined.</summary>
+    UpdateRefused,
+
+    /// <summary>A configured <see cref="IPayloadSignatureVerifier"/> actively REJECTED the payload's
+    /// signature. Never produced by the default verifier, which has no signing identity to check
+    /// against and answers <see cref="SignatureVerdictKind.NotAvailable"/> instead.</summary>
+    SignatureRejected,
 }
 
 /// <summary>The typed refusal/failure of an adapter operation.</summary>
@@ -291,6 +302,20 @@ public sealed class AdapterChannel
         {
             throw new AdapterChannelException(AdapterChannelError.HashMismatch,
                 $"Adapter '{adapterId}' payload hash did not match the pinned sha256; install refused.");
+        }
+
+        // The hash above answers "are these the bytes the pin covers?" — never "did these bytes come
+        // from someone we trust?". For a pin the USER's own accepted update wrote, the answer to the
+        // second question is circular: the hash was computed from whatever the registry served. This is
+        // the single seam where provenance would be established. It reports NotAvailable on every build
+        // today (Mainguard ships no signing identity) and the install proceeds; a real verifier makes it
+        // refuse here without any other change. See IPayloadSignatureVerifier.
+        var signature = PayloadSignature.VerifyBytes(
+            SignedArtifactKind.AdapterPayload, $"{spec.Id}@{spec.Version}", payload);
+        if (signature.MustRefuse)
+        {
+            throw new AdapterChannelException(AdapterChannelError.SignatureRejected,
+                $"Adapter '{adapterId}' payload failed its signature check; install refused: {signature.Reason}");
         }
 
         // Stage the VERIFIED bytes into the VM and expand {payload} in the install command — the

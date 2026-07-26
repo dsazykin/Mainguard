@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -60,13 +61,36 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     /// </summary>
     public static DaemonClient ForLoopback(int port = DaemonPaths.DefaultLoopbackPort, string? tokenPath = null)
     {
-        // h2c: the daemon serves gRPC over cleartext HTTP/2 on loopback.
-        AppContext.SetSwitch("System.Net.Http.SocketsHttpHandler.Http2UnencryptedSupport", true);
+        // MG-19: mutually-authenticated TLS with both ends pinned to this daemon session — NOT h2c.
+        // The session directory is resolved once per channel so the token and the certificates always
+        // come from the SAME daemon; pairing a fresh token with a stale daemon's certificates (or the
+        // reverse) would be an authentication failure that looks like a network fault.
         return new DaemonClient(
-            () => GrpcChannel.ForAddress($"http://127.0.0.1:{port}"),
+            () => CreateChannel(port, tokenPath),
             tokenPath is null
                 ? () => DaemonTokenLocator.ReadToken()
                 : () => File.ReadAllText(tokenPath).Trim());
+    }
+
+    /// <summary>
+    /// Builds a pinned mTLS channel to the loopback daemon. There is no plaintext fallback: if the
+    /// transport credentials are missing the call throws rather than downgrading, because a downgrade
+    /// would hand the bearer token to whatever answered on the port — the exact port-squatting theft the
+    /// pin exists to prevent.
+    /// </summary>
+    private static GrpcChannel CreateChannel(int port, string? tokenPath)
+    {
+        var sessionDirectory = tokenPath is null
+            ? DaemonTokenLocator.ResolveSessionDirectory()
+            : Path.GetDirectoryName(Path.GetFullPath(tokenPath))!;
+
+        // Deliberately NOT disposed here: the client certificate it owns must stay alive for as long as
+        // the handler that presents it. The channel disposes the handler, and the certificate goes with it.
+        var credentials = DaemonTransportCredentials.Load(sessionDirectory);
+        var handler = new SocketsHttpHandler { SslOptions = credentials.BuildSslOptions() };
+        return GrpcChannel.ForAddress(
+            $"https://127.0.0.1:{port}",
+            new GrpcChannelOptions { HttpHandler = handler, DisposeHttpClient = true });
     }
 
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -427,6 +451,21 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             NewMainSha = newMainSha,
         }, CallOptions(ct, deadline));
         return response.Confirmed;
+    }
+
+    /// <summary>P2-11 step 4: acknowledge ONE must-acknowledge flagged item daemon-side, and read the gate
+    /// back in the same round trip. The daemon owns the acknowledgment ledger the merge gate consults — a
+    /// client-side ack alone never unblocked anything.</summary>
+    public async Task<AcknowledgeFlaggedChangeResponse> AcknowledgeFlaggedChangeAsync(
+        string repoHandle, string agentId, string itemId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.AcknowledgeFlaggedChangeAsync(new AcknowledgeFlaggedChangeRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            ItemId = itemId,
+        }, CallOptions(ct, deadline));
     }
 
     /// <summary>P2-47 #7: the agent-branch-vs-main diff for the review cockpit, parsed into <see cref="FilePatch"/>

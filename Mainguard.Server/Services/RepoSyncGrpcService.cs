@@ -3,6 +3,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Git.Exceptions;
 using Mainguard.Protos.V1;
 
@@ -20,10 +21,12 @@ public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
     private const char HandleSeparator = ':';
 
     private readonly IAgentEnvironment _environment;
+    private readonly MergeQueueProvisioner _mergeQueues;
 
-    public RepoSyncGrpcService(IAgentEnvironment environment)
+    public RepoSyncGrpcService(IAgentEnvironment environment, MergeQueueProvisioner mergeQueues)
     {
         _environment = environment;
+        _mergeQueues = mergeQueues ?? throw new ArgumentNullException(nameof(mergeQueues));
     }
 
     public override Task<ProvisionRepoResponse> ProvisionRepo(ProvisionRepoRequest request, ServerCallContext context)
@@ -37,6 +40,14 @@ public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
         {
             var result = _environment.Repos.Provision(request.OriginUrl);
             var remote = _environment.ResolveSyncRemote(result.RepoHash);
+
+            // MG-10: provisioning is the moment a repo becomes ACTIVE, so it is where the repo's merge
+            // queue comes into existence — the registry was previously written by nothing at all, which is
+            // why every merge-queue RPC answered NOT_FOUND. Idempotent: a re-provision fetches main forward
+            // and this reconciles the existing queue's authoritative main@sha with the mirror's, firing the
+            // ordinary stale cascade rather than leaving branches "Verified" against a main that moved.
+            _mergeQueues.EnsureQueue(result.RepoHash);
+
             return new ProvisionRepoResponse
             {
                 RepoHandle = result.RepoHash,
@@ -56,6 +67,11 @@ public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
         return Task.FromResult(Guard(() =>
         {
             _environment.Worktrees.CreateAgentWorktree(request.RepoHandle, request.AgentId);
+
+            // The agent now has a branch in this repo, so it is a queue member: without an entry the queue
+            // tracks no agents and StreamQueue reports an empty repo however many branches exist.
+            _mergeQueues.EnsureEntry(request.RepoHandle, request.AgentId, MergeEntryOrigin.Local);
+
             return new CreateWorktreeResponse
             {
                 WorktreeHandle = MakeHandle(request.RepoHandle, request.AgentId),
