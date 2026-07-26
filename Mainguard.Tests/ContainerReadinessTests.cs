@@ -1,3 +1,5 @@
+using System.Net;
+using Docker.DotNet;
 using Docker.DotNet.Models;
 using Mainguard.Agents.Agents.Sandbox;
 using Xunit;
@@ -64,12 +66,223 @@ public sealed class ContainerReadinessTests
             EgressProxyConfigurator.ClassifyReadiness(state));
     }
 
+    // ---- the revive window: `docker start` does NOT clear FinishedAt ----
+
+    // The bug this class exists to prevent, in its second form. Restarting a STOPPED container leaves
+    // the previous run's FinishedAt in place, so for the moment between `docker start` returning and
+    // the state flipping to Running, an inspect is byte-for-byte indistinguishable from a corpse:
+    // Running=false, Restarting=false, Dead=false, FinishedAt=<the earlier stop>. Classifying that as
+    // Terminal made EnsureReadyAsync destroy and recreate a container that was merely still coming up.
+    // Invisible on a fast daemon, reliably hit on a loaded CI runner. StartedAt is what disambiguates:
+    // a start newer than the last exit means it is on its way up.
+    [Fact]
+    public void RestartedButNotYetRunning_IsPending_NotTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            StartedAt = "2026-07-24T10:05:00Z",  // the start we just issued
+            FinishedAt = "2026-07-24T10:00:00Z", // the PREVIOUS run's exit, never cleared
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Pending,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // The mirror case must keep working: an exit that POSTDATES the last start is a genuine corpse.
+    [Fact]
+    public void StoppedAfterItsLastStart_IsTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            StartedAt = "2026-07-24T10:00:00Z",
+            FinishedAt = "2026-07-24T10:05:00Z", // it ran, then ended
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // A restarted container that has come up reports Running WITH the stale FinishedAt still set —
+    // observed on a real daemon. Running must win outright.
+    [Fact]
+    public void RestartedAndRunning_WithStaleFinishedAt_IsRunning()
+    {
+        var state = new ContainerState
+        {
+            Running = true,
+            StartedAt = "2026-07-24T10:05:00Z",
+            FinishedAt = "2026-07-24T10:00:00Z",
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Running,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // Dead outranks the timestamps: a dead container is never coming up, however recent its start.
+    [Fact]
+    public void DeadWithARecentStart_IsStillTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            Dead = true,
+            StartedAt = "2026-07-24T10:05:00Z",
+            FinishedAt = "2026-07-24T10:00:00Z",
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
     [Fact]
     public void Dead_IsTerminal()
     {
         var state = new ContainerState { Running = false, Dead = true };
         Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
             EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // ---- the disturbance CLASS: "this container is not what I just saw" ----
+    //
+    // Three variants of one bug reached CI in three successive rounds — the proxy REMOVED mid-adoption
+    // (404 from the recovery path's own cleanup), SIGTERM'd mid-adoption (exit 143, 340ms, misreported
+    // as a boot failure), and an exec landing on a container stopped between the readiness check and
+    // the exec (409 Conflict, "container is not running"). Each round fixed the symptom that surfaced.
+    // These tests pin the CLASS instead: EnsureReadyAsync does not own the shared proxy, so ANY signal
+    // that its observed state is stale means the same thing and gets the same answer — start over.
+
+    [Fact]
+    public void NotFound_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerContainerNotFoundException(HttpStatusCode.NotFound, "gone")));
+    }
+
+    // The third variant, verbatim: the config exec against a container stopped underneath us.
+    [Fact]
+    public void Conflict_ContainerIsNotRunning_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerApiException(HttpStatusCode.Conflict, "{\"message\":\"container 142e30d4 is not running\"}")));
+    }
+
+    // A concurrent create taking the name is the same class — someone else moved the world.
+    [Fact]
+    public void Conflict_NameAlreadyInUse_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerApiException(HttpStatusCode.Conflict, "container name \"/mainguard-egress-proxy\" is already in use")));
+    }
+
+    [Fact]
+    public void OurOwnDisturbedSignal_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new EgressProxyConfigurator.EgressProxyDisturbedException("abc", "removed")));
+    }
+
+    // The other half of the contract, and the one that keeps the retry honest: a real error must NOT be
+    // retried into silence. Retrying a 500 or a policy failure would turn a loud bug into a slow one.
+    [Theory]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public void OtherDockerErrors_AreNotDisturbances(HttpStatusCode status)
+    {
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(new DockerApiException(status, "boom")));
+    }
+
+    [Fact]
+    public void NetworkDrift_IsNotADisturbance_ItIsAPolicyFailure()
+    {
+        // MG-18: a non-internal `mainguard-agents` must fail closed, never be retried away.
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(
+            new EgressNetworkDriftException("mainguard-agents", "expected Internal=true")));
+    }
+
+    [Fact]
+    public void AGenuineBootFailure_IsNotADisturbance()
+    {
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerContainerNotRunningException("abc", " state=exited exit=1")));
+    }
+
+    // ---- telling "something stopped it" apart from "it crashed on boot" ----
+
+    // The CI failure that produced this: a proxy that lived 340ms, exited 143, and logged nothing. The
+    // message said "it most likely exited during boot", which is the one thing it definitely had NOT
+    // done — 143 is 128+15, i.e. SIGTERM. That wording sent repeated investigations after a boot bug
+    // that never existed, so the verdict is now derived from the state rather than assumed.
+    [Theory]
+    [InlineData(143)] // SIGTERM — docker stop
+    [InlineData(137)] // SIGKILL — docker kill / force-remove
+    [InlineData(130)] // SIGINT
+    public void SignalExits_AreClassifiedAsExternalStops(long exitCode)
+    {
+        Assert.True(EgressProxyConfigurator.IsExternalStopExit(exitCode));
+
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = exitCode },
+            System.TimeSpan.FromMilliseconds(340));
+
+        Assert.Contains("STOPPED EXTERNALLY", verdict, System.StringComparison.Ordinal);
+        Assert.Contains("did NOT fail to boot", verdict, System.StringComparison.Ordinal);
+        // The phrase that misled must not appear for a signalled container.
+        Assert.DoesNotContain("exited on its own", verdict, System.StringComparison.Ordinal);
+    }
+
+    // A container that really did crash must still say so plainly — the fix must not make every
+    // failure look like someone else's fault.
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(127)]
+    public void OrdinaryExits_AreClassifiedAsRealBootFailures(long exitCode)
+    {
+        Assert.False(EgressProxyConfigurator.IsExternalStopExit(exitCode));
+
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = exitCode }, lifetime: null);
+
+        Assert.Contains("genuine boot failure", verdict, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("STOPPED EXTERNALLY", verdict, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void OomKill_IsCalledOutSeparately()
+    {
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, OOMKilled = true, ExitCode = 137 }, lifetime: null);
+
+        Assert.Contains("OOM-killed", verdict, System.StringComparison.Ordinal);
+    }
+
+    // A sub-second lifetime is the tell that separates "signalled right after starting" from a
+    // deliberate shutdown, so it has to reach the reader.
+    [Fact]
+    public void ShortLifetime_IsReported()
+    {
+        var verdict = EgressProxyConfigurator.Verdict(
+            new ContainerState { Running = false, ExitCode = 143 },
+            System.TimeSpan.FromMilliseconds(340));
+
+        Assert.Contains("lived only 340ms", verdict, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Lifetime_IsTheSpanBetweenStartAndFinish()
+    {
+        var span = EgressProxyConfigurator.Lifetime(new ContainerState
+        {
+            StartedAt = "2026-07-26T01:28:35.972667175Z",
+            FinishedAt = "2026-07-26T01:28:36.312258351Z",
+        });
+
+        // The real CI numbers, to sub-millisecond precision: 339.59ms.
+        Assert.NotNull(span);
+        Assert.InRange(span!.Value.TotalMilliseconds, 339.0, 340.0);
     }
 
     [Fact]

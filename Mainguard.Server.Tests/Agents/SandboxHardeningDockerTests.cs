@@ -34,6 +34,27 @@ public class SandboxHardeningDockerTests
         Assert.True(inspect.HostConfig.Memory > 0);
         Assert.NotNull(inspect.HostConfig.PidsLimit);
         Assert.Contains(inspect.HostConfig.SecurityOpt, o => o.Contains("no-new-privileges"));
+
+        // MG-26: memory+pids left two axes uncapped. A busy loop allocates nothing and forks nothing,
+        // so only a CPU ceiling bounds it; a descriptor leak hits the per-process file table long
+        // before 512 pids. Both are ceilings on the live container now, not conventions.
+        Assert.True(inspect.HostConfig.NanoCPUs > 0);
+        Assert.Contains(inspect.HostConfig.Ulimits, u => u.Name == "nofile" && u.Hard > 0);
+        Assert.Contains(inspect.HostConfig.Ulimits, u => u.Name == "nproc" && u.Hard > 0);
+    }
+
+    [RequiresDockerFact]
+    public async Task NofileUlimit_ShouldBeEnforcedInsideTheJail()
+    {
+        // The rlimit is only real if the kernel applied it — read it back from a process in the jail.
+        await using var fx = new SandboxFixture();
+        var handle = await fx.SpawnAsync(agentId: "rlimits");
+
+        var soft = await fx.ExecAsync(handle.ContainerId, "sh", "-c", "ulimit -n");
+        Assert.True(int.TryParse(soft.Stdout.Trim(), out var nofile),
+            $"could not read the nofile rlimit from the jail: '{soft.Stdout}'");
+        Assert.True(nofile > 0 && nofile <= Mainguard.Agents.Agents.Sandbox.SandboxLimits.DefaultNoFile,
+            $"expected a bounded nofile ceiling, got {nofile}");
     }
 
     [RequiresDockerFact]

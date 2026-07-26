@@ -7,10 +7,42 @@ using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents.Sandbox;
 
-/// <summary>Resource ceilings for one agent container (P2-07 §3.1).</summary>
-public sealed record SandboxLimits(long MemoryBytes, long Pids)
+/// <summary>
+/// Resource ceilings for one agent container (P2-07 §3.1).
+///
+/// <para>MG-26 — the jail used to bound only RAM and pids, which leaves two uncapped denial-of-service
+/// surfaces that a prompt-injected agent reaches with a one-liner: a busy loop per pid starves every
+/// OTHER agent (and the daemon) of CPU on the shared VM, and a descriptor leak exhausts the kernel's
+/// per-process file table long before the pids ceiling is anywhere near. Both are now ceilings on the
+/// create request, not conventions.</para>
+/// </summary>
+/// <param name="Cpus">The CPU ceiling in whole cores, applied as <c>NanoCPUs</c> (cgroup
+/// cpu.max). Fractional values are allowed — 1.5 is a legitimate ceiling.</param>
+/// <param name="NoFile">The <c>RLIMIT_NOFILE</c> ceiling (soft = hard). Per-process, so it is a true
+/// bound on one runaway CLI without any cross-container coupling.</param>
+/// <param name="NProc">The <c>RLIMIT_NPROC</c> ceiling (soft = hard). Deliberately set ABOVE
+/// <paramref name="Pids"/>: Docker's nproc ulimit is enforced by the kernel per <b>real uid</b>, and
+/// with userns-remap every jail shares one host uid — so a value at or below the pids ceiling would
+/// make the FIRST agent's processes count against the SECOND agent's fork budget. The per-container
+/// bound that actually binds is the cgroup <c>PidsLimit</c>; nproc is the outer fork-bomb backstop
+/// that survives a cgroup misconfiguration.</param>
+public sealed record SandboxLimits(
+    long MemoryBytes,
+    long Pids,
+    double Cpus = SandboxLimits.DefaultCpus,
+    long NoFile = SandboxLimits.DefaultNoFile,
+    long NProc = SandboxLimits.DefaultNProc)
 {
-    /// <summary>A conservative default: 2 GiB RAM, 512 pids.</summary>
+    /// <summary>2 cores: enough for a parallel build, never the whole VM.</summary>
+    public const double DefaultCpus = 2.0;
+
+    /// <summary>4096 descriptors — well above a node/go toolchain's working set, well below exhaustion.</summary>
+    public const long DefaultNoFile = 4096;
+
+    /// <summary>See <see cref="NProc"/>: strictly above the default pids ceiling, on purpose.</summary>
+    public const long DefaultNProc = 4096;
+
+    /// <summary>A conservative default: 2 GiB RAM, 512 pids, 2 CPUs, 4096 nofile/nproc.</summary>
     public static SandboxLimits Default { get; } = new(2L * 1024 * 1024 * 1024, 512);
 }
 
@@ -69,6 +101,13 @@ public sealed record CredTmpfsSpec(
 /// write objects and the <c>agent/&lt;id&gt;</c> ref into the mirror's common dir; the §3.4 quarantine
 /// is unchanged (the mirror is already the designated agent-writable surface — origin points at it).
 /// Null/empty = no mirror mount (session-only paths and pre-P2-18 tests).</param>
+/// <param name="DnsServerAddress">MG-7 — the IPv4 address of the egress proxy's dnsmasq, pinned as the
+/// jail's ONLY resolver (<c>HostConfig.Dns</c>). Without it Docker hands the container its embedded
+/// resolver at <c>127.0.0.11</c>, which forwards to the VM's upstream DNS: the NXDOMAIN-pinned dnsmasq
+/// is then rendered into the proxy container and never consulted by anything, so the "DNS exfiltration
+/// is blocked" control is a no-op. Mandatory whenever the jail sits on the default-deny agent network
+/// (see <see cref="EgressProxyConfigurator.AgentNetworkName"/>); null only for the ad-hoc engines that
+/// run outside that network (merge-queue/lifecycle harnesses on <c>bridge</c>).</param>
 public sealed record ContainerSpecRequest(
     string RepoHash,
     string AgentId,
@@ -81,7 +120,8 @@ public sealed record ContainerSpecRequest(
     string UsernsMode = "",
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
-    string? BareRepoPath = null);
+    string? BareRepoPath = null,
+    string? DnsServerAddress = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -186,6 +226,7 @@ public static class ContainerSpecBuilder
             throw new SandboxSpecException("G2 control 1: supervisor uid must differ from the agent uid.");
 
         var env = BuildProxyEnv(request.ProxyUrl);
+        var dns = ResolveDnsPinning(request);
 
         var hostConfig = new HostConfig
         {
@@ -201,6 +242,25 @@ public static class ContainerSpecBuilder
 
             Memory = request.Limits.MemoryBytes,
             PidsLimit = request.Limits.Pids,
+
+            // MG-26: a CPU ceiling (cgroup cpu.max) — without it one `while :; do :; done` per pid
+            // starves every other jail AND the daemon on the shared VM. Memory+pids alone bound the
+            // wrong axis: a busy loop allocates nothing and forks nothing.
+            NanoCPUs = NanoCpus(request.Limits.Cpus),
+
+            // MG-26: kernel rlimits, the ceilings cgroups do NOT cover. nofile is the descriptor-leak
+            // bound (hit long before 512 pids); nproc is the outer fork-bomb backstop that survives a
+            // cgroup misconfiguration — see SandboxLimits.NProc for why it sits ABOVE PidsLimit.
+            Ulimits = new List<Ulimit>
+            {
+                new() { Name = "nofile", Soft = request.Limits.NoFile, Hard = request.Limits.NoFile },
+                new() { Name = "nproc", Soft = request.Limits.NProc, Hard = request.Limits.NProc },
+            },
+
+            // MG-7: pin the jail's resolver to the proxy's NXDOMAIN-default dnsmasq. Left unset, Docker
+            // injects its embedded resolver (127.0.0.11) which forwards to the VM's upstream DNS — every
+            // name resolves and the pinned-DNS control never sits in the path at all.
+            DNS = dns,
 
             // Read-only rootfs; writable surfaces are tmpfs only.
             ReadonlyRootfs = true,
@@ -255,6 +315,8 @@ public static class ContainerSpecBuilder
         // builder error, not a warning (rejection trigger: shipping fewer than all four G2 controls).
         AssertG2Controls(create, request.Credentials);
         AssertNoSecretsInEnv(create);
+        AssertResourceCeilings(create);
+        AssertDnsPinned(create, request);
 
         return create;
     }
@@ -284,6 +346,84 @@ public static class ContainerSpecBuilder
             // claude-code's footer showed a permanent "Auto-update failed" until this was set.
             "DISABLE_AUTOUPDATER=1",
         };
+    }
+
+    /// <summary>
+    /// MG-7 — validates the requested resolver pin and turns it into the <c>HostConfig.Dns</c> list.
+    ///
+    /// <para>Two rules, both fail-closed. (1) A jail on the default-deny agent network MUST carry a pin:
+    /// that network exists so the proxy is the only route out, and an unpinned resolver hands the jail
+    /// Docker's embedded <c>127.0.0.11</c> — which resolves EVERY name (the rendered NXDOMAIN dnsmasq is
+    /// simply never asked), so DNS-tunnelled exfiltration walks straight out of the "default-deny"
+    /// network. (2) The pin itself must be a real IPv4 literal and must not be a loopback address:
+    /// <c>127.0.0.11</c> is exactly the resolver we are replacing, and any 127/8 address inside the
+    /// jail's own netns points at the jail, not at the proxy.</para>
+    /// </summary>
+    private static List<string>? ResolveDnsPinning(ContainerSpecRequest request)
+    {
+        var address = request.DnsServerAddress?.Trim();
+        var onDefaultDenyNetwork = string.Equals(
+            request.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal);
+
+        if (string.IsNullOrEmpty(address))
+        {
+            if (onDefaultDenyNetwork)
+                throw new SandboxSpecException(
+                    $"MG-7: a jail on the default-deny network '{EgressProxyConfigurator.AgentNetworkName}' must pin its resolver to the "
+                    + "egress proxy's dnsmasq; with no HostConfig.Dns Docker injects its embedded 127.0.0.11 resolver and the pinned-DNS "
+                    + "control never sits in the resolution path.");
+            return null;
+        }
+
+        if (!System.Net.IPAddress.TryParse(address, out var parsed)
+            || parsed.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
+            throw new SandboxSpecException($"MG-7: the pinned DNS server '{address}' is not an IPv4 literal; Docker's Dns list takes addresses, not names.");
+
+        if (System.Net.IPAddress.IsLoopback(parsed))
+            throw new SandboxSpecException(
+                $"MG-7: refusing to pin DNS at loopback '{address}'. Inside the jail's netns 127/8 is the jail itself, and 127.0.0.11 is "
+                + "precisely Docker's embedded resolver this pin exists to replace.");
+
+        return new List<string> { address };
+    }
+
+    /// <summary>Whole cores → Docker's <c>NanoCPUs</c> (1e9 nanoCPU = 1 core).</summary>
+    private static long NanoCpus(double cpus) => (long)Math.Round(cpus * 1_000_000_000d, MidpointRounding.AwayFromZero);
+
+    private static void AssertResourceCeilings(CreateContainerParameters create)
+    {
+        // MG-26: re-assert on the finished request, in the same style as the G2 quartet — an unbounded
+        // axis is a builder error, not a warning. A jail with no CPU or descriptor ceiling is a
+        // one-liner away from taking the whole VM (and every other agent) down.
+        var host = create.HostConfig;
+        if (host.Memory <= 0)
+            throw new SandboxSpecException("MG-26: the agent jail must carry a memory ceiling.");
+        if (host.PidsLimit is null or <= 0)
+            throw new SandboxSpecException("MG-26: the agent jail must carry a pids ceiling.");
+        if (host.NanoCPUs <= 0)
+            throw new SandboxSpecException("MG-26: the agent jail must carry a CPU ceiling (NanoCPUs); memory+pids do not bound a busy loop.");
+
+        var ulimits = host.Ulimits ?? new List<Ulimit>();
+        foreach (var required in new[] { "nofile", "nproc" })
+        {
+            var limit = ulimits.FirstOrDefault(u => string.Equals(u.Name, required, StringComparison.Ordinal));
+            if (limit is null || limit.Hard <= 0 || limit.Soft <= 0)
+                throw new SandboxSpecException($"MG-26: the agent jail must carry a positive '{required}' ulimit.");
+        }
+    }
+
+    private static void AssertDnsPinned(CreateContainerParameters create, ContainerSpecRequest request)
+    {
+        // MG-7 re-assert: the pin survived onto the request the daemon is about to POST. A future edit
+        // that drops HostConfig.Dns silently restores 127.0.0.11 and un-does pinned DNS wholesale, and
+        // no egress test would notice — the existing exfil probe used a name that NXDOMAINs everywhere.
+        if (!string.Equals(request.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal))
+            return;
+
+        var dns = create.HostConfig.DNS;
+        if (dns is null || dns.Count != 1 || string.IsNullOrWhiteSpace(dns[0]))
+            throw new SandboxSpecException(
+                "MG-7: the create request for a default-deny jail must pin exactly one resolver (the egress proxy's dnsmasq).");
     }
 
     private static void RejectNonExt4Source(string source)
