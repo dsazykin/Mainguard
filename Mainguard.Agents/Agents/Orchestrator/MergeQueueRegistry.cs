@@ -6,7 +6,16 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// <summary>The per-repo merge-queue objects the daemon serves over gRPC (queue + lease store).</summary>
 /// <param name="Queue">The repo's live <see cref="MergeQueue"/>.</param>
 /// <param name="Leases">The RT-D1 lease store for the repo (shared daemon store, scoped by repo hash).</param>
-public sealed record MergeQueueContext(MergeQueue Queue, IMergeLeaseStore Leases);
+public sealed record MergeQueueContext(MergeQueue Queue, IMergeLeaseStore Leases)
+{
+    /// <summary>
+    /// The RT-D2 changed-test-command gate this repo's queue ANDs into <c>CanMerge</c>, when one is wired
+    /// (MG-11). Held here — rather than only inside the queue's opaque gate list — because the gate is also
+    /// the target of the human acknowledgment RPC: a must-acknowledge gate the daemon can evaluate but the
+    /// human cannot clear is a permanently unmergeable branch, not a gate.
+    /// </summary>
+    public ChangedTestCommandGate? ChangedTestCommand { get; init; }
+}
 
 /// <summary>
 /// Resolves the <see cref="MergeQueue"/> serving a given repo handle. The daemon registers one context
