@@ -154,12 +154,12 @@ public sealed class EgressSegmentationTests
 
         foreach (var address in new[] { ProxyAddressA, ProxyAddressB })
         {
-            Assert.Contains($"iptables -A INPUT -p tcp -d {address} --dport {EgressProxyConfigurator.ProxyPort} -j ACCEPT", script);
-            Assert.Contains($"iptables -A INPUT -p udp -d {address} --dport 53 -j ACCEPT", script);
+            Assert.Contains($"-A INPUT -p tcp -d {address} --dport {EgressProxyConfigurator.ProxyPort} -j ACCEPT", script);
+            Assert.Contains($"-A INPUT -p udp -d {address} --dport 53 -j ACCEPT", script);
         }
 
-        Assert.Contains("iptables -P INPUT DROP", script);
-        Assert.EndsWith("iptables -A FORWARD -j DROP\n", script, StringComparison.Ordinal);
+        Assert.Contains(":INPUT DROP", script);
+        Assert.Contains("\n-A FORWARD -j DROP\nCOMMIT\n", script, StringComparison.Ordinal);
 
         // Every ACCEPT is still destination-constrained — the MG-18 property, preserved per address.
         foreach (var line in script.Split('\n'))
@@ -174,12 +174,11 @@ public sealed class EgressSegmentationTests
                 $"unconstrained ACCEPT survived the multi-address render: {line}");
         }
 
-        // The terminal DROP is reached, not shadowed: every ACCEPT precedes it.
+        // The terminal DROP is reached, not shadowed: every INPUT ACCEPT precedes it.
         var lines = script.Split('\n').ToList();
         Assert.True(
-            lines.FindLastIndex(l => l.Contains("-j ACCEPT")) < lines.FindIndex(l => l == "iptables -A INPUT -j DROP")
-            || lines.FindLastIndex(l => l.Contains("INPUT") && l.Contains("-j ACCEPT"))
-               < lines.FindIndex(l => l == "iptables -A INPUT -j DROP"),
+            lines.FindLastIndex(l => l.StartsWith("-A INPUT", StringComparison.Ordinal) && l.Contains("-j ACCEPT"))
+                < lines.FindIndex(l => l == "-A INPUT -j DROP"),
             "an ACCEPT landed after the terminal INPUT DROP");
     }
 
@@ -207,6 +206,49 @@ public sealed class EgressSegmentationTests
         // NXDOMAIN catch-all are what make this a default-deny resolver in the first place.
         Assert.Contains("server=/api.anthropic.com/", config, StringComparison.Ordinal);
         Assert.Contains("address=/#/0.0.0.0", config, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The backstop is applied in ONE transaction, never flush-then-repopulate.
+    ///
+    /// <para>It used to be <c>iptables -F</c> plus ~13 separate <c>iptables -A</c> processes. Measured
+    /// on a live proxy: straight after the flush the chain is <c>-P INPUT DROP</c> with zero rules — a
+    /// total blackhole, ESTABLISHED traffic included — and the re-apply takes 131 ms. A config push
+    /// happens on every agent spawn, so spawning one agent broke every other agent's egress for a tenth
+    /// of a second: 20 of 118 probes failed across 5 reloads, in five clusters of one per reload, with
+    /// 1.0 s SYN-retransmit recoveries and a connection reset — the exact symptoms CI reported.</para>
+    ///
+    /// <para>Pinned as a shape assertion because the failure it guards is invisible in any single
+    /// functional test: the window is ~100 ms wide and only hurts traffic that happens to be in flight,
+    /// so a reload-then-check test passes every time while the defect is fully present.</para>
+    /// </summary>
+    [Fact]
+    public void Backstop_IsAppliedAtomically_NeverFlushThenRepopulate()
+    {
+        var script = EgressProxyConfig.RenderIptablesScript(
+            EgressProxyConfigurator.ProxyPort, new[] { ProxyAddressA, ProxyAddressB });
+
+        // One transaction: a complete table handed to iptables-restore.
+        Assert.Contains("iptables-restore", script, StringComparison.Ordinal);
+        Assert.Contains("*filter", script, StringComparison.Ordinal);
+        Assert.Contains("\nCOMMIT\n", script, StringComparison.Ordinal);
+
+        // No flush, and no per-rule iptables invocations — either one re-opens the window.
+        Assert.DoesNotContain("iptables -F", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("iptables -A", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("iptables -P", script, StringComparison.Ordinal);
+
+        // Restoring a table sets EVERY chain in it, so OUTPUT has to be declared or it would be reset
+        // rather than preserved. The backstop has never filtered outbound traffic — dnsmasq's upstream
+        // queries and tinyproxy's upstream connections both leave through it.
+        Assert.Contains(":OUTPUT ACCEPT", script, StringComparison.Ordinal);
+
+        // And this must not have become the pre-MG-18 append bug: a restored table REPLACES, so the
+        // chain after N reloads still equals the chain after one.
+        Assert.Equal(
+            script,
+            EgressProxyConfig.RenderIptablesScript(
+                EgressProxyConfigurator.ProxyPort, new[] { ProxyAddressA, ProxyAddressB }));
     }
 
     [Fact]

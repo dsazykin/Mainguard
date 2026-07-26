@@ -242,6 +242,86 @@ public class SandboxNetworkIsolationDockerTests
         Assert.Equal("ERR ENODATA", v6.Stdout.Trim());
     }
 
+    /// <summary>
+    /// Re-applying the egress backstop must not interrupt a jail's connectivity.
+    ///
+    /// <para><b>What this caught.</b> The backstop was applied as <c>iptables -F</c> followed by ~13
+    /// separate <c>iptables -A</c> processes. Measured on a live proxy: immediately after the flush the
+    /// chain is <c>-P INPUT DROP</c> with <b>zero rules</b> — a total blackhole, ESTABLISHED traffic
+    /// included — and the full re-apply took 131 ms. Since a config push happens on every agent spawn,
+    /// spawning one agent broke every other agent's egress for a tenth of a second. With a jail
+    /// connect-probing ~20×/s across 5 reloads, 20 of 118 probes failed, including one-second
+    /// <c>time_connect</c> values — a dropped SYN recovering on the retransmit, which is exactly the
+    /// <c>tconnect=1.002318</c> CI reported.</para>
+    ///
+    /// <para>The ruleset is now handed to <c>iptables-restore</c> as a complete table, applied in one
+    /// netlink transaction. This test drives the backstop apply directly, rather than a whole
+    /// <c>reload.sh</c>, precisely so it measures THAT: <c>reload.sh</c> also restarts tinyproxy and
+    /// dnsmasq, which has its own ~80 ms listener gap (measured) and is a separate defect — folding
+    /// both into one test would leave neither pinned.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ReapplyingTheBackstop_DoesNotInterruptAJail()
+    {
+        await using var fx = new SandboxFixture();
+
+        var repo = "mg36" + Guid.NewGuid().ToString("N")[..8];
+        var (jail, segment) = await fx.CreateJailOnSegmentAsync(repo, "agent-a");
+        var target = $"{segment.ProxyAddress}:{EgressProxyConfigurator.ProxyPort}";
+
+        // A connect probe every ~40ms, writing one line per attempt.
+        await fx.ExecAsync(jail, "sh", "-c",
+            "(i=0; while [ $i -lt 150 ]; do "
+            + $"curl -sS --noproxy '*' --connect-timeout 3 -m 5 -o /dev/null "
+            + "-w '%{exitcode} t=%{time_connect}\\n' "
+            + $"http://{target} >> /tmp/backstop-probe.log 2>/dev/null "
+            + "|| echo 'FAILED' >> /tmp/backstop-probe.log; "
+            + "i=$((i+1)); sleep 0.04; done) </dev/null >/dev/null 2>&1 & exit 0");
+
+        await Task.Delay(500);
+
+        // Re-apply the backstop repeatedly, exactly as a config push does.
+        for (var i = 0; i < 6; i++)
+        {
+            var apply = await fx.ExecAsync(
+                EgressProxyConfigurator.ProxyContainerName, "sh", "/run/mainguard/backstop.sh");
+            Assert.Equal(0, apply.ExitCode);
+            await Task.Delay(250);
+        }
+
+        await Task.Delay(500);
+
+        var log = await fx.ExecAsync(jail, "sh", "-c",
+            "echo TOTAL=$(grep -c . /tmp/backstop-probe.log); "
+            + "echo BAD=$(grep -cE 'FAILED|^[1-9]' /tmp/backstop-probe.log); "
+            + "echo SLOW=$(awk -F't=' '/t=/{if ($2+0 > 0.3) n++} END{print n+0}' /tmp/backstop-probe.log); "
+            + "grep -nE 'FAILED|^[1-9]' /tmp/backstop-probe.log | head -10");
+
+        var report = log.Stdout.Trim();
+
+        // The probe must have actually run — otherwise "no failures" means "no measurements". The floor
+        // is deliberately low: when the window IS open the failing connects stall on the connect
+        // timeout and the loop gets through far fewer attempts, so a high floor would make the test
+        // report "it barely ran" instead of the dropped connections that are the point.
+        var total = ParseCounter(report, "TOTAL");
+        Assert.True(total >= 15, $"the probe barely ran, so this proves nothing. {report}");
+
+        // Not one connect may be lost or delayed by a rule swap that is supposed to be atomic. A
+        // dropped SYN shows up as a ~1s time_connect rather than an outright failure, so both count.
+        Assert.True(ParseCounter(report, "BAD") == 0,
+            $"a jail lost connectivity while the backstop was re-applied — the rule swap is not atomic, "
+            + $"so every agent's in-flight egress breaks on every config push. {report}");
+        Assert.True(ParseCounter(report, "SLOW") == 0,
+            $"a jail's connect was delayed past 0.3s while the backstop was re-applied — a dropped SYN "
+            + $"recovering on the ~1s retransmit, i.e. the rule swap left a window. {report}");
+    }
+
+    private static int ParseCounter(string report, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(report, key + @"=(\d+)");
+        return match.Success ? int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) : -1;
+    }
+
     /// <summary>Starts a trivial TCP listener inside the victim jail (python3 is pre-baked into the
     /// agent image's toolchain), and waits for it to actually bind.</summary>
     private static async Task StartVictimListenerAsync(SandboxFixture fx, string containerId)
