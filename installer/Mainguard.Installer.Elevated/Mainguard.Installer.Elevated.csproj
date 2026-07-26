@@ -23,9 +23,9 @@
     <AssemblyTitle>Mainguard Setup</AssemblyTitle>
     <Product>Mainguard</Product>
     <Company>Mainguard</Company>
-    <Version>0.2.0</Version>
-    <FileVersion>0.2.0.0</FileVersion>
-    <InformationalVersion>0.2.0</InformationalVersion>
+    <Version>0.2.5</Version>
+    <FileVersion>0.2.5.0</FileVersion>
+    <InformationalVersion>0.2.5</InformationalVersion>
     <Copyright>Copyright © Mainguard</Copyright>
   </PropertyGroup>
 

@@ -372,6 +372,75 @@ public class SandboxEgressDockerTests
         Assert.Equal("ok", tp.Stdout.Trim());
     }
 
+    // P2-08 gateway fronting — the rendered `tinyproxy-upstreams` artefact must be LOADED by the
+    // running proxy, not merely written. It was written on every config push and read by nothing:
+    // reload.sh generated tinyproxy.conf without ever pulling the upstreams in, so every model-API
+    // request went STRAIGHT to the provider with none of the gateway's token bucket, budget or
+    // 429-shaping — and nothing reported it, because the file existed and its contents were correct.
+    //
+    // Asserting the file exists (or matching it against the renderer) reproduces the defect exactly,
+    // so this asserts BEHAVIOUR. With the gateway pointed at a loopback port nothing listens on, a
+    // model-API request through the proxy comes back `502 Unable to connect to upstream proxy` — a
+    // response only tinyproxy with a LOADED `upstream` directive can produce. The control is a
+    // non-fronted allowlisted host (PackageRegistry ⇒ direct route), which must NOT get that answer;
+    // without it a proxy that was simply broken would pass.
+    //
+    // Deliberately needs no internet: the dead gateway refuses on loopback immediately (the backstop
+    // accepts `-i lo`), and the direct route's own failure on an offline runner is tinyproxy's
+    // `500 Unable to connect`, which is distinct from the upstream verdict either way.
+    [RequiresDockerFact]
+    public async Task RenderedGatewayUpstreams_ShouldBeInEffectOnTheRunningProxy_NotMerelyWritten()
+    {
+        await using var fx = new SandboxFixture();
+
+        const string DeadGateway = "127.0.0.1:1";
+        var egress = new EgressProxyConfigurator(
+            fx.Docker,
+            EgressAllowlist.WithDefaults(new Mainguard.Git.Audit.InMemoryAuditLog()),
+            gatewayUpstream: DeadGateway);
+
+        // Start from a clean proxy: this one has to be created with the gateway-fronting config, and a
+        // proxy another test left running would be adopted with ITS config still loaded.
+        await fx.ForceRemoveProxyAndNetworksAsync();
+        await egress.EnsureReadyAsync();
+
+        var proxy = EgressProxyConfigurator.ProxyContainerName;
+
+        // Sanity: tinyproxy accepted the config it was given. A tinyproxy that failed to parse the
+        // appended upstreams would not be listening at all, and every assertion below would then be
+        // reporting the wrong thing.
+        var status = await fx.Engine.ExecAsync(proxy, new[] { "cat", "/run/mainguard/tinyproxy.status" });
+        Assert.Equal("ok", status.Stdout.Trim());
+
+        var fronted = await ProxyGetAsync(fx, proxy, "api.anthropic.com");   // ModelApi ⇒ gateway-fronted
+        Assert.True(
+            fronted.Contains("502", StringComparison.Ordinal)
+            && fronted.Contains("upstream proxy", StringComparison.Ordinal),
+            "the model-API host was NOT routed through the configured gateway: tinyproxy answered without "
+            + "the upstream verdict, so the rendered tinyproxy-upstreams is being written and never loaded "
+            + $"(P2-08 fronting inert). The proxy said:\n{fronted}");
+
+        var direct = await ProxyGetAsync(fx, proxy, "registry.npmjs.org"); // PackageRegistry ⇒ direct
+        Assert.DoesNotContain("upstream proxy", direct, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Issues a plain HTTP proxy request from INSIDE the proxy container and returns what came back.
+    /// bash's <c>/dev/tcp</c> rather than curl — the proxy image has no HTTP client, and adding one to
+    /// the chokepoint container to satisfy a test would be the wrong trade.
+    /// </summary>
+    private static async Task<string> ProxyGetAsync(SandboxFixture fx, string proxyContainer, string host)
+    {
+        const string Script =
+            "exec 3<>/dev/tcp/127.0.0.1/8888 || { echo PROXY-UNREACHABLE; exit 1; }; " +
+            "printf 'GET http://%s/ HTTP/1.0\\r\\nHost: %s\\r\\n\\r\\n' \"$1\" \"$1\" >&3; " +
+            "head -c 300 <&3";
+
+        var result = await fx.Engine.ExecAsync(proxyContainer,
+            new[] { "timeout", "25", "bash", "-c", Script, "bash", host });
+        return result.Stdout + result.Stderr;
+    }
+
     [RequiresDockerFact]
     public async Task DirectGitHostClone_FromAgent_ShouldFailFast()
     {

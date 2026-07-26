@@ -41,7 +41,8 @@ internal static class Program
             removeSyncRemote: ct => RemoveSyncRemoteAsync(repoPaths, ct),
             // Fix #12: revert Mainguard's [wsl2] keys in the global .wslconfig (backed up first) so
             // the user's personal distros are not left memory-capped after Mainguard is gone.
-            wslConfigFs: new BootstrapFileSystem());
+            wslConfigFs: new BootstrapFileSystem(),
+            removeElevatedComponents: RemoveElevatedComponentsAsync);
 
         var report = await uninstaller.RunAsync(options, CancellationToken.None).ConfigureAwait(false);
 
@@ -71,6 +72,87 @@ internal static class Program
         {
             try { await wsl.RunAsync(command, null, ct).ConfigureAwait(false); }
             catch { /* distro may already be gone — every step here is best-effort */ }
+        }
+    }
+
+    /// <summary>
+    /// MG-15 inverse: remove <c>%ProgramFiles%\Mainguard</c>, where the elevated helper was relocated to.
+    ///
+    /// <para>Two attempts, in order. First a direct delete — which succeeds when the uninstaller is
+    /// itself running elevated (the ordinary "Uninstall" entry point on Windows runs from an elevated
+    /// context when the user is an administrator). If that leaves anything behind, ask the elevated
+    /// helper to remove its own install (<c>--uninstall</c>) across a UAC prompt: the helper is the only
+    /// component with the rights, and removal is the enumerated inverse of the install action, not a new
+    /// capability. If BOTH fail we throw — deliberately, so the uninstall report is not clean and the
+    /// user is told exactly which folder is still on their machine. A silent leak here would leave an
+    /// administrator-owned Mainguard binary installed on a machine the user believes is clean.</para>
+    /// </summary>
+    private static Task RemoveElevatedComponentsAsync(CancellationToken ct)
+    {
+        var protection = ProtectedLocationPolicy.ForHost();
+        if (!ElevatedComponentPlan.TryForHost(protection, AppContext.BaseDirectory, out var plan, out var refusal))
+        {
+            Console.WriteLine($"  elevated components: nothing to remove ({refusal}).");
+            return Task.CompletedTask;
+        }
+
+        var direct = ElevatedComponentInstaller.Remove(plan);
+        if (direct.Clean)
+        {
+            Console.WriteLine($"  elevated components: {direct.Message}");
+            return Task.CompletedTask;
+        }
+
+        if (TryElevatedRemoval(out var elevatedError))
+        {
+            var second = ElevatedComponentInstaller.Remove(plan);
+            if (second.Clean)
+            {
+                Console.WriteLine($"  elevated components: {second.Message}");
+                return Task.CompletedTask;
+            }
+
+            throw new InvalidOperationException(second.Message);
+        }
+
+        throw new InvalidOperationException($"{direct.Message} ({elevatedError})");
+    }
+
+    /// <summary>Runs the staged helper's <c>--uninstall</c> across a UAC prompt. The STAGED copy is used
+    /// on purpose: a running process cannot delete the directory it was loaded from, so the promoted
+    /// copy could not remove itself.</summary>
+    private static bool TryElevatedRemoval(out string error)
+    {
+        var staged = ElevatedComponentLayout.StagedHelperPath(AppContext.BaseDirectory);
+        if (!File.Exists(staged))
+        {
+            staged = Path.Combine(AppContext.BaseDirectory, ElevatedComponentLayout.HelperFileName);
+            if (!File.Exists(staged))
+            {
+                error = "the elevated helper is not present in this install, so the protected folder "
+                    + "could not be removed automatically";
+                return false;
+            }
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = staged,
+                UseShellExecute = true,
+                Verb = "runas",
+                Arguments = "--uninstall",
+            };
+            using var p = Process.Start(psi);
+            p?.WaitForExit();
+            error = string.Empty;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"the elevated removal could not be started: {ex.Message}";
+            return false;
         }
     }
 
