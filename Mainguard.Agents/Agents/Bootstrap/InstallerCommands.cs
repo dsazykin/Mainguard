@@ -71,11 +71,23 @@ public static class InstallerCommands
     /// forget to; see <see cref="TrustedExecutablePath"/> for exactly how far that protection goes
     /// (it stops an ARBITRARY exe — it does not stop a REPLACED one at the legitimate path).</para>
     /// </summary>
+    /// <para><b>MG-15: the RUN LEVEL is derived here too, from where the target lives.</b> This
+    /// registration used to hardcode <c>/RL HIGHEST</c> — elevated, at every logon, with no UAC prompt —
+    /// against an executable in <c>%LocalAppData%</c>, a directory the very user it runs as can write.
+    /// Any same-user process could replace those bytes and be launched with administrator rights at the
+    /// next logon, and no path check can see that (the path is still the right one; only the file
+    /// changed). The run level is therefore not a caller's choice: <see cref="ResumeTaskPolicy"/> grants
+    /// <c>HIGHEST</c> only for a target under an administrator-owned root, and <c>LIMITED</c> otherwise.
+    /// Deriving it in the builder — like the path validation above — means no future caller can
+    /// re-introduce the escalation by passing the wrong argument, because there is no argument.</para>
     /// <exception cref="ArgumentException">The resume target is not a canonical, fully-qualified
     /// executable inside <paramref name="installRoot"/>. Callers must surface this, never swallow it.</exception>
-    public static IReadOnlyList<string> RegisterResumeTask(string resumeExePath, string installRoot)
+    public static IReadOnlyList<string> RegisterResumeTask(
+        string resumeExePath, string installRoot, ProtectedLocationPolicy protection)
     {
+        ArgumentNullException.ThrowIfNull(protection);
         var target = TrustedExecutablePath.Require(resumeExePath, installRoot, "resume target");
+        var runLevel = ResumeTaskPolicy.RunLevelFor(target, protection);
         return new[]
         {
             "/Create",
@@ -84,7 +96,7 @@ public static class InstallerCommands
             // it cannot contain a quote, so it cannot break out of this quoted /TR string.
             "/TR", $"\"{target}\" --resume",
             "/SC", "ONLOGON",
-            "/RL", "HIGHEST",   // elevated — feature-enablement completion + VM import need it
+            "/RL", ResumeTaskPolicy.SchtasksValue(runLevel),
             "/F",               // overwrite any stale registration (idempotent re-run)
         };
     }
@@ -132,15 +144,28 @@ public static class InstallerCommands
         }
     }
 
-    /// <summary>The two enumerated privileged actions, so a test can prove the helper's scope never
-    /// grows: exactly {enable features, register resume task}. Deleting the resume task is the
-    /// INVERSE of the second action — lifecycle of the same registration, not a third capability —
-    /// which is why the helper may also unregister it (a stale elevated ONLOGON task re-runs setup
-    /// elevated at every logon and cannot reliably be removed unelevated).</summary>
+    /// <summary>
+    /// The enumerated privileged actions, so a test can prove the helper's scope never grows by
+    /// accident: exactly {enable features, register resume task, install the elevated components}.
+    /// Deleting the resume task and REMOVING the elevated components are the INVERSES of the second and
+    /// third actions — lifecycle of the same artifact, not new capabilities — which is why the helper
+    /// may also unregister the task (a stale elevated ONLOGON task re-runs setup elevated at every
+    /// logon and cannot reliably be removed unelevated) and remove its own protected install.
+    ///
+    /// <para><b>The third entry was added deliberately (MG-15), and is the narrowest thing that can
+    /// close the finding.</b> Relocating the elevated pieces out of the user-writable install directory
+    /// requires ONE privileged write into an administrator-owned root, and the only component that can
+    /// make it is the one that is already elevated. Note what it is not: it takes no source path, no
+    /// destination path and no file list from anyone. The helper promotes ITS OWN directory into a
+    /// destination derived from the machine's special folders (<see cref="ElevatedComponentPlan"/>). An
+    /// <c>--install-from &lt;dir&gt;</c> switch would have traded MG-15 for an arbitrary-write-as-admin
+    /// primitive, which is strictly worse.</para>
+    /// </summary>
     public static IReadOnlyList<string> PrivilegedActionCatalog() => new[]
     {
         "enable-windows-optional-features",
         "register-resume-scheduled-task",
+        "install-elevated-components-to-protected-root",
     };
 }
 
@@ -165,6 +190,16 @@ public sealed record ElevatedHelperResult
     public required bool FeaturesEnabled { get; init; }
     public required bool RebootRequired { get; init; }
     public required bool ResumeTaskRegistered { get; init; }
+
+    /// <summary>MG-15: whether this run moved Mainguard's elevated components into the
+    /// administrator-owned install root. Not <c>required</c>, so a result written by an older helper
+    /// still deserializes.</summary>
+    public bool ElevatedComponentsInstalled { get; init; }
+
+    /// <summary>Why <see cref="ElevatedComponentsInstalled"/> is what it is — including the reason a
+    /// machine could NOT be hardened, which the OOBE logs rather than silently accepting.</summary>
+    public string? ElevatedComponentsDetail { get; init; }
+
     public string? Error { get; init; }
 
     private static readonly JsonSerializerOptions Options = new()

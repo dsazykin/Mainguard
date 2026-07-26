@@ -86,8 +86,11 @@ public sealed class ResumeTaskGuard
             // than trusted.
             //
             // Be clear about what this is: a PATH check, not an identity check. It cannot tell a
-            // replaced binary at the legitimate path from the real one — that needs a signature
-            // (IPayloadSignatureVerifier, today a no-op) or an install root the user cannot write.
+            // replaced binary at the legitimate path from the real one. MG-15 makes that survivable
+            // rather than detectable here: a registration whose target is user-writable is registered
+            // /RL LIMITED (ResumeTaskPolicy), so a replaced binary at that path runs as the user who
+            // replaced it and gains nothing. A signed build additionally detects it
+            // (IPayloadSignatureVerifier, checked by the elevated helper before it registers).
             var command = InstallerCommands.ParseResumeTaskCommand(queryXml);
             var installRoot = TrustedExecutablePath.DirectoryOf(currentResumeTarget);
             if (TrustedExecutablePath.IsSameExecutable(command, currentResumeTarget, installRoot))

@@ -289,12 +289,19 @@ public sealed class DaemonPayloadException : Exception
 ///
 /// <para><b>What it does NOT establish:</b> that those bytes are legitimate. Both sides of this
 /// comparison are derived from the same source directory, so an attacker who can WRITE that directory
-/// simply gets their payload hashed and faithfully delivered. On the current per-user Velopack layout
-/// the payload directory (<c>AppContext.BaseDirectory/payload/daemon</c>) is writable by the user we
-/// are defending, so same-user malware is entirely unaddressed by this check. Only a signature over
-/// the payload (<see cref="IPayloadSignatureVerifier"/> — a documented no-op today, because Mainguard
-/// has no signing identity) or a machine-wide install root would change that. Do not describe this as
+/// simply gets their payload hashed and faithfully delivered. On the per-user Velopack layout the
+/// payload directory (<c>AppContext.BaseDirectory/payload/daemon</c>) is writable by the user we are
+/// defending, so same-user malware is entirely unaddressed by this check. Do not describe this as
 /// verifying the payload; it verifies the COPY.</para>
+///
+/// <para><b>And note what the signature gate below does and does not add here.</b> The daemon payload
+/// is a set of Linux ELF binaries; it cannot carry an Authenticode signature, so the step-3 pinned
+/// verifier deliberately does NOT cover it and says so
+/// (<see cref="SigningPolicy.WhyNotCovered"/>). Its provenance belongs to build attestations — step 2
+/// of docs/design/code-signing-plan.md, which is what actually closes MG-9 for this path. The
+/// relocation in step 1 covers the Windows elevation path only, not this directory: promoting ~90 MB
+/// into Program Files at every app update would need elevation at every update, which is the UX cost
+/// the plan's scope decision explicitly declines.</para>
 /// </summary>
 public sealed class DaemonPayloadManifest
 {
@@ -516,8 +523,13 @@ public sealed class DaemonUpdater : IDaemonUpdater
             }
 
             // The signature seam for the highest-privilege promote in the app: these bytes become a
-            // root-run service. It reports NotAvailable today (no signing identity) and we continue
-            // with the gap named in the result message rather than implied away.
+            // root-run service. What this does with each verdict:
+            //   Rejected     → refuse, before the running daemon is touched.
+            //   NotAvailable → continue, with the reason carried into the result message. Expected
+            //                  here even on a SIGNED build: an ELF payload cannot carry an Authenticode
+            //                  signature, so SigningPolicy.Covers deliberately excludes this kind and
+            //                  the reason names what does cover it (build attestations, plan step 2).
+            //   Verified     → continue; not reachable today for this kind, by that same exclusion.
             var signature = PayloadSignature.VerifyFile(SignedArtifactKind.DaemonPayload, payloadDirectory);
             if (signature.MustRefuse)
             {

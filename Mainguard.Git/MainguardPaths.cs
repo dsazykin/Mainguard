@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 
@@ -59,6 +60,82 @@ public static class MainguardPaths
         }
 
         return localAppData;
+    }
+
+    /// <summary>
+    /// The machine's ADMINISTRATOR-OWNED install roots, in preference order, for
+    /// <c>Mainguard.Agents</c>'s <c>ProtectedLocationPolicy</c> (audit MG-15). Entries that cannot be
+    /// resolved come back as empty strings and the caller drops them — a machine that exposes none is
+    /// a machine where relocation is refused, never one where it silently lands somewhere writable.
+    ///
+    /// <para>Lives here for the same reason <see cref="DataRoot"/> does: <c>DoNotVerify</c> is the only
+    /// safe option. The default option verifies existence and returns <c>""</c>, which on this path
+    /// would not produce a relative data root but something subtler and worse — a Program Files entry
+    /// that vanishes from the allow-list on the one machine where it was not yet materialised, silently
+    /// turning "protected" into "nothing is protected".</para>
+    /// </summary>
+    public static IReadOnlyList<string> ProtectedInstallRoots()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            // Nothing elevated runs off these today; they exist so the policy answers coherently on a
+            // dev box rather than degrading to "this machine protects nothing".
+            return new[] { "/opt", "/usr/local", "/usr" };
+        }
+
+        return new[]
+        {
+            // The NATIVE Program Files, which a 32-bit process would otherwise miss entirely.
+            Environment.GetEnvironmentVariable("ProgramW6432") ?? string.Empty,
+            SpecialFolder(Environment.SpecialFolder.ProgramFiles),
+            SpecialFolder(Environment.SpecialFolder.ProgramFilesX86),
+            SpecialFolder(Environment.SpecialFolder.Windows),
+        };
+    }
+
+    /// <summary>
+    /// The roots an unprivileged user can write, for the same policy's deny pass. <c>%ProgramData%</c>
+    /// is deliberately absent from <see cref="ProtectedInstallRoots"/> AND from here: its default ACL
+    /// lets any user create files in it, so it is not protected — and it is not a per-user root either.
+    /// </summary>
+    public static IReadOnlyList<string> UserWritableRoots()
+    {
+        var roots = new List<string>
+        {
+            SpecialFolder(Environment.SpecialFolder.UserProfile),
+            SpecialFolder(Environment.SpecialFolder.LocalApplicationData),
+            SpecialFolder(Environment.SpecialFolder.ApplicationData),
+            SafeTempPath(),
+        };
+
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            roots.Add("/tmp");
+            roots.Add("/var/tmp");
+        }
+
+        return roots;
+    }
+
+    /// <summary>DoNotVerify resolution that never throws — an unresolvable folder is an empty string the
+    /// caller drops, which is the correct behaviour for an allow/deny LIST (unlike the data root, where
+    /// an unresolvable value must fail loudly because there is no alternative).</summary>
+    private static string SpecialFolder(Environment.SpecialFolder folder)
+    {
+        try
+        {
+            return Environment.GetFolderPath(folder, Environment.SpecialFolderOption.DoNotVerify);
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string SafeTempPath()
+    {
+        try { return Path.GetTempPath(); }
+        catch (Exception) { return string.Empty; }
     }
 
     /// <summary>
