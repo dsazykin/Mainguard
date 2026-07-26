@@ -22,10 +22,12 @@
          sources (digest-pinned base images + checksummed toolchain installers) and the daemon spawn
          chain itself (digest-pinned image ref + per-agent network segments). No
          `build/mainguardos/VERSION` cut: the images ship beside the app, not inside the MainguardOS
-         tarball. -->
-    <Version>0.2.6</Version>
-    <FileVersion>0.2.6.0</FileVersion>
-    <InformationalVersion>0.2.6</InformationalVersion>
+         tarball. Bumped 0.2.6 → 0.2.7 (MG-41): the egress-proxy image sources moved again —
+         entrypoint.sh and reload.sh — so `SandboxImageVersions.EgressProxy` moved, and the daemon
+         compares that constant at spawn preflight. Same "no VERSION cut" reasoning as above. -->
+    <Version>0.2.7</Version>
+    <FileVersion>0.2.7.0</FileVersion>
+    <InformationalVersion>0.2.7</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
