@@ -13,7 +13,8 @@ using Xunit;
 namespace Mainguard.Tests;
 
 // TI-15 (integration): commit & tag signing end-to-end. These need a real gpg — the SAME binary
-// git will invoke — so they are gated `RequiresGpg` and Assert.Skip cleanly when gpg is absent.
+// git will invoke — so they are gated [RequiresGpgFact] and report a genuine Skipped (not a
+// failure) when gpg is absent.
 //
 // The signing environment is fully ephemeral and never touches the developer's real keyring:
 //   * a throwaway GNUPGHOME temp dir (set as a process env var for this test's lifetime so git's
@@ -50,19 +51,9 @@ public sealed class GitServiceSigningTests : IDisposable
         _fx.Dispose();
     }
 
-    private void RequireGpg()
-    {
-        // xUnit 2.9.3 dynamic skip: throwing SkipException marks the test Skipped (not Failed) so
-        // a machine without gpg reports these as cleanly skipped rather than red.
-        if (!_gpg.Available)
-            throw Xunit.Sdk.SkipException.ForSkip("gpg is not available in this environment.");
-    }
-
-    [Fact]
+    [RequiresGpgFact]
     public void Commit_WithSigningOn_ShouldProduceVerifiableSignature()
     {
-        RequireGpg();
-
         // Seed one commit through the ordinary (unsigned) LibGit2Sharp path, then a signed one.
         _fx.WriteFile("a.txt", "hello\n");
         StageAll();
@@ -80,10 +71,9 @@ public sealed class GitServiceSigningTests : IDisposable
         Assert.False(string.IsNullOrWhiteSpace(statuses[head].Signer));
     }
 
-    [Fact]
+    [RequiresGpgFact]
     public void Commit_WithSigningOff_ShouldShowStatusNone()
     {
-        RequireGpg();
         _prefs.SignCommits = false; // unsigned path (LibGit2Sharp)
 
         _fx.WriteFile("a.txt", "hello\n");
@@ -100,11 +90,9 @@ public sealed class GitServiceSigningTests : IDisposable
         Assert.NotEqual(0, verifyCode);
     }
 
-    [Fact]
+    [RequiresGpgFact]
     public void Tag_WithSigningOn_ShouldProduceVerifiableSignedTag()
     {
-        RequireGpg();
-
         _fx.WriteFile("a.txt", "hello\n");
         StageAll();
         _service.Commit(_fx.RepoPath, "base");
@@ -117,11 +105,9 @@ public sealed class GitServiceSigningTests : IDisposable
         Assert.True(verifyCode == 0, $"verify-tag failed: {verifyErr}");
     }
 
-    [Fact]
+    [RequiresGpgFact]
     public void Commit_SignedThenReadWithoutKey_ShouldNotVerifyGood()
     {
-        RequireGpg();
-
         _fx.WriteFile("a.txt", "hello\n");
         StageAll();
         _service.Commit(_fx.RepoPath, "signed commit");
@@ -136,10 +122,9 @@ public sealed class GitServiceSigningTests : IDisposable
         Assert.NotEqual(SignatureStatus.None, statuses[head].Status); // still carries a signature
     }
 
-    [Fact]
+    [RequiresGpgFact]
     public async System.Threading.Tasks.Task SigningFailure_WithBogusKey_ShouldThrowTyped_NotHang()
     {
-        RequireGpg();
         _prefs.SigningKey = "0xDEADBEEFDEADBEEF"; // no such secret key
 
         _fx.WriteFile("a.txt", "hello\n");
