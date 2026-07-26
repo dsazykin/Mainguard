@@ -100,12 +100,48 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     public EgressVerdict Evaluate(string host) =>
         Allowlist.Allows(host) ? EgressVerdict.Allowed : EgressVerdict.Denied;
 
+    /// <summary>
+    /// The proxy we were adopting disappeared mid-sequence. Internal control flow, never surfaced:
+    /// <see cref="EnsureReadyAsync"/> answers it by starting over and creating a fresh proxy.
+    /// </summary>
+    private sealed class ProxyVanishedException : Exception
+    {
+        public ProxyVanishedException(string containerId)
+            : base($"The egress proxy '{containerId}' was removed while EnsureReadyAsync was adopting it.") { }
+    }
+
     public async Task EnsureReadyAsync(CancellationToken ct = default)
     {
         // Internal network: no route out except via a container with a second (egress) leg.
         var internalId = await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
         var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
 
+        // The proxy is a SHARED, singleton container: every SandboxFixture teardown removes it, an
+        // operator may remove it, and a second daemon may be racing us. So it can disappear at ANY
+        // point between finding it and finishing with it — and the correct answer to that is simply
+        // "create a fresh one", which is already the fall-through. Retrying the whole adopt-or-create
+        // sequence once is what makes that true; patching each individual call is not, because the
+        // window exists before every one of them.
+        //
+        // This is the flake: reproduced locally at 3 failures in 10 runs of the revive test, where the
+        // RECOVERY path itself threw — the catch below called RemoveContainerAsync on a container that
+        // a previous test's teardown had already removed, and that 404 escaped uncaught.
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await EnsureProxyReadyOnceAsync(egressId, ct).ConfigureAwait(false);
+                return;
+            }
+            catch (ProxyVanishedException) when (attempt == 0)
+            {
+                // Gone underneath us — go around once more and create it fresh.
+            }
+        }
+    }
+
+    private async Task EnsureProxyReadyOnceAsync(string egressId, CancellationToken ct)
+    {
         var proxy = await FindContainerAsync(ProxyContainerName, ct).ConfigureAwait(false);
         string? proxyId = proxy?.ID;
         var revived = false;
@@ -114,8 +150,7 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         {
             // The proxy image was upgraded since this container was created — recreate below so the
             // new bytes run (same policy as the persistent agent jails).
-            await _docker.Containers.RemoveContainerAsync(proxy.ID,
-                new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
+            await TryRemoveContainerAsync(proxy.ID, ct).ConfigureAwait(false);
             proxyId = null;
         }
         else if (proxy is not null && !string.Equals(proxy.State, "running", StringComparison.OrdinalIgnoreCase))
@@ -136,9 +171,10 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             }
             catch (Exception ex) when (ex is DockerApiException or DockerContainerNotRunningException)
             {
-                // Unstartable corpse — replace it with a fresh container below.
-                await _docker.Containers.RemoveContainerAsync(proxyId!,
-                    new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
+                // Unstartable corpse — replace it with a fresh container below. The removal MUST
+                // tolerate the container already being gone: this is the recovery path, and having it
+                // throw its own 404 turned a recoverable state into an unhandled failure.
+                await TryRemoveContainerAsync(proxyId!, ct).ConfigureAwait(false);
                 proxyId = null;
                 revived = false;
             }
@@ -152,6 +188,15 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // produced an opaque Docker conflict from deep inside the exec instead of a real diagnosis.
         if (!await WaitUntilRunningAsync(proxyId, ct).ConfigureAwait(false))
         {
+            // "Not running" and "no longer exists" are different diagnoses with different answers. A
+            // container removed underneath us is a concurrent teardown, not a boot failure, and the
+            // right response is to create a fresh one — reporting it as "it exited during boot" sent
+            // three CI investigations after a boot bug that was never there.
+            if (!await ContainerExistsAsync(proxyId, ct).ConfigureAwait(false))
+            {
+                throw new ProxyVanishedException(proxyId);
+            }
+
             throw new DockerContainerNotRunningException(
                 proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
@@ -535,6 +580,36 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         }
 
         return report.ToString();
+    }
+
+    /// <summary>Force-removes a container, treating "already gone" as success. Used on every teardown
+    /// path here: the proxy is shared, so something else removing it first is a normal outcome, not an
+    /// error — and a cleanup that throws its own 404 masks whatever we were actually recovering from.</summary>
+    private async Task TryRemoveContainerAsync(string containerId, CancellationToken ct)
+    {
+        try
+        {
+            await _docker.Containers.RemoveContainerAsync(containerId,
+                new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            // Already gone — which is exactly the state we wanted.
+        }
+    }
+
+    /// <summary>Whether the container still exists at all (as opposed to existing but not running).</summary>
+    private async Task<bool> ContainerExistsAsync(string containerId, CancellationToken ct)
+    {
+        try
+        {
+            await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            return true;
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return false;
+        }
     }
 
     private async Task<ContainerListResponse?> FindContainerAsync(string name, CancellationToken ct)
