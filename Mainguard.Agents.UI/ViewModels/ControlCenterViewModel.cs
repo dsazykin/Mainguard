@@ -342,7 +342,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         if (_agents is Services.DaemonBackedOrchestrator daemon)
         {
             await daemon.AddAllowlistHostAsync(
-                host, Mainguard.Agents.Agents.Sandbox.EgressEntryKind.AgentService, "operator", CancellationToken.None);
+                host, Mainguard.Agents.Agents.Sandbox.EgressEntryKind.AgentService, CancellationToken.None);
         }
 
         EgressBlockPrompt = null;

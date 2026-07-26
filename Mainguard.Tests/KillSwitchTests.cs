@@ -140,6 +140,45 @@ public class KillSwitchTests
         Assert.True(gap.Fields.ContainsKey("observed_at"));
     }
 
+    // ---- MG-39(a) — a cooperative ACK must not buy an exemption from docker pause ----
+
+    /// <summary>
+    /// The <c>[IPC_UPDATE_READY]</c> ACK is written by the worker's own wrapper INSIDE the jail — by exactly
+    /// the party the kill switch exists to stop. Treating it as "already stopped, no pause needed" was a
+    /// one-line self-exemption: answer ready, skip the freezer cgroup, keep executing. The pause is now
+    /// unconditional; the ACK only records a cleaner stopping point.
+    /// </summary>
+    [Fact]
+    public async Task KillSwitch_AgentThatFakesTheYieldAck_IsStillDockerPaused()
+    {
+        var gate = new KillSwitchGate();
+        // Every agent "cooperates" — the exact shape a hostile worker would forge.
+        var target = new FakeKillTarget(new[] { "a", "b" }, yieldsFor: new[] { "a", "b" });
+        var kill = new KillSwitch(gate, target, rttBudget: () => TimeSpan.Zero);
+
+        var report = await kill.EngageAsync();
+
+        // Containment is unconditional: BOTH jails were paused despite both ACKing.
+        Assert.Contains("a", target.Paused);
+        Assert.Contains("b", target.Paused);
+        // The ACK is still reported (a nicer stopping point), it just never gated the pause.
+        Assert.All(report.Agents, a => Assert.Equal(KillAgentOutcome.Yielded, a.Outcome));
+    }
+
+    /// <summary>A jail that ACKed but could NOT be frozen is not contained — the report must say so.</summary>
+    [Fact]
+    public async Task KillSwitch_YieldAckedButPauseFails_ReportsPauseFailed()
+    {
+        var gate = new KillSwitchGate();
+        var target = new FakeKillTarget(new[] { "a" }, yieldsFor: new[] { "a" }) { FailPauses = true };
+        var kill = new KillSwitch(gate, target, rttBudget: () => TimeSpan.Zero);
+
+        var report = await kill.EngageAsync();
+
+        Assert.Equal(KillAgentOutcome.PauseFailed, report.Agents.Single().Outcome);
+        Assert.True(report.QueueFrozen); // the kill still completes
+    }
+
     // ---- fakes ----
 
     private sealed class FakeKillTarget : IKillTarget
@@ -155,6 +194,9 @@ public class KillSwitchTests
 
         public IReadOnlyList<string> ActiveAgentIds { get; }
 
+        /// <summary>Models a jail the engine could not freeze (MG-39(a) honesty path).</summary>
+        public bool FailPauses { get; init; }
+
         // The fake short-circuits the deadline wait (virtualized timing): an ignoring agent returns false
         // immediately rather than consuming the wall-clock deadline.
         public Task<bool> RequestYieldAsync(string agentId, TimeSpan timeout, CancellationToken ct) =>
@@ -162,6 +204,11 @@ public class KillSwitchTests
 
         public Task PauseAsync(string agentId, CancellationToken ct)
         {
+            if (FailPauses)
+            {
+                throw new InvalidOperationException("docker daemon unreachable");
+            }
+
             Paused.Add(agentId);
             return Task.CompletedTask;
         }

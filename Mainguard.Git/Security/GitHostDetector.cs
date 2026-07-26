@@ -44,11 +44,25 @@ public static class GitHostDetector
             "github.com" => HostKind.GitHub,
             "gitlab.com" => HostKind.GitLab,
             "bitbucket.org" => HostKind.Bitbucket,
-            _ when lower.Contains("dev.azure.com") || lower.Contains("visualstudio.com") => HostKind.AzureDevOps,
+            _ when IsHostOrSubdomainOf(lower, "dev.azure.com")
+                || IsHostOrSubdomainOf(lower, "visualstudio.com") => HostKind.AzureDevOps,
             _ => HostKind.Unknown
         };
         return (host, kind);
     }
+
+    /// <summary>
+    /// Exact host, or a label-aligned subdomain of it — never a substring. The Azure arms used
+    /// <c>Contains</c>, so an attacker-registered <c>dev.azure.com.evil.net</c> classified as Azure DevOps:
+    /// it would be handed the Azure token-username convention, and (through
+    /// <c>EgressAllowlistEntry.LooksLikeGitHost</c>, which asks this method) would be judged a git host on
+    /// the agent egress path. Matching on the dot boundary keeps the legitimate multi-label forms —
+    /// <c>ssh.dev.azure.com</c> for scp-like remotes, <c>&lt;org&gt;.visualstudio.com</c> for the legacy
+    /// host — while a suffix that merely ENDS in the domain's characters no longer qualifies.
+    /// </summary>
+    private static bool IsHostOrSubdomainOf(string lowerHost, string domain) =>
+        lowerHost.Equals(domain, StringComparison.Ordinal)
+        || lowerHost.EndsWith("." + domain, StringComparison.Ordinal);
 
     /// <summary>
     /// Converts an SSH-style remote URL to its HTTPS equivalent so token auth can
