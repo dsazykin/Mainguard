@@ -183,6 +183,32 @@ public sealed class EgressSegmentationTests
             "an ACCEPT landed after the terminal INPUT DROP");
     }
 
+    /// <summary>
+    /// The rendered resolver policy matches the fabric: IPv4 only.
+    ///
+    /// <para>Both the agent segments and the egress network are created without IPv6, and the segments
+    /// are additionally <c>Internal</c>, so a jail has no IPv6 address and no IPv6 route. Handing it a
+    /// AAAA record hands it an address it can never reach — and which family a given tool picks is up
+    /// to that tool, so the failure is nondeterministic and silent. dnsmasq is the jail's ONLY resolver
+    /// (MG-7), so this is the one place that view can be constrained.</para>
+    ///
+    /// <para>Pinned here as well as live because the two tests fail for different reasons: this one
+    /// catches the line being dropped from the render, the live one catches dnsmasq rejecting it.</para>
+    /// </summary>
+    [Fact]
+    public void DnsmasqConfig_FiltersAAAA_SoAJailIsNeverHandedAnUnroutableAddress()
+    {
+        var config = EgressProxyConfig.RenderDnsmasqConfig(
+            EgressAllowlist.WithDefaults(new Mainguard.Git.Audit.InMemoryAuditLog()), ProxyAddressA);
+
+        Assert.Contains("\nfilter-AAAA\n", config, StringComparison.Ordinal);
+
+        // It must narrow the answer, not replace the policy: the allowlist forwarding and the
+        // NXDOMAIN catch-all are what make this a default-deny resolver in the first place.
+        Assert.Contains("server=/api.anthropic.com/", config, StringComparison.Ordinal);
+        Assert.Contains("address=/#/0.0.0.0", config, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Backstop_SingleAddressForm_IsUnchanged()
     {

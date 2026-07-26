@@ -134,6 +134,51 @@ public sealed class SandboxFixture : IAsyncDisposable
     public Task<SandboxExecResult> ExecAsync(string containerId, params string[] command)
         => Engine.ExecAsync(containerId, command);
 
+    /// <summary>
+    /// Can <paramref name="containerId"/> open a TCP connection to <paramref name="hostPort"/>? The ONE
+    /// reachability probe, shared by the isolation tests and the egress-failure diagnostic.
+    ///
+    /// <para><b>Why it is not <c>/dev/tcp</c>.</b> The diagnostic used to probe with
+    /// <c>sh -c 'echo &gt; /dev/tcp/host/port'</c>. <c>/dev/tcp</c> is a <b>bash</b> builtin and that
+    /// ran under <c>sh</c> — dash on Debian — which has no such feature, so it failed with
+    /// <c>cannot create /dev/tcp/…: Directory nonexistent</c> and printed <b>UNREACHABLE
+    /// unconditionally, on every run, including when the hop was perfectly healthy</b>. Verified: the
+    /// same probe under <c>bash</c> answers CONNECTED against the same address the <c>sh</c> form calls
+    /// unreachable. It was worse than useless — the diagnostic's own guide reads leg-1-UNREACHABLE as
+    /// "the jail cannot reach the proxy", so it actively pointed the next investigation at the wrong
+    /// leg.</para>
+    ///
+    /// <para><b>Why curl.</b> It is in the agent image by construction (the Dockerfile installs it, and
+    /// the egress tests are built on it), so the probe cannot silently degrade to "tool missing" the way
+    /// a <c>nc</c>-based one would — the image has no <c>nc</c> at all, verified. Any three-digit HTTP
+    /// code proves the peer accepted a TCP connection and answered; tinyproxy replies 403 to a
+    /// non-proxy request on its CONNECT port, which is a perfectly good "yes, I am here". The proxy
+    /// environment is explicitly disabled (<c>--noproxy '*'</c>) so the probe measures the hop it names
+    /// rather than being quietly re-routed through the proxy it is trying to test.</para>
+    /// </summary>
+    public async Task<(bool Reached, string Detail)> TcpProbeAsync(
+        string containerId, string hostPort, CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await Engine.ExecAsync(containerId, new[]
+            {
+                "curl", "-sS", "--noproxy", "*", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                "http://" + hostPort,
+            }, ct).ConfigureAwait(false);
+
+            var code = result.Stdout.Trim();
+            var reached = result.ExitCode == 0 && code.Length == 3 && code != "000" && int.TryParse(code, out _);
+            return (reached,
+                $"{(reached ? "REACHABLE" : "UNREACHABLE")} {hostPort}: exit={result.ExitCode} "
+                + $"code='{code}' stderr='{result.Stderr.Trim()}'");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"UNREACHABLE {hostPort}: the probe itself failed — {ex.Message}");
+        }
+    }
+
     /// <summary>Inspects a spawned container (mounts, host config, state).</summary>
     public Task<ContainerInspectResponse> InspectAsync(string containerId, CancellationToken ct = default)
         => Docker.Containers.InspectContainerAsync(containerId, ct);

@@ -116,6 +116,17 @@ public static class EgressProxyConfig
         sb.Append("# mainguard pinned DNS — answer allowlisted names only; all else NXDOMAIN\n");
         sb.Append("no-resolv\n");
         sb.Append("bogus-priv\n");
+        // The agent fabric is IPv4-only by construction: EgressProxyConfigurator creates both the agent
+        // segments and the egress network without EnableIPv6, so a jail has no IPv6 address and no IPv6
+        // route — and the agent segments are additionally Internal. Handing a jail a AAAA record
+        // therefore hands it an address it can NEVER reach, and which of the two families a tool picks
+        // is up to that tool: an agent CLI that resolves a host itself gets a nondeterministic hang or
+        // failure depending on nothing it can see or control, and the operator gets no signal at all.
+        // dnsmasq is the jail's ONLY resolver (MG-7), so this is the one place that view can be made to
+        // match the network the jail actually has. (Available in this image: dnsmasq 2.90, verified with
+        // `dnsmasq --test --filter-AAAA` inside the built container — an unsupported option would be
+        // fatal at startup rather than ignored.)
+        sb.Append("filter-AAAA\n");
         if (!string.IsNullOrWhiteSpace(proxyAddress))
         {
             // MUST precede the catch-all: the jail's HTTP_PROXY names this host and nothing else can
