@@ -15,6 +15,26 @@
     <InternalsVisibleTo Include="Mainguard.Tests" />
   </ItemGroup>
 
+  <!--
+    ============== Step 3 (docs/design/code-signing-plan.md): the pinned code-signing thumbprints ==============
+    The ONE place a signing identity enters the product. Set $(MainguardPinnedThumbprints) at build time
+    (a ';'-separated list of SHA-1 or SHA-256 certificate thumbprints) and this build's
+    PinnedThumbprintSignatureVerifier starts enforcing them: an elevated helper or resume target that is
+    unsigned, altered, or signed by anyone else is REFUSED. Leave it empty — the default, and what every
+    build in this repository produces today — and the honest UnsignedBuildSignatureVerifier ships instead.
+
+    It is assembly METADATA rather than a generated source file on purpose: swapping the self-signed
+    certificate for Azure Trusted Signing (step 4, deferred) is then a build-property change and nothing
+    else, which is the entire reason the paid certificate is ordered last. build/velopack/pack.ps1 derives
+    the value from the signing certificate automatically; build/signing/README.md is the recipe.
+  -->
+  <PropertyGroup>
+    <MainguardPinnedThumbprints Condition="'$(MainguardPinnedThumbprints)' == ''"></MainguardPinnedThumbprints>
+  </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="MainguardPinnedThumbprints" Value="$(MainguardPinnedThumbprints)" />
+  </ItemGroup>
+
   <!-- Step 2a (ADR-0001): the pure git engine + persistence now lives in Mainguard.Git; Mainguard.Agents
        keeps the agent platform (orchestration, bootstrap, adapters, daemon, sandbox, terminal) and references
        the git-engine leaf. Docker.DotNet + Porta.Pty stay here (agents/daemon only); LibGit2Sharp / EF /

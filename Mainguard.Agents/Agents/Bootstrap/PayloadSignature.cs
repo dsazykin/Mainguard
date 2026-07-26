@@ -32,9 +32,18 @@ public enum SignatureVerdictKind
     /// signer. Callers MUST refuse the artifact.</summary>
     Rejected,
 
-    /// <summary>No signature could be checked at all, because this build has no signing identity to
-    /// check against. Callers proceed — with the gap logged — because refusing everything would mean
-    /// refusing every install. This is the default on every shipped build today.</summary>
+    /// <summary>
+    /// No signature could be checked at all. Callers proceed — with the gap logged — because refusing
+    /// everything would mean refusing every install.
+    ///
+    /// <para><b>This must never become the polite spelling of "the check failed".</b> It has exactly
+    /// two legitimate causes: (a) the build ships no signing identity at all
+    /// (<see cref="UnsignedBuildSignatureVerifier"/>), or (b) the build IS signed but the artifact is a
+    /// kind Authenticode cannot speak for — a Linux daemon payload, a third-party npm tarball — in
+    /// which case <see cref="SigningPolicy.WhyNotCovered"/> names the gap in the reason. On a
+    /// signing-enabled build, an artifact the pin DOES cover is never NotAvailable: unsigned or altered
+    /// is <see cref="Rejected"/>. See <see cref="PinnedThumbprintSignatureVerifier.VerifyFile"/>.</para>
+    /// </summary>
     NotAvailable,
 }
 
@@ -60,18 +69,23 @@ public sealed record SignatureVerdict(SignatureVerdictKind Kind, string Reason)
 /// <para>Every path in this app that promotes bytes to a higher privilege — the daemon build copied
 /// over <c>/opt/mainguard</c> and restarted as root, an agent-CLI tarball installed into the shared
 /// adapters prefix, the helper launched across the UAC boundary, the exe registered as an elevated
-/// ONLOGON task — ought to verify that those bytes came from us. None of them can today, because
-/// <b>Mainguard has no code-signing identity</b>: nothing this repository builds is signed, no
-/// certificate exists, and the dormant <c>SignMainguardExecutables</c> MSBuild target
-/// (Mainguard.Pro.App.csproj) is gated on a <c>$(MainguardSigningCertPath)</c> that no CI job ever
-/// sets. Hash pins cover byte-for-byte reproduction, not provenance — they prove "the same bytes I saw
-/// before", never "the bytes Mainguard published".</para>
+/// ONLOGON task — ought to verify that those bytes came from us. Hash pins cover byte-for-byte
+/// reproduction, not provenance — they prove "the same bytes I saw before", never "the bytes Mainguard
+/// published".</para>
 ///
-/// <para>This interface exists so that gap has ONE named shape and ONE set of call sites instead of
-/// being a comment in five files. When a certificate exists, implement this once (Authenticode via
-/// <c>WinVerifyTrust</c> for the Windows exes; a detached signature or an npm provenance attestation
-/// for the payloads), assign it to <see cref="PayloadSignature.Verifier"/> at startup, and every
-/// privileged promote in the app starts enforcing it — with no call-site changes.</para>
+/// <para><b>State of play.</b> The seam is now filled for the Windows executables on the elevation
+/// path: <see cref="PinnedThumbprintSignatureVerifier"/> checks an Authenticode signature against a
+/// thumbprint pinned into the build (see <see cref="SigningPolicy"/>), and
+/// <see cref="PayloadSignature"/> selects it automatically on a build configured with pins. A build
+/// with no pins — which is every default build in this repository — still ships
+/// <see cref="UnsignedBuildSignatureVerifier"/> and says so. The daemon payload and the adapter
+/// tarballs are deliberately NOT covered by that pin: neither can carry an Authenticode signature, and
+/// their provenance belongs to build/npm attestations rather than to a second bespoke signature format
+/// invented here.</para>
+///
+/// <para>This interface is why turning any of that on never touched a call site: the kinds, the
+/// three-valued verdict and the enforcement points were fixed first, and only the implementation behind
+/// them changed.</para>
 /// </summary>
 public interface IPayloadSignatureVerifier
 {
@@ -125,9 +139,9 @@ public sealed class UnsignedBuildSignatureVerifier : IPayloadSignatureVerifier
 /// </summary>
 public static class PayloadSignature
 {
-    private static IPayloadSignatureVerifier _verifier = new UnsignedBuildSignatureVerifier();
+    private static IPayloadSignatureVerifier _verifier = CreateDefault();
 
-    /// <summary>The active verifier. Assign a real implementation once a signing identity exists —
+    /// <summary>The active verifier. Assign a real implementation to override the build's own choice —
     /// that single assignment turns on enforcement across every privileged promote in the app.</summary>
     public static IPayloadSignatureVerifier Verifier
     {
@@ -137,7 +151,23 @@ public static class PayloadSignature
 
     /// <summary>Restores the shipped default. Tests that install a fake verifier must call this in a
     /// finally block — a leaked verifier would silently change every later test's trust decision.</summary>
-    public static void ResetToDefault() => _verifier = new UnsignedBuildSignatureVerifier();
+    public static void ResetToDefault() => _verifier = CreateDefault();
+
+    /// <summary>
+    /// The verifier THIS BUILD ships — chosen from the build's own configuration, not wired up by each
+    /// entry point. A build configured with pinned thumbprints (see <see cref="SigningPolicy"/>) gets
+    /// the real <see cref="PinnedThumbprintSignatureVerifier"/>; a build with none gets the honest
+    /// <see cref="UnsignedBuildSignatureVerifier"/>.
+    ///
+    /// <para>Selecting here rather than at each <c>Main</c> is what makes enforcement impossible to
+    /// forget: the elevated helper, the OOBE console driver and the Pro head all get the same policy
+    /// without any of them opting in — and a new entry point cannot ship with signature checking
+    /// silently off because nobody remembered to call a setup method.</para>
+    /// </summary>
+    private static IPayloadSignatureVerifier CreateDefault()
+        => SigningPolicy.Current.SigningEnabled
+            ? new PinnedThumbprintSignatureVerifier(SigningPolicy.Current, AuthenticodeInspector.ForHost())
+            : new UnsignedBuildSignatureVerifier();
 
     /// <summary>Verifies a file, converting a THROWING verifier into a
     /// <see cref="SignatureVerdictKind.Rejected"/>. A verifier that faults is a verifier that did not

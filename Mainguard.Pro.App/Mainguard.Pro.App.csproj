@@ -242,18 +242,67 @@
   </Target>
 
   <!--
+    ================= MG-15: the elevated-components STAGE (docs/design/code-signing-plan.md §1) =================
+    The elevated helper must stop living in %LocalAppData%, which the unprivileged user the elevated
+    ONLOGON task runs as can write. It cannot be INSTALLED to Program Files at pack time — a per-user
+    Velopack installer has no elevation — so the packaged app ships a STAGE, and the elevated helper
+    promotes that stage into %ProgramFiles%\Mainguard\elevated at the single UAC prompt the OOBE already
+    raises (Mainguard.Agents ElevatedComponentInstaller).
+
+    The stage is a SELF-CONTAINED publish, not the file-name copy the CopyElevatedHelper* targets make.
+    That copy only works because the helper happens to sit inside the Pro head's self-contained output
+    and borrows its runtime; the moment it is promoted somewhere else it has no runtime at all. It also
+    means the promoted directory carries the helper's whole closure and nothing of the app's.
+
+    Publish-time only: a plain `dotnet build` gets a Message and no stage (the launcher then falls back
+    to the co-located helper behind the UAC prompt, exactly as before this change). This keeps the dev
+    loop fast and keeps ~90 MB out of every bin/Debug.
+  -->
+  <PropertyGroup>
+    <MainguardElevatedStageRuntime Condition="'$(MainguardElevatedStageRuntime)' == ''">win-x64</MainguardElevatedStageRuntime>
+    <_ElevatedStageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\artifacts\elevated-stage\$(Configuration)'))</_ElevatedStageDir>
+  </PropertyGroup>
+
+  <Target Name="StageElevatedComponentsToPublish" AfterTargets="Publish"
+          Condition="'$(BuildElevatedStage)' != 'false'">
+    <Message Importance="high"
+             Text="Publishing the elevated helper self-contained into '$(_ElevatedStageDir)' so the packaged app can relocate it out of %LocalAppData% (MG-15; /p:BuildElevatedStage=false to skip)…" />
+    <Exec Command="dotnet publish &quot;$(MSBuildThisFileDirectory)..\installer\Mainguard.Installer.Elevated\Mainguard.Installer.Elevated.csproj&quot; -c $(Configuration) -r $(MainguardElevatedStageRuntime) --self-contained true -o &quot;$(_ElevatedStageDir.TrimEnd('\'))&quot;" />
+    <ItemGroup>
+      <_ElevatedStageFiles Include="$(_ElevatedStageDir)**\*" />
+    </ItemGroup>
+    <Warning Text="Elevated-components stage is empty at '$(_ElevatedStageDir)'; the published app cannot relocate its elevated helper out of the per-user install directory (MG-15) and will fall back to launching the co-located copy."
+             Condition="'@(_ElevatedStageFiles)' == ''" />
+    <Copy SourceFiles="@(_ElevatedStageFiles)"
+          DestinationFiles="@(_ElevatedStageFiles->'$(PublishDir)elevated-stage\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true"
+          Condition="'@(_ElevatedStageFiles)' != ''" />
+  </Target>
+
+  <!--
     P2-48 code-signing hook (owner-provided cert). When $(MainguardSigningCertPath) is set at build time,
     sign the packaged executables so the UAC prompt shows a VERIFIED PUBLISHER instead of unknown. No cert
     is invented here; unset = no-op. The real signing runs on the owner's release box.
+
+    Step 3 (docs/design/code-signing-plan.md): this is also what the PINNED-THUMBPRINT verifier checks
+    against at runtime. The pins themselves are configuration — $(MainguardPinnedThumbprints), compiled
+    into Mainguard.Agents as assembly metadata — so swapping the self-signed certificate for a real one
+    (Azure Trusted Signing, step 4) is a property change, not a rewrite. build/signing/README.md has the
+    generate-a-cert-and-read-its-thumbprint recipe.
+
+    The STAGED helper is signed too, and it must be: the stage is what gets promoted into Program Files,
+    so signing only the co-located copy would leave the relocated binary unsigned and — on a signed
+    build — refused at launch.
   -->
   <PropertyGroup>
     <MainguardSignTimestampUrl Condition="'$(MainguardSignTimestampUrl)' == ''">http://timestamp.digicert.com</MainguardSignTimestampUrl>
   </PropertyGroup>
-  <Target Name="SignMainguardExecutables" AfterTargets="Publish"
+  <Target Name="SignMainguardExecutables" AfterTargets="Publish;StageElevatedComponentsToPublish"
           Condition="'$(MainguardSigningCertPath)' != '' and Exists('$(MainguardSigningCertPath)')">
     <ItemGroup>
       <_SignTargets Include="$(PublishDir)Mainguard.Pro.App.exe" />
       <_SignTargets Include="$(PublishDir)Mainguard.Installer.Elevated.exe" />
+      <_SignTargets Include="$(PublishDir)elevated-stage\Mainguard.Installer.Elevated.exe" />
     </ItemGroup>
     <Exec Command="signtool sign /fd SHA256 /f &quot;$(MainguardSigningCertPath)&quot; /p &quot;$(MainguardSigningCertPassword)&quot; /tr &quot;$(MainguardSignTimestampUrl)&quot; /td SHA256 &quot;%(_SignTargets.Identity)&quot;"
           Condition="Exists('%(_SignTargets.Identity)')" />

@@ -307,9 +307,13 @@ public sealed class AdapterChannel
         // The hash above answers "are these the bytes the pin covers?" — never "did these bytes come
         // from someone we trust?". For a pin the USER's own accepted update wrote, the answer to the
         // second question is circular: the hash was computed from whatever the registry served. This is
-        // the single seam where provenance would be established. It reports NotAvailable on every build
-        // today (Mainguard ships no signing identity) and the install proceeds; a real verifier makes it
-        // refuse here without any other change. See IPayloadSignatureVerifier.
+        // the single seam where provenance would be established. What this does with each verdict:
+        //   Rejected     → refuse, before anything is staged into the VM.
+        //   NotAvailable → proceed, with the reason carried in the exception/log text. Expected here on
+        //                  EVERY build, signed or not: an npm tarball is a third-party artifact we do
+        //                  not sign, so SigningPolicy.Covers excludes this kind and the reason names
+        //                  what does cover it (npm provenance attestations, plan step 2).
+        //   Verified     → proceed; not reachable today for this kind, by that same exclusion.
         var signature = PayloadSignature.VerifyBytes(
             SignedArtifactKind.AdapterPayload, $"{spec.Id}@{spec.Version}", payload);
         if (signature.MustRefuse)
