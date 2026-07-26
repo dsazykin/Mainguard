@@ -33,6 +33,7 @@ public class AgentCliUpdateServiceTests
           "id": "tool",
           "displayName": "Tool",
           "version": "1.2.3",
+          "provenance": "npm-registry-signature",
           "sha256": "{{ShaOf(PayloadOld)}}",
           "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
           "configShims": [],
@@ -44,7 +45,7 @@ public class AgentCliUpdateServiceTests
     }
     """;
 
-    private sealed class InMemoryPinStore : IAdapterPinOverrideStore
+    internal sealed class InMemoryPinStore : IAdapterPinOverrideStore
     {
         public readonly Dictionary<string, AdapterPinOverride> Pins = new(StringComparer.Ordinal);
         public AdapterPinOverride? TryGet(string adapterId) => Pins.TryGetValue(adapterId, out var p) ? p : null;
@@ -84,21 +85,45 @@ public class AgentCliUpdateServiceTests
             });
     }
 
+    /// <summary>
+    /// Stands in for the MG-9 provenance gate. The pinned npm key lives inside
+    /// <see cref="NpmProvenanceGate"/> and cannot be swapped from outside — deliberately — so these
+    /// flow tests drive the gate's ANSWER rather than forging npm's signature. The gate's own logic is
+    /// proved against a real ECDSA key pair in <see cref="NpmProvenanceTests"/>.
+    /// </summary>
+    internal sealed class FakeProvenanceGate : INpmProvenanceGate
+    {
+        public NpmProvenanceVerdict Verdict = new(
+            NpmProvenanceOutcome.RegistrySignatureVerified, "fake gate: verified");
+
+        public readonly List<(string AdapterId, AdapterProvenanceLevel Level, string Package, string Version, int Bytes)> Calls = new();
+
+        public Task<NpmProvenanceVerdict> EvaluateAsync(
+            string adapterId, AdapterProvenanceLevel declared, string package, string version,
+            byte[] payload, CancellationToken ct)
+        {
+            Calls.Add((adapterId, declared, package, version, payload.Length));
+            return Task.FromResult(Verdict);
+        }
+    }
+
     private sealed class Fixture
     {
         public readonly AdapterChannelTests.FakeSource Source = new() { ManifestToServe = ManifestJson() };
         public readonly AdapterChannelTests.FakeInstallHost Host = new();
         public readonly InMemoryPinStore Pins = new();
         public readonly FakeNpmHandler Npm = new();
+        public readonly FakeProvenanceGate Provenance = new();
         public readonly AdapterChannel Channel;
         public readonly AgentCliUpdateService Updater;
+        public readonly List<string> Log = new();
 
         public Fixture()
         {
             Source.PayloadToServe = PayloadOld;
             Channel = new AdapterChannel(Source, Host, new AdapterChannelTests.FakeCache(ManifestJson()),
                 delay: (_, _) => Task.CompletedTask, pins: Pins);
-            Updater = new AgentCliUpdateService(Channel, Pins, Npm);
+            Updater = new AgentCliUpdateService(Channel, Pins, Npm, Log.Add, Provenance);
         }
     }
 
