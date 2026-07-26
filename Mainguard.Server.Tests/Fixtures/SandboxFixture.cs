@@ -116,13 +116,7 @@ public sealed class SandboxFixture : IAsyncDisposable
         // behind let one test/feature's Docker state bleed into the next — the root of the "works alone,
         // fails when other Docker tests run in the same job" flakiness. Serial execution (assembly
         // DisableTestParallelization) means the next test recreates them cleanly via EnsureEgressReadyAsync.
-        try { await Docker.Containers.RemoveContainerAsync(EgressProxyConfigurator.ProxyContainerName, new ContainerRemoveParameters { Force = true }); }
-        catch { /* best effort */ }
-        foreach (var network in new[] { EgressProxyConfigurator.AgentNetworkName, EgressProxyConfigurator.EgressNetworkName })
-        {
-            try { await RemoveNetworkByNameAsync(network); }
-            catch { /* best effort */ }
-        }
+        await ForceRemoveProxyAndNetworksAsync();
 
         foreach (var dir in _tempWorktrees)
         {
@@ -133,6 +127,22 @@ public sealed class SandboxFixture : IAsyncDisposable
         Docker.Dispose();
     }
 
+    /// <summary>
+    /// Removes the SHARED egress proxy + both mainguard networks, best-effort. Used by teardown and by
+    /// the MG-18 drift test, which has to plant a deliberately-wrong network under the agent network's
+    /// name and therefore needs whatever a previous test left attached to be gone first.
+    /// </summary>
+    public async Task ForceRemoveProxyAndNetworksAsync()
+    {
+        try { await Docker.Containers.RemoveContainerAsync(EgressProxyConfigurator.ProxyContainerName, new ContainerRemoveParameters { Force = true }); }
+        catch { /* best effort */ }
+        foreach (var network in new[] { EgressProxyConfigurator.AgentNetworkName, EgressProxyConfigurator.EgressNetworkName })
+        {
+            try { await RemoveNetworkByNameAsync(network); }
+            catch { /* best effort */ }
+        }
+    }
+
     private async Task RemoveNetworkByNameAsync(string name)
     {
         var matches = await Docker.Networks.ListNetworksAsync(new NetworksListParameters
@@ -141,10 +151,28 @@ public sealed class SandboxFixture : IAsyncDisposable
         }).ConfigureAwait(false);
         foreach (var net in matches)
         {
-            if (net.Name == name)
+            if (net.Name != name)
             {
-                await Docker.Networks.DeleteNetworkAsync(net.ID).ConfigureAwait(false);
+                continue;
             }
+
+            // Docker refuses to delete a network that still has endpoints, so a jail a previous test
+            // left behind silently pins the network in place — and the next test then reuses the OLD
+            // network instead of the one it meant to create. That is invisible until a test depends on
+            // the network's properties (the MG-18 drift test does), at which point it fails for a
+            // reason that has nothing to do with what it is testing. Evict the endpoints first.
+            var inspect = await Docker.Networks.InspectNetworkAsync(net.ID).ConfigureAwait(false);
+            foreach (var endpoint in inspect.Containers ?? new Dictionary<string, EndpointResource>())
+            {
+                try
+                {
+                    await Docker.Networks.DisconnectNetworkAsync(net.ID,
+                        new NetworkDisconnectParameters { Container = endpoint.Key, Force = true }).ConfigureAwait(false);
+                }
+                catch { /* best effort — the delete below reports the real problem */ }
+            }
+
+            await Docker.Networks.DeleteNetworkAsync(net.ID).ConfigureAwait(false);
         }
     }
 }
