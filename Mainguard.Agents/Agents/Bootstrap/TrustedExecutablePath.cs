@@ -25,14 +25,17 @@ namespace Mainguard.Agents.Agents.Bootstrap;
 ///
 /// <para><b>What this does NOT fix — read this before trusting it.</b> It is a check on the PATH, not
 /// on the BYTES. An attacker who can write to the install directory can replace the legitimate
-/// executable at its legitimate path, and every check here still passes. On the current per-user
-/// Velopack layout the install directory is <b>writable by the very user we are defending</b>, so
-/// same-user malware defeats this entirely — it does not need to point us anywhere else, it just
-/// overwrites what we already point at. Closing that needs either a code-signing identity (so the
-/// bytes can be verified — see <see cref="IPayloadSignatureVerifier"/>, today a documented no-op) or a
-/// machine-wide install root that a non-admin user cannot write. Neither exists today. Do not read
-/// this class as "the elevated target is trusted"; read it as "the elevated target is at least the
-/// path we shipped".</para>
+/// executable at its legitimate path, and every check here still passes. Do not read this class as
+/// "the elevated target is trusted"; read it as "the elevated target is at least the path we
+/// shipped".</para>
+///
+/// <para><b>What now covers that gap (MG-15).</b> Two things, from opposite directions, and neither is
+/// this class. <see cref="ProtectedLocationPolicy"/> removes the write primitive: the elevated helper
+/// is installed under an administrator-owned root, and a no-prompt elevated Scheduled Task is only ever
+/// registered against a target in one (<see cref="ResumeTaskPolicy"/>) — so on the per-user layout the
+/// replaceable binary simply has no privilege left to gain. <see cref="IPayloadSignatureVerifier"/>
+/// detects the replacement on a signed build. Path validation remains the first gate for the reason it
+/// always was: it is the only one that works before any of the others exist.</para>
 /// </summary>
 public static class TrustedExecutablePath
 {
@@ -176,6 +179,74 @@ public static class TrustedExecutablePath
 
         return new NormalizedPath(path.Root, path.Segments.Take(path.Segments.Count - 1).ToList())
             .Render(style);
+    }
+
+    /// <summary>
+    /// Canonicalises a DIRECTORY path with the same rules executables get (absolute, no traversal, no
+    /// UNC/device form, no quoting metacharacters, no trailing-dot/space spellings) but without
+    /// requiring a final segment — a drive or filesystem root is a legitimate directory.
+    ///
+    /// <para>Added for <see cref="ProtectedLocationPolicy"/>, which has to compare install roots rather
+    /// than executables. It reuses this class's normalisation on purpose: a second, subtly different
+    /// path parser is how "is it inside the protected root?" and "is it inside the install root?" end
+    /// up disagreeing, and a containment check only has to be talked around once.</para>
+    /// </summary>
+    public static bool TryCanonicalizeDirectory(string? path, out string canonical, out string refusal)
+    {
+        canonical = string.Empty;
+
+        if (!TryDetectStyle(path, out var style))
+        {
+            refusal = "it is not an absolute path";
+            return false;
+        }
+
+        if (!TryNormalize(path!, style, requireSegments: false, out var normalized, out refusal))
+            return false;
+
+        canonical = normalized.Render(style);
+        refusal = string.Empty;
+        return true;
+    }
+
+    /// <summary>
+    /// Whether <paramref name="candidate"/> is the same directory as <paramref name="root"/> or sits
+    /// below it, compared segment-wise on canonical forms.
+    ///
+    /// <para>Unlike <see cref="IsUnder"/> this accepts equality, because "is this path inside Program
+    /// Files?" must answer yes for Program Files itself. Segment-wise is load-bearing: a
+    /// <see cref="string.StartsWith(string,StringComparison)"/> check would report
+    /// <c>C:\Program Files Extra</c> as being inside <c>C:\Program Files</c>, which is precisely the
+    /// kind of near-miss an attacker gets to choose the name of.</para>
+    /// </summary>
+    public static bool IsWithinOrEqual(string? candidate, string? root)
+    {
+        if (!TryDetectStyle(candidate, out var candidateStyle)
+            || !TryDetectStyle(root, out var rootStyle)
+            || candidateStyle != rootStyle)
+        {
+            return false;
+        }
+
+        if (!TryNormalize(candidate!, candidateStyle, requireSegments: false, out var c, out _)
+            || !TryNormalize(root!, rootStyle, requireSegments: false, out var r, out _))
+        {
+            return false;
+        }
+
+        var comparison = Comparison(candidateStyle);
+        if (!string.Equals(c.Root, r.Root, comparison))
+            return false;
+        if (c.Segments.Count < r.Segments.Count)
+            return false;
+
+        for (var i = 0; i < r.Segments.Count; i++)
+        {
+            if (!string.Equals(c.Segments[i], r.Segments[i], comparison))
+                return false;
+        }
+
+        return true;
     }
 
     private static StringComparison Comparison(PathStyle style)

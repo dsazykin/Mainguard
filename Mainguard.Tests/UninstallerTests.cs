@@ -83,8 +83,11 @@ public class UninstallerTests
 
         Assert.True(report.Clean);
         Assert.True(report.DistroUnregistered);
+        // 'remove-elevated-components' (MG-15) sits between the Scheduled Tasks and the appdata: the
+        // relocation put an administrator-owned directory on the machine, and an uninstall that leaves
+        // it behind is the leak the relocation would otherwise have introduced.
         Assert.Equal(
-            new[] { "stop-daemon", "terminate-distro", "poll-stopped", "unregister-distro", "remove-registry", "remove-scheduled-tasks", "remove-appdata" },
+            new[] { "stop-daemon", "terminate-distro", "poll-stopped", "unregister-distro", "remove-registry", "remove-scheduled-tasks", "remove-elevated-components", "remove-appdata" },
             report.StepsRun);
 
         // Only MainguardEnv was terminated/unregistered.

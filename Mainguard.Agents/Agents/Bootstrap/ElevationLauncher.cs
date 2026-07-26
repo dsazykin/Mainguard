@@ -79,11 +79,16 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
                 + $"{ex.Message} Close any other Mainguard setup that may be running and try again.", ex);
         }
 
-        // Resolve the helper from the running app's own directory. Fall back to that directory if the
-        // caller handed us a bare/relative name, so a stray working directory can't hide the co-located
-        // helper. Fail with a clear message (not the opaque "cannot find the file specified"
-        // Win32Exception) if it is genuinely missing — this is the exact P2-21 hand-off failure point.
-        var helperExe = _helperExePath;
+        // MG-15: prefer the PROTECTED copy of the helper. The per-user Velopack install directory is
+        // writable by the same account the elevated task runs as, so a helper launched from there can
+        // be replaced between the moment the user reads the UAC prompt and the moment Windows starts
+        // it. The promoted copy in %ProgramFiles%\Mainguard\elevated cannot be. The staged copy only
+        // wins when it is NEWER — the update case — and that launch's first act is to promote itself,
+        // so the window closes again immediately. See ElevatedHelperResolution for the full order.
+        var choice = ChooseHelper();
+        Log($"helper selection: {choice.Reason}");
+
+        var helperExe = choice.HelperPath;
         if (!File.Exists(helperExe))
         {
             var colocated = Path.Combine(AppContext.BaseDirectory, Path.GetFileName(helperExe));
@@ -102,21 +107,30 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
         }
 
         // MG-9: File.Exists was the ONLY check standing between a path and `runas`. "It exists" says
-        // nothing about what it is — a helper path resolved from anywhere but our own install directory
-        // would be launched as administrator on the user's consent to a prompt that names Mainguard.
-        // Both the helper and the resume target must therefore be canonical, fully-qualified paths
-        // inside AppContext.BaseDirectory (where the packaged build co-locates every Mainguard exe).
+        // nothing about what it is — a helper path resolved from anywhere but a Mainguard install
+        // directory would be launched as administrator on the user's consent to a prompt that names
+        // Mainguard. Both the helper and the resume target must therefore be canonical, fully-qualified
+        // paths inside the root they belong to: the helper's own install root (protected or staged),
+        // and — for the resume target — the running app's directory.
         //
-        // Honest limit: this bounds WHERE the elevated binary comes from, not WHAT it is. Same-user
-        // malware can overwrite the helper at its legitimate path and this passes — see the signature
-        // gate immediately below, which is where that would be caught if Mainguard were signed.
-        helperExe = RequireInstallRootPath(helperExe, "elevated helper");
-        var resumeTarget = RequireInstallRootPath(_resumeTargetExePath, "resume target");
+        // Honest limit: this bounds WHERE the elevated binary comes from, not WHAT it is. That gap is
+        // what the two changes below close from different directions — the protected location removes
+        // the ability to replace the bytes, and the signature gate detects it if they were.
+        helperExe = RequirePathUnder(helperExe, choice.InstallRoot, "elevated helper");
+        var resumeTarget = RequirePathUnder(_resumeTargetExePath, AppContext.BaseDirectory, "resume target");
 
-        // The one place a code-signing check belongs on this path. Today it answers NotAvailable — this
-        // build has no signing identity — and we proceed with the gap written to elevation.log rather
-        // than implied away. A real IPayloadSignatureVerifier makes this refuse without touching this
-        // method again.
+        // The one place a code-signing check belongs on this path, and it is the LAST gate before a
+        // UAC prompt. What it does with each verdict:
+        //   Verified     → proceed; the helper is signed by a certificate this build pins.
+        //   Rejected     → abort, with nothing launched and nothing changed. On a SIGNED build this
+        //                  covers unsigned, altered, and signed-by-someone-else — an unsigned helper is
+        //                  a refusal here, never a shrug (PinnedThumbprintSignatureVerifier).
+        //   NotAvailable → proceed, with the gap written to elevation.log. Only reachable on a build
+        //                  with no signing identity, which is every default build in this repository.
+        // Note the ordering this depends on: a verifier is worth what the directory it loads from is
+        // worth. Once the helper is promoted (MG-15), the copy of this check that runs INSIDE it is
+        // administrator-owned; the copy running here, in the per-user app, is not, and defends against a
+        // corrupted or hostile download rather than against same-user malware.
         var signature = PayloadSignature.VerifyFile(SignedArtifactKind.ElevatedHelper, helperExe);
         Log($"signature check: {signature.Kind} — {signature.Reason}");
         if (signature.MustRefuse)
@@ -196,14 +210,67 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
     }
 
     /// <summary>
-    /// Validates a path that is about to cross the elevation boundary against the running install's own
-    /// directory, turning a refusal into the same actionable <see cref="BootstrapException"/> the rest
+    /// Decides which copy of the helper this launch uses. The filesystem questions are asked here; the
+    /// preference ORDER lives in the pure <see cref="ElevatedHelperResolution"/> so it is a unit test
+    /// rather than a comment. "Current" means the protected copy's promote marker records the same
+    /// fingerprint the stage hashes to — i.e. nothing newer is waiting to be promoted.
+    /// </summary>
+    private ElevatedHelperChoice ChooseHelper()
+    {
+        var appDir = AppContext.BaseDirectory;
+        var stageDir = ElevatedComponentLayout.StageDir(appDir);
+        var stagedHelper = ElevatedComponentLayout.StagedHelperPath(appDir);
+
+        var installBase = ProtectedLocationPolicy.ForHost().PreferredInstallRoot;
+        string? protectedHelper = null;
+        string? protectedDir = null;
+        var protectedExists = false;
+        var protectedIsCurrent = false;
+
+        if (installBase is not null)
+        {
+            protectedHelper = ElevatedComponentLayout.HelperPath(installBase);
+            protectedDir = ElevatedComponentLayout.ElevatedDir(installBase);
+            protectedExists = SafeExists(protectedHelper);
+            if (protectedExists)
+            {
+                var installed = ElevatedComponentIdentity.TryParse(
+                    ElevatedComponentInstaller.TryReadMarker(ElevatedComponentLayout.MarkerPath(installBase)));
+                var stagedFingerprint = SafeFingerprint(stageDir);
+                // No stage to compare against (a source build) → whatever is installed IS current.
+                protectedIsCurrent = stagedFingerprint is null
+                    || (installed is not null
+                        && string.Equals(installed.Fingerprint, stagedFingerprint, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        return ElevatedHelperResolution.Choose(
+            protectedHelper, protectedExists, protectedIsCurrent, protectedDir,
+            SafeExists(stagedHelper), stagedHelper, stageDir,
+            _helperExePath, appDir);
+    }
+
+    private static bool SafeExists(string? path)
+    {
+        try { return !string.IsNullOrWhiteSpace(path) && File.Exists(path); }
+        catch { return false; }
+    }
+
+    private static string? SafeFingerprint(string directory)
+    {
+        try { return ElevatedComponentInstaller.Fingerprint(directory); }
+        catch { return null; }
+    }
+
+    /// <summary>
+    /// Validates a path that is about to cross the elevation boundary against the root it must live
+    /// under, turning a refusal into the same actionable <see cref="BootstrapException"/> the rest
     /// of this flow raises (never a raw <see cref="ArgumentException"/> surfacing as "unexpected error").
     /// </summary>
-    private string RequireInstallRootPath(string candidate, string what)
+    private string RequirePathUnder(string candidate, string installRoot, string what)
     {
         if (TrustedExecutablePath.TryValidate(
-                candidate, AppContext.BaseDirectory, out var canonical, out var refusal))
+                candidate, installRoot, out var canonical, out var refusal))
         {
             return canonical;
         }
