@@ -185,13 +185,18 @@ public sealed class VmUpgradeOrchestrator : IVmUpgradeOrchestrator
     private readonly IWslRunner _wsl;
     private readonly IVmUpgradeHostFileSystem _fs;
     private readonly TimeSpan _moveRetryDelay;
+    private readonly BuildProvenanceGate _provenance;
 
     public VmUpgradeOrchestrator(
-        IWslRunner wsl, IVmUpgradeHostFileSystem? hostFileSystem = null, TimeSpan? moveRetryDelay = null)
+        IWslRunner wsl,
+        IVmUpgradeHostFileSystem? hostFileSystem = null,
+        TimeSpan? moveRetryDelay = null,
+        BuildProvenanceGate? provenance = null)
     {
         _wsl = wsl ?? throw new ArgumentNullException(nameof(wsl));
         _fs = hostFileSystem ?? new VmUpgradeHostFileSystem();
         _moveRetryDelay = moveRetryDelay ?? DefaultMoveRetryDelay;
+        _provenance = provenance ?? new BuildProvenanceGate();
     }
 
     public async Task<VmUpgradeResult> UpgradeAsync(
@@ -219,6 +224,18 @@ public sealed class VmUpgradeOrchestrator : IVmUpgradeOrchestrator
                 switch (step.Id)
                 {
                     case "import-staging":
+                        // MG-9: verify the NEW rootfs before anything about the running VM is touched.
+                        // The tarball becomes a root-executing VM; a build-time attestation is the only
+                        // evidence about it that a file swap cannot regenerate. Refusing here is the
+                        // cheapest possible failure — the old distro has not been touched yet, so the
+                        // posture stays OldDistroIntact.
+                        var tarballProvenance = await _provenance
+                            .VerifyFileAsync(BuildArtifactKind.MainguardOsTarball, options.TarballPath, ct)
+                            .ConfigureAwait(false);
+                        if (tarballProvenance.MustRefuse)
+                            throw new VmUpgradeStepException(tarballProvenance.Reason);
+                        progress?.Report(tarballProvenance.Reason);
+
                         // A stale staging from a previously failed run would make the import fail —
                         // clear it best-effort first (idempotent re-run posture).
                         await TryRunAsync(VmUpgradeCommands.TerminateStaging(), ct).ConfigureAwait(false);

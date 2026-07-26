@@ -171,6 +171,12 @@ jobs:
   payload-reproducible:
     name: MainguardOS payload hash-stable (P2-21)
     runs-on: ubuntu-latest
+    # MG-9 / code-signing plan step 2: attesting an artifact needs an OIDC token (id-token) and the
+    # attestations scope. Scoped to THIS job — no other job may mint a Mainguard attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -270,6 +276,48 @@ jobs:
             echo "::error::mainguardd never began listening on 127.0.0.1:5250 within 60s"
             exit 1
           '
+
+      # ------------------------------------------------------------------------------------------
+      # MG-9 — build provenance (code-signing plan step 2).
+      #
+      # Everything above proves the payload is REPRODUCIBLE. Reproducible is not authentic: the app
+      # used to derive its integrity expectation from the very bytes it had just been handed, so a
+      # swapped artifact verified against itself. A GitHub artifact attestation is signed by this
+      # workflow's OIDC identity at build time, so it is evidence about the artifact that whoever
+      # swaps the artifact cannot regenerate. `gh attestation verify` (and BuildProvenanceGate) check
+      # it against the repository pinned in BuildProvenanceStamp.SourceRepository.
+      #
+      # push-only: attestation minting requires the repo's own OIDC token, which a fork PR does not
+      # get. On a PR this step is skipped and the reproducibility gates above still run.
+      # ------------------------------------------------------------------------------------------
+      - name: Attest the MainguardOS payload (build provenance)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/out-a/MainguardOS.tar.gz
+
+      # The daemon payload is a DIRECTORY and attestations cover files, so what gets attested is its
+      # canonical sha256 manifest — the exact text DaemonPayloadManifest.ToCanonicalText() produces
+      # (`<sha256>  <relative path>`, sorted ordinally, LF). DaemonUpdater rebuilds that text from the
+      # payload on the user's disk and requires it to match this file byte for byte before it will
+      # accept the attestation, which is what ties a build-time signature to a directory.
+      - name: Build the daemon payload manifest (the attested artifact for the daemon build)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/daemon-payload"
+          dotnet publish Mainguard.Server/Mainguard.Server.csproj \
+            -c Release -r linux-x64 --self-contained false -o "$out"
+          ( cd "$out" && find . -type f -printf '%P\n' | LC_ALL=C sort \
+              | while IFS= read -r f; do printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done ) \
+            > "$RUNNER_TEMP/daemon.manifest"
+          echo "manifest lines: $(wc -l < "$RUNNER_TEMP/daemon.manifest")"
+
+      - name: Attest the daemon payload manifest (build provenance)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/daemon.manifest
 
   installer-guardrails:
     name: Installer rejection-trigger greps (P2-21)

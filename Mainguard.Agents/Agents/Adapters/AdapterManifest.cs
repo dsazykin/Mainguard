@@ -19,6 +19,12 @@ public enum AdapterManifestError
     BadHash,
     /// <summary>Two adapters share an id.</summary>
     DuplicateId,
+
+    /// <summary>The <c>provenance</c> rung is absent or names a level this build does not know (MG-9).
+    /// Its own code because "the maintainer forgot to say what origin assurance this CLI carries" is a
+    /// different failure from a malformed field — and it must be a REFUSAL, not a default, or an
+    /// unverified adapter would silently inherit whatever the weakest rung happens to be.</summary>
+    MissingProvenance,
 }
 
 /// <summary>The typed refusal of an adapter manifest.</summary>
@@ -87,7 +93,22 @@ public sealed record AdapterSpec(
     /// the real provider key stays daemon-side and is injected at the network hop. Null = this CLI
     /// cannot be redirected, so it must talk to the provider directly and BYOK confinement does not
     /// apply to it.</summary>
-    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null);
+    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null,
+    /// <summary>MG-9: how much ORIGIN assurance this CLI's tarball is required to carry —
+    /// <c>"npm-build-provenance"</c>, <c>"npm-registry-signature"</c>, or <c>"none"</c>. Mandatory on
+    /// every npm-sourced adapter: <see cref="AdapterManifest.Parse"/> refuses a spec that omits it, so
+    /// nobody can add a CLI without stating what can actually be verified about it. The declared rung is
+    /// enforced fail-closed by <see cref="NpmProvenancePolicy"/>; the string is the wire form of
+    /// <see cref="AdapterProvenanceLevel"/>.</summary>
+    [property: JsonPropertyName("provenance")] string? Provenance = null)
+{
+    /// <summary>The parsed <see cref="Provenance"/> rung. Only ever reached after
+    /// <see cref="AdapterManifest.Parse"/> validated it, so an unrecognised value here is a bug, not a
+    /// user input — and it resolves to <see cref="AdapterProvenanceLevel.None"/>, the rung that claims
+    /// nothing, rather than to anything that would read as verified.</summary>
+    public AdapterProvenanceLevel ProvenanceLevel =>
+        AdapterManifest.TryParseProvenance(Provenance, out var level) ? level : AdapterProvenanceLevel.None;
+}
 
 /// <summary>The <c>adapters.json</c> channel manifest: the full set of pinned agent CLIs.
 /// <para><c>_comment</c> is the ONE tolerated free-form field (JSON has no comment syntax, and the
@@ -155,6 +176,20 @@ public sealed record AdapterManifest(
                 && !a.PayloadUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
                 throw new AdapterManifestException(AdapterManifestError.Malformed,
                     $"Adapter '{a.Id}' payloadUrl must be HTTPS (a plaintext channel defeats the hash pin).");
+            // MG-9: every adapter must STATE what can be verified about its origin. Absent is refused
+            // rather than defaulted — a default would be a silent answer to the one question this field
+            // exists to force someone to answer out loud, and the honest answer for a CLI with no
+            // signing story ("none") is available and costs one reviewed line.
+            if (string.IsNullOrWhiteSpace(a.Provenance))
+                throw new AdapterManifestException(AdapterManifestError.MissingProvenance,
+                    $"Adapter '{a.Id}' is missing 'provenance'. Declare one of "
+                    + $"{string.Join(", ", ProvenanceNames.Keys.Select(k => $"'{k}'"))} — an adapter whose "
+                    + "origin cannot be verified must say so explicitly, never inherit a default.");
+            if (!TryParseProvenance(a.Provenance, out _))
+                throw new AdapterManifestException(AdapterManifestError.MissingProvenance,
+                    $"Adapter '{a.Id}' provenance '{a.Provenance}' is not a level this build knows "
+                    + $"({string.Join(", ", ProvenanceNames.Keys.Select(k => $"'{k}'"))}). Refusing rather "
+                    + "than guessing: an unknown rung must never resolve to a weaker check.");
             if (a.Launch is not null && (a.Launch.Count == 0 || a.Launch.Any(string.IsNullOrWhiteSpace)))
                 throw new AdapterManifestException(AdapterManifestError.MissingField,
                     $"Adapter '{a.Id}' has an empty 'launch' command.");
@@ -189,6 +224,24 @@ public sealed record AdapterManifest(
         }
 
         return manifest;
+    }
+
+    /// <summary>The wire spellings of <see cref="AdapterProvenanceLevel"/>. Ordinal and exact — a
+    /// case-insensitive or fuzzy match here would let a typo'd rung become a weaker one.</summary>
+    private static readonly IReadOnlyDictionary<string, AdapterProvenanceLevel> ProvenanceNames =
+        new Dictionary<string, AdapterProvenanceLevel>(StringComparer.Ordinal)
+        {
+            ["npm-build-provenance"] = AdapterProvenanceLevel.NpmBuildProvenance,
+            ["npm-registry-signature"] = AdapterProvenanceLevel.NpmRegistrySignature,
+            ["none"] = AdapterProvenanceLevel.None,
+        };
+
+    /// <summary>Maps a manifest <c>provenance</c> string to its rung. False for anything unrecognised —
+    /// the caller refuses; it never falls back.</summary>
+    public static bool TryParseProvenance(string? value, out AdapterProvenanceLevel level)
+    {
+        level = AdapterProvenanceLevel.None;
+        return value is not null && ProvenanceNames.TryGetValue(value, out level);
     }
 
     /// <summary>A version is pinned iff it is concrete: has a digit, and carries no range/wildcard/tag.</summary>
