@@ -14,10 +14,13 @@
          the App refreshes the in-VM daemon when it differs from the App's own. Keep these in
          lockstep with Mainguard.App.Shell.csproj's Version — a drifted pair makes every install look
          permanently skewed. Bumped 0.2.4 → 0.2.5 in step 2g: the gRPC package rename (mainguard.v1 →
-         mainguard.v1) changes the wire service paths, so the skew check must read as changed. -->
-    <Version>0.2.5</Version>
-    <FileVersion>0.2.5.0</FileVersion>
-    <InformationalVersion>0.2.5</InformationalVersion>
+         mainguard.v1) changes the wire service paths, so the skew check must read as changed.
+         Bumped 0.2.5 → 0.2.6 with the egress-proxy image source hash (reload.sh now LOADS the rendered
+         tinyproxy upstreams): the daemon compares SandboxImageVersions at spawn preflight, so it has to
+         ship in step with the image the app builds and labels. -->
+    <Version>0.2.6</Version>
+    <FileVersion>0.2.6.0</FileVersion>
+    <InformationalVersion>0.2.6</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>

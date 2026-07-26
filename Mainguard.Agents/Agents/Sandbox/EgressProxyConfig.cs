@@ -60,11 +60,29 @@ public static class EgressProxyConfig
     /// no-raw-429 handling before the request reaches the real provider. A model-host allowlist entry
     /// without this gateway fronting is a rejection trigger, so this is emitted for every
     /// <see cref="EgressEntryKind.ModelApi"/> entry. Non-model hosts keep their direct route.
+    ///
+    /// <para>These lines are <b>appended into the generated <c>tinyproxy.conf</c></b> by
+    /// <c>reload.sh</c>, not referenced from it: tinyproxy 1.11 has no <c>Include</c> directive and
+    /// rejects one outright ("Syntax error … Unable to parse config file. Not starting."). The file was
+    /// previously rendered on every push and read by nothing, so gateway fronting was inert while
+    /// looking perfectly applied — see the reload script for the load step.</para>
+    ///
+    /// <para><paramref name="gatewayHostPort"/> null means fronting is disabled; the artefact is still
+    /// rendered (header only, no <c>upstream</c> lines) so that EVERY push replaces the whole loaded
+    /// upstream set. Skipping the write instead would leave a PREVIOUS push's upstreams on the proxy's
+    /// tmpfs, still being appended into the config on every reload — policy that outlives the
+    /// configuration that produced it, which is the same class of defect as never loading it at all.</para>
     /// </summary>
-    public static string RenderTinyproxyUpstreams(EgressAllowlist allowlist, string gatewayHostPort)
+    public static string RenderTinyproxyUpstreams(EgressAllowlist allowlist, string? gatewayHostPort)
     {
         var sb = new StringBuilder();
         sb.Append("# mainguard model-API fronting — route model hosts through the P2-08 AI gateway\n");
+        if (string.IsNullOrWhiteSpace(gatewayHostPort))
+        {
+            sb.Append("# (no gateway configured — model hosts keep their direct route)\n");
+            return sb.ToString();
+        }
+
         foreach (var entry in allowlist.Entries)
         {
             if (entry.Kind == EgressEntryKind.ModelApi)
