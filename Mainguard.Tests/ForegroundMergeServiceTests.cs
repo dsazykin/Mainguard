@@ -101,7 +101,9 @@ public class ForegroundMergeServiceTests : IDisposable
         out InMemoryMergeLeaseStore leases,
         out OperationJournal journal,
         List<(string Agent, string Sha)>? merged = null,
-        Func<string, IReadOnlyList<string>, int>? installRunner = null)
+        Func<string, IReadOnlyList<string>, int>? installRunner = null,
+        MergeGateCheck? canMerge = null,
+        Action<string, string>? onStaleOverride = null)
     {
         leases = new InMemoryMergeLeaseStore();
         var dbPath = Path.Combine(NewDir("mainguard-fmerge-db-"), "journal.db");
@@ -112,7 +114,8 @@ public class ForegroundMergeServiceTests : IDisposable
         Action<string, string> onMerged = (a, s) => merged?.Add((a, s));
         return new ForegroundMergeService(
             new FakeAgentEnvironment(syncName, syncUrl), journal, leases,
-            onMerged: onMerged, depsRefreshRunner: installRunner);
+            canMerge: canMerge, onMerged: onMerged, onStaleOverride: onStaleOverride,
+            depsRefreshRunner: installRunner);
     }
 
     // ---- Journaled + undoable (A5 ff-only merge) -------------------------
@@ -256,6 +259,75 @@ public class ForegroundMergeServiceTests : IDisposable
         Assert.Null(leases.GetOutstanding(repo.RepoHash));       // lease released
         Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));  // main never moved
     }
+
+    // ---- MG-11: the merge gate is enforced before any ref moves ---------
+
+    [Fact]
+    public void ForegroundMerge_RefusedByTheQueueGate_TouchesNoRef_AndHandsBackTheLease()
+    {
+        var repo = BuildRepo();
+        // The live queue's answer for this branch: blocked (e.g. an unacknowledged flagged change). Before
+        // MG-11 the foreground merge consulted nothing at all — it took the lease and merged, so the only
+        // thing enforcing the gate was whichever UI happened to ask CanMerge first.
+        var service = NewService(repo.SyncName, repo.SyncUrl, out var leases, out var journal,
+            canMerge: Blocked("2 flagged changes need acknowledgment"));
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.False(result.Merged);
+        Assert.False(result.CasLost);                              // refused by policy, not by a lost race
+        Assert.Equal("2 flagged changes need acknowledgment", result.Reason);
+        Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));    // no ref moved
+        Assert.Empty(journal.GetHistory(repo.RepoPath));           // nothing was even attempted
+        Assert.Null(leases.GetOutstanding(repo.RepoHash));         // the lease did not strand the repo
+    }
+
+    [Fact]
+    public void ForegroundMerge_AllowedByTheQueueGate_StillMerges()
+    {
+        // The control — a gate that also blocks the honest path is indistinguishable from a broken merge.
+        var repo = BuildRepo();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _, canMerge: Allowed());
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.True(result.Merged);
+        Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main"));
+    }
+
+    [Fact]
+    public void ForegroundMerge_StaleOverride_BypassesTheGate_Loudly()
+    {
+        // The override is the documented, audited "CanMerge is false and the human accepted it" route
+        // (P2-10 step 4). Routing it through the gate would make the one deliberate escape hatch
+        // unreachable — so it must still merge, and it is the ONLY thing that skips the gate.
+        var repo = BuildRepo();
+        var overrides = new List<(string Agent, string Reason)>();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _,
+            canMerge: Blocked("verification is stale — re-verifying"),
+            onStaleOverride: (a, r) => overrides.Add((a, r)));
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main",
+            AllowStaleOverride: true, OverrideReason: "human accepted the risk"));
+
+        Assert.True(result.Merged);
+        Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main"));
+    }
+
+    private static MergeGateCheck Blocked(string reason) => (string _, out string r) =>
+    {
+        r = reason;
+        return false;
+    };
+
+    private static MergeGateCheck Allowed() => (string _, out string r) =>
+    {
+        r = "";
+        return true;
+    };
 
     public void Dispose()
     {
