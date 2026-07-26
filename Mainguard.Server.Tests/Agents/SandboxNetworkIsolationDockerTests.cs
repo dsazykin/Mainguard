@@ -3,6 +3,7 @@ using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Server.Tests.Fixtures;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Mainguard.Server.Tests.Agents;
 
@@ -24,6 +25,10 @@ namespace Mainguard.Server.Tests.Agents;
 [Trait("Category", "RequiresDocker")]
 public class SandboxNetworkIsolationDockerTests
 {
+    private readonly ITestOutputHelper _output;
+
+    public SandboxNetworkIsolationDockerTests(ITestOutputHelper output) => _output = output;
+
     /// <summary>An arbitrary port B listens on. Above 1024 so the jail's unprivileged uid can bind it.</summary>
     private const int VictimPort = 9099;
 
@@ -259,9 +264,27 @@ public class SandboxNetworkIsolationDockerTests
     /// <c>reload.sh</c>, precisely so it measures THAT: <c>reload.sh</c> also restarts tinyproxy and
     /// dnsmasq, which has its own ~80 ms listener gap (measured) and is a separate defect — folding
     /// both into one test would leave neither pinned.</para>
+    ///
+    /// <para><b>Why the assertion is by failure MODE rather than "no failures at all".</b> The two
+    /// mechanisms produce opposite, unambiguous curl signatures, established by direct experiment on a
+    /// live proxy:</para>
+    /// <list type="table">
+    ///   <item><term>iptables window</term><description>the SYN is <b>dropped</b> — no RST comes back,
+    ///   so curl waits: a ~1 s <c>time_connect</c> when the retransmit gets through, or exit 28
+    ///   (<c>Timeout was reached</c>) when it does not. Measured: <c>exit=28 … after 3001 ms</c>.</description></item>
+    ///   <item><term>daemon restart</term><description>the port is <b>closed</b>, so the kernel RSTs
+    ///   immediately: exit 7, <c>after 0 ms: Couldn't connect to server</c>. Measured by killing
+    ///   tinyproxy with the chain untouched.</description></item>
+    /// </list>
+    /// <para>CI reported <c>7 t=0.000000</c> — the daemon-restart signature, and it also reported
+    /// <c>SLOW=0</c>, i.e. the iptables class this change closed was gone. So an unqualified "zero
+    /// failures" here would be asserting a defect that is <b>not fixed yet</b> (see
+    /// <c>REFUSED</c> below) and would fail for a reason this change does not address. The refusals are
+    /// therefore counted and reported rather than silently tolerated — this is a narrowing to the
+    /// property that is genuinely closed, not a loosened threshold.</para>
     /// </summary>
     [RequiresDockerFact]
-    public async Task ReapplyingTheBackstop_DoesNotInterruptAJail()
+    public async Task ReapplyingTheBackstop_NeverDropsAPacket()
     {
         await using var fx = new SandboxFixture();
 
@@ -269,13 +292,20 @@ public class SandboxNetworkIsolationDockerTests
         var (jail, segment) = await fx.CreateJailOnSegmentAsync(repo, "agent-a");
         var target = $"{segment.ProxyAddress}:{EgressProxyConfigurator.ProxyPort}";
 
-        // A connect probe every ~40ms, writing one line per attempt.
+        // A connect probe every ~40ms. One line per attempt, always — curl writes the -w output even
+        // when the transfer fails (verified for exits 0, 7 and 28), so every attempt is classifiable.
         await fx.ExecAsync(jail, "sh", "-c",
             "(i=0; while [ $i -lt 150 ]; do "
-            + $"curl -sS --noproxy '*' --connect-timeout 3 -m 5 -o /dev/null "
-            + "-w '%{exitcode} t=%{time_connect}\\n' "
-            + $"http://{target} >> /tmp/backstop-probe.log 2>/dev/null "
-            + "|| echo 'FAILED' >> /tmp/backstop-probe.log; "
+            // Field names are deliberately collision-free. An earlier version wrote
+            // `exit=%{exitcode} t=%{time_connect}` and parsed the second field with awk -F't=' — but
+            // "exi**t=**0" contains the separator, so awk split on the WRONG occurrence and the
+            // slow-connect counter silently measured the exit code instead of the connect time. It read
+            // zero no matter what happened. Same disease as the /dev/tcp probe: a check that looks like
+            // a measurement and is not.
+            + "out=$(curl -sS --noproxy '*' --connect-timeout 3 -m 5 -o /dev/null "
+            + "-w 'rc=%{exitcode} ct=%{time_connect}' "
+            + $"http://{target} 2>/dev/null); "
+            + "echo \"${out:-rc=noout ct=0}\" >> /tmp/backstop-probe.log; "
             + "i=$((i+1)); sleep 0.04; done) </dev/null >/dev/null 2>&1 & exit 0");
 
         await Task.Delay(500);
@@ -293,24 +323,47 @@ public class SandboxNetworkIsolationDockerTests
 
         var log = await fx.ExecAsync(jail, "sh", "-c",
             "echo TOTAL=$(grep -c . /tmp/backstop-probe.log); "
-            + "echo BAD=$(grep -cE 'FAILED|^[1-9]' /tmp/backstop-probe.log); "
-            + "echo SLOW=$(awk -F't=' '/t=/{if ($2+0 > 0.3) n++} END{print n+0}' /tmp/backstop-probe.log); "
-            + "grep -nE 'FAILED|^[1-9]' /tmp/backstop-probe.log | head -10");
+            // rc 28 = the SYN went unanswered until the connect timeout: a DROP, i.e. the chain had no
+            // ACCEPT for it. Only a packet filter does this.
+            + "echo TIMEOUT=$(grep -c 'rc=28 ' /tmp/backstop-probe.log); "
+            // connect time > 0.3s on a same-bridge hop (normally ~0.0005s) = a dropped SYN that the ~1s
+            // retransmit recovered. Same mechanism as above, softer outcome — and the one that actually
+            // fires for a sub-second window, because the drop is over before curl gives up.
+            + "echo SLOW=$(awk '{if (match($0, / ct=[0-9.]+/) && "
+            + "substr($0, RSTART+4, RLENGTH-4)+0 > 0.3) n++} END{print n+0}' /tmp/backstop-probe.log); "
+            // rc 7 = an immediate RST: the port is closed, nothing is listening. That is a daemon
+            // restart, not a filter — reported, not asserted (see the summary).
+            + "echo REFUSED=$(grep -c 'rc=7 ' /tmp/backstop-probe.log); "
+            + "echo '--- failed probes ---'; grep -v 'rc=0 ' /tmp/backstop-probe.log | head -8; "
+            // A slow probe still exits 0, so it is invisible in the list above — and it is the whole
+            // signature of a sub-second drop window. List those separately or the report shows nothing
+            // when SLOW is the count that fired.
+            + "echo '--- slow probes ---'; awk '{if (match($0, / ct=[0-9.]+/) && "
+            + "substr($0, RSTART+4, RLENGTH-4)+0 > 0.3) print NR\": \"$0}' /tmp/backstop-probe.log | head -8");
 
         var report = log.Stdout.Trim();
+
+        // Always emitted, pass or fail. REFUSED > 0 is the daemon-restart outage — a real production
+        // defect that this change does NOT fix (reload.sh stops and restarts tinyproxy/dnsmasq on every
+        // config push: ~80 ms and ~20 ms of listener downtime, measured; and the container's entrypoint
+        // runs its own reload that is not synchronised with EnsureReadyAsync returning). Surfacing it on
+        // every run keeps it visible instead of letting a narrowed assertion quietly bury it.
+        _output.WriteLine("backstop re-apply probe:\n" + report);
 
         // The probe must have actually run — otherwise "no failures" means "no measurements". The floor
         // is deliberately low: when the window IS open the failing connects stall on the connect
         // timeout and the loop gets through far fewer attempts, so a high floor would make the test
-        // report "it barely ran" instead of the dropped connections that are the point.
+        // report "it barely ran" instead of the dropped packets that are the point.
         var total = ParseCounter(report, "TOTAL");
         Assert.True(total >= 15, $"the probe barely ran, so this proves nothing. {report}");
 
-        // Not one connect may be lost or delayed by a rule swap that is supposed to be atomic. A
-        // dropped SYN shows up as a ~1s time_connect rather than an outright failure, so both count.
-        Assert.True(ParseCounter(report, "BAD") == 0,
-            $"a jail lost connectivity while the backstop was re-applied — the rule swap is not atomic, "
-            + $"so every agent's in-flight egress breaks on every config push. {report}");
+        // THE PROPERTY: a rule swap that is one transaction cannot drop a packet. Both symptoms of a
+        // drop are asserted at zero — the hard one (the connect timed out) and the soft one (the
+        // retransmit rescued it a second later).
+        Assert.True(ParseCounter(report, "TIMEOUT") == 0,
+            $"a jail's SYN went unanswered while the backstop was re-applied — the chain had no ACCEPT "
+            + $"for it, so the rule swap is not atomic and every agent's egress breaks on every config "
+            + $"push. {report}");
         Assert.True(ParseCounter(report, "SLOW") == 0,
             $"a jail's connect was delayed past 0.3s while the backstop was re-applied — a dropped SYN "
             + $"recovering on the ~1s retransmit, i.e. the rule swap left a window. {report}");
