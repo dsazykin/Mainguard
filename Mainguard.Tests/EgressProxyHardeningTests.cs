@@ -143,4 +143,130 @@ public sealed class EgressProxyHardeningTests
         Assert.Contains("address=/#/0.0.0.0", conf);
         Assert.DoesNotContain("server=/example.com/", conf);
     }
+
+    // ---- in-jail DNS must not depend on a PUBLIC resolver ----
+
+    /// <summary>
+    /// No allowlisted name may be pinned to a resolver out on the internet.
+    ///
+    /// <para>Every one of them used to be pinned to <c>1.1.1.1</c>, so in-jail DNS died anywhere an
+    /// external resolver is blocked, intercepted or unreachable — corporate networks, captive portals,
+    /// split-horizon DNS, an offline runner. It stayed invisible because tinyproxy does NOT resolve
+    /// through dnsmasq (it uses <c>/etc/resolv.conf</c>, i.e. Docker's embedded resolver), so egress by
+    /// name THROUGH the proxy kept working while the agent's own resolution failed — and the agent CLIs
+    /// are Node and Go binaries carrying their own resolvers, which is exactly the population that
+    /// breaks. Reproduced against the real image by blocking 1.1.1.1 in the proxy's netns: a cold-cache
+    /// forwarded name then answers REFUSED while every locally-served record keeps working.</para>
+    ///
+    /// <para>Asserted as "no public literal" rather than "not 1.1.1.1", because swapping one hardcoded
+    /// public resolver for another would satisfy the narrower assertion while leaving the defect
+    /// exactly where it was.</para>
+    /// </summary>
+    [Fact]
+    public void Dnsmasq_ForwardsToTheContainersOwnResolver_NotAPublicOne()
+    {
+        var conf = EgressProxyConfig.RenderDnsmasqConfig(Defaults(), "172.30.0.2");
+
+        var forwards = conf.Split('\n')
+            .Where(l => l.StartsWith("server=/", System.StringComparison.Ordinal))
+            .ToArray();
+        Assert.NotEmpty(forwards); // the allowlist must still be forwarded somewhere
+
+        foreach (var line in forwards)
+        {
+            var upstream = line[(line.LastIndexOf('/') + 1)..];
+            Assert.True(
+                System.Net.IPAddress.TryParse(upstream, out var address)
+                    && System.Net.IPAddress.IsLoopback(address),
+                $"'{line}' forwards an allowlisted name to '{upstream}', which is not this container's "
+                + "own stub resolver. A public resolver here means in-jail DNS breaks wherever external "
+                + "resolvers are blocked, intercepted or unreachable.");
+        }
+    }
+
+    /// <summary>
+    /// The upstream is whatever the proxy container's <c>/etc/resolv.conf</c> names, and the fallback is
+    /// used only when that read yields nothing.
+    /// </summary>
+    [Fact]
+    public void Dnsmasq_UsesTheDiscoveredResolvers_AndFallsBackWhenThereAreNone()
+    {
+        var discovered = EgressProxyConfig.RenderDnsmasqConfig(
+            Defaults(), "172.30.0.2", new[] { "10.0.0.53", "10.0.0.54" });
+        Assert.Contains("server=/api.anthropic.com/10.0.0.53\n", discovered, System.StringComparison.Ordinal);
+        Assert.Contains("server=/api.anthropic.com/10.0.0.54\n", discovered, System.StringComparison.Ordinal);
+
+        // Rendering NO server for a domain would answer REFUSED — a total egress outage — so an empty
+        // discovery falls back to the address Docker gives this container in every topology it is
+        // created in, rather than leaving the domain unrouted.
+        var fallback = EgressProxyConfig.RenderDnsmasqConfig(Defaults(), "172.30.0.2", System.Array.Empty<string>());
+        Assert.Contains(
+            $"server=/api.anthropic.com/{EgressProxyConfig.DockerEmbeddedResolver}\n",
+            fallback, System.StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>no-resolv</c> is a SECURITY control and must survive the upstream change.
+    ///
+    /// <para>The obvious way to defer to the host resolver is to drop <c>no-resolv</c> and write
+    /// <c>server=/&lt;host&gt;/#</c> ("use the standard servers"). Measured against the real image, that
+    /// resolves allowlisted names correctly AND opens a DNS-exfiltration channel: giving dnsmasq a
+    /// default upstream means the catch-all no longer covers everything, because
+    /// <c>address=/#/0.0.0.0</c> is an IPv4 record and answers only the A query. The AAAA query for the
+    /// same non-allowlisted name falls through and is forwarded off the box —
+    /// <c>query[AAAA] ipv6.google.com → forwarded ipv6.google.com to 127.0.0.11</c> in dnsmasq's own
+    /// query log — and an exfiltrator needs only the QUERY to reach its authoritative server. With
+    /// <c>no-resolv</c> there is no default server to fall through to and the same query is REFUSED
+    /// locally.</para>
+    /// </summary>
+    [Fact]
+    public void Dnsmasq_KeepsNoResolv_SoANonAllowlistedNameHasNoDefaultUpstreamToLeakTo()
+    {
+        var conf = EgressProxyConfig.RenderDnsmasqConfig(
+            Defaults(), "172.30.0.2", new[] { "127.0.0.11" });
+
+        Assert.Contains("\nno-resolv\n", conf, System.StringComparison.Ordinal);
+
+        // The "use the standard servers" spec is the shape that requires dropping no-resolv; its
+        // presence would mean the leak above is back regardless of what the no-resolv line says.
+        Assert.DoesNotContain("/#\n", conf, System.StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// dnsmasq must not answer on loopback — the guard that keeps a forwarding loop impossible.
+    ///
+    /// <para>dnsmasq binds the wildcard <c>0.0.0.0:53</c>, so its own socket is the only thing bound on
+    /// port 53 in the proxy's netns, 127.0.0.11 included (verified in <c>/proc/net/udp</c> inside the
+    /// running container). What actually stops a query to 127.0.0.11:53 coming straight back is Docker's
+    /// <c>nat</c> OUTPUT DNAT to the embedded resolver's high port — a rule that is not ours. This line
+    /// bounds the blast radius if it is ever absent: the query is dropped and the lookup fails cleanly
+    /// instead of dnsmasq re-forwarding its own query to itself. Verified non-vacuous against the real
+    /// image: with the line the proxy's own 127.0.0.1:53 times out, without it the same query is
+    /// answered.</para>
+    /// </summary>
+    [Fact]
+    public void Dnsmasq_DoesNotServeOnLoopback_SoAForwardingLoopCannotForm()
+    {
+        var conf = EgressProxyConfig.RenderDnsmasqConfig(Defaults(), "172.30.0.2");
+        Assert.Contains("\nexcept-interface=lo\n", conf, System.StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // Docker's generated resolv.conf: the embedded resolver, plus commentary that NAMES upstream
+    // addresses ("# ExtServers: [host(192.168.65.7)]") — so comments must be dropped before matching.
+    [InlineData("# Generated by Docker Engine.\nnameserver 127.0.0.11\noptions ndots:0\n"
+              + "# Based on host file: '/etc/resolv.conf'\n# ExtServers: [host(192.168.65.7)]\n", "127.0.0.11")]
+    [InlineData("nameserver 10.0.0.53\nnameserver 10.0.0.54\n", "10.0.0.53,10.0.0.54")]
+    [InlineData("nameserver 10.0.0.53\nnameserver 10.0.0.53\n", "10.0.0.53")]            // de-duplicated
+    [InlineData("#nameserver 8.8.8.8\n;nameserver 8.8.4.4\n", "")]                        // commented out
+    // IPv6 upstreams are dropped for the same reason filter-AAAA is set: the fabric has no IPv6 route,
+    // so listing one yields a resolver dnsmasq can never reach.
+    [InlineData("nameserver fe80::1\nnameserver 10.0.0.53\n", "10.0.0.53")]
+    [InlineData("search example.com\noptions ndots:0\n", "")]
+    [InlineData("", "")]
+    public void ResolvConf_ParsesOnlyRealIPv4Nameservers(string content, string expected)
+    {
+        var parsed = EgressProxyConfig.ParseResolvConfNameservers(content);
+        Assert.Equal(expected, string.Join(',', parsed));
+    }
 }

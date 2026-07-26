@@ -5,10 +5,13 @@ using System.IO;
 using System.Linq;
 using Grpc.Core;
 using Grpc.Net.Client;
+using Mainguard.Agents.Agents;
 using Mainguard.Server.Auth;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -60,6 +63,15 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
     public Metadata WrongTokenHeaders()
         => new() { { "authorization", "bearer 0000000000000000000000000000000000000000000000000000000000000000" } };
 
+    /// <summary>
+    /// The memory reading every in-proc daemon test runs against. Matches
+    /// <c>CoordinatorSpawnGateTests.Roomy()</c> — ~15 GB total with ~12 GB free, i.e. 25% used, far
+    /// below <see cref="AdmissionController.DefaultUsedThreshold"/>. The <c>MemTotalKb</c> value doubles
+    /// as a sentinel: no real machine reports exactly this, so a test can assert that the graph is
+    /// reading THIS and not <c>/proc/meminfo</c>.
+    /// </summary>
+    public static MemorySample RoomySample => new(MemTotalKb: 16_000_000, MemAvailableKb: 12_000_000);
+
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
         // Isolate the on-disk token to a temp path so tests never touch the real
@@ -70,6 +82,31 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
             logging.ClearProviders();
             logging.AddProvider(_logs);
             logging.SetMinimumLevel(LogLevel.Trace);
+        });
+
+        builder.ConfigureTestServices(services =>
+        {
+            // MG-37 flake: the in-proc tier must not gate on the BOX's live memory.
+            //
+            // The production graph wires AdmissionController with its DEFAULT sampler, which reads
+            // /proc/meminfo (GatewayServiceRegistration) — and the wired shim-spawn path consults it on
+            // every spawn (AgentSpawnService -> CoordinatorSpawnGate.Evaluate -> CanSpawn). So on Linux
+            // every `HandleShimRequestAsync("spawn")` in this tier was gated on however much memory the
+            // machine happened to have free at that instant. A full `dotnet test` runs two test
+            // assemblies alongside the MSBuild nodes that just built them; cross the 85% threshold for
+            // one 5-second sample window (the controller caches that long) and exactly one shim spawn
+            // comes back `Ok:false` with the honest "free memory or stop an agent" refusal, while the
+            // re-run — a few seconds later, under no load — passes. That is the whole flake: not a race
+            // inside the code under test, but an uncontrolled machine input reaching it.
+            //
+            // Pinned here rather than per-test because the exposure is the TIER's, not one test's, and
+            // a per-test fix leaves the next shim-spawn test to rediscover it. Admission itself keeps
+            // its deterministic coverage in CoordinatorSpawnGateTests, which injects its own sampler —
+            // this replacement is registered before WiringRig's, so a test that wants to exercise
+            // pressure can still override it.
+            services.Replace(ServiceDescriptor.Singleton(new AdmissionController(
+                sampler: () => RoomySample,
+                runningAgentCount: () => 0)));
         });
     }
 

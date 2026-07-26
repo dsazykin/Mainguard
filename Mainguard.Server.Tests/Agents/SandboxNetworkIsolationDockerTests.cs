@@ -218,13 +218,14 @@ public class SandboxNetworkIsolationDockerTests
     /// is the only thing that can prove suppression rather than assume it.</para>
     ///
     /// <para><b>Which makes the A-record control load-bearing, and it is why this test went red on CI
-    /// once already.</b> That failure was NOT the AAAA assertion: it was <c>resolve4</c> answering
-    /// <c>ESERVFAIL</c>, because the proxy could not reach the hardcoded <c>1.1.1.1</c> upstream at that
-    /// moment. Reproduced deterministically here by blocking <c>1.1.1.1</c> in the proxy's netns: a
-    /// cold-cache forwarded name then answers ESERVFAIL to node and fails <c>getent</c> alike, while
-    /// every locally-served record keeps working. That is a real, separate, pre-existing defect (the
-    /// resolver upstream should not be a hardcoded public IP), and the control's message says so — so a
-    /// future red is diagnosed on sight instead of being mistaken for an IPv6 regression.</para>
+    /// once already.</b> That failure was NOT the AAAA assertion: it was <c>resolve4</c> failing,
+    /// because the proxy could not reach the hardcoded <c>1.1.1.1</c> upstream at that moment. That
+    /// upstream is <b>gone</b> — allowlisted names now forward to the proxy container's own stub
+    /// resolver (<c>EgressProxyConfig.DockerEmbeddedResolver</c>), so this control no longer depends on
+    /// any public resolver being reachable, and the flake it carried went with it.
+    /// <c>SandboxEgressDockerTests.AllowlistedName_ShouldStillResolve_WithoutAnyPublicResolver</c> is
+    /// the regression test for that. The control stays, and its message still names the distinction: a
+    /// forwarding failure here says nothing about AAAA suppression either way.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task JailResolution_IsIPv4Only_MatchingTheIPv4OnlyFabric()
@@ -249,15 +250,17 @@ public class SandboxNetworkIsolationDockerTests
         Assert.Equal(0, v4.ExitCode);
         Assert.StartsWith("A ", v4.Stdout.Trim(), StringComparison.Ordinal);
 
-        // ESERVFAIL here is NOT an IPv6 problem: it means dnsmasq could not reach the hardcoded 1.1.1.1
-        // upstream, so nothing about AAAA suppression can be concluded either way. Named explicitly
-        // because this exact failure has already been mistaken for something else once.
-        Assert.False(v4.Stdout.Contains("ESERVFAIL", StringComparison.Ordinal),
-            $"the jail's resolver could not forward '{host}': dnsmasq's upstream is the hardcoded public "
-            + "1.1.1.1 (EgressProxyConfig.RenderDnsmasqConfig) and this environment cannot reach it. That "
-            + "is a separate, pre-existing defect — in-jail DNS breaks anywhere external resolvers are "
-            + "blocked — and it says nothing about filter-AAAA. Reproduce: block 1.1.1.1 in the proxy's "
-            + $"netns and query a cold-cache name. Got: '{v4.Stdout.Trim()}'");
+        // A forwarding failure here is NOT an IPv6 problem: it means dnsmasq could not reach its
+        // upstream at all, so nothing about AAAA suppression can be concluded either way. Named
+        // explicitly because this exact failure has already been mistaken for something else once.
+        Assert.False(v4.Stdout.Contains("ESERVFAIL", StringComparison.Ordinal)
+                     || v4.Stdout.Contains("EREFUSED", StringComparison.Ordinal),
+            $"the jail's resolver could not forward '{host}', so this says nothing about filter-AAAA. "
+            + "dnsmasq forwards allowlisted names to the proxy container's own stub resolver "
+            + "(EgressProxyConfig.DockerEmbeddedResolver, read from its /etc/resolv.conf), so this means "
+            + "the HOST's DNS is not answering for the proxy — check the proxy's resolv.conf and that "
+            + "Docker's embedded resolver is reachable from its netns (the backstop must keep admitting "
+            + $"-i lo, and must restore *filter only so the nat DNAT survives). Got: '{v4.Stdout.Trim()}'");
 
         // THE CONTROL UNDER TEST: the same name must yield no AAAA, so a CLI that asks for one is told
         // there is none instead of being handed an address the jail can never route to.
