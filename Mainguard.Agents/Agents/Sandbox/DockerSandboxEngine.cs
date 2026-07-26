@@ -83,10 +83,17 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         ArgumentNullException.ThrowIfNull(request);
         var name = ContainerSpecBuilder.ContainerName(request.RepoHash, request.AgentId);
 
-        // MG-7: the resolver pin is the proxy's CURRENT address on the agent network, so it is resolved
-        // per spawn rather than captured at construction — the proxy is recreated on image upgrade and
-        // on corpse replacement, and Docker hands out a new address each time.
-        var dnsServer = await ResolveDnsServerAsync(ct).ConfigureAwait(false);
+        // MG-36: the jail's network and proxy URL come from the request when the caller resolved a
+        // per-agent segment (the production launcher always does), and fall back to the engine-wide
+        // options for the ad-hoc harnesses that run on `bridge` or on the shared network.
+        var networkName = string.IsNullOrWhiteSpace(request.NetworkName) ? _options.NetworkName : request.NetworkName;
+        var proxyUrl = string.IsNullOrWhiteSpace(request.ProxyUrl) ? _options.ProxyUrl : request.ProxyUrl;
+
+        // MG-7: the resolver pin is the proxy's CURRENT address on THIS jail's network, so it is
+        // resolved per spawn rather than captured at construction — the proxy is recreated on image
+        // upgrade and on corpse replacement, and Docker hands out a new address each time (and with
+        // MG-36 a different address per segment).
+        var dnsServer = await ResolveDnsServerAsync(networkName, ct).ConfigureAwait(false);
 
         var existing = await FindByNameAsync(name, ct).ConfigureAwait(false);
         if (existing is not null)
@@ -101,7 +108,13 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // Recreating is the only way to re-pin; the alternative is a jail with no working DNS.
             var stalePin = dnsServer is not null
                 && !await PinnedDnsMatchesAsync(existing.ID, dnsServer, ct).ConfigureAwait(false);
-            if (!string.Equals(existing.Image, request.ImageRef, StringComparison.Ordinal) || missingBareMount || stalePin)
+            // MG-36: a jail created before segmentation (or on another segment) must move — its network
+            // is fixed at create, so an unsegmented jail would otherwise sit on the flat network forever.
+            var wrongNetwork = !await AttachedToAsync(existing.ID, networkName, ct).ConfigureAwait(false);
+            // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
+            // id — compare through the matcher, never with `!=`, or every reuse would look like an
+            // upgrade and recreate a perfectly good jail on every spawn.
+            if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef) || missingBareMount || stalePin || wrongNetwork)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -121,7 +134,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
-            request.Limits, _options.NetworkName, credentials, _options.ProxyUrl, _options.UsernsMode,
+            request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
             request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer);
 
         var create = ContainerSpecBuilder.Build(spec);
@@ -183,6 +196,25 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     }
 
     /// <summary>
+    /// MG-27 — the immutable content digest behind <paramref name="imageRef"/>. Docker's image inspect
+    /// answers <c>Id</c> as <c>sha256:&lt;64 hex&gt;</c>, computed over the image's own config and
+    /// layers: unlike the <see cref="SandboxImageVersions.LabelKey"/> label (an arbitrary string the
+    /// builder chooses) it cannot be set to a value the image does not have.
+    /// </summary>
+    public async Task<string?> ImageDigestAsync(string imageRef, CancellationToken ct = default)
+    {
+        try
+        {
+            var inspect = await _docker.Images.InspectImageAsync(imageRef, ct).ConfigureAwait(false);
+            return SandboxImageDigest.Normalize(inspect.ID);
+        }
+        catch (DockerImageNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
     /// Runs a command in a live jail. The three CONTROL-PLANE calls are bounded by
     /// <see cref="ControlPlaneTimeout"/>; the output drain in the middle is not, because its duration is
     /// the command's own runtime and that is the caller's <paramref name="ct"/> to govern. Splitting it
@@ -233,19 +265,39 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// network the absence of an address is fatal — <see cref="ContainerSpecBuilder"/> refuses to build
     /// an unpinned spec there, which is the fail-closed half of this control.
     /// </summary>
-    private async Task<string?> ResolveDnsServerAsync(CancellationToken ct)
+    private async Task<string?> ResolveDnsServerAsync(string networkName, CancellationToken ct)
     {
-        if (!string.Equals(_options.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal))
+        // MG-36: the class of network, not one literal name — see EgressProxyConfigurator.
+        if (!EgressProxyConfigurator.IsDefaultDenyAgentNetwork(networkName))
             return null;
 
         try
         {
             var inspect = await _docker.Containers.InspectContainerAsync(_options.ProxyContainerName, ct).ConfigureAwait(false);
-            return EgressProxyConfigurator.ProxyAddressOf(inspect);
+            // The proxy's address ON THIS SEGMENT. A jail cannot reach the proxy's address on another
+            // segment — internal networks are isolated from one another, which is the whole point.
+            return EgressProxyConfigurator.ProxyAddressOf(inspect, networkName);
         }
         catch (DockerContainerNotFoundException)
         {
             return null;
+        }
+    }
+
+    /// <summary>MG-36 — true when a reusable jail already sits on <paramref name="networkName"/>. A
+    /// container that vanished under us counts as matching so the caller's own recreate path — not this
+    /// probe — decides what to do about it (same convention as <see cref="PinnedDnsMatchesAsync"/>).</summary>
+    private async Task<bool> AttachedToAsync(string containerId, string networkName, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            var networks = inspect.NetworkSettings?.Networks;
+            return networks is not null && networks.ContainsKey(networkName);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return true;
         }
     }
 

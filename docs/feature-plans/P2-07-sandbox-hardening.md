@@ -152,6 +152,23 @@ control 1) or supervisor memory scrape (closed by controls 3+4, hardened by cont
 
 - `EnsureNetworkAsync`: create internal network `mainguard-agents` (`Internal = true`) + attach the
   proxy container with a second leg on the egress-capable network.
+- **Amended by MG-36 (2026-07-26) — one segment per agent, not one shared segment.** As originally
+  built, every jail attached to the single `mainguard-agents` network, which contained egress to the
+  internet and kept the daemon unreachable but left **no east-west control at all**: agent A could
+  dial agent B's container IP and any port B had open. `mainguard-agents` is now the proxy's own
+  agent-side home leg, and each jail gets its own internal `mainguard-agent-<repo>-<agent>` network
+  whose only other member is the proxy. Why segments rather than an intra-network isolation policy:
+  Docker's one knob for this, `com.docker.network.bridge.enable_icc=false`, is all-or-nothing — it
+  drops jail→proxy along with jail→jail (measured against a real daemon), so "one network, tenants
+  isolated from each other but not from the proxy" cannot be expressed. Punching a hole back through
+  it would need a rule in the VM's host network namespace, and the daemon runs as an unprivileged VM
+  user whose only capability is membership of the `docker` group. Attaching the running proxy to a
+  new segment is additive (its pid and its existing legs' addresses/MACs are untouched), so this does
+  not re-open the "recreating the proxy strands running jails" failure. Consequences: the proxy holds
+  one address per segment, so the MG-18 backstop is rendered with all of them; the jail's
+  `HTTP(S)_PROXY` and MG-7 resolver pin use the proxy's address **on that segment** rather than its
+  name (one dnsmasq cannot answer a name differently per client); and segments are reclaimed at
+  teardown, because Docker's default local bridge pool is only ~32 networks deep.
 - Proxy container: allowlist-driven HTTP(S) CONNECT proxy; dnsmasq answering **only** allowlisted
   names (everything else NXDOMAIN → kills DNS exfiltration); iptables inside the agent network
   namespace (or on the proxy as the only gateway) DROP non-proxy egress.

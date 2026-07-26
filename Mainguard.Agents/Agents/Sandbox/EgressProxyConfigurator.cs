@@ -21,8 +21,22 @@ namespace Mainguard.Agents.Agents.Sandbox;
 /// </summary>
 public sealed class EgressProxyConfigurator : IEgressPolicy
 {
-    /// <summary>The internal (default-deny) network agents attach to.</summary>
+    /// <summary>
+    /// The internal (default-deny) network the PROXY's agent-side leg sits on, and the network the
+    /// ad-hoc harnesses still attach to. Before MG-36 every jail attached here too, which is exactly
+    /// what made the segment flat: agent A could dial agent B's container IP and ports. A jail now gets
+    /// its own <see cref="AgentSegmentName"/> network instead.
+    /// </summary>
     public const string AgentNetworkName = "mainguard-agents";
+
+    /// <summary>
+    /// MG-36 — the name prefix of a per-agent default-deny segment. Deliberately a prefix of
+    /// <see cref="AgentNetworkName"/>'s own stem so <see cref="IsDefaultDenyAgentNetwork"/> recognises
+    /// the shared network and every segment with one predicate — the MG-7 resolver-pin gate and the
+    /// MG-18 posture gate must apply to ALL of them, and a gate that keys on one literal network name
+    /// silently switches itself off the moment the topology gains a second one.
+    /// </summary>
+    public const string AgentSegmentPrefix = "mainguard-agent-";
 
     /// <summary>The egress-capable network the proxy's second leg sits on.</summary>
     public const string EgressNetworkName = "mainguard-egress";
@@ -102,6 +116,28 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         Allowlist.Allows(host) ? EgressVerdict.Allowed : EgressVerdict.Denied;
 
     /// <summary>
+    /// MG-36 — true when <paramref name="networkName"/> is one of mainguard's default-deny agent
+    /// networks: the shared <see cref="AgentNetworkName"/> the proxy homes on, or any per-agent
+    /// segment. Every control that used to test <c>name == AgentNetworkName</c> tests THIS instead;
+    /// the two that matter are the MG-7 fail-closed resolver pin (an unpinned jail silently falls back
+    /// to Docker's 127.0.0.11 and DNS exfiltration walks out) and the MG-18 network-posture gate.
+    /// </summary>
+    public static bool IsDefaultDenyAgentNetwork(string? networkName) =>
+        networkName is not null
+        && (string.Equals(networkName, AgentNetworkName, StringComparison.Ordinal)
+            || networkName.StartsWith(AgentSegmentPrefix, StringComparison.Ordinal));
+
+    /// <summary>
+    /// MG-36 — the single-tenant segment name for one agent. Derived from the SAME
+    /// <c>repoHash</c>/<c>agentId</c> pair (and the same sanitisation) as the jail's container name, so
+    /// the segment and the container it isolates are trivially correlated by an operator reading
+    /// <c>docker network ls</c>, and so the name is stable across restarts — a per-spawn random name
+    /// would leak a network per relaunch.
+    /// </summary>
+    public static string AgentSegmentName(string repoHash, string agentId) =>
+        AgentSegmentPrefix + ContainerSpecBuilder.ContainerName(repoHash, agentId)["mainguard-".Length..];
+
+    /// <summary>
     /// Something outside this call disturbed the proxy while we were adopting it. Raised where WE
     /// detect the disturbance (a state read that says removed/signalled); Docker's own 404/409
     /// responses mean the same thing and are recognised directly by <see cref="IsProxyDisturbed"/>.
@@ -159,18 +195,89 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// is still resolving (a stop that is mid-flight completes in well under this).</summary>
     private static readonly TimeSpan AdoptionRetryDelay = TimeSpan.FromMilliseconds(400);
 
-    public async Task EnsureReadyAsync(CancellationToken ct = default)
+    public Task EnsureReadyAsync(CancellationToken ct = default) => EnsureAsync(segmentName: null, ct);
+
+    /// <summary>
+    /// MG-36 — ensures this agent's own default-deny segment, attaches the proxy to it, and re-renders
+    /// the backstop so the proxy's address ON that segment is admitted.
+    ///
+    /// <para>Deliberately NOT a separate code path. It runs the SAME adopt→start→wait→push sequence
+    /// <see cref="EnsureReadyAsync"/> runs, under the SAME whole-sequence retry, with the segment
+    /// folded in as one more step of that sequence. Bolting a per-call-site "connect the network"
+    /// helper alongside the sequence is precisely the shape that let three variants of the same
+    /// disturbance bug through in three successive CI rounds (see <see cref="IsProxyDisturbed"/>):
+    /// attaching a network to a container we do not own is exactly as TOCTOU as exec'ing into it, and
+    /// the answer to a disturbance is always to start the whole thing over.</para>
+    /// </summary>
+    public async Task<AgentSegment> EnsureAgentSegmentAsync(
+        string repoHash, string agentId, CancellationToken ct = default)
     {
-        // The ENTIRE sequence is retried — networks, adopt, start, wait, AND the config push. Not the
-        // steps that have failed so far; all of them. "Wait until running, then exec" is inherently
-        // TOCTOU against a container we do not own, so the exec is treated as a step that may fail and
-        // be re-run, never as one guaranteed safe by a check that preceded it.
+        ArgumentException.ThrowIfNullOrWhiteSpace(repoHash);
+        ArgumentException.ThrowIfNullOrWhiteSpace(agentId);
+
+        var segment = AgentSegmentName(repoHash, agentId);
+        var address = await EnsureAsync(segment, ct).ConfigureAwait(false);
+        if (string.IsNullOrWhiteSpace(address))
+        {
+            // Fail closed. A segment with no proxy address is a jail with no resolver and no route out;
+            // ContainerSpecBuilder would refuse the spec anyway (MG-7), and saying so here names the
+            // actual problem instead of surfacing it three layers away as a spec violation.
+            throw new EgressNetworkDriftException(segment,
+                "the egress proxy has no address on this segment after being attached to it, so a jail "
+                + "there would have neither a resolver nor a route out.");
+        }
+
+        return new AgentSegment(segment, address);
+    }
+
+    /// <inheritdoc />
+    public async Task RemoveAgentSegmentAsync(string repoHash, string agentId, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(repoHash) || string.IsNullOrWhiteSpace(agentId))
+        {
+            return;
+        }
+
+        var segment = AgentSegmentName(repoHash, agentId);
+        try
+        {
+            // Detach the proxy first: Docker refuses to delete a network that still holds an endpoint,
+            // and the proxy is by construction the last one left once the jail is gone.
+            try
+            {
+                await _docker.Networks.DisconnectNetworkAsync(segment,
+                    new NetworkDisconnectParameters { Container = ProxyContainerName, Force = true }, ct)
+                    .ConfigureAwait(false);
+            }
+            catch (DockerApiException)
+            {
+                // Already detached, already gone, or the proxy itself is gone — all fine.
+            }
+
+            await _docker.Networks.DeleteNetworkAsync(segment, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is DockerApiException or OperationCanceledException)
+        {
+            // Best effort by contract: a lingering segment costs one bridge-pool slot until the next
+            // sweep; a throw here would fail an agent STOP, which is strictly worse.
+        }
+    }
+
+    /// <summary>
+    /// The whole adopt→start→wait→(attach segment)→push sequence, retried as ONE unit. Returns the
+    /// proxy's address on <paramref name="segmentName"/>, or null when no segment was requested.
+    /// </summary>
+    private async Task<string?> EnsureAsync(string? segmentName, CancellationToken ct)
+    {
+        // The ENTIRE sequence is retried — networks, adopt, start, wait, the segment attach, AND the
+        // config push. Not the steps that have failed so far; all of them. "Wait until running, then
+        // exec" is inherently TOCTOU against a container we do not own, so the exec is treated as a
+        // step that may fail and be re-run, never as one guaranteed safe by a check that preceded it.
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                await EnsureProxyReadyOnceAsync(ct).ConfigureAwait(false);
-                return;
+                return await EnsureProxyReadyOnceAsync(segmentName, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (attempt < MaxAdoptionAttempts && IsProxyDisturbed(ex))
             {
@@ -181,7 +288,7 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         }
     }
 
-    private async Task EnsureProxyReadyOnceAsync(CancellationToken ct)
+    private async Task<string?> EnsureProxyReadyOnceAsync(string? segmentName, CancellationToken ct)
     {
         // Inside the retry: a concurrent teardown removes the networks too, and re-reading them is part
         // of starting over. A drifted network (EgressNetworkDriftException) is a policy failure, not a
@@ -189,11 +296,19 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
         var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
 
+        // MG-27: resolve the proxy's ref to its immutable content digest ONCE, and both compare and
+        // create against THAT. `mainguard-egress-proxy:latest` is a mutable pointer, so a tag-vs-tag
+        // comparison can never detect that the bytes behind it changed — this container would keep
+        // running an image that has been replaced underneath it. A null resolution (image absent) keeps
+        // the ref, so the create below fails with Docker's own "no such image" rather than something
+        // opaque; the spawn preflight has normally already turned that into a typed error.
+        var proxyImageRef = await ResolveImageRefAsync(_proxyImageRef, ct).ConfigureAwait(false);
+
         var proxy = await FindContainerAsync(ProxyContainerName, ct).ConfigureAwait(false);
         string? proxyId = proxy?.ID;
         var revived = false;
 
-        if (proxy is not null && !string.Equals(proxy.Image, _proxyImageRef, StringComparison.Ordinal))
+        if (proxy is not null && !SandboxImageDigest.SameImage(proxy.Image, proxyImageRef))
         {
             // The proxy image was upgraded since this container was created — recreate below so the
             // new bytes run (same policy as the persistent agent jails).
@@ -239,7 +354,7 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             }
         }
 
-        proxyId ??= await CreateAndStartProxyAsync(egressId, ct).ConfigureAwait(false);
+        proxyId ??= await CreateAndStartProxyAsync(egressId, proxyImageRef, ct).ConfigureAwait(false);
 
         // The config exec 409s ("container … is not running") against anything not fully up. Every path
         // above ends in a start, so verify the postcondition ONCE here rather than assuming it — this is
@@ -256,23 +371,67 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
                 proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
 
+        // MG-36: the per-agent segment is attached HERE — after the proxy is confirmed running and
+        // BEFORE the config push, so the push renders a backstop that already admits the new address.
+        // Attaching is additive and non-destructive: `docker network connect` on a running container
+        // leaves its pid, its existing legs' addresses and their MACs untouched (verified against a
+        // real daemon), which is what makes segmenting compatible with "recreating the proxy strands
+        // every running jail". Nothing here recreates anything.
+        if (segmentName is not null)
+        {
+            await AttachSegmentAsync(proxyId, segmentName, ct).ConfigureAwait(false);
+        }
+
         // The config push is INSIDE the retried sequence and carries no special-case recovery of its
         // own. It used to have a bespoke "if this was a revived container, recreate and push again"
         // branch; that is exactly the per-call-site patching that let the next variant through. A 409
         // here ("container is not running", because the container was stopped between the readiness
         // check above and this exec) is just another disturbance, and the sequence retry answers it.
         await PushConfigAsync(proxyId, ct).ConfigureAwait(false);
+
+        return segmentName is null
+            ? null
+            : ProxyAddressOf(await _docker.Containers.InspectContainerAsync(proxyId, ct).ConfigureAwait(false), segmentName);
+    }
+
+    /// <summary>
+    /// MG-36 — creates the per-agent segment if absent (through the SAME MG-18 posture gate every other
+    /// mainguard network passes: internal + role-labelled) and attaches the running proxy to it.
+    /// Attaching a container that is already attached answers 403 <c>"endpoint … already exists"</c>,
+    /// which is the desired end state, not an error.
+    /// </summary>
+    private async Task AttachSegmentAsync(string proxyId, string segmentName, CancellationToken ct)
+    {
+        var segmentId = await EnsureNetworkAsync(segmentName, isInternal: true, ct).ConfigureAwait(false);
+
+        var inspect = await _docker.Containers.InspectContainerAsync(proxyId, ct).ConfigureAwait(false);
+        if (ProxyAddressOf(inspect, segmentName) is not null)
+        {
+            return; // already a member with an address — nothing to do
+        }
+
+        try
+        {
+            await _docker.Networks.ConnectNetworkAsync(
+                segmentId, new NetworkConnectParameters { Container = proxyId }, ct).ConfigureAwait(false);
+        }
+        catch (DockerApiException api) when (api.StatusCode is HttpStatusCode.Forbidden)
+        {
+            // "endpoint with name mainguard-egress-proxy already exists in network …" — a concurrent
+            // spawn attached it between the inspect above and this call. That IS the postcondition.
+        }
     }
 
     /// <summary>Creates the proxy container on the internal network, attaches its second (egress) leg,
     /// and starts it — the known-good creation path shared by first-provision and corpse replacement.</summary>
-    private async Task<string> CreateAndStartProxyAsync(string egressNetworkId, CancellationToken ct)
+    private async Task<string> CreateAndStartProxyAsync(string egressNetworkId, string proxyImageRef, CancellationToken ct)
     {
         var created = await _docker.Containers.CreateContainerAsync(new CreateContainerParameters
         {
             Name = ProxyContainerName,
             Hostname = ProxyContainerName,
-            Image = _proxyImageRef,
+            // MG-27: the resolved content digest, not the floating tag (see EnsureProxyReadyOnceAsync).
+            Image = proxyImageRef,
             Labels = new Dictionary<string, string> { ["mainguard.role"] = "egress-proxy" },
             HostConfig = ProxyHostConfig(),
         }, ct).ConfigureAwait(false);
@@ -282,6 +441,21 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await _docker.Networks.ConnectNetworkAsync(egressNetworkId, new NetworkConnectParameters { Container = created.ID }, ct).ConfigureAwait(false);
         await _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
         return created.ID;
+    }
+
+    /// <summary>MG-27 — <paramref name="imageRef"/>'s immutable content digest, or the ref itself when
+    /// the image cannot be inspected (absent, or an engine with no image store).</summary>
+    private async Task<string> ResolveImageRefAsync(string imageRef, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Images.InspectImageAsync(imageRef, ct).ConfigureAwait(false);
+            return SandboxImageDigest.Normalize(inspect.ID) ?? imageRef;
+        }
+        catch (DockerImageNotFoundException)
+        {
+            return imageRef;
+        }
     }
 
     /// <summary>
@@ -387,12 +561,40 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     }
 
     /// <summary>Pure extraction of the proxy's agent-network IPv4 from an inspect response.</summary>
-    internal static string? ProxyAddressOf(ContainerInspectResponse? inspect)
+    internal static string? ProxyAddressOf(ContainerInspectResponse? inspect) =>
+        ProxyAddressOf(inspect, AgentNetworkName);
+
+    /// <summary>Pure extraction of the proxy's IPv4 on ONE named network. MG-36 made this
+    /// network-qualified: with a segment per agent the proxy holds several addresses and "the" proxy
+    /// address is only meaningful relative to the segment the asking jail sits on.</summary>
+    internal static string? ProxyAddressOf(ContainerInspectResponse? inspect, string networkName)
     {
         var networks = inspect?.NetworkSettings?.Networks;
-        if (networks is null || !networks.TryGetValue(AgentNetworkName, out var endpoint))
+        if (networks is null || !networks.TryGetValue(networkName, out var endpoint))
             return null;
         return string.IsNullOrWhiteSpace(endpoint?.IPAddress) ? null : endpoint.IPAddress;
+    }
+
+    /// <summary>
+    /// MG-36 — every address the proxy answers on across the default-deny agent networks (the shared
+    /// one plus one per segment). This is what the MG-18 backstop's destination constraint has to be
+    /// rendered from: an ACCEPT pinned to a single address would silently DROP the traffic of every
+    /// segment added after it. Pure so the set is unit-assertable without a Docker daemon.
+    /// </summary>
+    internal static IReadOnlyList<string> ProxyAddressesOf(ContainerInspectResponse? inspect)
+    {
+        var networks = inspect?.NetworkSettings?.Networks;
+        if (networks is null)
+        {
+            return Array.Empty<string>();
+        }
+
+        return networks
+            .Where(kv => IsDefaultDenyAgentNetwork(kv.Key) && !string.IsNullOrWhiteSpace(kv.Value?.IPAddress))
+            .Select(kv => kv.Value.IPAddress.Trim())
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(a => a, StringComparer.Ordinal)
+            .ToArray();
     }
 
     private async Task<string> EnsureNetworkAsync(string name, bool isInternal, CancellationToken ct)
@@ -729,10 +931,16 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// needs to tell "removed" apart from "still here but not running".</summary>
     private async Task<ContainerState?> TryInspectStateAsync(string containerId, CancellationToken ct)
     {
+        var inspect = await TryInspectAsync(containerId, ct).ConfigureAwait(false);
+        return inspect?.State;
+    }
+
+    /// <summary>The container's inspect response, or null when it no longer exists.</summary>
+    private async Task<ContainerInspectResponse?> TryInspectAsync(string containerId, CancellationToken ct)
+    {
         try
         {
-            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
-            return inspect.State;
+            return await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
         }
         catch (DockerContainerNotFoundException)
         {
@@ -768,10 +976,13 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             ? Allowlist
             : Allowlist.CombinedWith(_installedAdapterHosts(), EgressEntryKind.AgentService, "Agent CLI");
 
-        // MG-7/MG-18: both the pinned-DNS self-record and the backstop's destination constraint need
-        // the proxy's own address on the agent network. Resolved here, after the container is up and
-        // attached, because Docker assigns it at attach time.
-        var proxyAddress = await ResolveProxyAddressAsync(ct).ConfigureAwait(false);
+        // MG-7/MG-18/MG-36: both the pinned-DNS self-record and the backstop's destination constraint
+        // need the proxy's own addresses. Resolved here, after the container is up and every segment is
+        // attached, because Docker assigns an address at attach time — and re-resolved on EVERY push,
+        // which is what keeps the backstop correct as segments come and go.
+        var inspect = await TryInspectAsync(proxyId, ct).ConfigureAwait(false);
+        var proxyAddress = ProxyAddressOf(inspect);
+        var proxyAddresses = ProxyAddressesOf(inspect);
 
         await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-filter", EgressProxyConfig.RenderTinyproxyFilter(effective), ct).ConfigureAwait(false);
         // P2-08: front the model-API hosts through the AI gateway (token bucket + budgets + no-raw-429).
@@ -783,7 +994,7 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             EgressProxyConfig.RenderTinyproxyUpstreams(effective, _gatewayUpstream), ct).ConfigureAwait(false);
 
         await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress), ct).ConfigureAwait(false);
-        await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddress), ct).ConfigureAwait(false);
+        await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddresses), ct).ConfigureAwait(false);
         // The image's entrypoint reloads tinyproxy/dnsmasq and (re)applies the backstop from these paths.
         await ExecAsync(proxyId, new[] { "sh", ReloadScript }, ct).ConfigureAwait(false);
     }

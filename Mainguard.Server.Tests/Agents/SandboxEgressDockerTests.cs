@@ -76,22 +76,51 @@ public class SandboxEgressDockerTests
             }
         }
 
+        // Which PHASE of the request got furthest. This is the fact that separates "the hop never
+        // happened" from "the tunnel was up and the transfer died", and without it the two are
+        // indistinguishable from a bare exit code — which is how a CURLE_PARTIAL_FILE (18) came to be
+        // investigated as a connectivity failure. http_connect is the CONNECT tunnel's own status:
+        // 200 means the proxy established the tunnel to the upstream, so everything after that is a
+        // transfer-side problem and no amount of staring at leg 1 will explain it.
+        await ProbeAsync("request phases (curl)", jailId,
+            "curl", "-sS", "-m", "15", "-o", "/dev/null",
+            "-w", "http_connect=%{http_connect} http_code=%{http_code} num_connects=%{num_connects} "
+                + "time_connect=%{time_connect} time_appconnect=%{time_appconnect} "
+                + "time_starttransfer=%{time_starttransfer} size_download=%{size_download}",
+            "https://api.anthropic.com/v1/models");
+
         // LEG 1 — jail → proxy. Name resolution and the TCP hop, separately.
         await ProbeAsync("jail resolves the proxy name", jailId, "getent", "hosts", proxy);
-        await ProbeAsync("jail reaches proxy:8888", jailId, "sh", "-c",
-            $"timeout 5 sh -c 'echo > /dev/tcp/{proxy}/8888' 2>&1 && echo CONNECTED || echo UNREACHABLE");
+        var hop = await fx.TcpProbeAsync(jailId, $"{proxy}:{EgressProxyConfigurator.ProxyPort}");
+        report.Append("  jail reaches proxy:").Append(EgressProxyConfigurator.ProxyPort)
+              .Append(": ").Append(hop.Detail).Append('\n');
 
         // LEG 2 — the proxy's own health and its route out.
         await ProbeAsync("proxy daemon status", proxy, "sh", "-c",
             "echo dns=$(cat /run/mainguard/dnsmasq.status 2>&1) tinyproxy=$(cat /run/mainguard/tinyproxy.status 2>&1)");
         await ProbeAsync("proxy listeners", proxy, "sh", "-c",
             "awk 'NR>1{split($2,a,\":\"); if(a[2]==\"22B8\" && $4==\"0A\") print \"tinyproxy LISTENING\"}' /proc/net/tcp");
-        await ProbeAsync("proxy resolves upstream", proxy, "getent", "hosts", "api.anthropic.com");
+
+        // `getent ahosts`, NOT `getent hosts`. They answer different questions, and the difference has
+        // already misdirected one investigation. `getent hosts` resolves AF_INET6 FIRST and reports the
+        // AAAA record whenever one exists — even in a container with no IPv6 address and no IPv6 route,
+        // verified against this exact image: a name with both an A and an AAAA in /etc/hosts reports
+        // the AAAA under `getent hosts` and the A under `getent ahosts`. tinyproxy resolves with
+        // getaddrinfo(AF_UNSPEC) — which is what `ahosts` shows — so `hosts` was reporting an address
+        // the proxy would never dial and inviting an IPv6 diagnosis that the evidence does not support.
+        await ProbeAsync("proxy resolves upstream (getaddrinfo order, as tinyproxy sees it)", proxy,
+            "sh", "-c", "getent ahosts api.anthropic.com | grep STREAM || echo '(no STREAM result)'");
+        await ProbeAsync("proxy IPv6 addresses (blank => IPv4-only fabric)", proxy,
+            "sh", "-c", "grep -v '^00000000000000000000000000000001' /proc/net/if_inet6 || echo '(none — loopback only)'");
         await ProbeAsync("proxy logs", proxy, "sh", "-c", "tail -5 /run/mainguard/dnsmasq.log 2>&1");
 
-        report.Append("Read it this way: leg 1 broken => the jail cannot reach the proxy (a recreated "
-                    + "proxy strands running jails — same IP, new MAC). Leg 1 fine but leg 2 broken => "
-                    + "the proxy is up and the upstream is unreachable from this runner.");
+        report.Append("Read it this way. FIRST look at http_connect: 200 means the CONNECT tunnel was "
+                    + "established, so legs 1 and 2 both worked and the failure is in the transfer "
+                    + "(curl 18 = CURLE_PARTIAL_FILE — the stream ended mid-response); blank/000 means "
+                    + "the tunnel was never built, and then leg 1 UNREACHABLE => the jail cannot reach "
+                    + "the proxy (a recreated proxy strands running jails — same IP, new MAC), while "
+                    + "leg 1 REACHABLE with leg 2 broken => the proxy is up and the upstream is "
+                    + "unreachable from this runner.");
         return report.ToString();
     }
 

@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -115,6 +116,17 @@ public static class EgressProxyConfig
         sb.Append("# mainguard pinned DNS — answer allowlisted names only; all else NXDOMAIN\n");
         sb.Append("no-resolv\n");
         sb.Append("bogus-priv\n");
+        // The agent fabric is IPv4-only by construction: EgressProxyConfigurator creates both the agent
+        // segments and the egress network without EnableIPv6, so a jail has no IPv6 address and no IPv6
+        // route — and the agent segments are additionally Internal. Handing a jail a AAAA record
+        // therefore hands it an address it can NEVER reach, and which of the two families a tool picks
+        // is up to that tool: an agent CLI that resolves a host itself gets a nondeterministic hang or
+        // failure depending on nothing it can see or control, and the operator gets no signal at all.
+        // dnsmasq is the jail's ONLY resolver (MG-7), so this is the one place that view can be made to
+        // match the network the jail actually has. (Available in this image: dnsmasq 2.90, verified with
+        // `dnsmasq --test --filter-AAAA` inside the built container — an unsupported option would be
+        // fatal at startup rather than ignored.)
+        sb.Append("filter-AAAA\n");
         if (!string.IsNullOrWhiteSpace(proxyAddress))
         {
             // MUST precede the catch-all: the jail's HTTP_PROXY names this host and nothing else can
@@ -151,9 +163,58 @@ public static class EgressProxyConfig
     /// </summary>
     /// <param name="proxyAddress">The proxy's own IPv4 on the agent network — the only legitimate
     /// destination for agent traffic. Null/empty falls back to port-only rules (pure tests).</param>
-    public static string RenderIptablesScript(int proxyPort, string? proxyAddress = null)
+    public static string RenderIptablesScript(int proxyPort, string? proxyAddress = null) =>
+        RenderIptablesScript(
+            proxyPort,
+            string.IsNullOrWhiteSpace(proxyAddress) ? Array.Empty<string>() : new[] { proxyAddress });
+
+    /// <summary>
+    /// MG-36 — the same backstop for a proxy that holds SEVERAL addresses, one per per-agent segment.
+    ///
+    /// <para>Segmenting the agents (one internal network each) necessarily gives the proxy a new
+    /// interface, and therefore a new address, on every segment it fronts. The MG-18 destination
+    /// constraint is what makes the ACCEPTs meaningful — "port 53 to anywhere" is not a restriction —
+    /// so it has to be re-rendered as the segment set grows rather than dropped. Every admitted
+    /// address gets its own rule; the chain stays default-deny and everything not named is DROPped,
+    /// which is exactly the property the single-address form had.</para>
+    ///
+    /// <para><b>The apply is ATOMIC, and that is a correctness requirement, not tidiness.</b> This used
+    /// to be <c>iptables -F</c> followed by ~13 separate <c>iptables -A</c> processes. Measured against
+    /// a real proxy: immediately after the flush the chain is <c>-P INPUT DROP</c> with <b>zero</b>
+    /// rules — a total blackhole that drops even ESTABLISHED traffic — and the full re-apply takes
+    /// <b>131 ms</b>. A config push runs on every agent spawn, so spawning agent B silently blackholed
+    /// agent A's egress for a tenth of a second.</para>
+    ///
+    /// <para>Measured effect, with a jail connect-probing the proxy ~20×/s across 5 reloads: <b>20 of
+    /// 118 probes failed</b>, in five clusters of exactly one per reload — hard <c>exit 7</c> connect
+    /// failures, one-second <c>time_connect</c> values (a dropped SYN recovering on the retransmit),
+    /// and an <c>exit 56</c> reset. Those are precisely the three symptoms CI reported
+    /// (<c>tconnect=1.002318</c>, <c>exit=7 num_connects=0</c>, <c>Connection reset by peer</c>), and a
+    /// dropped ESTABLISHED packet is also a clean explanation for an in-flight HTTP/2 stream dying
+    /// mid-response.</para>
+    ///
+    /// <para>So the ruleset is now handed to <c>iptables-restore</c> as a complete table, which the
+    /// kernel applies in a single netlink transaction: the chain moves from the old policy to the new
+    /// one with nothing observable in between. Note this is NOT a return to the pre-MG-18 append
+    /// behaviour — restoring a table replaces it, so reloads stay idempotent; the difference is that
+    /// the replacement is one operation instead of fourteen.</para>
+    /// </summary>
+    /// <param name="proxyPort">The tinyproxy CONNECT port to admit.</param>
+    /// <param name="proxyAddresses">Every address the proxy answers on across the agent segments.
+    /// Empty falls back to port-only rules (the pure tests and the pre-MG-7 paths).</param>
+    public static string RenderIptablesScript(int proxyPort, IReadOnlyCollection<string> proxyAddresses)
     {
-        var to = string.IsNullOrWhiteSpace(proxyAddress) ? string.Empty : $" -d {proxyAddress.Trim()}";
+        var destinations = (proxyAddresses ?? Array.Empty<string>())
+            .Where(a => !string.IsNullOrWhiteSpace(a))
+            .Select(a => a.Trim())
+            .Distinct(System.StringComparer.Ordinal)
+            .OrderBy(a => a, System.StringComparer.Ordinal)
+            .Select(a => " -d " + a)
+            .ToList();
+        if (destinations.Count == 0)
+        {
+            destinations.Add(string.Empty); // port-only fallback
+        }
 
         var sb = new StringBuilder();
         sb.Append("#!/bin/sh\n");
@@ -161,29 +222,50 @@ public static class EgressProxyConfig
         sb.Append("# Agent containment is the Internal network, asserted daemon-side; this chain bounds\n");
         sb.Append("# what an agent may reach INSIDE the proxy: tinyproxy + dnsmasq at the proxy's own\n");
         sb.Append("# address, nothing else. FORWARD stays default-deny as defence in depth only.\n");
+        sb.Append("# MG-36: one rule per address — the proxy answers on every per-agent segment it fronts.\n");
+        sb.Append("#\n");
+        sb.Append("# APPLIED ATOMICALLY. iptables-restore loads the whole table in ONE netlink\n");
+        sb.Append("# transaction, so the chain goes straight from the old policy to the new one with no\n");
+        sb.Append("# state in between. See the C# summary for the measurement that forced this.\n");
         sb.Append("set -eu\n");
 
-        // Flush first. Every reload used to APPEND, so the chain grew a fresh copy of every rule each
-        // time — and because the copies land AFTER the terminal `-j DROP`, they are dead weight that
-        // makes the live policy progressively harder to read (13 rules after two reloads instead of 8).
-        // Applying policy has to be idempotent: the chain after N reloads must equal the chain after 1.
-        sb.Append("iptables -F INPUT\n");
-        sb.Append("iptables -F FORWARD\n");
+        // The table is REPLACED, not edited: iptables-restore without --noflush swaps the whole filter
+        // table in a single transaction. That is what makes reloads idempotent (the chain after N
+        // reloads equals the chain after 1 — the original reason this stopped appending) AND
+        // uninterrupted (there is never a moment when the policy is DROP with no rules).
+        //
+        // OUTPUT is declared ACCEPT explicitly. Restoring a table sets every chain in it, so leaving
+        // OUTPUT out would not preserve it — it would reset it to this file's idea of the default. The
+        // backstop has never filtered outbound traffic (dnsmasq's upstream queries and tinyproxy's
+        // upstream connections both leave through it) and must not start now.
+        sb.Append("iptables-restore <<'MAINGUARD_BACKSTOP_EOF'\n");
+        sb.Append("*filter\n");
+        sb.Append(":INPUT DROP [0:0]\n");
+        sb.Append(":FORWARD DROP [0:0]\n");
+        sb.Append(":OUTPUT ACCEPT [0:0]\n");
 
-        sb.Append("iptables -P INPUT DROP\n");
-        sb.Append("iptables -A INPUT -i lo -j ACCEPT\n");
-        sb.Append("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p udp{to} --dport 53 -j ACCEPT\n");
-        sb.Append($"iptables -A INPUT -p tcp{to} --dport 53 -j ACCEPT\n");
-        sb.Append("iptables -A INPUT -j DROP\n");
+        sb.Append("-A INPUT -i lo -j ACCEPT\n");
+        sb.Append("-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
+        foreach (var to in destinations)
+        {
+            sb.Append($"-A INPUT -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+            sb.Append($"-A INPUT -p udp{to} --dport 53 -j ACCEPT\n");
+            sb.Append($"-A INPUT -p tcp{to} --dport 53 -j ACCEPT\n");
+        }
 
-        sb.Append("iptables -P FORWARD DROP\n");
-        sb.Append("iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p udp{to} --dport 53 -j ACCEPT\n");
-        sb.Append($"iptables -A FORWARD -p tcp{to} --dport 53 -j ACCEPT\n");
-        sb.Append("iptables -A FORWARD -j DROP\n");
+        sb.Append("-A INPUT -j DROP\n");
+
+        sb.Append("-A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT\n");
+        foreach (var to in destinations)
+        {
+            sb.Append($"-A FORWARD -p tcp{to} --dport {proxyPort} -j ACCEPT\n");
+            sb.Append($"-A FORWARD -p udp{to} --dport 53 -j ACCEPT\n");
+            sb.Append($"-A FORWARD -p tcp{to} --dport 53 -j ACCEPT\n");
+        }
+
+        sb.Append("-A FORWARD -j DROP\n");
+        sb.Append("COMMIT\n");
+        sb.Append("MAINGUARD_BACKSTOP_EOF\n");
         return sb.ToString();
     }
 

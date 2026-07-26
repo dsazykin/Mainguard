@@ -15,9 +15,14 @@
          lockstep with Mainguard.App.Shell.csproj's Version — a drifted pair makes every install look
          permanently skewed. Bumped 0.2.4 → 0.2.5 in step 2g: the gRPC package rename (mainguard.v1 →
          mainguard.v1) changes the wire service paths, so the skew check must read as changed.
-         Bumped 0.2.5 → 0.2.6 with the egress-proxy image source hash (reload.sh now LOADS the rendered
-         tinyproxy upstreams): the daemon compares SandboxImageVersions at spawn preflight, so it has to
-         ship in step with the image the app builds and labels. -->
+         Bumped 0.2.5 → 0.2.6. Two independent reasons landed in the same release, both of which
+         change the egress-proxy image the DAEMON compares at spawn preflight (versioning-discipline
+         rule 3), so the daemon has to ship in step with the image the app builds and labels:
+         reload.sh now LOADS the rendered tinyproxy upstreams, and MG-27/MG-36 changed the jail-image
+         sources (digest-pinned base images + checksummed toolchain installers) and the daemon spawn
+         chain itself (digest-pinned image ref + per-agent network segments). No
+         `build/mainguardos/VERSION` cut: the images ship beside the app, not inside the MainguardOS
+         tarball. -->
     <Version>0.2.6</Version>
     <FileVersion>0.2.6.0</FileVersion>
     <InformationalVersion>0.2.6</InformationalVersion>

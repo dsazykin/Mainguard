@@ -122,17 +122,21 @@ public sealed class EgressNetworkPostureTests
         // The chain that does sit in the path is INPUT — traffic arriving AT the proxy.
         var script = EgressProxyConfig.RenderIptablesScript(EgressProxyConfigurator.ProxyPort, "172.30.0.2");
 
-        Assert.Contains("iptables -P INPUT DROP", script);
-        Assert.Contains("iptables -A INPUT -p tcp -d 172.30.0.2 --dport 8888 -j ACCEPT", script);
-        Assert.Contains("iptables -A INPUT -p udp -d 172.30.0.2 --dport 53 -j ACCEPT", script);
-        Assert.Contains("iptables -A INPUT -j DROP", script);
+        // The rules now travel as an `iptables-restore` table rather than one `iptables -A` process per
+        // rule (the apply had to become atomic — see EgressProxyConfig.RenderIptablesScript), so the
+        // chain policy is a `:CHAIN POLICY` line and the rules lose the `iptables ` prefix. Every
+        // property asserted here is unchanged; only the transport is.
+        Assert.Contains(":INPUT DROP", script);
+        Assert.Contains("-A INPUT -p tcp -d 172.30.0.2 --dport 8888 -j ACCEPT", script);
+        Assert.Contains("-A INPUT -p udp -d 172.30.0.2 --dport 53 -j ACCEPT", script);
+        Assert.Contains("\n-A INPUT -j DROP\n", script);
 
         // The proxy must still be able to hear its own upstream replies and its own loopback traffic,
         // or a default-deny INPUT chain takes the whole egress path down with it.
-        Assert.Contains("iptables -A INPUT -i lo -j ACCEPT", script);
-        Assert.Contains("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT", script);
+        Assert.Contains("-A INPUT -i lo -j ACCEPT", script);
+        Assert.Contains("-A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT", script);
 
         // FORWARD is kept as defence in depth for the day this container is given a routing role.
-        Assert.Contains("iptables -P FORWARD DROP", script);
+        Assert.Contains(":FORWARD DROP", script);
     }
 }

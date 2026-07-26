@@ -24,6 +24,11 @@ public sealed class SandboxFixture : IAsyncDisposable
     private readonly List<string> _containerIds = new();
     private readonly List<string> _tempWorktrees = new();
 
+    /// <summary>MG-36 — the per-agent segments this fixture asked for, so teardown reclaims them.
+    /// Docker's default local bridge pool is only ~32 networks deep; a suite that leaked one per test
+    /// would eventually fail every subsequent create with an address-pool error.</summary>
+    private readonly List<(string RepoHash, string AgentId)> _segments = new();
+
     public IDockerClient Docker { get; }
     public DockerSandboxEngine Engine { get; }
     public EgressProxyConfigurator Egress { get; }
@@ -80,9 +85,150 @@ public sealed class SandboxFixture : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// MG-36 — creates and starts a hardened jail on <b>this agent's own default-deny segment</b>,
+    /// building the create request with the production <see cref="ContainerSpecBuilder"/>.
+    ///
+    /// <para>Deliberately NOT <see cref="SpawnAsync"/>: that path delivers secrets over an exec's
+    /// stdin, and a hijacked-stream stdin exec is exactly what some Docker endpoints (Docker Desktop's
+    /// WSL2 socket proxy, verified) do not deliver — which would make a NETWORK test fail for reasons
+    /// that have nothing to do with the network. What this test needs from a jail is that it is a real
+    /// hardened container sitting on a real segment; it needs no credentials at all. Everything about
+    /// the spec — capabilities, seccomp, read-only rootfs, the MG-7 resolver pin, the segment — comes
+    /// from the same builder the daemon uses.</para>
+    /// </summary>
+    public async Task<(string ContainerId, AgentSegment Segment)> CreateJailOnSegmentAsync(
+        string repoHash, string agentId, CancellationToken ct = default)
+    {
+        await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
+        var segment = await Egress.EnsureAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false);
+
+        var create = ContainerSpecBuilder.Build(new ContainerSpecRequest(
+            RepoHash: repoHash,
+            AgentId: agentId,
+            WorktreePath: NewTempWorktree(),
+            ImageRef: ImageRef,
+            Limits: new SandboxLimits(1L * 1024 * 1024 * 1024, 256),
+            NetworkName: segment.NetworkName,
+            Credentials: CredTmpfsSpec.Create(1000, 1001),
+            ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)!,
+            DnsServerAddress: segment.ProxyAddress));
+
+        var created = await Docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
+        _containerIds.Add(created.ID);
+        _segments.Add((repoHash, agentId));
+        await Docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+        return (created.ID, segment);
+    }
+
+    /// <summary>The container's IPv4 on <paramref name="networkName"/> (its segment).</summary>
+    public async Task<string?> AddressOnAsync(string containerId, string networkName, CancellationToken ct = default)
+    {
+        var inspect = await Docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+        return inspect.NetworkSettings?.Networks is { } nets && nets.TryGetValue(networkName, out var ep)
+            ? ep?.IPAddress
+            : null;
+    }
+
     /// <summary>Runs a command in a live sandbox and returns exit + output.</summary>
     public Task<SandboxExecResult> ExecAsync(string containerId, params string[] command)
         => Engine.ExecAsync(containerId, command);
+
+    /// <summary>
+    /// Can <paramref name="containerId"/> open a TCP connection to <paramref name="hostPort"/>? The ONE
+    /// reachability probe, shared by the isolation tests and the egress-failure diagnostic.
+    ///
+    /// <para><b>Why it is not <c>/dev/tcp</c>.</b> The diagnostic used to probe with
+    /// <c>sh -c 'echo &gt; /dev/tcp/host/port'</c>. <c>/dev/tcp</c> is a <b>bash</b> builtin and that
+    /// ran under <c>sh</c> — dash on Debian — which has no such feature, so it failed with
+    /// <c>cannot create /dev/tcp/…: Directory nonexistent</c> and printed <b>UNREACHABLE
+    /// unconditionally, on every run, including when the hop was perfectly healthy</b>. Verified: the
+    /// same probe under <c>bash</c> answers CONNECTED against the same address the <c>sh</c> form calls
+    /// unreachable. It was worse than useless — the diagnostic's own guide reads leg-1-UNREACHABLE as
+    /// "the jail cannot reach the proxy", so it actively pointed the next investigation at the wrong
+    /// leg.</para>
+    ///
+    /// <para><b>Why curl.</b> It is in the agent image by construction (the Dockerfile installs it, and
+    /// the egress tests are built on it), so the probe cannot silently degrade to "tool missing" the way
+    /// a <c>nc</c>-based one would — the image has no <c>nc</c> at all, verified. The proxy environment
+    /// is explicitly disabled (<c>--noproxy '*'</c>) so the probe measures the hop it names rather than
+    /// being quietly re-routed through the proxy it is trying to test.</para>
+    ///
+    /// <para><b>Why the verdict is the TCP handshake, not the HTTP reply.</b> The first version asked
+    /// "did I get a valid HTTP status?", which conflates <i>can I reach this peer</i> with <i>does this
+    /// peer like my request</i>. CI caught it: the same jail→proxy hop that answers 403 here answered
+    /// <c>curl: (56) Recv failure: Connection reset by peer</c> there, and the probe called that
+    /// UNREACHABLE. It is the opposite — <c>CURLE_RECV_ERROR</c> is a failure <b>after</b> the
+    /// connection is established, so a reset is positive proof the SYN/ACK completed and the peer was
+    /// there to reset it. Reachability is now read off curl's own connection counters
+    /// (<c>num_connects</c>/<c>time_connect</c>), which state the fact directly instead of inferring it
+    /// from how far the conversation got.</para>
+    ///
+    /// <para>Measured against a real daemon, this separates all four outcomes the tests depend on:
+    /// <list type="bullet">
+    ///   <item>live proxy port → <c>connects=1 tconnect=0.0005 code=403</c>, exit 0 — REACHABLE</item>
+    ///   <item>accepted then RST (the CI case) → <c>connects=1</c>, exit 56 — REACHABLE</item>
+    ///   <item>port dropped by the backstop → <c>connects=0</c>, exit 28 (connect timeout) — unreachable</item>
+    ///   <item>another agent's segment → <c>connects=0</c>, exit 7 (no route) — unreachable</item>
+    /// </list>
+    /// The last two are what the isolation assertions rest on, and both still read unreachable: a
+    /// blocked destination never completes a handshake, whether it is dropped or has no route at all.</para>
+    /// </summary>
+    public async Task<(bool Reached, string Detail)> TcpProbeAsync(
+        string containerId, string hostPort, CancellationToken ct = default)
+    {
+        try
+        {
+            var result = await Engine.ExecAsync(containerId, new[]
+            {
+                "curl", "-sS", "--noproxy", "*", "--connect-timeout", "5", "-m", "10",
+                "-o", "/dev/null",
+                "-w", "connects=%{num_connects} tconnect=%{time_connect} code=%{http_code}",
+                "http://" + hostPort,
+            }, ct).ConfigureAwait(false);
+
+            var stdout = result.Stdout.Trim();
+            var reached = ConnectCompleted(stdout, result.ExitCode);
+            return (reached,
+                $"{(reached ? "REACHABLE" : "UNREACHABLE")} {hostPort}: exit={result.ExitCode} "
+                + $"[{stdout}] stderr='{result.Stderr.Trim()}'");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"UNREACHABLE {hostPort}: the probe itself failed — {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Did the TCP handshake complete? Read from curl's counters when they are present — they are
+    /// emitted even on a failed transfer (verified for exits 7, 28 and 0) — and from the exit code
+    /// otherwise. The two connect-phase failures are 7 (<c>CURLE_COULDNT_CONNECT</c>: refused, or no
+    /// route) and 28 when nothing came back at all; every other failure happens after a connection
+    /// exists and therefore proves reachability.
+    /// </summary>
+    internal static bool ConnectCompleted(string writeOut, int exitCode)
+    {
+        var connects = MatchNumber(writeOut, "connects=");
+        var timeConnect = MatchNumber(writeOut, "tconnect=");
+        if (connects is not null || timeConnect is not null)
+        {
+            return connects >= 1 || timeConnect > 0;
+        }
+
+        // No counters to read (curl died before writing them) — fall back to the exit code.
+        return exitCode is not (6 or 7 or 28);
+    }
+
+    private static double? MatchNumber(string haystack, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            haystack, System.Text.RegularExpressions.Regex.Escape(key) + @"([0-9]+(?:\.[0-9]+)?)");
+        return match.Success
+            && double.TryParse(match.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
+    }
 
     /// <summary>Inspects a spawned container (mounts, host config, state).</summary>
     public Task<ContainerInspectResponse> InspectAsync(string containerId, CancellationToken ct = default)
@@ -109,6 +255,14 @@ public sealed class SandboxFixture : IAsyncDisposable
         foreach (var id in _containerIds)
         {
             try { await Engine.RemoveAsync(id); }
+            catch { /* never fail a test from cleanup */ }
+        }
+
+        // MG-36: reclaim this test's per-agent segments before the shared teardown (the proxy has to
+        // still exist for the disconnect leg to be meaningful).
+        foreach (var (repoHash, agentId) in _segments)
+        {
+            try { await Egress.RemoveAgentSegmentAsync(repoHash, agentId); }
             catch { /* never fail a test from cleanup */ }
         }
 
@@ -141,6 +295,23 @@ public sealed class SandboxFixture : IAsyncDisposable
             try { await RemoveNetworkByNameAsync(network); }
             catch { /* best effort */ }
         }
+
+        // MG-36: sweep every per-agent segment, including ones a failed/aborted test never registered.
+        // A segment left behind is a bridge-pool slot left behind, and the pool is small.
+        try
+        {
+            var all = await Docker.Networks.ListNetworksAsync();
+            foreach (var net in all)
+            {
+                if (net.Name is not null
+                    && net.Name.StartsWith(EgressProxyConfigurator.AgentSegmentPrefix, StringComparison.Ordinal))
+                {
+                    try { await RemoveNetworkByNameAsync(net.Name); }
+                    catch { /* best effort */ }
+                }
+            }
+        }
+        catch { /* best effort */ }
     }
 
     private async Task RemoveNetworkByNameAsync(string name)

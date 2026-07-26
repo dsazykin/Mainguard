@@ -362,14 +362,17 @@ public static class ContainerSpecBuilder
     private static List<string>? ResolveDnsPinning(ContainerSpecRequest request)
     {
         var address = request.DnsServerAddress?.Trim();
-        var onDefaultDenyNetwork = string.Equals(
-            request.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal);
+        // MG-36: the gate keys on the CLASS of network, not on one literal name. It used to compare
+        // against `mainguard-agents` alone, so the moment a jail moved onto its own per-agent segment
+        // this fail-closed check would have quietly stopped applying — an unpinned jail with Docker's
+        // 127.0.0.11 resolver, and no error anywhere.
+        var onDefaultDenyNetwork = EgressProxyConfigurator.IsDefaultDenyAgentNetwork(request.NetworkName);
 
         if (string.IsNullOrEmpty(address))
         {
             if (onDefaultDenyNetwork)
                 throw new SandboxSpecException(
-                    $"MG-7: a jail on the default-deny network '{EgressProxyConfigurator.AgentNetworkName}' must pin its resolver to the "
+                    $"MG-7: a jail on the default-deny network '{request.NetworkName}' must pin its resolver to the "
                     + "egress proxy's dnsmasq; with no HostConfig.Dns Docker injects its embedded 127.0.0.11 resolver and the pinned-DNS "
                     + "control never sits in the resolution path.");
             return null;
@@ -417,7 +420,7 @@ public static class ContainerSpecBuilder
         // MG-7 re-assert: the pin survived onto the request the daemon is about to POST. A future edit
         // that drops HostConfig.Dns silently restores 127.0.0.11 and un-does pinned DNS wholesale, and
         // no egress test would notice — the existing exfil probe used a name that NXDOMAINs everywhere.
-        if (!string.Equals(request.NetworkName, EgressProxyConfigurator.AgentNetworkName, StringComparison.Ordinal))
+        if (!EgressProxyConfigurator.IsDefaultDenyAgentNetwork(request.NetworkName))
             return;
 
         var dns = create.HostConfig.DNS;
