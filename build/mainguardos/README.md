@@ -33,7 +33,10 @@ connects to nothing and no agent can spawn/verify. So the payload carries the da
   `systemctl start mainguardd` is then only a repair path — `pgrep` already matches on a healthy boot.
 - **Reachability.** The daemon binds **loopback `127.0.0.1:5250` only** (invariant 2). WSL2
   `localhostForwarding` relays the Windows app's `127.0.0.1:5250` connection into the in-VM listener, so
-  no non-loopback bind is ever needed.
+  no non-loopback bind is ever needed. **That relay is also why loopback is not a trust boundary (MG-19):**
+  the port is reachable from any process in the Windows user's session and from the user's other distros,
+  so the listener serves **mutually-authenticated, pinned TLS** rather than h2c — see
+  `docs/security-architecture.md`.
 
 ## Reproducibility of the daemon layer (interaction with invariant 2)
 

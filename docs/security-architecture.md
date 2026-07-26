@@ -89,6 +89,76 @@ make exfiltration expensive and observable, not impossible.
 
 ---
 
+## The control plane: loopback is not a boundary (MG-19)
+
+The daemon's gRPC control plane binds `127.0.0.1:5250` **inside the MainguardEnv WSL2 VM**, while the GUI
+runs on Windows. It used to serve **cleartext h2c** with a per-session bearer token as the *sole* gate.
+That is not sufficient, for reasons that were measured rather than assumed.
+
+### The `localhostForwarding` exposure (measured)
+
+WSL2 enables `localhostForwarding` by default. It relays a Windows-side `127.0.0.1:<port>` connection into
+the in-VM listener, which means **"bound to loopback" buys no isolation at all**: the daemon port is
+reachable from any process in the Windows user's session, and — because all WSL2 distros share one
+network stack under the default NAT mode — from the user's *other* distros too. Measured on
+Windows 11 (10.0.26200) with WSL2:
+
+| # | Measurement | Result |
+|---|---|---|
+| 1 | Windows .NET process → `127.0.0.1:<port>`, listener bound to `127.0.0.1` inside the VM | **CONNECTED** — the relay is real and transparent |
+| 2 | The in-VM listener's view of that peer | `127.0.0.1:<ephemeral>`, `/proc/net/tcp` **`uid=0`**, owning pid not visible in the user namespace |
+| 3 | `SO_PEERCRED` on that accepted TCP socket | `pid=0 uid=-1 gid=-1` — meaningless (it is a Unix-socket facility) |
+
+Measurement 2 is the important one: **the relay launders peer identity.** Even if a peer credential could
+be read on the TCP path, it would describe the WSL relay (root, in-VM), never the Windows process that
+actually made the call. No peer-authentication scheme can be built on the loopback TCP path itself.
+
+### Why not a Unix-domain socket + `SO_PEERCRED`
+
+This was the first choice, and it was measured and **rejected**: it cannot work for the shipped topology.
+The daemon is in the VM and the GUI is on Windows, and an AF_UNIX socket inside the VM is not connectable
+from a Windows process.
+
+| # | Measurement | Result |
+|---|---|---|
+| 4 | In-VM UDS at `$HOME/…/daemon.sock`, in-VM client | CONNECTED; `SO_PEERCRED` returns a real `pid`/`uid`/`gid` |
+| 5 | Windows .NET process → that socket via `\\wsl.localhost\<distro>\home\…\daemon.sock` | **`SocketException` `NetworkDown` (WSAENETDOWN, 10050)** |
+| 6 | Control: Windows .NET process → an AF_UNIX socket it created on the Windows filesystem | CONNECTED — so measurement 5 is a real negative, not a broken-AF_UNIX artifact |
+
+The 9P share *displays* the socket (`File.Exists` is `true`, attributes `ReparsePoint`, length 0), which
+makes this failure mode easy to mistake for a path bug. It is not: 9P carries no socket semantics, so
+there is nothing to `connect()` to. A UDS control plane would require an in-VM relay process bridging
+back to a TCP port — reintroducing exactly the exposure above, with an extra hop.
+
+### What shipped instead: pinned mutual TLS
+
+The control-plane listener now requires **mutually-authenticated TLS**, with both ends pinned by SHA-256
+fingerprint to material minted fresh on every daemon start (`SessionTransportCertificates`, written beside
+`daemon.token` with the same `0600` / single-ACE-DACL protection). There is deliberately **no plaintext
+fallback and no downgrade knob** — the client throws rather than connect unauthenticated.
+
+What this closes:
+
+1. **The token no longer crosses the wire in cleartext.** Every RPC used to carry it in plaintext across
+   loopback and the WSL relay, harvestable by anything that could observe local traffic.
+2. **Port squatting.** The client used to hand its bearer token to whatever answered on `127.0.0.1:5250`,
+   with no way to tell. An unprivileged process that bound the port before `mainguardd` started could
+   collect the operator token on the first RPC. The client now pins the daemon's certificate, so the
+   handshake with an impostor fails *before any HTTP/2 frame is written* — the token is never sent.
+3. **Unauthenticated reachability.** A peer without the pinned client certificate is rejected during the
+   TLS handshake, before the HTTP/2 parser, the gRPC dispatcher, and `BearerTokenInterceptor`.
+
+**The accepted residual — stated plainly.** A process running as the **same OS user** can read
+`daemon-client.pfx` beside the token and impersonate the client. No local transport defeats a same-uid
+attacker: a `0600` Unix socket with `SO_PEERCRED` would not have either, because the peer uid would match.
+The honest claim is that the bar moves from *read one file* to *read two files and complete a mutual
+handshake*, and that the sniffing and port-squatting vectors close outright. A host-un-forgeable presence
+factor remains deferred (OPS §10.1), and `PeerCredentialIdentityResolver` still resolves the daemon's own
+identity — the connection now carries a genuine peer credential, so deriving approver identity from the
+client certificate is unblocked future work, not something already done.
+
+---
+
 ## Runtime toolchain: pre-baked, not `devbox add` (A6 decision)
 
 The design intent was that agents sideload toolchains at runtime via `devbox add <tool>`. In a strict

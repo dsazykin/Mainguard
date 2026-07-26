@@ -50,10 +50,12 @@ public static class DaemonTokenLocator
         => $@"\\wsl.localhost\{distroName}\home\{vmUser}\.mainguard\daemon.token";
 
     /// <summary>
-    /// Reads the current session token from the freshest existing candidate, or <c>null</c> when no
-    /// candidate exists / none is readable. Never throws — a missing daemon is a state, not a fault.
+    /// The freshest candidate token file's path, or <c>null</c> when none exists / none is readable.
+    /// This is the single selection point: everything session-scoped the client needs — the token AND
+    /// the MG-19 mTLS material — must be read from the directory this returns, so a token can never be
+    /// paired with another daemon's certificates.
     /// </summary>
-    public static string? TryReadToken(IReadOnlyList<string>? candidates = null)
+    public static string? TryResolveTokenPath(IReadOnlyList<string>? candidates = null)
     {
         var best = (candidates ?? CandidatePaths())
             .Select(path =>
@@ -72,14 +74,47 @@ public static class DaemonTokenLocator
             .OrderByDescending(c => c.Stamp)
             .FirstOrDefault();
 
-        if (best.Path is null)
+        return best.Path;
+    }
+
+    /// <summary>
+    /// The directory of the freshest candidate token file — the daemon's session directory, holding both
+    /// <c>daemon.token</c> and the MG-19 transport credentials. Null when no candidate exists.
+    /// </summary>
+    public static string? TryResolveSessionDirectory(IReadOnlyList<string>? candidates = null)
+    {
+        var path = TryResolveTokenPath(candidates);
+        return path is null ? null : Path.GetDirectoryName(path);
+    }
+
+    /// <summary>
+    /// The session directory, or an actionable <see cref="InvalidOperationException"/> naming every path
+    /// probed — the same failure shape <see cref="ReadToken"/> raises.
+    /// </summary>
+    public static string ResolveSessionDirectory(IReadOnlyList<string>? candidates = null)
+    {
+        var resolved = candidates ?? CandidatePaths();
+        return TryResolveSessionDirectory(resolved) ?? throw new InvalidOperationException(
+            "No Mainguard daemon session was found — the daemon has probably never started. "
+            + $"Paths probed: {string.Join(", ", resolved)}. "
+            + "Run Mainguard setup (or start mainguardd) and try again.");
+    }
+
+    /// <summary>
+    /// Reads the current session token from the freshest existing candidate, or <c>null</c> when no
+    /// candidate exists / none is readable. Never throws — a missing daemon is a state, not a fault.
+    /// </summary>
+    public static string? TryReadToken(IReadOnlyList<string>? candidates = null)
+    {
+        var path = TryResolveTokenPath(candidates);
+        if (path is null)
         {
             return null;
         }
 
         try
         {
-            var token = File.ReadAllText(best.Path).Trim();
+            var token = File.ReadAllText(path).Trim();
             return token.Length > 0 ? token : null;
         }
         catch
