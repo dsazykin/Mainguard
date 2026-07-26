@@ -477,4 +477,93 @@ public class AdapterChannelTests
         IAdapterChannelSource bundled = new BundledAdapterChannelSource();
         Assert.True(bundled.IsAuthoritativeLocal);
     }
+
+    // ---- MG-9: the --ignore-scripts poison canary ----------------------------------------------
+
+    [Fact]
+    public async Task ShippedInstallCommands_RunScriptFree_SoAPoisonedPostinstallNeverExecutes()
+    {
+        // The behavioural half of the structural guard in AdapterManifestTests, in the idiom
+        // ForegroundMergeServiceTests uses for the same hazard on the host side: a fake package manager
+        // that "runs" the poisoned lifecycle hook ONLY when --ignore-scripts is absent. Drive the REAL
+        // shipped manifest through the real install path and prove the hook never fires.
+        var manifest = AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson());
+        foreach (var shipped in manifest.Adapters)
+        {
+            var payload = Encoding.UTF8.GetBytes($"payload-for-{shipped.Id}");
+            var single = $$"""
+            {
+              "adapters": [
+                {
+                  "id": "{{shipped.Id}}",
+                  "displayName": "{{shipped.DisplayName}}",
+                  "version": "{{shipped.Version}}",
+                  "sha256": "{{ShaOf(payload)}}",
+                  "installCmd": {{System.Text.Json.JsonSerializer.Serialize(shipped.InstallCmd)}},
+                  "configShims": [],
+                  "healthProbe": {
+                    "command": {{System.Text.Json.JsonSerializer.Serialize(shipped.HealthProbe!.Command)}},
+                    "expectedVersionSubstring": "{{shipped.Version}}"
+                  },
+                  "payloadUrl": "{{shipped.PayloadUrl}}"
+                }
+              ]
+            }
+            """;
+
+            var host = new PoisonedNpmHost(shipped.HealthProbe.Command, shipped.Version);
+            var channel = new AdapterChannel(
+                new FakeSource { ManifestToServe = single, PayloadToServe = payload },
+                host,
+                new FakeCache(single),
+                delay: (_, _) => Task.CompletedTask);
+
+            await channel.EnsureAsync(shipped.Id);
+
+            Assert.False(host.PostinstallRan,
+                $"'{shipped.Id}' installed WITHOUT --ignore-scripts — an upstream postinstall would "
+                + "have executed inside MainguardEnv.");
+        }
+    }
+
+    /// <summary>A fake npm that executes the "postinstall" (sets a flag) unless <c>--ignore-scripts</c>
+    /// is on the command line — the canary. The probe answers green so the install path completes.</summary>
+    private sealed class PoisonedNpmHost : IAdapterInstallHost
+    {
+        private readonly IReadOnlyList<string> _probe;
+        private readonly string _version;
+
+        public PoisonedNpmHost(IReadOnlyList<string> probe, string version)
+        {
+            _probe = probe;
+            _version = version;
+        }
+
+        public bool PostinstallRan { get; private set; }
+
+        public bool Installed { get; private set; }
+
+        public Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
+        {
+            if (command.SequenceEqual(_probe))
+            {
+                // The FIRST probe must miss, or EnsureAsync short-circuits as AlreadyHealthy and the
+                // canary never gets the chance to fire — a vacuous pass.
+                return Task.FromResult(Installed
+                    ? new AdapterCommandResult(0, $"version {_version}", "")
+                    : new AdapterCommandResult(1, "", "not installed"));
+            }
+
+            if (!command.Contains("--ignore-scripts"))
+                PostinstallRan = true;
+
+            Installed = true;
+            return Task.FromResult(new AdapterCommandResult(0, "", ""));
+        }
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+            => Task.FromResult($"/stage/{fileName}");
+    }
 }
