@@ -152,7 +152,8 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // produced an opaque Docker conflict from deep inside the exec instead of a real diagnosis.
         if (!await WaitUntilRunningAsync(proxyId, ct).ConfigureAwait(false))
         {
-            throw new DockerContainerNotRunningException(proxyId);
+            throw new DockerContainerNotRunningException(
+                proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
 
         try
@@ -443,11 +444,97 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             return ContainerReadiness.Pending;
         }
 
-        // Dead, or a finished run: a start was attempted and ended. "Created" has never run and has no
-        // FinishedAt, so it stays Pending while the start we just issued takes effect.
-        var finished = !string.IsNullOrEmpty(state.FinishedAt)
-                       && !state.FinishedAt.StartsWith("0001-01-01", StringComparison.Ordinal);
-        return state.Dead || finished ? ContainerReadiness.Terminal : ContainerReadiness.Pending;
+        if (state.Dead)
+        {
+            return ContainerReadiness.Terminal;
+        }
+
+        // A finished run means a start was attempted and ended — but ONLY if that exit is newer than
+        // the most recent start. `docker start` on a stopped container does NOT clear FinishedAt: for
+        // a moment the inspect reports Running=false alongside the PREVIOUS run's FinishedAt, which is
+        // indistinguishable from a corpse unless StartedAt is consulted. Treating that window as
+        // terminal made the revive path destroy and recreate a container that was merely still
+        // starting — invisible on a fast daemon, reliably hit on a loaded CI runner. Verified: a
+        // restarted proxy reports running=true with FinishedAt still set to the earlier stop.
+        var finished = ParseDockerTime(state.FinishedAt);
+        if (finished is null)
+        {
+            return ContainerReadiness.Pending; // never ran (Created), or no timestamp yet
+        }
+
+        var started = ParseDockerTime(state.StartedAt);
+        return started is not null && started > finished
+            ? ContainerReadiness.Pending  // the latest start postdates the last exit — it is coming up
+            : ContainerReadiness.Terminal;
+    }
+
+    /// <summary>Docker's RFC3339 state timestamps, with its "never happened" sentinel treated as null.</summary>
+    private static DateTimeOffset? ParseDockerTime(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.StartsWith("0001-01-01", StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return DateTimeOffset.TryParse(
+            value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
+            ? parsed
+            : null;
+    }
+
+    /// <summary>
+    /// Everything a human would have run <c>docker logs</c> / <c>docker inspect</c> for, gathered at the
+    /// moment of failure and folded into the exception.
+    ///
+    /// <para>The old message ended with "inspect its logs (docker logs mainguard-egress-proxy)". On CI
+    /// there is nobody to do that, and by the time anyone looks the container has been torn down with
+    /// the job — so a boot failure there was a dead end: no exit code, no OOM flag, not one line of the
+    /// container's own output. Whatever the container said about why it died is the single most useful
+    /// fact about this failure, so it belongs IN the failure. Best-effort throughout: a diagnostic that
+    /// throws while diagnosing would replace a real error with a useless one.</para>
+    /// </summary>
+    private async Task<string> DescribeContainerFailureAsync(string containerId, CancellationToken ct)
+    {
+        var report = new StringBuilder();
+
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            var state = inspect.State;
+            report.Append(" state=").Append(state?.Status ?? "<none>")
+                  .Append(" exit=").Append(state?.ExitCode)
+                  .Append(" oomKilled=").Append(state?.OOMKilled)
+                  .Append(" startedAt=").Append(state?.StartedAt)
+                  .Append(" finishedAt=").Append(state?.FinishedAt);
+            if (!string.IsNullOrWhiteSpace(state?.Error))
+            {
+                report.Append(" dockerError='").Append(state!.Error).Append('\'');
+            }
+        }
+        catch (Exception ex)
+        {
+            report.Append(" (inspect failed: ").Append(ex.Message).Append(')');
+        }
+
+        try
+        {
+            using var logs = await _docker.Containers.GetContainerLogsAsync(
+                containerId,
+                tty: false,
+                new ContainerLogsParameters { ShowStdout = true, ShowStderr = true, Tail = "50" },
+                ct).ConfigureAwait(false);
+            var (stdout, stderr) = await logs.ReadOutputToEndAsync(ct).ConfigureAwait(false);
+            var combined = (stdout + stderr).Trim();
+            report.Append("\n--- container logs (last 50 lines) ---\n")
+                  .Append(combined.Length == 0 ? "(the container produced no output)" : combined);
+        }
+        catch (Exception ex)
+        {
+            report.Append("\n(could not read container logs: ").Append(ex.Message).Append(')');
+        }
+
+        return report.ToString();
     }
 
     private async Task<ContainerListResponse?> FindContainerAsync(string name, CancellationToken ct)
@@ -615,12 +702,22 @@ public sealed class EgressNetworkDriftException : Exception
 /// </summary>
 public sealed class DockerContainerNotRunningException : Exception
 {
-    public DockerContainerNotRunningException(string containerId)
+    /// <param name="diagnostics">The container's state and its own log output, captured at the moment
+    /// of failure. This used to say "inspect its logs (docker logs …)", which is no help on CI: the
+    /// container is gone with the job before anyone reads it, so the one fact that explains the failure
+    /// — what the container printed on its way out — was never recoverable. Empty only if the
+    /// diagnostic itself could not run.</param>
+    public DockerContainerNotRunningException(string containerId, string diagnostics = "")
         : base($"The egress proxy container '{containerId}' was started but never reached a running state. "
-             + "It most likely exited during boot — inspect its logs (docker logs mainguard-egress-proxy).")
+             + "It most likely exited during boot."
+             + (string.IsNullOrWhiteSpace(diagnostics) ? string.Empty : diagnostics))
     {
         ContainerId = containerId;
+        Diagnostics = diagnostics;
     }
 
     public string ContainerId { get; }
+
+    /// <summary>The captured state + container logs (see the constructor).</summary>
+    public string Diagnostics { get; } = string.Empty;
 }

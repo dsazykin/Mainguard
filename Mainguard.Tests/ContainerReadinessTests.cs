@@ -64,6 +64,76 @@ public sealed class ContainerReadinessTests
             EgressProxyConfigurator.ClassifyReadiness(state));
     }
 
+    // ---- the revive window: `docker start` does NOT clear FinishedAt ----
+
+    // The bug this class exists to prevent, in its second form. Restarting a STOPPED container leaves
+    // the previous run's FinishedAt in place, so for the moment between `docker start` returning and
+    // the state flipping to Running, an inspect is byte-for-byte indistinguishable from a corpse:
+    // Running=false, Restarting=false, Dead=false, FinishedAt=<the earlier stop>. Classifying that as
+    // Terminal made EnsureReadyAsync destroy and recreate a container that was merely still coming up.
+    // Invisible on a fast daemon, reliably hit on a loaded CI runner. StartedAt is what disambiguates:
+    // a start newer than the last exit means it is on its way up.
+    [Fact]
+    public void RestartedButNotYetRunning_IsPending_NotTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            StartedAt = "2026-07-24T10:05:00Z",  // the start we just issued
+            FinishedAt = "2026-07-24T10:00:00Z", // the PREVIOUS run's exit, never cleared
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Pending,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // The mirror case must keep working: an exit that POSTDATES the last start is a genuine corpse.
+    [Fact]
+    public void StoppedAfterItsLastStart_IsTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            StartedAt = "2026-07-24T10:00:00Z",
+            FinishedAt = "2026-07-24T10:05:00Z", // it ran, then ended
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // A restarted container that has come up reports Running WITH the stale FinishedAt still set —
+    // observed on a real daemon. Running must win outright.
+    [Fact]
+    public void RestartedAndRunning_WithStaleFinishedAt_IsRunning()
+    {
+        var state = new ContainerState
+        {
+            Running = true,
+            StartedAt = "2026-07-24T10:05:00Z",
+            FinishedAt = "2026-07-24T10:00:00Z",
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Running,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // Dead outranks the timestamps: a dead container is never coming up, however recent its start.
+    [Fact]
+    public void DeadWithARecentStart_IsStillTerminal()
+    {
+        var state = new ContainerState
+        {
+            Running = false,
+            Dead = true,
+            StartedAt = "2026-07-24T10:05:00Z",
+            FinishedAt = "2026-07-24T10:00:00Z",
+        };
+
+        Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
+            EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
     [Fact]
     public void Dead_IsTerminal()
     {

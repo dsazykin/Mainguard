@@ -100,6 +100,9 @@ if [ -f "$CONF_DIR/dnsmasq.conf" ]; then
             echo ok > "$CONF_DIR/dnsmasq.status"
         else
             echo failed > "$CONF_DIR/dnsmasq.status"
+            # The log is the only record of WHY: dnsmasq exits 5 silently on a capability problem.
+            echo "[mainguard-egress-proxy] dnsmasq FAILED to start; its log follows"
+            [ -f "$CONF_DIR/dnsmasq.log" ] && tail -20 "$CONF_DIR/dnsmasq.log" || true
         fi
     fi
 fi
@@ -129,9 +132,12 @@ EOF
             echo ok > "$CONF_DIR/tinyproxy.status"
         else
             echo failed > "$CONF_DIR/tinyproxy.status"
+            echo "[mainguard-egress-proxy] tinyproxy FAILED to start"
         fi
     fi
 fi
+
+echo "[mainguard-egress-proxy] reload: dnsmasq=$(cat "$CONF_DIR/dnsmasq.status" 2>/dev/null || echo none) tinyproxy=$(cat "$CONF_DIR/tinyproxy.status" 2>/dev/null || echo none)"
 
 # 3. iptables backstop: a default-deny INPUT chain in THIS namespace (MG-18 — agent containment is the
 #    Internal network, which the daemon now asserts on every reuse; what this chain bounds is which of
