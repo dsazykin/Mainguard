@@ -213,6 +213,114 @@ public class AgentCliUpdateServiceTests
         await Assert.ThrowsAsync<InvalidOperationException>(() => f.Updater.RevertAsync("tool"));
     }
 
+    // ---- MG-14: an update must move FORWARD, never merely differ ---------------------------------
+
+    [Theory]
+    // registry "latest", whether it should be offered as an update to the pinned 1.2.3
+    [InlineData("2.0.0", true)]      // newer → a real upgrade
+    [InlineData("1.2.4", true)]
+    [InlineData("1.10.0", true)]     // numeric ordering: 1.10 > 1.2, though "1.10.0" < "1.2.3" as text
+    [InlineData("1.2.3", false)]     // equal → nothing to offer
+    [InlineData("1.2.2", false)]     // OLDER → a downgrade dressed as an update
+    [InlineData("1.0.0", false)]
+    [InlineData("0.9.9", false)]
+    [InlineData("1.2.3-rc.1", false)] // a prerelease of the pinned version is BEHIND it
+    [InlineData("1.2.3+rebuild", false)] // build metadata alone is not a new version
+    public async Task Check_OnlyOffersUpdatesThatMoveForward(string registryLatest, bool offered)
+    {
+        // The defect: this used to be `!string.Equals(latest, pinned)`, so ANY difference — including
+        // a registry that moved its `latest` tag backwards — was presented to the user as an update.
+        var f = new Fixture();
+        f.Npm.LatestVersion = registryLatest;
+
+        var updates = await f.Updater.CheckForUpdatesAsync();
+
+        Assert.Equal(offered, updates.Count == 1);
+        if (offered)
+            Assert.Equal(registryLatest, updates[0].LatestVersion);
+    }
+
+    [Fact]
+    public async Task Check_ARegistryMovingLatestBackwards_IsRefusedAndRecorded_NotSilentlyIgnored()
+    {
+        var f = new Fixture();
+        f.Npm.LatestVersion = "1.0.0"; // upstream un-published 1.2.3, or someone is standing in for it
+
+        Assert.Empty(await f.Updater.CheckForUpdatesAsync());
+
+        // A refusal that only manifests as "no updates" is indistinguishable from "already current".
+        var refusal = Assert.Single(f.Updater.RefusedUpdates);
+        Assert.Contains("DOWNGRADE", refusal);
+        Assert.Contains("1.0.0", refusal);
+    }
+
+    [Theory]
+    [InlineData("1.0.0", "OLDER")]        // an explicit downgrade request
+    [InlineData("1.2.3", "already")]      // re-applying the pinned version is a no-op, not an install
+    [InlineData("garbage", "cannot be ordered")]
+    public async Task ApplyUpdate_RefusesAnythingThatDoesNotMoveForward_AndLeavesThePinAlone(
+        string version, string expected)
+    {
+        var f = new Fixture();
+        f.Source.PayloadToServe = PayloadNew;
+
+        var ex = await Assert.ThrowsAsync<AdapterChannelException>(
+            () => f.Updater.ApplyUpdateAsync("tool", version));
+
+        Assert.Equal(AdapterChannelError.UpdateRefused, ex.Error);
+        Assert.Contains(expected, ex.Message);
+        Assert.Null(f.Pins.TryGet("tool"));            // the pin never moved…
+        Assert.Null(f.Host.InstalledVersion);           // …and nothing was installed
+        Assert.Contains(f.Updater.RefusedUpdates, r => r.Contains(expected));
+    }
+
+    [Fact]
+    public async Task EnsureLatest_RegistryLatestIsOlderThanThePin_InstallsThePin_AndSaysSo()
+    {
+        // The install-side twin: "latest" is the registry's word for it. A registry that moved its tag
+        // backwards must not be able to drag a FRESH install backwards with it — the bundled pin is a
+        // floor, not merely an offline fallback. Refusing outright would be worse than useless here:
+        // it would leave the user with no CLI at all over an upstream mistake.
+        var f = new Fixture();
+        f.Npm.LatestVersion = "1.0.0";
+        f.Source.PayloadToServe = PayloadOld; // the bundled 1.2.3 bytes
+
+        await f.Updater.EnsureLatestAsync("tool");
+
+        Assert.Equal("1.2.3", f.Host.InstalledVersion);   // the pinned version, not the registry's older one
+        Assert.Null(f.Pins.TryGet("tool"));                // no override was written
+        Assert.Contains(f.Updater.RefusedUpdates, r => r.Contains("DOWNGRADING"));
+    }
+
+    [Fact]
+    public async Task EnsureLatest_RegistryAgreesWithThePin_IsAPlainPinnedInstall()
+    {
+        var f = new Fixture();
+        f.Npm.LatestVersion = "1.2.3";
+        f.Source.PayloadToServe = PayloadOld;
+
+        await f.Updater.EnsureLatestAsync("tool");
+
+        Assert.Equal("1.2.3", f.Host.InstalledVersion);
+        Assert.Empty(f.Updater.RefusedUpdates); // "already current" is not a refusal
+    }
+
+    [Fact]
+    public async Task Revert_StillGoesBackwards_TheOneLegitimateBackwardMove()
+    {
+        // The monotonic guard must not break the escape hatch: Revert writes the previous pin directly
+        // rather than going through ApplyUpdateAsync, and that separation is load-bearing.
+        var f = new Fixture();
+        f.Source.PayloadToServe = PayloadNew;
+        await f.Updater.ApplyUpdateAsync("tool", "2.0.0");
+        Assert.Equal("2.0.0", f.Host.InstalledVersion);
+
+        f.Source.PayloadToServe = PayloadOld;
+        await f.Updater.RevertAsync("tool");
+
+        Assert.Equal("1.2.3", f.Host.InstalledVersion); // deliberately backwards, and it worked
+    }
+
     [Fact]
     public async Task Ensure_HonorsThePinOverride_SoRefreshNeverDowngradesAnUpdatedCli()
     {

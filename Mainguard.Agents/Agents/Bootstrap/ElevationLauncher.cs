@@ -101,8 +101,35 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
                 helperExe);
         }
 
+        // MG-9: File.Exists was the ONLY check standing between a path and `runas`. "It exists" says
+        // nothing about what it is — a helper path resolved from anywhere but our own install directory
+        // would be launched as administrator on the user's consent to a prompt that names Mainguard.
+        // Both the helper and the resume target must therefore be canonical, fully-qualified paths
+        // inside AppContext.BaseDirectory (where the packaged build co-locates every Mainguard exe).
+        //
+        // Honest limit: this bounds WHERE the elevated binary comes from, not WHAT it is. Same-user
+        // malware can overwrite the helper at its legitimate path and this passes — see the signature
+        // gate immediately below, which is where that would be caught if Mainguard were signed.
+        helperExe = RequireInstallRootPath(helperExe, "elevated helper");
+        var resumeTarget = RequireInstallRootPath(_resumeTargetExePath, "resume target");
+
+        // The one place a code-signing check belongs on this path. Today it answers NotAvailable — this
+        // build has no signing identity — and we proceed with the gap written to elevation.log rather
+        // than implied away. A real IPayloadSignatureVerifier makes this refuse without touching this
+        // method again.
+        var signature = PayloadSignature.VerifyFile(SignedArtifactKind.ElevatedHelper, helperExe);
+        Log($"signature check: {signature.Kind} — {signature.Reason}");
+        if (signature.MustRefuse)
+        {
+            throw new BootstrapException("EnableFeatures",
+                $"Mainguard's elevated setup helper failed its signature check and was not run: "
+                + $"{signature.Reason} Reinstall Mainguard from a trusted source.");
+        }
+
         // UseShellExecute + Verb=runas is what raises the single UAC prompt. Arguments can't be an
-        // ArgumentList with ShellExecute, so they are a carefully quoted string (no user-supplied input).
+        // ArgumentList with ShellExecute, so they are a carefully quoted string — and the two paths
+        // interpolated below are the VALIDATED canonical forms, which by construction contain no quote
+        // that could terminate an argument early and append attacker-chosen trailing arguments.
         // Note: CreateNoWindow is documented as ignored under ShellExecute, and a WindowStyle of Hidden
         // only sets the launched app's show-command — the helper is a windowless WinExe, so neither is
         // needed; both were removed to keep the elevation call free of contradictory flags. The only UI
@@ -112,7 +139,7 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
             FileName = helperExe,
             UseShellExecute = true,
             Verb = "runas",
-            Arguments = $"--resume-target \"{_resumeTargetExePath}\" --result \"{_resultPath}\"",
+            Arguments = $"--resume-target \"{resumeTarget}\" --result \"{_resultPath}\"",
         };
 
         Log($"launching elevated helper '{helperExe}' (caller thread apartment: "
@@ -166,6 +193,26 @@ public sealed class RunAsElevationLauncher : IElevationLauncher
         Log($"result: featuresEnabled={result.FeaturesEnabled} rebootRequired={result.RebootRequired} "
             + $"resumeTaskRegistered={result.ResumeTaskRegistered} error={result.Error ?? "<none>"}");
         return result;
+    }
+
+    /// <summary>
+    /// Validates a path that is about to cross the elevation boundary against the running install's own
+    /// directory, turning a refusal into the same actionable <see cref="BootstrapException"/> the rest
+    /// of this flow raises (never a raw <see cref="ArgumentException"/> surfacing as "unexpected error").
+    /// </summary>
+    private string RequireInstallRootPath(string candidate, string what)
+    {
+        if (TrustedExecutablePath.TryValidate(
+                candidate, AppContext.BaseDirectory, out var canonical, out var refusal))
+        {
+            return canonical;
+        }
+
+        Log($"REFUSED {what} '{candidate}': {refusal}");
+        throw new BootstrapException("EnableFeatures",
+            $"Mainguard refused to run setup with administrator rights because the {what} "
+            + $"('{candidate}') is not part of this installation: {refusal}. Nothing on your machine "
+            + $"was changed. Reinstall Mainguard and run setup again.");
     }
 
     /// <summary>Runs <see cref="Process.Start(ProcessStartInfo)"/> on a dedicated background STA
