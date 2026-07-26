@@ -22,6 +22,25 @@
     "{payload} in installCmd expands to the staged, hash-verified file — the install MUST consume the",
     "bytes the pin covered rather than re-resolving from a registry (that would defeat the pin).",
     "",
+    "--ignore-scripts IS MANDATORY on every installCmd, and AdapterManifestTests enforces it with a",
+    "poison-canary test that fails if any entry loses it. Without it, `npm install <tarball>` runs the",
+    "preinstall/install/postinstall lifecycle scripts of the pinned package AND of every dependency npm",
+    "resolves for it — arbitrary code from an upstream publisher, executing inside MainguardEnv at",
+    "install time, before any health probe or sandbox boundary applies. The sha256 pin does not help",
+    "here: it proves the tarball is the one we chose, not that the code inside it is safe to run.",
+    "",
+    "RESIDUAL GAP, stated plainly so nobody reads more assurance into this file than it carries: the",
+    "pin covers the TOP-LEVEL TARBALL ONLY. Installing that tarball still resolves its dependency tree",
+    "live from the registry, and none of those transitive packages is pinned, hashed, or reproducible",
+    "here — a compromised or newly-published dependency version still lands in the adapters prefix and",
+    "runs when the CLI runs. --ignore-scripts removes the INSTALL-TIME execution of that code; it does",
+    "not remove the code. Closing the rest needs a lockfile-pinned or vendored dependency closure per",
+    "adapter, which this channel format does not express yet.",
+    "",
+    "(If a future CLI genuinely cannot install script-free — e.g. it fetches a platform binary in a",
+    "postinstall — do NOT drop the flag for everyone. That CLI needs its payload vendored, or an",
+    "explicit per-adapter opt-out with its own review.)",
+    "",
     "apiKeyEnvVar names the env var the CLI reads its model API key from; the spawn path injects the",
     "user's key under exactly that name (audit fix #13 — a hardcoded ANTHROPIC_API_KEY meant codex never",
     "saw its key). Omit it for CLIs that authenticate interactively (opencode is multi-provider and",
@@ -48,7 +67,7 @@
       "version": "2.1.218",
       "sha256": "3a434c8bcb493e9ca87315d9aa6064835c5987e8fbc85c181bb76157dd5c45d8",
       "payloadUrl": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.218.tgz",
-      "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/claude", "--version"],
         "expectedVersionSubstring": "2.1.218"
@@ -64,7 +83,7 @@
       "version": "0.145.0",
       "sha256": "416399796cac371d1a033b17f34b08ba9b25c8f298a5b9d00e10f72c3b128c8d",
       "payloadUrl": "https://registry.npmjs.org/@openai/codex/-/codex-0.145.0.tgz",
-      "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/codex", "--version"],
         "expectedVersionSubstring": "0.145.0"
@@ -80,7 +99,7 @@
       "version": "0.52.0",
       "sha256": "829adc203e66804c5cd86776891162cbda94f671cc707ec9c00c5a999efe1c12",
       "payloadUrl": "https://registry.npmjs.org/@google/gemini-cli/-/gemini-cli-0.52.0.tgz",
-      "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/gemini", "--version"],
         "expectedVersionSubstring": "0.52.0"
@@ -96,7 +115,7 @@
       "version": "0.20.1",
       "sha256": "eb351ff7bcd0c583df252e125325634362ea754d1f9cc4cd69b9797ce89bf0de",
       "payloadUrl": "https://registry.npmjs.org/@qwen-code/qwen-code/-/qwen-code-0.20.1.tgz",
-      "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/qwen", "--version"],
         "expectedVersionSubstring": "0.20.1"
@@ -111,7 +130,7 @@
       "version": "1.18.4",
       "sha256": "6060f03c1c45afcd901a05fdd8eae60b7e82c7113ffa092792be30d6e8117eda",
       "payloadUrl": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.18.4.tgz",
-      "installCmd": ["npm", "install", "-g", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/opencode", "--version"],
         "expectedVersionSubstring": "1.18.4"

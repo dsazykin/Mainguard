@@ -211,7 +211,8 @@ public class OobeStateMachineTests
     [Fact]
     public void Oobe_ResumeTask_UsesScheduledTask_NeverRunOnce()
     {
-        var args = InstallerCommands.RegisterResumeTask(@"C:\Program Files\Mainguard\Mainguard.Installer.exe");
+        var args = InstallerCommands.RegisterResumeTask(
+            @"C:\Program Files\Mainguard\Mainguard.Installer.exe", @"C:\Program Files\Mainguard");
         var joined = string.Join(" ", args);
 
         Assert.DoesNotContain("RunOnce", joined, StringComparison.OrdinalIgnoreCase);
@@ -224,6 +225,36 @@ public class OobeStateMachineTests
         var del = InstallerCommands.UnregisterResumeTask();
         Assert.Contains("/Delete", del);
         Assert.Contains(InstallerCommands.ResumeTaskName, del);
+    }
+
+    // ---- MG-9: the ONLOGON/HIGHEST registration refuses to name an arbitrary executable ----------
+
+    [Theory]
+    // The registration this builds runs /RL HIGHEST at ONLOGON — elevated, at every logon, with NO UAC
+    // prompt. It used to interpolate whatever string it was handed, so anything that could reach the
+    // elevated helper could have Windows run any executable as administrator, forever.
+    [InlineData(@"C:\Users\victim\Downloads\evil.exe")]      // an arbitrary exe elsewhere on disk
+    [InlineData(@"C:\Windows\System32\cmd.exe")]
+    [InlineData(@"\\attacker\share\evil.exe")]               // off-machine
+    [InlineData(@"C:\Program Files\Mainguard\..\..\Windows\System32\cmd.exe")] // traversal out
+    [InlineData("evil.exe")]                                  // relative → resolved against a CWD
+    [InlineData("C:\\Program Files\\Mainguard\\x.exe\" & calc.exe & \"")] // /TR quoting break-out
+    public void Oobe_ResumeTask_RefusesAnyTargetOutsideTheInstall(string target)
+    {
+        Assert.Throws<ArgumentException>(
+            () => InstallerCommands.RegisterResumeTask(target, @"C:\Program Files\Mainguard"));
+    }
+
+    [Fact]
+    public void Oobe_ResumeTask_RegistersTheCanonicalFormOfALegitimateTarget()
+    {
+        var args = InstallerCommands.RegisterResumeTask(
+            "C:/Program Files/Mainguard/Mainguard.Pro.App.exe", @"C:\Program Files\Mainguard");
+
+        var tr = args.SkipWhile(a => a != "/TR").Skip(1).First();
+        Assert.Equal("\"C:\\Program Files\\Mainguard\\Mainguard.Pro.App.exe\" --resume", tr);
+        // Exactly two quotes: the ones we put there. A validated path cannot contribute a third.
+        Assert.Equal(2, tr.Split('"').Length - 1);
     }
 
     // ---- Invariant 4: elevated helper scope is exactly the two enumerated actions ----------------

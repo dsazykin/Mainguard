@@ -48,6 +48,7 @@ public sealed class AgentSpawnService
     private readonly KillSwitchGate _killGate;
     private readonly AdmissionController _admission;
     private readonly Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits _limits;
+    private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner _mergeQueues;
     private readonly IAuditLog _audit;
     private readonly ILogger _spawnLog;
     private readonly ILogger _coordLog;
@@ -62,6 +63,7 @@ public sealed class AgentSpawnService
         KillSwitchGate killGate,
         AdmissionController admission,
         Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits limits,
+        Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner mergeQueues,
         IAuditLog audit,
         ILoggerFactory loggerFactory)
     {
@@ -74,6 +76,7 @@ public sealed class AgentSpawnService
         _killGate = killGate;
         _admission = admission;
         _limits = limits;
+        _mergeQueues = mergeQueues;
         _audit = audit;
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _spawnLog = loggerFactory.CreateLogger(DaemonLogCategories.Spawn);
@@ -173,6 +176,13 @@ public sealed class AgentSpawnService
             if (launch is not null)
             {
                 _store.AttachSandbox(session.Id, launch.ContainerId, repoHandle);
+
+                // MG-10: a jailed agent has a worktree + agent/<id> branch in a provisioned repo, so it is
+                // a merge-queue member from this moment. Registering here (as well as on CreateWorktree)
+                // covers the real spawn chain, which provisions the worktree inside the launcher rather
+                // than through the RepoSync RPC — a coordinator-spawned worker takes only this path.
+                _mergeQueues.EnsureEntry(
+                    repoHandle, session.Id, Mainguard.Agents.Agents.MergeEntryOrigin.Local);
                 if (launch.LaunchCommand is { Count: > 0 })
                 {
                     // The core P2-47→P2-03/09 wiring: the CLI starts inside the jail on a real TTY
