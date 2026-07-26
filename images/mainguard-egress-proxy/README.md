@@ -17,6 +17,23 @@ The daemon's `EgressProxyConfigurator` renders the allowlist to `/run/mainguard/
 `/run/mainguard/tinyproxy-upstreams`, `/run/mainguard/dnsmasq.conf`, and `/run/mainguard/backstop.sh`
 (see `EgressProxyConfig` for the exact rendering) and calls `reload.sh`.
 
+**A reload is an outage, so it only happens when it changes something (MG-41).** Restarting the two
+daemons takes their listeners down — ~80 ms for tinyproxy, ~20 ms for dnsmasq, measured by sampling
+`/proc/net` every 10 ms — and a config push runs on every agent spawn, where the rendered policy is
+almost always identical to the one already loaded. So `reload.sh` restarts the daemons only when the
+rendered config differs from what the live ones were started from (`applied.digest`, recorded only
+after both were confirmed listening) or one of them is no longer listening; and the entrypoint's boot
+reload (`reload.sh --boot`) yields to any reload that has already run or is running, so it can never
+restart the proxy after the daemon's `EnsureReadyAsync` has told a caller it is ready. Both gates fail
+towards restarting, and a policy *change* always restarts. The backstop is re-applied on every reload
+either way — it is one `iptables-restore` transaction and drops nothing.
+
+SIGHUP is not a substitute for the restart, on measurement rather than principle: tinyproxy 1.11.1 does
+re-read its filter on SIGHUP, but **dnsmasq 2.90 does not re-read its config file** — a name removed
+from the allowlist and SIGHUP'd still answered its old address, while a restart with the same config
+answered `0.0.0.0`. Using it would reintroduce the exact bug `CAP_KILL` was granted to fix: a host
+removed from the allowlist that stays reachable.
+
 `tinyproxy-upstreams` carries the P2-08 gateway fronting: `upstream` directives routing every model-API
 host through the AI gateway. `reload.sh` **appends** it into the `tinyproxy.conf` it generates —
 tinyproxy 1.11 has no `Include` directive and refuses to start on one — and that append is the load

@@ -37,7 +37,19 @@ else
     log "boot: WARNING no config after ${i}s — staying up; the daemon's own push will reload"
 fi
 
-if /etc/mainguard/reload.sh; then
+# MG-41: `--boot`, and the flag is the whole fix. This reload used to be unconditional and
+# unsynchronised with the daemon's push, which runs its OWN reload right after writing the artefacts —
+# so the two raced, and the loser restarted tinyproxy/dnsmasq a second time for no reason. Measured: the
+# live tinyproxy's start time matched THIS reload, not the push's, and locally it landed ~1.5s before
+# the daemon's setup call returned. On a slower runner it lands after, which means a caller that was
+# told "the proxy is ready" could still have the proxy restart underneath it (~80ms of tinyproxy
+# downtime; CI saw it as connect failures at probes 6-8 with the rc=7/t=0.000000 closed-port signature).
+#
+# With the flag, reload.sh yields whenever another reload has already run or is running, so exactly one
+# of the two ever restarts anything and it is never the one that lands last. There is no timing
+# assumption here and nothing sleeps: the decision is made under the reload lock, off a mark on the
+# tmpfs, so it is correct in either arrival order.
+if /etc/mainguard/reload.sh --boot; then
     log "boot: reload ok"
 else
     log "boot: WARNING reload exited $? — staying up so the daemon can retry"
