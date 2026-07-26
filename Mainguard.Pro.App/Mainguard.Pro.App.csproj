@@ -13,9 +13,9 @@
     <Product>Mainguard</Product>
     <AssemblyTitle>Mainguard</AssemblyTitle>
     <Company>Mainguard</Company>
-    <Version>0.2.5</Version>
-    <FileVersion>0.2.5.0</FileVersion>
-    <InformationalVersion>0.2.5</InformationalVersion>
+    <Version>0.2.6</Version>
+    <FileVersion>0.2.6.0</FileVersion>
+    <InformationalVersion>0.2.6</InformationalVersion>
     <Copyright>Copyright © Mainguard</Copyright>
   </PropertyGroup>
 

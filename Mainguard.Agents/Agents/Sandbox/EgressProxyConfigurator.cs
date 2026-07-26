@@ -775,11 +775,12 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
 
         await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-filter", EgressProxyConfig.RenderTinyproxyFilter(effective), ct).ConfigureAwait(false);
         // P2-08: front the model-API hosts through the AI gateway (token bucket + budgets + no-raw-429).
-        if (_gatewayUpstream is not null)
-        {
-            await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-upstreams",
-                EgressProxyConfig.RenderTinyproxyUpstreams(effective, _gatewayUpstream), ct).ConfigureAwait(false);
-        }
+        // Written UNCONDITIONALLY — a null gateway renders the header with no `upstream` lines rather
+        // than skipping the write. reload.sh appends this artefact into the config it generates, so a
+        // skipped write would leave an EARLIER push's upstreams on the tmpfs and keep loading them; every
+        // push must replace the whole upstream set, not just add to it.
+        await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-upstreams",
+            EgressProxyConfig.RenderTinyproxyUpstreams(effective, _gatewayUpstream), ct).ConfigureAwait(false);
 
         await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress), ct).ConfigureAwait(false);
         await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddress), ct).ConfigureAwait(false);

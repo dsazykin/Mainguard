@@ -1,6 +1,8 @@
 #!/bin/sh
 # Applies the daemon-rendered egress policy (P2-07). Called by the entrypoint and on every config push.
-# The three artefacts are rendered by EgressProxyConfigurator/EgressProxyConfig from the allowlist.
+# The four artefacts (tinyproxy-filter, tinyproxy-upstreams, dnsmasq.conf, backstop.sh) are rendered by
+# EgressProxyConfigurator/EgressProxyConfig from the allowlist. Every one of them has to be LOADED here,
+# not merely present: an artefact this script does not consume is policy that silently does nothing.
 #
 # MG-25: this container now runs with a READ-ONLY rootfs, so every path written at runtime has to live
 # on a tmpfs. CONF_DIR moved from /etc/mainguard (image layer, now immutable) to /run/mainguard, and the
@@ -139,6 +141,22 @@ FilterExtended On
 ConnectPort 443
 ConnectPort 80
 EOF
+    # P2-08 gateway fronting. The daemon renders the model-API `upstream` lines to their own artefact
+    # (EgressProxyConfig.RenderTinyproxyUpstreams) and NOTHING used to load them: the file was written
+    # on every push and read by no one, so fronting was inert — every model-API request went straight to
+    # the provider, with none of the gateway's token bucket / budget / 429 handling, and no error
+    # anywhere because the file existed and looked correct.
+    #
+    # This APPENDS the rendered lines into the config tinyproxy actually parses rather than adding an
+    # `Include` for them: tinyproxy 1.11 (this image's version) has no Include directive at all and
+    # refuses to start on one — "ERROR: Syntax error on line N / Unable to parse config file. Not
+    # starting." Verified against the image. Appending is the only way to get them loaded, and because
+    # the config above is regenerated from scratch on every reload, the appended set is replaced (never
+    # accumulated) each time. The daemon writes this artefact on every push — header-only when no
+    # gateway is configured — so an absent file means a pre-P2-08 proxy, not "no policy".
+    if [ -f "$CONF_DIR/tinyproxy-upstreams" ]; then
+        cat "$CONF_DIR/tinyproxy-upstreams" >> "$CONF_DIR/tinyproxy.conf"
+    fi
     if ! stop_daemon tinyproxy; then
         # Same failure mode as dnsmasq: an unkillable predecessor keeps the OLD allow-filter in force,
         # so a host the user just REMOVED from the allowlist stays reachable.
