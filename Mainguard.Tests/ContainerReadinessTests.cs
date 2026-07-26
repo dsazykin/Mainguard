@@ -1,3 +1,5 @@
+using System.Net;
+using Docker.DotNet;
 using Docker.DotNet.Models;
 using Mainguard.Agents.Agents.Sandbox;
 using Xunit;
@@ -140,6 +142,71 @@ public sealed class ContainerReadinessTests
         var state = new ContainerState { Running = false, Dead = true };
         Assert.Equal(EgressProxyConfigurator.ContainerReadiness.Terminal,
             EgressProxyConfigurator.ClassifyReadiness(state));
+    }
+
+    // ---- the disturbance CLASS: "this container is not what I just saw" ----
+    //
+    // Three variants of one bug reached CI in three successive rounds — the proxy REMOVED mid-adoption
+    // (404 from the recovery path's own cleanup), SIGTERM'd mid-adoption (exit 143, 340ms, misreported
+    // as a boot failure), and an exec landing on a container stopped between the readiness check and
+    // the exec (409 Conflict, "container is not running"). Each round fixed the symptom that surfaced.
+    // These tests pin the CLASS instead: EnsureReadyAsync does not own the shared proxy, so ANY signal
+    // that its observed state is stale means the same thing and gets the same answer — start over.
+
+    [Fact]
+    public void NotFound_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerContainerNotFoundException(HttpStatusCode.NotFound, "gone")));
+    }
+
+    // The third variant, verbatim: the config exec against a container stopped underneath us.
+    [Fact]
+    public void Conflict_ContainerIsNotRunning_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerApiException(HttpStatusCode.Conflict, "{\"message\":\"container 142e30d4 is not running\"}")));
+    }
+
+    // A concurrent create taking the name is the same class — someone else moved the world.
+    [Fact]
+    public void Conflict_NameAlreadyInUse_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerApiException(HttpStatusCode.Conflict, "container name \"/mainguard-egress-proxy\" is already in use")));
+    }
+
+    [Fact]
+    public void OurOwnDisturbedSignal_IsADisturbance()
+    {
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(
+            new EgressProxyConfigurator.EgressProxyDisturbedException("abc", "removed")));
+    }
+
+    // The other half of the contract, and the one that keeps the retry honest: a real error must NOT be
+    // retried into silence. Retrying a 500 or a policy failure would turn a loud bug into a slow one.
+    [Theory]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public void OtherDockerErrors_AreNotDisturbances(HttpStatusCode status)
+    {
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(new DockerApiException(status, "boom")));
+    }
+
+    [Fact]
+    public void NetworkDrift_IsNotADisturbance_ItIsAPolicyFailure()
+    {
+        // MG-18: a non-internal `mainguard-agents` must fail closed, never be retried away.
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(
+            new EgressNetworkDriftException("mainguard-agents", "expected Internal=true")));
+    }
+
+    [Fact]
+    public void AGenuineBootFailure_IsNotADisturbance()
+    {
+        Assert.False(EgressProxyConfigurator.IsProxyDisturbed(
+            new DockerContainerNotRunningException("abc", " state=exited exit=1")));
     }
 
     // ---- telling "something stopped it" apart from "it crashed on boot" ----

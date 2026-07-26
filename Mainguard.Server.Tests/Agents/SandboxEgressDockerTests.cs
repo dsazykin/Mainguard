@@ -199,14 +199,46 @@ public class SandboxEgressDockerTests
         await using var fx = new SandboxFixture();
         await fx.EnsureEgressReadyAsync();
 
-        for (var i = 0; i < 4; i++)
+        // Two interleavings, because the disturbance can land at different points and each one produced
+        // its own CI failure before this was handled as a class:
+        //   delay 0    — the stop races the adopt/start (CI saw exit 143, a 340ms lifetime, empty logs)
+        //   delay >0   — the stop lands AFTER the readiness check, while the config exec is in flight
+        //                (CI saw a raw 409 Conflict, "container ... is not running")
+        // "Wait until running, then exec" is TOCTOU against a container we do not own, so the exec has
+        // to survive being raced, not merely be preceded by a check.
+        foreach (var delayMs in new[] { 0, 0, 120, 250, 400 })
         {
-            // Deliberately race a stop against an adopt — the exact interleaving CI hit.
-            var stop = fx.Docker.Containers.StopContainerAsync(
-                EgressProxyConfigurator.ProxyContainerName, new ContainerStopParameters());
+            var stop = Task.Run(async () =>
+            {
+                if (delayMs > 0)
+                {
+                    await Task.Delay(delayMs);
+                }
+
+                try
+                {
+                    await fx.Docker.Containers.StopContainerAsync(
+                        EgressProxyConfigurator.ProxyContainerName, new ContainerStopParameters());
+                }
+                catch (Docker.DotNet.DockerApiException)
+                {
+                    // The proxy may legitimately be mid-recreate — the point is the disturbance, not
+                    // that this particular stop lands.
+                }
+            });
+
             var ensure = fx.EnsureEgressReadyAsync();
+
+            // The property under test is that EnsureReadyAsync RECOVERS from the disturbance instead of
+            // throwing — so awaiting it without an exception is itself the assertion for this round.
             await Task.WhenAll(stop, ensure);
         }
+
+        // A stop deliberately scheduled to land late can fire AFTER the last EnsureReadyAsync has
+        // already returned, which leaves the proxy legitimately stopped — that is the racing harness,
+        // not the daemon. One final uncontended call establishes the quiescent state to assert on; it
+        // is not a retry of the property above, which has already been exercised five times.
+        await fx.EnsureEgressReadyAsync();
 
         var inspect = await fx.Docker.Containers.InspectContainerAsync(EgressProxyConfigurator.ProxyContainerName);
         Assert.True(inspect.State.Running, "the proxy must end up running despite being stopped mid-adoption");

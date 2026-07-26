@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -101,14 +102,21 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         Allowlist.Allows(host) ? EgressVerdict.Allowed : EgressVerdict.Denied;
 
     /// <summary>
-    /// Something outside this call disturbed the proxy while we were adopting it — it was removed, or
-    /// stopped/killed by a signal. Internal control flow, never surfaced: <see cref="EnsureReadyAsync"/>
-    /// answers it by starting the whole sequence over.
+    /// Something outside this call disturbed the proxy while we were adopting it. Raised where WE
+    /// detect the disturbance (a state read that says removed/signalled); Docker's own 404/409
+    /// responses mean the same thing and are recognised directly by <see cref="IsProxyDisturbed"/>.
+    /// Surfaced only if every attempt is disturbed, which is itself the useful diagnosis.
     /// </summary>
-    private sealed class ProxyDisturbedException : Exception
+    public sealed class EgressProxyDisturbedException : Exception
     {
-        public ProxyDisturbedException(string containerId, string what)
-            : base($"The egress proxy '{containerId}' was {what} while EnsureReadyAsync was adopting it.") { }
+        public EgressProxyDisturbedException(string containerId, string what)
+            : base($"The egress proxy '{containerId}' was {what} while EnsureReadyAsync was adopting it. "
+                 + "Something outside the daemon is stopping or removing the shared proxy container.")
+        {
+            ContainerId = containerId;
+        }
+
+        public string ContainerId { get; }
     }
 
     /// <summary>Exit codes that mean "a signal ended this", i.e. 128+N. A container that exits this way
@@ -116,8 +124,36 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// error. 143 = SIGTERM (docker stop), 137 = SIGKILL (docker kill / force-remove), 130 = SIGINT.</summary>
     internal static bool IsExternalStopExit(long exitCode) => exitCode is 143 or 137 or 130;
 
+    /// <summary>
+    /// THE invariant, in one predicate: <c>EnsureReadyAsync</c> does not own the proxy container, so no
+    /// observation of its state survives to the next call. Every signal that says "this container is no
+    /// longer what you just saw" is the SAME condition and gets the SAME answer — re-run the whole
+    /// adopt-or-create sequence.
+    ///
+    /// <para>This exists because fixing the manifestations one at a time does not converge. Three
+    /// variants of this single bug reached CI in three successive rounds: the container REMOVED
+    /// mid-adoption (a 404 out of the recovery path's own cleanup), the container SIGTERM'd mid-adoption
+    /// (exit 143, 340ms lifetime, reported as a boot failure), and an exec landing on a container
+    /// stopped between the readiness check and the exec (409 Conflict, "container is not running").
+    /// Each fix covered the symptom that happened to surface that round. Recognising the CLASS is what
+    /// stops the fourth.</para>
+    ///
+    /// <para>404 = it is gone. 409 = it is not in the state the call requires (not running, name taken
+    /// by a concurrent create, removal in progress). Both are disturbances by definition. Anything else
+    /// — a 500, a malformed request, a policy failure like
+    /// <see cref="EgressNetworkDriftException"/> — is a real error and must NOT be retried into
+    /// silence.</para>
+    /// </summary>
+    internal static bool IsProxyDisturbed(Exception ex) => ex switch
+    {
+        EgressProxyDisturbedException => true,
+        DockerContainerNotFoundException => true,
+        DockerApiException api => api.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Conflict,
+        _ => false,
+    };
+
     /// <summary>How many times the adopt-or-create sequence is attempted before a failure is real.</summary>
-    private const int MaxAdoptionAttempts = 3;
+    private const int MaxAdoptionAttempts = 4;
 
     /// <summary>Breathing room before re-attempting, so a retry does not re-enter the same race Docker
     /// is still resolving (a stop that is mid-flight completes in well under this).</summary>
@@ -125,41 +161,34 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
 
     public async Task EnsureReadyAsync(CancellationToken ct = default)
     {
-        // Internal network: no route out except via a container with a second (egress) leg.
-        var internalId = await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
-        var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
-
-        // The proxy is a SHARED, singleton container. Every SandboxFixture teardown removes it, the VM
-        // shutdown path stops it, an operator may do either, and Docker itself can still be finishing a
-        // stop when the next start arrives. So between finding it and finishing with it, it can be
-        // removed OR signalled out from under us at ANY point — and neither is a failure. The right
-        // answer to both is the same: start the sequence over.
-        //
-        // Retrying at the SEQUENCE level is deliberate. The window exists before every individual call,
-        // so hardening call sites one at a time only moves it. Two distinct instances of this bug have
-        // now been fixed by widening this loop rather than by patching a call:
-        //   * the container REMOVED mid-adoption — the recovery path's own RemoveContainerAsync raised
-        //     a 404 that escaped uncaught (reproduced locally: 3 failures in 10 runs);
-        //   * the container SIGTERM'd mid-adoption — CI caught a proxy that lived 340ms and exited 143
-        //     with empty logs, because a rapid stop→start let our start land inside a stop Docker was
-        //     still completing, which then signalled the process we had just started.
+        // The ENTIRE sequence is retried — networks, adopt, start, wait, AND the config push. Not the
+        // steps that have failed so far; all of them. "Wait until running, then exec" is inherently
+        // TOCTOU against a container we do not own, so the exec is treated as a step that may fail and
+        // be re-run, never as one guaranteed safe by a check that preceded it.
         for (var attempt = 1; ; attempt++)
         {
             try
             {
-                await EnsureProxyReadyOnceAsync(egressId, ct).ConfigureAwait(false);
+                await EnsureProxyReadyOnceAsync(ct).ConfigureAwait(false);
                 return;
             }
-            catch (ProxyDisturbedException) when (attempt < MaxAdoptionAttempts)
+            catch (Exception ex) when (attempt < MaxAdoptionAttempts && IsProxyDisturbed(ex))
             {
-                // Removed or signalled underneath us. Let Docker settle, then go around again.
+                // Removed, signalled, or otherwise not in the state we observed. Let Docker settle,
+                // then start over from scratch — including re-reading whether the proxy exists at all.
                 await Task.Delay(AdoptionRetryDelay, ct).ConfigureAwait(false);
             }
         }
     }
 
-    private async Task EnsureProxyReadyOnceAsync(string egressId, CancellationToken ct)
+    private async Task EnsureProxyReadyOnceAsync(CancellationToken ct)
     {
+        // Inside the retry: a concurrent teardown removes the networks too, and re-reading them is part
+        // of starting over. A drifted network (EgressNetworkDriftException) is a policy failure, not a
+        // disturbance, and deliberately propagates on the first attempt.
+        await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
+        var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
+
         var proxy = await FindContainerAsync(ProxyContainerName, ct).ConfigureAwait(false);
         string? proxyId = proxy?.ID;
         var revived = false;
@@ -214,14 +243,14 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             // 1. Removed underneath us — a concurrent teardown. Start over and create a fresh one.
             if (state is null)
             {
-                throw new ProxyDisturbedException(proxyId, "removed");
+                throw new EgressProxyDisturbedException(proxyId, "removed");
             }
 
             // 2. Signalled underneath us — `docker stop`/`kill`, or a stop Docker was still completing
             //    when our start landed. The container did not fail; something ended it. Start over.
             if (!state.Running && IsExternalStopExit(state.ExitCode))
             {
-                throw new ProxyDisturbedException(
+                throw new EgressProxyDisturbedException(
                     proxyId, $"stopped externally (exit {state.ExitCode} = 128+{state.ExitCode - 128})");
             }
 
@@ -230,28 +259,12 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
                 proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
 
-        try
-        {
-            await PushConfigAsync(proxyId, ct).ConfigureAwait(false);
-        }
-        catch (DockerApiException) when (revived)
-        {
-            // The revived corpse died again before the config exec (seen on CI's docker; a fresh
-            // container is the known-good path everywhere) — replace it outright and push again.
-            // Only the revive path retries: a fresh create that fails must surface, not loop.
-            try
-            {
-                await _docker.Containers.RemoveContainerAsync(proxyId,
-                    new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
-            }
-            catch (DockerApiException)
-            {
-                // Already gone — the recreate below is the answer either way.
-            }
-
-            proxyId = await CreateAndStartProxyAsync(egressId, ct).ConfigureAwait(false);
-            await PushConfigAsync(proxyId, ct).ConfigureAwait(false);
-        }
+        // The config push is INSIDE the retried sequence and carries no special-case recovery of its
+        // own. It used to have a bespoke "if this was a revived container, recreate and push again"
+        // branch; that is exactly the per-call-site patching that let the next variant through. A 409
+        // here ("container is not running", because the container was stopped between the readiness
+        // check above and this exec) is just another disturbance, and the sequence retry answers it.
+        await PushConfigAsync(proxyId, ct).ConfigureAwait(false);
     }
 
     /// <summary>Creates the proxy container on the internal network, attaches its second (egress) leg,
