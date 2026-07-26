@@ -60,11 +60,30 @@ stop_daemon() {
     ! is_running "$1"
 }
 
-# Wait for a freshly-started daemon to appear.
+# Is something LISTENING on this port? $1 = "tcp" or "udp", $2 = port in uppercase hex.
+#
+# "The process exists" and "the socket is accepting connections" are different facts, and the gap
+# between them is a real window: both daemons fork and bind afterwards, so a readiness check that only
+# looks for the process reports ready while connections are still refused. Parsed straight out of
+# /proc/net/{tcp,udp} so this needs no ss/netstat/lsof in the image. TCP state 0A is LISTEN; a UDP
+# socket appears in the table once bound.
+is_listening() {
+    awk -v want="$2" -v proto="$1" '
+        NR > 1 {
+            split($2, a, ":")
+            if (a[2] == want && (proto == "udp" || $4 == "0A")) { found = 1 }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "/proc/net/$1"
+}
+
+# Wait for a freshly-started daemon to be RUNNING and LISTENING. $1 = process name, $2 = proto,
+# $3 = port (hex). Reporting "ok" before the socket is up is what makes a caller's "the proxy is
+# ready" a lie, and the caller then hands that proxy to an agent whose very first request is refused.
 wait_started() {
     i=0
     while [ "$i" -lt 50 ]; do
-        if is_running "$1"; then
+        if is_running "$1" && is_listening "$2" "$3"; then
             return 0
         fi
         i=$((i + 1))
@@ -96,7 +115,7 @@ if [ -f "$CONF_DIR/dnsmasq.conf" ]; then
             --pid-file="$CONF_DIR/dnsmasq.pid" --log-facility="$CONF_DIR/dnsmasq.log" \
             </dev/null >/dev/null 2>&1 &
 
-        if wait_started dnsmasq; then
+        if wait_started dnsmasq udp 0035; then
             echo ok > "$CONF_DIR/dnsmasq.status"
         else
             echo failed > "$CONF_DIR/dnsmasq.status"
@@ -128,7 +147,7 @@ EOF
         # tinyproxy daemonizes (forks + parent exits); redirect its fds too so the daemon child never
         # holds the exec's attach pipe open.
         tinyproxy -c "$CONF_DIR/tinyproxy.conf" </dev/null >/dev/null 2>&1
-        if wait_started tinyproxy; then
+        if wait_started tinyproxy tcp 22B8; then
             echo ok > "$CONF_DIR/tinyproxy.status"
         else
             echo failed > "$CONF_DIR/tinyproxy.status"

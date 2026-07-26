@@ -145,6 +145,13 @@ public static class EgressProxyConfig
         sb.Append("# address, nothing else. FORWARD stays default-deny as defence in depth only.\n");
         sb.Append("set -eu\n");
 
+        // Flush first. Every reload used to APPEND, so the chain grew a fresh copy of every rule each
+        // time — and because the copies land AFTER the terminal `-j DROP`, they are dead weight that
+        // makes the live policy progressively harder to read (13 rules after two reloads instead of 8).
+        // Applying policy has to be idempotent: the chain after N reloads must equal the chain after 1.
+        sb.Append("iptables -F INPUT\n");
+        sb.Append("iptables -F FORWARD\n");
+
         sb.Append("iptables -P INPUT DROP\n");
         sb.Append("iptables -A INPUT -i lo -j ACCEPT\n");
         sb.Append("iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT\n");

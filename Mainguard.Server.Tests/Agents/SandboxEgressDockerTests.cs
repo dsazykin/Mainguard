@@ -31,8 +31,68 @@ public class SandboxEgressDockerTests
         // A 200/401 both prove the connection reached the API through the proxy (auth aside).
         var result = await fx.ExecAsync(handle.ContainerId,
             "curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "https://api.anthropic.com/v1/models");
-        Assert.Matches(@"^\d{3}$", result.Stdout.Trim());
-        Assert.NotEqual("000", result.Stdout.Trim()); // 000 = never connected
+        var code = result.Stdout.Trim();
+
+        // `000` means curl never got an HTTP response, and on its own it cannot tell you WHICH leg
+        // broke: the jail→proxy hop, or the proxy→internet hop. That ambiguity is the same diagnostic
+        // weakness that cost several rounds elsewhere, so the failure now answers it before you ask.
+        if (code == "000" || !System.Text.RegularExpressions.Regex.IsMatch(code, @"^\d{3}$"))
+        {
+            Assert.Fail(await DescribeEgressBreakAsync(fx, handle.ContainerId, result));
+        }
+    }
+
+    /// <summary>
+    /// Splits an egress failure into "the jail could not reach the proxy" versus "the proxy could not
+    /// reach the internet", and reports the proxy's own health alongside. Every probe is best-effort:
+    /// a diagnostic that throws while diagnosing replaces a real failure with a useless one.
+    /// </summary>
+    private static async Task<string> DescribeEgressBreakAsync(
+        SandboxFixture fx, string jailId, SandboxExecResult curl)
+    {
+        var report = new System.Text.StringBuilder();
+        report.Append("egress through the proxy failed. curl: exit=").Append(curl.ExitCode)
+              .Append(" code='").Append(curl.Stdout.Trim()).Append("' stderr='").Append(curl.Stderr.Trim()).Append("'\n");
+
+        var proxy = EgressProxyConfigurator.ProxyContainerName;
+
+        async Task ProbeAsync(string label, string containerId, params string[] cmd)
+        {
+            try
+            {
+                var r = await fx.Engine.ExecAsync(containerId, cmd);
+                report.Append("  ").Append(label).Append(": exit=").Append(r.ExitCode)
+                      .Append(" '").Append(r.Stdout.Trim().Replace("\n", " | ")).Append('\'');
+                if (!string.IsNullOrWhiteSpace(r.Stderr))
+                {
+                    report.Append(" err='").Append(r.Stderr.Trim()).Append('\'');
+                }
+
+                report.Append('\n');
+            }
+            catch (Exception ex)
+            {
+                report.Append("  ").Append(label).Append(": probe failed — ").Append(ex.Message).Append('\n');
+            }
+        }
+
+        // LEG 1 — jail → proxy. Name resolution and the TCP hop, separately.
+        await ProbeAsync("jail resolves the proxy name", jailId, "getent", "hosts", proxy);
+        await ProbeAsync("jail reaches proxy:8888", jailId, "sh", "-c",
+            $"timeout 5 sh -c 'echo > /dev/tcp/{proxy}/8888' 2>&1 && echo CONNECTED || echo UNREACHABLE");
+
+        // LEG 2 — the proxy's own health and its route out.
+        await ProbeAsync("proxy daemon status", proxy, "sh", "-c",
+            "echo dns=$(cat /run/mainguard/dnsmasq.status 2>&1) tinyproxy=$(cat /run/mainguard/tinyproxy.status 2>&1)");
+        await ProbeAsync("proxy listeners", proxy, "sh", "-c",
+            "awk 'NR>1{split($2,a,\":\"); if(a[2]==\"22B8\" && $4==\"0A\") print \"tinyproxy LISTENING\"}' /proc/net/tcp");
+        await ProbeAsync("proxy resolves upstream", proxy, "getent", "hosts", "api.anthropic.com");
+        await ProbeAsync("proxy logs", proxy, "sh", "-c", "tail -5 /run/mainguard/dnsmasq.log 2>&1");
+
+        report.Append("Read it this way: leg 1 broken => the jail cannot reach the proxy (a recreated "
+                    + "proxy strands running jails — same IP, new MAC). Leg 1 fine but leg 2 broken => "
+                    + "the proxy is up and the upstream is unreachable from this runner.");
+        return report.ToString();
     }
 
     [RequiresDockerFact]

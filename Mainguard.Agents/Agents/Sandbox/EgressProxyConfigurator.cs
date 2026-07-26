@@ -213,14 +213,26 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
                 revived = await WaitUntilRunningAsync(proxyId!, ct).ConfigureAwait(false);
                 if (!revived)
                 {
+                    // Do NOT reach for the delete key yet — decide WHY it is not running first.
+                    await ThrowIfDisturbedAsync(proxyId!, ct).ConfigureAwait(false);
                     throw new DockerContainerNotRunningException(proxyId!);
                 }
             }
+            catch (Exception ex) when (IsProxyDisturbed(ex))
+            {
+                // Removed or signalled underneath us — the container may be perfectly good. Let the
+                // sequence retry rather than replacing it, because REPLACING IT IS DESTRUCTIVE: a
+                // recreated proxy reuses the same IP with a NEW MAC, so every already-running agent
+                // jail keeps an ARP entry pointing at a container that no longer exists and its egress
+                // silently blackholes. Verified against a real daemon — after a recreate the proxy is
+                // healthy in every respect (same IP, tinyproxy LISTENING, upstream DNS fine) and a
+                // running jail's curl still fails "after 1 ms". Recreating is a last resort, reserved
+                // for a container that genuinely will not run.
+                throw;
+            }
             catch (Exception ex) when (ex is DockerApiException or DockerContainerNotRunningException)
             {
-                // Unstartable corpse — replace it with a fresh container below. The removal MUST
-                // tolerate the container already being gone: this is the recovery path, and having it
-                // throw its own 404 turned a recoverable state into an unhandled failure.
+                // Genuinely unstartable — this one has earned replacement.
                 await TryRemoveContainerAsync(proxyId!, ct).ConfigureAwait(false);
                 proxyId = null;
                 revived = false;
@@ -237,24 +249,9 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         {
             // Three different states hide behind "not running", with three different answers, and
             // conflating them is what sent repeated CI investigations after a boot bug that was never
-            // there. Only the third is a real failure.
-            var state = await TryInspectStateAsync(proxyId, ct).ConfigureAwait(false);
+            // there. Only the last is a real failure.
+            await ThrowIfDisturbedAsync(proxyId, ct).ConfigureAwait(false);
 
-            // 1. Removed underneath us — a concurrent teardown. Start over and create a fresh one.
-            if (state is null)
-            {
-                throw new EgressProxyDisturbedException(proxyId, "removed");
-            }
-
-            // 2. Signalled underneath us — `docker stop`/`kill`, or a stop Docker was still completing
-            //    when our start landed. The container did not fail; something ended it. Start over.
-            if (!state.Running && IsExternalStopExit(state.ExitCode))
-            {
-                throw new EgressProxyDisturbedException(
-                    proxyId, $"stopped externally (exit {state.ExitCode} = 128+{state.ExitCode - 128})");
-            }
-
-            // 3. It genuinely came up wrong. THIS is a boot failure, and it reports as one.
             throw new DockerContainerNotRunningException(
                 proxyId, await DescribeContainerFailureAsync(proxyId, ct).ConfigureAwait(false));
         }
@@ -696,6 +693,35 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         catch (DockerContainerNotFoundException)
         {
             // Already gone — which is exactly the state we wanted.
+        }
+    }
+
+    /// <summary>
+    /// Reads why a container is not running and raises <see cref="EgressProxyDisturbedException"/> if
+    /// the answer is "something outside this call ended it". Returns normally only when the container
+    /// is still here and stopped on its own — the one case that is genuinely our problem.
+    ///
+    /// <para>Called BEFORE any decision to replace the container, because replacing it is destructive:
+    /// a recreated proxy strands every already-running jail (same IP, new MAC — their ARP entries point
+    /// at a container that no longer exists). Deciding "disturbed" versus "broken" correctly is what
+    /// keeps recreates rare.</para>
+    /// </summary>
+    private async Task ThrowIfDisturbedAsync(string containerId, CancellationToken ct)
+    {
+        var state = await TryInspectStateAsync(containerId, ct).ConfigureAwait(false);
+
+        // Removed underneath us — a concurrent teardown.
+        if (state is null)
+        {
+            throw new EgressProxyDisturbedException(containerId, "removed");
+        }
+
+        // Signalled underneath us — `docker stop`/`kill`, or a stop Docker was still completing when
+        // our start landed. The container did not fail; something ended it.
+        if (!state.Running && IsExternalStopExit(state.ExitCode))
+        {
+            throw new EgressProxyDisturbedException(
+                containerId, $"stopped externally (exit {state.ExitCode} = 128+{state.ExitCode - 128})");
         }
     }
 
