@@ -87,27 +87,51 @@ public class SandboxNetworkIsolationDockerTests
     /// "the jail cannot reach the proxy", pointing the next investigation at the wrong leg.</para>
     ///
     /// <para>A probe that only ever returns one answer is not measuring anything, and the only way to
-    /// catch that is to assert the answer it is supposed to give when the thing works. Both directions
-    /// are pinned here: REACHABLE for the live proxy, UNREACHABLE for a closed port on the same host —
-    /// so a probe that degenerated to "always REACHABLE" would fail too.</para>
+    /// catch that is to assert the answer it is supposed to give when the thing works. All three
+    /// answers are pinned here, because the second version of this probe got the middle one wrong:
+    /// it classified on "did I receive a valid HTTP status", so a peer that accepted the connection and
+    /// then reset it — which is what CI saw, <c>curl: (56) Recv failure: Connection reset by peer</c> —
+    /// was reported UNREACHABLE even though the reset is proof the handshake completed. The verdict is
+    /// now the TCP handshake itself.</para>
     /// </summary>
     [RequiresDockerFact]
-    public async Task ReachabilityProbe_ReportsReachable_ForAHealthyHop()
+    public async Task ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply()
     {
         await using var fx = new SandboxFixture();
 
         var repo = "mg36" + Guid.NewGuid().ToString("N")[..8];
         var (jail, segment) = await fx.CreateJailOnSegmentAsync(repo, "agent-a");
 
+        // 1. A healthy hop that answers HTTP.
         var live = await fx.TcpProbeAsync(jail, $"{segment.ProxyAddress}:{EgressProxyConfigurator.ProxyPort}");
         Assert.True(live.Reached,
-            $"the reachability probe cannot report success against a healthy jail->proxy hop, so it "
-            + $"cannot diagnose anything. {live.Detail}");
+            $"the probe cannot report success against a healthy jail->proxy hop, so it cannot diagnose "
+            + $"anything. {live.Detail}");
 
-        // The other direction, on the same reachable host: a port nothing listens on must read
-        // UNREACHABLE, or the probe is just saying yes to everything.
+        // 2. A peer that accepts and immediately RSTs — CI's exact symptom, reproduced deterministically
+        //    with SO_LINGER(1,0) so the close sends a reset instead of a FIN. curl fails with 56, and
+        //    the connection it failed on is precisely what makes the peer reachable.
+        const int resetPort = 9098;
+        await fx.ExecAsync(jail, "sh", "-c",
+            "(python3 -c \"import socket,struct\n"
+            + "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            + $"s.bind(('127.0.0.1',{resetPort})); s.listen(8)\n"
+            + "while True:\n"
+            + "    c,_=s.accept()\n"
+            + "    c.setsockopt(socket.SOL_SOCKET,socket.SO_LINGER,struct.pack('ii',1,0))\n"
+            + "    c.close()\" </dev/null >/dev/null 2>&1 &) ; exit 0");
+        await WaitForListenerAsync(fx, jail, resetPort);
+
+        var reset = await fx.TcpProbeAsync(jail, $"127.0.0.1:{resetPort}");
+        Assert.True(reset.Reached,
+            $"a peer that accepted the connection and then reset it was reported UNREACHABLE — this is "
+            + $"the CI false negative, and it means the probe is still judging the reply rather than the "
+            + $"handshake. {reset.Detail}");
+
+        // 3. Nothing listening / dropped: the handshake never completes, so this must read UNREACHABLE
+        //    or the probe is simply saying yes to everything.
         var closed = await fx.TcpProbeAsync(jail, $"{segment.ProxyAddress}:9");
-        Assert.False(closed.Reached, $"the probe reported a closed port as reachable. {closed.Detail}");
+        Assert.False(closed.Reached, $"the probe reported a dead port as reachable. {closed.Detail}");
     }
 
     // The other half of the containment claim, restated on the segmented topology: a jail must still
@@ -152,6 +176,22 @@ public class SandboxNetworkIsolationDockerTests
     /// test built on it passes vacuously (measured). The agent CLIs are Node and Go binaries that carry
     /// their OWN resolvers and do issue the AAAA query regardless, which is exactly the population this
     /// control exists for, so the assertion is made through the resolver they actually use.</para>
+    ///
+    /// <para><b>The name must be a FORWARDED one.</b> The obvious way to stabilise this test is to ask
+    /// about a record dnsmasq serves itself (its own <c>address=/mainguard-egress-proxy/…</c>), which
+    /// needs no upstream at all — but that record has no AAAA to suppress, so dnsmasq answers the AAAA
+    /// query with NODATA whether or not <c>filter-AAAA</c> is set, and the test passes identically with
+    /// the fix removed (measured). The only source of a real AAAA is the upstream, so an upstream name
+    /// is the only thing that can prove suppression rather than assume it.</para>
+    ///
+    /// <para><b>Which makes the A-record control load-bearing, and it is why this test went red on CI
+    /// once already.</b> That failure was NOT the AAAA assertion: it was <c>resolve4</c> answering
+    /// <c>ESERVFAIL</c>, because the proxy could not reach the hardcoded <c>1.1.1.1</c> upstream at that
+    /// moment. Reproduced deterministically here by blocking <c>1.1.1.1</c> in the proxy's netns: a
+    /// cold-cache forwarded name then answers ESERVFAIL to node and fails <c>getent</c> alike, while
+    /// every locally-served record keeps working. That is a real, separate, pre-existing defect (the
+    /// resolver upstream should not be a hardcoded public IP), and the control's message says so — so a
+    /// future red is diagnosed on sight instead of being mistaken for an IPv6 regression.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task JailResolution_IsIPv4Only_MatchingTheIPv4OnlyFabric()
@@ -160,6 +200,7 @@ public class SandboxNetworkIsolationDockerTests
 
         var repo = "mg36" + Guid.NewGuid().ToString("N")[..8];
         var (jail, _) = await fx.CreateJailOnSegmentAsync(repo, "agent-a");
+        const string host = "api.anthropic.com";
 
         // dnsmasq accepted the config and is serving — without this the assertions below could pass
         // simply because nothing resolves at all.
@@ -167,38 +208,59 @@ public class SandboxNetworkIsolationDockerTests
             EgressProxyConfigurator.ProxyContainerName, "cat", "/run/mainguard/dnsmasq.status");
         Assert.Equal("ok", status.Stdout.Trim());
 
-        // CONTROL: an allowlisted name still resolves over A. filter-AAAA must narrow the answer, not
-        // break resolution — a resolver that answers nothing would satisfy the AAAA assertion below
-        // while making the jail useless.
+        // CONTROL / PRECONDITION: the A record answers. filter-AAAA must narrow the answer, not break
+        // resolution — a resolver that answered nothing at all would satisfy the AAAA assertion below
+        // while making the jail useless, which is exactly the failure mode to guard against.
         var v4 = await fx.ExecAsync(jail, "node", "-e",
-            "require('dns').resolve4('api.anthropic.com',(e,a)=>console.log(e?'ERR '+e.code:a.join(',')))");
+            $"require('dns').resolve4('{host}',(e,a)=>console.log(e?'ERR '+e.code:'A '+a.join(',')))");
         Assert.Equal(0, v4.ExitCode);
-        Assert.DoesNotContain("ERR", v4.Stdout, StringComparison.Ordinal);
+        Assert.StartsWith("A ", v4.Stdout.Trim(), StringComparison.Ordinal);
+
+        // ESERVFAIL here is NOT an IPv6 problem: it means dnsmasq could not reach the hardcoded 1.1.1.1
+        // upstream, so nothing about AAAA suppression can be concluded either way. Named explicitly
+        // because this exact failure has already been mistaken for something else once.
+        Assert.False(v4.Stdout.Contains("ESERVFAIL", StringComparison.Ordinal),
+            $"the jail's resolver could not forward '{host}': dnsmasq's upstream is the hardcoded public "
+            + "1.1.1.1 (EgressProxyConfig.RenderDnsmasqConfig) and this environment cannot reach it. That "
+            + "is a separate, pre-existing defect — in-jail DNS breaks anywhere external resolvers are "
+            + "blocked — and it says nothing about filter-AAAA. Reproduce: block 1.1.1.1 in the proxy's "
+            + $"netns and query a cold-cache name. Got: '{v4.Stdout.Trim()}'");
 
         // THE CONTROL UNDER TEST: the same name must yield no AAAA, so a CLI that asks for one is told
         // there is none instead of being handed an address the jail can never route to.
-        // The two sentinels must not be substrings of one another — "NOAAAA" contains "AAAA", and an
-        // assertion that cannot tell its own two outcomes apart is the bug this file keeps finding.
+        //
+        // The expected error is ENODATA specifically — NOERROR with an empty answer, which is what
+        // dnsmasq's filter-AAAA produces (dnsmasq 2.90; upstream added the option in 2.87, and the
+        // Dockerfile's pinned base digest means CI runs this exact build). Asserted exactly rather than
+        // as a disjunction because the alternatives mean different things: SERVFAIL would say the query
+        // FAILED, and some resolvers retry a whole lookup on SERVFAIL rather than treating it as "no
+        // such record" — a materially different, and worse, behaviour that happens to satisfy a loose
+        // "there was no AAAA" assertion.
         var v6 = await fx.ExecAsync(jail, "node", "-e",
-            "require('dns').resolve6('api.anthropic.com',(e,a)=>console.log(e?'RESULT-none '+e.code:'RESULT-got '+a.join(',')))");
+            $"require('dns').resolve6('{host}',(e,a)=>console.log(e?'ERR '+e.code:'AAAA '+a.join(',')))");
         Assert.Equal(0, v6.ExitCode);
-        Assert.DoesNotContain("RESULT-got", v6.Stdout, StringComparison.Ordinal);
-        Assert.Contains("RESULT-none", v6.Stdout, StringComparison.Ordinal);
+        Assert.Equal("ERR ENODATA", v6.Stdout.Trim());
     }
 
     /// <summary>Starts a trivial TCP listener inside the victim jail (python3 is pre-baked into the
-    /// agent image's toolchain), and waits for it to actually bind — "the process was launched" and
-    /// "the socket accepts" are different facts, and the gap between them is a real window.</summary>
+    /// agent image's toolchain), and waits for it to actually bind.</summary>
     private static async Task StartVictimListenerAsync(SandboxFixture fx, string containerId)
     {
         await fx.ExecAsync(containerId, "sh", "-c",
             $"(python3 -m http.server {VictimPort} --bind 0.0.0.0 </dev/null >/dev/null 2>&1 &) ; exit 0");
+        await WaitForListenerAsync(fx, containerId, VictimPort);
+    }
 
+    /// <summary>Waits until <paramref name="port"/> is actually accepting inside the container.
+    /// "The process was launched" and "the socket accepts" are different facts, and the gap between
+    /// them is a real window — /proc/net/tcp, hex port, state 0A = LISTEN, parsed directly so this
+    /// needs no ss/netstat in the image.</summary>
+    private static async Task WaitForListenerAsync(SandboxFixture fx, string containerId, int port)
+    {
         for (var i = 0; i < 50; i++)
         {
-            // /proc/net/tcp, hex port, state 0A = LISTEN. Parsed directly so this needs no ss/netstat.
             var listening = await fx.ExecAsync(containerId, "sh", "-c",
-                $"awk 'NR>1{{split($2,a,\":\"); if (a[2]==\"{VictimPort:X4}\" && $4==\"0A\") f=1}} END{{exit(f?0:1)}}' /proc/net/tcp");
+                $"awk 'NR>1{{split($2,a,\":\"); if (a[2]==\"{port:X4}\" && $4==\"0A\") f=1}} END{{exit(f?0:1)}}' /proc/net/tcp");
             if (listening.ExitCode == 0)
             {
                 return;

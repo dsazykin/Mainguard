@@ -150,11 +150,29 @@ public sealed class SandboxFixture : IAsyncDisposable
     ///
     /// <para><b>Why curl.</b> It is in the agent image by construction (the Dockerfile installs it, and
     /// the egress tests are built on it), so the probe cannot silently degrade to "tool missing" the way
-    /// a <c>nc</c>-based one would — the image has no <c>nc</c> at all, verified. Any three-digit HTTP
-    /// code proves the peer accepted a TCP connection and answered; tinyproxy replies 403 to a
-    /// non-proxy request on its CONNECT port, which is a perfectly good "yes, I am here". The proxy
-    /// environment is explicitly disabled (<c>--noproxy '*'</c>) so the probe measures the hop it names
-    /// rather than being quietly re-routed through the proxy it is trying to test.</para>
+    /// a <c>nc</c>-based one would — the image has no <c>nc</c> at all, verified. The proxy environment
+    /// is explicitly disabled (<c>--noproxy '*'</c>) so the probe measures the hop it names rather than
+    /// being quietly re-routed through the proxy it is trying to test.</para>
+    ///
+    /// <para><b>Why the verdict is the TCP handshake, not the HTTP reply.</b> The first version asked
+    /// "did I get a valid HTTP status?", which conflates <i>can I reach this peer</i> with <i>does this
+    /// peer like my request</i>. CI caught it: the same jail→proxy hop that answers 403 here answered
+    /// <c>curl: (56) Recv failure: Connection reset by peer</c> there, and the probe called that
+    /// UNREACHABLE. It is the opposite — <c>CURLE_RECV_ERROR</c> is a failure <b>after</b> the
+    /// connection is established, so a reset is positive proof the SYN/ACK completed and the peer was
+    /// there to reset it. Reachability is now read off curl's own connection counters
+    /// (<c>num_connects</c>/<c>time_connect</c>), which state the fact directly instead of inferring it
+    /// from how far the conversation got.</para>
+    ///
+    /// <para>Measured against a real daemon, this separates all four outcomes the tests depend on:
+    /// <list type="bullet">
+    ///   <item>live proxy port → <c>connects=1 tconnect=0.0005 code=403</c>, exit 0 — REACHABLE</item>
+    ///   <item>accepted then RST (the CI case) → <c>connects=1</c>, exit 56 — REACHABLE</item>
+    ///   <item>port dropped by the backstop → <c>connects=0</c>, exit 28 (connect timeout) — unreachable</item>
+    ///   <item>another agent's segment → <c>connects=0</c>, exit 7 (no route) — unreachable</item>
+    /// </list>
+    /// The last two are what the isolation assertions rest on, and both still read unreachable: a
+    /// blocked destination never completes a handshake, whether it is dropped or has no route at all.</para>
     /// </summary>
     public async Task<(bool Reached, string Detail)> TcpProbeAsync(
         string containerId, string hostPort, CancellationToken ct = default)
@@ -163,20 +181,53 @@ public sealed class SandboxFixture : IAsyncDisposable
         {
             var result = await Engine.ExecAsync(containerId, new[]
             {
-                "curl", "-sS", "--noproxy", "*", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}",
+                "curl", "-sS", "--noproxy", "*", "--connect-timeout", "5", "-m", "10",
+                "-o", "/dev/null",
+                "-w", "connects=%{num_connects} tconnect=%{time_connect} code=%{http_code}",
                 "http://" + hostPort,
             }, ct).ConfigureAwait(false);
 
-            var code = result.Stdout.Trim();
-            var reached = result.ExitCode == 0 && code.Length == 3 && code != "000" && int.TryParse(code, out _);
+            var stdout = result.Stdout.Trim();
+            var reached = ConnectCompleted(stdout, result.ExitCode);
             return (reached,
                 $"{(reached ? "REACHABLE" : "UNREACHABLE")} {hostPort}: exit={result.ExitCode} "
-                + $"code='{code}' stderr='{result.Stderr.Trim()}'");
+                + $"[{stdout}] stderr='{result.Stderr.Trim()}'");
         }
         catch (Exception ex)
         {
             return (false, $"UNREACHABLE {hostPort}: the probe itself failed — {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Did the TCP handshake complete? Read from curl's counters when they are present — they are
+    /// emitted even on a failed transfer (verified for exits 7, 28 and 0) — and from the exit code
+    /// otherwise. The two connect-phase failures are 7 (<c>CURLE_COULDNT_CONNECT</c>: refused, or no
+    /// route) and 28 when nothing came back at all; every other failure happens after a connection
+    /// exists and therefore proves reachability.
+    /// </summary>
+    private static bool ConnectCompleted(string writeOut, int exitCode)
+    {
+        var connects = MatchNumber(writeOut, "connects=");
+        var timeConnect = MatchNumber(writeOut, "tconnect=");
+        if (connects is not null || timeConnect is not null)
+        {
+            return connects >= 1 || timeConnect > 0;
+        }
+
+        // No counters to read (curl died before writing them) — fall back to the exit code.
+        return exitCode is not (6 or 7 or 28);
+    }
+
+    private static double? MatchNumber(string haystack, string key)
+    {
+        var match = System.Text.RegularExpressions.Regex.Match(
+            haystack, System.Text.RegularExpressions.Regex.Escape(key) + @"([0-9]+(?:\.[0-9]+)?)");
+        return match.Success
+            && double.TryParse(match.Groups[1].Value, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var value)
+            ? value
+            : null;
     }
 
     /// <summary>Inspects a spawned container (mounts, host config, state).</summary>
