@@ -993,7 +993,16 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await WriteFileAsync(proxyId, ConfDir + "/tinyproxy-upstreams",
             EgressProxyConfig.RenderTinyproxyUpstreams(effective, _gatewayUpstream), ct).ConfigureAwait(false);
 
-        await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress), ct).ConfigureAwait(false);
+        // The resolver dnsmasq forwards allowlisted names to is THIS container's own — read out of its
+        // /etc/resolv.conf rather than hardcoded. Every allowlisted domain used to be pinned to the
+        // public 1.1.1.1, so in-jail DNS died anywhere an external resolver is blocked, intercepted or
+        // unreachable; deferring to the resolver Docker gave the proxy is what makes the jail's DNS work
+        // wherever the HOST's DNS works. Read on every push for the same reason the addresses above are:
+        // it is the container's current state, not a fact captured once. See
+        // EgressProxyConfig.DockerEmbeddedResolver for the fallback and for why this cannot loop.
+        var upstreamResolvers = await ReadProxyResolversAsync(proxyId, ct).ConfigureAwait(false);
+
+        await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress, upstreamResolvers), ct).ConfigureAwait(false);
         await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddresses), ct).ConfigureAwait(false);
         // The image's entrypoint reloads tinyproxy/dnsmasq and (re)applies the backstop from these paths.
         await ExecAsync(proxyId, new[] { "sh", ReloadScript }, ct).ConfigureAwait(false);
@@ -1069,6 +1078,53 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await stream.WriteAsync(bytes, 0, bytes.Length, bounded).ConfigureAwait(false);
         stream.CloseWrite();
         await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The proxy container's OWN IPv4 nameservers, read from its <c>/etc/resolv.conf</c> — the upstream
+    /// dnsmasq forwards allowlisted names to.
+    ///
+    /// <para>Best effort BY DESIGN. A failure here degrades to
+    /// <see cref="EgressProxyConfig.DockerEmbeddedResolver"/>, which is the address that file names in
+    /// every topology this proxy is created in (it is always on user-defined networks), so the read is
+    /// strictly additive: it cannot introduce a failure the hardcoded value would not also have had.
+    /// Throwing instead would make an unreadable file a total spawn outage, which is a far worse trade
+    /// than falling back to the value we would otherwise have written anyway.</para>
+    /// </summary>
+    private async Task<IReadOnlyList<string>> ReadProxyResolversAsync(string proxyId, CancellationToken ct)
+    {
+        try
+        {
+            var resolvConf = await ExecCaptureAsync(
+                proxyId, new[] { "cat", "/etc/resolv.conf" }, ct).ConfigureAwait(false);
+            return EgressProxyConfig.ParseResolvConfNameservers(resolvConf);
+        }
+        catch (Exception ex) when (ex is DockerApiException or OperationCanceledException or System.IO.IOException)
+        {
+            return Array.Empty<string>();
+        }
+    }
+
+    /// <summary>Runs a command in the container and returns its stdout. Stdout only — never stdin: an
+    /// exec's stdin is a hijacked stream that some Docker endpoints (Docker Desktop's WSL2 proxy,
+    /// verified) do not deliver at all, which is why <see cref="WriteFileAsync"/> carries content as an
+    /// argument. Reading output back is the direction that does work.</summary>
+    private async Task<string> ExecCaptureAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ExecTimeout);
+        var bounded = timeout.Token;
+
+        var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+        {
+            User = "0",
+            AttachStdout = true,
+            AttachStderr = true,
+            Cmd = cmd.ToList(),
+        }, bounded).ConfigureAwait(false);
+        using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
+        var (stdout, _) = await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+        return stdout;
     }
 
     private async Task ExecAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)

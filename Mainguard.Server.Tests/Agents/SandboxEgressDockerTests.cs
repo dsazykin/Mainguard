@@ -211,18 +211,74 @@ public class SandboxEgressDockerTests
         Assert.Equal("ok", status.Stdout.Trim());
     }
 
+    /// <summary>
+    /// Non-vacuity in the other direction: a pin that resolves NOTHING would also pass the exfil probe
+    /// above while breaking every agent. The allowlisted model API must still resolve — <b>and it must
+    /// do so without a public resolver</b>.
+    ///
+    /// <para><b>What this used to be, and why it could flake.</b> It asked <c>getent hosts</c> and
+    /// checked the answer was not 0.0.0.0, against a dnsmasq that forwarded every allowlisted domain to
+    /// a hardcoded <c>1.1.1.1</c>. Both halves were wrong. The upstream made the test — and in-jail DNS
+    /// generally — fail anywhere an external resolver is blocked, intercepted or unreachable, which is
+    /// a real defect this test carried rather than caught. And <c>getent</c> is the wrong instrument:
+    /// glibc short-circuits (it never issues an AAAA query on an IPv4-only host) and <c>getent
+    /// hosts</c> specifically resolves AF_INET6 first, so it reports things the jail's own resolvers
+    /// never see. The agent CLIs are Node and Go binaries carrying their own resolvers, so the
+    /// assertion is made through one that actually puts the query on the wire.</para>
+    ///
+    /// <para><b>The two setup steps are load-bearing, both measured against the real image.</b> Blocking
+    /// 1.1.1.1 in the proxy's netns is what makes "resolution does not depend on a public resolver" an
+    /// assertion instead of a hope. Flushing dnsmasq's cache (SIGHUP) is what makes the block bite: with
+    /// a warm cache the same probe answers correctly with 1.1.1.1 fully blocked and the fix removed —
+    /// i.e. it passes vacuously. Verified both ways against <c>mainguard-egress-proxy:latest</c>: with a
+    /// cold cache and 1.1.1.1 dropped, the old <c>server=/…/1.1.1.1</c> config answers REFUSED (EDE:
+    /// network error) and this config resolves normally.</para>
+    ///
+    /// <para>The DROP rule is removed in a <c>finally</c>, and it is self-healing besides: the backstop
+    /// is applied with <c>iptables-restore</c> over the whole <c>*filter</c> table, so the next config
+    /// push replaces it regardless.</para>
+    /// </summary>
     [RequiresDockerFact]
-    public async Task AllowlistedName_ShouldStillResolve_UnderThePinnedResolver()
+    public async Task AllowlistedName_ShouldStillResolve_WithoutAnyPublicResolver()
     {
-        // Non-vacuity in the other direction: a pin that resolves NOTHING would also pass the exfil
-        // probe above while breaking every agent. The allowlisted model API must still resolve.
         await using var fx = new SandboxFixture();
         await fx.EnsureEgressReadyAsync();
         var handle = await fx.SpawnAsync();
 
-        var result = await fx.ExecAsync(handle.ContainerId, "getent", "hosts", "api.anthropic.com");
-        Assert.Equal(0, result.ExitCode);
-        Assert.DoesNotContain("0.0.0.0", result.Stdout, StringComparison.Ordinal);
+        var proxy = EgressProxyConfigurator.ProxyContainerName;
+        const string publicResolver = "1.1.1.1";
+
+        var blocked = await fx.ExecAsync(proxy, "iptables", "-I", "OUTPUT", "-d", publicResolver, "-j", "DROP");
+        Assert.True(blocked.ExitCode == 0,
+            $"could not block {publicResolver} in the proxy netns, so this test would prove nothing: "
+            + $"exit={blocked.ExitCode} stderr='{blocked.Stderr.Trim()}'");
+
+        try
+        {
+            // Cold cache, or the block is unobservable — see the summary.
+            var flushed = await fx.ExecAsync(proxy, "pkill", "-HUP", "-x", "dnsmasq");
+            Assert.True(flushed.ExitCode == 0,
+                $"could not flush dnsmasq's cache, so a warm entry could answer this probe without any "
+                + $"upstream being reached: exit={flushed.ExitCode} stderr='{flushed.Stderr.Trim()}'");
+
+            const string host = "api.anthropic.com";
+            var v4 = await fx.ExecAsync(handle.ContainerId, "node", "-e",
+                $"require('dns').resolve4('{host}',(e,a)=>console.log(e?'ERR '+e.code:'A '+a.join(',')))");
+            Assert.Equal(0, v4.ExitCode);
+
+            var answer = v4.Stdout.Trim();
+            Assert.True(answer.StartsWith("A ", StringComparison.Ordinal),
+                $"the jail could not resolve the allowlisted '{host}' while {publicResolver} was "
+                + "unreachable. dnsmasq must forward allowlisted names to the proxy container's OWN stub "
+                + $"resolver (EgressProxyConfig.DockerEmbeddedResolver), never to a public one. Got: '{answer}'");
+
+            // ...and it is a real answer, not the catch-all sinkhole.
+            Assert.DoesNotContain("0.0.0.0", answer, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await fx.ExecAsync(proxy, "iptables", "-D", "OUTPUT", "-d", publicResolver, "-j", "DROP");
+        }
     }
 
     // The toolchain is PRE-BAKED into the agent image (A6 decision): devbox's runtime `add` resolves
