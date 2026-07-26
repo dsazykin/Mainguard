@@ -26,6 +26,7 @@ public sealed class AdapterBaseUrlEnvVarTests
         "id": "claude-code",
         "displayName": "Claude Code",
         "version": "1.2.3",
+        "provenance": "npm-registry-signature",
         "sha256": "{{Sha}}",
         "installCmd": ["npm", "install", "-g", "x"],
         "configShims": null,
@@ -95,7 +96,7 @@ public sealed class AdapterBaseUrlEnvVarTests
     public void InstallMarker_WrittenBeforeTheFieldExisted_StillLoads()
     {
         const string legacy = """
-        {"id":"claude-code","version":"2.1.0","launch":["claude"],"apiKeyEnvVar":"ANTHROPIC_API_KEY"}
+        {"id":"claude-code","version":"2.1.0","provenance":"none","launch":["claude"],"apiKeyEnvVar":"ANTHROPIC_API_KEY"}
         """;
 
         var round = InstalledAdapterMarker.TryDeserialize(legacy);

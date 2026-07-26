@@ -15,6 +15,7 @@ public class AdapterManifestTests
       "id": "claude-code",
       "displayName": "Claude Code",
       "version": "1.2.3",
+      "provenance": "npm-registry-signature",
       "sha256": "{{Sha}}",
       "installCmd": ["npm", "install", "-g", "@anthropic-ai/claude-code@1.2.3"],
       "configShims": [{ "path": "/home/agent/.claude/settings.json", "content": "{}" }],
@@ -37,7 +38,7 @@ public class AdapterManifestTests
     public void EgressHosts_Valid_ParseAndAreReadable()
     {
         var body = $$"""
-        { "id": "claude-code", "displayName": "Claude Code", "version": "1.2.3", "sha256": "{{Sha}}",
+        { "id": "claude-code", "displayName": "Claude Code", "version": "1.2.3", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["platform.claude.com", "statsig.anthropic.com"] }
         """;
@@ -49,7 +50,7 @@ public class AdapterManifestTests
     public void EgressHosts_GitHost_IsRejected_A6()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["github.com"] }
         """;
@@ -66,7 +67,7 @@ public class AdapterManifestTests
     public void EgressHosts_NotBareHostname_IsRejected(string host)
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["{{host}}"] }
         """;
@@ -78,7 +79,7 @@ public class AdapterManifestTests
     public void MissingHealthProbe_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"] }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
@@ -99,7 +100,7 @@ public class AdapterManifestTests
     public void UnpinnedVersion_ShouldBeRejected(string version)
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "{{version}}", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "{{version}}", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
@@ -124,7 +125,7 @@ public class AdapterManifestTests
     public void InstallCmdWithAtLatest_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["npm", "install", "-g", "claude@latest"],
           "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
@@ -136,7 +137,7 @@ public class AdapterManifestTests
     public void UnknownField_ShouldBeRejectedByStrictSchema()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "surpriseField": true,
           "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
@@ -148,7 +149,7 @@ public class AdapterManifestTests
     public void BadHash_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "not-a-hash",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "not-a-hash",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));

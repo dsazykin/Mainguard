@@ -16,12 +16,17 @@ public sealed class ImportDistroStep : IBootstrapStep
     private readonly IWslRunner _wsl;
     private readonly IBootstrapFileSystem _fs;
     private readonly BootstrapOptions _options;
+    private readonly BuildProvenanceGate _provenance;
 
-    public ImportDistroStep(IWslRunner wsl, IBootstrapFileSystem fs, BootstrapOptions options)
+    /// <param name="provenance">The MG-9 build-provenance gate for <c>MainguardOS.tar.gz</c>. Null → the
+    /// compiled-in policy (a logged no-op on any build that is not a stamped attested release).</param>
+    public ImportDistroStep(
+        IWslRunner wsl, IBootstrapFileSystem fs, BootstrapOptions options, BuildProvenanceGate? provenance = null)
     {
         _wsl = wsl;
         _fs = fs;
         _options = options;
+        _provenance = provenance ?? new BuildProvenanceGate();
     }
 
     public string Name => "Import MainguardEnv";
@@ -40,6 +45,17 @@ public sealed class ImportDistroStep : IBootstrapStep
                 $"The Mainguard OS payload was not found at '{_options.TarballPath}'. A packaged Mainguard "
                 + "install bundles it next to the app — reinstall Mainguard, or (source runs) build it with "
                 + "build/mainguardos/build.sh and stage it at that path.");
+
+        // MG-9: this tarball becomes the ENTIRE root filesystem of a VM that then runs mainguardd as
+        // root, and until now nothing checked where it came from. The attestation is produced by the CI
+        // run that built the tarball, so unlike a hash the app derives from the file in front of it, it
+        // cannot be re-created by whoever swapped the file. Fail-closed on a stamped release build.
+        var provenance = await _provenance
+            .VerifyFileAsync(BuildArtifactKind.MainguardOsTarball, _options.TarballPath, ct)
+            .ConfigureAwait(false);
+        if (provenance.MustRefuse)
+            throw new BootstrapException(Name, $"Refusing to import {_options.DistroName}: {provenance.Reason}");
+        log.Report(provenance.Reason);
 
         log.Report($"Importing {_options.DistroName} from {_options.TarballPath}…");
         var result = await _wsl.RunAsync(

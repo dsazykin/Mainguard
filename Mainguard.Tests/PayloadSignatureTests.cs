@@ -67,6 +67,7 @@ public class PayloadSignatureTests : IDisposable
                   "id": "tool",
                   "displayName": "Tool",
                   "version": "1.2.3",
+                  "provenance": "npm-registry-signature",
                   "sha256": "{{sha}}",
                   "installCmd": ["npm", "install", "-g", "--ignore-scripts", "{payload}"],
                   "configShims": [],
