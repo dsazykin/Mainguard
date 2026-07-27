@@ -28,35 +28,22 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class DaemonTransportSecurityTests
 {
-    private static int FreePort()
-    {
-        var listener = new TcpListener(System.Net.IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
-    }
-
     private static string TempTokenPath()
         => Path.Combine(
             Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), "mg-transport-" + Guid.NewGuid().ToString("n"))).FullName,
             "daemon.token");
 
-    private static async Task<(Microsoft.AspNetCore.Builder.WebApplication App, int Port, string TokenPath, string Token)>
-        StartDaemonAsync()
-    {
-        var tokenPath = TempTokenPath();
-        var port = FreePort();
-        var app = await DaemonHost.StartAsync(new DaemonOptions
+    /// <summary>
+    /// A real Kestrel daemon on a port nothing else in this process was given, retried if a foreign
+    /// process steals it before the bind (<see cref="TestDaemonHost"/>). The port is an OUTPUT — none of
+    /// these tests care which one they get, only that the daemon and the client agree on it.
+    /// </summary>
+    private static Task<TestDaemonHost.RunningDaemon> StartDaemonAsync()
+        => TestDaemonHost.StartAsync(new DaemonOptions
         {
-            Port = port,
             LocalDev = true,
-            TokenPath = tokenPath,
+            TokenPath = TempTokenPath(),
         });
-        var token = Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions
-            .GetRequiredService<SessionTokenFile>(app.Services).Token;
-        return (app, port, tokenPath, token);
-    }
 
     private static Metadata Bearer(string token) => new() { { "authorization", $"bearer {token}" } };
 
@@ -90,12 +77,11 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task PinnedMutualTls_WithValidToken_Succeeds()
     {
-        var (app, port, tokenPath, token) = await StartDaemonAsync();
-        await using var _ = app;
+        await using var daemon = await StartDaemonAsync();
 
-        using var channel = PinnedDaemonChannel.Pinned(port, tokenPath);
+        using var channel = PinnedDaemonChannel.Pinned(daemon.Port, daemon.TokenPath);
         var response = await new AgentService.AgentServiceClient(channel).ListAgentsAsync(
-            new ListAgentsRequest(), Bearer(token), deadline: DateTime.UtcNow.AddSeconds(15));
+            new ListAgentsRequest(), Bearer(daemon.Token), deadline: DateTime.UtcNow.AddSeconds(15));
 
         Assert.Empty(response.Agents);
     }
@@ -108,12 +94,11 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task PlaintextH2c_WithValidToken_IsRefused()
     {
-        var (app, port, _, token) = await StartDaemonAsync();
-        await using var _app = app;
+        await using var daemon = await StartDaemonAsync();
 
-        using var channel = PinnedDaemonChannel.Plaintext(port);
+        using var channel = PinnedDaemonChannel.Plaintext(daemon.Port);
 
-        await AssertTransportRefusedAsync(channel, token);
+        await AssertTransportRefusedAsync(channel, daemon.Token);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -124,12 +109,11 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task ValidToken_WithoutClientCertificate_IsRefused()
     {
-        var (app, port, tokenPath, token) = await StartDaemonAsync();
-        await using var _ = app;
+        await using var daemon = await StartDaemonAsync();
 
-        using var channel = PinnedDaemonChannel.WithoutClientCertificate(port, tokenPath);
+        using var channel = PinnedDaemonChannel.WithoutClientCertificate(daemon.Port, daemon.TokenPath);
 
-        await AssertTransportRefusedAsync(channel, token);
+        await AssertTransportRefusedAsync(channel, daemon.Token);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -140,8 +124,7 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task ValidToken_WithUnpinnedClientCertificate_IsRefused()
     {
-        var (app, port, tokenPath, token) = await StartDaemonAsync();
-        await using var _ = app;
+        await using var daemon = await StartDaemonAsync();
 
         // A second, independent daemon session's material — well-formed, correctly shaped for client
         // auth, and simply not the certificate this daemon pinned.
@@ -153,9 +136,9 @@ public sealed class DaemonTransportSecurityTests
                 PinnedDaemonChannel.SessionDirectory(foreignTokenPath))));
 
         using var channel = PinnedDaemonChannel.WithForeignClientCertificate(
-            port, tokenPath, foreignClientCertificate);
+            daemon.Port, daemon.TokenPath, foreignClientCertificate);
 
-        await AssertTransportRefusedAsync(channel, token);
+        await AssertTransportRefusedAsync(channel, daemon.Token);
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -167,10 +150,9 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task Client_RefusesServerCertificateItDidNotPin()
     {
-        var (app, port, tokenPath, _) = await StartDaemonAsync();
-        await using var _app = app;
+        await using var daemon = await StartDaemonAsync();
 
-        var credentials = DaemonTransportCredentials.Load(PinnedDaemonChannel.SessionDirectory(tokenPath));
+        var credentials = DaemonTransportCredentials.Load(PinnedDaemonChannel.SessionDirectory(daemon.TokenPath));
 
         // An impostor's certificate: correctly formed, self-signed, and not the pinned one.
         var impostorTokenPath = TempTokenPath();
@@ -183,7 +165,7 @@ public sealed class DaemonTransportSecurityTests
 
         // ...and the genuine one is accepted, so the refusal above is about identity, not blanket denial.
         using var genuine = X509CertificateLoader.LoadCertificateFromFile(
-            DaemonTransportFiles.ServerCertificatePath(PinnedDaemonChannel.SessionDirectory(tokenPath)));
+            DaemonTransportFiles.ServerCertificatePath(PinnedDaemonChannel.SessionDirectory(daemon.TokenPath)));
         Assert.True(credentials.IsPinnedServerCertificate(genuine));
     }
 
@@ -195,28 +177,27 @@ public sealed class DaemonTransportSecurityTests
     [Fact]
     public async Task RestartedDaemon_MintsFreshCredentials_StaleOnesAreRefused()
     {
+        // The restart is defined by the SESSION (same token path → same credential directory, re-minted),
+        // not by the TCP port: each start leases its own, because a port is not a property under test here
+        // and re-binding a just-released one is its own source of flake.
         var tokenPath = TempTokenPath();
-        var port = FreePort();
+        var template = new DaemonOptions { LocalDev = true, TokenPath = tokenPath };
 
-        var first = await DaemonHost.StartAsync(new DaemonOptions { Port = port, LocalDev = true, TokenPath = tokenPath });
+        var first = await TestDaemonHost.StartAsync(template);
         var staleCredentials = DaemonTransportCredentials.Load(PinnedDaemonChannel.SessionDirectory(tokenPath));
         var staleFingerprint = staleCredentials.PinnedServerFingerprint;
-        await first.StopAsync();
         await first.DisposeAsync();
 
-        var second = await DaemonHost.StartAsync(new DaemonOptions { Port = port, LocalDev = true, TokenPath = tokenPath });
-        await using var _ = second;
+        await using var second = await TestDaemonHost.StartAsync(template);
         var freshCredentials = DaemonTransportCredentials.Load(PinnedDaemonChannel.SessionDirectory(tokenPath));
 
         Assert.NotEqual(staleFingerprint, freshCredentials.PinnedServerFingerprint);
 
         // The restarted daemon does not accept the previous session's client certificate.
-        var freshToken = Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions
-            .GetRequiredService<SessionTokenFile>(second.Services).Token;
         using var channel = PinnedDaemonChannel.WithForeignClientCertificate(
-            port, tokenPath, staleCredentials.ClientCertificate);
+            second.Port, tokenPath, staleCredentials.ClientCertificate);
 
-        await AssertTransportRefusedAsync(channel, freshToken);
+        await AssertTransportRefusedAsync(channel, second.Token);
     }
 
     // ---------------------------------------------------------------------------------------------
