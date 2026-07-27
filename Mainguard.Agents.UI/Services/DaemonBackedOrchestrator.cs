@@ -62,6 +62,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Func<string, IReadOnlyList<string>> _keystoreList;
     private readonly Action<string, string> _keystoreSave;
     private readonly Func<Mainguard.Git.Services.IOperationJournal> _journalFactory;
+    private readonly Lazy<Mainguard.Agents.Services.IHostPullRequestGateway> _hostPullRequests;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
 
@@ -103,11 +104,21 @@ public sealed class DaemonBackedOrchestrator :
     /// Defaults to the app's own journal — the SAME undo journal the repo dashboard shows, so a merge
     /// driven from the agent surface is undoable from the git surface. Injectable so a test can point it
     /// at a temp database; it redirects only where the journal is written, never what the merge does.</param>
+    /// <param name="hostPullRequests">
+    /// The host PR seam an <see cref="MergeEntryOrigin.External"/> merge drives (P2-12). Defaults to the
+    /// audited T-23 transport reading this Windows host's keyring.
+    /// <para><b>Why the client and not the daemon:</b> the host token lives only in the host OS keychain —
+    /// nothing copies <c>token_&lt;host&gt;</c> into the VM — so the daemon simply has no credential to
+    /// merge a pull request with. The lease and the gate stay daemon-side regardless; only the transport
+    /// runs here, exactly like the local leg's <c>git merge</c>. Injectable so tests drive a fake host and
+    /// never the live GitHub API.</para>
+    /// </param>
     public DaemonBackedOrchestrator(
         DaemonClient client, bool ownsClient = true, Func<string, string?>? keystoreLookup = null,
         Func<string, IReadOnlyList<string>>? keystoreList = null,
         Action<string, string>? keystoreSave = null,
-        Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null)
+        Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null,
+        Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _ownsClient = ownsClient;
@@ -115,7 +126,15 @@ public sealed class DaemonBackedOrchestrator :
         _keystoreList = keystoreList ?? DefaultKeystoreList;
         _keystoreSave = keystoreSave ?? DefaultKeystoreSave;
         _journalFactory = journalFactory ?? (() => new Mainguard.Git.Services.OperationJournal());
+        _hostPullRequests = new Lazy<Mainguard.Agents.Services.IHostPullRequestGateway>(
+            hostPullRequests ?? DefaultHostPullRequestGateway);
     }
+
+    /// <summary>The shipped host seam: the ONE audited T-23 transport over this host's keyring. Built once
+    /// (its HttpClient is shared — a per-merge client is socket exhaustion) and only if a merge needs it.</summary>
+    private static Mainguard.Agents.Services.IHostPullRequestGateway DefaultHostPullRequestGateway()
+        => new Mainguard.Agents.Services.HostPullRequestGateway(
+            new Mainguard.Git.Services.PullRequestService(new Mainguard.Git.Services.GitService()));
 
     private static string? DefaultKeystoreLookup(string name)
     {
@@ -752,18 +771,6 @@ public sealed class DaemonBackedOrchestrator :
                 "Can't merge — no repository is active for agents yet.");
         }
 
-        if (origin == MergeEntryOrigin.External)
-        {
-            // P2-12: an external entry's merge belongs to the host PR API (the pluggable step in
-            // MergeDispatch), which the daemon does not yet drive from a user action. Its
-            // agent/pr-<n> branch DOES exist in the mirror, so the local fast-forward below would
-            // "succeed" — landing the PR's commits on the user's main while the pull request stayed
-            // open upstream. Refusing is the honest answer until that transport is connected.
-            throw new InvalidOperationException(
-                "Can't merge — this is an upstream pull request. Merge it on its host; Mainguard will "
-                + "pick the merge up when main moves.");
-        }
-
         if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(syncRemote))
         {
             // Refuse rather than take the lease: a merge we cannot perform must not consume the repo's
@@ -794,22 +801,36 @@ public sealed class DaemonBackedOrchestrator :
             MainBranch = MainBranchName,
         };
 
+        var mergeRequest = new Mainguard.Agents.Services.ForegroundMergeRequest(
+            RepoPath: repoPath!,
+            RepoHash: repoHandle!,
+            AgentId: agentId,
+            ExpectedMainSha: lease.ExpectedMainSha,
+            MainBranch: MainBranchName);
+
         Mainguard.Agents.Services.ForegroundMergeResult result;
         try
         {
-            // RT-D1 step 2 — the merge itself, on the user's real repository. Synchronous git work off the
-            // UI thread. The lease is the daemon's, so this executor is built without a lease store: a
-            // second store would be a second arbiter of "one merge per repo" (MG-23).
-            result = await Task.Run(
-                () => CreateMergeExecutor(syncRemote).PerformJournaledMerge(
-                    new Mainguard.Agents.Services.ForegroundMergeRequest(
-                        RepoPath: repoPath!,
-                        RepoHash: repoHandle!,
-                        AgentId: agentId,
-                        ExpectedMainSha: lease.ExpectedMainSha,
-                        MainBranch: MainBranchName),
-                    lease),
-                cts.Token).ConfigureAwait(false);
+            // RT-D1 step 2 — the merge itself. WHICH transport is the entry's origin's business; the lease
+            // (step 1) and the recording (step 3) are identical for both, which is the whole point: the
+            // daemon arbitrates one merge per repo regardless of where the merge is performed.
+            //
+            // The lease is the daemon's, so neither executor is built with a lease store: a second store
+            // would be a second arbiter of "one merge per repo" (MG-23).
+            result = origin == MergeEntryOrigin.External
+
+                // P2-12 — an upstream pull request merges on its HOST, then this checkout is brought up to
+                // date with the merge the host performed. A local fast-forward would "succeed" here (the
+                // entry's agent/pr-<n> branch really is in the mirror) while leaving the pull request open
+                // upstream: main advances, the queue records a merge, and the two records disagree forever.
+                ? await CreateExternalMergeExecutor(syncRemote)
+                    .MergeExternalPrAsync(mergeRequest, lease, cts.Token).ConfigureAwait(false)
+
+                // Local — the real git merge --ff-only on the user's own checkout. Synchronous git work,
+                // moved off the UI thread.
+                : await Task.Run(
+                    () => CreateMergeExecutor(syncRemote).PerformJournaledMerge(mergeRequest, lease),
+                    cts.Token).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -845,6 +866,19 @@ public sealed class DaemonBackedOrchestrator :
             resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
             journal: _journalFactory(),
             leases: null); // the lease is the daemon's; see the ctor doc on why this must not be a store.
+
+    /// <summary>
+    /// The P2-12 external leg: the same shape as <see cref="CreateMergeExecutor"/>, built per merge for the
+    /// same reason (the sync-remote binding is per active repo), holding no lease for the same reason
+    /// (there is one <c>IMergeLeaseStore</c> and it is the daemon's, MG-23). The sync remote is still
+    /// needed here — it is where the VERIFIED pull-request head is read from, which is what the host merge
+    /// is compare-and-swapped against.
+    /// </summary>
+    private Mainguard.Agents.Services.IExternalPrMergeExecutor CreateExternalMergeExecutor(string syncRemoteName)
+        => new Mainguard.Agents.Services.ExternalPrMergeService(
+            resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
+            host: _hostPullRequests.Value,
+            journal: _journalFactory());
 
     /// <summary>
     /// Hands a granted lease back after a merge that did not land. Best-effort by construction: it is the

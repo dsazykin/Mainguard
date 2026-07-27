@@ -37,7 +37,7 @@ public sealed class FakePullRequestService : IPullRequestService
     public Task<PullRequestItem> CreateAsync(string repoPath, CreatePullRequest request, CancellationToken ct)
         => Task.FromResult(CreateImpl?.Invoke(repoPath, request) ?? new PullRequestItem());
 
-    public Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, CancellationToken ct)
+    public Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct)
         => Task.FromResult(MergeImpl?.Invoke(repoPath, number, method) ?? new PullRequestItem { Number = number, State = PullRequestState.Merged });
 
     public Task CloseAsync(string repoPath, int number, CancellationToken ct)

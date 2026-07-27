@@ -68,6 +68,7 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
             Summary = MapItem(dto),
             Body = dto.Body ?? "",
             Mergeable = dto.Mergeable ?? false,
+            MergeableState = (dto.MergeableState ?? "").ToLowerInvariant(),
             Reviewers = (dto.RequestedReviewers ?? new()).Select(r => r.Login ?? "").Where(s => s.Length > 0).ToList(),
         };
     }
@@ -88,7 +89,16 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
         return MapItem(dto);
     }
 
-    public async Task<PullRequestItem> MergeAsync(RepoSlug repo, string token, int number, PullRequestMergeMethod method, CancellationToken ct)
+    /// <param name="expectedHeadSha">
+    /// The head commit this merge is authorized against, sent as GitHub's <c>sha</c> parameter — the
+    /// endpoint refuses with <c>409 Head branch was modified</c> if the PR has moved since. This is the
+    /// external merge's compare-and-swap, and it is the only thing that closes the window between reading
+    /// the PR's head and merging it: without it, a bot pushing one more commit in that window gets
+    /// unverified work merged under a verification that never saw it. Null skips the CAS — correct only
+    /// for the manual PR panel, where the human is looking at the PR and no verification is being spent.
+    /// </param>
+    public async Task<PullRequestItem> MergeAsync(
+        RepoSlug repo, string token, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct)
     {
         var url = $"{_api.ApiBase}/repos/{GitHubApiClient.Esc(repo.Owner)}/{GitHubApiClient.Esc(repo.Name)}/pulls/{number}/merge";
         var payload = JsonSerializer.Serialize(new MergeDto
@@ -99,6 +109,7 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
                 PullRequestMergeMethod.Rebase => "rebase",
                 _ => "merge",
             },
+            Sha = string.IsNullOrWhiteSpace(expectedHeadSha) ? null : expectedHeadSha,
         });
         var json = await _api.SendAsync(HttpMethod.Put, url, token, payload, ct);
         var result = GitHubApiClient.Deserialize<MergeResultDto>(json);
@@ -106,8 +117,14 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
             throw new GitOperationException(
                 $"GitHub did not merge pull request #{number}: {GitHubApiClient.Redact(result?.Message ?? "not mergeable", token)}");
 
-        // The merge endpoint returns only {merged, sha, message}; project the known facts.
-        return new PullRequestItem { Number = number, State = PullRequestState.Merged };
+        // The merge endpoint returns only {merged, sha, message}; project the known facts. The sha is the
+        // commit the merge produced on the base branch — the caller reconciles its own main against it.
+        return new PullRequestItem
+        {
+            Number = number,
+            State = PullRequestState.Merged,
+            MergeCommitSha = result.Sha ?? "",
+        };
     }
 
     public async Task CloseAsync(RepoSlug repo, string token, int number, CancellationToken ct)
@@ -203,6 +220,7 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
         SourceBranch = d.Head?.Ref ?? "",
         TargetBranch = d.Base?.Ref ?? "",
         IsDraft = d.Draft,
+        HeadSha = d.Head?.Sha ?? "",
         State = d.MergedAt is not null
             ? PullRequestState.Merged
             : string.Equals(d.State, "closed", StringComparison.OrdinalIgnoreCase)
@@ -223,6 +241,7 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
         [JsonPropertyName("html_url")] public string? HtmlUrl { get; set; }
         [JsonPropertyName("merged_at")] public string? MergedAt { get; set; }
         [JsonPropertyName("mergeable")] public bool? Mergeable { get; set; }
+        [JsonPropertyName("mergeable_state")] public string? MergeableState { get; set; }
         [JsonPropertyName("user")] public UserDto? User { get; set; }
         [JsonPropertyName("head")] public RefDto? Head { get; set; }
         [JsonPropertyName("base")] public RefDto? Base { get; set; }
@@ -230,7 +249,11 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
     }
 
     private sealed class UserDto { [JsonPropertyName("login")] public string? Login { get; set; } }
-    private sealed class RefDto { [JsonPropertyName("ref")] public string? Ref { get; set; } }
+    private sealed class RefDto
+    {
+        [JsonPropertyName("ref")] public string? Ref { get; set; }
+        [JsonPropertyName("sha")] public string? Sha { get; set; }
+    }
 
     private sealed class MergeResultDto
     {
@@ -251,6 +274,12 @@ internal sealed class GitHubPullRequestProvider : IPullRequestProvider
     private sealed class MergeDto
     {
         [JsonPropertyName("merge_method")] public string MergeMethod { get; set; } = "merge";
+
+        // GitHub's optional compare-and-swap: "SHA that pull request head must match to allow merge".
+        // Omitted entirely when null so the no-CAS caller sends the same body it always did.
+        [JsonPropertyName("sha")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Sha { get; set; }
     }
 
     // ---- Review JSON shapes (T-25) -------------------------------------------------------------

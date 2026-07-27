@@ -62,8 +62,13 @@ internal sealed class GitHubApiClient
         }
         catch (Exception ex)
         {
-            // Network down / DNS / TLS: typed, never carrying the token.
-            throw new GitOperationException($"Could not reach GitHub: {Redact(ex.Message, token)}");
+            // Network down / DNS / TLS: typed, never carrying the token. The HostUnreachable flag is
+            // additive — the type and the message are unchanged — and only lets a caller tell "we never
+            // reached the host" from "the host said no", which need opposite advice (P2-12 merge).
+            throw new GitOperationException($"Could not reach GitHub: {Redact(ex.Message, token)}")
+            {
+                HostUnreachable = true,
+            };
         }
 
         var content = response.Content is null ? "" : await response.Content.ReadAsStringAsync(ct);
@@ -84,11 +89,20 @@ internal sealed class GitHubApiClient
             return new AuthenticationRequiredException(
                 $"GitHub rejected the stored token: {message}", "github.com");
 
+        // Both branches below now carry the status alongside the identical message, so a caller can branch
+        // on 403/405/409 structurally instead of substring-matching the host's prose. The rate-limit branch
+        // keeps its distinct wording — ExternalPrIntake's backoff recognizes it by message, unaffected.
         if (status == HttpStatusCode.Forbidden &&
             message.Contains("rate limit", StringComparison.OrdinalIgnoreCase))
-            return new GitOperationException($"GitHub API rate limit reached: {message}");
+            return new GitOperationException($"GitHub API rate limit reached: {message}")
+            {
+                HostStatusCode = (int)status,
+            };
 
-        return new GitOperationException($"GitHub request failed ({(int)status}): {message}");
+        return new GitOperationException($"GitHub request failed ({(int)status}): {message}")
+        {
+            HostStatusCode = (int)status,
+        };
     }
 
     // Pulls GitHub's human-readable text out of an error body: the top-level "message" plus any nested

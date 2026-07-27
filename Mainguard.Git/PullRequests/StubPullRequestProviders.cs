@@ -26,7 +26,7 @@ internal abstract class UnsupportedPullRequestProvider : IPullRequestProvider
     public Task<IReadOnlyList<PullRequestItem>> ListAsync(RepoSlug repo, string token, PullRequestState filter, CancellationToken ct) => throw NotSupported();
     public Task<PullRequestDetail> GetAsync(RepoSlug repo, string token, int number, CancellationToken ct) => throw NotSupported();
     public Task<PullRequestItem> CreateAsync(RepoSlug repo, string token, CreatePullRequest request, CancellationToken ct) => throw NotSupported();
-    public Task<PullRequestItem> MergeAsync(RepoSlug repo, string token, int number, PullRequestMergeMethod method, CancellationToken ct) => throw NotSupported();
+    public Task<PullRequestItem> MergeAsync(RepoSlug repo, string token, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct) => throw NotSupported();
     public Task CloseAsync(RepoSlug repo, string token, int number, CancellationToken ct) => throw NotSupported();
 
     // Review (T-25): same typed "not yet supported for <host>" until the host's live flow lands.
