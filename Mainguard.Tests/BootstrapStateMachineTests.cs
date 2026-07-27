@@ -6,6 +6,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Bootstrap;
+using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Exceptions;
 using Xunit;
 
@@ -45,7 +46,9 @@ public class BootstrapStateMachineTests
                 if (Contains(args, "--list")) return Ok("MainguardEnv\nUbuntu\n");
                 if (Contains(args, "/proc/sys/kernel/yama/ptrace_scope")) return Ok("2");
                 if (Contains(args, "/proc/sys/fs/inotify/max_user_watches")) return Ok("524288");
+                if (IsUsernsProbe(args)) return Ok(GreenUsernsProbe);
                 if (Contains(args, "docker") && Contains(args, "info")) return Ok("Server Version: 27");
+                if (Contains(args, "cat") && Contains(args, "/etc/docker/daemon.json")) return Ok(FirstBootStep.DockerDaemonJson);
                 if (Contains(args, "pgrep")) return Ok("42");   // daemon already running
                 return Ok("");
             },
@@ -208,6 +211,9 @@ public class BootstrapStateMachineTests
         {
             Responder = args =>
             {
+                // MG-17 probe green (checked BEFORE the generic docker-info arm, which would otherwise
+                // swallow it — the probe runs `bash -c "… docker info --format …"`).
+                if (IsUsernsProbe(args)) return Ok(GreenUsernsProbe);
                 // docker info green immediately so the poll ends on the first attempt.
                 if (Contains(args, "docker") && Contains(args, "info")) return Ok("Server Version: 27");
                 // /proc reads for the final invariant check must report the hardened values.
@@ -237,37 +243,77 @@ public class BootstrapStateMachineTests
         // The persistence write runs as root.
         Assert.Contains("-u", runner.Calls[dropInIndex]);
         Assert.Contains("root", runner.Calls[dropInIndex]);
+
+        // ---- MG-17, on the SAME act phase --------------------------------------------------------
+        // The subordinate ranges must be pinned BEFORE dockerd is restarted with userns-remap in
+        // daemon.json: dockerd refuses to start when the remap user has no range, so the wrong order
+        // takes the whole VM down instead of merely leaving the remap off.
+        var subuidIdx = runner.Calls.FindIndex(c => c.Contains(UsernsRemapPolicy.SubuidPath));
+        var subgidIdx = runner.Calls.FindIndex(c => c.Contains(UsernsRemapPolicy.SubgidPath));
+        Assert.True(subuidIdx >= 0 && subgidIdx >= 0, "expected /etc/subuid + /etc/subgid to be written");
+        Assert.Equal(UsernsRemapPolicy.SubidFileContent, runner.Stdins[subuidIdx]);
+        Assert.Equal(UsernsRemapPolicy.SubidFileContent, runner.Stdins[subgidIdx]);
+
+        var daemonJsonIdx = runner.Calls.FindIndex(c => c.Contains("tee") && c.Contains("/etc/docker/daemon.json"));
+        Assert.True(daemonJsonIdx >= 0, "expected /etc/docker/daemon.json to be written");
+        Assert.Contains("\"userns-remap\": \"mainguard\"", runner.Stdins[daemonJsonIdx]!, StringComparison.Ordinal);
+        Assert.True(subuidIdx < daemonJsonIdx, "/etc/subuid must be written before daemon.json enables the remap");
+
+        // The mount sources the jail bind-mounts are brought to the shared-ownership invariant, and the
+        // shared group is provisioned, on the same act.
+        Assert.Contains(runner.Calls, c => c.Any(a => a.Contains("groupadd -g 101000 mainguard-jail", StringComparison.Ordinal)));
+        Assert.Contains(runner.Calls, c => c.Any(a => a.Contains("worktrees", StringComparison.Ordinal) && a.Contains("g+rwX", StringComparison.Ordinal)));
     }
+
+    /// <summary>The MG-17 boot probe: `bash -c &lt;UsernsRemapPolicy.ProbeScript&gt;`. Matched on the
+    /// script itself so it can never be confused with the plain `docker info` readiness poll.</summary>
+    private static bool IsUsernsProbe(IReadOnlyList<string> args) =>
+        args.Any(a => a.Contains("MGGROUPS[", StringComparison.Ordinal));
+
+    /// <summary>What the probe prints on a correctly provisioned VM.</summary>
+    private const string GreenUsernsProbe =
+        "MGUSERNS[name=seccomp,profile=builtin;name=cgroupns;name=userns;]"
+        + "MGROOT[/var/lib/docker/100000.100000]MGGROUPS[mainguard docker mainguard-jail]";
 
     [Fact]
     public async Task FirstBootStep_CheckPhase_RequiresPtraceScopeAtLeast2()
     {
         // ptrace_scope regressed to 1 → NOT satisfied (re-provisions).
-        var regressed = new RecordingWslRunner
-        {
-            Responder = args =>
-            {
-                if (Contains(args, "/proc/sys/kernel/yama/ptrace_scope")) return Ok("1");
-                if (Contains(args, "/proc/sys/fs/inotify/max_user_watches")) return Ok("524288");
-                if (Contains(args, "docker") && Contains(args, "info")) return Ok("ok");
-                return Ok("");
-            },
-        };
-        Assert.False(await new FirstBootStep(regressed).IsSatisfiedAsync(CancellationToken.None));
+        Assert.False(await new FirstBootStep(Vm(ptrace: "1", userns: GreenUsernsProbe)).IsSatisfiedAsync(CancellationToken.None));
 
-        // ptrace_scope=2, watches raised, docker green → satisfied.
-        var green = new RecordingWslRunner
-        {
-            Responder = args =>
-            {
-                if (Contains(args, "/proc/sys/kernel/yama/ptrace_scope")) return Ok("2");
-                if (Contains(args, "/proc/sys/fs/inotify/max_user_watches")) return Ok("524288");
-                if (Contains(args, "docker") && Contains(args, "info")) return Ok("ok");
-                return Ok("");
-            },
-        };
-        Assert.True(await new FirstBootStep(green).IsSatisfiedAsync(CancellationToken.None));
+        // ptrace_scope=2, watches raised, docker green, userns remapped → satisfied.
+        Assert.True(await new FirstBootStep(Vm(ptrace: "2", userns: GreenUsernsProbe)).IsSatisfiedAsync(CancellationToken.None));
     }
+
+    // ---- MG-17: the check phase asserts the remap is IN EFFECT, not merely configured -------------
+
+    [Fact]
+    public async Task FirstBootStep_CheckPhase_RequiresTheUsernsRemapToBeInEffect()
+    {
+        // Every other invariant green; only the remap is missing → NOT satisfied, so the step
+        // re-provisions. This is the exact state the audit found: a healthy VM with no remap at all.
+        var unremapped = Vm(ptrace: "2", userns:
+            "MGUSERNS[name=seccomp,profile=builtin;name=cgroupns;]MGROOT[/var/lib/docker]MGGROUPS[mainguard docker]");
+        Assert.False(await new FirstBootStep(unremapped).IsSatisfiedAsync(CancellationToken.None));
+
+        // …and the probe answering NOTHING (a failed `docker info`, a distro that did not respond) is
+        // also unsatisfied. This is the vacuity guard: the check must never be able to pass because it
+        // could not observe anything.
+        Assert.False(await new FirstBootStep(Vm(ptrace: "2", userns: "")).IsSatisfiedAsync(CancellationToken.None));
+    }
+
+    /// <summary>A VM whose every invariant is green except the ones named.</summary>
+    private static RecordingWslRunner Vm(string ptrace, string userns) => new()
+    {
+        Responder = args =>
+        {
+            if (IsUsernsProbe(args)) return Ok(userns);
+            if (Contains(args, "/proc/sys/kernel/yama/ptrace_scope")) return Ok(ptrace);
+            if (Contains(args, "/proc/sys/fs/inotify/max_user_watches")) return Ok("524288");
+            if (Contains(args, "docker") && Contains(args, "info")) return Ok("ok");
+            return Ok("");
+        },
+    };
 
     // ---- Import edge rows (§4): tarball missing / partial-import cleanup --------------------------
 

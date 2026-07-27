@@ -48,10 +48,26 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/* /tmp/packages.pinned.txt
 
 # The unprivileged VM user the daemon and agents run as (uid pinned for reproducibility).
+#
+# MG-17: this user also lends dockerd its userns-remap range. /etc/subuid + /etc/subgid are written
+# EXPLICITLY (not left to whatever shadow's defaults happen to allocate) because Mainguard.Agents'
+# UsernsRemapPolicy provisions the bind-mount ownership against a pinned base: container uid 0 ->
+# 100000, the agent CLI's uid 1000 -> 101000. `mainguard-jail` is a real host group whose gid IS that
+# remapped agent gid, and the daemon is a member — that shared group is how the unprivileged daemon and
+# the remapped jails can both use ~/mainguard/repos and ~/mainguard/worktrees while the jail owns
+# neither and can reach nothing else in the home directory. FirstBootStep writes the same files/group
+# for VMs that were imported before this existed.
 RUN set -eux; \
     groupadd -g 1000 mainguard; \
     useradd -u 1000 -g 1000 -m -s /bin/bash mainguard; \
-    usermod -aG docker mainguard
+    usermod -aG docker mainguard; \
+    groupadd -g 101000 mainguard-jail; \
+    usermod -aG mainguard-jail mainguard; \
+    printf 'mainguard:100000:65536\n' > /etc/subuid; \
+    printf 'mainguard:100000:65536\n' > /etc/subgid; \
+    install -d -o mainguard -g mainguard -m 0755 /home/mainguard/mainguard; \
+    install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/repos; \
+    install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/worktrees
 
 # binfmt_misc is KERNEL-GLOBAL — one table shared by every WSL2 distro in the utility VM. Two separate
 # hazards live here, and the mask alone does NOT cover the second one.
@@ -85,8 +101,11 @@ RUN ln -sf /dev/null /etc/systemd/system/systemd-binfmt.service; \
 # a default docker0 (172.17.0.0/16) collides with a concurrently-running Docker Desktop — dropping the
 # user's Docker Desktop and wedging this daemon in a boltdb-lock restart loop. 10.202/10.203 avoids
 # Docker Desktop (172.x) and typical LANs. FirstBootStep writes the same file for already-imported VMs.
+# MG-17 adds "userns-remap": "mainguard" here: without it container uid 0 is host uid 0 and the agent's
+# uid 1000 is the mainguard service user, so every jail write through a bind mount landed as the most
+# privileged unprivileged identity in the VM. Keep this byte-identical to FirstBootStep.DockerDaemonJson.
 RUN mkdir -p /etc/docker; \
-    printf '{\n  "bip": "10.202.0.1/24",\n  "default-address-pools": [ { "base": "10.203.0.0/16", "size": 24 } ]\n}\n' > /etc/docker/daemon.json
+    printf '{\n  "bip": "10.202.0.1/24",\n  "default-address-pools": [ { "base": "10.203.0.0/16", "size": 24 } ],\n  "userns-remap": "mainguard"\n}\n' > /etc/docker/daemon.json
 
 # The Mainguard daemon (mainguardd = the published Mainguard.Server, linux-x64 self-contained). build.sh
 # publishes it deterministically into payload/daemon/ (apphost renamed to `mainguardd`) BEFORE the docker

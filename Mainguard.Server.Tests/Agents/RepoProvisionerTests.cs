@@ -164,6 +164,65 @@ public sealed class RepoProvisionerTests
         }
     }
 
+    // ---- MG-17: the mirror is bind-mounted READ-WRITE into a jail that is no longer this uid ---------
+
+    [Fact]
+    public void Provision_RecordsSharedRepositoryGroup_SoFutureGitWritesStayJailWritable()
+    {
+        // Platform-independent half: the config that governs every FUTURE git write inside the git dir.
+        // Without it a later incremental fetch creates 0755 object fan-out directories, and the remapped
+        // jail (host uid/gid 101000, sharing only the group) cannot write one object into them.
+        using var fixture = new DualRepoFixture();
+        var vmRoot = AgentTestGit.NewVmRoot();
+        try
+        {
+            var result = new RepoProvisioner(vmRoot).Provision(fixture.WorkRepoPath);
+            Assert.Equal("group", AgentTestGit.RunChecked(result.BareRepoPath, "config", "core.sharedRepository").Trim());
+
+            // Set on EVERY provision, not just the clone: a mirror created before the userns remap must
+            // be repaired by a daemon update alone.
+            AgentTestGit.RunChecked(result.BareRepoPath, "config", "core.sharedRepository", "umask");
+            new RepoProvisioner(vmRoot).Provision(fixture.WorkRepoPath);
+            Assert.Equal("group", AgentTestGit.RunChecked(result.BareRepoPath, "config", "core.sharedRepository").Trim());
+        }
+        finally
+        {
+            AgentTestGit.DeleteTree(vmRoot);
+        }
+    }
+
+    [LinuxOnlyFact]
+    // The attribute already skips on Windows; the annotation is what tells the CA1416 analyzer so.
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public void Provision_LeavesTheMirrorGroupWritable_AndItsDirectoriesSetgid()
+    {
+        // The half the config does NOT cover: the tree the clone already laid down under the daemon's
+        // 022 umask. A 0755 objects/ directory is one the jail can read and never add an object to, so
+        // the agent's very first commit fails — with a permission error three layers from the cause.
+        using var fixture = new DualRepoFixture();
+        var vmRoot = AgentTestGit.NewVmRoot();
+        try
+        {
+            var result = new RepoProvisioner(vmRoot).Provision(fixture.WorkRepoPath);
+
+            foreach (var dir in new[] { result.BareRepoPath, Path.Combine(result.BareRepoPath, "objects") })
+            {
+                var mode = File.GetUnixFileMode(dir);
+                Assert.True(mode.HasFlag(UnixFileMode.GroupWrite), dir + " must be group-writable");
+                Assert.True(mode.HasFlag(UnixFileMode.GroupExecute), dir + " must be group-traversable");
+                // setgid so anything created inside keeps the shared jail group rather than falling back
+                // to the creating process's primary group.
+                Assert.True(mode.HasFlag(UnixFileMode.SetGroup), dir + " must be setgid");
+            }
+
+            Assert.True(File.GetUnixFileMode(Path.Combine(result.BareRepoPath, "config")).HasFlag(UnixFileMode.GroupRead));
+        }
+        finally
+        {
+            AgentTestGit.DeleteTree(vmRoot);
+        }
+    }
+
     private static void CopyDir(string source, string dest)
     {
         Directory.CreateDirectory(dest);

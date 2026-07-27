@@ -94,7 +94,91 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // a warning but the worktree is still returned.
         MaybeRunPnpm(worktreePath, agentId);
 
+        // MG-17: the jail that mounts this worktree read-write is host uid/gid 101000 (the userns
+        // remap), not this process's uid 1000 — so a checkout laid down under the daemon's 022 umask
+        // (0644 files, 0755 dirs) is one the agent can READ and never EDIT. Group-share it. This runs
+        // LAST so it also covers whatever `pnpm install` just wrote.
+        GroupShareRecursive(worktreePath);
+
         return worktreePath;
+    }
+
+    /// <summary>
+    /// MG-17 — grants the group <c>rwX</c> throughout a tree the daemon owns and a remapped jail must be
+    /// able to write, and sets the setgid bit on its directories so anything created underneath inherits
+    /// that group.
+    ///
+    /// <para>The GROUP itself is not set here and does not need to be: <c>~/mainguard/worktrees</c> is
+    /// provisioned <c>2775 mainguard:mainguard-jail</c> at boot, so every directory created inside it
+    /// already carries gid 101000 by inheritance. What inheritance cannot supply is the mode — umask is
+    /// a property of the writing process, not of the parent directory — which is exactly what this fixes.
+    /// <b>Anything MG-3 adds that a jail must write needs this same call (or
+    /// <c>core.sharedRepository=group</c> for a git dir); anything it mounts read-only needs neither,
+    /// because read+traverse already come from the group.</b></para>
+    ///
+    /// <para>Best effort and Unix-only: on Windows (the unit-test and dev-box path) there is no jail and
+    /// no remap, and a failure to relax a mode must never fail a spawn — the failure it would cause is
+    /// strictly worse than the one it is preventing.</para>
+    /// </summary>
+    internal static void GroupShareRecursive(string root)
+    {
+        if (OperatingSystem.IsWindows() || !Directory.Exists(root))
+        {
+            return;
+        }
+
+        try
+        {
+            ShareOne(root, isDirectory: true);
+            foreach (var dir in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories))
+            {
+                ShareOne(dir, isDirectory: true);
+            }
+
+            foreach (var file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                ShareOne(file, isDirectory: false);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // A symlink loop, a racing removal, a filesystem with no Unix modes — never fail the spawn.
+        }
+    }
+
+    private static void ShareOne(string path, bool isDirectory)
+    {
+        // Repeated (the caller already returned on Windows) so the platform analyzer can see the guard
+        // on the call site itself rather than one frame up.
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        try
+        {
+            var mode = File.GetUnixFileMode(path);
+            // `g+rwX`: read/write always; execute only where execute already exists (or it is a
+            // directory), so a data file never becomes executable.
+            mode |= UnixFileMode.GroupRead | UnixFileMode.GroupWrite;
+            if (isDirectory
+                || (mode & (UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute)) != 0)
+            {
+                mode |= UnixFileMode.GroupExecute;
+            }
+
+            if (isDirectory)
+            {
+                // setgid: children inherit the shared group instead of the creator's primary group.
+                mode |= UnixFileMode.SetGroup;
+            }
+
+            File.SetUnixFileMode(path, mode);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+        {
+            // Per-entry best effort (a dangling symlink is the common one).
+        }
     }
 
     public void RemoveAgentWorktree(string repoHash, string agentId, bool force)
