@@ -46,8 +46,14 @@ public sealed class SandboxFixture : IAsyncDisposable
     public Task EnsureEgressReadyAsync(CancellationToken ct = default) => Egress.EnsureReadyAsync(ct);
 
     /// <summary>Spawns a hardened agent jail on an ext4 (temp) worktree; tracks it for cleanup.</summary>
+    /// <param name="agentEnv">The credential env-file contents delivered to the jail's 0400 tmpfs. Null
+    /// uses a fixed dummy key. The secret-delivery suite passes a per-run nonce instead, so that "the
+    /// credential file holds what THIS spawn sent" is distinguishable from "a file was already there".</param>
+    /// <param name="oobKey">The OOB session key delivered to the SUPERVISOR-owned 0400 tmpfs. Null
+    /// generates a random one.</param>
     public async Task<SandboxHandle> SpawnAsync(
-        string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001, CancellationToken ct = default)
+        string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
+        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null, CancellationToken ct = default)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
@@ -56,8 +62,8 @@ public sealed class SandboxFixture : IAsyncDisposable
 
         var worktree = NewTempWorktree();
         var secrets = new SandboxSecrets(
-            new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
-            OobKey: RandomKey());
+            agentEnv ?? new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
+            OobKey: oobKey ?? RandomKey());
 
         try
         {
