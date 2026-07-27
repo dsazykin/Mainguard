@@ -19,6 +19,12 @@ service MergeQueueService {
   rpc BeginMerge(BeginMergeRequest) returns (BeginMergeResponse);
   // RT-D1 step 3: record the merge outcome, release the lease, fire the stale cascade.
   rpc ConfirmMerge(ConfirmMergeRequest) returns (ConfirmMergeResponse);
+  // RT-D1 step 3', the OTHER terminal: hand the lease back WITHOUT recording a merge, for the Windows-side
+  // merge that refused or failed (dirty tree, lost CAS, no fast-forward). Strictly weaker than ConfirmMerge
+  // by construction — it can only release, never move a branch to Merged and never fire the stale cascade —
+  // so it is still true that nothing but the human foreground merge reaches Merged (NoAutoMergePathExists).
+  // Without it a refused merge stranded the repo's one lease until the daemon restarted.
+  rpc AbandonMerge(AbandonMergeRequest) returns (AbandonMergeResponse);
   // P2-47 #7: the agent-branch-vs-main diff the review cockpit renders (StreamQueue doesn't carry it).
   rpc GetMergeDiff(GetMergeDiffRequest) returns (GetMergeDiffResponse);
   // P2-11 step 4 / RT-D2: acknowledge ONE must-acknowledge flagged item, daemon-side, so a gate the daemon
@@ -80,6 +86,25 @@ message BeginMergeResponse {
   bool granted = 1;
   string lease_id = 2;
   string reason = 3; // when not granted (another merge in progress)
+  // The A5 compare-and-swap OLD-OID this lease authorizes: the queue's authoritative main@sha at grant
+  // time, which ConfirmMerge will compare against. The Windows-side merge must fast-forward FROM this
+  // sha, so it comes from the daemon that granted the lease — never from the client's own cached
+  // projection of the queue, which may already be a revision behind.
+  string expected_main_sha = 4;
+}
+
+message AbandonMergeRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+  string lease_id = 3;
+  string reason = 4; // why the Windows-side merge did not land (logged verbatim)
+}
+
+message AbandonMergeResponse {
+  // False when the named lease was not this repo's outstanding one (already confirmed, already released,
+  // or someone else's) — an idempotent no-op, never an error, so a cleanup path can never mask the
+  // failure that sent it here.
+  bool released = 1;
 }
 
 message ConfirmMergeRequest {
