@@ -50,6 +50,16 @@ public interface IAgentWorktreeManager
     /// ref is at the agent's tip afterwards.
     /// </summary>
     bool PublishAgentBranch(string repoHash, string agentId) => false;
+
+    /// <summary>
+    /// MG-3 — start watching this agent's own <c>refs/heads/agent/&lt;id&gt;</c> and publish it into the
+    /// mirror whenever it moves (design §7: the daemon watches AND re-fetches before verification).
+    /// Called at spawn. Default no-op for the substrate-less test doubles.
+    /// </summary>
+    void WatchAgentRef(string repoHash, string agentId) { }
+
+    /// <summary>MG-3 — stop watching (teardown). Default no-op.</summary>
+    void UnwatchAgentRef(string repoHash, string agentId) { }
 }
 
 /// <inheritdoc cref="IAgentWorktreeManager"/>
@@ -59,6 +69,8 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private readonly Func<string, (int ExitCode, string Output)> _pnpmRunner;
     private readonly Action<string>? _warningSink;
     private readonly AgentRepoManager _agentRepos;
+    private readonly AgentRefMediator _refs;
+    private readonly Lazy<AgentRefWatcher> _watcher;
 
     /// <param name="vmRoot">The VM base directory (shared with the provisioner). Injected for tests.</param>
     /// <param name="pnpmRunner">
@@ -77,7 +89,45 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         _pnpmRunner = pnpmRunner ?? RealPnpmInstall;
         _warningSink = warningSink;
         _agentRepos = new AgentRepoManager(_vmRoot);
+        _refs = new AgentRefMediator(
+            _agentRepos,
+            BareRepoPathFor,
+            // A refusal is the interesting half: it means an agent rewrote history the mirror had
+            // already published, and it must not pass silently just because the caller wanted a bool.
+            result =>
+            {
+                if (result.Refused)
+                {
+                    // The agent id is echoed RAW, never through AgentRepoLayout.RefFor: a RefusedTarget
+                    // outcome is precisely the case where the id failed that gate, and re-running it
+                    // here would throw out of a mediator whose contract is that it never does.
+                    _warningSink?.Invoke(
+                        $"MG-3: refused to publish agent '{result.AgentId}' into repo "
+                        + $"'{result.RepoHash}' — {result.Outcome}: {result.Reason}");
+                }
+            });
+        _watcher = new Lazy<AgentRefWatcher>(() => new AgentRefWatcher(_refs, _agentRepos));
     }
+
+    /// <summary>MG-3 — the mediator this manager publishes through (the watcher shares it).</summary>
+    public AgentRefMediator RefMediator => _refs;
+
+    /// <summary>MG-3 — the per-agent repository store (the watcher needs it to snapshot refs).</summary>
+    public AgentRepoManager AgentRepos => _agentRepos;
+
+    /// <summary>
+    /// MG-3 — the ref watcher, created on first use so a manager that never spawns an agent (every unit
+    /// test, the merge-diff bridge) never starts a background loop at all. Its lifetime is the daemon's:
+    /// <see cref="UnwatchAgentRef"/> removes an agent from the sweep, and there is nothing per-agent to
+    /// dispose.
+    /// </summary>
+    public AgentRefWatcher RefWatcher => _watcher.Value;
+
+    /// <inheritdoc />
+    public void WatchAgentRef(string repoHash, string agentId) => RefWatcher.Watch(repoHash, agentId);
+
+    /// <inheritdoc />
+    public void UnwatchAgentRef(string repoHash, string agentId) => RefWatcher.Unwatch(repoHash, agentId);
 
     public string CreateAgentWorktree(string repoHash, string agentId)
     {
@@ -160,21 +210,15 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     public string AgentRepoPathFor(string repoHash, string agentId) => _agentRepos.PathFor(repoHash, agentId);
 
     /// <inheritdoc />
-    public bool PublishAgentBranch(string repoHash, string agentId)
-    {
-        var barePath = BareRepoPathFor(repoHash);
-        var agentRepoPath = _agentRepos.PathFor(repoHash, agentId);
-        if (!Directory.Exists(agentRepoPath) || !Directory.Exists(barePath))
-        {
-            return false;
-        }
+    public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
 
-        var refName = AgentRepoLayout.RefFor(agentId);
-        // The daemon names BOTH sides. The refspec has no leading '+', so git's own fetch machinery
-        // refuses a non-fast-forward; stage 2 replaces this with the explicit four-rule mediation.
-        return AgentGitCommand.TryRun(
-            barePath, out _, "fetch", "--no-tags", agentRepoPath, $"{refName}:{refName}") == 0;
-    }
+    /// <summary>
+    /// MG-3 stage 2 — the mediated publish, with the outcome rather than a bool. The four rules
+    /// (destination is this agent's branch, fast-forward only, no deletes, never the integration
+    /// branch) live in <see cref="AgentRefMediator"/>; this is the manager's entry point to them.
+    /// </summary>
+    public AgentRefPublishResult Publish(string repoHash, string agentId)
+        => _refs.Publish(repoHash, agentId);
 
     /// <summary>
     /// MG-17 — grants the group <c>rwX</c> throughout a tree the daemon owns and a remapped jail must be

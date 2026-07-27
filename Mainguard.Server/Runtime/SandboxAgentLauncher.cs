@@ -195,6 +195,12 @@ public sealed class SandboxAgentLauncher
                 NetworkName: segment.NetworkName,
                 ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)), ct).ConfigureAwait(false);
 
+            // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
+            // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
+            // after the jail is up, so a failed spawn leaves no watcher behind; the pre-verification
+            // re-fetch is the other half and neither replaces the other.
+            _environment.Worktrees.WatchAgentRef(repoHandle, agentId);
+
             _log.LogInformation(
                 "jail started: container={Container} reused={Reused} launchCmd={HasLaunch}",
                 handle.ContainerId, handle.Reused, launchCommand is { Count: > 0 });
@@ -218,6 +224,14 @@ public sealed class SandboxAgentLauncher
 
         if (!string.IsNullOrEmpty(repoHash))
         {
+            // MG-3: a LAST publish before anything is removed, then stop watching. Without it the work
+            // an agent committed between the final verification and the stop would be lost with its
+            // repository — the agent's own repo is deleted a few lines below.
+            try { _environment.Worktrees.PublishAgentBranch(repoHash, agentId); }
+            catch { /* never fail a stop from housekeeping */ }
+            try { _environment.Worktrees.UnwatchAgentRef(repoHash, agentId); }
+            catch { /* never fail a stop from housekeeping */ }
+
             // MG-36: reclaim the segment. Docker's local bridge address pool is finite (~32 networks by
             // default), so a segment leaked per agent would eventually make spawning fail with an
             // address-pool exhaustion error that reads like anything but the cause. Ordered AFTER the
