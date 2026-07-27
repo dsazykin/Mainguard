@@ -421,7 +421,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var exec = new ExecStdinRequest(
             containerId,
             "0", // root, so chown to the supervisor uid is permitted; the file ends 0400/uid.
-            // path/uid/length are not secret (argv-safe); the secret content is piped via stdin only.
+                 // path/uid/length are not secret (argv-safe); the secret content is piped via stdin only.
             new[]
             {
                 "sh", "-c",
