@@ -3,6 +3,7 @@ using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
 using Mainguard.Server;
+using Mainguard.Server.Tests.Fixtures;
 using Xunit;
 
 namespace Mainguard.Server.Tests.Gateway;
@@ -22,29 +23,19 @@ public sealed class GatewayListenerBindTests
     private static string TempToken() =>
         System.IO.Path.Combine(System.IO.Path.GetTempPath(), "mg-gwtok-" + Guid.NewGuid().ToString("N"));
 
-    private static int FreePort()
-    {
-        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
-    }
-
     // The default must remain exactly today's posture: loopback only, no gateway.
     [Fact]
     public async Task GatewayDisabledByDefault_DaemonStaysLoopbackOnly()
     {
-        await using var app = await DaemonHost.StartAsync(new DaemonOptions
+        await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions
         {
-            Port = FreePort(),
             LocalDev = true,
             TokenPath = TempToken(),
             GatewayBindAddress = null, // default
         });
 
-        Assert.NotEmpty(app.Urls);
-        foreach (var url in app.Urls)
+        Assert.NotEmpty(daemon.Urls);
+        foreach (var url in daemon.Urls)
         {
             var host = new Uri(url).Host;
             Assert.True(IPAddress.TryParse(host, out var ip), $"host not an IP: {host}");
@@ -60,15 +51,15 @@ public sealed class GatewayListenerBindTests
     [InlineData("8.8.8.8")]
     public async Task ImpermissibleGatewayBind_FailsStartupLoudly(string address)
     {
+        // TestDaemonHost retries ONLY address-in-use, so the refusal this test wants surfaces on the
+        // first attempt rather than being retried into a timeout.
         var ex = await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
-            await using var app = await DaemonHost.StartAsync(new DaemonOptions
+            await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions
             {
-                Port = FreePort(),
                 LocalDev = true,
                 TokenPath = TempToken(),
                 GatewayBindAddress = address,
-                GatewayPort = FreePort(),
             });
         });
 
@@ -80,13 +71,11 @@ public sealed class GatewayListenerBindTests
     {
         var ex = await Assert.ThrowsAnyAsync<Exception>(async () =>
         {
-            await using var app = await DaemonHost.StartAsync(new DaemonOptions
+            await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions
             {
-                Port = FreePort(),
                 LocalDev = true,
                 TokenPath = TempToken(),
                 GatewayBindAddress = "not-an-ip",
-                GatewayPort = FreePort(),
             });
         });
 
@@ -98,23 +87,21 @@ public sealed class GatewayListenerBindTests
     [Fact]
     public async Task PermittedGatewayBind_Starts_AndControlPlaneStaysLoopback()
     {
-        var gatewayPort = FreePort();
-        await using var app = await DaemonHost.StartAsync(new DaemonOptions
+        await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions
         {
-            Port = FreePort(),
             LocalDev = true,
             TokenPath = TempToken(),
             GatewayBindAddress = "127.0.0.1",
-            GatewayPort = gatewayPort,
         });
 
         // Every bound address is still loopback here, and the gateway port is among them.
-        foreach (var url in app.Urls)
+        foreach (var url in daemon.Urls)
         {
             Assert.True(IPAddress.IsLoopback(IPAddress.Parse(new Uri(url).Host)));
         }
 
-        Assert.Contains(app.Urls, u => new Uri(u).Port == gatewayPort);
+        Assert.Contains(daemon.Urls, u => new Uri(u).Port == daemon.GatewayPort);
+        Assert.NotEqual(daemon.Port, daemon.GatewayPort);
     }
 
     private static string Flatten(Exception ex)

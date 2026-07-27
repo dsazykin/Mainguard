@@ -104,16 +104,14 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task Daemon_ShouldBindLoopbackOnly()
     {
-        var port = FreePort();
-        await using var app = await DaemonHost.StartAsync(new DaemonOptions
+        await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions
         {
-            Port = port,
             LocalDev = true,
             TokenPath = TempToken(),
         });
 
-        Assert.NotEmpty(app.Urls);
-        foreach (var address in app.Urls)
+        Assert.NotEmpty(daemon.Urls);
+        foreach (var address in daemon.Urls)
         {
             var uri = new Uri(address);
             Assert.True(IPAddress.TryParse(uri.Host, out var ip), $"host not an IP: {uri.Host}");
@@ -160,15 +158,13 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
     public async Task TokenFileDeletedWhileRunning_ShouldNotBreakExistingChannels()
     {
         var tokenPath = TempToken();
-        var port = FreePort();
-        await using var app = await DaemonHost.StartAsync(new DaemonOptions { Port = port, LocalDev = true, TokenPath = tokenPath });
-        var token = Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions
-            .GetRequiredService<Mainguard.Server.Auth.SessionTokenFile>(app.Services).Token;
+        await using var daemon = await TestDaemonHost.StartAsync(new DaemonOptions { LocalDev = true, TokenPath = tokenPath });
+        var token = daemon.Token;
 
         // MG-19: the control plane is mutually-authenticated TLS, so this goes through the real
         // pinned transport. The credentials are loaded BEFORE the token file is deleted below —
         // exactly like a live client that connected while the daemon was healthy.
-        using var channel = Fixtures.PinnedDaemonChannel.Pinned(port, tokenPath);
+        using var channel = Fixtures.PinnedDaemonChannel.Pinned(daemon.Port, tokenPath);
         var client = new AgentService.AgentServiceClient(channel);
         var headers = new Metadata { { "authorization", $"bearer {token}" } };
 
@@ -183,12 +179,17 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
     }
 
     // §6 edge row 3 / TI.6 — port already bound → typed startup failure naming the port.
+    //
+    // The ONE test here that wants a specific port, and wants it OCCUPIED. It therefore takes a listener
+    // that is already bound (TestPorts.LeaseBoundListener never releases the socket, so unlike a leased
+    // port number there is no window for another process to steal it) and calls DaemonHost.StartAsync
+    // DIRECTLY — deliberately bypassing TestDaemonHost, whose whole job is to retry past exactly the
+    // failure this test is asserting on.
     [Fact]
     public async Task PortAlreadyBound_ShouldFailTypedNamingPort()
     {
-        var port = FreePort();
-        var blocker = new System.Net.Sockets.TcpListener(IPAddress.Loopback, port);
-        blocker.Start();
+        var blocker = Fixtures.TestPorts.LeaseBoundListener();
+        var port = ((IPEndPoint)blocker.LocalEndpoint).Port;
         try
         {
             var ex = await Assert.ThrowsAsync<DaemonStartupException>(() =>
@@ -254,15 +255,6 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
 
                 break;
         }
-    }
-
-    private static int FreePort()
-    {
-        var l = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        var port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 
     private static string TempToken()

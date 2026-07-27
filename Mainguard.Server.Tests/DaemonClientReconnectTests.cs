@@ -30,17 +30,15 @@ public sealed class DaemonClientReconnectTests
     [Fact]
     public async Task StreamAgentEvents_ShouldResume_AfterDaemonRestart_AndTransitionStates()
     {
-        var port1 = FreePort();
-        var port2 = FreePort();
         var tokenPath1 = TempToken();
         var tokenPath2 = TempToken();
-        var host1 = await DaemonHost.StartAsync(new DaemonOptions { Port = port1, LocalDev = true, TokenPath = tokenPath1 });
-        var host2 = await DaemonHost.StartAsync(new DaemonOptions { Port = port2, LocalDev = true, TokenPath = tokenPath2 });
+        var host1 = await Fixtures.TestDaemonHost.StartAsync(new DaemonOptions { LocalDev = true, TokenPath = tokenPath1 });
+        var host2 = await Fixtures.TestDaemonHost.StartAsync(new DaemonOptions { LocalDev = true, TokenPath = tokenPath2 });
 
-        var currentPort = port1;
+        var currentPort = host1.Port;
         var currentTokenPath = tokenPath1;
-        var currentToken = host1.Services.GetRequiredService<SessionTokenFile>().Token;
-        var token2 = host2.Services.GetRequiredService<SessionTokenFile>().Token;
+        var currentToken = host1.Token;
+        var token2 = host2.Token;
 
         // MG-19: the control plane is pinned mutual TLS, so reconnecting means re-reading the TARGET
         // daemon's credentials as well as its token — each host mints its own session material.
@@ -88,7 +86,7 @@ public sealed class DaemonClientReconnectTests
             await host1.DisposeAsync();
             Volatile.Write(ref currentToken, token2);
             Volatile.Write(ref currentTokenPath, tokenPath2);
-            Volatile.Write(ref currentPort, port2);
+            Volatile.Write(ref currentPort, host2.Port);
 
             // Reconnect + fresh snapshot from host2 (resume).
             await secondSnapshot.Task.WaitAsync(TimeSpan.FromSeconds(25));
@@ -128,15 +126,6 @@ public sealed class DaemonClientReconnectTests
 
         Assert.True(w == wanted.Length,
             $"expected subsequence [{string.Join(", ", wanted)}] within [{string.Join(", ", actual)}]");
-    }
-
-    private static int FreePort()
-    {
-        var l = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        var port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 
     private static string TempToken()

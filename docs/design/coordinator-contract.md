@@ -58,16 +58,39 @@ and it is not the same gate:
 Same number of human interactions, materially better information, and a rejection now improves the
 plan instead of discarding the attempt.
 
-**Two operational consequences that need decisions before implementation:**
+**Two operational consequences, decided 2026-07-27:**
 
-1. **The revise→re-present loop must be bounded.** Reject → revise → reject with no limit burns budget
-   and wall-clock indefinitely. Proposal: cap revision rounds (default **3**), after which the worker
-   stops and escalates to the human rather than looping. The cap belongs with the other daemon-side
-   limits in `CoordinatorLimits`, not in a prompt.
-2. **A blocked worker still holds its jail**, and therefore a slot against `MaxActiveWorkers`. Six
-   workers awaiting plan approval consume the whole cap while doing nothing. Either blocked workers
-   do not count toward the active cap, or the cap needs to account for them — otherwise the
-   coordinator can deadlock itself by spawning six workers that are all waiting on a human.
+**1. The revise→re-present loop is bounded at 3 rounds.** Reject → revise → reject with no limit burns
+budget and wall-clock indefinitely, and a worker that keeps producing plans the human dislikes will do
+so forever. After the third rejection the worker **stops and escalates to the human** rather than
+looping. `MaxPlanRevisions = 3` lives in `CoordinatorLimits` beside the other daemon-side caps — **not
+in a prompt**, for the same reason no other limit lives there: a limit an agent is merely told about
+is a suggestion.
+
+**2. A blocked worker DOES count against `MaxActiveWorkers`.** Working this through reversed the
+answer sketched in the first draft, and the reversal is the important part:
+
+The tempting fix is "blocked workers are idle, so don't count them." That is wrong, because
+**`MaxActiveWorkers` is a resource cap and a blocked worker still holds its jail** — a container, its
+tmpfs, its network segment, its worktree. Exempting them lets the coordinator spawn unboundedly many
+workers that each consume real resources while doing nothing, which converts a bounded system into an
+unbounded one at exactly the moment a human is too busy to approve.
+
+So the cap counts them, and the resulting behaviour is **backpressure, not deadlock**: the coordinator
+stops spawning until the human clears plans. That is the plan gate doing its job, one level up.
+
+Two things make the backpressure tolerable, and both are requirements rather than hopes:
+
+- **Plans must arrive fast.** The worker inspects the repo and presents a plan, then blocks — it does
+  not do the work first. So a full cap becomes *N plans waiting for review*, not *N half-finished
+  jobs*, and reviewing them is one batch of decisions.
+- **The stall must be legible.** When the cap is reached because workers await approval, the UI must
+  say so — "6 workers waiting on your approval" — rather than the coordinator silently going quiet.
+  A silent stall is indistinguishable from a hang, and this codebase has already spent real effort on
+  failures that could not explain themselves.
+
+Neither number is load-bearing for security; both are `CoordinatorLimits` fields and can be retuned
+once there is real usage data.
 
 ## 3. The surface — the complete set of coordinator operations
 
