@@ -23,7 +23,10 @@ internal interface IPullRequestProvider
     Task<IReadOnlyList<PullRequestItem>> ListAsync(RepoSlug repo, string token, PullRequestState filter, CancellationToken ct);
     Task<PullRequestDetail> GetAsync(RepoSlug repo, string token, int number, CancellationToken ct);
     Task<PullRequestItem> CreateAsync(RepoSlug repo, string token, CreatePullRequest request, CancellationToken ct);
-    Task<PullRequestItem> MergeAsync(RepoSlug repo, string token, int number, PullRequestMergeMethod method, CancellationToken ct);
+    /// <param name="expectedHeadSha">The head commit the merge is authorized against — sent as the host's
+    /// merge compare-and-swap so a PR that gained commits since verification is refused rather than merged
+    /// (P2-12). Null merges whatever the head is now, which is only correct when a human is looking at it.</param>
+    Task<PullRequestItem> MergeAsync(RepoSlug repo, string token, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct);
     Task CloseAsync(RepoSlug repo, string token, int number, CancellationToken ct);
 
     // ---- Review (T-25) ------------------------------------------------------------------------

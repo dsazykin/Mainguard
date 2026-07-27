@@ -22,39 +22,38 @@ public class MergeDispatchTests
     private const string RepoPath = "/repo";
     private const string RepoHash = "hash0";
 
-    /// <summary>Records the host merge call; everything else is an unused stub. <see cref="OnMerge"/> is
-    /// the seam the MG-23 tests use to hold a merge open (concurrency) or make the host refuse it.</summary>
-    private sealed class RecordingPrService : IPullRequestService
+    /// <summary>
+    /// Stands in for the external transport (host PR merge + local reconcile). It records the calls that
+    /// reached it and, by default, reports the merge as landed on <see cref="MergedSha"/>.
+    /// <see cref="OnMerge"/> is the seam the MG-23 tests use to hold a merge open (concurrency) or to make
+    /// the transport refuse.
+    /// </summary>
+    private sealed class RecordingExternalMerge : IExternalPrMergeExecutor
     {
         private int _mergeCalls;
 
         public int MergeCalls => Volatile.Read(ref _mergeCalls);
-        public int LastMergedNumber { get; private set; }
+        public string? LastAgentId { get; private set; }
 
-        /// <summary>Runs inside <see cref="MergeAsync"/>, after the call is counted.</summary>
-        public Func<int, CancellationToken, Task>? OnMerge { get; set; }
+        /// <summary>The sha the transport reports main landed on (the real one proves it against git).</summary>
+        public string MergedSha { get; set; } = "sha-ext-1";
 
-        public async Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, CancellationToken ct)
+        /// <summary>Runs inside <see cref="MergeExternalPrAsync"/>, after the call is counted. Returning a
+        /// non-null result makes the transport refuse with it.</summary>
+        public Func<string, CancellationToken, Task<ForegroundMergeResult?>>? OnMerge { get; set; }
+
+        public async Task<ForegroundMergeResult> MergeExternalPrAsync(
+            ForegroundMergeRequest request, MergeLeaseRow lease, CancellationToken ct)
         {
             Interlocked.Increment(ref _mergeCalls);
-            LastMergedNumber = number;
-            if (OnMerge is not null)
+            LastAgentId = request.AgentId;
+            if (OnMerge is not null && await OnMerge(request.AgentId, ct).ConfigureAwait(false) is { } refusal)
             {
-                await OnMerge(number, ct).ConfigureAwait(false);
+                return refusal;
             }
 
-            return new PullRequestItem { Number = number, State = PullRequestState.Merged };
+            return new ForegroundMergeResult(true, MergedSha, CasLost: false, Reason: null);
         }
-
-        public bool IsSupported(string repoPath) => true;
-        public Task<IReadOnlyList<PullRequestItem>> ListAsync(string repoPath, PullRequestState filter, CancellationToken ct) =>
-            Task.FromResult<IReadOnlyList<PullRequestItem>>(Array.Empty<PullRequestItem>());
-        public Task<PullRequestDetail> GetAsync(string repoPath, int number, CancellationToken ct) => Task.FromResult(new PullRequestDetail());
-        public Task<PullRequestItem> CreateAsync(string repoPath, CreatePullRequest request, CancellationToken ct) => Task.FromResult(new PullRequestItem());
-        public Task CloseAsync(string repoPath, int number, CancellationToken ct) => Task.CompletedTask;
-        public Task<IReadOnlyList<PullRequestReview>> GetReviewsAsync(string repoPath, int number, CancellationToken ct) => Task.FromResult<IReadOnlyList<PullRequestReview>>(Array.Empty<PullRequestReview>());
-        public Task<IReadOnlyList<ReviewComment>> GetReviewCommentsAsync(string repoPath, int number, CancellationToken ct) => Task.FromResult<IReadOnlyList<ReviewComment>>(Array.Empty<ReviewComment>());
-        public Task<PullRequestReview> SubmitReviewAsync(string repoPath, int number, SubmitReview review, CancellationToken ct) => Task.FromResult(new PullRequestReview());
     }
 
     /// <summary>Mimics the real foreground service: on merge it fires the daemon-wired <c>onMerged</c>
@@ -104,11 +103,10 @@ public class MergeDispatchTests
     }
 
     private static MergeDispatch BuildDispatch(
-        MergeQueue queue, IPullRequestService pr, IMergeLeaseStore leases, string mergedSha = "sha-ext-1") =>
+        MergeQueue queue, IExternalPrMergeExecutor external, IMergeLeaseStore leases) =>
         new(
-            new FakeForeground((id, sha) => { }, "unused"), pr, leases,
-            resolveQueue: rh => rh == RepoHash ? queue : null,
-            fetchMergedMainSha: (req, ct) => Task.FromResult(mergedSha));
+            new FakeForeground((id, sha) => { }, "unused"), external, leases,
+            resolveQueue: rh => rh == RepoHash ? queue : null);
 
     [Fact]
     public async Task MergePathDispatch_ShouldUseHostApiForPrEntries_AndLocalForegroundForLocalAgents()
@@ -123,38 +121,36 @@ public class MergeDispatchTests
             localQueue.ConfirmHumanMerge(id, sha); // fires NotifyMainMoved
         };
         var localForeground = new FakeForeground(localOnMerged, "sha-local-1");
-        var localPr = new RecordingPrService();
+        var localExternal = new RecordingExternalMerge();
         var localDispatch = new MergeDispatch(
-            localForeground, localPr, new InMemoryMergeLeaseStore(),
-            resolveQueue: rh => rh == RepoHash ? localQueue : null,
-            fetchMergedMainSha: (req, ct) => Task.FromResult("unused"));
+            localForeground, localExternal, new InMemoryMergeLeaseStore(),
+            resolveQueue: rh => rh == RepoHash ? localQueue : null);
 
         var localOutcome = await localDispatch.DispatchMergeAsync(
             new MergeDispatchRequest(RepoPath, RepoHash, "local", "sha0"), CancellationToken.None);
 
         Assert.True(localOutcome.Merged);
         Assert.True(localForeground.Called);                 // routed to the foreground service
-        Assert.Equal(0, localPr.MergeCalls);                 // NOT the host API
+        Assert.Equal(0, localExternal.MergeCalls);           // NOT the host transport
         Assert.Equal(WorkerMergeState.Merged, localQueue.GetState("local"));
         Assert.Equal("sha-local-1", localQueue.CurrentMainSha); // NotifyMainMoved fired
         Assert.Contains("local", notified);
 
-        // ---- External origin → host merge API, then NotifyMainMoved after the merged sha lands ----
+        // ---- External origin → host transport, then NotifyMainMoved after the merged sha lands ----
         var extQueue = BuildVerifiedQueue("pr-7", MergeEntryOrigin.External, (id, sha) => { });
-        var extPr = new RecordingPrService();
+        var extExternal = new RecordingExternalMerge();
         var extForeground = new FakeForeground((id, sha) => { }, "unused");
         var extDispatch = new MergeDispatch(
-            extForeground, extPr, new InMemoryMergeLeaseStore(),
-            resolveQueue: rh => rh == RepoHash ? extQueue : null,
-            fetchMergedMainSha: (req, ct) => Task.FromResult("sha-ext-1"));
+            extForeground, extExternal, new InMemoryMergeLeaseStore(),
+            resolveQueue: rh => rh == RepoHash ? extQueue : null);
 
         var extOutcome = await extDispatch.DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
 
         Assert.True(extOutcome.Merged);
         Assert.False(extForeground.Called);                  // NOT the foreground service
-        Assert.Equal(1, extPr.MergeCalls);                   // routed to the host merge API
-        Assert.Equal(7, extPr.LastMergedNumber);
+        Assert.Equal(1, extExternal.MergeCalls);             // routed to the host transport
+        Assert.Equal("pr-7", extExternal.LastAgentId);
         Assert.Equal(WorkerMergeState.Merged, extQueue.GetState("pr-7"));
         Assert.Equal("sha-ext-1", extQueue.CurrentMainSha);  // NotifyMainMoved fired for the external path too
     }
@@ -178,34 +174,35 @@ public class MergeDispatchTests
         // Hold the first merge open inside the host API so the second dispatch overlaps it for real.
         var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pr = new RecordingPrService
+        var external = new RecordingExternalMerge
         {
             // Only PR 7 is held. If the lease ever stops covering the external path, PR 8 must be free to
             // run to completion so this test FAILS on the merge count rather than deadlocking on the gate.
-            OnMerge = (number, ct) =>
+            OnMerge = async (agentId, ct) =>
             {
-                if (number != 7)
+                if (agentId != "pr-7")
                 {
-                    return Task.CompletedTask;
+                    return null;
                 }
 
                 entered.TrySetResult();
-                return release.Task;
+                await release.Task.ConfigureAwait(false);
+                return null;
             },
         };
 
-        var dispatch = BuildDispatch(queue, pr, leases);
+        var dispatch = BuildDispatch(queue, external, leases);
 
         var first = dispatch.DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
         await entered.Task; // the first merge is now in flight, holding the repo's lease
 
         var second = await dispatch.DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-8", "sha0", PrNumber: 8), CancellationToken.None);
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-8", "sha0"), CancellationToken.None);
 
         Assert.False(second.Merged);
         Assert.Equal("another merge is already in progress for this repository", second.Reason);
-        Assert.Equal(1, pr.MergeCalls);                       // the second never reached the host API
+        Assert.Equal(1, external.MergeCalls);                 // the second never reached the host
         Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("pr-8"));
 
         release.TrySetResult();
@@ -229,12 +226,12 @@ public class MergeDispatchTests
         // The Windows foreground merge takes the repo's lease first (ForegroundMergeService.BeginMerge).
         Assert.NotNull(leases.TryBegin(RepoHash, "foreground-lease", "loom-1", "sha0", "main"));
 
-        var pr = new RecordingPrService();
-        var outcome = await BuildDispatch(queue, pr, leases).DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+        var external = new RecordingExternalMerge();
+        var outcome = await BuildDispatch(queue, external, leases).DispatchMergeAsync(
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
 
         Assert.False(outcome.Merged);
-        Assert.Equal(0, pr.MergeCalls);
+        Assert.Equal(0, external.MergeCalls);
         Assert.Equal("another merge is already in progress for this repository", outcome.Reason);
         Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("pr-7"));
     }
@@ -250,17 +247,17 @@ public class MergeDispatchTests
     {
         var queue = BuildVerifiedQueue(("pr-7", MergeEntryOrigin.External));
         var leases = new InMemoryMergeLeaseStore();
-        var pr = new RecordingPrService();
+        var external = new RecordingExternalMerge();
 
         // The entry is verified against sha0 (CanMerge is true), but the caller's request was built from
         // an older read of main — the freshness CAS is what catches that.
-        var outcome = await BuildDispatch(queue, pr, leases).DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha-older", PrNumber: 7), CancellationToken.None);
+        var outcome = await BuildDispatch(queue, external, leases).DispatchMergeAsync(
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha-older"), CancellationToken.None);
 
         Assert.True(queue.CanMerge("pr-7", out _));           // the gate alone would have let this through
         Assert.False(outcome.Merged);
         Assert.True(outcome.CasLost);
-        Assert.Equal(0, pr.MergeCalls);
+        Assert.Equal(0, external.MergeCalls);
         Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("pr-7"));
         Assert.Null(leases.GetOutstanding(RepoHash));         // released, not stranded
     }
@@ -276,13 +273,13 @@ public class MergeDispatchTests
         var queue = BuildVerifiedQueue(("pr-7", MergeEntryOrigin.External));
         queue.IsFrozen = true;
         var leases = new InMemoryMergeLeaseStore();
-        var pr = new RecordingPrService();
+        var external = new RecordingExternalMerge();
 
-        var outcome = await BuildDispatch(queue, pr, leases).DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+        var outcome = await BuildDispatch(queue, external, leases).DispatchMergeAsync(
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
 
         Assert.False(outcome.Merged);
-        Assert.Equal(0, pr.MergeCalls);
+        Assert.Equal(0, external.MergeCalls);
         Assert.Contains("frozen", outcome.Reason!);
         Assert.Null(leases.GetOutstanding(RepoHash));
     }
@@ -297,14 +294,15 @@ public class MergeDispatchTests
     {
         var queue = BuildVerifiedQueue(("pr-7", MergeEntryOrigin.External));
         var leases = new InMemoryMergeLeaseStore();
-        var pr = new RecordingPrService
+        var external = new RecordingExternalMerge
         {
-            OnMerge = (number, ct) => throw new InvalidOperationException("Base branch was modified."),
+            OnMerge = (agentId, ct) => Task.FromResult<ForegroundMergeResult?>(
+                new ForegroundMergeResult(false, null, CasLost: true, "the host refused the merge")),
         };
 
-        var dispatch = BuildDispatch(queue, pr, leases);
+        var dispatch = BuildDispatch(queue, external, leases);
         var outcome = await dispatch.DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
 
         Assert.False(outcome.Merged);
         Assert.True(outcome.CasLost);
@@ -312,9 +310,9 @@ public class MergeDispatchTests
         Assert.Null(leases.GetOutstanding(RepoHash));
 
         // And the repo is genuinely usable again: the very next merge attempt can take the lease.
-        pr.OnMerge = null;
+        external.OnMerge = null;
         var retry = await dispatch.DispatchMergeAsync(
-            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0", PrNumber: 7), CancellationToken.None);
+            new MergeDispatchRequest(RepoPath, RepoHash, "pr-7", "sha0"), CancellationToken.None);
         Assert.True(retry.Merged);
     }
 }

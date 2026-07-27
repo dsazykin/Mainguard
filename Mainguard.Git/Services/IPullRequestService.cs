@@ -22,7 +22,16 @@ public interface IPullRequestService
     Task<IReadOnlyList<PullRequestItem>> ListAsync(string repoPath, PullRequestState filter, CancellationToken ct);
     Task<PullRequestDetail> GetAsync(string repoPath, int number, CancellationToken ct);
     Task<PullRequestItem> CreateAsync(string repoPath, CreatePullRequest request, CancellationToken ct);
-    Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, CancellationToken ct);
+    /// <summary>
+    /// Merges a pull request on the host. The returned item carries the resulting
+    /// <see cref="PullRequestItem.MergeCommitSha"/> so the caller can verify the merge really landed
+    /// rather than trusting the call's success.
+    /// </summary>
+    /// <param name="expectedHeadSha">The head commit the merge is authorized against, forwarded as the
+    /// host's merge compare-and-swap: a PR that gained commits since it was verified is refused (the
+    /// external analogue of <c>--ff-only</c> losing the race, P2-12). Null skips the CAS — correct only
+    /// for the manual PR panel, where a human is looking at the PR as they press merge.</param>
+    Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct);
     Task CloseAsync(string repoPath, int number, CancellationToken ct);
 
     // ---- Review (T-25) ------------------------------------------------------------------------
