@@ -42,6 +42,11 @@ public sealed class DaemonBackedOrchestrator :
     IKillSwitchService, ITelemetryService, IVibeService, ICliAgentHost, IDisposable
 {
     private const string DefaultCoordinatorId = "coordinator-1";
+
+    /// <summary>The branch the merge queue lands on. The daemon's <c>BeginMerge</c> takes its lease against
+    /// this same name, so the two legs of the RT-D1 conversation must agree on it.</summary>
+    private const string MainBranchName = "main";
+
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
 
     /// <summary>SpawnAgent runs the daemon's whole provision chain (worktree + hardened container +
@@ -56,6 +61,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Func<string, string?> _keystoreLookup;
     private readonly Func<string, IReadOnlyList<string>> _keystoreList;
     private readonly Action<string, string> _keystoreSave;
+    private readonly Func<Mainguard.Git.Services.IOperationJournal> _journalFactory;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
 
@@ -63,6 +69,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Dictionary<string, AgentInfo> _agents = new(StringComparer.Ordinal);
     private readonly List<QueueEntry> _queue = new();
     private readonly Dictionary<string, (bool CanMerge, string Reason)> _gate_ = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, MergeEntryOrigin> _origins = new(StringComparer.Ordinal);
     private readonly List<TaskPlan> _plans = new();
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
@@ -75,6 +82,8 @@ public sealed class DaemonBackedOrchestrator :
     private string _phaseText = string.Empty;
 
     private string? _repoHandle;
+    private string? _repoLocalPath;
+    private string _syncRemoteName = string.Empty;
     private string? _coordinatorAgentId;
     private Task? _agentPump;
     private Task? _planPump;
@@ -90,16 +99,22 @@ public sealed class DaemonBackedOrchestrator :
     /// <c>llm_env_*</c> injection); defaults to the OS keyring, injectable like the lookup.</param>
     /// <param name="keystoreSave">Writes a keystore entry (persists the CLI login state a stop
     /// harvested — <c>cli_login_*</c>); defaults to the OS keyring, injectable like the lookup.</param>
+    /// <param name="journalFactory">Supplies the T-19 operation journal the human merge is recorded in.
+    /// Defaults to the app's own journal — the SAME undo journal the repo dashboard shows, so a merge
+    /// driven from the agent surface is undoable from the git surface. Injectable so a test can point it
+    /// at a temp database; it redirects only where the journal is written, never what the merge does.</param>
     public DaemonBackedOrchestrator(
         DaemonClient client, bool ownsClient = true, Func<string, string?>? keystoreLookup = null,
         Func<string, IReadOnlyList<string>>? keystoreList = null,
-        Action<string, string>? keystoreSave = null)
+        Action<string, string>? keystoreSave = null,
+        Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _ownsClient = ownsClient;
         _keystoreLookup = keystoreLookup ?? DefaultKeystoreLookup;
         _keystoreList = keystoreList ?? DefaultKeystoreList;
         _keystoreSave = keystoreSave ?? DefaultKeystoreSave;
+        _journalFactory = journalFactory ?? (() => new Mainguard.Git.Services.OperationJournal());
     }
 
     private static string? DefaultKeystoreLookup(string name)
@@ -205,8 +220,15 @@ public sealed class DaemonBackedOrchestrator :
             or AgentLifecycleState.Rejected or AgentLifecycleState.Merged;
 
     /// <summary>Point the merge-queue projection at a repo handle (from the daemon's <c>ProvisionRepo</c>).
-    /// Restarts the queue pump so the merge rail + review cockpit reflect that repo's live queue.</summary>
-    public void SetActiveRepo(string repoHandle)
+    /// Restarts the queue pump so the merge rail + review cockpit reflect that repo's live queue.
+    ///
+    /// <para><paramref name="localRepoPath"/> and <paramref name="syncRemoteName"/> are the OTHER half of
+    /// the same <c>ProvisionRepo</c> answer, and they are what makes the merge button able to merge: the
+    /// human foreground merge lands on the user's own Windows checkout (never the VM mirror, which is
+    /// staging), fetching the agent branch over the SC-2-resolved sync remote registered on it. Without
+    /// them the queue is observable but not mergeable, and <see cref="ConfirmMergeAsync"/> says so rather
+    /// than recording a merge it never performed.</para></summary>
+    public void SetActiveRepo(string repoHandle, string? localRepoPath = null, string? syncRemoteName = null)
     {
         if (string.IsNullOrWhiteSpace(repoHandle))
         {
@@ -215,6 +237,18 @@ public sealed class DaemonBackedOrchestrator :
 
         lock (_gate)
         {
+            // The local binding is refreshed even when the handle is unchanged — a re-provision can hand
+            // back a renamed sync remote, and a merge against the previous name would fail its fetch.
+            if (!string.IsNullOrWhiteSpace(localRepoPath))
+            {
+                _repoLocalPath = localRepoPath;
+            }
+
+            if (!string.IsNullOrWhiteSpace(syncRemoteName))
+            {
+                _syncRemoteName = syncRemoteName!;
+            }
+
             if (_repoHandle == repoHandle && _queuePump is not null)
             {
                 return;
@@ -411,8 +445,15 @@ public sealed class DaemonBackedOrchestrator :
             _mainSha = update.MainSha ?? string.Empty;
             _queue.Clear();
             _gate_.Clear();
+            _origins.Clear();
             foreach (var entry in update.Entries)
             {
+                // P2-12 origin: an External entry is an upstream PR that merges through the host API, not
+                // by fast-forwarding a local branch. It is carried so the merge path can refuse rather
+                // than land PR commits on the user's main behind the host's back.
+                _origins[entry.AgentId] = Enum.TryParse<MergeEntryOrigin>(
+                    entry.Origin, ignoreCase: true, out var origin) ? origin : MergeEntryOrigin.Local;
+
                 var state = Enum.TryParse<WorkerMergeState>(entry.State, ignoreCase: true, out var s)
                     ? s : WorkerMergeState.Working;
                 _queue.Add(new QueueEntry(
@@ -671,32 +712,156 @@ public sealed class DaemonBackedOrchestrator :
         return false;
     }
 
-    /// <summary>The human foreground merge: take the lease (BeginMerge), then record the outcome and fire
-    /// the stale cascade (ConfirmMerge). The actual Windows-side git merge between the two steps is the
-    /// GUI/manual leg; the RPC pair is exercised for real here.</summary>
+    /// <summary>
+    /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
+    /// button: <c>BeginMerge</c> (the daemon takes the repo's one lease and enforces <c>CanMerge</c> under
+    /// it) → <b>the real Windows-side <c>git merge --ff-only</c> on the user's own checkout</b> →
+    /// <c>ConfirmMerge</c> with the sha main ACTUALLY moved to, or <c>AbandonMerge</c> when nothing landed.
+    ///
+    /// <para><b>The middle leg used to be missing.</b> This method took the lease and then went straight to
+    /// <c>ConfirmMerge</c>, passing the cached <see cref="MainSha"/> projection — the PRE-merge value — as
+    /// the post-merge sha. Pressing Merge therefore consumed the repo's merge lease, walked the branch to
+    /// the terminal <c>Merged</c> state, and wrote the RT-D1 idempotency record asserting the merge had
+    /// landed, while <c>refs/heads/main</c> had not moved by a single commit. The agent's work was dropped
+    /// from the queue without ever reaching main, and the boot reconcile would afterwards read the
+    /// confirmed lease as proof of a merge that does not exist. A merge queue whose merge step is absent
+    /// does not fail safe — it fails silently, and the queue is the record everything downstream trusts.</para>
+    ///
+    /// <para>The human still drives: this runs only from the Merge button, and there is still no
+    /// auto-merge RPC. What is connected here is the drive, not an automation of it.</para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The merge did not happen; the message is the reason,
+    /// already phrased for display. Queue state is unchanged in every one of those cases.</exception>
     public async Task ConfirmMergeAsync(string agentId)
     {
         string? repoHandle;
-        string mainSha;
+        string? repoPath;
+        string syncRemote;
+        MergeEntryOrigin origin;
         lock (_gate)
         {
             repoHandle = _repoHandle;
-            mainSha = _mainSha;
+            repoPath = _repoLocalPath;
+            syncRemote = _syncRemoteName;
+            origin = _origins.TryGetValue(agentId, out var o) ? o : MergeEntryOrigin.Local;
         }
 
-        if (repoHandle is null)
+        if (string.IsNullOrWhiteSpace(repoHandle))
         {
-            return;
+            throw new InvalidOperationException(
+                "Can't merge — no repository is active for agents yet.");
+        }
+
+        if (origin == MergeEntryOrigin.External)
+        {
+            // P2-12: an external entry's merge belongs to the host PR API (the pluggable step in
+            // MergeDispatch), which the daemon does not yet drive from a user action. Its
+            // agent/pr-<n> branch DOES exist in the mirror, so the local fast-forward below would
+            // "succeed" — landing the PR's commits on the user's main while the pull request stayed
+            // open upstream. Refusing is the honest answer until that transport is connected.
+            throw new InvalidOperationException(
+                "Can't merge — this is an upstream pull request. Merge it on its host; Mainguard will "
+                + "pick the merge up when main moves.");
+        }
+
+        if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(syncRemote))
+        {
+            // Refuse rather than take the lease: a merge we cannot perform must not consume the repo's
+            // one outstanding merge, and must certainly not be recorded as having happened.
+            throw new InvalidOperationException(
+                "Can't merge — this repository isn't bound to a local checkout yet. Reopen it so Mainguard "
+                + "can register the sync remote, then merge.");
         }
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        var begun = await _client.BeginMergeAsync(repoHandle, agentId, cts.Token).ConfigureAwait(false);
+
+        // RT-D1 step 1 — the daemon's lease. BeginMerge is also where CanMerge is enforced, UNDER the
+        // lease (MG-11), so a refusal here is the gate speaking and nothing has been touched.
+        var begun = await _client.BeginMergeAsync(repoHandle!, agentId, cts.Token).ConfigureAwait(false);
         if (!begun.Granted)
         {
             throw new InvalidOperationException($"Can't merge — {begun.Reason}.");
         }
 
-        await _client.ConfirmMergeAsync(repoHandle, agentId, begun.LeaseId, mainSha, cts.Token).ConfigureAwait(false);
+        // The CAS old-OID comes from the grant, not from our own queue projection: the projection is a
+        // stream snapshot and may be a revision behind the main the daemon just authorized against.
+        var lease = new Mainguard.Git.Models.MergeLeaseRow
+        {
+            RepoHash = repoHandle!,
+            LeaseId = begun.LeaseId,
+            AgentId = agentId,
+            ExpectedMainSha = begun.ExpectedMainSha ?? string.Empty,
+            MainBranch = MainBranchName,
+        };
+
+        Mainguard.Agents.Services.ForegroundMergeResult result;
+        try
+        {
+            // RT-D1 step 2 — the merge itself, on the user's real repository. Synchronous git work off the
+            // UI thread. The lease is the daemon's, so this executor is built without a lease store: a
+            // second store would be a second arbiter of "one merge per repo" (MG-23).
+            result = await Task.Run(
+                () => CreateMergeExecutor(syncRemote).PerformJournaledMerge(
+                    new Mainguard.Agents.Services.ForegroundMergeRequest(
+                        RepoPath: repoPath!,
+                        RepoHash: repoHandle!,
+                        AgentId: agentId,
+                        ExpectedMainSha: lease.ExpectedMainSha,
+                        MainBranch: MainBranchName),
+                    lease),
+                cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // The merge threw rather than refusing. Hand the lease back before surfacing it, or this repo
+            // stays unmergeable until the daemon restarts.
+            await TryAbandonAsync(repoHandle!, agentId, begun.LeaseId, ex.Message).ConfigureAwait(false);
+            throw;
+        }
+
+        if (!result.Merged || string.IsNullOrEmpty(result.NewMainSha))
+        {
+            // NOTHING LANDED. The one thing that must not happen here is ConfirmMerge: it would move the
+            // branch to Merged and fire NotifyMainMoved, telling every other agent in the repo that main
+            // advanced — on the strength of a merge that did not occur. Release, and say why.
+            var reason = result.Reason ?? "the merge did not complete";
+            await TryAbandonAsync(repoHandle!, agentId, begun.LeaseId, reason).ConfigureAwait(false);
+            throw new InvalidOperationException($"Can't merge — {reason}.");
+        }
+
+        // RT-D1 step 3 — record the outcome against the sha main REALLY moved to. The daemon re-checks the
+        // gate and the CAS under its queue lock before it writes anything (MG-11), so a race lost between
+        // the two legs is refused there rather than papered over here.
+        await _client.ConfirmMergeAsync(repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, cts.Token)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The Windows-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
+    /// Built per merge because the sync-remote binding is per active repo.
+    /// </summary>
+    private Mainguard.Agents.Services.IJournaledMergeExecutor CreateMergeExecutor(string syncRemoteName)
+        => new Mainguard.Agents.Services.ForegroundMergeService(
+            resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote(syncRemoteName, string.Empty),
+            journal: _journalFactory(),
+            leases: null); // the lease is the daemon's; see the ctor doc on why this must not be a store.
+
+    /// <summary>
+    /// Hands a granted lease back after a merge that did not land. Best-effort by construction: it is the
+    /// cleanup arm of a failure the caller is already reporting, so a transport fault here must not replace
+    /// that reason with a worse one. A lease that survives this is still swept by the RT-D1 boot reconcile.
+    /// </summary>
+    private async Task TryAbandonAsync(string repoHandle, string agentId, string leaseId, string reason)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await _client.AbandonMergeAsync(repoHandle, agentId, leaseId, reason, cts.Token).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Daemon unreachable mid-merge — surfaced through ConnectionState like every other call.
+        }
     }
 
     /// <summary>P2-11 step 4 — acknowledge one flagged item on the DAEMON, which is where the merge gate

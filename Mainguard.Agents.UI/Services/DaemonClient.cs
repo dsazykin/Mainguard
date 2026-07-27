@@ -453,6 +453,28 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.Confirmed;
     }
 
+    /// <summary>
+    /// RT-D1 step 3', the non-merge terminal: hands the repo's merge lease back with nothing recorded,
+    /// after a Windows-side merge that refused or failed. Records no outcome and fires no stale cascade —
+    /// its whole job is that a refused merge does not strand the repo's one lease.
+    /// </summary>
+    /// <returns>True when this call released the lease; false when it named no outstanding lease
+    /// (already confirmed/released) — an idempotent no-op, never an error.</returns>
+    public async Task<bool> AbandonMergeAsync(
+        string repoHandle, string agentId, string leaseId, string reason,
+        CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        var response = await client.AbandonMergeAsync(new AbandonMergeRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            LeaseId = leaseId,
+            Reason = reason ?? string.Empty,
+        }, CallOptions(ct, deadline));
+        return response.Released;
+    }
+
     /// <summary>P2-11 step 4: acknowledge ONE must-acknowledge flagged item daemon-side, and read the gate
     /// back in the same round trip. The daemon owns the acknowledgment ledger the merge gate consults — a
     /// client-side ack alone never unblocked anything.</summary>

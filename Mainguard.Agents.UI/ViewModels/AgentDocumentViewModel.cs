@@ -142,7 +142,11 @@ public partial class AgentDocumentViewModel : ViewModelBase
     private async Task MergeAsync()
     {
         if (!_queue.CanMerge(AgentId, out _)) return; // the gate re-reads state (S-3)
-        await _queue.ConfirmMergeAsync(AgentId);
+
+        // Through the runner so a refusal is a sentence the human sees, not a dropped exception: the merge
+        // legitimately refuses (stale, lease held, not a fast-forward, dirty tree) and a button that goes
+        // quiet on refusal reads as "merged".
+        await Services.MergeActionRunner.RunAsync(_queue, AgentId);
         Refresh();
     }
 }
