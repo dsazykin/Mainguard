@@ -43,7 +43,11 @@ public sealed class DaemonAuthTests
         var dir = Path.Combine(Path.GetTempPath(), "mainguard-missing-" + Guid.NewGuid().ToString("N"));
         TestTools.DaemonTransportMaterial.Write(dir);
         var missing = Path.Combine(dir, "daemon.token");
-        using var client = DaemonClient.ForLoopback(FreePort(), missing);
+
+        // The token read fails while the auth metadata is built, before the lazily-created channel ever
+        // dials anything — so this port is never connected to and only has to be plausible. It still
+        // comes from the one helper rather than a second hand-rolled copy of the racy shape.
+        using var client = DaemonClient.ForLoopback(TestTools.TestPorts.LeaseDeadPort(), missing);
 
         // The token is read from the file when the call builds its auth metadata — a
         // missing file surfaces as an IO error, proving the client reads the token file.
@@ -69,11 +73,17 @@ public sealed class DaemonAuthTests
         await File.WriteAllTextAsync(path, "deadbeef");
         TestTools.DaemonTransportMaterial.Write(dir); // MG-19: a complete session, so only the daemon is absent
 
-        using var client = DaemonClient.ForLoopback(FreePort(), path);
+        // This one genuinely depends on the port being dead — "failed at the network, not at the token
+        // read" is only a true reading of an RpcException if nothing was listening. TestPorts verifies
+        // that and re-runs on a fresh port if a foreign process takes this one mid-test.
+        await TestTools.TestPorts.OnDeadPortAsync(async deadPort =>
+        {
+            using var client = DaemonClient.ForLoopback(deadPort, path);
 
-        // Token read succeeds; the failure is the dead network (RpcException), not an IO error.
-        await Assert.ThrowsAsync<RpcException>(() =>
-            client.ListAgentsAsync(CancellationToken.None, TimeSpan.FromSeconds(2)));
+            // Token read succeeds; the failure is the dead network (RpcException), not an IO error.
+            await Assert.ThrowsAsync<RpcException>(() =>
+                client.ListAgentsAsync(CancellationToken.None, TimeSpan.FromSeconds(2)));
+        });
     }
 
     // MG-19 — the client must refuse to build a connection when the transport credentials are absent,
@@ -87,7 +97,9 @@ public sealed class DaemonAuthTests
         var path = Path.Combine(dir, "daemon.token");
         File.WriteAllText(path, "deadbeef"); // a valid token, and deliberately nothing else
 
-        using var client = DaemonClient.ForLoopback(FreePort(), path);
+        // The credential gate throws while the channel is being built, so — as above — this port is
+        // never dialed.
+        using var client = DaemonClient.ForLoopback(TestTools.TestPorts.LeaseDeadPort(), path);
 
         var ex = Assert.ThrowsAny<InvalidOperationException>(() =>
         {
@@ -119,14 +131,5 @@ public sealed class DaemonAuthTests
 
         var def = t.GetGenericTypeDefinition();
         return def == typeof(Task<>) || def == typeof(IAsyncEnumerable<>);
-    }
-
-    private static int FreePort()
-    {
-        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        l.Start();
-        var port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 }

@@ -153,7 +153,10 @@
           Outputs="$(MainguardDaemonPayload)Mainguard.Server">
     <Message Importance="high"
              Text="Publishing the in-VM daemon into '$(MainguardDaemonPayload)' so the tier-1 auto-update can deploy your daemon changes (incremental; /p:BuildDaemonPayload=false to skip)…" />
-    <Exec Command="dotnet publish &quot;$(MSBuildThisFileDirectory)..\Mainguard.Server\Mainguard.Server.csproj&quot; -c $(Configuration) -r linux-x64 --self-contained true -p:BuildDaemonPayload=false -o &quot;$(MainguardDaemonPayload.TrimEnd('\'))&quot;" />
+    <!-- $(MainguardDotnetHost), not a bare `dotnet`: an Exec resolves the command from the CHILD's PATH,
+         so this used to fail with MSB3073/127 whenever the SDK lived outside the default location, even
+         when the build itself was launched by absolute path. See Directory.Build.props. -->
+    <Exec Command="&quot;$(MainguardDotnetHost)&quot; publish &quot;$(MSBuildThisFileDirectory)..\Mainguard.Server\Mainguard.Server.csproj&quot; -c $(Configuration) -r linux-x64 --self-contained true -p:BuildDaemonPayload=false -o &quot;$(MainguardDaemonPayload.TrimEnd('\'))&quot;" />
   </Target>
 
   <Target Name="BundleDaemonPayloadToOutput" AfterTargets="Build">
@@ -267,7 +270,8 @@
           Condition="'$(BuildElevatedStage)' != 'false'">
     <Message Importance="high"
              Text="Publishing the elevated helper self-contained into '$(_ElevatedStageDir)' so the packaged app can relocate it out of %LocalAppData% (MG-15; /p:BuildElevatedStage=false to skip)…" />
-    <Exec Command="dotnet publish &quot;$(MSBuildThisFileDirectory)..\installer\Mainguard.Installer.Elevated\Mainguard.Installer.Elevated.csproj&quot; -c $(Configuration) -r $(MainguardElevatedStageRuntime) --self-contained true -o &quot;$(_ElevatedStageDir.TrimEnd('\'))&quot;" />
+    <!-- $(MainguardDotnetHost), not a bare `dotnet` — same PATH hazard as the daemon-payload publish above. -->
+    <Exec Command="&quot;$(MainguardDotnetHost)&quot; publish &quot;$(MSBuildThisFileDirectory)..\installer\Mainguard.Installer.Elevated\Mainguard.Installer.Elevated.csproj&quot; -c $(Configuration) -r $(MainguardElevatedStageRuntime) --self-contained true -o &quot;$(_ElevatedStageDir.TrimEnd('\'))&quot;" />
     <ItemGroup>
       <_ElevatedStageFiles Include="$(_ElevatedStageDir)**\*" />
     </ItemGroup>
