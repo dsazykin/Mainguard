@@ -18,6 +18,10 @@ namespace Mainguard.Server.Services;
 /// </summary>
 public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceBase
 {
+    /// <summary>The item id the review cockpit renders for the RT-D2 gate item (it has no
+    /// <c>FlaggedChange</c> row — the gate owns it), so client and daemon address it by the same name.</summary>
+    internal const string ChangedTestCommandItemId = "changed-test-command";
+
     private readonly IMergeQueueRegistry _registry;
     private readonly KillSwitchGate _killGate;
     private readonly IMergeBranchDiffService _mergeDiff;
@@ -95,24 +99,115 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         var leaseId = Guid.NewGuid().ToString("N");
         var verified = ctx.Queue.CurrentMainSha;
         var lease = ctx.Leases.TryBegin(request.RepoHandle, leaseId, request.AgentId, verified, "main");
-        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted={Granted}",
-            request.RepoHandle, request.AgentId, lease is not null);
-        return Task.FromResult(lease is null
-            ? new BeginMergeResponse { Granted = false, Reason = "another merge is already in progress for this repository" }
-            : new BeginMergeResponse { Granted = true, LeaseId = lease.LeaseId });
+        if (lease is null)
+        {
+            _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=False (lease held)",
+                request.RepoHandle, request.AgentId);
+            return Task.FromResult(new BeginMergeResponse
+            {
+                Granted = false,
+                Reason = "another merge is already in progress for this repository",
+            });
+        }
+
+        // MG-11: the gate is read UNDER the lease, never before it (the MG-23 ordering the external
+        // dispatch already uses). Granting a lease to a branch that cannot merge is worse than useless: it
+        // blocks every other merge on the repo while the caller goes off to perform a merge the daemon was
+        // always going to refuse at ConfirmMerge.
+        if (!ctx.Queue.CanMerge(request.AgentId, out var gateReason))
+        {
+            ctx.Leases.Release(request.RepoHandle, leaseId);
+            _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=False reason={Reason}",
+                request.RepoHandle, request.AgentId, gateReason);
+            return Task.FromResult(new BeginMergeResponse { Granted = false, Reason = gateReason });
+        }
+
+        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=True", request.RepoHandle, request.AgentId);
+        return Task.FromResult(new BeginMergeResponse { Granted = true, LeaseId = lease.LeaseId });
     }
 
+    /// <summary>
+    /// RT-D1 step 3 — record a merge the human already drove. <b>MG-11: this is an ENFORCEMENT point, not a
+    /// bookkeeping call.</b> It used to invoke <c>Leases.Confirm</c> (a no-op when no lease is held) and then
+    /// <c>ConfirmHumanMerge</c> unconditionally: no <c>CanMerge</c>, no freshness compare, no gate, and no
+    /// requirement that the caller hold the merge lease at all. Every check lived in the client cockpit, so
+    /// any caller that skipped the cockpit — or any cockpit that lost a race to a co-tenant's merge — moved
+    /// a branch to <c>Merged</c> on stale or unreviewed evidence. Three things are now required, in order:
+    /// the caller's lease must be the repo's outstanding one and name this agent; the queue's merge gate
+    /// must pass; and the lease's expected <c>main@sha</c> must still be the queue's current main — the last
+    /// two evaluated together under the queue lock by <see cref="MergeQueue.TryConfirmHumanMerge"/>.
+    /// </summary>
     public override Task<ConfirmMergeResponse> ConfirmMerge(ConfirmMergeRequest request, ServerCallContext context)
     {
         // SA-1/F4: a frozen queue refuses the merge confirmation too.
         ThrowIfFrozen("ConfirmMerge");
         var ctx = Resolve(request.RepoHandle);
-        // Record the idempotency outcome, then move the branch to Merged and fire the stale cascade.
+
+        // (1) A held lease is the caller's proof it went through BeginMerge for THIS agent. Leases.Confirm
+        // is idempotent and silently no-ops on an unknown lease, so calling it was never a check.
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is null
+            || !string.Equals(lease.LeaseId, request.LeaseId, StringComparison.Ordinal)
+            || !string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: no matching outstanding merge lease",
+                request.RepoHandle, request.AgentId);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                "No outstanding merge lease for this repository and agent — call BeginMerge first."));
+        }
+
+        // (2)+(3) Gate and freshness, atomically with the Merged transition.
+        if (!ctx.Queue.TryConfirmHumanMerge(request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason))
+        {
+            // Nothing moved to Merged, so the lease must not strand the repo — the same "every non-merged
+            // exit hands the lease back" rule MergeDispatch follows. A merge that really did land on a ref
+            // despite the refusal is still recoverable: it left a T-19 journal entry, and the boot reconcile
+            // synthesizes the confirm from it.
+            ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
+            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, reason);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, reason));
+        }
+
+        // Only now is the idempotency record written: a confirmed lease is the daemon's statement that this
+        // merge landed, and the boot reconcile reads it to tell a landed merge from an abandoned one.
         ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
-        ctx.Queue.ConfirmHumanMerge(request.AgentId, request.NewMainSha);
         _log.LogInformation("ConfirmMerge repo={Repo} agent={Agent} newMainSha={Sha}",
             request.RepoHandle, request.AgentId, request.NewMainSha);
         return Task.FromResult(new ConfirmMergeResponse { Confirmed = true });
+    }
+
+    /// <summary>
+    /// P2-11 step 4 — acknowledge one must-acknowledge flagged item so the merge gate can pass. A gate the
+    /// daemon evaluates but no human can clear is not a gate, it is a permanently unmergeable branch; this
+    /// is the missing half of moving the RT-D2 gate daemon-side. Per item, never "all" (a global ack is a
+    /// rejection trigger, which is why <c>AcknowledgmentStore</c> exposes no such method either).
+    /// </summary>
+    public override Task<AcknowledgeFlaggedChangeResponse> AcknowledgeFlaggedChange(
+        AcknowledgeFlaggedChangeRequest request, ServerCallContext context)
+    {
+        var ctx = Resolve(request.RepoHandle);
+        var acknowledged = false;
+
+        if (string.Equals(request.ItemId, ChangedTestCommandItemId, StringComparison.Ordinal)
+            && ctx.ChangedTestCommand is { } changed)
+        {
+            // Acknowledge is a no-op for an agent that is not flagged, so the "was it really cleared?"
+            // answer is read back off the gate rather than assumed from the call having been made.
+            changed.Acknowledge(request.AgentId);
+            acknowledged = !changed.IsUnacknowledged(request.AgentId);
+        }
+
+        var can = ctx.Queue.CanMerge(request.AgentId, out var reason);
+        _log.LogInformation(
+            "AcknowledgeFlaggedChange repo={Repo} agent={Agent} item={Item} acknowledged={Ack} canMerge={Can}",
+            request.RepoHandle, request.AgentId, request.ItemId, acknowledged, can);
+        return Task.FromResult(new AcknowledgeFlaggedChangeResponse
+        {
+            Acknowledged = acknowledged,
+            CanMerge = can,
+            Reason = reason,
+        });
     }
 
     public override Task<GetMergeDiffResponse> GetMergeDiff(GetMergeDiffRequest request, ServerCallContext context)

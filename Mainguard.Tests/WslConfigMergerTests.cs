@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using Mainguard.Agents.Agents.Bootstrap;
 using Xunit;
 
@@ -8,7 +9,9 @@ namespace Mainguard.Tests;
 
 // TI-P2-05 #1-#3 / plan §6 #1-#2: the pure INI merger is the correctness heart of P2-05. Every case
 // is fixture-tested against a committed expected file so a byte-level regression (lost user key,
-// clobbered comment, mangled CRLF) fails the build.
+// clobbered comment, mangled CRLF) fails the build. The tail of the file pins the other half of the
+// same guarantee — how the merged result LANDS on disk (MG-32: atomic temp+swap, backup first), since
+// .wslconfig is the machine's GLOBAL WSL2 config and a torn write there breaks every distro.
 public class WslConfigMergerTests
 {
     // The keys Mainguard wants under [wsl2]. Fixed here so the expected fixtures are stable.
@@ -165,6 +168,121 @@ public class WslConfigMergerTests
         var content = "[wsl2]\r\nprocessors=2\r\nmemory=6GB\r\n";
 
         Assert.Equal("[wsl2]\r\nprocessors=2\r\n", WslConfigMerger.RemoveMainguardKeys(content));
+    }
+
+    // ---- MG-32: the ON-DISK write path (BootstrapFileSystem) ----------------------------------------
+    // The merge above is pure; landing its result on disk is where the machine-wide risk lives.
+    // %UserProfile%\.wslconfig configures EVERY WSL2 distro, so the write must never be observable in a
+    // torn state: File.WriteAllText truncates in place and then streams, which under a crash — or under
+    // a reader/another writer — leaves the user's GLOBAL config empty or half-written. These run against
+    // the real BootstrapFileSystem in a temp directory.
+
+    [Fact]
+    public async System.Threading.Tasks.Task WriteWslConfig_ShouldNeverBeObservableTruncated_WhileBeingRewritten()
+    {
+        using var dir = new TempDir();
+        var fs = new BootstrapFileSystem(dir.Path);
+
+        // Big enough that an in-place truncate+stream write leaves a wide window a reader lands in.
+        var a = "[wsl2]\n" + new string('a', 1024 * 1024) + "\n";
+        var b = "[wsl2]\n" + new string('b', 1024 * 1024) + "\n";
+        fs.WriteWslConfig(a);
+
+        var torn = new System.Collections.Concurrent.ConcurrentBag<int>();
+        var reads = 0;
+        var seen = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>();
+        var stop = false;
+
+        var reader = System.Threading.Tasks.Task.Run(() =>
+        {
+            while (!System.Threading.Volatile.Read(ref stop))
+            {
+                string observed;
+                try
+                {
+                    // FileShare.ReadWrite: we are only observing, never blocking the writer.
+                    using var stream = new FileStream(fs.WslConfigPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var sr = new StreamReader(stream);
+                    observed = sr.ReadToEnd();
+                }
+                catch (IOException) { continue; }              // transient share/rename race — not an observation
+                catch (UnauthorizedAccessException) { continue; }
+
+                System.Threading.Interlocked.Increment(ref reads);
+                if (observed == a || observed == b)
+                    seen.TryAdd(observed, 0);
+                else
+                    torn.Add(observed.Length);                  // ANY other content is a torn read
+            }
+        });
+
+        for (var i = 0; i < 40 && seen.Count < 2; i++)
+            fs.WriteWslConfig(i % 2 == 0 ? b : a);
+
+        System.Threading.Volatile.Write(ref stop, true);
+        await reader.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.True(reads > 0, "the reader never observed the file — the test proved nothing");
+        Assert.True(torn.IsEmpty,
+            $"observed {torn.Count} torn .wslconfig read(s) (lengths: {string.Join(", ", torn)}) — the write is not atomic");
+    }
+
+    // Round-trips through the real filesystem: creating a missing file, replacing an existing one
+    // byte-for-byte (incl. CRLF and no BOM — WSL parses this INI), and leaving no temp litter behind in
+    // %UserProfile% from the temp+swap.
+    [Fact]
+    public void WriteWslConfig_ShouldReplaceContentExactly_AndLeaveNoTempFiles()
+    {
+        using var dir = new TempDir();
+        var fs = new BootstrapFileSystem(dir.Path);
+
+        Assert.Null(fs.ReadWslConfig());                          // nothing there yet
+        fs.WriteWslConfig("[wsl2]\r\nmemory=6GB\r\n");            // create
+        Assert.Equal("[wsl2]\r\nmemory=6GB\r\n", fs.ReadWslConfig());
+
+        fs.WriteWslConfig("[wsl2]\nmemory=2GB\n");                // replace with SHORTER content
+        Assert.Equal("[wsl2]\nmemory=2GB\n", fs.ReadWslConfig());
+
+        // No BOM: File.WriteAllText emitted none and WSL's parser should not have to tolerate one.
+        var bytes = File.ReadAllBytes(fs.WslConfigPath);
+        Assert.NotEqual(new byte[] { 0xEF, 0xBB, 0xBF }, bytes[..3]);
+
+        Assert.Equal(new[] { ".wslconfig" }, Directory.GetFiles(dir.Path).Select(Path.GetFileName).ToArray());
+    }
+
+    // Backup-before-write still holds (invariant §5.4) after the write became a temp+swap: the backup is
+    // a copy of the PRE-write content, taken next to the file, and never clobbers an earlier one.
+    [Fact]
+    public void BackupWslConfig_ShouldSnapshotPreWriteContent_AndNeverClobberAnEarlierBackup()
+    {
+        using var dir = new TempDir();
+        var fs = new BootstrapFileSystem(dir.Path);
+
+        fs.BackupWslConfig();                                     // missing file → no-op, no throw
+        Assert.Empty(Directory.GetFiles(dir.Path));
+
+        fs.WriteWslConfig("[wsl2]\nmemory=6GB\n");
+        fs.BackupWslConfig();
+        fs.WriteWslConfig("[wsl2]\nmemory=2GB\n");
+        fs.BackupWslConfig();
+
+        var backups = Directory.GetFiles(dir.Path, ".wslconfig.mainguard.*.bak");
+        Assert.Equal(2, backups.Length);                          // second-resolution collision uniquified
+        var contents = backups.Select(File.ReadAllText).ToArray();
+        Assert.Contains("[wsl2]\nmemory=6GB\n", contents);
+        Assert.Contains("[wsl2]\nmemory=2GB\n", contents);
+    }
+
+    private sealed class TempDir : IDisposable
+    {
+        public TempDir() => Path = Directory.CreateTempSubdirectory("mainguard-wslconfig-").FullName;
+
+        public string Path { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(Path, recursive: true); } catch { /* best-effort */ }
+        }
     }
 
     private static string ReadFixture(string name)

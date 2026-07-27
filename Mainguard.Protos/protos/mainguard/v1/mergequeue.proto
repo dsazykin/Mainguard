@@ -21,6 +21,10 @@ service MergeQueueService {
   rpc ConfirmMerge(ConfirmMergeRequest) returns (ConfirmMergeResponse);
   // P2-47 #7: the agent-branch-vs-main diff the review cockpit renders (StreamQueue doesn't carry it).
   rpc GetMergeDiff(GetMergeDiffRequest) returns (GetMergeDiffResponse);
+  // P2-11 step 4 / RT-D2: acknowledge ONE must-acknowledge flagged item, daemon-side, so a gate the daemon
+  // evaluates is a gate a human can actually clear. Item-by-item by construction — there is no
+  // "acknowledge all" RPC, exactly as there is no "acknowledge all" method on AcknowledgmentStore.
+  rpc AcknowledgeFlaggedChange(AcknowledgeFlaggedChangeRequest) returns (AcknowledgeFlaggedChangeResponse);
 }
 
 message StreamQueueRequest {
@@ -87,6 +91,20 @@ message ConfirmMergeRequest {
 
 message ConfirmMergeResponse {
   bool confirmed = 1;
+}
+
+message AcknowledgeFlaggedChangeRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+  // The FlaggedChange.Id to acknowledge, or the literal "changed-test-command" for the RT-D2 item, which
+  // lives on its own gate rather than in the branch's flagged set.
+  string item_id = 3;
+}
+
+message AcknowledgeFlaggedChangeResponse {
+  bool acknowledged = 1;   // false when the id named no live, unacknowledged item
+  bool can_merge = 2;      // the gate re-read after the ack (so the caller needn't round-trip again)
+  string reason = 3;       // rendered verbatim when can_merge is false (§3.4 vocabulary)
 }
 
 message GetMergeDiffRequest {

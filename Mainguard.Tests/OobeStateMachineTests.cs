@@ -208,16 +208,26 @@ public class OobeStateMachineTests
 
     // ---- #4 / plan §7: resume task uses the elevated Scheduled Task — NEVER RunOnce ---------------
 
+    /// <summary>A synthetic Windows machine: Program Files is administrator-owned, the user profile is
+    /// not. Data rather than an environment lookup, which is what lets the Windows rules run on Linux CI.</summary>
+    internal static ProtectedLocationPolicy WindowsLikeProtection() => ProtectedLocationPolicy.Create(
+        new[] { @"C:\Program Files", @"C:\Windows" },
+        new[] { @"C:\Users\victim", @"C:\Users\victim\AppData\Local" });
+
     [Fact]
     public void Oobe_ResumeTask_UsesScheduledTask_NeverRunOnce()
     {
-        var args = InstallerCommands.RegisterResumeTask(@"C:\Program Files\Mainguard\Mainguard.Installer.exe");
+        var args = InstallerCommands.RegisterResumeTask(
+            @"C:\Program Files\Mainguard\Mainguard.Installer.exe", @"C:\Program Files\Mainguard",
+            WindowsLikeProtection());
         var joined = string.Join(" ", args);
 
         Assert.DoesNotContain("RunOnce", joined, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("/Create", args);
         Assert.Contains("ONLOGON", args);                       // survives the reboot
-        Assert.Contains("HIGHEST", args);                       // elevated
+        // HIGHEST is granted here — and ONLY here — because this target sits under an administrator-owned
+        // root, so its bytes cannot be replaced without already having administrator rights (MG-15).
+        Assert.Contains("HIGHEST", args);
         Assert.Contains(InstallerCommands.ResumeTaskName, args);
 
         // Self-deleting: the unregister builder targets exactly the same task.
@@ -226,15 +236,52 @@ public class OobeStateMachineTests
         Assert.Contains(InstallerCommands.ResumeTaskName, del);
     }
 
+    // ---- MG-9: the ONLOGON/HIGHEST registration refuses to name an arbitrary executable ----------
+
+    [Theory]
+    // The registration this builds runs /RL HIGHEST at ONLOGON — elevated, at every logon, with NO UAC
+    // prompt. It used to interpolate whatever string it was handed, so anything that could reach the
+    // elevated helper could have Windows run any executable as administrator, forever.
+    [InlineData(@"C:\Users\victim\Downloads\evil.exe")]      // an arbitrary exe elsewhere on disk
+    [InlineData(@"C:\Windows\System32\cmd.exe")]
+    [InlineData(@"\\attacker\share\evil.exe")]               // off-machine
+    [InlineData(@"C:\Program Files\Mainguard\..\..\Windows\System32\cmd.exe")] // traversal out
+    [InlineData("evil.exe")]                                  // relative → resolved against a CWD
+    [InlineData("C:\\Program Files\\Mainguard\\x.exe\" & calc.exe & \"")] // /TR quoting break-out
+    public void Oobe_ResumeTask_RefusesAnyTargetOutsideTheInstall(string target)
+    {
+        Assert.Throws<ArgumentException>(
+            () => InstallerCommands.RegisterResumeTask(
+                target, @"C:\Program Files\Mainguard", WindowsLikeProtection()));
+    }
+
+    [Fact]
+    public void Oobe_ResumeTask_RegistersTheCanonicalFormOfALegitimateTarget()
+    {
+        var args = InstallerCommands.RegisterResumeTask(
+            "C:/Program Files/Mainguard/Mainguard.Pro.App.exe", @"C:\Program Files\Mainguard",
+            WindowsLikeProtection());
+
+        var tr = args.SkipWhile(a => a != "/TR").Skip(1).First();
+        Assert.Equal("\"C:\\Program Files\\Mainguard\\Mainguard.Pro.App.exe\" --resume", tr);
+        // Exactly two quotes: the ones we put there. A validated path cannot contribute a third.
+        Assert.Equal(2, tr.Split('"').Length - 1);
+    }
+
     // ---- Invariant 4: elevated helper scope is exactly the two enumerated actions ----------------
 
     [Fact]
-    public void Oobe_ElevatedHelper_ScopeIsExactlyTwoActions()
+    public void Oobe_ElevatedHelper_ScopeIsExactlyTheEnumeratedActions()
     {
+        // MG-15 added the third entry — relocating the elevated components into an administrator-owned
+        // root needs one privileged write, and only the already-elevated component can make it. Its
+        // safety argument is that it takes NO source or destination from anyone (see
+        // InstallerCommands.PrivilegedActionCatalog); the scope is still an enumerated, closed list.
         var catalog = InstallerCommands.PrivilegedActionCatalog();
-        Assert.Equal(2, catalog.Count);
+        Assert.Equal(3, catalog.Count);
         Assert.Contains("enable-windows-optional-features", catalog);
         Assert.Contains("register-resume-scheduled-task", catalog);
+        Assert.Contains("install-elevated-components-to-protected-root", catalog);
     }
 
     [Fact]

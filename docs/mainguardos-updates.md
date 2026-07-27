@@ -70,7 +70,11 @@ Precedent (2026-07): the daemon-side migration-lock fix shipped as the 0.2.0→0
 in-depth daemon-logging change followed the same discipline: 0.2.1→0.2.2 lockstep (both csprojs) +
 0.1.1→0.1.2 payload `VERSION` (the embedded daemon changed). The sandbox-image version anchor
 (Item 1) shipped as the **0.2.3→0.2.4 lockstep bump with NO payload `VERSION` cut** — the daemon
-gained the version constant + staleness preflight but the images ship beside the app (rule 3). A CI guard enforcing the App/Server
+gained the version constant + staleness preflight but the images ship beside the app (rule 3).
+MG-27/MG-36 followed the identical shape: **0.2.5→0.2.6 lockstep, no payload `VERSION` cut** — both
+Dockerfiles changed (pinned base-image digests + checksummed toolchain installers) so both image
+constants moved, and the daemon spawn chain changed with them (it now creates jails from the resolved
+`sha256:` digest, on a per-agent network segment). A CI guard enforcing the App/Server
 lockstep is a tracked follow-up (see
 `docs/planning/Agent_Image_Provisioning_And_Daemon_Logging_Backlog.md`); until it lands, review is
 the guard.

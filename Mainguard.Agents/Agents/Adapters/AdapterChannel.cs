@@ -24,6 +24,24 @@ public enum AdapterChannelError
     ProbeFailed,
     /// <summary>The health probe ran but did not report the pinned version (wrong version installed).</summary>
     VersionMismatch,
+
+    /// <summary>The requested update did not move the pin strictly FORWARD (MG-14) — it was older than,
+    /// equal to, or not orderable against the version currently pinned, so it was refused rather than
+    /// applied. A distinct code because callers must not present it as an install failure: nothing
+    /// broke, an unsafe or pointless move was declined.</summary>
+    UpdateRefused,
+
+    /// <summary>A configured <see cref="IPayloadSignatureVerifier"/> actively REJECTED the payload's
+    /// signature. Never produced by the default verifier, which has no signing identity to check
+    /// against and answers <see cref="SignatureVerdictKind.NotAvailable"/> instead.</summary>
+    SignatureRejected,
+
+    /// <summary>MG-9: the adapter's declared <see cref="AdapterProvenanceLevel"/> could not be met — no
+    /// registry signature under a pinned npm key, bytes that do not hash to the signed integrity, or a
+    /// missing/mis-bound build-provenance attestation. Distinct from
+    /// <see cref="HashMismatch"/> (which only ever compares against a pin we ourselves wrote) because
+    /// this is the check that establishes ORIGIN rather than sameness.</summary>
+    ProvenanceRejected,
 }
 
 /// <summary>The typed refusal/failure of an adapter operation.</summary>
@@ -291,6 +309,24 @@ public sealed class AdapterChannel
         {
             throw new AdapterChannelException(AdapterChannelError.HashMismatch,
                 $"Adapter '{adapterId}' payload hash did not match the pinned sha256; install refused.");
+        }
+
+        // The hash above answers "are these the bytes the pin covers?" — never "did these bytes come
+        // from someone we trust?". For a pin the USER's own accepted update wrote, the answer to the
+        // second question is circular: the hash was computed from whatever the registry served. This is
+        // the single seam where provenance would be established. What this does with each verdict:
+        //   Rejected     → refuse, before anything is staged into the VM.
+        //   NotAvailable → proceed, with the reason carried in the exception/log text. Expected here on
+        //                  EVERY build, signed or not: an npm tarball is a third-party artifact we do
+        //                  not sign, so SigningPolicy.Covers excludes this kind and the reason names
+        //                  what does cover it (npm provenance attestations, plan step 2).
+        //   Verified     → proceed; not reachable today for this kind, by that same exclusion.
+        var signature = PayloadSignature.VerifyBytes(
+            SignedArtifactKind.AdapterPayload, $"{spec.Id}@{spec.Version}", payload);
+        if (signature.MustRefuse)
+        {
+            throw new AdapterChannelException(AdapterChannelError.SignatureRejected,
+                $"Adapter '{adapterId}' payload failed its signature check; install refused: {signature.Reason}");
         }
 
         // Stage the VERIFIED bytes into the VM and expand {payload} in the install command — the

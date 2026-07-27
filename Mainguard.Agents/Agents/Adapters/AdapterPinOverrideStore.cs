@@ -52,10 +52,15 @@ public interface IAdapterPinOverrideStore
 
 /// <summary>
 /// The file-backed override store: one JSON dictionary at
-/// <c>%LocalAppData%\Mainguard\adapters\pin-overrides.json</c>. Set validates like the manifest
-/// parser (a concrete pinned version, a 64-hex sha256, an HTTPS payload URL) so a corrupt or
-/// hand-edited entry can never weaken what <see cref="AdapterChannel.EnsureAsync"/> installs; a
-/// corrupt FILE reads as "no overrides" (the bundled pins simply apply).
+/// <c>%LocalAppData%\Mainguard\adapters\pin-overrides.json</c>. Entries are validated like the manifest
+/// parser (a concrete pinned version, a 64-hex sha256, an HTTPS payload URL) on <b>both</b> sides of the
+/// file — <see cref="Set"/> refuses to write one, and <see cref="ReadAll"/> drops one it finds — so a
+/// corrupt or hand-edited entry can never weaken what <see cref="AdapterChannel.EnsureAsync"/> installs.
+/// Validating only on write trusted the file itself, which is exactly the input an attacker (or a botched
+/// merge) can supply: this file is a plain user-writable JSON on disk, not something only this class
+/// authors, so an unvalidated read let an `http://` payload URL or a `latest` version back in. A corrupt
+/// FILE, and now any invalid ENTRY within a good file, reads as "no override" — the bundled pin applies,
+/// which is the safe direction.
 /// </summary>
 public sealed class FileAdapterPinOverrideStore : IAdapterPinOverrideStore
 {
@@ -92,12 +97,23 @@ public sealed class FileAdapterPinOverrideStore : IAdapterPinOverrideStore
     private static void Validate(AdapterPinOverride pin)
     {
         ArgumentNullException.ThrowIfNull(pin);
+        var reason = Invalid(pin);
+        if (reason is not null) throw new ArgumentException(reason);
+    }
+
+    /// <summary>The single pin-discipline rule, phrased as a reason-or-null so the write path can throw
+    /// it and the read path can silently drop the entry. One rule, two callers — a second copy is how
+    /// the read side drifted into trusting the file in the first place.</summary>
+    private static string? Invalid(AdapterPinOverride? pin)
+    {
+        if (pin is null) return "Override entry is null.";
         if (!AdapterManifest.IsPinnedVersion(pin.Version))
-            throw new ArgumentException($"Override version '{pin.Version}' is not pinned to a concrete release.");
+            return $"Override version '{pin.Version}' is not pinned to a concrete release.";
         if (pin.Sha256 is not { Length: 64 })
-            throw new ArgumentException("Override sha256 must be 64 hex chars.");
-        if (!pin.PayloadUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-            throw new ArgumentException("Override payloadUrl must be HTTPS.");
+            return "Override sha256 must be 64 hex chars.";
+        if (pin.PayloadUrl is null || !pin.PayloadUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return "Override payloadUrl must be HTTPS.";
+        return null;
     }
 
     private Dictionary<string, AdapterPinOverride> ReadAll()
@@ -106,8 +122,21 @@ public sealed class FileAdapterPinOverrideStore : IAdapterPinOverrideStore
         {
             if (!File.Exists(_path))
                 return new Dictionary<string, AdapterPinOverride>(StringComparer.Ordinal);
-            return JsonSerializer.Deserialize<Dictionary<string, AdapterPinOverride>>(File.ReadAllText(_path))
+            var parsed = JsonSerializer.Deserialize<Dictionary<string, AdapterPinOverride>>(File.ReadAllText(_path))
                 ?? new Dictionary<string, AdapterPinOverride>(StringComparer.Ordinal);
+
+            // Re-validate on the way IN: the file is user-writable, so "we validated it when we wrote it"
+            // is not a property of what we just read back. An entry that fails the pin discipline is
+            // dropped rather than thrown, so one bad hand-edit degrades to the bundled pin for THAT
+            // adapter instead of bricking every install. Dropping it here also prunes it from the next
+            // Set(), because Set writes this same (filtered) dictionary back.
+            var clean = new Dictionary<string, AdapterPinOverride>(StringComparer.Ordinal);
+            foreach (var (id, pin) in parsed)
+            {
+                if (!string.IsNullOrWhiteSpace(id) && Invalid(pin) is null) clean[id] = pin;
+            }
+
+            return clean;
         }
         catch (Exception)
         {

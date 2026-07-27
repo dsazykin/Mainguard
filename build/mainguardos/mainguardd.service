@@ -8,6 +8,11 @@
 # The daemon binds loopback 127.0.0.1:5250 only (DaemonOptions.DefaultPort, invariant 2). WSL2
 # localhostForwarding relays the Windows app's 127.0.0.1:5250 connection into this in-VM listener, so
 # no non-loopback bind is ever needed.
+#
+# MG-19: that relay also means loopback is NOT an isolation boundary — the port is reachable from any
+# process in the Windows user's session, and from the user's other WSL2 distros. The listener therefore
+# serves mutually-authenticated TLS (not h2c), pinned to per-session certificates written beside
+# daemon.token; the bearer token is no longer the sole gate. See docs/security-architecture.md.
 
 [Unit]
 Description=Mainguard orchestration daemon (mainguardd)

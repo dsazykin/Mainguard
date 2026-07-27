@@ -38,7 +38,11 @@ public sealed class DaemonAuthTests
     [Fact]
     public void ForLoopback_MissingTokenFile_ShouldThrowWhenReadingToken()
     {
-        var missing = Path.Combine(Path.GetTempPath(), "mainguard-missing-" + Guid.NewGuid().ToString("N"), "daemon.token");
+        // MG-19: give the client valid transport credentials so the ONLY thing missing is the token —
+        // otherwise the credential gate would fire first and this would stop testing the token read.
+        var dir = Path.Combine(Path.GetTempPath(), "mainguard-missing-" + Guid.NewGuid().ToString("N"));
+        TestTools.DaemonTransportMaterial.Write(dir);
+        var missing = Path.Combine(dir, "daemon.token");
         using var client = DaemonClient.ForLoopback(FreePort(), missing);
 
         // The token is read from the file when the call builds its auth metadata — a
@@ -63,12 +67,41 @@ public sealed class DaemonAuthTests
         Directory.CreateDirectory(dir);
         var path = Path.Combine(dir, "daemon.token");
         await File.WriteAllTextAsync(path, "deadbeef");
+        TestTools.DaemonTransportMaterial.Write(dir); // MG-19: a complete session, so only the daemon is absent
 
         using var client = DaemonClient.ForLoopback(FreePort(), path);
 
         // Token read succeeds; the failure is the dead network (RpcException), not an IO error.
         await Assert.ThrowsAsync<RpcException>(() =>
             client.ListAgentsAsync(CancellationToken.None, TimeSpan.FromSeconds(2)));
+    }
+
+    // MG-19 — the client must refuse to build a connection when the transport credentials are absent,
+    // rather than silently reverting to the cleartext h2c channel it used to open. A downgrade here
+    // would hand the bearer token to whatever process happened to be listening on the port.
+    [Fact]
+    public void ForLoopback_MissingTransportCredentials_ShouldThrow_NotDowngradeToPlaintext()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "mainguard-nocreds-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var path = Path.Combine(dir, "daemon.token");
+        File.WriteAllText(path, "deadbeef"); // a valid token, and deliberately nothing else
+
+        using var client = DaemonClient.ForLoopback(FreePort(), path);
+
+        var ex = Assert.ThrowsAny<InvalidOperationException>(() =>
+        {
+            try
+            {
+                client.ListAgentsAsync(CancellationToken.None, TimeSpan.FromSeconds(2)).GetAwaiter().GetResult();
+            }
+            catch (AggregateException aggregate) when (aggregate.InnerException is not null)
+            {
+                throw aggregate.InnerException;
+            }
+        });
+
+        Assert.Contains("will not fall back", ex.Message);
     }
 
     private static bool IsRpcMethod(MethodInfo method)

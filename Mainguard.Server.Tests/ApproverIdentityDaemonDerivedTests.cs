@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using System.Threading.Tasks;
 using Grpc.Core;
@@ -26,6 +27,41 @@ public class ApproverIdentityDaemonDerivedTests
         public FakeIdentityResolver(string identity) => _identity = identity;
         public string Resolve(ServerCallContext context) => _identity;
     }
+
+    /// <summary>
+    /// MG-16 — what the shipped resolver ACTUALLY returns, asserted rather than described. Loopback TCP
+    /// carries no peer credential (<c>SO_PEERCRED</c> is a Unix-domain-socket facility), so
+    /// <see cref="PeerCredentialIdentityResolver"/> reports the DAEMON's own OS identity: a constant, the
+    /// same for every caller. Locking that down keeps the code and its documentation honest — an approval
+    /// record attributes the host session, and cannot say which local principal approved. Changing that
+    /// is a transport/trust-model decision, not a refactor.
+    /// </summary>
+    [Fact]
+    public void PeerCredentialResolver_ReportsTheDaemonsOwnIdentity_ConstantForEveryCaller()
+    {
+        var resolver = new PeerCredentialIdentityResolver();
+
+        // The call context is never consulted — there is nothing on a loopback TCP connection to read —
+        // so resolution succeeds even with no context at all, and cannot vary between callers.
+        var first = resolver.Resolve(null!);
+        var second = resolver.Resolve(null!);
+
+        Assert.False(string.IsNullOrWhiteSpace(first));
+        Assert.Equal(first, second);
+
+        if (OperatingSystem.IsLinux())
+        {
+            // This test runs in the same process as the in-proc daemon, so "the daemon's euid" is ours.
+            Assert.Equal($"uid:{geteuid()}", first);
+        }
+        else
+        {
+            Assert.Equal($"os:{Environment.UserName}", first);
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", SetLastError = true)]
+    private static extern uint geteuid();
 
     [Fact]
     public void ApproverIdentity_IsDaemonDerived_NotClientField_ProtoHasNoIdentityField()

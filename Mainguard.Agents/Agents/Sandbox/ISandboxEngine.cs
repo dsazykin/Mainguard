@@ -31,6 +31,14 @@ public sealed record SandboxSecrets(
 /// <param name="BareRepoPath">The VM-side bare mirror backing the worktree, bind-mounted at its
 /// identical VM path so the linked worktree's <c>gitdir:</c> pointer resolves in-jail (see
 /// <see cref="ContainerSpecRequest"/>). Null = no mirror mount.</param>
+/// <param name="NetworkName">MG-36 — the per-agent, single-tenant default-deny segment this jail
+/// attaches to (<see cref="EgressProxyConfigurator.AgentSegmentName"/>), so agent A has no L2 or L3
+/// path to agent B. Null keeps the engine's configured network (the shared <c>mainguard-agents</c>
+/// segment) — the pre-segmentation topology, still used by the ad-hoc harnesses.</param>
+/// <param name="ProxyUrl">MG-36 — the proxy URL for THIS segment. With one network per agent the
+/// proxy holds a different address on each, and the jail's pinned dnsmasq cannot answer the proxy's
+/// name differently per client, so the jail is given the address directly. Null keeps the engine's
+/// configured URL.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -42,7 +50,9 @@ public sealed record SandboxSpawnRequest(
     int SupervisorUid,
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
-    string? BareRepoPath = null);
+    string? BareRepoPath = null,
+    string? NetworkName = null,
+    string? ProxyUrl = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);
@@ -84,6 +94,19 @@ public interface ISandboxEngine
     /// </summary>
     Task<string?> ImageVersionAsync(string imageRef, CancellationToken ct = default) =>
         Task.FromResult(SandboxImageVersions.For(imageRef));
+
+    /// <summary>
+    /// MG-27 — the immutable content digest (<c>sha256:&lt;64 hex&gt;</c>) the mutable ref
+    /// <paramref name="imageRef"/> currently resolves to, or <c>null</c> when the image is absent.
+    ///
+    /// <para>This is what turns the spawn preflight from "the thing behind <c>:latest</c> looked right
+    /// a moment ago" into a pin: the launcher resolves the ref ONCE, checks that digest, and then
+    /// creates the container from the digest, so a tag re-pointed between the check and the create
+    /// cannot change which bytes run. The default returns <c>null</c> — an engine (or test fake) with
+    /// no image store has no digest to offer and stays on its ref, exactly as before.</para>
+    /// </summary>
+    Task<string?> ImageDigestAsync(string imageRef, CancellationToken ct = default) =>
+        Task.FromResult<string?>(null);
 
     /// <summary>Run a command inside a live sandbox (e.g. <c>devbox add jq</c>) and return its exit + output.</summary>
     Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default);

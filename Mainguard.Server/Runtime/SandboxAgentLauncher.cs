@@ -89,6 +89,7 @@ public sealed class SandboxAgentLauncher
         // DockerImageNotFoundException at container-create (agent-base), an opaque create failure
         // inside Egress.EnsureReadyAsync (egress-proxy), or a silently-stale image running old bytes.
         var problems = new List<SandboxImagePreflightProblem>();
+        string? pinnedImageRef = null;
         foreach (var imageRef in new[] { _imageRef, EgressProxyConfigurator.DefaultImageRef })
         {
             if (!await _environment.Sandboxes.ImageExistsAsync(imageRef, ct).ConfigureAwait(false))
@@ -97,8 +98,22 @@ public sealed class SandboxAgentLauncher
                 continue;
             }
 
+            // MG-27: resolve the MUTABLE ref to the image's immutable content digest, once, HERE — and
+            // spawn from that digest below. `:latest` is a pointer: without this the preflight verifies
+            // whatever the tag happened to name at check time and the create then re-resolves the tag,
+            // so nothing ties the image that was checked to the image that runs. A digest cannot be
+            // re-pointed, and unlike the mainguard.image.version label it cannot be chosen by whoever
+            // built the image. An engine with no image store answers null and stays on its ref.
+            var digest = await _environment.Sandboxes.ImageDigestAsync(imageRef, ct).ConfigureAwait(false);
+            if (string.Equals(imageRef, _imageRef, StringComparison.Ordinal))
+            {
+                pinnedImageRef = digest;
+            }
+
             // An image we don't version (a fully-renamed MAINGUARD_AGENT_IMAGE override) is
-            // presence-only — we have no expected hash to compare against.
+            // presence-only — we have no expected hash to compare against. It is still digest-pinned:
+            // the pin is about "the bytes we checked are the bytes that run", which holds regardless of
+            // whether we can say anything about WHICH bytes they ought to be.
             var expected = SandboxImageVersions.For(imageRef);
             if (expected is null)
             {
@@ -119,7 +134,10 @@ public sealed class SandboxAgentLauncher
             throw new SandboxImageMissingException(problems);
         }
 
-        _log.LogInformation("preflight ok: jail images present and current");
+        // The ref the jail is actually created from: the resolved digest when one is available, the
+        // original ref otherwise (a storeless engine / test fake).
+        var spawnImageRef = pinnedImageRef ?? _imageRef;
+        _log.LogInformation("preflight ok: jail images present and current; pinned image={Image}", spawnImageRef);
 
         // agentKind → the CLI the user dynamically installed. Resolved BEFORE the worktree so an
         // unknown kind costs nothing; the jail still spawns without a launch command (the operator
@@ -135,12 +153,23 @@ public sealed class SandboxAgentLauncher
             await _environment.Egress.EnsureReadyAsync(ct).ConfigureAwait(false);
             _log.LogInformation("egress ready (default-deny network + proxy)");
 
+            // MG-36: this agent's OWN default-deny segment — an internal network whose only other member
+            // is the shared proxy. Before this, every jail sat on one flat `mainguard-agents` network,
+            // so agent A could dial agent B's container IP and ports directly; there was no east-west
+            // control at all. Attaching the proxy to a new segment is additive (it keeps running, and
+            // its existing legs keep their addresses and MACs), so segmenting does not re-introduce the
+            // "recreating the proxy strands running jails" problem.
+            var segment = await _environment.Egress
+                .EnsureAgentSegmentAsync(repoHandle, agentId, ct).ConfigureAwait(false);
+            _log.LogInformation(
+                "egress segment ready: network={Network} proxy={Proxy}", segment.NetworkName, segment.ProxyAddress);
+
             var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials);
             var handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
                 AgentId: agentId,
                 WorktreePath: worktreePath,
-                ImageRef: _imageRef,
+                ImageRef: spawnImageRef,
                 Limits: SandboxLimits.Default,
                 Secrets: secrets,
                 AgentUid: AgentUid,
@@ -151,7 +180,12 @@ public sealed class SandboxAgentLauncher
                 IpcDirPath: ipcDirPath,
                 // The bare mirror at its identical VM path so the worktree's gitdir pointer resolves
                 // in-jail (field bug 2026-07-23: every in-jail git command died "not a git repository").
-                BareRepoPath: barePath), ct).ConfigureAwait(false);
+                BareRepoPath: barePath,
+                // MG-36: this agent's segment, and the proxy's address ON that segment. The address
+                // rather than the proxy's NAME because one dnsmasq cannot answer the same name with a
+                // different address per segment, and every other segment's address is unreachable.
+                NetworkName: segment.NetworkName,
+                ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)), ct).ConfigureAwait(false);
 
             _log.LogInformation(
                 "jail started: container={Container} reused={Reused} launchCmd={HasLaunch}",
@@ -167,7 +201,8 @@ public sealed class SandboxAgentLauncher
         }
     }
 
-    /// <summary>Best-effort teardown of a launched agent: remove the jail, then its worktree. Never throws.</summary>
+    /// <summary>Best-effort teardown of a launched agent: remove the jail, then its MG-36 network
+    /// segment, then its worktree. Never throws.</summary>
     public async Task TeardownAsync(string? repoHash, string agentId, string containerId, CancellationToken ct = default)
     {
         try { await _environment.Sandboxes.RemoveAsync(containerId, ct).ConfigureAwait(false); }
@@ -175,6 +210,13 @@ public sealed class SandboxAgentLauncher
 
         if (!string.IsNullOrEmpty(repoHash))
         {
+            // MG-36: reclaim the segment. Docker's local bridge address pool is finite (~32 networks by
+            // default), so a segment leaked per agent would eventually make spawning fail with an
+            // address-pool exhaustion error that reads like anything but the cause. Ordered AFTER the
+            // container removal because Docker refuses to delete a network with a live endpoint.
+            try { await _environment.Egress.RemoveAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false); }
+            catch { /* never fail a stop from teardown */ }
+
             TryRemoveWorktree(repoHash, agentId);
         }
     }

@@ -32,6 +32,10 @@ public sealed class RoleInterceptor : Interceptor
     {
         "/mainguard.v1.MergeQueueService/BeginMerge",
         "/mainguard.v1.MergeQueueService/ConfirmMerge",
+        // MG-11: acknowledging a flagged change is the human review act that unblocks a merge, so it is
+        // merge power by another name — a coordinator that could ack its own branch's flagged items would
+        // hold the merge gate it is denied at BeginMerge/ConfirmMerge.
+        "/mainguard.v1.MergeQueueService/AcknowledgeFlaggedChange",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
         // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per

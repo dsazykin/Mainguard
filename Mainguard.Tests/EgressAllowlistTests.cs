@@ -80,9 +80,29 @@ public class EgressAllowlistTests
     [InlineData("git.internal.corp", true)]
     [InlineData("api.anthropic.com", false)]
     [InlineData("registry.npmjs.org", false)]
+    // MG-40: this delegates to GitHostDetector.Detect, whose Azure arms matched by substring — so an
+    // attacker-registered lookalike was judged a git host (and a REAL Azure subdomain must still be one).
+    [InlineData("ssh.dev.azure.com", true)]
+    [InlineData("acme.visualstudio.com", true)]
+    [InlineData("dev.azure.com.evil.net", false)]
     public void LooksLikeGitHost_Classifies(string host, bool expected)
     {
         Assert.Equal(expected, EgressAllowlistEntry.LooksLikeGitHost(host));
+    }
+
+    /// <summary>MG-40: the App's design-preview gateway renders the A6 warning marker from the SAME
+    /// heuristic as the daemon (it used to keep a hand-copied mirror that had already drifted to a
+    /// substring match on <c>dev.azure.com</c>).</summary>
+    [Theory]
+    [InlineData("dev.azure.com", true)]
+    [InlineData("dev.azure.com.evil.net", false)]
+    public void InMemoryGateway_MarksA6_UsingTheDaemonHeuristic(string host, bool expected)
+    {
+        var gateway = new Mainguard.Agents.UI.Services.InMemoryEgressAllowlistGateway();
+        gateway.Add(host, host, "Custom");
+
+        var item = gateway.List().Single(i => i.HostPattern == host);
+        Assert.Equal(expected, item.DefeatsA6);
     }
 
     [Fact]

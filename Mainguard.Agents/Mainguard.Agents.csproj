@@ -15,6 +15,40 @@
     <InternalsVisibleTo Include="Mainguard.Tests" />
   </ItemGroup>
 
+  <!--
+    ============== Step 3 (docs/design/code-signing-plan.md): the pinned code-signing thumbprints ==============
+    The ONE place a signing identity enters the product. Set $(MainguardPinnedThumbprints) at build time
+    (a ';'-separated list of SHA-1 or SHA-256 certificate thumbprints) and this build's
+    PinnedThumbprintSignatureVerifier starts enforcing them: an elevated helper or resume target that is
+    unsigned, altered, or signed by anyone else is REFUSED. Leave it empty — the default, and what every
+    build in this repository produces today — and the honest UnsignedBuildSignatureVerifier ships instead.
+
+    It is assembly METADATA rather than a generated source file on purpose: swapping the self-signed
+    certificate for Azure Trusted Signing (step 4, deferred) is then a build-property change and nothing
+    else, which is the entire reason the paid certificate is ordered last. build/velopack/pack.ps1 derives
+    the value from the signing certificate automatically; build/signing/README.md is the recipe.
+  -->
+  <PropertyGroup>
+    <MainguardPinnedThumbprints Condition="'$(MainguardPinnedThumbprints)' == ''"></MainguardPinnedThumbprints>
+  </PropertyGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="MainguardPinnedThumbprints" Value="$(MainguardPinnedThumbprints)" />
+  </ItemGroup>
+
+  <!-- MG-9 (code-signing plan step 2): the build-provenance REQUIREMENT, compiled into the assembly.
+
+       The attesting release workflow builds with -p:MainguardAttestedRelease=true, which stamps this
+       metadata; BuildProvenanceStamp reads it and, when present, makes a missing or non-matching GitHub
+       artifact attestation a hard refusal on the daemon-payload promote and the MainguardOS import.
+
+       It has to be compiled in rather than read from a file next to the artifact: a requirement that
+       lives beside the thing it guards is deleted along with the attestation, and the check then
+       "passes" by not running. Unset (every developer/source/CI build) it is absent, and the gates
+       report NotAttestedBuild — honest, and `dotnet run` from a checkout keeps working. -->
+  <ItemGroup Condition="'$(MainguardAttestedRelease)' == 'true'">
+    <AssemblyMetadata Include="MainguardAttestedRelease" Value="true" />
+  </ItemGroup>
+
   <!-- Step 2a (ADR-0001): the pure git engine + persistence now lives in Mainguard.Git; Mainguard.Agents
        keeps the agent platform (orchestration, bootstrap, adapters, daemon, sandbox, terminal) and references
        the git-engine leaf. Docker.DotNet + Porta.Pty stay here (agents/daemon only); LibGit2Sharp / EF /

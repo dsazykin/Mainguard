@@ -95,7 +95,12 @@ public sealed class CoordinatorAgent
             if (_gateway is not null)
             {
                 var lease = await _gateway.AcquireAsync(_coordinatorId, estimatedTokens: 512, ct).ConfigureAwait(false);
-                _ = lease; // settled by the real adapter; the loop just gates on acquisition here.
+                // The lease is a rate GATE here — the real spend is settled by the model adapter on its
+                // own pass through the proxy, so this one is handed straight back. MG-24: it now carries
+                // a provisional budget debit, and a lease that is merely discarded would hold 512 tokens
+                // of phantom spend per turn until the daemon restarts. Abandon keeps the request permit
+                // spent (which is the whole point of the gate) and refunds only the token estimate.
+                _gateway.Abandon(lease);
             }
 
             var turn = await _model.NextAsync(_transcript, ct).ConfigureAwait(false);

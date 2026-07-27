@@ -24,6 +24,28 @@ public class GitHostDetectorTests
         Assert.Equal(expectedKind, kind);
     }
 
+    /// <summary>
+    /// MG-40: the Azure arms matched by substring, so any host an attacker can register that merely
+    /// CONTAINS the domain — <c>dev.azure.com.evil.net</c>, <c>notvisualstudio.com</c> — classified as
+    /// Azure DevOps. That hands a hostile host the Azure token-username convention and, through
+    /// <c>EgressAllowlistEntry.LooksLikeGitHost</c> (which asks this method), a git-host verdict on the
+    /// agent egress path. Real subdomains must keep matching: SSH remotes use <c>ssh.dev.azure.com</c>
+    /// and the legacy host is <c>&lt;org&gt;.visualstudio.com</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("https://dev.azure.com/acme/proj/_git/repo", HostKind.AzureDevOps)]
+    [InlineData("git@ssh.dev.azure.com:v3/acme/proj/repo", HostKind.AzureDevOps)]
+    [InlineData("https://acme.visualstudio.com/proj/_git/repo", HostKind.AzureDevOps)]
+    [InlineData("https://dev.azure.com.evil.net/acme/repo.git", HostKind.Unknown)]
+    [InlineData("git@dev.azure.com.evil.net:acme/repo.git", HostKind.Unknown)]
+    [InlineData("https://notvisualstudio.com/acme/repo.git", HostKind.Unknown)]
+    [InlineData("https://evil.net/dev.azure.com/repo.git", HostKind.Unknown)]
+    public void Detect_MatchesAzureHostsOnTheDotBoundary_NotBySubstring(string url, HostKind expectedKind)
+    {
+        var (_, kind) = GitHostDetector.Detect(url);
+        Assert.Equal(expectedKind, kind);
+    }
+
     [Theory]
     [InlineData(HostKind.GitHub, "x-access-token")]
     [InlineData(HostKind.GitLab, "oauth2")]

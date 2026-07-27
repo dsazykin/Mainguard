@@ -79,6 +79,12 @@ param(
     [string]$SigningCertPath = $env:MAINGUARD_SIGNING_CERT_PATH,
     [string]$SigningCertPassword = $env:MAINGUARD_SIGNING_CERT_PASSWORD,
 
+    # Step 3 (docs/design/code-signing-plan.md): the thumbprint(s) the RUNTIME verifier pins. Leave empty
+    # and it is derived from -SigningCertPath, which is what you want — the build then trusts exactly the
+    # certificate it signed with, and there is no second place to keep in sync. Set it explicitly only to
+    # pin MORE than one certificate, which is how a cert rollover ships (pin old+new, release, drop old).
+    [string]$PinnedThumbprints = $env:MAINGUARD_PINNED_THUMBPRINTS,
+
     # The channel's RELEASES feed / delta root. Empty => artifacts/releases/<channel> (distinct per channel).
     [string]$ReleaseDir = "",
 
@@ -119,6 +125,27 @@ if (-not $ReleaseDir)  { $ReleaseDir = Join-Path $repo "artifacts/releases/$feed
 
 $publishDir = Join-Path $repo "artifacts/publish/$publishLeaf"
 
+# ---- Step 3: resolve the runtime signature pins from the signing certificate. ----
+# Signing the binaries and PINNING them are two halves of one thing: signtool proves the bytes came from
+# this key, and the pin is what makes the app refuse bytes that did not. Deriving the pin from the same
+# -SigningCertPath the signing uses is what keeps them from drifting apart — a build that signs with one
+# certificate and pins another rejects itself, loudly, on the release box rather than on a user's machine.
+if (-not $PinnedThumbprints -and $SigningCertPath -and (Test-Path $SigningCertPath)) {
+    try {
+        $cert = [System.Security.Cryptography.X509Certificates.X509CertificateLoader]::LoadPkcs12FromFile(
+            (Resolve-Path $SigningCertPath).Path, $SigningCertPassword)
+        $PinnedThumbprints = $cert.Thumbprint
+        Write-Host "==> Runtime pin derived from the signing certificate: $PinnedThumbprints ($($cert.Subject))"
+    } catch {
+        throw "Could not read the signing certificate '$SigningCertPath' to derive its thumbprint: $_. " +
+              "Pass -PinnedThumbprints explicitly, or -SigningCertPassword if the .pfx is protected."
+    }
+}
+if ($SigningCertPath -and -not $PinnedThumbprints) {
+    throw "A signing certificate was supplied but no runtime pin could be resolved. Signing without " +
+          "pinning ships a build that LOOKS signed and verifies nothing (docs/design/code-signing-plan.md §3)."
+}
+
 # ---- Publish the selected head (self-contained win-x64), same flags as the single-channel script used. ----
 Write-Host "==> [$Channel] Publishing $projectPath (self-contained $Runtime) -> $publishDir"
 $publishArgs = @(
@@ -129,11 +156,17 @@ $publishArgs = @(
 if ($bundlePayload) {
     # Pro only: the MainguardOS payload-bundling target consumes this (daemon / image payloads default in the csproj).
     $publishArgs += "/p:MainguardOsPayload=$PayloadPath"
-    # Pro only: the csproj SignMainguardExecutables target signs the app + elevated helper at publish when set.
+    # Pro only: the csproj SignMainguardExecutables target signs the app + elevated helper (co-located AND
+    # staged) at publish when set.
     if ($SigningCertPath) {
         $publishArgs += "/p:MainguardSigningCertPath=$SigningCertPath"
         $publishArgs += "/p:MainguardSigningCertPassword=$SigningCertPassword"
     }
+}
+# Both channels: the runtime pin is compiled into Mainguard.Agents (see its csproj). The client head does
+# not ship the elevation path, but pinning the same certificate there keeps ONE identity per release.
+if ($PinnedThumbprints) {
+    $publishArgs += "/p:MainguardPinnedThumbprints=$PinnedThumbprints"
 }
 if ($DryRun) {
     Write-Host "    [dry-run] dotnet $($publishArgs -join ' ')"
@@ -145,12 +178,17 @@ if ($DryRun) {
 if ($bundlePayload) {
     $helper  = Join-Path $publishDir "Mainguard.Installer.Elevated.exe"
     $payload = Join-Path $publishDir "payload/MainguardOS.tar.gz"
+    # MG-15: the elevated-components stage is what gets promoted into %ProgramFiles%\Mainguard\elevated at
+    # the OOBE's UAC prompt. Without it the app falls back to launching the helper out of the per-user
+    # install directory - which is the escalation this release is supposed to have removed.
+    $stage   = Join-Path $publishDir "elevated-stage/Mainguard.Installer.Elevated.exe"
     if ($DryRun) {
-        Write-Host "    [dry-run] assert co-located: $helper  +  $payload"
+        Write-Host "    [dry-run] assert co-located: $helper  +  $payload  +  $stage"
     } else {
         if (-not (Test-Path $helper))  { throw "Elevated helper missing from publish ($helper) - UAC hand-off would fail." }
         if (-not (Test-Path $payload)) { throw "MainguardOS payload missing from publish ($payload) - set -PayloadPath to the CI artifact." }
-        Write-Host "==> Co-location OK: elevated helper + MainguardOS payload are in the publish dir."
+        if (-not (Test-Path $stage))   { throw "Elevated-components stage missing from publish ($stage) - the elevated helper could not be relocated out of %LocalAppData% (MG-15). Do not pack with /p:BuildElevatedStage=false." }
+        Write-Host "==> Co-location OK: elevated helper + MainguardOS payload + elevated-components stage are in the publish dir."
     }
 } else {
     Write-Host "==> [$Channel] Small install: no MainguardOS payload / elevated helper expected (client head is agent-platform-free)."

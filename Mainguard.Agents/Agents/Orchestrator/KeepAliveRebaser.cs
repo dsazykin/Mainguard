@@ -56,6 +56,10 @@ public interface IKeepAliveRebaser
 /// </list>
 /// This is not a second git runner: every git call routes through the shared audited
 /// <see cref="AgentGitCommand"/> primitive.
+///
+/// <para><b>Kill-switch aware</b> (MG-39(b)): the cycle consults the shared <see cref="KillSwitchGate"/>
+/// both before starting and before resuming, so a background rebase tick can never <c>docker unpause</c>
+/// a jail the kill switch just froze.</para>
 /// </summary>
 public sealed class KeepAliveRebaser : IKeepAliveRebaser
 {
@@ -67,29 +71,39 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         "-c", "user.email=keepalive@mainguard.local",
     };
 
+    /// <summary>The reason word a cycle refused because the kill switch holds everything frozen.</summary>
+    internal const string KillSwitchSkipReason =
+        "Kill switch engaged — the keep-alive cycle is refused while the queue is frozen.";
+
     private readonly IYieldProtocol _yield;
     private readonly Func<string, AgentWorktreeLocation> _locate;
     private readonly Action<string, AgentRunState> _setState;
     private readonly Action<ConflictHandoff> _onConflict;
     private readonly TimeSpan? _yieldTimeout;
+    private readonly KillSwitchGate _killGate;
 
     /// <param name="yield">The cooperative-yield protocol (the mutation gateway).</param>
     /// <param name="locate">Resolves an agent id → its worktree/bare/main.</param>
     /// <param name="setState">Reflects the agent run state (Yielding/Rebasing/Conflict/Working).</param>
     /// <param name="onConflict">Routes a conflicted worktree to the T-04 resolver.</param>
     /// <param name="yieldTimeout">Overrides the yield window (tests pass a short one).</param>
+    /// <param name="killGate">MG-39(b): the shared kill-switch freeze gate. A cycle refuses to start —
+    /// and, if the kill fires mid-cycle, refuses to resume — while it is frozen. Defaults to a private,
+    /// never-frozen gate so an un-wired caller behaves exactly as before.</param>
     public KeepAliveRebaser(
         IYieldProtocol yield,
         Func<string, AgentWorktreeLocation> locate,
         Action<string, AgentRunState>? setState = null,
         Action<ConflictHandoff>? onConflict = null,
-        TimeSpan? yieldTimeout = null)
+        TimeSpan? yieldTimeout = null,
+        KillSwitchGate? killGate = null)
     {
         _yield = yield ?? throw new ArgumentNullException(nameof(yield));
         _locate = locate ?? throw new ArgumentNullException(nameof(locate));
         _setState = setState ?? ((_, _) => { });
         _onConflict = onConflict ?? (_ => { });
         _yieldTimeout = yieldTimeout;
+        _killGate = killGate ?? new KillSwitchGate();
     }
 
     public Task<RebaseCycleResult> NotifyMainMoved(string agentId, CancellationToken ct = default) =>
@@ -100,6 +114,17 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         if (string.IsNullOrWhiteSpace(agentId))
         {
             throw new ArgumentException("agentId is required.", nameof(agentId));
+        }
+
+        // MG-39(b): the keep-alive cycle is a BACKGROUND mutator whose every non-conflict path ends in
+        // token.Resume() → ISandboxEngine.UnpauseAsync. Left unaware of the freeze gate it would happily
+        // start (or finish) during/after a kill and `docker unpause` the very jail the operator just
+        // stopped — a timer silently undoing the emergency stop. Refuse to start while frozen: a Skipped
+        // cycle is retried by the next tick once the operator resumes, and skipping only costs the agent
+        // a staler main, whereas running costs containment.
+        if (_killGate.IsFrozen)
+        {
+            return new RebaseCycleResult(RebaseCycleKind.Skipped, KillSwitchSkipReason, WipCommitCreated: false);
         }
 
         var loc = _locate(agentId);
@@ -169,8 +194,13 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
         }
         finally
         {
-            // Resume on every path except a live conflict (where the PTY must stay paused for the resolver).
-            if (!conflicted)
+            // Resume on every path except a live conflict (where the PTY must stay paused for the resolver)
+            // — and except a kill that fired WHILE this cycle ran (MG-39(b)). The start-of-cycle gate check
+            // cannot cover that race: the kill's docker pause and this cycle's docker unpause would then be
+            // concurrent, and last-writer-wins could leave a killed jail running. Re-reading the gate here
+            // makes the kill win by construction; the token is deliberately left un-resumed (the jail stays
+            // paused, the state stays Paused) until the operator resumes the kill switch.
+            if (!conflicted && !_killGate.IsFrozen)
             {
                 token.Resume();
             }

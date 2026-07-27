@@ -15,10 +15,21 @@ namespace Mainguard.Agents.Agents.Sandbox;
 /// <para>These strings are the SOURCE OF TRUTH the app, the daemon, and CI all reference (CI stamps
 /// the same value as the label); the guard test keeps them honest against <c>images/&lt;name&gt;/</c>.
 /// Do NOT hand-edit to a guessed value — run the guard test and paste the hash it prints.</para>
+///
+/// <para><b>MG-27 — what this label is, and what it is NOT.</b> It is a <i>staleness</i> signal: it
+/// answers "did the build inputs move on since this image was made?", which is what the app's
+/// provisioning probe and the daemon's spawn preflight need in order to rebuild a superseded image.
+/// It is <b>not</b> an integrity anchor. A docker label is an arbitrary string chosen by whoever built
+/// the image, so it cannot distinguish "the image we shipped" from "an image someone stamped with our
+/// version". Integrity comes from the content digest instead: the preflight resolves each mutable ref
+/// (<c>…:latest</c>) to its immutable <c>sha256:</c> digest and the jail is created from THAT digest,
+/// so the bytes that were checked are the bytes that run and a re-pointed tag cannot substitute them.
+/// See <see cref="SandboxImageDigest"/>.</para>
 /// </summary>
 public static class SandboxImageVersions
 {
-    /// <summary>The docker label every jail image carries; its value is the image's source hash.</summary>
+    /// <summary>The docker label every jail image carries; its value is the image's source hash. A
+    /// STALENESS signal only — see the type summary for why the integrity check is the digest.</summary>
     public const string LabelKey = "mainguard.image.version";
 
     /// <summary>The env var that overrides the agent-base image tag (dev/testing). Read through
@@ -33,11 +44,11 @@ public static class SandboxImageVersions
     public const string EgressProxyName = "mainguard-egress-proxy";
 
     /// <summary>Source hash of <c>images/mainguard-agent-base/</c> (curated input: Dockerfile).</summary>
-    public const string AgentBase = "91ff1bc412c4ebbaff71d148615f64be17d1fcac4034d154dfc002cb32961d77";
+    public const string AgentBase = "200eb4038804da5cbd7cb77493bd41dd35fe7c263dc588ed60e9d30b5496be3f";
 
     /// <summary>Source hash of <c>images/mainguard-egress-proxy/</c> (curated inputs: Dockerfile,
     /// entrypoint.sh, reload.sh).</summary>
-    public const string EgressProxy = "3cfd94d22d8b5c946a9e896f88a48e7f9b7347385ea8886ab37ea50bc908093c";
+    public const string EgressProxy = "f5ce714212c05c319dcf8c8794c52c1e7eba027fa95805eb38280fbd588623e8";
 
     private static readonly IReadOnlyDictionary<string, string> ByName =
         new Dictionary<string, string>(StringComparer.Ordinal)

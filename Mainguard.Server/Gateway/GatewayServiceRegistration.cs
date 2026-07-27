@@ -58,6 +58,17 @@ public static class GatewayServiceRegistration
             mergeLeaseStore = new InMemoryMergeLeaseStore();
         }
 
+        // The P2-10 queue-state + immutable-verification stores follow the same posture as the gateway
+        // stores above: SQLite when the daemon DB opened, in-memory otherwise so the daemon always starts.
+        // Bound to locals here (rather than inline in the provisioner registration) because the null check
+        // has to happen ONCE, outside the lambdas — the daemon's persistence mode cannot change at runtime.
+        Func<string, IMergeQueueStore> queueStoreFactory = dbFactory is null
+            ? _ => new InMemoryMergeQueueStore()
+            : _ => new DbMergeQueueStore(dbFactory);
+        Func<string, IVerificationStore> verificationStoreFactory = dbFactory is null
+            ? _ => new InMemoryVerificationStore()
+            : _ => new DbVerificationStore(dbFactory);
+
         Func<DateTimeOffset> clock = () => DateTimeOffset.UtcNow;
 
         // Register the store instances behind their interfaces so a test host can override them (isolated
@@ -67,9 +78,43 @@ public static class GatewayServiceRegistration
         services.AddSingleton(budgetStore);
         services.AddSingleton(mergeLeaseStore);
 
-        // P2-10 merge queue: the registry the gRPC service resolves per-repo queues through (populated as
-        // repos' swarms come up). Empty at boot — an unknown handle is a typed NOT_FOUND.
-        services.AddSingleton<IMergeQueueRegistry, MergeQueueRegistry>();
+        // P2-10 merge queue: the registry the gRPC service resolves per-repo queues through. Empty at boot —
+        // an unknown handle is a typed NOT_FOUND — and populated by the MergeQueueProvisioner below as repos
+        // come up. The CONCRETE type is the registration and the interface forwards to it (MG-10): the
+        // provisioner needs Register/Remove, which are deliberately not on the read-only resolve interface,
+        // and two registrations of MergeQueueRegistry would hand the writer and the reader different
+        // dictionaries — a registry that is written to and never read from is the bug we are fixing.
+        services.AddSingleton<MergeQueueRegistry>();
+        services.AddSingleton<IMergeQueueRegistry>(sp => sp.GetRequiredService<MergeQueueRegistry>());
+
+        // MG-10: the missing constructor call. `new MergeQueue(...)` and `registry.Register(...)` existed
+        // ONLY in the test projects, so the registry stayed empty for the daemon's whole lifetime and every
+        // merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were neither enforced nor bypassable,
+        // they were simply not running. The provisioner builds a repo's queue on the events that make a repo
+        // active (ProvisionRepo / CreateWorktree / a jailed spawn) over the SAME persisted stores, and — the
+        // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
+        // MergeDispatch contend for, since the one-outstanding-merge-per-repo invariant only spans origins
+        // while they share one store (MG-23).
+        services.AddSingleton(sp => new MergeQueueProvisioner(
+            registry: sp.GetRequiredService<MergeQueueRegistry>(),
+            repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
+            leases: sp.GetRequiredService<IMergeLeaseStore>(),
+            resolveContainerId: (repoHash, agentId) =>
+            {
+                // Verification runs in the worker's OWN jail (§3.2 — host execution is a rejection
+                // trigger). Scoped by repo hash too, so one repo's queue can never reach into another's
+                // container even if agent ids ever collide.
+                var session = sp.GetRequiredService<AgentSessionStore>().Find(agentId);
+                return session is not null && string.Equals(session.RepoHash, repoHash, StringComparison.Ordinal)
+                    ? session.ContainerId
+                    : null;
+            },
+            queueStore: queueStoreFactory,
+            verificationStore: verificationStoreFactory,
+            sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
+            artifactDirectory: ResolveVerificationArtifactDir(dbPath),
+            audit: sp.GetRequiredService<IAuditLog>(),
+            log: log));
 
         services.AddSingleton(sp =>
         {
@@ -200,6 +245,18 @@ public static class GatewayServiceRegistration
 
             return intake;
         });
+    }
+
+    /// <summary>
+    /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's
+    /// per-host temp directory isolates them exactly like the DB, the leader registry and the plan store.
+    /// </summary>
+    private static string ResolveVerificationArtifactDir(string dbPath)
+    {
+        var dir = Path.GetDirectoryName(dbPath);
+        return string.IsNullOrEmpty(dir)
+            ? Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "verify-artifacts")
+            : Path.Combine(dir, "verify-artifacts");
     }
 
     /// <summary>How long <see cref="TryPrepareDatabase"/> lets a migration run before falling back

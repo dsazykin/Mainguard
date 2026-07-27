@@ -74,12 +74,26 @@ public sealed class ResumeTaskGuard
 
         if (!launchedByResumeTask && persistedStage == OobeStage.RebootPending)
         {
-            // The one legitimate window for the task to exist — but only if it is OURS. A stale
-            // registration from an older install (retired exe) must not survive to fire blind.
+            // The one legitimate window for the task to exist — but only if it points where THIS
+            // install points. A stale registration from an older install (retired exe) must not
+            // survive to fire blind.
+            //
+            // MG-9: this was a raw case-insensitive string compare, which got even the path question
+            // wrong — `C:\App\.\x.exe`, `C:\App\sub\..\x.exe` and `C:\App\x.exe` are one file and three
+            // strings, so a registration could be spelled past the check and kept. Comparison now runs
+            // on canonical forms, and BOTH sides must additionally validate as executables inside the
+            // running install's directory, so a registration pointing anywhere else is deleted rather
+            // than trusted.
+            //
+            // Be clear about what this is: a PATH check, not an identity check. It cannot tell a
+            // replaced binary at the legitimate path from the real one. MG-15 makes that survivable
+            // rather than detectable here: a registration whose target is user-writable is registered
+            // /RL LIMITED (ResumeTaskPolicy), so a replaced binary at that path runs as the user who
+            // replaced it and gains nothing. A signed build additionally detects it
+            // (IPayloadSignatureVerifier, checked by the elevated helper before it registers).
             var command = InstallerCommands.ParseResumeTaskCommand(queryXml);
-            if (command is not null
-                && currentResumeTarget is not null
-                && string.Equals(command, currentResumeTarget, StringComparison.OrdinalIgnoreCase))
+            var installRoot = TrustedExecutablePath.DirectoryOf(currentResumeTarget);
+            if (TrustedExecutablePath.IsSameExecutable(command, currentResumeTarget, installRoot))
             {
                 _log?.Invoke($"resume-task sweep: kept (awaiting reboot, target '{command}')");
                 return ResumeTaskSweepResult.KeptAwaitingReboot;

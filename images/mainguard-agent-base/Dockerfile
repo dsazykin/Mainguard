@@ -14,9 +14,18 @@
 # and reaches the network only through the mainguard-egress-proxy (default-deny: model APIs + package
 # registries incl. cache.nixos.org; A6 keeps the git host off the allowlist).
 
-FROM debian:bookworm-slim
+# MG-27: the base image is pinned by DIGEST, not by the floating `bookworm-slim` tag. A tag is a
+# mutable pointer — the same Dockerfile built a week apart silently produced different bytes, and the
+# `mainguard.image.version` source hash (which hashes THIS FILE) could not see the difference. The
+# digest names the exact manifest. Refreshing it is a deliberate edit: `docker pull debian:bookworm-slim`
+# then `docker image inspect --format '{{index .RepoDigests 0}}' debian:bookworm-slim`, and because the
+# digest lives in this file, updating it moves the image version constant too (the guard test says so).
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 
 # Base tooling only. git + curl for package/dependency fetches through the proxy; xz for nix.
+# (Debian's archive keeps only the current point release of each package, so pinning apt versions here
+# would break the build within weeks rather than harden it; the base-image digest is what pins the
+# starting package set, and every artefact fetched from OUTSIDE the archive below is checksummed.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates curl git xz-utils \
@@ -31,23 +40,48 @@ RUN groupadd -g 1000 agent      && useradd -u 1000 -g 1000 -m -s /bin/bash agent
 # --- Nix (build-time, single-user, no daemon) ---------------------------------------------------
 # The Determinate installer with `--init none` installs Nix WITHOUT systemd (correct for a container)
 # into /nix, owned root. Flakes on. At runtime /nix is remounted as a writable volume seeded from here.
-RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix \
-      | sh -s -- install linux --no-confirm --init none \
+#
+# MG-27: this was `curl https://install.determinate.systems/nix | sh`. That URL serves a bootstrap
+# script whose CONTENT changes with every upstream release, and piping it straight into a shell means
+# the image executes whatever bytes arrive, unverified, with root and network — the single largest
+# supply-chain surface in this file. The bootstrap script's only job is to detect the platform and
+# download the versioned `nix-installer` binary, so it is skipped entirely: the pinned binary is
+# fetched from the version-addressed URL the script itself would have used, its SHA-256 is checked
+# before it is made executable, and only then is it run with exactly the same arguments.
+# Refresh: bump NIX_INSTALLER_VERSION, download the artefact, and paste its `sha256sum`.
+ARG NIX_INSTALLER_VERSION=v3.21.8
+ARG NIX_INSTALLER_SHA256=eecf66f62b044f40b0632d8e9ea72ffc3bd3214357d09317117febff748e71b3
+RUN curl --proto '=https' --tlsv1.2 -sSf -L -o /tmp/nix-installer \
+      "https://install.determinate.systems/nix/tag/${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux" \
+    && echo "${NIX_INSTALLER_SHA256}  /tmp/nix-installer" | sha256sum -c - \
+    && chmod 0755 /tmp/nix-installer \
+    && /tmp/nix-installer install linux --no-confirm --init none \
         --extra-conf "experimental-features = nix-command flakes" \
-        --extra-conf "build-users-group ="
+        --extra-conf "build-users-group =" \
+    && rm -f /tmp/nix-installer
 ENV PATH=/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 
 # --- Devbox: the REAL binary (not the self-downloading launcher) ---------------------------------
-# get.jetify.com installs a launcher that self-downloads the real binary on first run (blocked in the
-# default-deny jail). Run it once here as `agent` so the real binary lands in the cache, then promote it
-# to /usr/local/bin so the runtime `devbox` is the real, self-contained binary — no runtime download.
-RUN curl -fsSL https://get.jetify.com/devbox | bash -s -- -f \
+# get.jetify.com installs a LAUNCHER that self-downloads the real binary on first run — which the
+# default-deny jail blocks — so this used to run the launcher here, execute it once to populate its
+# cache, then fish the real binary out of that cache with `find`. Two unpinned, unverified downloads
+# (the install script and whatever the launcher decided to fetch) to obtain a binary whose identity was
+# never checked.
+#
+# MG-27: the same binary is published as a versioned GitHub release asset. Fetch THAT, verify its
+# SHA-256, and unpack it — one pinned, checksummed artefact and no launcher. Verified byte-identical to
+# what the old recipe produced: the extracted binary's sha256 matches the `/usr/local/bin/devbox` in the
+# image built from the previous Dockerfile, so this is a pure provenance change, not a version bump.
+# Refresh: bump DEVBOX_VERSION and paste the release tarball's `sha256sum`.
+ARG DEVBOX_VERSION=0.17.5
+ARG DEVBOX_SHA256=eb2d8fb34266ba3befc294d7d6f56e2cd4da2cacb7a0cf52db5b8092575544f8
+RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/devbox.tar.gz \
+      "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/devbox_${DEVBOX_VERSION}_linux_amd64.tar.gz" \
+    && echo "${DEVBOX_SHA256}  /tmp/devbox.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox \
     && chmod 0755 /usr/local/bin/devbox \
-    && HOME=/root /usr/local/bin/devbox version \
-    && real="$(find /root/.cache/devbox -type f -name devbox -size +1M | head -1)" \
-    && cp "$real" /usr/local/bin/devbox \
-    && chmod 0755 /usr/local/bin/devbox \
-    && rm -rf /root/.cache/devbox
+    && rm -f /tmp/devbox.tar.gz \
+    && HOME=/root /usr/local/bin/devbox version
 
 # --- Pre-baked A6-clean toolchain ---------------------------------------------------------------
 # devbox's `add` resolves packages via nixhub → fetches nixpkgs from GITHUB at runtime, which the

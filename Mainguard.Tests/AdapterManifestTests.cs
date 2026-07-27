@@ -15,6 +15,7 @@ public class AdapterManifestTests
       "id": "claude-code",
       "displayName": "Claude Code",
       "version": "1.2.3",
+      "provenance": "npm-registry-signature",
       "sha256": "{{Sha}}",
       "installCmd": ["npm", "install", "-g", "@anthropic-ai/claude-code@1.2.3"],
       "configShims": [{ "path": "/home/agent/.claude/settings.json", "content": "{}" }],
@@ -37,7 +38,7 @@ public class AdapterManifestTests
     public void EgressHosts_Valid_ParseAndAreReadable()
     {
         var body = $$"""
-        { "id": "claude-code", "displayName": "Claude Code", "version": "1.2.3", "sha256": "{{Sha}}",
+        { "id": "claude-code", "displayName": "Claude Code", "version": "1.2.3", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["platform.claude.com", "statsig.anthropic.com"] }
         """;
@@ -49,7 +50,7 @@ public class AdapterManifestTests
     public void EgressHosts_GitHost_IsRejected_A6()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["github.com"] }
         """;
@@ -66,7 +67,7 @@ public class AdapterManifestTests
     public void EgressHosts_NotBareHostname_IsRejected(string host)
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
           "egressHosts": ["{{host}}"] }
         """;
@@ -78,7 +79,7 @@ public class AdapterManifestTests
     public void MissingHealthProbe_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"] }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
@@ -89,21 +90,42 @@ public class AdapterManifestTests
     [InlineData("latest")]
     [InlineData("^1.0.0")]
     [InlineData("*")]
+    // MG-40: a wildcard dot-segment is a RANGE — `1.x` resolves to whatever the registry serves at
+    // install time, so the manifest's sha256 would stop describing the bytes that land. These parsed
+    // as pinned because the old wildcard guard only fired when the version carried no digit at all.
+    [InlineData("1.x")]
+    [InlineData("1.X")]
+    [InlineData("1.2.x")]
+    [InlineData("1.x.x")]
     public void UnpinnedVersion_ShouldBeRejected(string version)
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "{{version}}", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "{{version}}", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
         Assert.Equal(AdapterManifestError.UnpinnedVersion, ex.Error);
     }
 
+    /// <summary>MG-40, both directions: a range is not a pin, and a concrete tag that merely contains an
+    /// <c>x</c> still is (the fix must not start refusing real releases like <c>1.0.0-hotfix</c>).</summary>
+    [Theory]
+    [InlineData("1.2.3", true)]
+    [InlineData("0.2.71", true)]
+    [InlineData("1.0.0-hotfix", true)]
+    [InlineData("2.1.0-linux-x64", true)]
+    [InlineData("1.x", false)]
+    [InlineData("1.2.X", false)]
+    [InlineData("x", false)]
+    [InlineData("~1.2.3", false)]
+    public void IsPinnedVersion_TreatsRangesAsUnpinned(string version, bool pinned)
+        => Assert.Equal(pinned, AdapterManifest.IsPinnedVersion(version));
+
     [Fact]
     public void InstallCmdWithAtLatest_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["npm", "install", "-g", "claude@latest"],
           "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
@@ -115,7 +137,7 @@ public class AdapterManifestTests
     public void UnknownField_ShouldBeRejectedByStrictSchema()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "{{Sha}}",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "{{Sha}}",
           "installCmd": ["true"], "surpriseField": true,
           "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
@@ -127,7 +149,7 @@ public class AdapterManifestTests
     public void BadHash_ShouldBeRejected()
     {
         var body = $$"""
-        { "id": "x", "displayName": "X", "version": "1.0.0", "sha256": "not-a-hash",
+        { "id": "x", "displayName": "X", "version": "1.0.0", "provenance": "none", "sha256": "not-a-hash",
           "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" } }
         """;
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(body)));
@@ -201,6 +223,43 @@ public class AdapterManifestTests
             + $@", ""credentialPaths"": [""{bad.Replace("\\", "\\\\")}""] }}";
         var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(Manifest(adapter)));
         Assert.Equal(AdapterManifestError.Malformed, ex.Error);
+    }
+
+    // ---- MG-9: every shipped install runs script-free ------------------------------------------
+
+    [Fact]
+    public void BundledStarterCatalog_EveryInstallCommand_IsScriptFree()
+    {
+        // `npm install <tarball>` runs the preinstall/install/postinstall lifecycle scripts of the
+        // pinned package AND of every dependency npm resolves for it — arbitrary upstream code
+        // executing inside MainguardEnv at install time, before any health probe or sandbox boundary
+        // applies. The sha256 pin does not help: it proves the tarball is the one we chose, not that
+        // running the code inside it is safe.
+        //
+        // This is a structural guard, so a future adapter cannot be added without the flag. See
+        // AdapterChannelTests' poison canary for the behavioural half.
+        foreach (var adapter in AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters)
+        {
+            var manager = adapter.InstallCmd[0];
+            if (manager is not ("npm" or "pnpm" or "yarn"))
+                continue; // a non-JS installer has no lifecycle-script surface to close
+
+            Assert.True(
+                adapter.InstallCmd.Contains("--ignore-scripts"),
+                $"'{adapter.Id}' installs with {manager} but without --ignore-scripts: an upstream "
+                + "postinstall (its own, or any transitive dependency's) would execute in the VM.");
+        }
+    }
+
+    [Fact]
+    public void BundledStarterCatalog_StillConsumesTheHashVerifiedPayload()
+    {
+        // --ignore-scripts must not have been bought by loosening anything else: every install still
+        // consumes the staged {payload} file the pin covers, rather than re-resolving from a registry.
+        foreach (var adapter in AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters)
+        {
+            Assert.Contains(AdapterChannel.PayloadToken, adapter.InstallCmd);
+        }
     }
 
     [Fact]

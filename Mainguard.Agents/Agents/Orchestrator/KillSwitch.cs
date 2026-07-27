@@ -104,10 +104,13 @@ public interface IKillTarget
     /// <summary>The agents currently in scope for the kill (live workers).</summary>
     IReadOnlyList<string> ActiveAgentIds { get; }
 
-    /// <summary>Requests a cooperative yield within <paramref name="timeout"/>; true if the agent yielded in time.</summary>
+    /// <summary>Requests a cooperative yield within <paramref name="timeout"/>; true if the agent yielded in time.
+    /// The answer is a courtesy only — it is authored inside the jail and NEVER skips <see cref="PauseAsync"/>.</summary>
     Task<bool> RequestYieldAsync(string agentId, TimeSpan timeout, CancellationToken ct);
 
-    /// <summary><c>docker pause</c> the agent's jail (the timeout fallback — needs no supervisor cooperation).</summary>
+    /// <summary>Contain the agent unconditionally: sever its terminal input and <c>docker pause</c> its jail
+    /// (neither needs supervisor cooperation). Called for EVERY agent in the fan-out — MG-39(a). Throwing
+    /// means "containment unconfirmed" and is reported as <see cref="KillAgentOutcome.PauseFailed"/>.</summary>
     Task PauseAsync(string agentId, CancellationToken ct);
 
     /// <summary>A point-in-time state word per agent, for the journal snapshot.</summary>
@@ -140,7 +143,12 @@ public sealed class InMemoryKillJournal : IKillJournal
     }
 }
 
-/// <summary>How one agent ended the fan-out.</summary>
+/// <summary>
+/// How one agent ended the fan-out. <b>Every</b> non-<see cref="PauseFailed"/> outcome means the jail was
+/// force-paused: <see cref="Yielded"/> only records that the agent <i>also</i> acknowledged the cooperative
+/// request first (a nicer stopping point for the later resume), never that the pause was skipped — see
+/// MG-39(a) in <see cref="KillSwitch.FanOutOneAsync"/>.
+/// </summary>
 public enum KillAgentOutcome { Yielded, Paused, PauseFailed }
 
 /// <summary>One agent's line in the kill snapshot.</summary>
@@ -166,8 +174,10 @@ public sealed record KillReport(
 /// P2-14 kill switch (contract §2, SA-1/F4 + RT-D4 + RT-D3). One always-visible emergency stop.
 ///
 /// <para>Ordering is binding: step 1 = <b>freeze the queue in-proc, instantly</b> (before any await), so no
-/// merge slips the fan-out window; step 2 = yield-all fan-out with the RT-D4 deadline (timeout →
-/// <c>docker pause</c>); step 3 = journal snapshot written before returning. Audit is best-effort
+/// merge slips the fan-out window; step 2 = yield-all fan-out with the RT-D4 deadline, then an
+/// <b>unconditional</b> <c>docker pause</c> + terminal-input sever per agent (MG-39(a): the cooperative
+/// ACK comes from inside the jail, so it may never buy an exemption from containment); step 3 = journal
+/// snapshot written before returning. Audit is best-effort
 /// (freeze-then-audit, RT-D3) — a kill NEVER blocks on audit-store availability; on store recovery
 /// <see cref="NotifyAuditStoreRecovered"/> appends the chained <c>killswitch_audit_gap</c> so the carve-out
 /// is tamper-evident rather than silent.</para>
@@ -282,28 +292,43 @@ public sealed class KillSwitch
 
     private async Task<KillAgentState> FanOutOneAsync(string agentId, TimeSpan deadline, CancellationToken ct)
     {
+        var yielded = false;
         try
         {
-            var yielded = await _target.RequestYieldAsync(agentId, deadline, ct).ConfigureAwait(false);
-            if (yielded)
-            {
-                return new KillAgentState(agentId, "Yielded", KillAgentOutcome.Yielded);
-            }
+            yielded = await _target.RequestYieldAsync(agentId, deadline, ct).ConfigureAwait(false);
         }
         catch (Exception) when (!ct.IsCancellationRequested)
         {
-            // A yield failure is not fatal to the kill — fall through to the pause fallback.
+            // A yield failure is not fatal to the kill — the unconditional pause below still runs.
         }
 
-        // Timeout / non-cooperation → docker pause (needs no supervisor cooperation).
+        // MG-39(a): the pause is UNCONDITIONAL — it is NOT a timeout fallback.
+        //
+        // The cooperative ACK ([IPC_UPDATE_READY]) is authored by the worker's own wrapper inside the
+        // jail, i.e. by exactly the party a kill switch exists to stop. Treating that ACK as "already
+        // stopped, no pause needed" handed the target a one-line self-exemption: answer ready, skip
+        // `docker pause`, keep executing. The freezer cgroup needs no cooperation at all, so paying for
+        // it on every agent costs nothing but closes the bypass. A cooperative ACK now only buys a
+        // cleaner stopping point (recorded as Yielded), never an exemption from containment.
         try
         {
-            await _target.PauseAsync(agentId, ct).ConfigureAwait(false);
-            return new KillAgentState(agentId, "Paused", KillAgentOutcome.Paused);
+            // The RT-D4 ceiling must bound the WHOLE fan-out, not just the yield window: an unreachable
+            // or wedged container engine must not stretch the emergency stop past the ceiling. A pause
+            // that blows the deadline is cancelled and reported as PauseFailed — the honest word for
+            // "containment unconfirmed" — rather than silently holding the kill open.
+            using var pauseCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            pauseCts.CancelAfter(deadline);
+            await _target.PauseAsync(agentId, pauseCts.Token).ConfigureAwait(false);
+
+            return yielded
+                ? new KillAgentState(agentId, "Yielded", KillAgentOutcome.Yielded)
+                : new KillAgentState(agentId, "Paused", KillAgentOutcome.Paused);
         }
         catch (Exception)
         {
             // Even a pause failure is recorded, not thrown — the kill must always complete + snapshot.
+            // Note this outranks a cooperative ACK: an agent that said "ready" but whose jail could not
+            // be frozen is NOT contained, and the report must not claim otherwise.
             return new KillAgentState(agentId, "PauseFailed", KillAgentOutcome.PauseFailed);
         }
     }

@@ -9,8 +9,13 @@ using Mainguard.Git.Security;
 
 namespace Mainguard.Agents.Agents;
 
-/// <summary>One granted gateway slice: the agent, the bucket ticket, and the reserved token estimate.</summary>
-public sealed record GatewayLease(string AgentId, long Ticket, int EstimatedTokens);
+/// <summary>
+/// One granted gateway slice: the agent, the bucket ticket, the reserved token estimate, and the
+/// MG-24 <paramref name="ReservationId"/> — the budget ledger's provisional debit for this request.
+/// The lease is the only handle to that debit, so a lease that is neither settled nor abandoned leaks
+/// budget forever; every path that acquires one must reach <c>Settle</c> or <c>Abandon</c>.
+/// </summary>
+public sealed record GatewayLease(string AgentId, long Ticket, int EstimatedTokens, long ReservationId = 0);
 
 /// <summary>Per-agent view for <see cref="IAiGateway.GetSnapshot"/>: spend, queue depth, and state.</summary>
 public sealed record AgentSpendSnapshot(
@@ -58,6 +63,13 @@ public interface IAiGateway
 {
     /// <summary>FIFO (within a priority class) acquire of one request's rate budget.</summary>
     Task<GatewayLease> AcquireAsync(string agentId, int estimatedTokens, CancellationToken ct);
+
+    /// <summary>
+    /// Hands an acquired lease back without recording spend (MG-24). Part of the acquire contract
+    /// rather than the forwarding seam: whoever can take a lease must be able to release it, because
+    /// the lease holds a provisional budget debit that would otherwise never be discharged.
+    /// </summary>
+    void Abandon(GatewayLease lease);
 
     /// <summary>Signal an upstream 429: pause the worker, mark <c>RateLimited</c>, start backoff.</summary>
     void Report429(string agentId, TimeSpan? retryAfter);
@@ -124,9 +136,23 @@ public sealed class AiGateway : IAiGateway
         }
 
         // Budget gate first: an exhausted agent is paused with a typed reason and never forwards more.
-        if (_ledger.IsExhausted(agentId, out var reason))
+        //
+        // MG-24: the gate is a check-AND-RESERVE, not a bare check. Debiting only in Settle (after the
+        // upstream round-trip) meant N concurrent requests for one agent all read "under cap" and every
+        // one of them forwarded — the cap was enforced against spend that had already been committed,
+        // never against spend in flight. TryReserve does both halves inside one ledger lock, so the
+        // (N+1)th request sees the N estimates already outstanding and is refused at the boundary.
+        var admission = _ledger.TryReserve(agentId, estimatedTokens, out var reservationId, out var reason);
+        if (admission != BudgetAdmission.Granted)
         {
-            MarkBudgetExhausted(agentId, reason);
+            // Only settled spend at the cap is a durable exhaustion: that pauses the worker and audits
+            // once (unchanged P2-08 behaviour). A refusal caused purely by in-flight reservations is
+            // transient — refuse this request, but never pause a worker for spend that may never settle.
+            if (admission == BudgetAdmission.Exhausted)
+            {
+                MarkBudgetExhausted(agentId, reason);
+            }
+
             throw new BudgetExhaustedException(agentId, reason);
         }
 
@@ -134,12 +160,37 @@ public sealed class AiGateway : IAiGateway
         try
         {
             var bucketLease = await _bucket.AcquireAsync(estimatedTokens, ct).ConfigureAwait(false);
-            return new GatewayLease(agentId, bucketLease.Ticket, bucketLease.EstimatedTokens);
+            return new GatewayLease(agentId, bucketLease.Ticket, bucketLease.EstimatedTokens, reservationId);
+        }
+        catch
+        {
+            // Nothing downstream ever sees this lease, so nothing downstream can release it. A bucket
+            // acquire that is cancelled or faults must hand the reservation back here or the agent's
+            // budget bleeds away on requests that were never even sent.
+            _ledger.ReleaseReservation(reservationId);
+            throw;
         }
         finally
         {
             AdjustPending(agentId, -1);
         }
+    }
+
+    /// <summary>
+    /// Releases a lease WITHOUT recording spend: the request never completed (the upstream call threw,
+    /// the caller was cancelled, the response was discarded). Refunds the token estimate to the bucket
+    /// and drops the MG-24 provisional debit. The one request permit stays spent — a request really was
+    /// attempted. Never call this and <see cref="Settle"/> for the same lease.
+    /// </summary>
+    public void Abandon(GatewayLease lease)
+    {
+        if (lease is null)
+        {
+            return;
+        }
+
+        _bucket.Release(new BucketLease(lease.Ticket, lease.EstimatedTokens), actualTokens: 0);
+        _ledger.ReleaseReservation(lease.ReservationId);
     }
 
     public void Report429(string agentId, TimeSpan? retryAfter)
@@ -201,11 +252,13 @@ public sealed class AiGateway : IAiGateway
     /// <summary>
     /// Settle a lease with actual token usage: reconcile the bucket (estimate→actual conserved) and
     /// record the spend row (priced by <paramref name="model"/>). Streams via the ledger event.
+    /// MG-24: this also discharges the lease's provisional debit — the reservation is swapped for the
+    /// real, model-priced row inside one ledger lock, so the agent is never momentarily uncharged.
     /// </summary>
     public SpendTotals Settle(GatewayLease lease, int actualTokens, string model)
     {
         _bucket.Release(new BucketLease(lease.Ticket, lease.EstimatedTokens), actualTokens);
-        _ledger.Record(lease.AgentId, model, actualTokens);
+        _ledger.SettleReservation(lease.ReservationId, lease.AgentId, model, actualTokens);
         return _ledger.GetTotals(lease.AgentId);
     }
 

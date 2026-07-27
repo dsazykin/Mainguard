@@ -12,6 +12,33 @@ namespace Mainguard.Agents.Agents.Bootstrap;
 /// it never touches repo working trees, only removes the one added remote).</param>
 public sealed record UninstallOptions(bool KeepSettings = false, bool RemoveSyncRemote = false);
 
+/// <summary>
+/// The in-VM commands the uninstaller's <c>stop-daemon</c> step runs, in order. Pure argument-list
+/// builders (the exe only supplies the runner) so the SHAPE is unit-testable without a process — the
+/// same discipline as <see cref="WslCommands"/>/<see cref="InstallerCommands"/>.
+/// </summary>
+public static class UninstallDaemonCommands
+{
+    /// <summary>
+    /// Stop <c>mainguardd</c> before the distro is terminated: ask systemd first, then a last-resort
+    /// process kill for a daemon that is running outside its unit (hand-started, or a unit systemd has
+    /// already given up on). Both are best-effort — the caller ignores failures, and the distro is
+    /// terminated immediately afterwards regardless.
+    /// <para><b>Audit MG-34:</b> the kill matches the process NAME exactly (<c>pkill -x mainguardd</c>),
+    /// never <c>pkill -f mainguardd</c>. <c>-f</c> matches any process whose full command line merely
+    /// CONTAINS the string — an editor with <c>mainguardd.service</c> open, a <c>tail -f</c> on its log,
+    /// a <c>grep mainguardd</c> — and this runs as root inside the distro, so a fuzzy match kills the
+    /// user's unrelated processes during an uninstall. The presence probes already use the exact form
+    /// (<c>pgrep -x</c>, audit fix #10); the payload renames the apphost to <c>mainguardd</c> precisely
+    /// so that exact match works.</para>
+    /// </summary>
+    public static IReadOnlyList<IReadOnlyList<string>> StopSequence() => new[]
+    {
+        DaemonUpdateCommands.StopUnit(),
+        WslCommands.InDistroAsRoot("pkill", "-x", DaemonUpdateCommands.UnitName),
+    };
+}
+
 /// <summary>The ordered, failure-tolerant uninstall report. <see cref="Clean"/> iff nothing errored.</summary>
 public sealed record UninstallReport(
     IReadOnlyList<string> StepsRun,
@@ -44,6 +71,7 @@ public sealed class Uninstaller
     private readonly Func<CancellationToken, Task>? _removeScheduledTasks;
     private readonly Func<bool, CancellationToken, Task>? _removeAppData;
     private readonly Func<CancellationToken, Task>? _removeSyncRemote;
+    private readonly Func<CancellationToken, Task>? _removeElevatedComponents;
     private readonly IBootstrapFileSystem? _wslConfigFs;
     private readonly int _terminatePollAttempts;
     private readonly TimeSpan _terminatePollDelay;
@@ -57,7 +85,8 @@ public sealed class Uninstaller
         Func<CancellationToken, Task>? removeSyncRemote = null,
         IBootstrapFileSystem? wslConfigFs = null,
         int terminatePollAttempts = 10,
-        TimeSpan? terminatePollDelay = null)
+        TimeSpan? terminatePollDelay = null,
+        Func<CancellationToken, Task>? removeElevatedComponents = null)
     {
         _wsl = wsl ?? throw new ArgumentNullException(nameof(wsl));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
@@ -65,6 +94,7 @@ public sealed class Uninstaller
         _removeScheduledTasks = removeScheduledTasks;
         _removeAppData = removeAppData;
         _removeSyncRemote = removeSyncRemote;
+        _removeElevatedComponents = removeElevatedComponents;
         _wslConfigFs = wslConfigFs;
         _terminatePollAttempts = terminatePollAttempts;
         _terminatePollDelay = terminatePollDelay ?? TimeSpan.FromMilliseconds(500);
@@ -106,6 +136,15 @@ public sealed class Uninstaller
         // 6. Remove Scheduled Tasks (the resume task, any others).
         await RunStep(steps, errors, "remove-scheduled-tasks",
             c => _removeScheduledTasks?.Invoke(c) ?? Task.CompletedTask, ct).ConfigureAwait(false);
+
+        // 6b. MG-15: remove the elevated components from the administrator-owned install root. This
+        // step exists BECAUSE of the relocation: moving the elevated helper out of %LocalAppData% put
+        // it somewhere the per-user uninstall cannot reach, and a relocation that leaks an
+        // administrator-owned directory on uninstall is a bug — the user believes Mainguard is gone
+        // while a Mainguard binary is still installed under Program Files. Failure-tolerant like every
+        // other step, but the delegate REPORTS what it could not remove rather than swallowing it.
+        await RunStep(steps, errors, "remove-elevated-components",
+            c => _removeElevatedComponents?.Invoke(c) ?? Task.CompletedTask, ct).ConfigureAwait(false);
 
         // 7. Revert Mainguard's [wsl2] keys in the user's GLOBAL .wslconfig (audit fix #12): the
         // memory cap applies to EVERY WSL2 distro on the machine, so leaving it behind kept the

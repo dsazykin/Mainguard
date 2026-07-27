@@ -92,6 +92,44 @@ public class ResumeTaskGuardTests
         Assert.Equal(ResumeTaskSweepResult.Deleted, result);
     }
 
+    // ---- MG-9: the "is it ours" check compares canonical paths, and confines them to the install ----
+
+    [Theory]
+    // Same file, spelled differently. The old raw string compare called these FOREIGN and deleted a
+    // legitimate registration — the harmless direction of a check that was wrong in both.
+    [InlineData("C:/Apps/Mainguard/Mainguard.App.exe")]
+    [InlineData(@"C:\APPS\MAINGUARD\MAINGUARD.APP.EXE")]
+    public void Sweep_RebootPending_OwnTaskSpelledDifferently_IsStillRecognised(string registered)
+    {
+        var runner = new ScriptedSchtasks(queryExit: 0, queryXml: TaskXml(registered), deleteExit: 0);
+        var result = new ResumeTaskGuard(runner.Run).Sweep(OobeStage.RebootPending, launchedByResumeTask: false, CurrentExe);
+
+        Assert.Equal(ResumeTaskSweepResult.KeptAwaitingReboot, result);
+    }
+
+    [Theory]
+    // An elevated ONLOGON task pointing anywhere but this install must be deleted, never trusted to
+    // fire. Each of these would have been KEPT — or was reachable — under a raw string compare of
+    // paths that were never canonicalised or confined in the first place.
+    [InlineData(@"C:\Users\victim\Downloads\evil.exe")]
+    [InlineData(@"C:\Apps\Mainguard-evil\Mainguard.App.exe")]   // sibling sharing a name prefix
+    [InlineData(@"C:\Apps\Mainguard\sub\..\..\evil.exe")]        // traversal out of the install
+    [InlineData(@"\\attacker\share\Mainguard.App.exe")]          // off-machine
+    [InlineData(@"C:\Apps\Mainguard\Mainguard.App.exe:evil.exe")] // NTFS alternate data stream
+    // Traversal is REFUSED, not resolved — so even a registration that would resolve back to our own
+    // exe is treated as foreign and deleted. That is the safe direction: the cost is one re-prompted
+    // setup, whereas resolving '.' and '..' would mean accepting the very syntax used to walk out.
+    [InlineData(@"C:\Apps\Mainguard\.\Mainguard.App.exe")]
+    [InlineData(@"C:\Apps\Mainguard\sub\..\Mainguard.App.exe")]
+    public void Sweep_RebootPending_RegistrationOutsideThisInstall_IsDeleted(string registered)
+    {
+        var runner = new ScriptedSchtasks(queryExit: 0, queryXml: TaskXml(registered), deleteExit: 0);
+        var result = new ResumeTaskGuard(runner.Run).Sweep(OobeStage.RebootPending, launchedByResumeTask: false, CurrentExe);
+
+        Assert.Equal(ResumeTaskSweepResult.Deleted, result);
+        Assert.Contains(runner.Invocations, args => args.Contains("/Delete"));
+    }
+
     [Fact]
     public void Sweep_DeleteDenied_IsReportedNotSwallowed()
     {

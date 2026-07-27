@@ -18,6 +18,9 @@ public class ContainerSpecBuilderTests
     private const int AgentUid = 1000;
     private const int SupervisorUid = 1001;
 
+    /// <summary>The egress proxy's address on the agent network — what MG-7 pins as the jail's resolver.</summary>
+    private const string ProxyDns = "172.30.0.2";
+
     private static ContainerSpecRequest ValidRequest(string worktree = Ext4Worktree) =>
         new(
             RepoHash: "abc123def456abc123",
@@ -28,7 +31,8 @@ public class ContainerSpecBuilderTests
             NetworkName: "mainguard-agents",
             Credentials: CredTmpfsSpec.Create(AgentUid, SupervisorUid),
             ProxyUrl: "http://mainguard-egress-proxy:8888",
-            UsernsMode: "host");
+            UsernsMode: "host",
+            DnsServerAddress: ProxyDns);
 
     [Fact]
     public void Build_SetsAllHardeningFlags()
@@ -218,5 +222,124 @@ public class ContainerSpecBuilderTests
     {
         Assert.Throws<Mainguard.Git.Exceptions.SandboxSpecException>(() =>
             ContainerSpecBuilder.Build(ValidRequest() with { IpcDirPath = badSource }));
+    }
+
+    // ---- MG-7: the jail's resolver is PINNED to the egress proxy's dnsmasq ----
+
+    [Fact]
+    public void Build_PinsTheJailResolver_ToTheEgressProxy()
+    {
+        var create = ContainerSpecBuilder.Build(ValidRequest());
+
+        // Without HostConfig.Dns, Docker hands the container its embedded resolver at 127.0.0.11, which
+        // forwards to the VM's upstream DNS. The rendered NXDOMAIN dnsmasq then lives only inside the
+        // proxy container and is never consulted — "DNS exfiltration is blocked" would be a no-op.
+        var dns = Assert.Single(create.HostConfig.DNS);
+        Assert.Equal(ProxyDns, dns);
+    }
+
+    [Fact]
+    public void Build_OnTheDefaultDenyNetwork_WithoutADnsPin_ThrowsTyped()
+    {
+        // Fail closed: the default-deny network exists so the proxy is the only route out. Spawning
+        // there with the embedded resolver still in play is the exact hole MG-7 names.
+        var unpinned = ValidRequest() with { DnsServerAddress = null };
+        Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(unpinned));
+    }
+
+    [Fact]
+    public void Build_OffTheDefaultDenyNetwork_MayGoUnpinned()
+    {
+        // The merge-queue / lifecycle harnesses run jails on `bridge` with no proxy at all; pinning them
+        // at an address that does not exist would break them for no security gain.
+        var create = ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            NetworkName = "bridge",
+            DnsServerAddress = null,
+        });
+
+        Assert.True(create.HostConfig.DNS is null || create.HostConfig.DNS.Count == 0);
+    }
+
+    [Theory]
+    [InlineData("127.0.0.11")]  // Docker's embedded resolver — precisely what the pin replaces
+    [InlineData("127.0.0.1")]   // inside the jail's netns, loopback is the jail itself
+    [InlineData("mainguard-egress-proxy")] // Docker's Dns list takes addresses, not names
+    [InlineData("not-an-ip")]
+    [InlineData("::1")]
+    public void Build_RejectsAUselessDnsPin_Typed(string bad)
+    {
+        Assert.Throws<SandboxSpecException>(() =>
+            ContainerSpecBuilder.Build(ValidRequest() with { DnsServerAddress = bad }));
+    }
+
+    // ---- MG-26: the jail's CPU + rlimit ceilings ----
+
+    [Fact]
+    public void Build_SetsACpuCeiling_MemoryAndPidsDoNotBoundABusyLoop()
+    {
+        var create = ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            Limits = new SandboxLimits(4L * 1024 * 1024 * 1024, 256, Cpus: 1.5),
+        });
+
+        // NanoCPUs is the cgroup cpu.max ceiling: 1e9 nanoCPU == one core.
+        Assert.Equal(1_500_000_000L, create.HostConfig.NanoCPUs);
+    }
+
+    [Fact]
+    public void Build_SetsNofileAndNprocUlimits()
+    {
+        var create = ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            Limits = new SandboxLimits(4L * 1024 * 1024 * 1024, 256, NoFile: 2048, NProc: 3000),
+        });
+
+        var nofile = Assert.Single(create.HostConfig.Ulimits, u => u.Name == "nofile");
+        Assert.Equal(2048, nofile.Soft);
+        Assert.Equal(2048, nofile.Hard);
+
+        var nproc = Assert.Single(create.HostConfig.Ulimits, u => u.Name == "nproc");
+        Assert.Equal(3000, nproc.Soft);
+        Assert.Equal(3000, nproc.Hard);
+    }
+
+    [Fact]
+    public void SandboxLimits_Default_BoundsEveryAxis_AndKeepsNprocAbovePids()
+    {
+        var limits = SandboxLimits.Default;
+
+        Assert.True(limits.MemoryBytes > 0);
+        Assert.True(limits.Pids > 0);
+        Assert.True(limits.Cpus > 0);
+        Assert.True(limits.NoFile > 0);
+
+        // Docker's nproc ulimit is enforced per REAL uid, and with userns-remap every jail shares one
+        // host uid — an nproc at or below the pids ceiling would make one agent's processes count
+        // against the next agent's fork budget. The per-container bound is PidsLimit; nproc is the
+        // outer backstop and must sit above it.
+        Assert.True(limits.NProc > limits.Pids);
+    }
+
+    [Theory]
+    [InlineData(0.0)]
+    [InlineData(-1.0)]
+    public void Build_WithNoCpuCeiling_ThrowsTyped(double cpus)
+    {
+        Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            Limits = new SandboxLimits(4L * 1024 * 1024 * 1024, 256, Cpus: cpus),
+        }));
+    }
+
+    [Theory]
+    [InlineData(0L, SandboxLimits.DefaultNProc)]
+    [InlineData(SandboxLimits.DefaultNoFile, 0L)]
+    public void Build_WithAMissingRlimit_ThrowsTyped(long nofile, long nproc)
+    {
+        Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            Limits = new SandboxLimits(4L * 1024 * 1024 * 1024, 256, NoFile: nofile, NProc: nproc),
+        }));
     }
 }

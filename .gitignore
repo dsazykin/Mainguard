@@ -57,6 +57,10 @@ Agentic_IDE_Implementation_Plan.md
 # Headless render harness output (not committed)
 artifacts_headless/
 
+# Packaging output: build/velopack/pack.ps1's publish + RELEASES feeds, and the MG-15
+# elevated-components stage the Pro head self-contained-publishes at Publish time (~90 MB).
+artifacts/
+
 # MainguardOS payload build products (built by build/mainguardos/build.sh; never committed)
 build/mainguardos/out/
 build/mainguardos/payload/

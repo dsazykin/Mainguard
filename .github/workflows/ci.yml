@@ -18,14 +18,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Uses the SDK version pinned in global.json (10.0.100).
+      # MG-35: global.json pins the SDK to an EXACT build (10.0.301, rollForward latestPatch).
+      # setup-dotnet@v4 only special-cases rollForward: latestFeature (which it widens to the
+      # "10.0" channel = newest 10.0.x); every other value is passed through verbatim, so this
+      # file installs exactly 10.0.301 on every runner. Two builds of the same commit therefore
+      # use the same compiler, analyzers and runtime packs.
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
 
-      - name: Restore
-        run: dotnet restore
+      # MG-35: --locked-mode restores ONLY what the committed packages.lock.json already names.
+      # Direct PackageReference versions were always exact, but the TRANSITIVE closure was resolved
+      # fresh on every run — a republished package or a new dependency patch could quietly enter the
+      # product between review and merge. Locked mode turns that drift into NU1004/NU1403 here
+      # instead. If this step fails after you deliberately bumped a package, run a plain
+      # `dotnet restore Mainguard.slnx` locally and commit the regenerated lockfiles.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
 
       - name: Build
         run: dotnet build --no-restore --configuration Release
@@ -54,10 +64,15 @@ jobs:
         with:
           global-json-file: global.json
 
+      # dotnet format restores implicitly; doing it explicitly first is what makes THIS job a
+      # lockfile gate too (MG-35) rather than a silently-unlocked resolve.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
       # Verifies code matches .editorconfig. If this fails on an untouched file,
       # run `dotnet format` locally once, commit the result, then re-run.
       - name: Verify formatting
-        run: dotnet format --verify-no-changes
+        run: dotnet format --no-restore --verify-no-changes
 
   allowlist-shrink-guard:
     name: VT allowlist may only shrink (P2-04)
@@ -138,8 +153,8 @@ jobs:
           path: build/images/*.tar
           retention-days: 7
 
-      - name: Restore
-        run: dotnet restore
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
 
       - name: Build
         run: dotnet build --no-restore --configuration Release
@@ -156,6 +171,12 @@ jobs:
   payload-reproducible:
     name: MainguardOS payload hash-stable (P2-21)
     runs-on: ubuntu-latest
+    # MG-9 / code-signing plan step 2: attesting an artifact needs an OIDC token (id-token) and the
+    # attestations scope. Scoped to THIS job — no other job may mint a Mainguard attestation.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -163,6 +184,15 @@ jobs:
       # context, so the SDK must be present. The publish is deterministic (Deterministic +
       # ContinuousIntegrationBuild, no ReadyToRun/single-file; deterministic portable PDBs), so both
       # builds below stay identical.
+      #
+      # MG-35: this job is deliberately NOT restored with --locked-mode. build.sh publishes
+      # `-r linux-x64`, and a RID restore resolves an ADDITIONAL `net10.0/linux-x64` lockfile target
+      # that a plain restore does not (and strips again on the next plain restore), so committing it
+      # would make the lockfiles churn on every ordinary `dotnet restore`. Nothing is lost: the RID
+      # graph is the RID-less graph plus SDK-supplied runtime packs, and both halves are pinned
+      # anyway — the packages by the lockfile that build-and-test enforces, the runtime packs by the
+      # exact SDK in global.json. The same reasoning covers the win-x64 publishes in
+      # package-smoke.yml.
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -247,6 +277,48 @@ jobs:
             exit 1
           '
 
+      # ------------------------------------------------------------------------------------------
+      # MG-9 — build provenance (code-signing plan step 2).
+      #
+      # Everything above proves the payload is REPRODUCIBLE. Reproducible is not authentic: the app
+      # used to derive its integrity expectation from the very bytes it had just been handed, so a
+      # swapped artifact verified against itself. A GitHub artifact attestation is signed by this
+      # workflow's OIDC identity at build time, so it is evidence about the artifact that whoever
+      # swaps the artifact cannot regenerate. `gh attestation verify` (and BuildProvenanceGate) check
+      # it against the repository pinned in BuildProvenanceStamp.SourceRepository.
+      #
+      # push-only: attestation minting requires the repo's own OIDC token, which a fork PR does not
+      # get. On a PR this step is skipped and the reproducibility gates above still run.
+      # ------------------------------------------------------------------------------------------
+      - name: Attest the MainguardOS payload (build provenance)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/out-a/MainguardOS.tar.gz
+
+      # The daemon payload is a DIRECTORY and attestations cover files, so what gets attested is its
+      # canonical sha256 manifest — the exact text DaemonPayloadManifest.ToCanonicalText() produces
+      # (`<sha256>  <relative path>`, sorted ordinally, LF). DaemonUpdater rebuilds that text from the
+      # payload on the user's disk and requires it to match this file byte for byte before it will
+      # accept the attestation, which is what ties a build-time signature to a directory.
+      - name: Build the daemon payload manifest (the attested artifact for the daemon build)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/daemon-payload"
+          dotnet publish Mainguard.Server/Mainguard.Server.csproj \
+            -c Release -r linux-x64 --self-contained false -o "$out"
+          ( cd "$out" && find . -type f -printf '%P\n' | LC_ALL=C sort \
+              | while IFS= read -r f; do printf '%s  %s\n' "$(sha256sum "$f" | cut -d' ' -f1)" "$f"; done ) \
+            > "$RUNNER_TEMP/daemon.manifest"
+          echo "manifest lines: $(wc -l < "$RUNNER_TEMP/daemon.manifest")"
+
+      - name: Attest the daemon payload manifest (build provenance)
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ${{ runner.temp }}/daemon.manifest
+
   installer-guardrails:
     name: Installer rejection-trigger greps (P2-21)
     runs-on: ubuntu-latest
@@ -277,6 +349,12 @@ jobs:
         with:
           global-json-file: global.json
 
+      # verify-client-closure.sh publishes framework-dependent (no RID), so its implicit restore is
+      # the same RID-less graph the lockfiles describe — restore it locked first (MG-35), and the
+      # publish below then finds everything already resolved.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
       # ADR-0001 payoff, automated. The plain Git-client head (Mainguard.Client.App) references
       # Mainguard.App.Shell ONLY, so its PUBLISHED dependency closure physically cannot contain the agent
       # platform. This gate publishes the head and fails if its .deps.json / publish dir names any of
@@ -300,8 +378,10 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Restore
-        run: dotnet restore
+      # MG-35: the Windows leg locks too — a lockfile that only binds on Linux would let a
+      # Windows-only transitive (a runtime.win asset, a native shim) drift unobserved.
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
 
       - name: Build Mainguard.Server
         run: dotnet build Mainguard.Server/Mainguard.Server.csproj --no-restore --configuration Release

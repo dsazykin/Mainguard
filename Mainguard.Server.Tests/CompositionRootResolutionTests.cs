@@ -21,7 +21,9 @@ namespace Mainguard.Server.Tests;
 public sealed class CompositionRootResolutionTests
 {
     /// <summary>Every gRPC service mapped by <c>DaemonHost.MapServices</c> must have a fully resolvable
-    /// constructor graph in the real composition root (no missing registration).</summary>
+    /// constructor graph in the real composition root (no missing registration). The set is read off the
+    /// host's routing table — the hand-kept list this replaced had drifted to 8 of the 9 mapped services
+    /// (<c>EgressGrpcService</c> was absent), which is the same silent-coverage-loss the auth theory had.</summary>
     [Fact]
     public void EveryMappedGrpcService_ConstructorGraph_Resolves()
     {
@@ -30,14 +32,10 @@ public sealed class CompositionRootResolutionTests
 
         // ActivatorUtilities resolves each service's ctor dependencies from the real container — a missing
         // registration throws here, which is exactly the startup failure this test guards against.
-        Assert.NotNull(ActivatorUtilities.CreateInstance<AgentGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<TerminalGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<RepoSyncGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<GatewayGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<MergeQueueGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<PlanApprovalGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<KillSwitchGrpcService>(sp));
-        Assert.NotNull(ActivatorUtilities.CreateInstance<CoordinatorGrpcService>(sp));
+        foreach (var serviceType in MappedGrpcRpcs.ServiceTypes(sp))
+        {
+            Assert.NotNull(ActivatorUtilities.CreateInstance(sp, serviceType));
+        }
     }
 
     /// <summary>The P2-08 gateway stack + P2-09 leader + P2-14 governance spine all resolve as singletons.</summary>
