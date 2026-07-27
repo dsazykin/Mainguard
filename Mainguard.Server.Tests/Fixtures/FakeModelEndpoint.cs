@@ -15,6 +15,9 @@ namespace Mainguard.Server.Tests.Fixtures;
 /// </summary>
 public sealed class FakeModelEndpoint : IDisposable
 {
+    /// <summary>Bind attempts before the port contention is treated as a real failure.</summary>
+    private const int MaxStartAttempts = 4;
+
     private readonly HttpListener _listener = new();
     private readonly Queue<ScriptedResponse> _script = new();
     private readonly object _gate = new();
@@ -23,11 +26,30 @@ public sealed class FakeModelEndpoint : IDisposable
 
     public FakeModelEndpoint()
     {
-        var port = GetFreePort();
-        BaseAddress = new Uri($"http://127.0.0.1:{port}/");
-        _listener.Prefixes.Add(BaseAddress.ToString());
-        _listener.Start();
+        // Same race as the daemon hosts: an OS-assigned port is released before this listener claims it.
+        // TestPorts stops THIS process from double-issuing; the bounded retry covers a foreign process
+        // taking the port in between.
+        BaseAddress = StartOnFreePort(_listener);
         _ = Task.Run(LoopAsync);
+    }
+
+    private static Uri StartOnFreePort(HttpListener listener)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            var address = new Uri($"http://127.0.0.1:{TestPorts.Lease()}/");
+            listener.Prefixes.Clear();
+            listener.Prefixes.Add(address.ToString());
+            try
+            {
+                listener.Start();
+                return address;
+            }
+            catch (Exception ex) when (attempt < MaxStartAttempts && TestPorts.IsAddressInUse(ex))
+            {
+                // Lost the port to another process between the lease and the bind — take another.
+            }
+        }
     }
 
     /// <summary>The root URL of the fake endpoint (loopback).</summary>
@@ -118,15 +140,6 @@ public sealed class FakeModelEndpoint : IDisposable
         }
 
         target.Close();
-    }
-
-    private static int GetFreePort()
-    {
-        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
     }
 
     public void Dispose()
