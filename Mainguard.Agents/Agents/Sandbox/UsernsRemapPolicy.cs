@@ -296,10 +296,20 @@ public static class UsernsRemapPolicy
     /// <summary>
     /// Brings the bind-mount sources to the shared-ownership invariant, idempotently.
     ///
-    /// <para><b>repos/ + worktrees/</b> (bind-mounted READ-WRITE): group <see cref="JailGroupName"/>,
-    /// group-rwX, setgid on every directory so new children inherit the group. Guarded on the top
-    /// directory's own gid so the recursive pass runs ONCE — on an already-migrated VM this is three
-    /// <c>stat</c>s, not a walk of every worktree on every boot.</para>
+    /// <para><b>repos/ + worktrees/ + agents/</b> (bind-mounted READ-WRITE): group
+    /// <see cref="JailGroupName"/>, group-rwX, setgid on every directory so new children inherit the
+    /// group. Guarded on the top directory's own gid so the recursive pass runs ONCE — on an
+    /// already-migrated VM this is three <c>stat</c>s, not a walk of every worktree on every boot.</para>
+    ///
+    /// <para><c>agents/</c> holds nothing yet. It is created and grouped HERE, ahead of use, because
+    /// <c>docs/design/mg-3-mediated-ref-updates.md</c> (the approved plan of record, which names this
+    /// change as its prerequisite) puts each agent's own repository at
+    /// <c>&lt;vmRoot&gt;/agents/&lt;hash&gt;/&lt;agentId&gt;.git</c> — and its §6.2 asks for exactly
+    /// this ordering so those directories are correct <i>by construction</i> rather than retrofitted.
+    /// With the setgid parent already in place, MG-3 has to do nothing about ownership at all; it only
+    /// has to make the CONTENT of a new git dir group-writable (<c>core.sharedRepository=group</c>,
+    /// exactly as <c>RepoProvisioner</c> does for the mirror), because umask is a property of the
+    /// writing process and no parent directory can supply it.</para>
     ///
     /// <para><b>adapters/</b> (bind-mounted READ-ONLY): deliberately NOT group-shared. The jail's uid
     /// moved from "the owner" to "other" when the remap landed, so all it needs — and all it may have —
@@ -317,14 +327,14 @@ public static class UsernsRemapPolicy
         return
             "set -u; "
             + $"root='{vmRoot}'; gid={gid}; "
-            + "mkdir -p \"$root/repos\" \"$root/worktrees\" || exit 1; "
+            + "mkdir -p \"$root/repos\" \"$root/worktrees\" \"$root/agents\" || exit 1; "
             // Owner only, and NEVER -R: a recursive chown would strip the remapped uid off every file
             // the jails legitimately wrote, on every boot. `mkdir -p` as root can create these three
             // root-owned on a fresh VM, which is the only ownership this has to repair.
             + $"chown {RemapUser}:{RemapUser} \"$root\" 2>/dev/null || true; "
-            + $"chown {RemapUser} \"$root/repos\" \"$root/worktrees\" 2>/dev/null || true; "
+            + $"chown {RemapUser} \"$root/repos\" \"$root/worktrees\" \"$root/agents\" 2>/dev/null || true; "
             + "chmod 0755 \"$root\" || exit 1; "
-            + "for d in \"$root/repos\" \"$root/worktrees\"; do "
+            + "for d in \"$root/repos\" \"$root/worktrees\" \"$root/agents\"; do "
             + "  cur=$(stat -c %g \"$d\" 2>/dev/null || echo -1); "
             + "  if [ \"$cur\" != \"$gid\" ]; then "
             + "    chgrp -R \"$gid\" \"$d\" || exit 1; "

@@ -43,6 +43,16 @@ needs, but owns neither tree (it cannot `chmod`/`chown`/replace them) and has **
 anything else under `/home/mainguard`. The read-only `adapters` mount is `a+rX` and deliberately not in
 that group; the read-only coordinator IPC dir already grants the traversal/connect bits it needs.
 
+**MG-3 ordering.** `docs/design/mg-3-mediated-ref-updates.md` (the approved plan of record) names this
+change as its prerequisite so that the per-agent repositories it introduces at
+`<vmRoot>/agents/<hash>/<agentId>.git` are created with correct ownership *by construction*. That
+parent directory is therefore provisioned here, ahead of use, with the same `2775
+mainguard:mainguard-jail` setgid treatment — MG-3 has to do nothing about ownership at all, only make
+the content of a new git dir group-writable (`core.sharedRepository=group`), because umask is a
+property of the writing process and no parent directory can supply it. Nothing here makes flipping the
+mirror mount to read-only (MG-3 Stage 3) harder: a read-only mount needs read+traverse only, which the
+group already grants.
+
 **The check, not the config.** `FirstBootStep`'s check phase asserts the remap is *in effect* — `docker
 info` reports the `name=userns` security option **and** its `DockerRootDir` is
 `/var/lib/docker/100000.100000`, which is the only direct evidence that the remap running is the one the

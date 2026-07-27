@@ -67,7 +67,8 @@ RUN set -eux; \
     printf 'mainguard:100000:65536\n' > /etc/subgid; \
     install -d -o mainguard -g mainguard -m 0755 /home/mainguard/mainguard; \
     install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/repos; \
-    install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/worktrees
+    install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/worktrees; \
+    install -d -o mainguard -g mainguard-jail -m 2775 /home/mainguard/mainguard/agents
 
 # binfmt_misc is KERNEL-GLOBAL — one table shared by every WSL2 distro in the utility VM. Two separate
 # hazards live here, and the mask alone does NOT cover the second one.

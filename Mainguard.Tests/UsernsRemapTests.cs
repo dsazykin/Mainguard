@@ -91,6 +91,7 @@ public class UsernsRemapTests
         Assert.Contains("usermod -aG mainguard-jail mainguard;", dockerfile, StringComparison.Ordinal);
         Assert.Contains("-g mainguard-jail -m 2775 /home/mainguard/mainguard/repos", dockerfile, StringComparison.Ordinal);
         Assert.Contains("-g mainguard-jail -m 2775 /home/mainguard/mainguard/worktrees", dockerfile, StringComparison.Ordinal);
+        Assert.Contains("-g mainguard-jail -m 2775 /home/mainguard/mainguard/agents", dockerfile, StringComparison.Ordinal);
     }
 
     // ---- The boot probe: the assertion that must not be able to pass vacuously -------------------
@@ -249,10 +250,14 @@ public class UsernsRemapTests
     {
         var script = UsernsRemapPolicy.MountOwnershipScript();
 
-        // The two read-write bind-mount sources, grouped to the remapped agent gid with setgid on
-        // directories so MG-3's new per-agent repositories inherit it by construction.
+        // The two read-write bind-mount sources — plus `agents/`, which holds nothing yet but is where
+        // docs/design/mg-3-mediated-ref-updates.md puts each agent's own repository. Grouped to the
+        // remapped agent gid with setgid on directories, so MG-3's per-agent repositories inherit the
+        // ownership BY CONSTRUCTION (its §6.2 asks for exactly this ordering) instead of being
+        // retrofitted.
         Assert.Contains("$root/repos", script, StringComparison.Ordinal);
         Assert.Contains("$root/worktrees", script, StringComparison.Ordinal);
+        Assert.Contains("$root/agents", script, StringComparison.Ordinal);
         Assert.Contains("gid=101000", script, StringComparison.Ordinal);
         Assert.Contains("chmod 2775", script, StringComparison.Ordinal);
         Assert.Contains("chmod g+s", script, StringComparison.Ordinal);
@@ -359,7 +364,7 @@ public class UsernsRemapTests
                 process.WaitForExit();
                 Assert.True(process.ExitCode == 0, $"run {run} failed: {stderr}");
 
-                foreach (var dir in new[] { "repos", "worktrees" })
+                foreach (var dir in new[] { "repos", "worktrees", "agents" })
                 {
                     var path = Path.Combine(root, "mainguard", dir);
                     Assert.True(Directory.Exists(path), path + " must exist");
