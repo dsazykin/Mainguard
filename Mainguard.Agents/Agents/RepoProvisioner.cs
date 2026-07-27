@@ -133,6 +133,13 @@ public sealed class RepoProvisioner : IRepoProvisioner
         AgentGitCommand.Run(barePath, "config", "core.sharedRepository", "group");
         WorktreeManager.GroupShareRecursive(barePath);
 
+        // MG-3 §4: every agent repository borrows this mirror's objects through an alternate, and git
+        // does not track borrowers. An implicit `gc --auto` — which git fires after many ordinary
+        // commands, including the fetch above — would prune objects a live agent's repo still depends
+        // on. Pinned on EVERY provision so a mirror created before this policy is repaired by a daemon
+        // update alone. Repacking (which deletes nothing) stays allowed and is driven from teardown.
+        MirrorMaintenance.ApplyGcPolicy(barePath);
+
         var vmRemoteUrl = _vmRemoteUrlResolver(hash);
         if (string.IsNullOrEmpty(vmRemoteUrl))
         {

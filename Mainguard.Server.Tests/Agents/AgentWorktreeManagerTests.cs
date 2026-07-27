@@ -101,51 +101,105 @@ public sealed class AgentWorktreeManagerTests
         Assert.False(Directory.Exists(path)); // force cleans
     }
 
+    // MG-3: the quarantine remote is now the agent's OWN repository, not the shared mirror. That is the
+    // whole point — `git push origin` has to keep working (LLM CLIs push reflexively) while the mirror
+    // stops being something the agent talks to at all.
     [Fact]
-    public void QuarantineRemote_IsExactlyTheDaemonBareRepo()
+    public void QuarantineRemote_IsExactlyTheAgentsOwnRepo_NeverTheSharedMirror()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var path = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var bare = env.BarePath(hash);
+        var agentRepo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+
+        // Exactly one configured remote, named origin, pointing at the agent's own repository.
+        var remotes = AgentTestGit.RunChecked(path, "remote").Trim()
+            .Split('\n', System.StringSplitOptions.RemoveEmptyEntries);
+        Assert.Equal(new[] { "origin" }, remotes);
+
+        var originUrl = AgentTestGit.RunChecked(path, "remote", "get-url", "origin").Trim();
+        Assert.Equal(agentRepo, originUrl);
+
+        // NOT the shared mirror (MG-3), not the user's real remote, not the fixture's work repo.
+        Assert.NotEqual(bare, originUrl);
+        Assert.NotEqual(env.Fixture.WorkRepoPath, originUrl);
+        Assert.NotEqual(env.Fixture.BareMirrorPath, originUrl);
+
+        // The mirror itself still denies rewrites/deletes over receive-pack (defence in depth; after
+        // stage 3 it is no longer the load-bearing control).
+        Assert.Equal("true", AgentTestGit.RunChecked(bare, "config", "receive.denyNonFastForwards").Trim());
+        Assert.Equal("true", AgentTestGit.RunChecked(bare, "config", "receive.denyDeletes").Trim());
+    }
+
+    /// <summary>
+    /// MG-3 — the per-agent repository borrows the mirror's objects instead of copying them. A
+    /// three-commit seed repo produces an agent repo whose OWN object store is empty (one
+    /// <c>objects/info/alternates</c> file and nothing else), and the whole directory is a few tens of
+    /// kilobytes — the sample hooks and config, not history.
+    /// </summary>
+    [Fact]
+    public void AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var agentRepo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+        var bare = env.BarePath(hash);
+
+        var alternates = Path.Combine(agentRepo, "objects", "info", "alternates");
+        Assert.True(File.Exists(alternates), "the per-agent repo must carry objects/info/alternates");
+        Assert.Equal(Path.Combine(bare, "objects"), File.ReadAllText(alternates).Trim());
+
+        // No pack and no loose object of its own — every object of the history resolves through the
+        // alternate. (The alternates file itself is the only thing under objects/.)
+        var ownObjects = Directory
+            .EnumerateFiles(Path.Combine(agentRepo, "objects"), "*", SearchOption.AllDirectories)
+            .Where(f => Path.GetFileName(f) != "alternates")
+            .ToArray();
+        Assert.Empty(ownObjects);
+
+        // …and history is nonetheless fully readable from it.
+        Assert.Equal("commit", AgentTestGit.RunChecked(agentRepo, "cat-file", "-t", "HEAD").Trim());
+    }
+
+    // MG-3: an agent's push lands in its OWN repo. Reaching the mirror is a separate, daemon-driven
+    // step that names both refs itself — so this test is also the proof that the agent cannot move the
+    // mirror's ref by pushing.
+    [Fact]
+    public void AgentPush_LandsInItsOwnRepo_AndOnlyTheDaemonPublishesToTheMirror()
     {
         using var env = new WorktreeEnv();
         var hash = env.Provision();
         var path = env.Worktrees.CreateAgentWorktree(hash, "a1");
         var bare = env.BarePath(hash);
 
-        // Exactly one configured remote, named origin, pointing at the bare mirror.
-        var remotes = AgentTestGit.RunChecked(path, "remote").Trim()
-            .Split('\n', System.StringSplitOptions.RemoveEmptyEntries);
-        Assert.Equal(new[] { "origin" }, remotes);
-
-        var originUrl = AgentTestGit.RunChecked(path, "remote", "get-url", "origin").Trim();
-        Assert.Equal(bare, originUrl);
-
-        // Not the user's real remote (the fixture's work repo or its separate mirror).
-        Assert.NotEqual(env.Fixture.WorkRepoPath, originUrl);
-        Assert.NotEqual(env.Fixture.BareMirrorPath, originUrl);
-
-        // The mirror itself denies rewrites/deletes.
-        Assert.Equal("true", AgentTestGit.RunChecked(bare, "config", "receive.denyNonFastForwards").Trim());
-        Assert.Equal("true", AgentTestGit.RunChecked(bare, "config", "receive.denyDeletes").Trim());
-    }
-
-    [Fact]
-    public void AgentPush_LandsInBareRepo_NeverUpstream()
-    {
-        using var env = new WorktreeEnv();
-        var hash = env.Provision();
-        var path = env.Worktrees.CreateAgentWorktree(hash, "a1");
-
         // The fixture's separate mirror stands in for the user's real remote.
         var upstreamBefore = DualRepoFixture.CaptureRefState(env.Fixture.BareMirrorPath);
+        var mirrorBefore = AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim();
 
         AgentTestGit.SetIdentity(path);
         File.WriteAllText(Path.Combine(path, "agent.txt"), "from-agent\n");
         AgentTestGit.RunChecked(path, "add", "agent.txt");
         AgentTestGit.RunChecked(path, "commit", "-m", "agent work");
         AgentTestGit.RunChecked(path, "push", "origin", "agent/a1");
+        var agentSha = AgentTestGit.RunChecked(path, "rev-parse", "HEAD").Trim();
 
-        // The push moved the quarantine bare's ref...
-        Assert.Equal("commit",
-            AgentTestGit.RunChecked(env.BarePath(hash), "cat-file", "-t", "refs/heads/agent/a1").Trim());
-        // ...and left the "real remote" completely untouched.
+        // The push moved the AGENT's own ref...
+        var agentRepo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+        Assert.Equal(agentSha, AgentTestGit.RunChecked(agentRepo, "rev-parse", "refs/heads/agent/a1").Trim());
+
+        // ...and the mirror has NOT moved: nothing the agent did reached it.
+        Assert.Equal(mirrorBefore, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+
+        // Only the daemon's publish carries it across — the merge queue's input contract, unchanged.
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
+        Assert.Equal(agentSha, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+        // The mirror holds the objects itself (it borrows from nobody), so deleting the agent repo
+        // later cannot strand the commit its ref names.
+        Assert.Equal("commit", AgentTestGit.RunChecked(bare, "cat-file", "-t", agentSha).Trim());
+
+        // The "real remote" is completely untouched throughout.
         var upstreamAfter = DualRepoFixture.CaptureRefState(env.Fixture.BareMirrorPath);
         Assert.Equal(upstreamBefore, upstreamAfter);
     }
@@ -164,6 +218,9 @@ public sealed class AgentWorktreeManagerTests
         AgentTestGit.RunChecked(path, "commit", "-m", "agent round trip");
         var agentSha = AgentTestGit.RunChecked(path, "rev-parse", "HEAD").Trim();
         AgentTestGit.RunChecked(path, "push", "origin", "agent/a1");
+        // MG-3: the daemon carries agent/<id> from the agent's own repo into the mirror the Windows
+        // side syncs from. Without it the agent's work never leaves its own writable space.
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
 
         // Windows side: register the SC-2-resolved sync remote and fetch + merge the agent branch.
         var remote = env.Env.ResolveSyncRemote(hash);
@@ -193,6 +250,7 @@ public sealed class AgentWorktreeManagerTests
         AgentTestGit.RunChecked(path, "add", "agent.txt");
         AgentTestGit.RunChecked(path, "commit", "-m", "cloud round trip");
         AgentTestGit.RunChecked(path, "push", "origin", "agent/a1");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
 
         AgentTestGit.RunChecked(env.Fixture.WorkRepoPath, "remote", "add", remote.Name, remote.Url);
         AgentTestGit.RunChecked(env.Fixture.WorkRepoPath, "fetch", remote.Name);

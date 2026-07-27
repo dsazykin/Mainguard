@@ -144,6 +144,15 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
 
             _setState(agentId, AgentRunState.Rebasing);
 
+            // MG-3: the worktree is linked off the agent's OWN repository now, which holds its own copy
+            // of main taken when the agent was created. Before this change the worktree shared the
+            // mirror's refs, so "the already-fetched mirror main" was current by construction; it no
+            // longer is, and rebasing onto a stale main would silently make the keep-alive cycle a no-op
+            // — the human's committed work would stop reaching the agent while every state transition
+            // still looked healthy. So carry the mirror's main across first. Best effort: a mirror that
+            // cannot be read leaves the previous main in place and the cycle proceeds as before.
+            RefreshMainFromMirror(loc);
+
             var wip = false;
             if (IsDirty(loc.WorktreePath))
             {
@@ -209,6 +218,28 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
 
     private static bool IsDirty(string worktreePath) =>
         AgentGitCommand.Run(worktreePath, "status", "--porcelain").Trim().Length > 0;
+
+    /// <summary>
+    /// MG-3 — fast-forwards the agent repository's copy of the main branch from the shared mirror, so
+    /// <c>git rebase &lt;main&gt;</c> below really does rebase onto the main the human advanced.
+    ///
+    /// <para>The refspec is daemon-written and names exactly one branch. It is forced (<c>+</c>) because
+    /// the agent owns this ref inside its own repo and may have moved it; the mirror is authoritative for
+    /// what "main" means, and the agent's own work lives on <c>agent/&lt;id&gt;</c>, which this never
+    /// touches. Fetching main can never be refused as "checked out": the worktree is on the agent
+    /// branch.</para>
+    /// </summary>
+    private static void RefreshMainFromMirror(AgentWorktreeLocation loc)
+    {
+        if (string.IsNullOrEmpty(loc.BarePath) || string.IsNullOrEmpty(loc.MainBranch))
+        {
+            return;
+        }
+
+        AgentGitCommand.TryRun(
+            loc.WorktreePath, out _, "fetch", "--no-tags", loc.BarePath,
+            $"+refs/heads/{loc.MainBranch}:refs/heads/{loc.MainBranch}");
+    }
 
     private static string HeadSha(string worktreePath)
     {

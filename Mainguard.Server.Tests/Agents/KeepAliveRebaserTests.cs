@@ -43,7 +43,7 @@ public sealed class KeepAliveRebaserTests
         Assert.True(File.Exists(Path.Combine(env.Worktree, "human.txt")));
         // The wip commit exists on the branch and main is now an ancestor (reparented).
         Assert.Contains("wip: sync", AgentTestGit.RunChecked(env.Worktree, "log", "--oneline"));
-        Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MainBranch, "HEAD").Code);
+        Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
         // Agent was resumed (token released), never left in Conflict.
         Assert.True(yield.LastToken!.Resumed);
         Assert.Contains(AgentRunState.Working, states);
@@ -66,14 +66,14 @@ public sealed class KeepAliveRebaserTests
         var skipped = await rebaser.RunCycleAsync("a1");
         Assert.Equal(RebaseCycleKind.Skipped, skipped.Kind);
         // No mutation: main is not yet an ancestor of the untouched agent branch.
-        Assert.NotEqual(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MainBranch, "HEAD").Code);
+        Assert.NotEqual(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
         Assert.True(yield.LastToken!.Resumed); // resumed so the agent finishes its own rebase
 
         // The agent finishes its rebase; the next cycle succeeds.
         Directory.Delete(rebaseMergeDir, recursive: true);
         var second = await rebaser.RunCycleAsync("a1");
         Assert.Equal(RebaseCycleKind.Rebased, second.Kind);
-        Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MainBranch, "HEAD").Code);
+        Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
     }
 
     [Fact]
@@ -153,7 +153,7 @@ public sealed class KeepAliveRebaserTests
         Assert.Null(yield.LastToken); // no yield token was ever taken → no unpause path exists
         Assert.Empty(states);         // the agent's state was not touched either
         // No mutation: main is still not an ancestor of the untouched agent branch.
-        Assert.NotEqual(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MainBranch, "HEAD").Code);
+        Assert.NotEqual(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
 
         // Once the operator resumes the kill switch, the very next cycle works normally.
         gate.Resume();
@@ -216,6 +216,20 @@ public sealed class KeepAliveRebaserTests
         public AgentWorktreeLocation Location { get; }
 
         public string MainBranch => Location.MainBranch;
+
+        /// <summary>
+        /// The MIRROR's current main commit, by sha.
+        ///
+        /// <para>These assertions used to name the branch (<c>merge-base --is-ancestor main HEAD</c>),
+        /// which resolved <c>main</c> in whatever repository the worktree belonged to. Under MG-3 the
+        /// worktree hangs off the agent's OWN repository, which holds its own copy of main frozen at
+        /// spawn — so a branch-name assertion silently starts measuring the stale ref and reads
+        /// "unmutated" as "already up to date". Naming the sha makes the question unambiguous: is the
+        /// commit the human actually pushed reachable from the agent's HEAD? The worktree can always
+        /// resolve it — that is exactly what the alternate to the mirror is for.</para>
+        /// </summary>
+        public string MirrorMainSha =>
+            AgentTestGit.RunChecked(Location.BarePath, "rev-parse", Location.MainBranch).Trim();
 
         /// <summary>Commits a file on the Windows-side work repo and re-provisions so the mirror's main advances.</summary>
         public void AdvanceMain(string relPath, string content, string message)

@@ -159,7 +159,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             queueStore: _ => new InMemoryMergeQueueStore(),
             verificationStore: _ => new InMemoryVerificationStore(),
             sandboxes: engine,
-            artifactDirectory: NewDir("mainguard-mqprov-artifacts-"));
+            artifactDirectory: NewDir("mainguard-mqprov-artifacts-"),
+            // MG-3: the production wiring. The agent commits into its OWN repository now, so without the
+            // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
+            // agent/<id> — the branch's rewritten test command would be invisible and the drift gate
+            // would silently stop firing while every assertion below still looked plausible.
+            publishAgentRef: (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId));
     }
 
     /// <summary>Seeds a source repo carrying a main-side verification config, then provisions its mirror.</summary>

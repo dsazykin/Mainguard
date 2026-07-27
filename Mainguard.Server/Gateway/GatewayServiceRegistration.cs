@@ -114,7 +114,12 @@ public static class GatewayServiceRegistration
             sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
             artifactDirectory: ResolveVerificationArtifactDir(dbPath),
             audit: sp.GetRequiredService<IAuditLog>(),
-            log: log));
+            log: log,
+            // MG-3: the daemon-side publish. The queue's input contract is refs/heads/agent/<id> in the
+            // mirror; with the agent now committing into its OWN repository, this is what carries it
+            // there — immediately before verification, so the verified bytes are current (design §7).
+            publishAgentRef: (repoHash, agentId) =>
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId)));
 
         services.AddSingleton(sp =>
         {

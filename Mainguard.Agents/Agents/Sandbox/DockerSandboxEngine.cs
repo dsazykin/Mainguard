@@ -122,6 +122,18 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // worktree's gitdir pointer dangles and every in-jail git command fails).
             var missingBareMount = !string.IsNullOrEmpty(request.BareRepoPath)
                 && (existing.Mounts is null || existing.Mounts.All(m => m.Destination != request.BareRepoPath));
+            // MG-3: the same reasoning for the per-agent repository. A jail created before MG-3 has its
+            // worktree linked off the mirror and carries no agents/ mount, so reusing it would leave the
+            // agent committing into the mirror — exactly the write path this change exists to remove.
+            var missingAgentRepoMount = !string.IsNullOrEmpty(request.AgentRepoPath)
+                && (existing.Mounts is null || existing.Mounts.All(m => m.Destination != request.AgentRepoPath));
+            // MG-3 stage 3: a jail created while the mirror mount was still read-write must be recreated,
+            // or the MG-3 write path survives a daemon upgrade in every already-running container. Mount
+            // options are fixed at create; recreating is the only way to change them.
+            var writableMirror = ContainerSpecBuilder.MirrorMountReadOnly
+                && !string.IsNullOrEmpty(request.BareRepoPath)
+                && existing.Mounts is not null
+                && existing.Mounts.Any(m => m.Destination == request.BareRepoPath && m.RW);
             // MG-7: HostConfig.Dns is fixed at create, so a jail that outlived a proxy recreate is
             // pinned to an address that no longer answers — every name in it would fail to resolve.
             // Recreating is the only way to re-pin; the alternative is a jail with no working DNS.
@@ -133,7 +145,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
-            if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef) || missingBareMount || stalePin || wrongNetwork)
+            if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
+                || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -154,7 +167,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
-            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer);
+            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

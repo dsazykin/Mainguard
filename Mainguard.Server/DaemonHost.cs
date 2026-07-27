@@ -170,7 +170,12 @@ public static class DaemonHost
         // diff the review cockpit renders (StreamQueue doesn't carry it). Reuses the audited git path +
         // pure PatchParser over the daemon's bare mirror.
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.IMergeBranchDiffService>(sp =>
-            new Mainguard.Agents.Agents.Orchestrator.MergeBranchDiffService(sp.GetRequiredService<IAgentEnvironment>().Repos));
+            new Mainguard.Agents.Agents.Orchestrator.MergeBranchDiffService(
+                sp.GetRequiredService<IAgentEnvironment>().Repos,
+                // MG-3: publish the agent's branch from its own repository into the mirror before
+                // diffing it — the review cockpit reads the mirror.
+                (repoHash, agentId) =>
+                    sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId)));
 
         // Terminal sessions: agents launched with an installed CLI get a long-lived BOUND session
         // (AgentCliBinder → docker exec under a real PTY) that Attach streams with replay across
