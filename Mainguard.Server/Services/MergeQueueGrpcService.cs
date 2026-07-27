@@ -122,8 +122,56 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             return Task.FromResult(new BeginMergeResponse { Granted = false, Reason = gateReason });
         }
 
-        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=True", request.RepoHandle, request.AgentId);
-        return Task.FromResult(new BeginMergeResponse { Granted = true, LeaseId = lease.LeaseId });
+        _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=True main={Sha}",
+            request.RepoHandle, request.AgentId, verified);
+
+        // The CAS old-OID travels back with the grant. The Windows-side merge has to fast-forward FROM
+        // exactly this sha and ConfirmMerge compares against exactly this sha, so both legs must read it
+        // from the daemon that granted the lease rather than from the client's own queue projection —
+        // which is a stream snapshot, and therefore allowed to be a revision behind.
+        return Task.FromResult(new BeginMergeResponse
+        {
+            Granted = true,
+            LeaseId = lease.LeaseId,
+            ExpectedMainSha = lease.ExpectedMainSha,
+        });
+    }
+
+    /// <summary>
+    /// RT-D1 step 3', the non-merge terminal: the human's Windows-side merge refused or failed, so the
+    /// repo's one lease is handed back with <b>nothing recorded</b> — no idempotency row, no
+    /// <c>Merged</c> transition, no <c>NotifyMainMoved</c> cascade. The queue is left exactly as it was.
+    ///
+    /// <para>This is deliberately the weakest merge-queue RPC there is: it can only release. It exists
+    /// because the merge lease is taken daemon-side (<c>BeginMerge</c>) but the merge itself runs on the
+    /// Windows repo, so a merge that never landed had no way to say so — the lease stranded the repo and
+    /// every later merge was refused with "another merge is already in progress" until the daemon
+    /// restarted and the RT-D1 reconcile swept it.</para>
+    ///
+    /// <para>Not gated on the kill switch: a frozen queue is a reason to hand a lease BACK, never a reason
+    /// to keep holding one. Lease ownership is still proved (repo + lease id + agent), so this cannot be
+    /// used to knock out someone else's in-flight merge.</para>
+    /// </summary>
+    public override Task<AbandonMergeResponse> AbandonMerge(AbandonMergeRequest request, ServerCallContext context)
+    {
+        var ctx = Resolve(request.RepoHandle);
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is null
+            || !string.Equals(lease.LeaseId, request.LeaseId, StringComparison.Ordinal)
+            || !string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            // Idempotent no-op rather than a fault: this call is the cleanup arm of a failure the caller is
+            // already reporting, and a throw here would replace that reason with a less useful one.
+            _log.LogInformation("AbandonMerge repo={Repo} agent={Agent}: no matching outstanding lease (no-op)",
+                request.RepoHandle, request.AgentId);
+            return Task.FromResult(new AbandonMergeResponse { Released = false });
+        }
+
+        ctx.Leases.Release(request.RepoHandle, request.LeaseId);
+        _log.LogInformation("AbandonMerge repo={Repo} agent={Agent}: lease released, nothing recorded ({Reason})",
+            request.RepoHandle, request.AgentId,
+            string.IsNullOrWhiteSpace(request.Reason) ? "no reason given" : request.Reason);
+        return Task.FromResult(new AbandonMergeResponse { Released = true });
     }
 
     /// <summary>

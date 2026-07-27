@@ -46,7 +46,7 @@ public class ExternalPrIntakeTests
             return Task.FromResult<IReadOnlyList<PullRequestItem>>(Open.ToList());
         }
 
-        public Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, CancellationToken ct)
+        public Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct)
         {
             MutatingCalls++;
             return Task.FromResult(new PullRequestItem { Number = number, State = PullRequestState.Merged });

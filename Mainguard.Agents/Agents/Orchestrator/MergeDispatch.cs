@@ -10,11 +10,10 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// <summary>A request to merge a queue entry (P2-12). Origin is read from the queue, not passed in.</summary>
 /// <param name="RepoPath">The local repo path (T-23 host/token resolution + the foreground merge).</param>
 /// <param name="RepoHash">The P2-06 repo hash (resolves the queue + drives the merge lease).</param>
-/// <param name="AgentId">The entry's agent id (<c>pr-&lt;n&gt;</c> for an external PR).</param>
+/// <param name="AgentId">The entry's agent id. For an external PR it is <c>pr-&lt;n&gt;</c> and the number
+/// IS the pull request — the queue key and the PR it merges cannot be allowed to disagree.</param>
 /// <param name="ExpectedMainSha">The <c>main@sha</c> the verification ran against (the A5 CAS old-OID).</param>
 /// <param name="MainBranch">The local main branch the merge lands on.</param>
-/// <param name="PrNumber">The upstream PR number — REQUIRED for an external entry, ignored for a local one.</param>
-/// <param name="Method">The host merge method for an external entry.</param>
 /// <param name="AllowStaleOverride">Loud, separate stale-override path for a local foreground merge.</param>
 /// <param name="OverrideReason">Why the override was used (audited).</param>
 public sealed record MergeDispatchRequest(
@@ -23,8 +22,6 @@ public sealed record MergeDispatchRequest(
     string AgentId,
     string ExpectedMainSha,
     string MainBranch = "main",
-    int? PrNumber = null,
-    PullRequestMergeMethod Method = PullRequestMergeMethod.Merge,
     bool AllowStaleOverride = false,
     string? OverrideReason = null);
 
@@ -35,9 +32,24 @@ public sealed record MergeDispatchOutcome(bool Merged, string? NewMainSha, bool 
 /// The P2-12 pluggable merge step: routes a merge by the queue entry's <see cref="MergeEntryOrigin"/>.
 /// A <see cref="MergeEntryOrigin.Local"/> entry merges via the existing Windows foreground merge
 /// (<see cref="IForegroundMergeService"/>, P2-10); a <see cref="MergeEntryOrigin.External"/> entry merges
-/// back through the host PR merge API (T-23) and then, once the merged SHA lands locally, fires the
-/// queue's <c>NotifyMainMoved</c> stale cascade. Both origins end at the SAME cascade — the human review
-/// gate is unchanged (P2-11 cockpit); this only swaps the transport that lands the merge.
+/// back through the host PR merge API (<see cref="IExternalPrMergeExecutor"/>) and then, once the merge
+/// has demonstrably landed locally, fires the queue's <c>NotifyMainMoved</c> stale cascade. Both origins
+/// end at the SAME cascade — the human review gate is unchanged (P2-11 cockpit); this only swaps the
+/// transport that lands the merge.
+///
+/// <para><b>This type has no production caller.</b> The shipped merge is driven from the Windows GUI
+/// (<c>DaemonBackedOrchestrator.ConfirmMergeAsync</c>), because both transports need host-side things the
+/// daemon does not have: the user's checkout for a local merge, and the host token for an external one —
+/// which lives only in the host OS keychain and is never copied into the VM. This remains the daemon-side
+/// shape from the P2-12 plan for the day a daemon-driven merge exists. If it is ever wired, it must
+/// contend for the daemon's SINGLE <see cref="IMergeLeaseStore"/> rather than being handed one of its own,
+/// or "one outstanding merge per repository" stops being true the moment both paths are live (MG-23).</para>
+///
+/// <para><b>It performs no host call of its own.</b> The external transport is
+/// <see cref="IExternalPrMergeExecutor"/> — the same implementation the GUI runs. It used to call the
+/// merge API here and then take the post-merge main sha from an injected callback, which meant the
+/// dispatch could confirm a merge on the strength of a sha nobody had verified against a ref; the
+/// executor instead proves the merge is on the base branch before anything is recorded.</para>
 ///
 /// <para><b>MG-23 — external merges obey the same serialization as local ones.</b> The external path used
 /// to call the host merge API and then <c>ConfirmHumanMerge</c> with no <c>TryBegin</c> lease, no
@@ -63,30 +75,27 @@ public sealed class MergeDispatch : IMergeDispatch
     internal const string LeaseHeldReason = "another merge is already in progress for this repository";
 
     private readonly IForegroundMergeService _foreground;
-    private readonly IPullRequestService _prService;
+    private readonly IExternalPrMergeExecutor _external;
     private readonly IMergeLeaseStore _leases;
     private readonly Func<string, MergeQueue?> _resolveQueue;
-    private readonly Func<MergeDispatchRequest, CancellationToken, Task<string>> _fetchMergedMainSha;
 
     /// <param name="foreground">The P2-10 Windows foreground merge (local entries). Its own <c>onMerged</c>
     /// wiring fires the queue's <c>ConfirmHumanMerge</c> → <c>NotifyMainMoved</c>.</param>
-    /// <param name="prService">The audited T-23 transport used for the host PR merge (external entries).</param>
+    /// <param name="external">The P2-12 external transport (host PR merge + local reconcile) — the SAME
+    /// implementation the GUI drives, so there is one answer to "how does an upstream PR merge".</param>
     /// <param name="leases">The RT-D1 per-repo merge lease store — the SAME instance the foreground merge
     /// uses, which is what makes the one-outstanding-merge-per-repo invariant span both origins (MG-23).</param>
     /// <param name="resolveQueue">Resolves a repo hash → its live <see cref="MergeQueue"/> (origin lookup + cascade).</param>
-    /// <param name="fetchMergedMainSha">After a host merge, fetches main and returns its new SHA (the sha that "lands locally").</param>
     public MergeDispatch(
         IForegroundMergeService foreground,
-        IPullRequestService prService,
+        IExternalPrMergeExecutor external,
         IMergeLeaseStore leases,
-        Func<string, MergeQueue?> resolveQueue,
-        Func<MergeDispatchRequest, CancellationToken, Task<string>> fetchMergedMainSha)
+        Func<string, MergeQueue?> resolveQueue)
     {
         _foreground = foreground ?? throw new ArgumentNullException(nameof(foreground));
-        _prService = prService ?? throw new ArgumentNullException(nameof(prService));
+        _external = external ?? throw new ArgumentNullException(nameof(external));
         _leases = leases ?? throw new ArgumentNullException(nameof(leases));
         _resolveQueue = resolveQueue ?? throw new ArgumentNullException(nameof(resolveQueue));
-        _fetchMergedMainSha = fetchMergedMainSha ?? throw new ArgumentNullException(nameof(fetchMergedMainSha));
     }
 
     public async Task<MergeDispatchOutcome> DispatchMergeAsync(MergeDispatchRequest request, CancellationToken ct)
@@ -125,12 +134,6 @@ public sealed class MergeDispatch : IMergeDispatch
     // so the serialization the local path gets from `--ff-only` has to be reconstructed explicitly.
     private async Task<MergeDispatchOutcome> MergeExternalAsync(MergeQueue queue, MergeDispatchRequest request, CancellationToken ct)
     {
-        if (request.PrNumber is not int prNumber)
-        {
-            throw new InvalidOperationException(
-                $"External entry '{request.AgentId}' has no PR number to merge through the host API.");
-        }
-
         // MG-23 step 1 — the SAME per-repo lease the foreground merge takes. Whichever origin wins owns
         // this repo's main until it confirms or releases; every other merge, local or external, is told
         // to wait in the identical words. Without this the external transport ran wholly outside the
@@ -163,30 +166,33 @@ public sealed class MergeDispatch : IMergeDispatch
                     "verification is stale — main moved; re-verifying");
             }
 
-            // The ONE audited transport performs the merge (an explicit user action — invariant 1 permits it).
-            try
+            // The external transport: merge the pull request on its host, then bring the checkout up to
+            // date with the merge the host performed. Every way that can fail — including the host
+            // refusing, which is precisely an `--ff-only` refusal on the local path — comes back as a
+            // reason rather than an exception, and none of them confirms anything.
+            var result = await _external
+                .MergeExternalPrAsync(
+                    new ForegroundMergeRequest(
+                        request.RepoPath, request.RepoHash, request.AgentId,
+                        request.ExpectedMainSha, request.MainBranch),
+                    lease, ct)
+                .ConfigureAwait(false);
+
+            if (!result.Merged || string.IsNullOrEmpty(result.NewMainSha))
             {
-                await _prService.MergeAsync(request.RepoPath, prNumber, request.Method, ct).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // The host refused: the PR stopped being mergeable because its base moved, or it was
-                // already merged/closed upstream. That is precisely an `--ff-only` refusal on the local
-                // path — the CAS lost, no merge of ours landed, nothing is confirmed, the branch
-                // re-verifies against the new main. Reported as CasLost, not as a crash.
-                return new MergeDispatchOutcome(false, null, CasLost: true,
-                    $"verification is stale — the host refused the merge; re-verifying ({ex.Message})");
+                // NOTHING LANDED. Confirming here would move the entry to Merged and fire NotifyMainMoved
+                // at every other agent in the repo on the strength of a merge that did not happen.
+                return new MergeDispatchOutcome(false, null, result.CasLost, result.Reason);
             }
 
-            // The merged sha lands locally (fetch main), then the queue's stale cascade fires — identical
-            // to the local path's terminal handling. Confirm writes the RT-D1 idempotency record and
-            // releases the lease, so the boot reconcile can tell a landed merge from an abandoned one.
-            var newMainSha = await _fetchMergedMainSha(request, ct).ConfigureAwait(false);
-            _leases.Confirm(request.RepoHash, leaseId, newMainSha);
+            // The merge is proven landed, so the queue's stale cascade fires — identical to the local
+            // path's terminal handling. Confirm writes the RT-D1 idempotency record and releases the
+            // lease, so the boot reconcile can tell a landed merge from an abandoned one.
+            _leases.Confirm(request.RepoHash, leaseId, result.NewMainSha!);
             confirmed = true;
-            queue.ConfirmHumanMerge(request.AgentId, newMainSha); // → Merged + NotifyMainMoved
+            queue.ConfirmHumanMerge(request.AgentId, result.NewMainSha!); // → Merged + NotifyMainMoved
 
-            return new MergeDispatchOutcome(Merged: true, newMainSha, CasLost: false, Reason: null);
+            return new MergeDispatchOutcome(Merged: true, result.NewMainSha, CasLost: false, Reason: null);
         }
         finally
         {

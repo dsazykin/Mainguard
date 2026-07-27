@@ -878,7 +878,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             {
                 var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
                 var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files);
-                ReviewCockpit = new ReviewCockpitViewModel(ctx, onMerge: id => _ = _queue.ConfirmMergeAsync(id));
+                ReviewCockpit = new ReviewCockpitViewModel(
+                    ctx, onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id));
                 return;
             }
         }
@@ -897,9 +898,22 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     {
         if (_agents is Services.DaemonBackedOrchestrator daemon)
         {
-            daemon.SetActiveRepo(repoHandle);
+            // The local checkout + sync-remote name from the SAME ProvisionRepo answer travel with the
+            // handle: the human merge lands on the user's own repository, so an adapter that knows only
+            // the opaque handle can observe the queue but cannot merge anything (see ConfirmMergeAsync).
+            var binding = _lastProvisioned;
+            var matches = binding is not null
+                && string.Equals(binding.Value.RepoHandle, repoHandle, StringComparison.Ordinal);
+            daemon.SetActiveRepo(
+                repoHandle,
+                matches ? binding!.Value.RepoPath : null,
+                matches ? binding!.Value.SyncRemoteName : null);
         }
     }
+
+    /// <summary>The most recent ProvisionRepo answer paired with the Windows path it was provisioned FROM
+    /// (the daemon only ever hands back opaque handles — G-14 — so the path has to be remembered here).</summary>
+    private (string RepoHandle, string RepoPath, string SyncRemoteName)? _lastProvisioned;
 
     /// <summary>Provision the just-opened repo into the daemon (P2-06) and return its sync-remote binding
     /// for the shell to register with its own IGitService (step 2f seam). Gated on the real
@@ -918,6 +932,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             using var daemon = Services.DaemonClient.ForLoopback();
             using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(5));
             var provisioned = await daemon.ProvisionRepoAsync(repoPath, cts.Token).ConfigureAwait(false);
+            _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName);
             return new Mainguard.UI.Editions.RepoSyncBinding(
                 provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl);
         }

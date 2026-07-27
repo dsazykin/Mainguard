@@ -62,10 +62,11 @@ public sealed class PullRequestService : IPullRequestService
         return provider.CreateAsync(slug, token, request, ct);
     }
 
-    public Task<PullRequestItem> MergeAsync(string repoPath, int number, PullRequestMergeMethod method, CancellationToken ct)
+    public Task<PullRequestItem> MergeAsync(
+        string repoPath, int number, PullRequestMergeMethod method, string? expectedHeadSha, CancellationToken ct)
     {
         var (provider, slug, token) = Resolve(repoPath);
-        return provider.MergeAsync(slug, token, number, method, ct);
+        return provider.MergeAsync(slug, token, number, method, expectedHeadSha, ct);
     }
 
     public Task CloseAsync(string repoPath, int number, CancellationToken ct)

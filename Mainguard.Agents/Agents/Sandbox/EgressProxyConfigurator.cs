@@ -79,6 +79,7 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     private readonly string _proxyImageRef;
     private readonly string? _gatewayUpstream;
     private readonly Func<IReadOnlyList<string>>? _installedAdapterHosts;
+    private readonly IExecStdinTransport _stdin;
 
     /// <param name="gatewayUpstream">
     /// The P2-08 AI-gateway <c>host:port</c> the proxy routes model-API hosts through (gateway
@@ -92,18 +93,23 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// next spawn without a restart; unioned into the rendered proxy config as
     /// <see cref="EgressEntryKind.AgentService"/> (direct route). Null = none (tests / no adapters).
     /// </param>
+    /// <param name="stdin">The exec-stdin transport used for the (rare) artefact too large for an argv
+    /// entry. Docker.DotNet's own stdin path cannot deliver against a modern engine — see
+    /// <see cref="DockerSocketExecStdinTransport"/>.</param>
     public EgressProxyConfigurator(
         IDockerClient docker,
         EgressAllowlist allowlist,
         string proxyImageRef = DefaultImageRef,
         string? gatewayUpstream = null,
-        Func<IReadOnlyList<string>>? installedAdapterHosts = null)
+        Func<IReadOnlyList<string>>? installedAdapterHosts = null,
+        IExecStdinTransport? stdin = null)
     {
         _docker = docker ?? throw new ArgumentNullException(nameof(docker));
         Allowlist = allowlist ?? throw new ArgumentNullException(nameof(allowlist));
         _proxyImageRef = proxyImageRef;
         _gatewayUpstream = gatewayUpstream;
         _installedAdapterHosts = installedAdapterHosts;
+        _stdin = stdin ?? DockerSocketExecStdinTransport.For(docker);
     }
 
     public EgressAllowlist Allowlist { get; }
@@ -1053,7 +1059,15 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         await WriteFileOverStdinAsync(containerId, path, content, ct).ConfigureAwait(false);
     }
 
-    /// <summary>The pre-existing stdin transport, kept only for content too large for an argv entry.</summary>
+    /// <summary>
+    /// The stdin transport, kept only for content too large for an argv entry.
+    ///
+    /// <para>It no longer runs through Docker.DotNet: that library's <c>AttachStdin</c> path delivers
+    /// neither the bytes nor the half-close against a modern engine, so this fallback — the one that
+    /// exists precisely so an absurd allowlist still works — would have been the branch that silently
+    /// wrote an EMPTY default-deny filter. <see cref="DockerSocketExecStdinTransport"/> carries it now
+    /// and has the measurements.</para>
+    /// </summary>
     private async Task WriteFileOverStdinAsync(string containerId, string path, string content, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -1066,18 +1080,22 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // this path does not additionally depend on the half-close arriving.
         var length = bytes.Length.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
-        var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+        var result = await _stdin.RunAsync(
+            new ExecStdinRequest(
+                containerId, "0",
+                new[] { "sh", "-c", "mkdir -p \"$(dirname \"$1\")\"; head -c \"$2\" > \"$1\"", "sh", path, length },
+                bytes),
+            bounded).ConfigureAwait(false);
+
+        // The exit status was never read here either. A default-deny proxy whose filter failed to write
+        // is a proxy that permits nothing, so silence is the one outcome this must not produce.
+        if (result.ExitCode != 0)
         {
-            User = "0",
-            AttachStdin = true,
-            AttachStdout = true,
-            AttachStderr = true,
-            Cmd = new List<string> { "sh", "-c", "mkdir -p \"$(dirname \"$1\")\"; head -c \"$2\" > \"$1\"", "sh", path, length },
-        }, bounded).ConfigureAwait(false);
-        using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
-        await stream.WriteAsync(bytes, 0, bytes.Length, bounded).ConfigureAwait(false);
-        stream.CloseWrite();
-        await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+            throw new InvalidOperationException(
+                $"Writing the proxy artefact '{path}' into container '{containerId}' exited "
+                + $"{result.ExitCode}."
+                + (string.IsNullOrWhiteSpace(result.Output) ? " It printed nothing." : $" It printed: {result.Output}"));
+        }
     }
 
     /// <summary>

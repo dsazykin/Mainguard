@@ -7,8 +7,12 @@
   "html_url": "https://github.com/octocat/hello-world/pull/42",
   "merged_at": null,
   "mergeable": true,
+  "mergeable_state": "BLOCKED",
   "user": { "login": "danielsazykin" },
-  "head": { "ref": "feature/T-23-pr-integration" },
+  "head": {
+    "ref": "feature/T-23-pr-integration",
+    "sha": "9f2c1d4ab7e30516d2c88b9f6a3e5c7d81904bb2"
+  },
   "base": { "ref": "main" },
   "requested_reviewers": [
     { "login": "octocat" },

@@ -183,7 +183,7 @@ public class PullRequestProviderTests
     public async Task MergeAsync_WhenMerged_ReturnsMergedItem_AndMapsMethod()
     {
         var handler = new StubHandler(HttpStatusCode.OK, Fixture("github_pull_merged.json"));
-        var item = await ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Squash, CancellationToken.None);
+        var item = await ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Squash, expectedHeadSha: null, CancellationToken.None);
 
         Assert.Equal(42, item.Number);
         Assert.Equal(PullRequestState.Merged, item.State);
@@ -197,7 +197,7 @@ public class PullRequestProviderTests
     {
         var handler = new StubHandler(HttpStatusCode.OK, Fixture("github_merge_not_mergeable.json"));
         var ex = await Assert.ThrowsAsync<GitOperationException>(() =>
-            ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, CancellationToken.None));
+            ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, expectedHeadSha: null, CancellationToken.None));
 
         Assert.Contains("not mergeable", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
@@ -207,7 +207,54 @@ public class PullRequestProviderTests
     {
         var handler = new StubHandler((HttpStatusCode)405, "{\"message\":\"Pull Request is not mergeable\"}");
         await Assert.ThrowsAsync<GitOperationException>(() =>
-            ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, CancellationToken.None));
+            ProviderFor(handler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, expectedHeadSha: null, CancellationToken.None));
+    }
+
+    /// <summary>
+    /// P2-12: the verified head travels as GitHub's <c>sha</c> merge parameter — the host's own
+    /// compare-and-swap, which is what closes the window between reading a pull request's head and
+    /// merging it. Without it on the wire, a bot pushing one more commit in that window gets unverified
+    /// work merged under a verification that never saw it, and the request looks identical from here.
+    /// The merge commit the host names is returned too: the caller proves the merge landed against it.
+    /// </summary>
+    [Fact]
+    public async Task MergeAsync_WithExpectedHeadSha_SendsItAsTheHostsCompareAndSwap_AndReturnsTheMergeCommit()
+    {
+        var handler = new StubHandler(HttpStatusCode.OK, Fixture("github_pull_merged.json"));
+        var item = await ProviderFor(handler).MergeAsync(
+            Slug, Token, 42, PullRequestMergeMethod.Merge,
+            expectedHeadSha: "9f2c1d4ab7e30516d2c88b9f6a3e5c7d81904bb2", CancellationToken.None);
+
+        Assert.Contains("\"sha\":\"9f2c1d4ab7e30516d2c88b9f6a3e5c7d81904bb2\"", handler.LastBody);
+        Assert.Equal("6dcb09b5b57875f334f61aebed695e2e4193db5e", item.MergeCommitSha);
+        AssertTokenOnlyInAuthHeader(handler);
+    }
+
+    /// <summary>The manual PR panel merges without a CAS, and must send the body it always did — an
+    /// unconditional <c>"sha": null</c> would be rejected by the host outright.</summary>
+    [Fact]
+    public async Task MergeAsync_WithoutExpectedHeadSha_OmitsTheShaParameterEntirely()
+    {
+        var handler = new StubHandler(HttpStatusCode.OK, Fixture("github_pull_merged.json"));
+        await ProviderFor(handler).MergeAsync(
+            Slug, Token, 42, PullRequestMergeMethod.Merge, expectedHeadSha: null, CancellationToken.None);
+
+        Assert.DoesNotContain("\"sha\"", handler.LastBody);
+    }
+
+    /// <summary>
+    /// The two fields the external merge reads a pull request for. <c>mergeable_state</c> is normalized to
+    /// lower case because GitHub's casing is not contractual, and the head sha is the commit the merge is
+    /// compare-and-swapped against — a detail read that dropped either would silently disable a gate.
+    /// </summary>
+    [Fact]
+    public async Task GetAsync_MapsTheHeadShaAndTheMergeableState()
+    {
+        var handler = new StubHandler(HttpStatusCode.OK, Fixture("github_pull_detail.json"));
+        var detail = await ProviderFor(handler).GetAsync(Slug, Token, 42, CancellationToken.None);
+
+        Assert.Equal("9f2c1d4ab7e30516d2c88b9f6a3e5c7d81904bb2", detail.Summary.HeadSha);
+        Assert.Equal("blocked", detail.MergeableState);
     }
 
     // ---- Close --------------------------------------------------------------------------------
@@ -397,7 +444,7 @@ public class PullRequestProviderTests
 
         // Merge
         var mergeHandler = new StubHandler(HttpStatusCode.OK, Fixture("github_pull_merged.json"));
-        var merged = await ProviderFor(mergeHandler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, CancellationToken.None);
+        var merged = await ProviderFor(mergeHandler).MergeAsync(Slug, Token, 42, PullRequestMergeMethod.Merge, expectedHeadSha: null, CancellationToken.None);
         Assert.DoesNotContain(Token, $"{merged.Number}{merged.State}");
     }
 

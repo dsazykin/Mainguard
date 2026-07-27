@@ -301,7 +301,10 @@ public partial class PullRequestsViewModel : ViewModelBase
         ErrorMessage = null;
         try
         {
-            await _pr.MergeAsync(_repoPath, row.Number, method, CancellationToken.None);
+            // No head CAS here on purpose: this is the manual PR panel, where the human is looking at the
+            // pull request they are merging and no verification is being spent on it. The merge-queue path
+            // (P2-12 external entries) passes the verified head and is refused if the PR moved since.
+            await _pr.MergeAsync(_repoPath, row.Number, method, expectedHeadSha: null, CancellationToken.None);
         }
         catch (Exception ex)
         {
