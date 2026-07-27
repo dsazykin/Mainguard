@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents.Bootstrap;
@@ -32,6 +33,18 @@ namespace Mainguard.Agents.Agents.Bootstrap;
 /// distro at uninstall and never re-applies afterwards. Scoping this per-distro is not possible
 /// (non-namespaced sysctl), and weakening it would break the G2 key-custody chain, so the fix is to
 /// state the side effect here and in the OOBE log line rather than to change the security posture.
+/// </para>
+/// <para>
+/// <b>MG-17 — the user-namespace remap is provisioned here too, and asserted here too.</b> The product
+/// claimed the jails were user-namespaced while <c>daemon.json</c> set no <c>userns-remap</c> at all.
+/// This step now (a) pins <c>/etc/subuid</c>+<c>/etc/subgid</c> <i>before</i> writing the daemon.json
+/// that enables the remap — dockerd refuses to start when the named user has no subordinate range, so
+/// the reverse order takes the whole VM down rather than merely leaving the remap off; (b) drains
+/// mainguard's containers and networks with the OLD daemon on the one boot that flips the storage root
+/// (see <see cref="UsernsRemapPolicy.PreFlipDrainScript"/>); (c) provisions the shared
+/// <c>mainguard-jail</c> group and the two bind-mount sources' ownership; and (d) asserts in its
+/// <b>check</b> phase that the remap is genuinely in effect, exactly as it asserts <c>ptrace_scope</c>
+/// ≥ 2 — a control that only exists in a config file is a control nobody has confirmed.
 /// </para>
 /// </summary>
 public sealed class FirstBootStep : IBootstrapStep
@@ -91,7 +104,32 @@ public sealed class FirstBootStep : IBootstrapStep
         if (!await DockerIsGreenAsync(ct).ConfigureAwait(false))
             return "Docker is not responding to `docker info`";
 
+        // MG-17: the product claims the jails are user-namespaced. Assert that the DAEMON is actually
+        // remapping — in the same spirit as the ptrace_scope check above, and for the same reason: a
+        // control that is only written to a config file is a control nobody has confirmed. Ordered after
+        // the Docker readiness check so a dead dockerd reports "Docker is not responding", never "no
+        // userns remap".
+        var userns = await UsernsUnsatisfiedReasonAsync(ct).ConfigureAwait(false);
+        if (userns is not null)
+            return "MG-17: " + userns;
+
         return null;
+    }
+
+    /// <summary>
+    /// Runs the MG-17 probe in-VM and hands its stdout to the pure
+    /// <see cref="UsernsRemapPolicy.DescribeUnsatisfied"/>. The parsing — including telling "the probe
+    /// did not run" apart from "the remap is off" — lives in that pure function so every branch is
+    /// unit-assertable without a VM.
+    /// </summary>
+    private async Task<string?> UsernsUnsatisfiedReasonAsync(CancellationToken ct)
+    {
+        var result = await _wsl.RunAsync(
+            WslCommands.InDistro("bash", "-c", UsernsRemapPolicy.ProbeScript), stdin: null, ct).ConfigureAwait(false);
+
+        // Deliberately NOT gated on result.Succeeded: the script always exits 0 and always prints its
+        // frames, so the frames themselves — not an exit code — are the evidence that it ran.
+        return UsernsRemapPolicy.DescribeUnsatisfied(result.StdOut);
     }
 
     public async Task ExecuteAsync(IProgress<string> log, CancellationToken ct)
@@ -118,6 +156,17 @@ public sealed class FirstBootStep : IBootstrapStep
         var dropIn = $"{InotifyWatches}\n{PtraceScope}\n";
         await _wsl.RunAsync(WslCommands.InDistroAsRoot("tee", SysctlDropInPath), stdin: dropIn, ct).ConfigureAwait(false);
 
+        // MG-17: the subordinate id ranges dockerd's userns-remap maps into. These MUST exist before
+        // dockerd is (re)started with `"userns-remap": "mainguard"` in daemon.json — dockerd refuses to
+        // start if the named user has no subordinate range, which would take the whole VM down rather
+        // than merely leaving the remap off. Written whole (same convention as /etc/wsl.conf and
+        // daemon.json) so the files are a deterministic function of UsernsRemapPolicy.
+        log.Report($"Pinning the container userns range ({UsernsRemapPolicy.RemapUser}:{UsernsRemapPolicy.SubordinateBase})…");
+        await _wsl.RunAsync(WslCommands.InDistroAsRoot("tee", UsernsRemapPolicy.SubuidPath),
+            stdin: UsernsRemapPolicy.SubidFileContent, ct).ConfigureAwait(false);
+        await _wsl.RunAsync(WslCommands.InDistroAsRoot("tee", UsernsRemapPolicy.SubgidPath),
+            stdin: UsernsRemapPolicy.SubidFileContent, ct).ConfigureAwait(false);
+
         // Make sure dockerd is actually up (repairs wsl.conf + clears a stale pidfile, then starts it).
         await EnsureDockerRunningAsync(log, ct).ConfigureAwait(false);
 
@@ -142,6 +191,13 @@ public sealed class FirstBootStep : IBootstrapStep
         if (!dockerReady)
             throw new BootstrapException(Name,
                 $"Docker did not become ready inside {WslCommands.DistroName}. {await DescribeDockerFailureAsync(ct).ConfigureAwait(false)}".Trim());
+
+        // MG-17: with the jails now remapped, the identity that writes through every read-write bind
+        // mount is host uid/gid 101000, not the daemon's own 1000. Provision the shared group and the
+        // mount ownership so the jail can still read and write exactly what it legitimately needs — and
+        // nothing else under /home/mainguard. See UsernsRemapPolicy for why this is a group grant rather
+        // than an owner chown.
+        await EnsureJailOwnershipAsync(log, ct).ConfigureAwait(false);
 
         // Docker is up — confirm the remaining invariants and, if one is unmet, name it precisely rather
         // than letting the bootstrapper's opaque post-check swallow the reason.
@@ -230,6 +286,20 @@ public sealed class FirstBootStep : IBootstrapStep
         var alreadyConfigured = await DaemonJsonMatchesAsync(ct).ConfigureAwait(false);
         if (!alreadyConfigured)
         {
+            // MG-17 migration, and the ONE moment it can be done: enabling userns-remap relocates
+            // dockerd's whole storage root, so everything in the current root becomes invisible rather
+            // than removed. Drain mainguard's containers and networks with the OLD daemon while it can
+            // still see them — otherwise the jails and the shared egress proxy survive as unmanaged
+            // containers and their bridges keep holding subnets out of the pool the new root allocates
+            // from. Best effort: a failure here must never block provisioning. This is also where the
+            // proxy is recreated exactly ONCE — after the flip its container simply does not exist in the
+            // new root, so EnsureReadyAsync's ordinary create path runs, and no jail is left stranded
+            // because every jail was removed here too.
+            log.Report("Migrating Docker to a user-namespaced storage root (removing mainguard containers/networks first)…");
+            await _wsl.RunAsync(
+                WslCommands.InDistroAsRoot("bash", "-c", UsernsRemapPolicy.PreFlipDrainScript), stdin: null, ct)
+                .ConfigureAwait(false);
+
             await _wsl.RunAsync(WslCommands.InDistroAsRoot("mkdir", "-p", "/etc/docker"), stdin: null, ct).ConfigureAwait(false);
             await _wsl.RunAsync(WslCommands.InDistroAsRoot("tee", "/etc/docker/daemon.json"), stdin: DockerDaemonJson, ct).ConfigureAwait(false);
         }
@@ -252,15 +322,66 @@ public sealed class FirstBootStep : IBootstrapStep
         await _wsl.RunAsync(WslCommands.InDistroAsRoot("systemctl", "start", "docker"), stdin: null, ct).ConfigureAwait(false);
     }
 
-    /// <summary>The dedicated Docker network config baked into MainguardEnv so its dockerd never collides
-    /// with a concurrently-running Docker Desktop in the shared WSL2 network stack.</summary>
-    public const string DockerDaemonJson =
-        "{\n  \"bip\": \"10.202.0.1/24\",\n  \"default-address-pools\": [ { \"base\": \"10.203.0.0/16\", \"size\": 24 } ]\n}\n";
+    /// <summary>
+    /// The dockerd config baked into MainguardEnv: a dedicated bridge subnet + address pool so its
+    /// dockerd never collides with a concurrently-running Docker Desktop in the shared WSL2 network
+    /// stack, and (MG-17) the <c>userns-remap</c> that makes "user-namespaced jail" true rather than
+    /// merely claimed. Kept in one constant so the daemon.json this step writes and the one the
+    /// MainguardOS Dockerfile bakes cannot drift apart.
+    /// </summary>
+    public static readonly string DockerDaemonJson =
+        "{\n  \"bip\": \"10.202.0.1/24\",\n"
+        + "  \"default-address-pools\": [ { \"base\": \"10.203.0.0/16\", \"size\": 24 } ],\n"
+        + $"  \"userns-remap\": \"{UsernsRemapPolicy.RemapUser}\"\n}}\n";
 
+    /// <summary>
+    /// True when the VM's daemon.json is already the one this step writes. Both facts are required:
+    /// the subnet pin AND the MG-17 remap. An existing install carries a daemon.json with the subnet
+    /// only, so requiring the remap key here is precisely what makes the upgrade path fire — the file
+    /// is rewritten and dockerd restarted onto the remapped storage root.
+    /// </summary>
     private async Task<bool> DaemonJsonMatchesAsync(CancellationToken ct)
     {
         var current = await _wsl.RunAsync(WslCommands.InDistro("cat", "/etc/docker/daemon.json"), stdin: null, ct).ConfigureAwait(false);
-        return current.Succeeded && current.StdOut.Contains("10.202.0.1/24", StringComparison.Ordinal);
+        if (!current.Succeeded)
+            return false;
+
+        return current.StdOut.Contains("10.202.0.1/24", StringComparison.Ordinal)
+            && current.StdOut.Contains($"\"userns-remap\": \"{UsernsRemapPolicy.RemapUser}\"", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// MG-17 — provisions the shared identity between the unprivileged daemon and the remapped jails,
+    /// then brings the two read-write bind-mount sources to the shared-ownership invariant. Both scripts
+    /// are idempotent and both live in <see cref="UsernsRemapPolicy"/> so their content is unit-testable.
+    ///
+    /// <para>The <c>mainguardd</c> restart is conditional on the group having actually changed:
+    /// supplementary groups are captured at process start, so a daemon that was already running when
+    /// <c>mainguard-jail</c> appeared holds an identity that cannot touch the shared trees — and nothing
+    /// would say so, it would simply fail to fetch or to remove a worktree. Restarting unconditionally
+    /// would instead bounce a healthy daemon on every provisioning re-run.</para>
+    /// </summary>
+    private async Task EnsureJailOwnershipAsync(IProgress<string> log, CancellationToken ct)
+    {
+        log.Report($"Sharing the agent worktrees with the remapped jail identity (gid {UsernsRemapPolicy.AgentHostGid})…");
+
+        var group = await _wsl.RunAsync(
+            WslCommands.InDistroAsRoot("bash", "-c", UsernsRemapPolicy.GroupProvisionScript), stdin: null, ct)
+            .ConfigureAwait(false);
+
+        await _wsl.RunAsync(
+            WslCommands.InDistroAsRoot("bash", "-c", UsernsRemapPolicy.MountOwnershipScript()), stdin: null, ct)
+            .ConfigureAwait(false);
+
+        if (group.StdOut.Contains(UsernsRemapPolicy.GroupChangedSentinel, StringComparison.Ordinal))
+        {
+            log.Report("Restarting mainguardd so it picks up the shared jail group…");
+            // try-restart, not restart: a daemon that is not running must not be started here — that is
+            // StartDaemonStep's job, and starting it early would hide a genuine start failure there.
+            await _wsl.RunAsync(
+                WslCommands.InDistroAsRoot("systemctl", "try-restart", "mainguardd"), stdin: null, ct)
+                .ConfigureAwait(false);
+        }
     }
 
     /// <summary>The <c>/proc/sys</c> path for a dotted sysctl key (e.g. <c>kernel.yama.ptrace_scope</c>

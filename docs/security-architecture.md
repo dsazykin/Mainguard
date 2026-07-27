@@ -13,11 +13,58 @@ sandbox, and — crucially — the **residual** that those controls do *not* clo
 | # | Control | Kind | Where |
 |---|---|---|---|
 | S-1 | P2-06 quarantine: no git-host credential and no remote but the daemon bare mirror | STRUCT | `WorktreeManager` |
-| G-15 | Hardened container spec: `no-new-privileges`, default-deny seccomp (moby default + the 3 memory-inspection denials), `CapDrop ALL`, userns, limits, read-only rootfs | STRUCT/CHECK | `ContainerSpecBuilder` |
+| G-15 | Hardened container spec: `no-new-privileges`, default-deny seccomp (moby default + the 3 memory-inspection denials), `CapDrop ALL`, **userns-remap (MG-17 — see below; enforced by the daemon config + the boot check, and the per-container `--userns=host` opt-out is a typed builder error)**, limits, read-only rootfs | STRUCT/CHECK | `ContainerSpecBuilder`, `UsernsRemapPolicy`, `FirstBootStep` |
 | G-11 | ext4-only worktree mount; Windows/UNC sources rejected at construction | STRUCT | `ContainerSpecBuilder` |
 | — | Default-deny egress: internal network + allowlist proxy + pinned DNS + iptables backstop | STRUCT/CHECK | `EgressProxyConfigurator` |
 | A6 | Git host absent from the agent allowlist; the only path to it is the daemon read-only, prefix-allowlisted git proxy; push has no code path | STRUCT | `EgressAllowlist`, `DaemonGitProxy` |
 | G2 | Anti-memory-inspection quartet, so the agent uid obtains zero bytes of the OOB key `K` | STRUCT | controls 1/3/4 in `ContainerSpecBuilder`; control 2 (`kernel.yama.ptrace_scope`) VM-wide in P2-05 |
+
+## MG-17 — the user-namespace remap, and what it is (and is not)
+
+This row used to say "userns" while `/etc/docker/daemon.json` set **no** `userns-remap` and the
+container spec's `UsernsMode` was an empty string. With no daemon-level remap the empty string means
+"do what the daemon does", i.e. nothing: container uid 0 **was** host uid 0, and the agent CLI's
+container uid 1000 **was** the VM's `mainguard` service user — the uid that owns the daemon, its
+keyring, its SQLite state and every binary the jails execute. Every byte a jail wrote through a bind
+mount landed owned by the most privileged unprivileged identity in the VM.
+
+dockerd now runs with `"userns-remap": "mainguard"` and a **pinned** subordinate range
+(`/etc/subuid`+`/etc/subgid` = `mainguard:100000:65536`), so container id *N* maps to host id
+*100000 + N*: container root → 100000, the agent → 101000, the supervisor uid → 101001. Both remapped
+identities own nothing else on the VM.
+
+**Bind-mount ownership.** Docker does not chown bind-mount sources, and the daemon *creates and keeps
+writing* the two read-write ones (`~/mainguard/repos`, `~/mainguard/worktrees`) while running
+unprivileged as uid 1000 — so it can neither chown them to 101000 nor write a tree owned by it. They are
+therefore **shared through a group whose gid IS the remapped agent gid** (`mainguard-jail` = 101000, of
+which the daemon is a member), with the setgid bit on both parents so everything created inside inherits
+it. That is stronger than an owner-chown would have been: the jail reads and writes the content it
+needs, but owns neither tree (it cannot `chmod`/`chown`/replace them) and has **no** access at all to
+anything else under `/home/mainguard`. The read-only `adapters` mount is `a+rX` and deliberately not in
+that group; the read-only coordinator IPC dir already grants the traversal/connect bits it needs.
+
+**MG-3 ordering.** `docs/design/mg-3-mediated-ref-updates.md` (the approved plan of record) names this
+change as its prerequisite so that the per-agent repositories it introduces at
+`<vmRoot>/agents/<hash>/<agentId>.git` are created with correct ownership *by construction*. That
+parent directory is therefore provisioned here, ahead of use, with the same `2775
+mainguard:mainguard-jail` setgid treatment — MG-3 has to do nothing about ownership at all, only make
+the content of a new git dir group-writable (`core.sharedRepository=group`), because umask is a
+property of the writing process and no parent directory can supply it. Nothing here makes flipping the
+mirror mount to read-only (MG-3 Stage 3) harder: a read-only mount needs read+traverse only, which the
+group already grants.
+
+**The check, not the config.** `FirstBootStep`'s check phase asserts the remap is *in effect* — `docker
+info` reports the `name=userns` security option **and** its `DockerRootDir` is
+`/var/lib/docker/100000.100000`, which is the only direct evidence that the remap running is the one the
+mount ownership was provisioned against. The probe's output is sentinel-framed so "docker answered
+nothing" is a distinct, reported outcome and can never be read as a pass.
+
+**Migration.** Turning the remap on relocates dockerd's whole storage root, so the previous root's
+images, containers and networks become invisible rather than deleted. The images self-heal (the startup
+auto-provision sees them as *Missing* and `docker load`s the bundled CI tars; image ids and the
+`mainguard.image.version` labels ride the tar unchanged, so the MG-27 digest pin and the label check are
+unaffected). Mainguard's containers and networks do not, so they are removed with the OLD daemon on the
+one boot that performs the flip — which is also the single, one-time recreate of the shared egress proxy.
 
 ## A6 — no direct git-host egress
 

@@ -117,7 +117,7 @@ public sealed record ContainerSpecRequest(
     string NetworkName,
     CredTmpfsSpec Credentials,
     string ProxyUrl,
-    string UsernsMode = "",
+    string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
     string? BareRepoPath = null,
@@ -237,7 +237,10 @@ public static class ContainerSpecBuilder
             CapDrop = new List<string> { "ALL" },
             CapAdd = MinimalCaps.ToList(),
 
-            // userns remap per the daemon config (empty string = daemon default remap).
+            // MG-17: inherit the daemon's userns-remap. Docker's per-container knob has no value meaning
+            // "definitely remap" — "" is "whatever dockerd does" and "host" is an explicit OPT-OUT — so
+            // the empty string is the correct value here and AssertUsernsRemapped below refuses the
+            // opt-out. The daemon-level fact is asserted at boot (FirstBootStep, UsernsRemapPolicy).
             UsernsMode = request.UsernsMode,
 
             Memory = request.Limits.MemoryBytes,
@@ -317,6 +320,7 @@ public static class ContainerSpecBuilder
         AssertNoSecretsInEnv(create);
         AssertResourceCeilings(create);
         AssertDnsPinned(create, request);
+        AssertUsernsRemapped(create);
 
         return create;
     }
@@ -413,6 +417,30 @@ public static class ContainerSpecBuilder
             if (limit is null || limit.Hard <= 0 || limit.Soft <= 0)
                 throw new SandboxSpecException($"MG-26: the agent jail must carry a positive '{required}' ulimit.");
         }
+    }
+
+    /// <summary>
+    /// MG-17 — the jail must not opt OUT of the daemon's user-namespace remap.
+    ///
+    /// <para>Docker's <c>UsernsMode</c> is asymmetric: <c>""</c> means "inherit whatever dockerd does"
+    /// and there is no value that means "definitely remap", but <c>"host"</c> is a hard opt-out that puts
+    /// the container back on host uids — container root becomes host root — while every other flag on
+    /// this request still reads as fully hardened. That is precisely the shape of regression that ships
+    /// unnoticed, so it is a typed builder error here, in the same style as the G2 quartet. Anything that
+    /// is neither empty nor a recognised mode is refused too: Docker would reject it at create, and a
+    /// spec whose isolation posture nobody can name must not reach the daemon.</para>
+    /// </summary>
+    private static void AssertUsernsRemapped(CreateContainerParameters create)
+    {
+        var mode = create.HostConfig.UsernsMode ?? string.Empty;
+        if (mode.Length == 0)
+            return;
+
+        throw new SandboxSpecException(
+            $"MG-17: HostConfig.UsernsMode is '{mode}'. The agent jail must inherit the daemon's userns-remap "
+            + $"(UsernsMode = UsernsRemapPolicy.InheritDaemonRemap); '{UsernsRemapPolicy.OptOutUsernsMode}' opts the "
+            + "container OUT of it, which restores host uids (container root = host root) and makes every write "
+            + "through a bind mount land as the VM's own service uid again.");
     }
 
     private static void AssertDnsPinned(CreateContainerParameters create, ContainerSpecRequest request)

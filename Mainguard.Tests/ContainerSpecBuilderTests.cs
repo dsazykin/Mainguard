@@ -31,7 +31,11 @@ public class ContainerSpecBuilderTests
             NetworkName: "mainguard-agents",
             Credentials: CredTmpfsSpec.Create(AgentUid, SupervisorUid),
             ProxyUrl: "http://mainguard-egress-proxy:8888",
-            UsernsMode: "host",
+            // MG-17: this used to say `UsernsMode: "host"` and then assert the builder passed it
+            // through — i.e. the suite's one userns assertion pinned the value that DISABLES the
+            // remap. The jail inherits the daemon's userns-remap; UsernsRemapTests owns the rejection
+            // of the "host" opt-out.
+            UsernsMode: UsernsRemapPolicy.InheritDaemonRemap,
             DnsServerAddress: ProxyDns);
 
     [Fact]
@@ -41,7 +45,7 @@ public class ContainerSpecBuilderTests
         var host = create.HostConfig;
 
         Assert.Contains("no-new-privileges", host.SecurityOpt);
-        Assert.Equal("host", host.UsernsMode);
+        Assert.Equal(UsernsRemapPolicy.InheritDaemonRemap, host.UsernsMode);
         Assert.Equal(4L * 1024 * 1024 * 1024, host.Memory);
         Assert.Equal(256, host.PidsLimit);
         Assert.True(host.ReadonlyRootfs);

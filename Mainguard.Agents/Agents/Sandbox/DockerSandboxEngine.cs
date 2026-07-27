@@ -12,6 +12,13 @@ using Mainguard.Git.Security;
 namespace Mainguard.Agents.Agents.Sandbox;
 
 /// <summary>Daemon-side config for <see cref="DockerSandboxEngine"/> (network + proxy + userns).</summary>
+/// <param name="UsernsMode">MG-17 — the jail's <c>HostConfig.UsernsMode</c>. Defaults to
+/// <see cref="UsernsRemapPolicy.InheritDaemonRemap"/>: the daemon is configured with
+/// <c>"userns-remap": "mainguard"</c> (<see cref="Mainguard.Agents.Agents.Bootstrap.FirstBootStep"/>),
+/// and inheriting it is how a container IS remapped — Docker offers no per-container "definitely remap"
+/// value, only the <see cref="UsernsRemapPolicy.OptOutUsernsMode"/> escape, which
+/// <see cref="ContainerSpecBuilder"/> refuses. The named constant replaces the bare <c>""</c> the audit
+/// found here so the value states its intent instead of looking like an unset field.</param>
 /// <param name="ProxyContainerName">The egress proxy whose dnsmasq every jail pins as its resolver
 /// (MG-7). Named here rather than hard-coded so a test substrate can point at its own proxy.</param>
 /// <param name="SecretWriteTimeout">Bound on each fixed-purpose exec on the SPAWN path — secret
@@ -21,7 +28,7 @@ namespace Mainguard.Agents.Agents.Sandbox;
 public sealed record SandboxEngineOptions(
     string NetworkName,
     string ProxyUrl,
-    string UsernsMode = "",
+    string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string ProxyContainerName = EgressProxyConfigurator.ProxyContainerName,
     TimeSpan? SecretWriteTimeout = null);
 

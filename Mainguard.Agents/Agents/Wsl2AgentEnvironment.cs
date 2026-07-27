@@ -65,7 +65,13 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray());
         Egress = egress;
-        Sandboxes = new DockerSandboxEngine(docker, new SandboxEngineOptions(egress.NetworkName, egress.ProxyUrl));
+        // MG-17: the userns mode is stated EXPLICITLY on the production substrate rather than left to a
+        // positional default. This is the seam the audit found defaulting to a bare "" — the value is
+        // still the empty string (Docker has no "definitely remap" per-container value; see
+        // UsernsRemapPolicy.InheritDaemonRemap), but it now names the daemon-level remap it inherits, and
+        // ContainerSpecBuilder refuses the "host" opt-out on the way out.
+        Sandboxes = new DockerSandboxEngine(docker, new SandboxEngineOptions(
+            egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap));
     }
 
     public string SubstrateId => "wsl2";

@@ -118,6 +118,21 @@ public sealed class RepoProvisioner : IRepoProvisioner
             AgentGitCommand.Run(barePath, "config", "receive.denyDeletes", "true");
         }
 
+        // MG-17: the mirror is bind-mounted READ-WRITE into the jail, and with userns-remap that jail is
+        // host uid/gid 101000 while this process is uid 1000 — they meet only through the group the
+        // `repos/` parent's setgid bit propagates. Two halves, both required:
+        //
+        //   `core.sharedRepository=group` makes every FUTURE git write inside this git dir (ours and the
+        //   jail's) group-writable — including the object fan-out directories a later fetch creates,
+        //   which at git's default 0755 would leave the jail unable to write a single object into them.
+        //   Set on EVERY provision, not only at clone, so a mirror from an install that predates the
+        //   remap is repaired by a daemon update alone. Idempotent.
+        //
+        //   The mode pass fixes what ALREADY exists — the tree this clone (or an older provision) laid
+        //   down under the daemon's 022 umask, which the config setting does not retroactively touch.
+        AgentGitCommand.Run(barePath, "config", "core.sharedRepository", "group");
+        WorktreeManager.GroupShareRecursive(barePath);
+
         var vmRemoteUrl = _vmRemoteUrlResolver(hash);
         if (string.IsNullOrEmpty(vmRemoteUrl))
         {

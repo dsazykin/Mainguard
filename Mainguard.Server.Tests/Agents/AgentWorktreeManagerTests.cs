@@ -16,6 +16,35 @@ namespace Mainguard.Server.Tests.Agents;
 /// </summary>
 public sealed class AgentWorktreeManagerTests
 {
+    // MG-17: the worktree is bind-mounted READ-WRITE into a jail whose host uid/gid is 101000 (the
+    // userns remap), not the daemon's 1000. A checkout laid down under the daemon's 022 umask is 0644
+    // files / 0755 dirs — readable by the agent and NOT editable, which is the product silently broken.
+    [LinuxOnlyFact]
+    // The attribute already skips on Windows; the annotation is what tells the CA1416 analyzer so.
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public void Worktree_Checkout_IsGroupWritableForTheRemappedJail()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "a1");
+
+        var root = File.GetUnixFileMode(path);
+        Assert.True(root.HasFlag(UnixFileMode.GroupWrite), "the worktree root must be group-writable");
+        // setgid so files the agent creates keep the shared jail group (the daemon has to read them).
+        Assert.True(root.HasFlag(UnixFileMode.SetGroup), "the worktree root must be setgid");
+
+        // Every checked-out file, not just the root — this is the one the agent actually edits.
+        var files = Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories)
+            .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}.git", System.StringComparison.Ordinal))
+            .ToArray();
+        Assert.NotEmpty(files);
+        foreach (var file in files)
+        {
+            Assert.True(File.GetUnixFileMode(file).HasFlag(UnixFileMode.GroupWrite), file + " must be group-writable");
+        }
+    }
+
     [Fact]
     public void Worktree_AddRemovePrune_RoundTrip()
     {
