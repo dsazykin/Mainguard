@@ -25,12 +25,14 @@ user request
    -> coordinator plans the shape of the work
    -> coordinator spawns workers        (free, within caps — no human approval)
    -> each worker inspects the repo and authors ITS OWN TaskPlan
-   -> the worker presents that plan     (visible immediately; rejection stops the worker)
+   -> the worker presents that plan and BLOCKS          <- human gate #1
+        approved -> proceed
+        rejected -> revise against the feedback, re-present, block again
    -> worker does the work in its jail
    -> coordinator proposes readiness    (request_verification)
    -> the DAEMON verifies, in the worker's own jail
    -> on pass, the item enters the merge queue
-   -> HUMAN reviews and merges          <- this is the gate that matters
+   -> HUMAN reviews and merges                          <- human gate #2
 ```
 
 **Plan authorship belongs to the worker, not the coordinator.** The coordinator has no worktree, no
@@ -38,10 +40,34 @@ git credentials, and no view of repository contents; a plan it authored would de
 not inspect. The worker has the context, so the plan describes what will actually be done rather than
 what was guessed before anyone looked.
 
-**ASSUMPTION, flagged for correction:** the worker's plan is *presented*, not *blocking* — the worker
-proceeds unless a human rejects it, and rejection stops the worker. Making it blocking would put the
-human back in the loop once per worker, which is what freeing the spawn was meant to avoid. One line
-to change here if that is wrong.
+### The plan gate is blocking, and rejection is feedback
+
+The worker **does not start work until its plan is approved**. Rejection does not kill the worker —
+it returns the rejection to the worker, which revises the plan and presents it again.
+
+This is worth being precise about, because it looks superficially like the P2-14 gate that §6 removes
+and it is not the same gate:
+
+| | P2-14 (removed) | this contract |
+|---|---|---|
+| who authors the plan | the **coordinator** | the **worker** |
+| when | before a worker exists | after the worker has inspected the repo |
+| based on | what the coordinator guessed | what the code actually looks like |
+| rejection means | the worker never starts | revise and re-present |
+
+Same number of human interactions, materially better information, and a rejection now improves the
+plan instead of discarding the attempt.
+
+**Two operational consequences that need decisions before implementation:**
+
+1. **The revise→re-present loop must be bounded.** Reject → revise → reject with no limit burns budget
+   and wall-clock indefinitely. Proposal: cap revision rounds (default **3**), after which the worker
+   stops and escalates to the human rather than looping. The cap belongs with the other daemon-side
+   limits in `CoordinatorLimits`, not in a prompt.
+2. **A blocked worker still holds its jail**, and therefore a slot against `MaxActiveWorkers`. Six
+   workers awaiting plan approval consume the whole cap while doing nothing. Either blocked workers
+   do not count toward the active cap, or the cap needs to account for them — otherwise the
+   coordinator can deadlock itself by spawning six workers that are all waiting on a human.
 
 ## 3. The surface — the complete set of coordinator operations
 
@@ -102,11 +128,19 @@ Recording this explicitly because it is a **reduction in human oversight**, and 
 has repeatedly found gates that were assumed to be enforced and were not. This one is being removed
 on purpose, with the reasoning written down:
 
-- Human oversight moves to where the risk concentrates — the merge queue, where changes are reviewed
-  before they reach the user's real repository.
+- **The plan gate is not removed — it moves.** A human still approves a plan before any work starts;
+  it is now the worker's plan, written after inspecting the repo, instead of the coordinator's guess
+  written before a worker existed (§2). Net human interactions are unchanged; the information behind
+  each one is better.
 - The spawn path is not ungated: kill switch, worker cap (`MaxActiveWorkers`), admission control, and
   budget all still apply, and all are enforced daemon-side.
-- `ApprovePlan`/`RejectPlan` are **not** deleted — they now act on the *worker's* plan.
+- `ApprovePlan`/`RejectPlan` are **not** deleted — they now act on the *worker's* plan, and rejection
+  carries feedback the worker revises against rather than terminating it.
+
+So what P2-14 actually loses is the *pre-spawn* approval — the human no longer gates whether a worker
+comes into existence, only what it is about to do. That is the intended trade: the coordinator can
+fan out in the background, and nothing touches the repository without a human having read a plan
+grounded in the real code.
 
 ## 7. Ownership scoping
 
