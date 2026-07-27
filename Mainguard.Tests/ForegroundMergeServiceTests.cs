@@ -317,6 +317,146 @@ public class ForegroundMergeServiceTests : IDisposable
         Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main"));
     }
 
+    // ---- Preconditions the merge used to merely assume --------------------
+    //
+    // Once the GUI drives this leg for real, "the fetch worked", "the checkout worked" and "agent/<id> is
+    // in this repo" stop being setup assumptions and become live inputs from a user's own working repo.
+    // Each of these used to be a discarded exit code or an unchecked ref, and each of them fails in a way
+    // that is worse than a refusal — a merge onto the wrong branch, or a merge of an unknown-age copy.
+
+    [Fact]
+    public void ForegroundMerge_DirtyWorkingTree_RefusesBeforeTouchingAnything()
+    {
+        var repo = BuildRepo();
+        File.WriteAllText(Path.Combine(repo.RepoPath, "README.md"), "the human is mid-edit\n");
+        var service = NewService(repo.SyncName, repo.SyncUrl, out var leases, out var journal);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.False(result.Merged);
+        Assert.False(result.CasLost);                              // a precondition, not a lost race
+        Assert.Contains("uncommitted", result.Reason ?? "", StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));    // no ref moved
+        Assert.Empty(journal.GetHistory(repo.RepoPath));           // nothing was even attempted
+        Assert.Null(leases.GetOutstanding(repo.RepoHash));         // the lease did not strand the repo
+    }
+
+    [Fact]
+    public void ForegroundMerge_UntrackedFilesAreTolerated_AndStillMerge()
+    {
+        // The control for the dirty-tree refusal: untracked files never block a checkout or a
+        // fast-forward, so refusing on them would block honest merges for no safety gain.
+        var repo = BuildRepo();
+        File.WriteAllText(Path.Combine(repo.RepoPath, "scratch.log"), "untracked noise\n");
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.True(result.Merged);
+        Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main"));
+    }
+
+    [Fact]
+    public void ForegroundMerge_BranchReachableOnlyThroughTheSyncRemote_StillMerges()
+    {
+        // The shape a real user's repo actually has: the agent branch arrived over the sync remote's
+        // default refspec, so it exists as refs/remotes/<sync>/agent/<id> and NOT as a local branch.
+        // `git merge agent/<id>` does not fall back to the remote-tracking form — it fails outright with
+        // "not something we can merge" — so naming the branch unconditionally made the merge unreachable
+        // for exactly the repos it is meant to serve.
+        var repo = BuildRepo();
+        var agentTip = Rev(repo.RepoPath, "agent/x");
+        Git(repo.RepoPath, "push", repo.SyncName, "agent/x");
+        Git(repo.RepoPath, "branch", "-D", "agent/x");
+        Git(repo.RepoPath, "fetch", repo.SyncName);
+        Assert.Equal(string.Empty, Rev(repo.RepoPath, "refs/heads/agent/x"));     // gone locally
+        Assert.Equal(agentTip, Rev(repo.RepoPath, $"refs/remotes/{repo.SyncName}/agent/x"));
+
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.True(result.Merged, $"expected the remote-tracking branch to merge; reason: {result.Reason}");
+        Assert.Equal(agentTip, Rev(repo.RepoPath, "main"));
+    }
+
+    [Fact]
+    public void ForegroundMerge_BranchNowhereInTheRepo_SaysSo_InsteadOfBlamingFreshness()
+    {
+        // "not a fast-forward" would be a lie here, and would send the human off re-verifying a branch
+        // that simply has not arrived yet.
+        var repo = BuildRepo();
+        Git(repo.RepoPath, "branch", "-D", "agent/x");
+        var service = NewService(repo.SyncName, repo.SyncUrl, out var leases, out _);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.False(result.Merged);
+        Assert.Contains("agent/x", result.Reason ?? "", StringComparison.Ordinal);
+        Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));
+        Assert.Null(leases.GetOutstanding(repo.RepoHash));
+    }
+
+    [Fact]
+    public void ForegroundMerge_FetchFailed_RefusesRatherThanMergingAnUnknownAgeCopy()
+    {
+        // A failed fetch means whatever agent/<id> is in this repo is of unknown age. Merging it anyway
+        // lands work the queue never verified — silently, since the merge would otherwise succeed.
+        var repo = BuildRepo();
+        var service = NewService("no-such-remote", repo.SyncUrl, out var leases, out var journal);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+        Assert.False(result.Merged);
+        Assert.Contains("no-such-remote", result.Reason ?? "", StringComparison.Ordinal);
+        Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));
+        Assert.Empty(journal.GetHistory(repo.RepoPath));
+        Assert.Null(leases.GetOutstanding(repo.RepoHash));
+    }
+
+    [Fact]
+    public void PerformJournaledMerge_NeedsNoLeaseStore_BecauseTheDaemonOwnsTheLease()
+    {
+        // The Windows GUI takes the repo's lease over the daemon's BeginMerge RPC and then drives ONLY
+        // this leg. Constructing it with a second IMergeLeaseStore to satisfy the parameter would give
+        // the repo two arbiters of "one outstanding merge" — so the store is optional, and the full
+        // begin → merge → confirm entry point refuses to run without one instead of inventing one.
+        var repo = BuildRepo();
+        var journal = NewJournal();
+        var service = new ForegroundMergeService(
+            resolveSyncRemote: _ => new SyncRemote(repo.SyncName, repo.SyncUrl),
+            journal: journal,
+            leases: null);
+
+        var request = new ForegroundMergeRequest(repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main");
+        var lease = new Mainguard.Git.Models.MergeLeaseRow
+        {
+            RepoHash = repo.RepoHash, LeaseId = "granted-by-the-daemon", AgentId = "x",
+            ExpectedMainSha = repo.MainSha, MainBranch = "main",
+        };
+
+        var result = service.PerformJournaledMerge(request, lease);
+
+        Assert.True(result.Merged);
+        Assert.Equal(Rev(repo.RepoPath, "main"), result.NewMainSha);
+        Assert.NotEqual(repo.MainSha, result.NewMainSha);
+
+        // …and the lease-owning entry point is loud about the missing store rather than half-working.
+        Assert.Throws<InvalidOperationException>(() => service.MergeAgentBranch(request));
+    }
+
+    private OperationJournal NewJournal()
+    {
+        var dbPath = Path.Combine(NewDir("mainguard-fmerge-db-"), "journal.db");
+        Func<AppDbContext> factory = () => new AppDbContext(dbPath);
+        using (var db = factory()) { db.Database.EnsureCreated(); }
+        return new OperationJournal(factory);
+    }
+
     private static MergeGateCheck Blocked(string reason) => (string _, out string r) =>
     {
         r = reason;

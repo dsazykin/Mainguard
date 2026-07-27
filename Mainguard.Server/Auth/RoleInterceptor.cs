@@ -32,6 +32,11 @@ public sealed class RoleInterceptor : Interceptor
     {
         "/mainguard.v1.MergeQueueService/BeginMerge",
         "/mainguard.v1.MergeQueueService/ConfirmMerge",
+        // The third leg of the same conversation. A coordinator is denied BeginMerge, so it can never hold
+        // a lease to hand back, and AbandonMerge already proves lease ownership — but the merge
+        // conversation is human-only as a whole, and leaving one leg of it callable by the coordinator
+        // role is the kind of gap that only looks harmless until something else changes.
+        "/mainguard.v1.MergeQueueService/AbandonMerge",
         // MG-11: acknowledging a flagged change is the human review act that unblocks a merge, so it is
         // merge power by another name — a coordinator that could ack its own branch's flagged items would
         // hold the merge gate it is denied at BeginMerge/ConfirmMerge.
