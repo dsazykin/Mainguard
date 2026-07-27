@@ -41,7 +41,11 @@ public sealed record SandboxEngineOptions(
 ///
 /// <para>Secrets are written <b>after</b> start via an stdin exec (never <c>Env</c>/argv/disk): the
 /// P2-01 credential env-file to the agent-owned 0400 tmpfs, and the OOB key <c>K</c> to the
-/// supervisor-owned 0400 tmpfs (G2 control 1).</para>
+/// supervisor-owned 0400 tmpfs (G2 control 1). That stdin travels over
+/// <see cref="IExecStdinTransport"/> and <b>not</b> over Docker.DotNet, which cannot deliver it at all
+/// against a modern engine — see <see cref="DockerSocketExecStdinTransport"/> for the measurements and
+/// for why <c>PUT /containers/{id}/archive</c> is not an available replacement on a read-only-rootfs
+/// jail whose secret paths are tmpfs.</para>
 ///
 /// <para><b>Every stdin-attached exec on the spawn path is time-bounded</b>
 /// (<see cref="DefaultSecretWriteTimeout"/>). A Docker endpoint can accept the attach and then deliver
@@ -77,12 +81,20 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     private readonly IDockerClient _docker;
     private readonly SandboxEngineOptions _options;
     private readonly TimeSpan _secretWriteTimeout;
+    private readonly IExecStdinTransport _stdin;
 
-    public DockerSandboxEngine(IDockerClient docker, SandboxEngineOptions options)
+    /// <param name="stdin">How secret bytes reach a jail. Defaults to
+    /// <see cref="DockerSocketExecStdinTransport"/> — Docker.DotNet's own stdin path is NOT usable (it
+    /// delivers neither the bytes nor the half-close against modern engines; see that class for the
+    /// measurements). Injectable so the unit suite can drive the failure paths without a daemon.</param>
+    public DockerSandboxEngine(IDockerClient docker, SandboxEngineOptions options, IExecStdinTransport? stdin = null)
     {
         _docker = docker ?? throw new ArgumentNullException(nameof(docker));
         _options = options ?? throw new ArgumentNullException(nameof(options));
         _secretWriteTimeout = options.SecretWriteTimeout ?? DefaultSecretWriteTimeout;
+        // Constructed eagerly but RESOLVED lazily: DockerSocketExecStdinTransport.For only captures a
+        // callback, so building an engine still needs no live daemon.
+        _stdin = stdin ?? DockerSocketExecStdinTransport.For(docker);
     }
 
     public async Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default)
@@ -359,14 +371,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
             var path = ContainerSpecBuilder.AgentHome + "/" + file.HomeRelativePath;
             var length = file.Content.Length.ToString(CultureInfo.InvariantCulture);
-            var create = new ContainerExecCreateParameters
-            {
-                User = request.AgentUid.ToString(CultureInfo.InvariantCulture),
-                AttachStdin = true,
-                AttachStdout = true,
-                AttachStderr = true,
+            var exec = new ExecStdinRequest(
+                containerId,
+                request.AgentUid.ToString(CultureInfo.InvariantCulture),
                 // path is not secret (argv-safe); the secret content is piped via stdin only.
-                Cmd = new List<string>
+                new[]
                 {
                     "sh", "-c",
                     // The exists-branch still drains stdin so the daemon-side write never races a
@@ -382,13 +391,12 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                     + "mv \"$1.partial\" \"$1\"\n",
                     "sh", path, length,
                 },
-            };
+                file.Content);
 
             // Same unbounded-wait bug as the secret write below, and the same fix — this loop is on the
             // SAME spawn path, and it also runs on the REUSE path, where a hang wedged every relaunch of
             // an existing jail.
-            await WriteSecretOverExecStdinAsync(
-                containerId, path, file.Content, create, "CLI credential restore", ct).ConfigureAwait(false);
+            await WriteSecretOverExecStdinAsync(path, exec, "CLI credential restore", ct).ConfigureAwait(false);
         }
     }
 
@@ -410,14 +418,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     {
         var uid = ownerUid.ToString(CultureInfo.InvariantCulture);
         var length = content.Length.ToString(CultureInfo.InvariantCulture);
-        var create = new ContainerExecCreateParameters
-        {
-            User = "0", // root, so chown to the supervisor uid is permitted; the file ends 0400/uid.
-            AttachStdin = true,
-            AttachStdout = true,
-            AttachStderr = true,
+        var exec = new ExecStdinRequest(
+            containerId,
+            "0", // root, so chown to the supervisor uid is permitted; the file ends 0400/uid.
             // path/uid/length are not secret (argv-safe); the secret content is piped via stdin only.
-            Cmd = new List<string>
+            new[]
             {
                 "sh", "-c",
                 "umask 0377\n"
@@ -429,9 +434,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 + "mv \"$1.partial\" \"$1\"\n",
                 "sh", path, uid, length,
             },
-        };
+            content);
 
-        return WriteSecretOverExecStdinAsync(containerId, path, content, create, "secret-file write", ct);
+        return WriteSecretOverExecStdinAsync(path, exec, "secret-file write", ct);
     }
 
     /// <summary>
@@ -462,34 +467,30 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// nothing at all from the exec channel that just failed, and takes the whole tmpfs with it.</para>
     /// </summary>
     private async Task WriteSecretOverExecStdinAsync(
-        string containerId, string path, byte[] content, ContainerExecCreateParameters create,
-        string operation, CancellationToken ct)
+        string path, ExecStdinRequest exec, string operation, CancellationToken ct)
     {
+        var containerId = exec.ContainerId;
         try
         {
             await RunBoundedAsync(
                 async token =>
                 {
-                    var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, create, token).ConfigureAwait(false);
-                    using (var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, token).ConfigureAwait(false))
-                    {
-                        await stream.WriteAsync(content, 0, content.Length, token).ConfigureAwait(false);
-                        stream.CloseWrite();
-                        await stream.ReadOutputToEndAsync(token).ConfigureAwait(false);
-                    }
+                    var result = await _stdin.RunAsync(exec, token).ConfigureAwait(false);
 
                     // The exec's exit status was previously never read, so a short write, a failed chown
                     // or a full tmpfs all reported success and produced a jail with no credentials and no
                     // explanation. The staged-write shells signal exactly that with 74/75.
-                    var inspect = await _docker.Exec.InspectContainerExecAsync(exec.ID, token).ConfigureAwait(false);
-                    if (inspect.ExitCode != 0)
+                    if (result.ExitCode != 0)
                     {
                         throw new InvalidOperationException(
-                            $"The in-jail {operation} of '{path}' exited {inspect.ExitCode} in container "
+                            $"The in-jail {operation} of '{path}' exited {result.ExitCode} in container "
                             + $"'{containerId}' — the destination was NOT written (the shell stages to "
                             + "'<path>.partial' and only renames a complete file into place). Exit 75 means "
                             + "the endpoint delivered fewer bytes than promised; 74 means the file could not "
-                            + "be created, chowned or chmodded.");
+                            + "be created, chowned or chmodded."
+                            + (string.IsNullOrWhiteSpace(result.Output)
+                                ? " The command printed nothing."
+                                : $" It printed: {result.Output}"));
                     }
 
                     return true;
