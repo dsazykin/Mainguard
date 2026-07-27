@@ -435,8 +435,11 @@ public class ForegroundMergeServiceTests : IDisposable
         var request = new ForegroundMergeRequest(repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main");
         var lease = new Mainguard.Git.Models.MergeLeaseRow
         {
-            RepoHash = repo.RepoHash, LeaseId = "granted-by-the-daemon", AgentId = "x",
-            ExpectedMainSha = repo.MainSha, MainBranch = "main",
+            RepoHash = repo.RepoHash,
+            LeaseId = "granted-by-the-daemon",
+            AgentId = "x",
+            ExpectedMainSha = repo.MainSha,
+            MainBranch = "main",
         };
 
         var result = service.PerformJournaledMerge(request, lease);
