@@ -29,4 +29,32 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
   </PropertyGroup>
 
+  <!--
+    The dotnet host every <Exec> in this repo must invoke.
+
+    An <Exec> runs its command through cmd.exe / sh in a CHILD process, so a bare `dotnet` is resolved
+    from that child's PATH — never from whatever host is running the build. Launching the build by an
+    absolute path therefore does NOT help: `~/.dotnet/dotnet build Mainguard.slnx` still died at
+    Mainguard.Pro.App's daemon-payload publish with
+
+        /usr/bin/sh: …exec.cmd: dotnet: not found
+        error MSB3073: The command "dotnet publish …" exited with code 127
+
+    on any machine whose SDK is installed outside the default location (an `~/.dotnet` install, a
+    self-contained CI toolchain, a `dotnet-install.sh` layout).
+
+    $(DOTNET_HOST_PATH) is the property the SDK sets for exactly this: the absolute path of the dotnet
+    host executing the current build, so a child publish is guaranteed to be the SAME SDK the outer
+    build resolved through global.json — not merely whichever one happens to be first on PATH. Older
+    and non-SDK hosts (an msbuild.exe-driven build) may leave it empty, so fall back to the bare name
+    rather than emitting a command that starts with a space.
+
+    Always quote the expansion at the call site: the default Windows path is
+    C:\Program Files\dotnet\dotnet.exe.
+  -->
+  <PropertyGroup>
+    <MainguardDotnetHost Condition="'$(MainguardDotnetHost)' == ''">$(DOTNET_HOST_PATH)</MainguardDotnetHost>
+    <MainguardDotnetHost Condition="'$(MainguardDotnetHost)' == ''">dotnet</MainguardDotnetHost>
+  </PropertyGroup>
+
 </Project>
