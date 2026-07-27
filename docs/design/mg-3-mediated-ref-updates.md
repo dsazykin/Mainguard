@@ -1,6 +1,7 @@
 # MG-3 / MG-17 — Confining agent writes to the bare mirror
 
-**Status:** design proposal, no implementation. Written for review before any code.
+**Status:** APPROVED 2026-07-27 — plan of record. §6 records the decision; §7 the resolved questions.
+Implementation follows MG-17 (userns-remap), which lands first.
 **Findings covered:** MG-3 (quarantine config does not cover direct writes), MG-17 ("user-namespaced" claimed but no userns remap).
 **Related, already fixed:** MG-1 (daemon-side git no longer executes agent-planted hooks/config).
 
@@ -111,12 +112,36 @@ it has that, it can also rewrite `refs/heads/main`. That is MG-3 in one sentence
 Alternates give the identical storage benefit with the write direction reversed: same disk, different
 trust boundary. **The storage objection is therefore an argument FOR alternates, not against them.**
 
-### The real cost: `git gc`
+### The real cost: `git gc` — **resolved 2026-07-27**
 
-Not disk — object lifetime. If the mirror repacks or prunes objects an agent's repo depends on
-through the alternate, that agent's repo breaks; git does not track borrowers. Either gc is disabled
-while agents are attached, or it needs an explicit lock. **This is the genuine engineering cost of
-Option B** (see §7).
+Not disk — object lifetime. If the mirror prunes objects an agent's repo depends on through the
+alternate, that agent's repo breaks; git does not track borrowers.
+
+The resolving distinction is that **pruning breaks borrowers; repacking does not.** Repacking
+consolidates loose objects into packs and re-deltas them, but every object still exists and still
+resolves by SHA, so a borrower is unaffected. Deleting unreachable objects is the only operation that
+can pull the floor out from under an alternate. That splits gc into a safe half and an unsafe half:
+
+| operation | safe with agents attached? | reclaims |
+|---|---|---|
+| repack / consolidate loose objects | **yes** — no object is deleted | most of it: loose-object consolidation + delta compression |
+| prune unreachable | **no** | the tail |
+
+So the policy is:
+
+1. **`gc.auto=0` on the mirror.** Git runs `gc --auto` implicitly after many ordinary commands; with
+   agents borrowing objects, an implicit prune firing mid-session is exactly the failure mode. Nothing
+   in the codebase runs `gc`/`repack` explicitly today (only `worktree prune`), so this is purely
+   about suppressing the automatic path.
+2. **Repack-without-prune may run at any time**, including with agents attached. This is what keeps
+   the mirror from growing without bound, and it is the answer to "what if agents are never all
+   stopped at once" — space is reclaimed continuously without ever waiting for an idle window.
+3. **Full prune only at a genuine idle point** — no agent attached to that repo. That occurs naturally
+   when the last agent tears down, so it needs no new scheduler.
+4. **A size guard** so this cannot rot silently: track pack/loose growth per mirror and surface it.
+   Unbounded growth should be visible, not discovered at 40 GB.
+
+No locking primitive is required, and there is no stale-lease failure mode.
 
 ### Publishing: the agent pushes to its OWN repo, the daemon fetches
 
@@ -167,26 +192,33 @@ Useful only as a stopgap or as defense-in-depth alongside Option B.
 
 ---
 
-## 6. Recommendation
+## 6. Decision — **taken 2026-07-27 (owner)**
 
-1. **Option B** as the real fix, staged:
-   - *Stage 1* — introduce the per-agent repo + alternates; worktrees move to it. Mirror still RW
-     (no security gain yet, but the data path is proven and reversible).
-   - *Stage 2* — add the daemon-side mediated ref-update API with the four rules in §4.
-   - *Stage 3* — flip the mirror mount to `ReadOnly = true`. **This is the commit that closes MG-3**;
-     everything before it is refactoring that can land independently.
-2. **Option A (userns-remap)** in parallel, tracked as MG-17 on its own merits — and the
-   "user-namespaced" claim stays out of the docs until it is actually enabled.
-3. Option C only if a stopgap is wanted before Stage 3 lands.
+This section was a recommendation; it is now the plan of record.
 
-## 7. Open questions for review
+1. **Option B, all three stages.** Stage 3 is the point of the exercise — everything before it is
+   refactoring that changes no security posture, so stopping at Stage 2 would leave MG-3 open.
+   - *Stage 1* — per-agent repo + alternates; worktrees move to it. Mirror still RW (data path proven,
+     reversible).
+   - *Stage 2* — daemon-side mediated ref updates with the four rules in §4.
+   - *Stage 3* — flip the mirror mount to `ReadOnly = true`. **This is the commit that closes MG-3.**
+2. **Option A (userns-remap) is being enabled**, tracked as MG-17, and it lands **before** this work.
+   Ordering is deliberate: MG-3 creates new per-agent directories that need correct ownership, and
+   with the remap already in place they are created correctly by construction instead of retrofitted.
+   Both changes also touch `ContainerSpecBuilder`, so they must not run concurrently.
+   Until the remap is actually enabled, the "user-namespaced" claim stays out of the docs.
+3. **Option C is not being taken.** It is detective rather than preventive, and Stage 3 supersedes it.
 
-- **`git gc` vs alternates.** Does repack/prune on the mirror while agents hold alternates need an
-  explicit lock, or is gc simply disabled while any agent is attached? This is the main unresolved
-  design cost of Option B.
-- **Per-agent disk.** Alternates make object storage near-zero, but each repo still carries its own
-  refs/config/index. Confirm that is acceptable at the expected agent count.
-- **Fetch trigger.** The daemon watching the agent ref move is the proposed signal; verification time
-  is the natural alternative. Which is preferred?
+## 7. Resolved questions
+
+- ~~`git gc` vs alternates~~ — **resolved**: prune breaks borrowers, repack does not. `gc.auto=0`,
+  repack-without-prune allowed at any time (this is what bounds growth without waiting for an idle
+  window), full prune only when no agent is attached, plus a size guard so growth stays visible. No
+  locking primitive, no stale-lease failure mode. See §4.
+- ~~Per-agent disk~~ — **accepted**. `CoordinatorLimits.MaxActiveWorkers` is 6, and the per-agent repo
+  carries only refs/config/index plus its own new objects, so the cost is bounded and small.
+- ~~Fetch trigger~~ — **resolved: both.** The daemon watches the agent ref move (responsiveness, and it
+  keeps the agent's own `git push` meaningful) **and** re-fetches immediately before verification, so
+  the bytes that get verified are definitely current rather than whatever the watcher last saw.
 - ~~Push-to-daemon vs daemon-fetch~~ — **resolved**: the agent pushes to its own repo and the daemon
   fetches, which keeps `git push` working while leaving ref naming entirely daemon-side (§4).
