@@ -31,10 +31,18 @@ public interface IMergeBranchDiffService
 public sealed class MergeBranchDiffService : IMergeBranchDiffService
 {
     private readonly IRepoProvisioner _repos;
+    private readonly Func<string, string, bool>? _publishAgentRef;
 
-    public MergeBranchDiffService(IRepoProvisioner repos)
+    /// <param name="publishAgentRef">
+    /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
+    /// Called before the diff is computed: with the agent now committing into its OWN repo, a review
+    /// asked for between two ref-watcher ticks would otherwise render an empty diff and read as "the
+    /// agent has done nothing". Null (the pre-MG-3 tests) diffs whatever the mirror already holds.
+    /// </param>
+    public MergeBranchDiffService(IRepoProvisioner repos, Func<string, string, bool>? publishAgentRef = null)
     {
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
+        _publishAgentRef = publishAgentRef;
     }
 
     public MergeBranchDiff Compute(string repoHash, string agentId)
@@ -49,8 +57,12 @@ public sealed class MergeBranchDiffService : IMergeBranchDiffService
             throw new ArgumentException("An agent id is required.", nameof(agentId));
         }
 
+        // MG-3: make the mirror current before reading it (design §7 — the daemon re-fetches immediately
+        // before it uses the branch, rather than trusting whatever the watcher last saw).
+        _publishAgentRef?.Invoke(repoHash, agentId);
+
         var barePath = _repos.BareRepoPathFor(repoHash);
-        var branch = "agent/" + agentId;
+        var branch = AgentRepoLayout.BranchFor(agentId);
         var main = ResolveDefaultBranch(barePath);
 
         // git diff main...agent/<id>: the merge-base diff (what the branch added since it diverged).

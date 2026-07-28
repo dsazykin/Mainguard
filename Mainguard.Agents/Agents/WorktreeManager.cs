@@ -4,17 +4,24 @@ using System.Diagnostics;
 using System.IO;
 using Mainguard.Agents.Services;
 using Mainguard.Git;
+using Mainguard.Git.Audit;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Models;
 using Mainguard.Git.Services;
 namespace Mainguard.Agents.Agents;
 
 /// <summary>
-/// P2-06 daemon service (no UI dependency). Manages per-agent worktrees off a repo's bare
-/// mirror: create <c>agent/&lt;id&gt;</c> off the mirror's default branch, remove, and prune.
-/// Every worktree is <b>quarantined</b> — its sole configured remote is the daemon-owned bare
-/// mirror (§3.4), so an agent's <c>git push</c> can only land in the mirror, never the user's
-/// real remote and never with credentials it does not have.
+/// P2-06 daemon service (no UI dependency). Manages per-agent worktrees: create
+/// <c>agent/&lt;id&gt;</c> off the mirror's default branch, remove, and prune.
+/// Every worktree is <b>quarantined</b> — its sole configured remote is a daemon-owned repository
+/// (§3.4), so an agent's <c>git push</c> can only land there, never in the user's real remote and
+/// never with credentials it does not have.
+///
+/// <para><b>MG-3.</b> That repository is no longer the shared mirror: each agent gets its OWN bare
+/// repo (<see cref="AgentRepoManager"/>) borrowing the mirror's objects through
+/// <c>objects/info/alternates</c>, and the worktree is linked off <i>that</i>. The mirror stops being
+/// a surface the jail writes at all; the daemon carries the agent's branch across
+/// (<see cref="PublishAgentBranch"/>), naming the source and destination refs itself.</para>
 /// </summary>
 public interface IAgentWorktreeManager
 {
@@ -24,11 +31,36 @@ public interface IAgentWorktreeManager
     /// <summary>Remove an agent's worktree; <paramref name="force"/> discards a dirty tree, otherwise a dirty tree is refused (typed).</summary>
     void RemoveAgentWorktree(string repoHash, string agentId, bool force);
 
-    /// <summary>Prune stale worktree metadata from the bare mirror.</summary>
+    /// <summary>Prune stale worktree metadata.</summary>
     void Prune(string repoHash);
 
-    /// <summary>List the mirror's worktrees via the porcelain parser (drives the ListWorktrees RPC).</summary>
+    /// <summary>List the repo's agent worktrees via the porcelain parser (drives the ListWorktrees RPC).</summary>
     IReadOnlyList<WorktreeItem> List(string repoHash);
+
+    /// <summary>
+    /// MG-3 — the per-agent repository whose git dir backs this agent's worktree, bind-mounted
+    /// READ-WRITE into exactly one jail at its identical VM path. Empty when this implementation has
+    /// no per-agent repo (the test doubles), which simply means the jail carries no such mount.
+    /// </summary>
+    string AgentRepoPathFor(string repoHash, string agentId) => string.Empty;
+
+    /// <summary>
+    /// MG-3 — carry <c>refs/heads/agent/&lt;id&gt;</c> from the agent's own repository into the shared
+    /// mirror, which is where the merge queue reads it from. The daemon names both the source ref and
+    /// the destination; the agent never proposes a ref update at all. Returns true when the mirror's
+    /// ref is at the agent's tip afterwards.
+    /// </summary>
+    bool PublishAgentBranch(string repoHash, string agentId) => false;
+
+    /// <summary>
+    /// MG-3 — start watching this agent's own <c>refs/heads/agent/&lt;id&gt;</c> and publish it into the
+    /// mirror whenever it moves (design §7: the daemon watches AND re-fetches before verification).
+    /// Called at spawn. Default no-op for the substrate-less test doubles.
+    /// </summary>
+    void WatchAgentRef(string repoHash, string agentId) { }
+
+    /// <summary>MG-3 — stop watching (teardown). Default no-op.</summary>
+    void UnwatchAgentRef(string repoHash, string agentId) { }
 }
 
 /// <inheritdoc cref="IAgentWorktreeManager"/>
@@ -37,6 +69,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private readonly string _vmRoot;
     private readonly Func<string, (int ExitCode, string Output)> _pnpmRunner;
     private readonly Action<string>? _warningSink;
+    private readonly IAuditLog? _audit;
+    private readonly AgentRepoManager _agentRepos;
+    private readonly AgentRefMediator _refs;
+    private readonly Lazy<AgentRefWatcher> _watcher;
 
     /// <param name="vmRoot">The VM base directory (shared with the provisioner). Injected for tests.</param>
     /// <param name="pnpmRunner">
@@ -46,15 +82,78 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// shared <see cref="GitServices.RunGit"/> primitive.
     /// </param>
     /// <param name="warningSink">Receives non-fatal warnings (e.g. a failed pnpm install).</param>
+    /// <param name="audit">
+    /// MG-3 — G-17 sink for the one security-relevant event this type produces: a REFUSED publish
+    /// (<see cref="AgentRefRefusedEvent"/>). An agent that rewrote history the mirror had already
+    /// published, or an id that failed the layout gate, must leave a durable record rather than only a
+    /// log line — the whole finding was a control that looked applied and was not.
+    /// </param>
     public WorktreeManager(
         string? vmRoot = null,
         Func<string, (int ExitCode, string Output)>? pnpmRunner = null,
-        Action<string>? warningSink = null)
+        Action<string>? warningSink = null,
+        IAuditLog? audit = null)
     {
         _vmRoot = vmRoot ?? DefaultVmRoot();
         _pnpmRunner = pnpmRunner ?? RealPnpmInstall;
         _warningSink = warningSink;
+        _audit = audit;
+        _agentRepos = new AgentRepoManager(_vmRoot);
+        _refs = new AgentRefMediator(_agentRepos, BareRepoPathFor, OnPublishOutcome);
+        _watcher = new Lazy<AgentRefWatcher>(() => new AgentRefWatcher(_refs, _agentRepos));
     }
+
+    /// <summary>The G-17 audit type for a refused publish (MG-3).</summary>
+    public const string AgentRefRefusedEvent = "agent_ref_refused";
+
+    // A refusal is the interesting half: it means an agent rewrote history the mirror had already
+    // published (or aimed at something that is not its own branch), and it must not pass silently just
+    // because the caller wanted a bool.
+    private void OnPublishOutcome(AgentRefPublishResult result)
+    {
+        if (!result.Refused)
+        {
+            return;
+        }
+
+        // The agent id is echoed RAW, never through AgentRepoLayout.RefFor: a RefusedTarget outcome is
+        // precisely the case where the id failed that gate, and re-running it here would throw out of a
+        // mediator whose entire contract is that it never does.
+        _warningSink?.Invoke(
+            $"MG-3: refused to publish agent '{result.AgentId}' into repo "
+            + $"'{result.RepoHash}' — {result.Outcome}: {result.Reason}");
+
+        _audit?.Append(new AuditEvent(AgentRefRefusedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = result.RepoHash,
+            ["agent"] = result.AgentId,
+            ["outcome"] = result.Outcome.ToString(),
+            ["old"] = result.OldSha ?? string.Empty,
+            ["new"] = result.NewSha ?? string.Empty,
+            ["reason"] = result.Reason ?? string.Empty,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+    }
+
+    /// <summary>MG-3 — the mediator this manager publishes through (the watcher shares it).</summary>
+    public AgentRefMediator RefMediator => _refs;
+
+    /// <summary>MG-3 — the per-agent repository store (the watcher needs it to snapshot refs).</summary>
+    public AgentRepoManager AgentRepos => _agentRepos;
+
+    /// <summary>
+    /// MG-3 — the ref watcher, created on first use so a manager that never spawns an agent (every unit
+    /// test, the merge-diff bridge) never starts a background loop at all. Its lifetime is the daemon's:
+    /// <see cref="UnwatchAgentRef"/> removes an agent from the sweep, and there is nothing per-agent to
+    /// dispose.
+    /// </summary>
+    public AgentRefWatcher RefWatcher => _watcher.Value;
+
+    /// <inheritdoc />
+    public void WatchAgentRef(string repoHash, string agentId) => RefWatcher.Watch(repoHash, agentId);
+
+    /// <inheritdoc />
+    public void UnwatchAgentRef(string repoHash, string agentId) => RefWatcher.Unwatch(repoHash, agentId);
 
     public string CreateAgentWorktree(string repoHash, string agentId)
     {
@@ -66,9 +165,11 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
         var branch = BranchFor(agentId);
         var worktreePath = WorktreePathFor(repoHash, agentId);
+        var agentRepoPath = _agentRepos.PathFor(repoHash, agentId);
 
-        // Refuse (typed) BEFORE any mutation if the branch or the path already exists (edge row 3):
-        // leave no residue.
+        // Refuse (typed) BEFORE any mutation if the branch or either path already exists (edge row 3):
+        // leave no residue. The mirror still carries agent/<id> — publishing it there is what the merge
+        // queue consumes — so it remains the authoritative "is this id taken?" question.
         if (BranchExists(barePath, branch))
         {
             throw new AgentWorktreeConflictException($"Branch '{branch}' already exists for repo '{repoHash}'.");
@@ -79,29 +180,71 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             throw new AgentWorktreeConflictException($"Worktree path already exists for agent '{agentId}'.");
         }
 
+        if (_agentRepos.Exists(repoHash, agentId))
+        {
+            throw new AgentWorktreeConflictException($"A per-agent repository already exists for agent '{agentId}'.");
+        }
+
         Directory.CreateDirectory(Path.GetDirectoryName(worktreePath)!);
 
-        var baseBranch = DefaultBranch(barePath);
-        AgentGitCommand.Run(barePath, "worktree", "add", "-b", branch, worktreePath, baseBranch);
+        // MG-3: the agent's own repository, borrowing the mirror's objects through alternates. The
+        // worktree is linked off THIS, not off the mirror — which is what lets the mirror's mount become
+        // read-only without taking `git commit` away from the agent.
+        _agentRepos.Create(repoHash, agentId, barePath);
+        try
+        {
+            var baseBranch = DefaultBranch(agentRepoPath);
+            AgentGitCommand.Run(agentRepoPath, "worktree", "add", "-b", branch, worktreePath, baseBranch);
 
-        // Quarantine remote (§3.4): the worktree's remotes MUST be exactly {origin -> bare mirror}.
-        // Remove any inherited origin first, then point origin at the local bare path only —
-        // never the user's real remote, never credentials.
-        AgentGitCommand.TryRun(worktreePath, out _, "remote", "remove", "origin");
-        AgentGitCommand.Run(worktreePath, "remote", "add", "origin", barePath);
+            // Quarantine remote (§3.4 + MG-3): the worktree's remotes MUST be exactly
+            // {origin -> the agent's OWN repo}. A linked worktree shares its main repository's config,
+            // so this is also the agent repo's only remote. `git push origin` therefore succeeds
+            // entirely inside the agent's writable space — LLM CLIs push reflexively and that has to
+            // keep working — while the mirror is not a remote it can name at all.
+            AgentGitCommand.TryRun(worktreePath, out _, "remote", "remove", "origin");
+            AgentGitCommand.Run(worktreePath, "remote", "add", "origin", agentRepoPath);
 
-        // pnpm hook (§3.3): only when a lockfile is present, and non-fatal — a failure surfaces
-        // a warning but the worktree is still returned.
-        MaybeRunPnpm(worktreePath, agentId);
+            // pnpm hook (§3.3): only when a lockfile is present, and non-fatal — a failure surfaces
+            // a warning but the worktree is still returned.
+            MaybeRunPnpm(worktreePath, agentId);
 
-        // MG-17: the jail that mounts this worktree read-write is host uid/gid 101000 (the userns
-        // remap), not this process's uid 1000 — so a checkout laid down under the daemon's 022 umask
-        // (0644 files, 0755 dirs) is one the agent can READ and never EDIT. Group-share it. This runs
-        // LAST so it also covers whatever `pnpm install` just wrote.
-        GroupShareRecursive(worktreePath);
+            // MG-17: the jail that mounts this worktree read-write is host uid/gid 101000 (the userns
+            // remap), not this process's uid 1000 — so a checkout laid down under the daemon's 022 umask
+            // (0644 files, 0755 dirs) is one the agent can READ and never EDIT. Group-share it. This runs
+            // LAST so it also covers whatever `pnpm install` just wrote.
+            GroupShareRecursive(worktreePath);
+            // …and again over the agent repo, whose `worktrees/<id>` metadata `worktree add` just created.
+            GroupShareRecursive(agentRepoPath);
+
+            // Seed the merge queue's input contract: refs/heads/agent/<id> exists in the MIRROR from the
+            // moment the agent does, pointing at the base commit. Everything downstream (the queue, the
+            // diff bridge, the host repo's sync fetch) reads it there and is unaffected by where the
+            // agent actually commits.
+            PublishAgentBranch(repoHash, agentId);
+        }
+        catch
+        {
+            // Leave no residue: a half-made agent repo would make the next spawn of this id conflict.
+            _agentRepos.Remove(repoHash, agentId);
+            throw;
+        }
 
         return worktreePath;
     }
+
+    /// <inheritdoc />
+    public string AgentRepoPathFor(string repoHash, string agentId) => _agentRepos.PathFor(repoHash, agentId);
+
+    /// <inheritdoc />
+    public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
+
+    /// <summary>
+    /// MG-3 stage 2 — the mediated publish, with the outcome rather than a bool. The four rules
+    /// (destination is this agent's branch, fast-forward only, no deletes, never the integration
+    /// branch) live in <see cref="AgentRefMediator"/>; this is the manager's entry point to them.
+    /// </summary>
+    public AgentRefPublishResult Publish(string repoHash, string agentId)
+        => _refs.Publish(repoHash, agentId);
 
     /// <summary>
     /// MG-17 — grants the group <c>rwX</c> throughout a tree the daemon owns and a remapped jail must be
@@ -186,6 +329,9 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         var barePath = BareRepoPathFor(repoHash);
         var worktreePath = WorktreePathFor(repoHash, agentId);
         var branch = BranchFor(agentId);
+        // The owner of the worktree metadata. A worktree made before MG-3 is still linked off the
+        // mirror, so an upgraded daemon must be able to tear that one down too.
+        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
 
         if (Directory.Exists(worktreePath))
         {
@@ -197,30 +343,76 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
             if (force)
             {
-                AgentGitCommand.Run(barePath, "worktree", "remove", "--force", worktreePath);
+                AgentGitCommand.Run(owner, "worktree", "remove", "--force", worktreePath);
             }
             else
             {
-                AgentGitCommand.Run(barePath, "worktree", "remove", worktreePath);
+                AgentGitCommand.Run(owner, "worktree", "remove", worktreePath);
             }
         }
 
         // Prune any dangling metadata and delete the agent branch so no residue survives either way.
+        // The mirror's copy of agent/<id> is what the merge queue consumed, so it is deleted too.
+        AgentGitCommand.TryRun(owner, out _, "worktree", "prune");
         AgentGitCommand.TryRun(barePath, out _, "worktree", "prune");
         AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch);
+
+        // MG-3: the agent's own repository goes with it. Its objects were already COPIED into the mirror
+        // by every publish (a fetch across a local transport transfers objects; the mirror borrows from
+        // nobody), so deleting it can never strand a commit the mirror's refs still name.
+        _agentRepos.Remove(repoHash, agentId);
+
+        // §4 gc policy: this is the natural idle point — if that was the last borrower, unreachable
+        // objects in the mirror may finally be pruned.
+        MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
     }
 
     public void Prune(string repoHash)
     {
         var barePath = BareRepoPathFor(repoHash);
         AgentGitCommand.Run(barePath, "worktree", "prune");
+        foreach (var agentId in _agentRepos.ListAgentIds(repoHash))
+        {
+            AgentGitCommand.TryRun(_agentRepos.PathFor(repoHash, agentId), out _, "worktree", "prune");
+        }
     }
 
     public IReadOnlyList<WorktreeItem> List(string repoHash)
     {
-        var barePath = BareRepoPathFor(repoHash);
-        var porcelain = AgentGitCommand.Run(barePath, "worktree", "list", "--porcelain");
-        return WorktreePorcelainParser.Parse(porcelain);
+        // MG-3: worktrees now hang off the per-agent repositories, so the listing is their union. The
+        // mirror is still asked because a pre-MG-3 daemon left its worktrees there, and an upgrade must
+        // not make them vanish from the RPC while they are still on disk.
+        var items = new List<WorktreeItem>();
+        foreach (var gitDir in EnumerateWorktreeOwners(repoHash))
+        {
+            if (AgentGitCommand.TryRun(gitDir, out var porcelain, "worktree", "list", "--porcelain") != 0)
+            {
+                continue;
+            }
+
+            foreach (var item in WorktreePorcelainParser.Parse(porcelain))
+            {
+                // Skip each repository's own bare stanza: it is a git dir, not an agent worktree, and
+                // before MG-3 the mirror's stanza was the (single) "main" entry that got filtered the
+                // same way by everything downstream.
+                if (item.Branch is { Length: > 0 } branch
+                    && branch.StartsWith(AgentRepoLayout.BranchPrefix, StringComparison.Ordinal))
+                {
+                    items.Add(item);
+                }
+            }
+        }
+
+        return items;
+    }
+
+    private IEnumerable<string> EnumerateWorktreeOwners(string repoHash)
+    {
+        yield return BareRepoPathFor(repoHash);
+        foreach (var agentId in _agentRepos.ListAgentIds(repoHash))
+        {
+            yield return _agentRepos.PathFor(repoHash, agentId);
+        }
     }
 
     /// <summary>The bare-mirror path for a hash (shared layout with the provisioner).</summary>

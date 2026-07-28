@@ -46,6 +46,7 @@ public sealed class MergeQueueProvisioner
     private readonly VerificationRunner _runner;
     private readonly IAuditLog _audit;
     private readonly Action<string>? _log;
+    private readonly Func<string, string, bool>? _publishAgentRef;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
@@ -60,6 +61,13 @@ public sealed class MergeQueueProvisioner
     /// <param name="artifactDirectory">Daemon-owned directory the verification log artifacts land in.</param>
     /// <param name="audit">Audit sink threaded into every queue (the loud <c>stale_override_used</c> path).</param>
     /// <param name="log">Optional milestone sink (daemon Merge log category).</param>
+    /// <param name="publishAgentRef">
+    /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
+    /// Called immediately BEFORE every verification, which is the second half of the resolved
+    /// fetch-trigger question (design §7): the watcher keeps the mirror responsive, and this makes the
+    /// bytes that get verified definitely current rather than whatever the watcher last saw. Null (the
+    /// pre-MG-3 tests) simply verifies whatever the mirror already holds.
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -70,7 +78,8 @@ public sealed class MergeQueueProvisioner
         ISandboxEngine sandboxes,
         string artifactDirectory,
         IAuditLog? audit = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Func<string, string, bool>? publishAgentRef = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -83,6 +92,7 @@ public sealed class MergeQueueProvisioner
             artifactDirectory ?? throw new ArgumentNullException(nameof(artifactDirectory)));
         _audit = audit ?? new InMemoryAuditLog();
         _log = log;
+        _publishAgentRef = publishAgentRef;
     }
 
     /// <summary>
@@ -207,6 +217,12 @@ public sealed class MergeQueueProvisioner
             throw new InvalidOperationException(
                 $"Agent '{agentId}' has no live sandbox — verification runs in the worker's own jail, never on the host.");
         }
+
+        // MG-3 (design §7, "fetch trigger: both"): re-publish the agent's branch from its OWN repository
+        // into the mirror right now, so what is about to be verified is the agent's current tip rather
+        // than whatever the ref watcher last happened to see. The daemon names the source ref and the
+        // destination; the agent cannot name a ref at all.
+        _publishAgentRef?.Invoke(repoHandle, agentId);
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);

@@ -163,17 +163,50 @@ public class ContainerSpecBuilderTests
     // ---- The bare-mirror mount (in-jail git: the worktree's gitdir pointer must resolve) ----
 
     [Fact]
-    public void Build_WithBareRepoPath_MountsItReadWrite_AtItsIdenticalVmPath()
+    public void Build_WithBareRepoPath_MountsTheSharedMirrorReadOnly_AtItsIdenticalVmPath()
     {
         const string bare = "/home/mainguard/mainguard/repos/abc123def456abc123.git";
         var create = ContainerSpecBuilder.Build(ValidRequest() with { BareRepoPath = bare });
 
         var mount = Assert.Single(create.HostConfig.Mounts, m => m.Source == bare);
-        // Target == Source: the worktree's .git file carries this absolute VM path; anything else
-        // leaves the gitdir pointer dangling and in-jail git dead ("not a git repository").
+        // Target == Source: the per-agent repo's objects/info/alternates carries this absolute VM
+        // path; anything else leaves every object lookup dangling and in-jail git dead.
         Assert.Equal(bare, mount.Target);
-        // Read-write: commits write objects + the agent/<id> ref into the mirror's common dir.
+        // MG-3: READ-ONLY. This is the shape assertion only — a mount option that never reached a
+        // container proves nothing, and the finding is precisely that a control which looked right was
+        // not in the path. The claim is made by MirrorReadOnlyDockerTests, which performs the attack
+        // (overwrite <bare>/refs/heads/main from inside a real production jail) and requires a refusal.
+        Assert.True(mount.ReadOnly);
+        Assert.True(ContainerSpecBuilder.MirrorMountReadOnly);
+    }
+
+    /// <summary>
+    /// MG-3 — the per-agent repository is the ONE git directory the jail may write, mounted at its
+    /// identical VM path so the linked worktree's <c>gitdir:</c> pointer resolves in-jail.
+    /// </summary>
+    [Fact]
+    public void Build_WithAgentRepoPath_MountsItReadWrite_AtItsIdenticalVmPath()
+    {
+        const string bare = "/home/mainguard/mainguard/repos/abc123def456abc123.git";
+        const string agentRepo = "/home/mainguard/mainguard/agents/abc123def456abc123/agent-1.git";
+        var create = ContainerSpecBuilder.Build(
+            ValidRequest() with { BareRepoPath = bare, AgentRepoPath = agentRepo });
+
+        var mount = Assert.Single(create.HostConfig.Mounts, m => m.Source == agentRepo);
+        Assert.Equal(agentRepo, mount.Target);
         Assert.False(mount.ReadOnly);
+        // …alongside, not instead of, the read-only mirror it borrows objects from.
+        Assert.True(Assert.Single(create.HostConfig.Mounts, m => m.Source == bare).ReadOnly);
+    }
+
+    [Theory]
+    [InlineData("/mnt/c/Users/dev/agents/abc/agent-1.git")]
+    [InlineData(@"C:\mainguard\agents\abc\agent-1.git")]
+    [InlineData(@"\\wsl.localhost\MainguardEnv\home\agents\abc\agent-1.git")]
+    public void Build_RejectsNonExt4AgentRepoPath_Typed(string badSource)
+    {
+        Assert.Throws<SandboxSpecException>(() =>
+            ContainerSpecBuilder.Build(ValidRequest() with { AgentRepoPath = badSource }));
     }
 
     [Fact]

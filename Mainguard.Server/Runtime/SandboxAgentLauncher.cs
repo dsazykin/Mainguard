@@ -146,7 +146,11 @@ public sealed class SandboxAgentLauncher
         var launchCommand = adapter?.Launch;
 
         var worktreePath = _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
-        _log.LogInformation("worktree ready: {Path}", worktreePath);
+        // MG-3: the per-agent repository the worktree is linked off — the ONE git dir this jail may
+        // write. Resolved AFTER creation so an implementation that has no per-agent repo (the test
+        // doubles' default) simply reports none and the jail carries no such mount.
+        var agentRepoPath = _environment.Worktrees.AgentRepoPathFor(repoHandle, agentId);
+        _log.LogInformation("worktree ready: {Path} agentRepo={AgentRepo}", worktreePath, agentRepoPath);
         try
         {
             // The default-deny network + allowlist proxy must exist before the jail joins the network.
@@ -178,14 +182,24 @@ public sealed class SandboxAgentLauncher
                 AdaptersRootPath: _adapters.HasAny() ? AdapterPaths.VmRoot : null,
                 // Coordinator-role jails only: the daemon-served spawn-channel dir (read-only mount).
                 IpcDirPath: ipcDirPath,
-                // The bare mirror at its identical VM path so the worktree's gitdir pointer resolves
-                // in-jail (field bug 2026-07-23: every in-jail git command died "not a git repository").
+                // The shared mirror at its identical VM path so the per-agent repo's alternates pointer
+                // resolves in-jail (field bug 2026-07-23: every in-jail git command died "not a git
+                // repository"). MG-3 stage 3 makes this mount read-only.
                 BareRepoPath: barePath,
+                // MG-3: the per-agent repository, at its identical VM path so the worktree's gitdir
+                // pointer resolves. Read-write, and mounted into exactly this one jail.
+                AgentRepoPath: string.IsNullOrEmpty(agentRepoPath) ? null : agentRepoPath,
                 // MG-36: this agent's segment, and the proxy's address ON that segment. The address
                 // rather than the proxy's NAME because one dnsmasq cannot answer the same name with a
                 // different address per segment, and every other segment's address is unreachable.
                 NetworkName: segment.NetworkName,
                 ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)), ct).ConfigureAwait(false);
+
+            // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
+            // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
+            // after the jail is up, so a failed spawn leaves no watcher behind; the pre-verification
+            // re-fetch is the other half and neither replaces the other.
+            _environment.Worktrees.WatchAgentRef(repoHandle, agentId);
 
             _log.LogInformation(
                 "jail started: container={Container} reused={Reused} launchCmd={HasLaunch}",
@@ -210,6 +224,14 @@ public sealed class SandboxAgentLauncher
 
         if (!string.IsNullOrEmpty(repoHash))
         {
+            // MG-3: a LAST publish before anything is removed, then stop watching. Without it the work
+            // an agent committed between the final verification and the stop would be lost with its
+            // repository — the agent's own repo is deleted a few lines below.
+            try { _environment.Worktrees.PublishAgentBranch(repoHash, agentId); }
+            catch { /* never fail a stop from housekeeping */ }
+            try { _environment.Worktrees.UnwatchAgentRef(repoHash, agentId); }
+            catch { /* never fail a stop from housekeeping */ }
+
             // MG-36: reclaim the segment. Docker's local bridge address pool is finite (~32 networks by
             // default), so a segment leaked per agent would eventually make spawning fail with an
             // address-pool exhaustion error that reads like anything but the cause. Ordered AFTER the

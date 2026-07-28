@@ -28,9 +28,12 @@ public sealed record SandboxSecrets(
 /// <c>mainguard-agent</c> spawn shim), bind-mounted READ-ONLY at
 /// <see cref="Ipc.AgentIpcPaths.SandboxMount"/>. Coordinator-role jails only; null for workers —
 /// they get no spawn channel (least privilege).</param>
-/// <param name="BareRepoPath">The VM-side bare mirror backing the worktree, bind-mounted at its
-/// identical VM path so the linked worktree's <c>gitdir:</c> pointer resolves in-jail (see
+/// <param name="BareRepoPath">The VM-side shared mirror, bind-mounted at its identical VM path so the
+/// per-agent repo's <c>objects/info/alternates</c> resolves in-jail (see
 /// <see cref="ContainerSpecRequest"/>). Null = no mirror mount.</param>
+/// <param name="AgentRepoPath">MG-3 — the VM-side per-agent repository backing the worktree,
+/// bind-mounted READ-WRITE at its identical VM path so the linked worktree's <c>gitdir:</c> pointer
+/// resolves in-jail. Null = no per-agent repo mount.</param>
 /// <param name="NetworkName">MG-36 — the per-agent, single-tenant default-deny segment this jail
 /// attaches to (<see cref="EgressProxyConfigurator.AgentSegmentName"/>), so agent A has no L2 or L3
 /// path to agent B. Null keeps the engine's configured network (the shared <c>mainguard-agents</c>
@@ -52,7 +55,8 @@ public sealed record SandboxSpawnRequest(
     string? IpcDirPath = null,
     string? BareRepoPath = null,
     string? NetworkName = null,
-    string? ProxyUrl = null);
+    string? ProxyUrl = null,
+    string? AgentRepoPath = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

@@ -94,13 +94,19 @@ public sealed record CredTmpfsSpec(
 /// <param name="IpcDirPath">The VM-side per-agent IPC dir (coordinator jails only), bind-mounted
 /// READ-ONLY at <see cref="Ipc.AgentIpcPaths.SandboxMount"/>; same G-11 ext4-only rejection as every
 /// other mount. Null/empty = no IPC mount (workers).</param>
-/// <param name="BareRepoPath">The VM-side bare mirror the worktree links back to, bind-mounted at its
-/// <b>identical</b> VM path so the worktree's <c>.git</c> <c>gitdir:</c> pointer (an absolute VM path
-/// into <c>&lt;bare&gt;/worktrees/&lt;agentId&gt;</c>) resolves inside the jail — without it every
-/// in-jail <c>git</c> command dies with "not a git repository". Mounted read-write because commits
-/// write objects and the <c>agent/&lt;id&gt;</c> ref into the mirror's common dir; the §3.4 quarantine
-/// is unchanged (the mirror is already the designated agent-writable surface — origin points at it).
-/// Null/empty = no mirror mount (session-only paths and pre-P2-18 tests).</param>
+/// <param name="BareRepoPath">The VM-side <b>shared mirror</b>, bind-mounted at its <b>identical</b> VM
+/// path so the per-agent repo's <c>objects/info/alternates</c> (an absolute VM path into
+/// <c>&lt;bare&gt;/objects</c>) resolves inside the jail — without it in-jail git cannot read a single
+/// object of the repo's history. Null/empty = no mirror mount (session-only paths and pre-P2-18 tests).
+/// <para><b>MG-3:</b> mounted READ-WRITE until stage 3, then read-only. It is a shared surface — every
+/// jail for this repo mounts the same directory — and the deny-non-fast-forward / deny-delete quarantine
+/// on it only ever constrained <c>receive-pack</c>, so a writable mount let any agent rewrite
+/// <c>refs/heads/main</c> by editing a 41-byte file.</para></param>
+/// <param name="AgentRepoPath">MG-3 — the VM-side per-agent repository
+/// (<c>&lt;vmRoot&gt;/agents/&lt;hash&gt;/&lt;agentId&gt;.git</c>), bind-mounted READ-WRITE at its
+/// <b>identical</b> VM path so the worktree's <c>.git</c> <c>gitdir:</c> pointer resolves in-jail. This
+/// is the ONLY git directory the jail may write, and exactly one jail ever mounts it. Null/empty = no
+/// per-agent repo (session-only paths and the pre-MG-3 test doubles).</param>
 /// <param name="DnsServerAddress">MG-7 — the IPv4 address of the egress proxy's dnsmasq, pinned as the
 /// jail's ONLY resolver (<c>HostConfig.Dns</c>). Without it Docker hands the container its embedded
 /// resolver at <c>127.0.0.11</c>, which forwards to the VM's upstream DNS: the NXDOMAIN-pinned dnsmasq
@@ -121,7 +127,8 @@ public sealed record ContainerSpecRequest(
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
     string? BareRepoPath = null,
-    string? DnsServerAddress = null);
+    string? DnsServerAddress = null,
+    string? AgentRepoPath = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -151,6 +158,26 @@ public static class ContainerSpecBuilder
     /// <summary>The container mount point of the agent worktree.</summary>
     public const string WorkspaceTarget = "/workspace";
 
+    /// <summary>
+    /// MG-3 — whether the shared mirror's bind mount denies writes from inside the jail.
+    ///
+    /// <para>This is the single bit that closes MG-3, and it is a named constant so that "is the mirror
+    /// writable from an agent?" is one greppable answer rather than an inference from a mount literal
+    /// buried in a list. It is only correct while the agent has somewhere else to write: the per-agent
+    /// repository (<see cref="ContainerSpecRequest.AgentRepoPath"/>) borrows this mirror's objects
+    /// through <c>objects/info/alternates</c> and owns the refs, HEAD, index and new objects, so a
+    /// <c>git commit</c> in the jail touches nothing here.</para>
+    ///
+    /// <para><b>Measured, not assumed.</b> With this false and everything else in MG-3 already landed,
+    /// <c>MirrorReadOnlyDockerTests</c> writes <c>&lt;bare&gt;/refs/heads/main</c> from inside a real
+    /// production jail and succeeds — on a box with no userns remap the container's uid 1000 IS the
+    /// daemon's, and <c>core.sharedRepository=group</c> makes it group-writable besides. With it true
+    /// the same write is refused by the bind mount, whoever the writer is. That is the whole of MG-3:
+    /// the deny-non-fast-forward / deny-delete settings only ever governed <c>receive-pack</c>, and
+    /// nothing above went anywhere near <c>receive-pack</c>.</para>
+    /// </summary>
+    public const bool MirrorMountReadOnly = true;
+
     /// <summary>The agent user's home inside the jail — a tmpfs (wiped every relaunch) by design;
     /// the ONE path the CLI login round-trip (restore at spawn / harvest at stop) resolves under.</summary>
     public const string AgentHome = "/home/agent";
@@ -172,10 +199,26 @@ public static class ContainerSpecBuilder
             mounts.Add(new Mount
             {
                 Type = "bind",
-                // Target == Source: the worktree's `.git` file names this absolute VM path; any other
-                // target leaves the gitdir pointer dangling and in-jail git dead.
+                // Target == Source: the per-agent repo's objects/info/alternates names this absolute VM
+                // path; any other target leaves every object lookup dangling and in-jail git dead.
                 Source = request.BareRepoPath,
                 Target = request.BareRepoPath,
+                ReadOnly = MirrorMountReadOnly,
+            });
+        }
+
+        if (!string.IsNullOrEmpty(request.AgentRepoPath))
+        {
+            RejectNonExt4Source(request.AgentRepoPath);
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                // Target == Source: the worktree's `.git` file names this absolute VM path; any other
+                // target leaves the gitdir pointer dangling and in-jail git dead.
+                Source = request.AgentRepoPath,
+                Target = request.AgentRepoPath,
+                // MG-3: the ONE git directory the agent may write. Exactly one jail mounts it, so a
+                // write here cannot reach another agent, and the shared mirror is not writable at all.
                 ReadOnly = false,
             });
         }

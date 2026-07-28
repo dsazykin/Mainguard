@@ -1,7 +1,20 @@
 # MG-3 / MG-17 — Confining agent writes to the bare mirror
 
-**Status:** APPROVED 2026-07-27 — plan of record. §6 records the decision; §7 the resolved questions.
-Implementation follows MG-17 (userns-remap), which lands first.
+**Status:** IMPLEMENTED 2026-07-27 — all three stages of Option B landed, one commit each.
+§6 records the decision; §7 the resolved questions. Both remain accurate to the code.
+Implementation followed MG-17 (userns-remap), which landed first.
+
+| stage | what landed | closes |
+|---|---|---|
+| 1 | per-agent repo + `objects/info/alternates`; worktrees moved to it; the gc policy of §4 | nothing yet (data path) |
+| 2 | `AgentRefMediator` — the four rules in code, quarantine-then-decide, CAS; `AgentRefWatcher` | nothing yet (route) |
+| 3 | `ContainerSpecBuilder.MirrorMountReadOnly = true` | **MG-3** |
+
+Measured on this repository (a 25 MB mirror): a per-agent repo is **39 KB** at creation with **zero
+objects of its own**, six are 238 KB, and one carrying 20 real commits is ~4 MB — the "kilobytes to a
+few MB" §4 predicted. The stage-3 flip was verified by performing the attack: with the mirror mounted
+read-write, an in-jail overwrite of `<bare>/refs/heads/main` succeeds; read-only, it is refused, while
+the agent still commits, pushes to its own repo, and reaches the merge queue through the daemon.
 **Findings covered:** MG-3 (quarantine config does not cover direct writes), MG-17 ("user-namespaced" claimed but no userns remap).
 **Related, already fixed:** MG-1 (daemon-side git no longer executes agent-planted hooks/config).
 

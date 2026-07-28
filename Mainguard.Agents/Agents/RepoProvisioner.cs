@@ -17,7 +17,10 @@ public sealed record ProvisionResult(string RepoHash, string BareRepoPath, strin
 /// P2-06 daemon service (no UI dependency). Provisions a bare ext4 mirror of the user's
 /// Windows repo inside <c>MainguardEnv</c> and keeps it current. First provision clones
 /// <c>--bare</c>; subsequent provisions of the same hash fetch incrementally (no re-clone).
-/// The mirror is hardened so a hostile agent cannot rewrite <c>main</c> or delete refs.
+/// A hostile agent cannot rewrite <c>main</c> or delete refs here — since MG-3 that is because the
+/// mirror is bind-mounted READ-ONLY into every jail and the only route in is the daemon's mediated
+/// publish (<see cref="AgentRefMediator"/>), not because of the <c>receive.*</c> settings, which only
+/// ever governed <c>git receive-pack</c>.
 /// </summary>
 public interface IRepoProvisioner
 {
@@ -112,26 +115,40 @@ public sealed class RepoProvisioner : IRepoProvisioner
             AgentGitCommand.Run(reposDir, "clone", "--bare", gitSourcePath, barePath);
             AgentGitCommand.Run(barePath, "config", "core.untrackedCache", "true");
 
-            // Quarantine the mirror itself (§3.4): a hostile agent push can add to agent/* refs
-            // but can neither rewrite main non-fast-forward nor delete refs in the mirror.
+            // Defence in depth over the receive-pack path (§3.4). MG-3 is the reason these are no
+            // longer LOAD-BEARING: they are enforced inside `git receive-pack`, so they never governed
+            // a direct filesystem write, which is exactly how an agent used to be able to overwrite
+            // refs/heads/main. The control that stops that now is the read-only mount
+            // (ContainerSpecBuilder.MirrorMountReadOnly). These stay because nothing about them is
+            // wrong — only insufficient.
             AgentGitCommand.Run(barePath, "config", "receive.denyNonFastForwards", "true");
             AgentGitCommand.Run(barePath, "config", "receive.denyDeletes", "true");
         }
 
-        // MG-17: the mirror is bind-mounted READ-WRITE into the jail, and with userns-remap that jail is
-        // host uid/gid 101000 while this process is uid 1000 — they meet only through the group the
-        // `repos/` parent's setgid bit propagates. Two halves, both required:
+        // MG-17 + MG-3: the mirror is bind-mounted into every jail READ-ONLY, and with userns-remap that
+        // jail is host uid/gid 101000 while this process is uid 1000 — they meet only through the group
+        // the `repos/` parent's setgid bit propagates. The jail therefore needs read+traverse here and
+        // nothing more; what still needs the group treatment is that the DAEMON's own writes stay
+        // readable to it. Two halves, both required:
         //
-        //   `core.sharedRepository=group` makes every FUTURE git write inside this git dir (ours and the
-        //   jail's) group-writable — including the object fan-out directories a later fetch creates,
-        //   which at git's default 0755 would leave the jail unable to write a single object into them.
-        //   Set on EVERY provision, not only at clone, so a mirror from an install that predates the
-        //   remap is repaired by a daemon update alone. Idempotent.
+        //   `core.sharedRepository=group` makes every FUTURE git write inside this git dir group-
+        //   accessible — including the object fan-out directories a later fetch creates, which at git's
+        //   default 0755/0644 would still be readable, but whose modes we keep uniform so a future
+        //   change of posture does not have to re-walk every mirror. Set on EVERY provision, not only at
+        //   clone, so a mirror from an install that predates the remap is repaired by a daemon update
+        //   alone. Idempotent.
         //
         //   The mode pass fixes what ALREADY exists — the tree this clone (or an older provision) laid
         //   down under the daemon's 022 umask, which the config setting does not retroactively touch.
         AgentGitCommand.Run(barePath, "config", "core.sharedRepository", "group");
         WorktreeManager.GroupShareRecursive(barePath);
+
+        // MG-3 §4: every agent repository borrows this mirror's objects through an alternate, and git
+        // does not track borrowers. An implicit `gc --auto` — which git fires after many ordinary
+        // commands, including the fetch above — would prune objects a live agent's repo still depends
+        // on. Pinned on EVERY provision so a mirror created before this policy is repaired by a daemon
+        // update alone. Repacking (which deletes nothing) stays allowed and is driven from teardown.
+        MirrorMaintenance.ApplyGcPolicy(barePath);
 
         var vmRemoteUrl = _vmRemoteUrlResolver(hash);
         if (string.IsNullOrEmpty(vmRemoteUrl))
