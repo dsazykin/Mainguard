@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using Mainguard.Agents.Services;
 using Mainguard.Git;
+using Mainguard.Git.Audit;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Models;
 using Mainguard.Git.Services;
@@ -68,6 +69,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private readonly string _vmRoot;
     private readonly Func<string, (int ExitCode, string Output)> _pnpmRunner;
     private readonly Action<string>? _warningSink;
+    private readonly IAuditLog? _audit;
     private readonly AgentRepoManager _agentRepos;
     private readonly AgentRefMediator _refs;
     private readonly Lazy<AgentRefWatcher> _watcher;
@@ -80,33 +82,57 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// shared <see cref="GitServices.RunGit"/> primitive.
     /// </param>
     /// <param name="warningSink">Receives non-fatal warnings (e.g. a failed pnpm install).</param>
+    /// <param name="audit">
+    /// MG-3 — G-17 sink for the one security-relevant event this type produces: a REFUSED publish
+    /// (<see cref="AgentRefRefusedEvent"/>). An agent that rewrote history the mirror had already
+    /// published, or an id that failed the layout gate, must leave a durable record rather than only a
+    /// log line — the whole finding was a control that looked applied and was not.
+    /// </param>
     public WorktreeManager(
         string? vmRoot = null,
         Func<string, (int ExitCode, string Output)>? pnpmRunner = null,
-        Action<string>? warningSink = null)
+        Action<string>? warningSink = null,
+        IAuditLog? audit = null)
     {
         _vmRoot = vmRoot ?? DefaultVmRoot();
         _pnpmRunner = pnpmRunner ?? RealPnpmInstall;
         _warningSink = warningSink;
+        _audit = audit;
         _agentRepos = new AgentRepoManager(_vmRoot);
-        _refs = new AgentRefMediator(
-            _agentRepos,
-            BareRepoPathFor,
-            // A refusal is the interesting half: it means an agent rewrote history the mirror had
-            // already published, and it must not pass silently just because the caller wanted a bool.
-            result =>
-            {
-                if (result.Refused)
-                {
-                    // The agent id is echoed RAW, never through AgentRepoLayout.RefFor: a RefusedTarget
-                    // outcome is precisely the case where the id failed that gate, and re-running it
-                    // here would throw out of a mediator whose contract is that it never does.
-                    _warningSink?.Invoke(
-                        $"MG-3: refused to publish agent '{result.AgentId}' into repo "
-                        + $"'{result.RepoHash}' — {result.Outcome}: {result.Reason}");
-                }
-            });
+        _refs = new AgentRefMediator(_agentRepos, BareRepoPathFor, OnPublishOutcome);
         _watcher = new Lazy<AgentRefWatcher>(() => new AgentRefWatcher(_refs, _agentRepos));
+    }
+
+    /// <summary>The G-17 audit type for a refused publish (MG-3).</summary>
+    public const string AgentRefRefusedEvent = "agent_ref_refused";
+
+    // A refusal is the interesting half: it means an agent rewrote history the mirror had already
+    // published (or aimed at something that is not its own branch), and it must not pass silently just
+    // because the caller wanted a bool.
+    private void OnPublishOutcome(AgentRefPublishResult result)
+    {
+        if (!result.Refused)
+        {
+            return;
+        }
+
+        // The agent id is echoed RAW, never through AgentRepoLayout.RefFor: a RefusedTarget outcome is
+        // precisely the case where the id failed that gate, and re-running it here would throw out of a
+        // mediator whose entire contract is that it never does.
+        _warningSink?.Invoke(
+            $"MG-3: refused to publish agent '{result.AgentId}' into repo "
+            + $"'{result.RepoHash}' — {result.Outcome}: {result.Reason}");
+
+        _audit?.Append(new AuditEvent(AgentRefRefusedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = result.RepoHash,
+            ["agent"] = result.AgentId,
+            ["outcome"] = result.Outcome.ToString(),
+            ["old"] = result.OldSha ?? string.Empty,
+            ["new"] = result.NewSha ?? string.Empty,
+            ["reason"] = result.Reason ?? string.Empty,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
     }
 
     /// <summary>MG-3 — the mediator this manager publishes through (the watcher shares it).</summary>

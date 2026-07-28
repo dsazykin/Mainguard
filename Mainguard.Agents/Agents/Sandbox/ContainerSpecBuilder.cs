@@ -167,8 +167,16 @@ public static class ContainerSpecBuilder
     /// repository (<see cref="ContainerSpecRequest.AgentRepoPath"/>) borrows this mirror's objects
     /// through <c>objects/info/alternates</c> and owns the refs, HEAD, index and new objects, so a
     /// <c>git commit</c> in the jail touches nothing here.</para>
+    ///
+    /// <para><b>Measured, not assumed.</b> With this false and everything else in MG-3 already landed,
+    /// <c>MirrorReadOnlyDockerTests</c> writes <c>&lt;bare&gt;/refs/heads/main</c> from inside a real
+    /// production jail and succeeds — on a box with no userns remap the container's uid 1000 IS the
+    /// daemon's, and <c>core.sharedRepository=group</c> makes it group-writable besides. With it true
+    /// the same write is refused by the bind mount, whoever the writer is. That is the whole of MG-3:
+    /// the deny-non-fast-forward / deny-delete settings only ever governed <c>receive-pack</c>, and
+    /// nothing above went anywhere near <c>receive-pack</c>.</para>
     /// </summary>
-    public const bool MirrorMountReadOnly = false;
+    public const bool MirrorMountReadOnly = true;
 
     /// <summary>The agent user's home inside the jail — a tmpfs (wiped every relaunch) by design;
     /// the ONE path the CLI login round-trip (restore at spawn / harvest at stop) resolves under.</summary>

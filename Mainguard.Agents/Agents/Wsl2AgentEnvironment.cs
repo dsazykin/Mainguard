@@ -43,12 +43,16 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // The provisioner's Windows-facing handle for a hash IS the resolved sync-remote URL.
         var provisioner = new RepoProvisioner(vmRoot, hash => ResolveSyncRemote(hash).Url);
         Repos = provisioner;
-        Worktrees = new WorktreeManager(vmRoot);
 
         // P2-07: hardened sandbox engine + default-deny egress. The Docker client connects lazily —
         // building it here does not require a live daemon (safe for construction/tests).
         var docker = dockerClient ?? new DockerClientConfiguration().CreateClient();
         var audit = auditLog ?? new InMemoryAuditLog();
+
+        // MG-3: the worktree manager owns the mediated publish, so it gets the audit sink — a REFUSED
+        // publish (an agent rewriting history the mirror already carries) is a security event and has to
+        // leave a durable record, not just a log line.
+        Worktrees = new WorktreeManager(vmRoot, audit: audit);
         // Auto-permit on install: the proxy config also permits the hosts each installed agent CLI
         // declared it needs (read fresh per spawn from the registry markers), so an installed CLI
         // reaches its own service hosts (e.g. claude-code → platform.claude.com) with no hand-editing.

@@ -72,6 +72,15 @@ public sealed class AgentRefMediationTests
         Assert.Equal(published, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
         // …and the refusal reached the warning sink rather than passing silently.
         Assert.Contains(env.Warnings, w => w.Contains("MG-3", StringComparison.Ordinal) && w.Contains("refused"));
+        // …and left a durable G-17 record. A log line is not enough for an event that means an agent
+        // tried to rewrite history the mirror had already published; the whole finding was a control
+        // that looked applied and was not.
+        var audited = Assert.Single(
+            env.Audit.Read(), e => e.Type == WorktreeManager.AgentRefRefusedEvent);
+        Assert.Equal("a1", audited.Fields["agent"]);
+        Assert.Equal(nameof(AgentRefPublishOutcome.RefusedNonFastForward), audited.Fields["outcome"]);
+        Assert.Equal(published, audited.Fields["old"]);
+        Assert.Equal(rewritten, audited.Fields["new"]);
     }
 
     /// <summary>
@@ -299,7 +308,7 @@ public sealed class AgentRefMediationTests
         public MediationEnv()
         {
             _provisioner = new RepoProvisioner(_vmRoot);
-            Worktrees = new WorktreeManager(_vmRoot, warningSink: Warnings.Add);
+            Worktrees = new WorktreeManager(_vmRoot, warningSink: Warnings.Add, audit: Audit);
             AgentRepos = new AgentRepoManager(_vmRoot);
         }
 
@@ -308,6 +317,8 @@ public sealed class AgentRefMediationTests
         public AgentRepoManager AgentRepos { get; }
 
         public List<string> Warnings { get; } = new();
+
+        public Mainguard.Git.Audit.InMemoryAuditLog Audit { get; } = new();
 
         public string Provision() => _provisioner.Provision(_fixture.WorkRepoPath).RepoHash;
 

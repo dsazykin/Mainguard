@@ -16,23 +16,30 @@ namespace Mainguard.Agents.Agents;
 /// every git call through here so there is exactly one checked path.
 ///
 /// <para>
-/// <b>MG-1 hardening.</b> Every git here runs <i>outside</i> the jail but against the
-/// agent-writable bare mirror (and its worktrees), which the jail can also edit directly
-/// (its <c>config</c>/<c>hooks</c> are the attack surface). So every invocation is spawned
-/// with <see cref="HardeningArgs"/> + <see cref="HardeningEnv"/>: hooks and fsmonitor are
-/// pinned off via command-line <c>-c</c> (highest precedence — it overrides any value the
-/// agent planted in <c>&lt;bare&gt;/config</c>), the <c>ext::</c> arbitrary-command transport
-/// is disabled, and system/global config are dropped. This closes the hook-execution and
-/// fsmonitor vectors even though the mount is read-write. (A repo-local <c>filter.*</c> still
-/// cannot be neutralized by env/-c alone; fully closing that requires a read-only mount with
-/// daemon-mediated ref updates — see MG-3/MG-17.)
+/// <b>MG-1 hardening.</b> Every git here runs <i>outside</i> the jail, against directories the
+/// jail can also see. So every invocation is spawned with <see cref="HardeningArgs"/> +
+/// <see cref="HardeningEnv"/>: hooks and fsmonitor are pinned off via command-line <c>-c</c>
+/// (highest precedence — it overrides any value planted in a repo-local <c>config</c>), the
+/// <c>ext::</c> arbitrary-command transport is disabled, and system/global config are dropped.
+/// </para>
+///
+/// <para>
+/// <b>MG-3 narrowed what this has to defend.</b> The shared mirror is now mounted READ-ONLY into
+/// every jail, so its <c>config</c> and <c>hooks</c> are no longer an attack surface at all — the
+/// agent cannot write them. What an agent CAN still write is its own repository
+/// (<c>&lt;vmRoot&gt;/agents/&lt;hash&gt;/&lt;agentId&gt;.git</c>) and its worktree, and the daemon
+/// runs git against both (worktree add/remove/prune, the mediated fetch, status). The hardening
+/// therefore stays exactly as load-bearing as it was, on a smaller surface. The residual
+/// repo-local <c>filter.*</c> vector — which env/<c>-c</c> alone cannot neutralize — is likewise
+/// confined to the per-agent repo, whose contents that agent already controls.
 /// </para>
 /// </summary>
 internal static class AgentGitCommand
 {
     /// <summary>
     /// Command-line <c>-c</c> overrides prepended to every daemon-side git. Command-line config has
-    /// the highest precedence, so these win over anything the jail wrote into <c>&lt;bare&gt;/config</c>:
+    /// the highest precedence, so these win over anything the jail wrote into a repo-local
+    /// <c>config</c> (post-MG-3 that is its own repository's, never the read-only mirror's):
     /// <list type="bullet">
     /// <item><c>core.hooksPath=/dev/null</c> — no hook (reference-transaction, post-checkout,
     ///   fsmonitor, pre-receive, …) is ever discovered or run.</item>
