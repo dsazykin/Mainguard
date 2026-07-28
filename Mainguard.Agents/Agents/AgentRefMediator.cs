@@ -304,7 +304,20 @@ public sealed class AgentRefWatcher : IDisposable
             string snapshot;
             try
             {
-                snapshot = Snapshot(_agentRepos.PathFor(key.RepoHash, key.AgentId), key.AgentId);
+                var agentRepoPath = _agentRepos.PathFor(key.RepoHash, key.AgentId);
+                if (!Directory.Exists(agentRepoPath))
+                {
+                    // The agent's repository is gone — a teardown, or the swarm reconciler disposing an
+                    // orphan directly (SwarmReconciler calls RemoveAgentWorktree without going through
+                    // the launcher, so nothing else unwatches it). Self-evict rather than retry forever:
+                    // a vanished repo publishes NothingToPublish, which is not Current, so the snapshot
+                    // would never be recorded and this entry would spawn a git process every tick for
+                    // the life of the daemon.
+                    _watched.TryRemove(key, out _);
+                    continue;
+                }
+
+                snapshot = Snapshot(agentRepoPath, key.AgentId);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {

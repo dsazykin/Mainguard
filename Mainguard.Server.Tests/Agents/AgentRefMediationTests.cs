@@ -258,6 +258,32 @@ public sealed class AgentRefMediationTests
     }
 
     /// <summary>
+    /// A watch whose agent repository has gone self-evicts. `SwarmReconciler` disposes an orphan by
+    /// calling `RemoveAgentWorktree` directly — it never goes through the launcher, so nothing else
+    /// unwatches it. A vanished repo publishes `NothingToPublish`, which is not `Current`, so the
+    /// snapshot would never be recorded and the entry would spawn a git process every tick for the life
+    /// of the daemon.
+    /// </summary>
+    [Fact]
+    public void Watcher_DropsAnAgentWhoseRepositoryIsGone_RatherThanRetryingForever()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var watcher = new AgentRefWatcher(env.Worktrees.RefMediator, env.AgentRepos);
+        watcher.Watch(hash, "a1");
+        watcher.PollOnce();
+        Assert.Contains((hash, "a1"), watcher.Watched);
+
+        // Teardown by a path that does not unwatch (the reconciler's).
+        env.Worktrees.RemoveAgentWorktree(hash, "a1", force: true);
+
+        Assert.Empty(watcher.PollOnce());
+        Assert.DoesNotContain((hash, "a1"), watcher.Watched);
+        watcher.Dispose();
+    }
+
+    /// <summary>
     /// A refusal must stay PENDING. If the watcher recorded the snapshot regardless of the outcome, one
     /// refused tick would make it stop trying — and "it silently gave up" is indistinguishable from
     /// "nothing has changed" in every log the operator can see.
