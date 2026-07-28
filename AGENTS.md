@@ -31,7 +31,7 @@ If you change how the app actually works, update **README.md**; if you change th
 
 ## Tech Stack
 
-- **.NET 10** (SDK pinned to `10.0.100` via `global.json`, `latestFeature` roll-forward). C# with `Nullable` enabled everywhere.
+- **.NET 10** (SDK pinned to `10.0.301` via `global.json`, `latestPatch` roll-forward — later patches of the same `10.0.3xx` feature band are accepted, a different feature band is not). C# with `Nullable` enabled everywhere.
 - **UI:** Avalonia 11.1.3, Fluent theme, `AvaloniaEdit` (text/diff), `LiveChartsCore` (analytics), compiled bindings on by default.
 - **MVVM:** `CommunityToolkit.Mvvm` — use `[ObservableProperty]` and `[RelayCommand]`, not hand-written `INotifyPropertyChanged`.
 - **Git engine:** `LibGit2Sharp` 0.30.0 (native libgit2 handles — see the handle rule below).
