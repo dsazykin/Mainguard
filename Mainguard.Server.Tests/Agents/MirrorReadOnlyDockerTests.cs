@@ -73,8 +73,18 @@ public class MirrorReadOnlyDockerTests
     private const string PlantedRef = "refs/heads/mg3-attacker-planted";
     private const string ConfigFrame = "MG3CONFIG[";
     private const string OwnRepoFrame = "MG3OWNREPO[";
-    private const string CommitFrame = "MG3COMMIT[";
     private const string ReadFrame = "MG3READ[";
+
+    // The "can the agent still work?" control, split per STEP. It used to be one chained
+    // `write && add && commit && push` behind a single COMMITTED/BROKEN frame, and when CI reported
+    // BROKEN that told us precisely nothing about which of the four failed or why — a diagnostic that
+    // costs a full CI round to learn one bit. Each step now answers for itself, and MG3DIAG carries the
+    // git stderr so the next failure explains itself on the first run.
+    private const string WriteStepFrame = "MG3STEPWRITE[";
+    private const string AddStepFrame = "MG3STEPADD[";
+    private const string CommitFrame = "MG3COMMIT[";
+    private const string PushStepFrame = "MG3STEPPUSH[";
+    private const string DiagFrame = "MG3DIAG[";
 
     private const string Wrote = "WROTE";
     private const string Refused = "REFUSED";
@@ -88,10 +98,15 @@ public class MirrorReadOnlyDockerTests
         "bare=\"$1\"; own=\"$2\"; "
         // Every git below runs against a repository the jail's uid does not OWN — in production because
         // of the userns remap, on a CI runner because the runner's uid is not 1000. Git refuses such a
-        // repository outright with "detected dubious ownership", which would make every frame report a
-        // refusal that has nothing to do with the mount. GIT_CONFIG_* is used rather than a per-command
-        // `-c` so it also covers the git the CLI would run.
-        + "export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0='*'; "
+        // repository outright with "detected dubious ownership", which would make a frame report a
+        // failure that has nothing to do with the mount.
+        //
+        // It has to be GIT_CONFIG_GLOBAL and not GIT_CONFIG_COUNT/KEY/VALUE. The env-var form covers the
+        // git we invoke but NOT the `git-receive-pack` child that `git push` spawns, so the push step
+        // still died with dubious ownership while every other step passed — measured under the CI shape
+        // (a container running as uid 4242, owning nothing). A config FILE named by GIT_CONFIG_GLOBAL is
+        // protected configuration, which `safe.directory` requires, and is inherited by children.
+        + "printf '[safe]\\n\\tdirectory = *\\n' > /tmp/mg3gitconfig; export GIT_CONFIG_GLOBAL=/tmp/mg3gitconfig; "
         // ---- READS FIRST, before anything below can damage what they read ----
         //
         // Ordering is load-bearing and was got wrong once. The destructive probes overwrite
@@ -130,12 +145,21 @@ public class MirrorReadOnlyDockerTests
         // ---- positive controls: the agent must still be able to work ----
         + "printf '" + OwnRepoFrame + "'; "
         + "if ( printf 'x' > \"$own/mainguard-write-probe\" ) 2>/dev/null; then printf '" + Wrote + "'; else printf '" + Refused + "'; fi; printf ']'; "
+        + "err=/tmp/mg3-probe-stderr; : > \"$err\"; cd /workspace; "
+        + "printf '" + WriteStepFrame + "'; "
+        + "if ( printf 'agent work\\n' > mg3-agent.txt ) 2>>\"$err\"; then printf 'OK'; else printf 'FAIL'; fi; printf ']'; "
+        + "printf '" + AddStepFrame + "'; "
+        + "if git -c user.name=agent -c user.email=agent@mainguard.local add mg3-agent.txt >/dev/null 2>>\"$err\"; "
+        + "  then printf 'OK'; else printf 'FAIL'; fi; printf ']'; "
         + "printf '" + CommitFrame + "'; "
-        + "cd /workspace && printf 'agent work\\n' > mg3-agent.txt 2>/dev/null "
-        + "  && git -c user.name=agent -c user.email=agent@mainguard.local add mg3-agent.txt >/dev/null 2>&1 "
-        + "  && git -c user.name=agent -c user.email=agent@mainguard.local commit -m 'mg3 agent commit' >/dev/null 2>&1 "
-        + "  && git push origin HEAD >/dev/null 2>&1; "
-        + "if [ $? -eq 0 ]; then printf 'COMMITTED'; else printf 'BROKEN'; fi; printf ']'";
+        + "if git -c user.name=agent -c user.email=agent@mainguard.local commit -m 'mg3 agent commit' >/dev/null 2>>\"$err\"; "
+        + "  then printf 'COMMITTED'; else printf 'BROKEN'; fi; printf ']'; "
+        + "printf '" + PushStepFrame + "'; "
+        + "if git push origin HEAD >/dev/null 2>>\"$err\"; then printf 'OK'; else printf 'FAIL'; fi; printf ']'; "
+        // The stderr of every step above, so a failure explains itself on the FIRST CI run instead of
+        // costing a round to learn one bit. `]` and newlines are stripped so the diagnostic can never
+        // close its own frame early or forge another.
+        + "printf '" + DiagFrame + "'; head -c 400 \"$err\" | tr -d ']\\n' | tr -s ' '; printf ']'";
 
     [RequiresDockerFact]
     public async Task TheMirrorIsUnwritableFromInsideTheJail_WhileTheAgentCanStillCommitAndPublish()
@@ -209,7 +233,15 @@ public class MirrorReadOnlyDockerTests
             // Without these "everything was refused" would also be what a broken shell reports.
             Assert.Equal("READ", ReadFrameValue(output, ReadFrame));
             Assert.Equal(Wrote, ReadFrameValue(output, OwnRepoFrame));
-            Assert.Equal("COMMITTED", ReadFrameValue(output, CommitFrame));
+            // Per step, with the git stderr attached to every message — a bare "BROKEN" names neither
+            // the failing step nor the reason, and that is a CI round wasted for one bit of information.
+            var diag = ReadFrameValue(output, DiagFrame);
+            Assert.True("OK" == ReadFrameValue(output, WriteStepFrame), $"write to /workspace failed: {diag}");
+            Assert.True("OK" == ReadFrameValue(output, AddStepFrame), $"git add failed: {diag}");
+            Assert.True("COMMITTED" == ReadFrameValue(output, CommitFrame), $"git commit failed: {diag}");
+            // `git push origin` must keep working — LLM CLIs push reflexively, and the whole publish
+            // design turns on that push landing in the agent's OWN repository.
+            Assert.True("OK" == ReadFrameValue(output, PushStepFrame), $"git push origin failed: {diag}");
 
             // ---- and the host-side truth: nothing the jail attempted landed ----
             Assert.Equal(mainShaBefore, HostGit(barePath, "rev-parse", mainBranch).Trim());
