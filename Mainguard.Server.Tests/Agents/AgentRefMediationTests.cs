@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using Mainguard.Agents.Agents;
 using Mainguard.Server.Tests.Fixtures;
 using Xunit;
@@ -18,6 +20,14 @@ namespace Mainguard.Server.Tests.Agents;
 /// </summary>
 public sealed class AgentRefMediationTests
 {
+    /// <summary>
+    /// How long <see cref="Watcher_TheBackgroundLoopReallySweeps_WithNobodyDrivingIt"/> waits for the
+    /// loop's publish before declaring that it never ran. Deliberately far larger than the sweep it is
+    /// waiting on: this is a failure deadline, not a sleep, so nothing is spent when the loop works and
+    /// contention only makes a passing run slower, never red. If it ever fires, the loop is dead.
+    /// </summary>
+    private static readonly TimeSpan LoopDeadline = TimeSpan.FromSeconds(60);
+
     [Fact]
     public void Publish_FastForward_MovesTheMirrorsRef_AndIsIdempotent()
     {
@@ -225,8 +235,16 @@ public sealed class AgentRefMediationTests
     /// <summary>
     /// A watched agent's commit reaches the mirror on the next sweep, with no verification asked for and
     /// nobody calling publish — which is the whole point of the watcher half: an agent's own
-    /// <c>git push</c> stays meaningful. Driven through <c>PollOnce</c> rather than by sleeping on the
-    /// background loop, because a test that waits "long enough" keeps passing after the loop stops.
+    /// <c>git push</c> stays meaningful.
+    ///
+    /// <para>Driven through <c>PollOnce</c> rather than by sleeping on the background loop, because a
+    /// test that waits "long enough" keeps passing after the loop stops. That premise only became TRUE
+    /// with <see cref="AgentRefWatcher.DriveManually"/>: <c>Watch</c> starts the 1 Hz loop, so this test
+    /// used to hand-crank a sweep while the watcher swept underneath it, and whichever got there first
+    /// consumed the snapshot delta. On an idle box the manual sweep almost always won; under contention
+    /// the loop won often enough to redden a run at random, which is worse than a test that never
+    /// existed. The loop itself is not left unproven — see
+    /// <see cref="Watcher_TheBackgroundLoopReallySweeps_WithNobodyDrivingIt"/>.</para>
     /// </summary>
     [Fact]
     public void Watcher_PublishesWhenTheAgentsRefMoves_AndDoesNothingWhileItIsStill()
@@ -235,12 +253,14 @@ public sealed class AgentRefMediationTests
         var hash = env.Provision();
         var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
         var bare = env.BarePath(hash);
-        var watcher = new AgentRefWatcher(env.Worktrees.RefMediator, env.AgentRepos);
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
         watcher.Watch(hash, "a1");
 
         // The first sweep publishes the ref as it stands (the snapshot starts empty, so an agent that
-        // committed before the watch began is never missed).
-        Assert.All(watcher.PollOnce(), r => Assert.True(r.Current));
+        // committed before the watch began is never missed). Asserted as EXACTLY one outcome: `Assert.All`
+        // over the empty list is how "the sweep produced nothing at all" used to read as a pass.
+        Assert.True(Assert.Single(watcher.PollOnce()).Current);
         // A still agent costs nothing: no outcome at all, because the snapshot did not change.
         Assert.Empty(watcher.PollOnce());
 
@@ -254,7 +274,44 @@ public sealed class AgentRefMediationTests
         watcher.Unwatch(hash, "a1");
         env.CommitInWorktree(worktree, "two.txt", "two\n");
         Assert.Empty(watcher.PollOnce()); // unwatched: the sweep no longer considers it
-        watcher.Dispose();
+    }
+
+    /// <summary>
+    /// The background loop really sweeps — the half <see cref="AgentRefWatcher.DriveManually"/> takes out
+    /// of every other watcher test. Nothing here calls <c>PollOnce</c>, publishes, or asks for a
+    /// verification: a commit is made, <c>Watch</c> is called, and the mirror is expected to catch up on
+    /// its own. If <c>Watch</c> stopped starting the loop, or the loop stopped sweeping, this is the test
+    /// that goes red.
+    ///
+    /// <para>The window closes on the EVENT (the mediator's publish observation), not on a clock: the
+    /// deadline is only the point at which "the loop never ran" is declared, so a machine under load
+    /// takes longer to get there and still passes.</para>
+    /// </summary>
+    [Fact]
+    public void Watcher_TheBackgroundLoopReallySweeps_WithNobodyDrivingIt()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var bare = env.BarePath(hash);
+
+        // Commit before anything is watching, and publish nothing by hand. The mirror is demonstrably
+        // NOT already where the assertion wants it, so the assertion cannot pass without the loop.
+        var tip = env.CommitInWorktree(worktree, "one.txt", "one\n");
+        Assert.NotEqual(tip, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+
+        var observed = new BlockingCollection<AgentRefPublishResult>();
+        var mediator = new AgentRefMediator(env.AgentRepos, env.BarePath, observed.Add);
+        using var watcher = new AgentRefWatcher(mediator, env.AgentRepos, TimeSpan.FromMilliseconds(50));
+
+        watcher.Watch(hash, "a1");
+
+        Assert.True(
+            observed.TryTake(out var result, (int)LoopDeadline.TotalMilliseconds),
+            "the background sweep loop never published — Watch() did not start it, or it stopped sweeping");
+        Assert.Equal(AgentRefPublishOutcome.Published, result.Outcome);
+        Assert.Equal(tip, result.NewSha);
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
     }
 
     /// <summary>
@@ -270,9 +327,10 @@ public sealed class AgentRefMediationTests
         using var env = new MediationEnv();
         var hash = env.Provision();
         env.Worktrees.CreateAgentWorktree(hash, "a1");
-        var watcher = new AgentRefWatcher(env.Worktrees.RefMediator, env.AgentRepos);
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
         watcher.Watch(hash, "a1");
-        watcher.PollOnce();
+        Assert.True(Assert.Single(watcher.PollOnce()).Current);
         Assert.Contains((hash, "a1"), watcher.Watched);
 
         // Teardown by a path that does not unwatch (the reconciler's).
@@ -280,7 +338,6 @@ public sealed class AgentRefMediationTests
 
         Assert.Empty(watcher.PollOnce());
         Assert.DoesNotContain((hash, "a1"), watcher.Watched);
-        watcher.Dispose();
     }
 
     /// <summary>
@@ -294,9 +351,10 @@ public sealed class AgentRefMediationTests
         using var env = new MediationEnv();
         var hash = env.Provision();
         var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
-        var watcher = new AgentRefWatcher(env.Worktrees.RefMediator, env.AgentRepos);
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
         watcher.Watch(hash, "a1");
-        watcher.PollOnce();
+        Assert.True(Assert.Single(watcher.PollOnce()).Current);
 
         var published = env.CommitInWorktree(worktree, "one.txt", "one\n");
         Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
@@ -314,7 +372,52 @@ public sealed class AgentRefMediationTests
         Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
         Assert.Equal(recovered,
             AgentTestGit.RunChecked(env.BarePath(hash), "rev-parse", "refs/heads/agent/a1").Trim());
-        watcher.Dispose();
+    }
+
+    /// <summary>
+    /// Design §7's trigger is "both", so two publishes of the SAME agent overlapping is the normal shape,
+    /// not an edge case: the watcher sweeps on its own clock while the merge queue and the review cockpit
+    /// publish immediately before reading the mirror. They share one quarantine ref and each deletes it in
+    /// a <c>finally</c>, so before serialization the loser reported <c>NothingToPublish</c> ("the fetched
+    /// ref resolved to nothing") or <c>Failed</c> ("the compare-and-swap … lost") for a mirror that was
+    /// carrying exactly the tip it asked for — and <c>Current</c>, which is what
+    /// <c>PublishAgentBranch</c> returns, was false for a publish that had in fact succeeded.
+    /// </summary>
+    [Fact]
+    public void Publish_ConcurrentlyForTheSameAgent_NeverReportsFailureForAMirrorThatIsCurrent()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var tip = env.CommitInWorktree(worktree, "one.txt", "one\n");
+
+        const int Racers = 8;
+        var start = new Barrier(Racers);
+        var results = new AgentRefPublishResult[Racers];
+        var threads = new Thread[Racers];
+        for (var i = 0; i < Racers; i++)
+        {
+            var slot = i;
+            threads[slot] = new Thread(() =>
+            {
+                start.SignalAndWait();
+                results[slot] = env.Worktrees.Publish(hash, "a1");
+            });
+            threads[slot].Start();
+        }
+
+        foreach (var thread in threads)
+        {
+            Assert.True(thread.Join(TimeSpan.FromMinutes(2)), "a concurrent publish never finished");
+        }
+
+        // Exactly one of them moved the ref; every other one must say the mirror is already current, and
+        // none may report a refusal (no rule was broken) or a failure (nothing failed).
+        Assert.Equal(1, results.Count(r => r.Outcome == AgentRefPublishOutcome.Published));
+        Assert.All(results, r => Assert.True(
+            r.Current, $"a concurrent publish reported {r.Outcome} ({r.Reason}) for a current mirror"));
+        Assert.Equal(tip, AgentTestGit.RunChecked(env.BarePath(hash), "rev-parse", "refs/heads/agent/a1").Trim());
+        Assert.Empty(RefsUnder(env.BarePath(hash), AgentRefMediator.QuarantineRefPrefix));
     }
 
     private static IReadOnlyList<string> RefsUnder(string gitDir, string prefix)
