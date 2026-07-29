@@ -88,11 +88,28 @@ public sealed class AgentSpawnService
     /// <see cref="AgentSpawnRefusedException"/> on a policy refusal (kill switch), and lets the
     /// launcher's typed provisioning failures propagate (the callers map them). Returns the agent id.
     /// </summary>
+    /// <param name="agentId">An explicit session id, or null to mint one. Only the external-PR intake
+    /// names its own (<c>pr-&lt;n&gt;</c>) — see <see cref="AgentSessionStore.Spawn"/>.</param>
+    /// <param name="queueOrigin">How the merge-queue entry this spawn creates is badged. The default is
+    /// <see cref="Mainguard.Agents.Agents.MergeEntryOrigin.Local"/>; an intake-driven spawn must stamp
+    /// <c>External</c>, because the origin is what routes the merge back through the host's pull-request
+    /// API instead of fast-forwarding the mirrored branch behind the pull request's back — and
+    /// <c>EnsureEntry</c> overwrites the origin on every call, so a Local stamp here would silently undo
+    /// the intake's.</param>
+    /// <param name="withoutHostCredentials">
+    /// TRUST BOUNDARY. Set for a jail running code from outside the user's own machine (an external pull
+    /// request head). A normal spawn falls back to the per-(repo, kind) memory cache for extra env and CLI
+    /// login files so a coordinator-spawned worker inherits the login the user just performed; an
+    /// untrusted head must inherit <b>nothing</b>, and must not seed that cache either.
+    /// </param>
     public async Task<string> SpawnAsync(
         string repoHandle, string agentKind, string? modelApiKey, string role, CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv = null,
         IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null,
-        string? parentAgentId = null)
+        string? parentAgentId = null,
+        string? agentId = null,
+        Mainguard.Agents.Agents.MergeEntryOrigin queueOrigin = Mainguard.Agents.Agents.MergeEntryOrigin.Local,
+        bool withoutHostCredentials = false)
     {
         // Custom env entries travel to the same 0400 tmpfs env-file as the model key; a malformed
         // name would corrupt it for every entry, so reject the whole spawn up front (typed →
@@ -127,14 +144,17 @@ public sealed class AgentSpawnService
         // SAME REPO reuse the key the client last supplied (the daemon has no keystore of its own —
         // P2-01 is host-side). MG-6: scoping by repo keeps one repo's credentials out of another's
         // spawns; a miss simply yields no key rather than substituting a stranger's.
-        _keys.Remember(repoHandle, agentKind, modelApiKey);
-        _keys.RememberExtraEnv(repoHandle, extraEnv);
-        _keys.RememberCliCredentials(repoHandle, agentKind, cliCredentials);
+        if (!withoutHostCredentials)
+        {
+            _keys.Remember(repoHandle, agentKind, modelApiKey);
+            _keys.RememberExtraEnv(repoHandle, extraEnv);
+            _keys.RememberCliCredentials(repoHandle, agentKind, cliCredentials);
+        }
 
         // Record the session first (its id names the worktree + container), then run the real
         // P2-06/P2-07 spawn chain. A provisioned repo takes the real-jail path; an unprovisioned
         // handle degrades to a session-only record (no fabricated jail).
-        var session = _store.Spawn(agentKind, role, parentAgentId);
+        var session = _store.Spawn(agentKind, role, parentAgentId, agentId);
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
         // renders as (agentId) in the file format, so one grep follows the whole chain.
@@ -168,10 +188,18 @@ public sealed class AgentSpawnService
                 }
             }
 
+            // The per-(repo, kind) memory cache is the fallback for a spawn with no client in the loop —
+            // EXCEPT for an untrusted head, which inherits neither the user's llm_env_* entries nor any
+            // harvested CLI login. Handing those to code that arrived in a pull request would put the
+            // user's provider credentials inside a jail whose contents an outside author chose.
+            var launchEnv = withoutHostCredentials ? null : extraEnv ?? _keys.TryGetExtraEnv(repoHandle);
+            var launchCredentials = withoutHostCredentials
+                ? null
+                : cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind);
             var launch = await _launcher.TryLaunchAsync(
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
-                extraEnv: extraEnv ?? _keys.TryGetExtraEnv(repoHandle),
-                cliCredentials: cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind)).ConfigureAwait(false);
+                extraEnv: launchEnv,
+                cliCredentials: launchCredentials).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -181,8 +209,7 @@ public sealed class AgentSpawnService
                 // a merge-queue member from this moment. Registering here (as well as on CreateWorktree)
                 // covers the real spawn chain, which provisions the worktree inside the launcher rather
                 // than through the RepoSync RPC — a coordinator-spawned worker takes only this path.
-                _mergeQueues.EnsureEntry(
-                    repoHandle, session.Id, Mainguard.Agents.Agents.MergeEntryOrigin.Local);
+                _mergeQueues.EnsureEntry(repoHandle, session.Id, queueOrigin);
                 if (launch.LaunchCommand is { Count: > 0 })
                 {
                     // The core P2-47→P2-03/09 wiring: the CLI starts inside the jail on a real TTY

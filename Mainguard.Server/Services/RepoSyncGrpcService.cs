@@ -22,11 +22,16 @@ public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
 
     private readonly IAgentEnvironment _environment;
     private readonly MergeQueueProvisioner _mergeQueues;
+    private readonly Runtime.ActiveRepoIndex _activeRepos;
 
-    public RepoSyncGrpcService(IAgentEnvironment environment, MergeQueueProvisioner mergeQueues)
+    public RepoSyncGrpcService(
+        IAgentEnvironment environment,
+        MergeQueueProvisioner mergeQueues,
+        Runtime.ActiveRepoIndex activeRepos)
     {
         _environment = environment;
         _mergeQueues = mergeQueues ?? throw new ArgumentNullException(nameof(mergeQueues));
+        _activeRepos = activeRepos ?? throw new ArgumentNullException(nameof(activeRepos));
     }
 
     public override Task<ProvisionRepoResponse> ProvisionRepo(ProvisionRepoRequest request, ServerCallContext context)
@@ -47,6 +52,12 @@ public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
             // and this reconciles the existing queue's authoritative main@sha with the mirror's, firing the
             // ordinary stale cascade rather than leaving branches "Verified" against a main that moved.
             _mergeQueues.EnsureQueue(result.RepoHash);
+
+            // …and it is the only moment the daemon ever learns which repository a handle stands for: the
+            // hash is one-way. Recorded in the daemon-openable form (the same translation Provision just
+            // used) so the external-PR intake can read this repo's origin remote to decide whether a
+            // subscribed source belongs to it.
+            _activeRepos.Record(result.RepoHash, HostPathTranslator.ToDaemonOpenablePath(request.OriginUrl));
 
             return new ProvisionRepoResponse
             {
