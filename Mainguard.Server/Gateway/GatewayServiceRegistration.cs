@@ -220,18 +220,43 @@ public static class GatewayServiceRegistration
     }
 
     /// <summary>
-    /// P2-47 — the P2-12 external-PR intake chain (PR transport → intake store → worktree manager → PR-head
-    /// fetcher → target resolver), wired so <see cref="IExternalPrIntake"/> resolves and
+    /// P2-47 — the P2-12 external-PR intake chain (PR transport → intake store → <b>worker host</b> →
+    /// PR-head fetcher → target resolver), wired so <see cref="IExternalPrIntake"/> resolves and
     /// <see cref="Runtime.PrIntakeHostedService"/> runs its poll loop. Subscriptions persisted in the store
-    /// are seeded into the running engine at construction. The per-source target resolver returns null until
-    /// a repo's swarm maps its (host/owner/repo) → (repoPath, repoHash, MergeQueue) — the same "empty until a
-    /// repo is active" posture the merge-reconcile and MergeQueueRegistry already take; a null target makes a
-    /// poll list-and-skip (no upstream writes, invariant 1) rather than crash.
+    /// are seeded into the running engine at construction.
+    ///
+    /// <para>Two things were missing here and both are supplied below. (1) The intake had no way to give an
+    /// entry a jail, so an intake'd pull request could never be verified — <see cref="ExternalPrWorkerHost"/>
+    /// is that seam, and it runs the ordinary gated spawn chain under the id <c>pr-&lt;n&gt;</c>. (2) The
+    /// per-source target resolver was the literal <c>_ =&gt; null</c>, which makes every poll list-and-skip,
+    /// so the intake materialized nothing in production regardless — <see cref="PrIntakeTargetResolver"/>
+    /// replaces it, matching a subscribed source against the origin remotes of the repos this daemon has
+    /// actually provisioned. A source that matches nothing still resolves to null and is skipped (no
+    /// upstream writes, invariant 1), which is the "empty until a repo is active" posture the
+    /// merge-reconcile and MergeQueueRegistry already take.</para>
     /// </summary>
     private static void RegisterPrIntake(IServiceCollection services, Func<AppDbContext>? dbFactory)
     {
         services.AddSingleton<IPrIntakeStore>(_ =>
             dbFactory is null ? new InMemoryPrIntakeStore() : new DbPrIntakeStore(dbFactory));
+
+        // The intake's spawn seam. `resolveRunningJail` is the SAME label-based lookup the merge queue
+        // decides jail liveness with (above) — one rule for "is this agent jailed", not two.
+        services.AddSingleton<IPrWorkerHost>(sp => new ExternalPrWorkerHost(
+            spawns: sp.GetRequiredService<AgentSpawnService>(),
+            sessions: sp.GetRequiredService<AgentSessionStore>(),
+            launcher: sp.GetRequiredService<SandboxAgentLauncher>(),
+            admission: sp.GetRequiredService<AdmissionController>(),
+            limits: sp.GetRequiredService<CoordinatorLimits>(),
+            resolveRunningJail: ResolveRunningJail,
+            audit: sp.GetRequiredService<IAuditLog>(),
+            loggerFactory: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()));
+
+        // (host/owner/repo) → (repoPath, repoHash, queue), matched on each active repo's own origin remote.
+        services.AddSingleton(sp => new PrIntakeTargetResolver(
+            repos: sp.GetRequiredService<ActiveRepoIndex>(),
+            queues: sp.GetRequiredService<MergeQueueProvisioner>(),
+            remotes: path => new Mainguard.Git.Services.GitService().GetRemotes(path)));
 
         // The ONE audited T-23 read transport (list surface only — invariant 2). A fresh GitService is the
         // engine seam; host/token/slug resolve per-repo from the source's RepoPath inside the transport.
@@ -249,14 +274,17 @@ public static class GatewayServiceRegistration
         services.AddSingleton<IExternalPrIntake>(sp =>
         {
             var store = sp.GetRequiredService<IPrIntakeStore>();
+            var resolver = sp.GetRequiredService<PrIntakeTargetResolver>();
             var intake = new ExternalPrIntake(
                 prService: sp.GetRequiredService<IPullRequestService>(),
                 store: store,
-                worktrees: sp.GetRequiredService<IAgentEnvironment>().Worktrees,
+                // The jail. Every materialization now begins by asking for one, and materializes nothing
+                // when it is refused — see ExternalPrWorkerHost for how the MG-2 gates apply.
+                workers: sp.GetRequiredService<IPrWorkerHost>(),
                 fetcher: sp.GetRequiredService<IPrHeadFetcher>(),
-                // No active-repo index at boot: a source resolves to a target only once its swarm is up
-                // (deferred to the swarm-lifecycle wiring — see the class doc). Null → list-and-skip.
-                resolveTarget: _ => (PrIntakeTarget?)null,
+                // Resolved against the repos this daemon has provisioned, by their origin remotes. Still
+                // null (list-and-skip) for a source whose repo is not open — that part was always right.
+                resolveTarget: resolver.Resolve,
                 audit: sp.GetRequiredService<IAuditLog>());
 
             // Seed any persisted subscriptions into the running engine (idempotent on the store).

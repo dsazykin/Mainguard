@@ -27,9 +27,17 @@ public sealed record ExternalPrSource(string Host, string Owner, string Repo, st
 /// <summary>
 /// External agent PR intake (P2-12, daemon). Polls subscribed sources for open bot-authored PRs through
 /// the ONE audited T-23 transport (<see cref="IPullRequestService"/>), materializes each new/updated PR
-/// head as an <c>agent/pr-&lt;n&gt;</c> merge-queue entry (fetch → worktree → <c>Working</c>), and lets the
-/// P2-10 queue verify it exactly as a local agent. Merge is routed back through the host PR merge API by
-/// <see cref="MergeDispatch"/>, never a local foreground merge.
+/// head as an <c>agent/pr-&lt;n&gt;</c> merge-queue entry (<b>jail</b> → fetch → <c>Working</c>), and lets
+/// the P2-10 queue verify it exactly as a local agent. Merge is routed back through the host PR merge API
+/// by <see cref="MergeDispatch"/>, never a local foreground merge.
+///
+/// <para><b>The jail comes first, and nothing is materialized without one.</b> This used to create a
+/// worktree and an entry and spawn nothing, so an external entry could never leave <c>Working</c>:
+/// verification runs in the worker's own jail and host execution is a rejection trigger. Materialization
+/// now begins by asking <see cref="IPrWorkerHost"/> for a real <c>pr-&lt;n&gt;</c> worker; a gate refusal
+/// or a provisioning failure materializes <b>nothing at all</b> — no worktree, no entry, no seen-head —
+/// so the pull request is simply picked up again on a later poll. That ordering is what keeps an
+/// unbounded external queue from becoming an unbounded number of jails on the user's own machine.</para>
 ///
 /// <para>INVARIANTS: the intake writes NOTHING upstream without an explicit user action — it only ever
 /// calls the read (list) surface of the transport (invariant 1); all host traffic stays inside the T-23
@@ -77,9 +85,14 @@ public sealed class ExternalPrIntake : IExternalPrIntake
     public static readonly IReadOnlyList<string> DefaultBotAuthors =
         new[] { "codex[bot]", "google-jules[bot]", "copilot" };
 
+    /// <summary>The agent kind an external-PR verification worker spawns under. Deliberately NOT a CLI
+    /// kind: no installed adapter answers to it, so the jail starts with no agent CLI, no model API key
+    /// and no launch command — it exists only to be the sandbox its own verification runs in.</summary>
+    public const string WorkerAgentKind = "external-pr";
+
     private readonly IPullRequestService _prService;
     private readonly IPrIntakeStore _store;
-    private readonly IAgentWorktreeManager _worktrees;
+    private readonly IPrWorkerHost _workers;
     private readonly IPrHeadFetcher _fetcher;
     private readonly Func<ExternalPrSource, PrIntakeTarget?> _resolveTarget;
     private readonly IAuditLog _audit;
@@ -104,7 +117,7 @@ public sealed class ExternalPrIntake : IExternalPrIntake
     public ExternalPrIntake(
         IPullRequestService prService,
         IPrIntakeStore store,
-        IAgentWorktreeManager worktrees,
+        IPrWorkerHost workers,
         IPrHeadFetcher fetcher,
         Func<ExternalPrSource, PrIntakeTarget?> resolveTarget,
         IAuditLog? audit = null,
@@ -112,7 +125,7 @@ public sealed class ExternalPrIntake : IExternalPrIntake
     {
         _prService = prService ?? throw new ArgumentNullException(nameof(prService));
         _store = store ?? throw new ArgumentNullException(nameof(store));
-        _worktrees = worktrees ?? throw new ArgumentNullException(nameof(worktrees));
+        _workers = workers ?? throw new ArgumentNullException(nameof(workers));
         _fetcher = fetcher ?? throw new ArgumentNullException(nameof(fetcher));
         _resolveTarget = resolveTarget ?? throw new ArgumentNullException(nameof(resolveTarget));
         _audit = audit ?? new InMemoryAuditLog();
@@ -188,6 +201,19 @@ public sealed class ExternalPrIntake : IExternalPrIntake
             RecordBackoff(source);
             return; // poller stays alive; the next allowed poll is delayed.
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Anything else the transport can raise — an expired/absent host token, DNS, a 5xx — used to
+            // escape PollOnceAsync, and RunAsync catches only cancellation, so ONE unauthenticated source
+            // permanently killed the daemon's whole intake loop (silently: nothing else logs it). Now the
+            // source is skipped for this cycle and audited, and every other subscription still polls.
+            _audit.Append(new AuditEvent("external_pr_poll_failed", new Dictionary<string, string>
+            {
+                ["source"] = source.Key,
+                ["reason"] = ex.Message,
+            }));
+            return;
+        }
 
         ClearBackoff(source);
 
@@ -197,7 +223,25 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         foreach (var pr in prs.Where(p => MatchesAuthor(p, source)))
         {
             ct.ThrowIfCancellationRequested();
-            await MaterializeAsync(source, target, pr, ct).ConfigureAwait(false);
+            try
+            {
+                await MaterializeAsync(source, target, pr, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Per PULL REQUEST, not per source: the head fetch is a network operation against the
+                // host, and one unreachable/deleted head must not stop the other open PRs on the same
+                // source from materializing — let alone escape into RunAsync, which catches only
+                // cancellation and would end the daemon's intake loop for good. Nothing is recorded as
+                // seen, so this PR is simply retried next cycle.
+                _audit.Append(new AuditEvent("external_pr_materialize_failed", new Dictionary<string, string>
+                {
+                    ["source"] = source.Key,
+                    ["pr"] = pr.Number.ToString(),
+                    ["agent"] = AgentIdFor(pr.Number),
+                    ["reason"] = ex.Message,
+                }));
+            }
         }
 
         // Clean up any tracked PR that is no longer open upstream (closed/merged mid-queue — edge row 2).
@@ -210,7 +254,10 @@ public sealed class ExternalPrIntake : IExternalPrIntake
 
             var agentId = AgentIdFor(tracked);
             target.Queue.Cancel(agentId);
-            TryRemoveWorktree(target.RepoHash, agentId);
+            // Releases the whole worker, not just the worktree: the jail, its MG-36 network segment (the
+            // bridge pool is ~32 deep — a segment leaked per intake'd PR exhausts it) and its package
+            // cache all go with it. Best-effort by contract; a release never fails a poll.
+            await _workers.ReleaseWorkerAsync(target.RepoHash, agentId, ct).ConfigureAwait(false);
             _store.Untrack(source.Key, tracked);
             _audit.Append(new AuditEvent("external_pr_closed", new Dictionary<string, string>
             {
@@ -226,10 +273,36 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         var agentId = AgentIdFor(pr.Number);
         var seen = _store.GetSeenHead(source.Key, pr.Number);
 
+        // THE JAIL FIRST. This is the whole point: an external entry with no sandbox can never be
+        // verified, because verification runs in the worker's own jail and never on the host. The host
+        // creates the worktree as part of the ordinary spawn chain, so there is no separate
+        // CreateAgentWorktree here any more — a worktree without a jail is precisely the state that made
+        // criterion 4's verify leg impossible to demonstrate.
+        //
+        // Re-asked on EVERY poll, not just the first: it is idempotent for a live worker, and it is what
+        // gives a daemon that restarted (sessions are memory-only, jails are not) a path back to a
+        // verifiable entry instead of a permanently stuck one.
+        var worker = await _workers.EnsureWorkerAsync(target.RepoHash, agentId, pr.Number, ct).ConfigureAwait(false);
+        if (!worker.HasJail)
+        {
+            // Gate refusal or provisioning failure: materialize NOTHING. No seen-head is written, so the
+            // next poll retries from scratch — the PR waits for capacity rather than entering a queue it
+            // could never leave.
+            _audit.Append(new AuditEvent("external_pr_worker_unavailable", new Dictionary<string, string>
+            {
+                ["source"] = source.Key,
+                ["pr"] = pr.Number.ToString(),
+                ["agent"] = agentId,
+                ["outcome"] = worker.Outcome.ToString(),
+                ["reason"] = worker.Reason ?? string.Empty,
+            }));
+            return;
+        }
+
         if (seen is null)
         {
-            // New PR: create the worktree, fetch the head, enter the queue at Working as an External entry.
-            _worktrees.CreateAgentWorktree(target.RepoHash, agentId);
+            // New PR: fetch the head into the jailed worker's own repository, then enter the queue at
+            // Working as an External entry.
             var head = await _fetcher.FetchHeadAsync(source, target.RepoHash, agentId, pr.Number, ct).ConfigureAwait(false);
             target.Queue.EnsureEntry(agentId, MergeEntryOrigin.External);
             _store.SetSeenHead(source.Key, pr.Number, head);
@@ -239,6 +312,7 @@ public sealed class ExternalPrIntake : IExternalPrIntake
                 ["pr"] = pr.Number.ToString(),
                 ["agent"] = agentId,
                 ["head"] = head,
+                ["worker"] = worker.Outcome.ToString(),
             }));
             return;
         }
@@ -315,18 +389,9 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         }
     }
 
-    private void TryRemoveWorktree(string repoHash, string agentId)
-    {
-        try
-        {
-            // Force: the branch is gone upstream, discard any local tree; this also deletes agent/<id>.
-            _worktrees.RemoveAgentWorktree(repoHash, agentId, force: true);
-        }
-        catch
-        {
-            // Best-effort cleanup — a missing/already-pruned worktree must not fail the poll.
-        }
-    }
-
-    private static string AgentIdFor(int prNumber) => $"pr-{prNumber}";
+    /// <summary>The agent id an intake'd pull request takes: <c>pr-&lt;n&gt;</c>. It is the worktree name,
+    /// the <c>agent/pr-&lt;n&gt;</c> branch, the jail's <c>mainguard.agent</c> label, the package-cache
+    /// directory and the merge-queue key — one id all the way down, which is what lets an external entry
+    /// use the identical verify path as a local agent rather than a parallel one.</summary>
+    public static string AgentIdFor(int prNumber) => $"pr-{prNumber}";
 }

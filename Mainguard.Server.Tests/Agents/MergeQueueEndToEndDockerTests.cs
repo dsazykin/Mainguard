@@ -313,14 +313,14 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
     /// mirrored branch locally behind the pull request's back.
     ///
     /// <para>The host is a fake whose "merge" performs a real git merge in a real upstream repository, so
-    /// every assertion is still a ref assertion. The daemon, the queue, the lease and the client adapter
-    /// are all the shipped ones.</para>
+    /// every assertion is still a ref assertion. The daemon, the queue, the lease, the client adapter and
+    /// (since the intake was wired to the spawn chain) the intake itself are all the shipped ones.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task ExternalPullRequestEntry_MergesUpstream_AndTheCheckoutConvergesOnThatMerge()
     {
         await using var loop = await LoopWorld.StartAsync(this, withUpstreamHost: true);
-        var pr = await loop.MaterializeExternalPrAsync(prNumber: 7, withJail: true);
+        var pr = await loop.IntakeExternalPrAsync(prNumber: 7);
 
         // The entry is badged External on the queue stream — the merge routes on it, and a Local routing
         // would fast-forward the mirror branch while leaving the pull request open upstream.
@@ -353,36 +353,164 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// <b>Criterion 4's standing gap, asserted rather than described.</b> The <see cref="ExternalPrIntake"/>
-    /// materializes an upstream pull request into a worktree and a queue entry and <b>spawns nothing</b> —
-    /// so unless something else gives <c>pr-&lt;n&gt;</c> a jail (the test above does it explicitly), the
-    /// entry has nowhere to be verified and can never leave <c>Working</c> under its own steam.
+    /// <b>Criterion 4's standing gap, closed.</b> This replaces
+    /// <c>ExternalPullRequestEntry_WithNoJail_CannotVerify_BecauseTheIntakeSpawnsNone</c>, which asserted
+    /// the defect positively: the intake materialized a worktree and a queue entry and <b>spawned
+    /// nothing</b>, so — verification running in the worker's own jail, host execution being a rejection
+    /// trigger — an intake'd pull request could never leave <c>Working</c> under its own steam. The old
+    /// test's own doc said the day the intake was wired to the spawn chain it must be turned into its
+    /// positive form. This is that form.
     ///
-    /// <para>The refusal itself is correct and must stay: verification runs in the worker's own jail, and
-    /// falling back to the host is a rejection trigger. What is missing is upstream of it. The assertion is
-    /// written positively against the CURRENT behaviour so that the day the intake is wired to the spawn
-    /// chain this test fails and has to be turned into its positive form — a gap that lives only in a
-    /// report gets fixed by nobody.</para>
+    /// <para>Nothing here supplies missing wiring on the intake's behalf. The engine is the real
+    /// <see cref="ExternalPrIntake"/>, the worker host is the daemon's own <c>IPrWorkerHost</c> resolved
+    /// out of the composition root, and the PR-head fetch is the production <see cref="PrHeadFetcher"/>
+    /// (only its URL is pointed at the local fixture host). One <c>PollOnceAsync</c> is the entire
+    /// trigger.</para>
+    ///
+    /// <para>The local agent spawned alongside is not decoration: it is the reference the PR jail is
+    /// compared against, so "the external entry takes the same path as an agent branch" is asserted
+    /// rather than asserted-about — same image (hence the same MG-42 toolchain layer), a
+    /// <b>separate</b> MG-43 package cache, and the same verify leg.</para>
     /// </summary>
     [RequiresDockerFact]
-    public async Task ExternalPullRequestEntry_WithNoJail_CannotVerify_BecauseTheIntakeSpawnsNone()
+    public async Task IntakedExternalPullRequest_IsGivenAJailByTheIntake_VerifiesInIt_AndBecomesMergeable()
     {
         await using var loop = await LoopWorld.StartAsync(this, withUpstreamHost: true);
-        var pr = await loop.MaterializeExternalPrAsync(prNumber: 9, withJail: false);
 
-        // The worktree exists and the entry is in the queue — everything except a jail to verify in.
-        Assert.True(Directory.Exists(loop.WorktreePathFor(pr.AgentId)));
-        Assert.Equal(WorkerMergeState.Working, loop.Queue.GetState(pr.AgentId));
+        // The reference tenant: an ordinary local agent, spawned by the shipped SpawnAgent RPC.
+        var local = await loop.SpawnJailedAgentAsync();
 
-        var ex = await Assert.ThrowsAsync<RpcException>(() => loop.Merge.RunVerificationAsync(
-            new RunVerificationRequest { RepoHandle = loop.RepoHandle, AgentId = pr.AgentId },
-            loop.Headers).ResponseAsync);
-        Assert.Contains("no live sandbox", ex.Status.Detail, StringComparison.OrdinalIgnoreCase);
+        // Before the poll there is no session, no jail and no worktree for pr-9 — so everything after is
+        // attributable to the intake and to nothing else in the fixture.
+        Assert.Null(loop.SessionFor("pr-9"));
+        Assert.False(Directory.Exists(loop.WorktreePathFor("pr-9")));
 
-        // …and the consequence: it is stuck at Working, so nothing can merge it.
-        Assert.Equal(WorkerMergeState.Working, loop.Queue.GetState(pr.AgentId));
-        Assert.False(loop.Queue.CanMerge(pr.AgentId, out var reason));
-        Assert.Contains("not verified", reason);
+        var pr = await loop.IntakeExternalPrAsync(prNumber: 9);
+
+        // ---- (a) THE fix: the intake gave the entry a real jail, under the pull request's own id ----
+        var session = loop.SessionFor(pr.AgentId);
+        Assert.NotNull(session);
+        Assert.Equal("pr-9", session!.Id);
+        Assert.False(string.IsNullOrEmpty(session.ContainerId),
+            "the intake must spawn a real jail — an external entry with no sandbox can never be verified");
+        Assert.Equal(loop.RepoHandle, session.RepoHash);
+
+        // MG-2: it is a Managed worker, which is what puts it in the SAME MaxActiveWorkers population a
+        // coordinator's fan-out is capped by, rather than a private allowance an open PR queue could
+        // exhaust the machine with. It also carries no model key — the head is untrusted code.
+        Assert.Equal(AgentRoles.Managed, session.Role);
+        Assert.Equal(ExternalPrIntake.WorkerAgentKind, session.Kind);
+
+        // ---- (b) the hardened per-agent substrate really is keyed by `pr-9` ----
+        // MG-42: same repo ⇒ same jail image as the local agent, so the repo's declared toolchain layer
+        // reaches the PR jail by the same route (it is resolved inside the shared launcher, per repo).
+        Assert.Equal(await loop.JailImageAsync(local.Id), await loop.JailImageAsync(pr.AgentId));
+
+        // MG-43: its OWN package cache, on a path derived from `pr-9`, distinct from the local agent's. A
+        // shared writable cache is a tenant→tenant supply-chain path, and this tenant is the one running
+        // code from outside the machine.
+        var prCache = PackageCachePolicy.AgentCachePath(loop.VmRoot, loop.RepoHandle, pr.AgentId);
+        var localCache = PackageCachePolicy.AgentCachePath(loop.VmRoot, loop.RepoHandle, local.Id);
+        Assert.True(Directory.Exists(prCache), $"no per-agent package cache at '{prCache}'");
+        Assert.NotEqual(localCache, prCache);
+
+        // MG-3: the head arrived in the AGENT'S OWN repository, and the daemon — not the agent — carried
+        // it into the read-only mirror, which is where the queue reads agent/<id> from.
+        Assert.Equal(pr.HeadSha, Rev(loop.WorktreePathFor(pr.AgentId), "HEAD"));
+
+        // ---- (c) it verifies IN THAT JAIL and becomes mergeable — the leg that could not run before ----
+        Assert.Equal(MergeEntryOrigin.External, loop.Queue.GetOrigin(pr.AgentId));
+        var verified = await loop.RunVerificationAsync(pr.AgentId);
+        Assert.True(verified.Passed, "the fixture's node suite should pass in the PR's own jail");
+        Assert.Equal(FixtureRepo.VerifyCommand, verified.ResolvedCommand);
+        Assert.Equal(WorkerMergeState.Verified.ToString(), verified.State);
+        Assert.Equal(loop.MainSha0, verified.MainSha);
+        Assert.Equal(pr.HeadSha, Rev(loop.MirrorPath, $"refs/heads/agent/{pr.AgentId}"));
+        Assert.True(loop.Queue.CanMerge(pr.AgentId, out var why), $"the entry should be mergeable: {why}");
+
+        // ---- (d) …and lands, by the external route: merged on the host, checkout converged onto it ----
+        // The badge has to reach the CLIENT for the merge to route externally — the adapter reads the
+        // origin off the queue stream, and a Local reading would fast-forward the mirror branch while
+        // leaving the pull request open upstream.
+        await loop.WaitForQueueProjectionAsync(pr.AgentId);
+        await loop.Adapter.ConfirmMergeAsync(pr.AgentId).WaitAsync(Timeout);
+        var upstreamMain = Rev(loop.UpstreamWork!, "main");
+        Assert.Equal(0, Contains(loop.UpstreamWork!, pr.HeadSha, upstreamMain));
+        Assert.Equal(upstreamMain, Rev(loop.Checkout, "main"));
+        Assert.NotEqual(loop.MainSha0, Rev(loop.Checkout, "main"));
+        Assert.Equal(WorkerMergeState.Merged, loop.Queue.GetState(pr.AgentId));
+        Assert.Equal(pr.HeadSha, loop.Host!.LastExpectedHeadSha);
+    }
+
+    /// <summary>
+    /// The non-vacuity control for the test above, and the reason its "it verified" means anything: the
+    /// identical intake-driven loop with a pull request whose head BREAKS the fixture's suite. The jail
+    /// reports the real non-zero exit, the queue refuses to call it verified, the merge is refused, and
+    /// nothing moves upstream or locally.
+    ///
+    /// <para>It is also the control on the jail itself. A "verification" that were quietly not running in
+    /// a container at all would pass both tests' happy path; only a run that can genuinely fail
+    /// distinguishes a jail from a rubber stamp.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task IntakedExternalPullRequestThatFailsItsTests_CannotMerge_AndNothingMoves()
+    {
+        await using var loop = await LoopWorld.StartAsync(this, withUpstreamHost: true);
+
+        var pr = await loop.IntakeExternalPrAsync(
+            prNumber: 11,
+            headContent: "exports.add = (a, b) => a + b + 1;\nexports.mul = (a, b) => a * b;\n");
+
+        Assert.False(string.IsNullOrEmpty(loop.SessionFor(pr.AgentId)?.ContainerId));
+
+        var verified = await loop.RunVerificationAsync(pr.AgentId);
+        Assert.False(verified.Passed, "the PR's jail must report the fixture suite's real non-zero exit");
+        Assert.NotEqual(WorkerMergeState.Verified.ToString(), verified.State);
+        Assert.False(loop.Queue.CanMerge(pr.AgentId, out var blocked));
+        Assert.Contains("verif", blocked, StringComparison.OrdinalIgnoreCase);
+
+        await loop.WaitForQueueProjectionAsync(pr.AgentId);
+        var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => loop.Adapter.ConfirmMergeAsync(pr.AgentId).WaitAsync(Timeout));
+        Assert.Contains("Can't merge", refusal.Message);
+
+        Assert.Equal(loop.MainSha0, Rev(loop.Checkout, "main"));
+        Assert.Null(loop.Host!.LastExpectedHeadSha);       // the host was never asked to merge anything
+        Assert.NotEqual(WorkerMergeState.Merged, loop.Queue.GetState(pr.AgentId));
+        Assert.Null(loop.Leases.GetOutstanding(loop.RepoHandle));
+    }
+
+    /// <summary>
+    /// MG-2 at the intake, end to end. An arriving bot pull request is a spawn request from outside the
+    /// machine; with the shared managed-worker pool full it must be REFUSED, and — the part that decides
+    /// whether this is a gate or a leak — the intake must then materialize <b>nothing</b>: no jail, no
+    /// worktree, no queue entry. An entry admitted without a jail could never be verified anyway, and an
+    /// unbounded external queue that spawned regardless is a denial of service on the user's own box.
+    ///
+    /// <para>The same pull request materializes normally once a slot frees, so the refusal is capacity and
+    /// not a permanent rejection.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task IntakedExternalPullRequest_AtTheWorkerCap_IsRefused_AndMaterializesNothing()
+    {
+        await using var loop = await LoopWorld.StartAsync(this, withUpstreamHost: true, maxActiveWorkers: 1);
+
+        // Fill the shared cap with an ordinary managed worker — NOT with a pull request, so the contention
+        // being asserted really is between the two daemon-driven spawn paths.
+        loop.OccupyAManagedWorkerSlot();
+
+        var refused = await loop.IntakeExternalPrAsync(prNumber: 13, expectMaterialized: false);
+
+        Assert.Null(loop.SessionFor(refused.AgentId));
+        Assert.False(Directory.Exists(loop.WorktreePathFor(refused.AgentId)));
+        Assert.DoesNotContain(refused.AgentId, loop.Queue.Agents);
+
+        // Capacity frees; the very same pull request is now materialized with a real jail.
+        loop.ReleaseTheManagedWorkerSlot();
+        var admitted = await loop.IntakeExternalPrAsync(prNumber: 13);
+
+        Assert.False(string.IsNullOrEmpty(loop.SessionFor(admitted.AgentId)?.ContainerId));
+        Assert.Equal(WorkerMergeState.Working, loop.Queue.GetState(admitted.AgentId));
     }
 
     // ================= restart resume =================
@@ -449,6 +577,9 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         public string? UpstreamWork { get; private set; }
         public FakeHost? Host { get; private set; }
 
+        /// <summary>The fixture pull request's head, created once per world.</summary>
+        private string? _prHeadSha;
+
         public DaemonBackedOrchestrator Adapter { get; private set; } = null!;
         public MergeQueueService.MergeQueueServiceClient Merge { get; private set; } = null!;
         public AgentService.AgentServiceClient AgentRpc { get; private set; } = null!;
@@ -462,15 +593,17 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         public MergeQueue Queue => Context.Queue;
         public IMergeLeaseStore Leases => _host.Services.GetRequiredService<IMergeLeaseStore>();
 
+        /// <param name="maxActiveWorkers">The shared managed-worker ceiling. Overridden only by the
+        /// cap-refusal test, which needs a cap it can fill without spawning six jails.</param>
         public static async Task<LoopWorld> StartAsync(
-            MergeQueueEndToEndDockerTests owner, bool withUpstreamHost = false)
+            MergeQueueEndToEndDockerTests owner, bool withUpstreamHost = false, int? maxActiveWorkers = null)
         {
             var world = new LoopWorld(owner);
-            await world.BuildAsync(withUpstreamHost);
+            await world.BuildAsync(withUpstreamHost, maxActiveWorkers);
             return world;
         }
 
-        private async Task BuildAsync(bool withUpstreamHost)
+        private async Task BuildAsync(bool withUpstreamHost, int? maxActiveWorkers = null)
         {
             VmRoot = _owner.NewDir("mg-e2e-vm-");
             Checkout = _owner.NewDir("mg-e2e-checkout-");
@@ -507,9 +640,16 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
             MainSha0 = Rev(Checkout, "main");
 
             // The real composition root, with ONE override: an isolated VM root so mirrors/worktrees never
-            // touch the developer's ~/mainguard.
+            // touch the developer's ~/mainguard. (Plus, for the cap-refusal test alone, a smaller
+            // MaxActiveWorkers — the number, never the gate.)
             _host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
-                services.AddSingleton<IAgentEnvironment>(new Wsl2AgentEnvironment(vmRoot: VmRoot))));
+            {
+                services.AddSingleton<IAgentEnvironment>(new Wsl2AgentEnvironment(vmRoot: VmRoot));
+                if (maxActiveWorkers is { } cap)
+                {
+                    services.AddSingleton(new CoordinatorLimits(MaxActiveWorkers: cap));
+                }
+            }));
 
             var channel = GrpcChannel.ForAddress(_host.Server.BaseAddress,
                 new GrpcChannelOptions { HttpHandler = _host.Server.CreateHandler() });
@@ -588,59 +728,103 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         // ---- external PR entries ----
 
         /// <summary>
-        /// The state the P2-12 intake leaves an upstream pull request in: a mirror branch at the PR head, a
-        /// worktree, and an <c>External</c> queue entry. Driven through the shipped RPC + the daemon's own
-        /// provisioner rather than by hand-registering, so the entry is the one the daemon serves.
+        /// Publishes a bot pull request on the fixture host and then runs <b>the real intake</b> over it:
+        /// one <c>PollOnceAsync</c> against the daemon's own <c>IPrWorkerHost</c>, which spawns the
+        /// <c>pr-&lt;n&gt;</c> jail through the ordinary gated chain, fetches the head with the production
+        /// <see cref="PrHeadFetcher"/> and stamps the External queue entry.
+        ///
+        /// <para>Everything substituted here is a boundary the intake was always designed to have: the
+        /// <see cref="IPullRequestService"/> list (a fixture host rather than github.com), the fetch URL
+        /// (the same local host), and the source→repo resolution (its own tests own that — see
+        /// <c>ExternalPrIntakeSpawnWiringTests</c>). The spawn, the fetch mechanics, the worker host, the
+        /// queue and the merge are production code.</para>
         /// </summary>
-        /// <param name="withJail">
-        /// Whether the entry is given a verification jail. The intake gives it none (see
-        /// <see cref="ExternalPullRequestEntry_WithNoJail_CannotVerify_BecauseTheIntakeSpawnsNone"/>), so
-        /// <c>true</c> supplies the one piece of wiring that is missing — and supplies it by running the
-        /// SAME production spawn chain a local agent takes (<see cref="SandboxAgentLauncher"/>), not by
-        /// hand-rolling a container.
-        /// </param>
-        public async Task<ExternalPr> MaterializeExternalPrAsync(int prNumber, bool withJail)
+        /// <param name="headContent">What the pull request makes <c>src/calc.js</c> say — the knob the
+        /// failing-suite control turns.</param>
+        /// <param name="expectMaterialized">Assert that the poll really did materialize the entry. False
+        /// for the cap-refusal case, where materializing nothing is the point.</param>
+        public async Task<ExternalPr> IntakeExternalPrAsync(
+            int prNumber, string? headContent = null, bool expectMaterialized = true)
         {
-            var agentId = "pr-" + prNumber.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            var agentId = ExternalPrIntake.AgentIdFor(prNumber);
+            var branch = "pr-head";
 
-            // The bot's pull request on the host.
-            Git(UpstreamWork!, "checkout", "-b", "pr-head");
-            File.WriteAllText(Path.Combine(UpstreamWork!, "src", "calc.js"),
-                FixtureRepo.CalcJs + "exports.div = (a, b) => a / b;\n");
-            Git(UpstreamWork!, "add", "-A");
-            Git(UpstreamWork!, "commit", "-m", "bot: division");
-            Git(UpstreamWork!, "push", "-u", "origin", "pr-head");
-            var head = Rev(UpstreamWork!, "pr-head");
-            Git(UpstreamWork!, "checkout", "main");
-
-            // The intake's materialize: the agent worktree + branch first…
-            if (withJail)
+            // The bot's pull request on the host — a branch, plus the refs/pull/<n>/head the host exposes
+            // it at, which is the ref the production fetcher asks for.
+            if (_prHeadSha is null)
             {
-                var launch = await new SandboxAgentLauncher(
-                        _host.Services.GetRequiredService<IAgentEnvironment>())
-                    .TryLaunchAsync(RepoHandle, agentId, "worker", "sk-test-not-a-real-key",
-                        ipcDirPath: null, ct: CancellationToken.None);
-                Assert.NotNull(launch);
-                _owner._containers.Add(launch!.ContainerId);
+                Git(UpstreamWork!, "checkout", "-b", branch);
+                File.WriteAllText(Path.Combine(UpstreamWork!, "src", "calc.js"),
+                    headContent ?? FixtureRepo.CalcJs + "exports.div = (a, b) => a / b;\n");
+                Git(UpstreamWork!, "add", "-A");
+                Git(UpstreamWork!, "commit", "-m", "bot: pull request head");
+                Git(UpstreamWork!, "push", "-u", "origin", branch);
+                Git(UpstreamWork!, "checkout", "main");
+                _prHeadSha = Rev(UpstreamWork!, branch);
+            }
+
+            var head = _prHeadSha!;
+            Git(Upstream!, "update-ref", $"refs/pull/{prNumber}/head", head);
+
+            // The REAL intake engine over the daemon's REAL worker host.
+            var listed = new StubPrList(prNumber, head);
+            var intake = new ExternalPrIntake(
+                prService: listed,
+                store: new InMemoryPrIntakeStore(),
+                workers: _host.Services.GetRequiredService<IPrWorkerHost>(),
+                fetcher: new PrHeadFetcher(
+                    (repoHash, id) => Path.Combine(VmRoot, "worktrees", repoHash, id),
+                    // The production https://<host>/<owner>/<repo>.git, pointed at the fixture host. The
+                    // host KIND (and hence the refs/pull/<n>/head shape) is still classified from the
+                    // canonical host name.
+                    _ => Upstream!),
+                resolveTarget: _ => new PrIntakeTarget(Checkout, RepoHandle, Queue),
+                audit: new InMemoryAuditLog());
+            intake.Subscribe(PrSource);
+
+            await intake.PollOnceAsync(CancellationToken.None);
+
+            if (expectMaterialized)
+            {
+                var session = _host.Services.GetRequiredService<AgentSessionStore>().Find(agentId);
+                Assert.NotNull(session);
+                Assert.False(string.IsNullOrEmpty(session!.ContainerId),
+                    "the intake must give an external entry a real jail — verification runs in it");
+                _owner._containers.Add(session.ContainerId!);
                 _owner._segments.Add((RepoHandle, agentId));
             }
-            else
-            {
-                await Sync.CreateWorktreeAsync(
-                    new CreateWorktreeRequest { RepoHandle = RepoHandle, AgentId = agentId }, Headers);
-            }
 
-            // …then the pull request's head fetched onto that branch in the MIRROR (the daemon-side
-            // provisioning fetch — the quarantine rule cuts the agent worktree off from the real remote,
-            // never this), and the entry stamped External.
-            Git(MirrorPath, "fetch", Upstream!, $"+refs/heads/pr-head:refs/heads/agent/{agentId}");
-            _host.Services.GetRequiredService<MergeQueueProvisioner>()
-                .EnsureEntry(RepoHandle, agentId, MergeEntryOrigin.External);
-
-            Git(Checkout, "fetch", SyncRemoteName);
-            Assert.Equal(head, Rev(Checkout, $"refs/remotes/{SyncRemoteName}/agent/{agentId}"));
             return new ExternalPr(agentId, prNumber, head);
         }
+
+        /// <summary>The source every intake in this suite polls; its slug is irrelevant because the
+        /// fixture resolves the target directly, and its host must be one whose PR-head ref shape is
+        /// known (github.com ⇒ <c>refs/pull/&lt;n&gt;/head</c>).</summary>
+        private static ExternalPrSource PrSource => new("github.com", "acme", "fixture", "codex[bot]");
+
+        /// <summary>The daemon's live image id for an agent's jail — read from the container runtime, so
+        /// "the same toolchain layer" is a fact about what is running, not about our bookkeeping.</summary>
+        public async Task<string> JailImageAsync(string agentId)
+        {
+            var containerId = SessionFor(agentId)?.ContainerId;
+            Assert.False(string.IsNullOrEmpty(containerId), $"'{agentId}' has no jail");
+            using var docker = new DockerClientConfiguration().CreateClient();
+            var inspected = await docker.Containers.InspectContainerAsync(containerId);
+            return inspected.Image;
+        }
+
+        // ---- worker-cap fixture ----
+
+        private string? _capFiller;
+
+        /// <summary>Takes one slot of the shared managed-worker allowance with an ORDINARY managed
+        /// session, so the cap the intake then meets is one it contends for rather than one of its own.</summary>
+        public void OccupyAManagedWorkerSlot()
+            => _capFiller = _host.Services.GetRequiredService<AgentSessionStore>()
+                .Spawn("claude-code", AgentRoles.Managed).Id;
+
+        public void ReleaseTheManagedWorkerSlot()
+            => _host.Services.GetRequiredService<AgentSessionStore>().Stop(_capFiller!);
 
         // ---- daemon restart ----
 
@@ -743,6 +927,60 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
     }
 
     private sealed record ExternalPr(string AgentId, int Number, string HeadSha);
+
+    /// <summary>
+    /// The fixture host's PR <b>list</b> — the only surface the intake is allowed to touch (invariant 1:
+    /// it never writes upstream without an explicit user action). Every mutating member throws rather
+    /// than returning something plausible, so a regression that made the intake write would fail loudly
+    /// here instead of passing quietly.
+    /// </summary>
+    private sealed class StubPrList : Mainguard.Git.Services.IPullRequestService
+    {
+        private readonly Mainguard.Git.Models.PullRequestItem _pr;
+
+        public StubPrList(int number, string headSha) => _pr = new Mainguard.Git.Models.PullRequestItem
+        {
+            Number = number,
+            Author = "codex[bot]",
+            State = Mainguard.Git.Models.PullRequestState.Open,
+            HeadSha = headSha,
+        };
+
+        public bool IsSupported(string repoPath) => true;
+
+        public Task<IReadOnlyList<Mainguard.Git.Models.PullRequestItem>> ListAsync(
+            string repoPath, Mainguard.Git.Models.PullRequestState filter, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<Mainguard.Git.Models.PullRequestItem>>(new[] { _pr });
+
+        public Task<Mainguard.Git.Models.PullRequestDetail> GetAsync(string repoPath, int number, CancellationToken ct)
+            => Task.FromResult(new Mainguard.Git.Models.PullRequestDetail { Summary = _pr });
+
+        public Task<IReadOnlyList<Mainguard.Git.Models.PullRequestReview>> GetReviewsAsync(
+            string repoPath, int number, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<Mainguard.Git.Models.PullRequestReview>>(
+                Array.Empty<Mainguard.Git.Models.PullRequestReview>());
+
+        public Task<IReadOnlyList<Mainguard.Git.Models.ReviewComment>> GetReviewCommentsAsync(
+            string repoPath, int number, CancellationToken ct)
+            => Task.FromResult<IReadOnlyList<Mainguard.Git.Models.ReviewComment>>(
+                Array.Empty<Mainguard.Git.Models.ReviewComment>());
+
+        public Task<Mainguard.Git.Models.PullRequestItem> CreateAsync(
+            string repoPath, Mainguard.Git.Models.CreatePullRequest request, CancellationToken ct)
+            => throw new InvalidOperationException("the intake must never write upstream");
+
+        public Task<Mainguard.Git.Models.PullRequestItem> MergeAsync(
+            string repoPath, int number, Mainguard.Git.Models.PullRequestMergeMethod method,
+            string? expectedHeadSha, CancellationToken ct)
+            => throw new InvalidOperationException("the intake must never write upstream");
+
+        public Task CloseAsync(string repoPath, int number, CancellationToken ct)
+            => throw new InvalidOperationException("the intake must never write upstream");
+
+        public Task<Mainguard.Git.Models.PullRequestReview> SubmitReviewAsync(
+            string repoPath, int number, Mainguard.Git.Models.SubmitReview review, CancellationToken ct)
+            => throw new InvalidOperationException("the intake must never write upstream");
+    }
 
     /// <summary>
     /// Stands in for the host's pull-request API. Its merge performs a REAL git merge in the real upstream
