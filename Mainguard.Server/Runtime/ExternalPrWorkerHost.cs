@@ -85,24 +85,25 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
     public async Task<PrWorkerResult> EnsureWorkerAsync(
         string repoHash, string agentId, int prNumber, CancellationToken ct)
     {
-        // Already ours, in this daemon's memory.
-        if (_sessions.Find(agentId) is { } live)
+        // Already ours, in this daemon's memory. Looked up by the FULL session identity (repo, id): a
+        // `pr-<n>` id is unique only inside a repo, and the session store is now keyed to match, so a
+        // pull request #n in another subscribed repository is a different session entirely rather than a
+        // collision this had to refuse. That refusal is what this method used to do — the second repo's
+        // pull request was never intake'd at all — and it is the defect this scoping removes.
+        var key = new AgentSessionKey(repoHash, agentId);
+        if (_sessions.Find(key) is { } live)
         {
-            if (string.Equals(live.RepoHash, repoHash, StringComparison.Ordinal)
-                && !string.IsNullOrEmpty(live.ContainerId))
+            if (!string.IsNullOrEmpty(live.ContainerId))
             {
                 return PrWorkerResult.AlreadyLive();
             }
 
-            // Same id, different repo. `pr-<n>` is the right id INSIDE a repo — it names the worktree,
-            // the branch and the queue entry, all of which are per-repo — but the session store is
-            // daemon-global, so two subscribed repositories that each have a pull request #n contend for
-            // one session id. Refusing loudly here is the safe side of that: the alternative is a second
-            // repo's untrusted head sharing (or evicting) the first repo's jail. Named explicitly rather
-            // than left to the store's generic duplicate-id error, because the cause is not obvious.
+            // Ours, this repo, but no jail ever attached — a session-only record left by a degraded
+            // spawn. It still holds the (repo, id) key, so a respawn would (correctly) hit the store's
+            // duplicate guard; say so instead of looping into it every poll.
             return PrWorkerResult.Failed(
-                $"agent id '{agentId}' is already taken by repo '{live.RepoHash}' on this daemon — two "
-                + "repositories with a pull request of the same number cannot both be intake'd at once.");
+                $"agent '{agentId}' in repo '{repoHash}' has a session but no jail — it is retried once "
+                + "that session is released.");
         }
 
         // Not in memory, but the container runtime — which P2-08 designates the sole source of truth for
@@ -160,9 +161,10 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
             // A repo with no provisioned mirror yields a session-only record and no jail. That is not a
             // worker: leave nothing behind and report it, rather than letting the intake materialize an
             // entry that would answer "no live sandbox" to every verification.
-            if (_sessions.Find(spawned)?.ContainerId is not { Length: > 0 })
+            if (_sessions.Find(new AgentSessionKey(repoHash, spawned))?.ContainerId is not { Length: > 0 })
             {
-                await _spawns.StopAsync(spawned, CancellationToken.None).ConfigureAwait(false);
+                await _spawns.StopAsync(new AgentSessionKey(repoHash, spawned), CancellationToken.None)
+                    .ConfigureAwait(false);
                 return PrWorkerResult.Failed(
                     $"repo '{repoHash}' has no provisioned mirror, so no jail could be started for '{agentId}'.");
             }
@@ -197,8 +199,10 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
         try
         {
             // The ordinary stop: session record, PTY, input lock, jail, MG-36 segment, package cache,
-            // worktree. Everything a local agent's stop reclaims.
-            var result = await _spawns.StopAsync(agentId, ct).ConfigureAwait(false);
+            // worktree. Everything a local agent's stop reclaims — scoped to THIS repo's session, so
+            // closing repo A's pull request #7 cannot tear down repo B's still-open pull request #7.
+            var result = await _spawns.StopAsync(new AgentSessionKey(repoHash, agentId), ct)
+                .ConfigureAwait(false);
             if (result.Stopped)
             {
                 return;
