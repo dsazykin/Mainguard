@@ -656,6 +656,59 @@ public sealed class ExternalPrMergePathTests : IClassFixture<DaemonFixture>, IDi
         Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
     }
 
+    // ---- 7. the confirmation names the origin that actually merged ---------------------------------
+
+    /// <summary>
+    /// <b>An external merge must not be reported in the local fast-forward's words.</b> Every refusal on
+    /// this path was already origin-specific; the confirmation was not, so merging an upstream pull request
+    /// announced <c>Merged agent/pr-7 into main</c> — the shape of the one thing P2-12 exists to prevent.
+    /// It is a plausible sentence, which is what makes it bad: <c>agent/pr-7</c> really is in the mirror and
+    /// really could have been fast-forwarded, so the line reads as correct while describing a merge that did
+    /// not happen here.
+    ///
+    /// <para>The assertions below are ordered so the distinguishing one comes first: the local sentence is
+    /// ruled out before the external sentence is checked, because a test that only asserted a substring
+    /// both origins share would pass in exactly the broken world it exists to catch.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheExternalConfirmation_SaysMergedUpstream_AndCannotWearTheLocalFastForwardSentence()
+    {
+        var world = BuildWorld();
+        var (client, adapter, queue, host) = await ArrangeAsync(world);
+        using var _c = client;
+        using var _a = adapter;
+
+        var reported = new List<(string Message, bool IsWarning)>();
+        await MergeActionRunner.RunAsync(adapter, AgentId, (m, w) => reported.Add((m, w))).WaitAsync(Timeout);
+
+        var success = Assert.Single(reported);
+        Assert.False(success.IsWarning, "the merge landed — this is a confirmation, not a refusal");
+
+        // The merge under discussion really is the external one: the host merged the pull request, and
+        // this checkout converged onto that merge. Without this the message assertions describe nothing.
+        var landedMain = Rev(world.Path, "main");
+        Assert.Equal(1, host.MergeCalls);
+        Assert.Equal(Rev(world.UpstreamWork, "main"), landedMain);
+        Assert.NotEqual(world.MainSha, landedMain);
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+
+        // THE defect: the local origin's sentence, on an external merge.
+        Assert.DoesNotContain($"Merged agent/{AgentId} into", success.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("into main", success.Message, StringComparison.Ordinal);
+
+        // Both halves of what this path guarantees, said separately so each is measured: the pull request
+        // was merged UPSTREAM by the host, and local main then fast-forwarded onto the commit that produced.
+        Assert.Contains($"pull request #{PrNumber}", success.Message, StringComparison.Ordinal);
+        Assert.Contains("upstream", success.Message, StringComparison.Ordinal);
+        Assert.Contains("fast-forwarded onto", success.Message, StringComparison.Ordinal);
+        Assert.Contains(landedMain[..7], success.Message, StringComparison.Ordinal);
+
+        // And the whole line, exactly — a substring check alone cannot tell the two origins apart.
+        Assert.Equal(
+            $"Merged pull request #{PrNumber} upstream — main fast-forwarded onto {landedMain[..7]}.",
+            success.Message);
+    }
+
     // ---- helpers -----------------------------------------------------------------------------------
 
     private static PullRequestDetail WithState(PullRequestDetail detail, PullRequestState state) => new()

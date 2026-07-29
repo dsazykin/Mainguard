@@ -28,6 +28,26 @@ public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, Awai
 /// </summary>
 public enum MergeEntryOrigin { Local, External }
 
+/// <summary>
+/// What a confirmed merge actually did (P2-12). The two origins land a merge in two different places — a
+/// <see cref="MergeEntryOrigin.Local"/> entry is fast-forwarded into the user's own checkout, while an
+/// <see cref="MergeEntryOrigin.External"/> entry is merged <b>upstream by the host</b> and the checkout is
+/// then converged onto the commit that merge produced — so one "Merged agent/&lt;id&gt; into main" line is
+/// true for exactly one of them. The origin travels back out with the merge so the surface can say what
+/// happened instead of describing the local shape for both.
+/// </summary>
+/// <param name="Origin">Which transport landed the merge — the fact the success message turns on.</param>
+/// <param name="AgentId">The entry's agent id (<c>pr-&lt;n&gt;</c> for an external one, where the number IS
+/// the upstream pull request).</param>
+/// <param name="MainBranch">The local branch the merge landed on.</param>
+/// <param name="NewMainSha">The sha <c>refs/heads/main</c> ACTUALLY moved to — never a cached pre-merge
+/// projection, since it is the same value the queue is confirmed against.</param>
+public sealed record MergeOutcome(
+    MergeEntryOrigin Origin,
+    string AgentId,
+    string MainBranch,
+    string NewMainSha);
+
 public sealed record AgentInfo(
     string AgentId,
     string Name,             // N-4 working name, e.g. "Loom-3"

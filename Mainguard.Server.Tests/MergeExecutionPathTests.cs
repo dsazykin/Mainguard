@@ -390,8 +390,15 @@ public sealed class MergeExecutionPathTests : IClassFixture<DaemonFixture>, IDis
 
         var success = Assert.Single(reported);
         Assert.False(success.IsWarning);
-        Assert.Contains("Merged agent/x into main", success.Message, StringComparison.Ordinal);
         Assert.Equal(repo.AgentTip, Rev(repo.Path, "main"));
+
+        // A LOCAL merge is a fast-forward of the user's own checkout, so it says so — and it must not
+        // borrow the external origin's "merged upstream" wording, which would claim a host round trip
+        // that never happened. The two origins are told apart in both directions, not just one.
+        Assert.DoesNotContain("upstream", success.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("pull request", success.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Merged agent/x into main", success.Message, StringComparison.Ordinal);
+        Assert.Equal("Merged agent/x into main.", success.Message);
     }
 
     // ---- helpers ---------------------------------------------------------
