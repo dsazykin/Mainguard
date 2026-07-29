@@ -28,7 +28,7 @@ namespace Mainguard.Server.Tests.Fixtures;
 /// production change on the security-critical path, to fix a testing defect. Several suites go further
 /// and are ABOUT the singleton at its real name: the MG-18 drift test plants a deliberately-wrong
 /// network under <c>mainguard-agents</c>, and the adoption tests stop and remove the proxy underneath a
-/// concurrent spawn on purpose. Renaming them would delete the thing they prove.
+/// concurrent spawn on purpose. Renaming them would delete the thing they prove.</para>
 ///
 /// <para>So the resources stay shared and exactly as production names them, and what is isolated is the
 /// RUN: two <c>dotnet test</c> invocations on one daemon take turns instead of fighting. That costs wall
@@ -40,9 +40,10 @@ namespace Mainguard.Server.Tests.Fixtures;
 /// the kernel drops when the process dies however it dies. A lock file holding a pid, or a named mutex,
 /// would leave a crashed run's lock held forever. Measured on this box (.NET 10, Linux): a second
 /// process opening the same path with <c>FileShare.None</c> gets <c>IOException</c> while the first
-/// holds it, and acquires immediately once the first exits. The exclusion also holds between two opens
-/// in the SAME process, which is what makes <see cref="DockerSuiteLockTests"/> able to prove it without
-/// spawning a child.</para>
+/// holds it, and acquires immediately once the first exits — including when the first is SIGKILLed. The
+/// exclusion also holds between two opens in the SAME process, which is what lets
+/// <c>FixtureAcceptanceTests.DockerSuiteLock_ExcludesASecondHolder_AndReleasesWhenDisposed</c> prove it
+/// without spawning a child.</para>
 /// </summary>
 internal sealed class DockerSuiteLock : IDisposable
 {
