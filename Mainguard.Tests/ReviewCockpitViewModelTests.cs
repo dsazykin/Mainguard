@@ -3,7 +3,9 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
+using Mainguard.Agents.UI.Services;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.App.Shell.ViewModels;
 using Mainguard.Git.Models;
@@ -136,5 +138,107 @@ public class ReviewCockpitViewModelTests
 
         Assert.True(vm.FlaggedPanel.AllAcknowledged);
         Assert.True(gate.Allows("loom-1", out _));
+    }
+
+    // ---- the live (daemon-backed) overlay panel --------------------------
+    //
+    // The overlay's items and acks both travel through IFlaggedChangeSource. These pin the two ways it
+    // must refuse to look like it worked; the end-to-end proof that a real acknowledgment reaches the real
+    // daemon gate (blocked → ack on the overlay → merge permitted) is
+    // Mainguard.Server.Tests.ReviewCockpitOverlayAckTests.
+
+    [Fact]
+    public void LivePanel_RendersTheDaemonsItems_AndTheDaemonsMergeAnswer()
+    {
+        var source = new FakeFlaggedSource
+        {
+            Items = { new FlaggedItem("changed-test-command", "(verification command)", "ExecutableConfig", "the test command changed on this branch vs main", false) },
+            MergeAllowed = false,
+            MergeReason = "test command changed on this branch",
+        };
+
+        var vm = new ReviewCockpitViewModel(Context(new List<FilePatch>()), live: source);
+
+        Assert.True(vm.FlaggedPanel.IsLive);
+        Assert.True(vm.FlaggedPanel.HasItems);
+        Assert.Equal("changed-test-command", Assert.Single(vm.FlaggedPanel.Items).ItemId);
+        Assert.False(vm.CanMerge);
+        Assert.Equal("test command changed on this branch", vm.MergeReason);
+    }
+
+    [Fact]
+    public void LivePanel_WhenTheGateIsUnreachable_SaysSo_AndOffersNoAckControl()
+    {
+        var source = new FakeFlaggedSource
+        {
+            Items = { new FlaggedItem("changed-test-command", "(verification command)", "ExecutableConfig", "drifted", false) },
+            AckAvailable = false,
+            AckUnavailableReason = "no repository is open in the daemon — acknowledging here would clear nothing.",
+        };
+
+        var vm = new ReviewCockpitViewModel(Context(new List<FilePatch>()), live: source);
+        var row = Assert.Single(vm.FlaggedPanel.Items);
+
+        Assert.True(vm.FlaggedPanel.HasUnavailableNotice);
+        Assert.Contains("no repository", vm.FlaggedPanel.UnavailableNotice, StringComparison.OrdinalIgnoreCase);
+        Assert.False(row.CanAck);
+        Assert.False(row.AcknowledgeCommand.CanExecute(null));
+        Assert.Contains("no repository", row.AckTooltip, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task LivePanel_WhenTheGateRefusesTheAck_TheRowStaysUnacknowledged_AndSaysWhy()
+    {
+        // The call succeeds; the GATE does not record it. "The RPC was invoked" must never read as done.
+        var source = new FakeFlaggedSource
+        {
+            Items = { new FlaggedItem("changed-test-command", "(verification command)", "ExecutableConfig", "drifted", false) },
+            Outcome = FlaggedAckOutcome.Refused("the daemon did not record this acknowledgment"),
+        };
+
+        var vm = new ReviewCockpitViewModel(Context(new List<FilePatch>()), live: source);
+        var row = Assert.Single(vm.FlaggedPanel.Items);
+
+        await row.AcknowledgeCommand.ExecuteAsync(null);
+
+        Assert.False(row.IsAcknowledged);
+        Assert.Equal("Acknowledge", row.AckLabel);
+        Assert.True(row.HasAckNotice);
+        Assert.Contains("Not acknowledged", row.AckNotice, StringComparison.Ordinal);
+        Assert.False(vm.FlaggedPanel.AllAcknowledged);
+    }
+
+    /// <summary>A source the panel can be driven against without a daemon (the daemon-backed proof is in
+    /// Mainguard.Server.Tests). It records the id it was asked to acknowledge, so a per-item ack that
+    /// addressed the wrong row would be visible here too.</summary>
+    private sealed class FakeFlaggedSource : Mainguard.Agents.UI.Services.IFlaggedChangeSource
+    {
+        public List<FlaggedItem> Items { get; } = new();
+        public bool AckAvailable { get; init; } = true;
+        public string AckUnavailableReason { get; init; } = "";
+        public bool MergeAllowed { get; init; }
+        public string MergeReason { get; init; } = "";
+        public FlaggedAckOutcome Outcome { get; init; } = new(true, true, "");
+        public List<string> Acknowledged { get; } = new();
+
+        public IReadOnlyList<FlaggedItem> FlaggedFor(string agentId) => Items;
+
+        public bool CanMerge(string agentId, out string reason)
+        {
+            reason = MergeReason;
+            return MergeAllowed;
+        }
+
+        public bool CanAcknowledge(out string reason)
+        {
+            reason = AckUnavailableReason;
+            return AckAvailable;
+        }
+
+        public Task<FlaggedAckOutcome> AcknowledgeAsync(string agentId, string itemId, CancellationToken ct)
+        {
+            Acknowledged.Add(itemId);
+            return Task.FromResult(Outcome);
+        }
     }
 }

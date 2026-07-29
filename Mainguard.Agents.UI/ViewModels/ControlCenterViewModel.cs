@@ -266,6 +266,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         RefreshCoordinatorCli();
         Queue.Refresh();
         SelectedDocument?.Refresh();
+        ReviewCockpit?.RefreshFromQueue();
         Vibe.OnOrchestratorEvent(e);
         if (e.Type is "attention_required" or "plan_pending") RefreshAttention();
     });
@@ -276,6 +277,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         RefreshAgents();
         RefreshCoordinatorCli();
         Queue.Refresh();
+        // The queue stream is re-pushed after an acknowledgment (it moves no queue state, so nothing else
+        // would): the overlay reads its items' acknowledged flags and its merge answer from that push.
+        ReviewCockpit?.RefreshFromQueue();
         RefreshKill();
         RefreshAttention();
     });
@@ -878,8 +882,15 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             {
                 var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
                 var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files);
+
+                // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same
+                // path the agent document uses. It was built with none: `changedGate: null`, `queue: null`
+                // and a private in-process acknowledgment store, so it surfaced no daemon-flagged item and
+                // any checkmark it did draw would have cleared a store the merge gate never reads.
                 ReviewCockpit = new ReviewCockpitViewModel(
-                    ctx, onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id));
+                    ctx,
+                    onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id),
+                    live: new Services.DaemonFlaggedChangeSource(_queue));
                 return;
             }
         }

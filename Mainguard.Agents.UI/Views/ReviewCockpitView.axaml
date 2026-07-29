@@ -45,20 +45,30 @@
                    Foreground="{DynamicResource DangerBrush}"/>
         <TextBlock Text="{Binding ResetNotice}" FontSize="10" Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"
                    IsVisible="{Binding ResetNotice, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+        <!-- Acknowledging cannot reach the gate right now (no repo / no daemon): said plainly, and the
+             per-row controls are disabled, rather than drawing checkmarks that clear nothing. -->
+        <TextBlock Text="{Binding UnavailableNotice}" FontSize="10" Foreground="{DynamicResource WarningBrush}"
+                   TextWrapping="Wrap" IsVisible="{Binding HasUnavailableNotice}"/>
         <ItemsControl ItemsSource="{Binding Items}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:FlaggedItemRowViewModel">
-              <Grid ColumnDefinitions="Auto,*,Auto" Margin="0,2">
-                <PathIcon Grid.Column="0" Classes="sev mustAck" VerticalAlignment="Center" Margin="0,0,6,0"
+              <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto" Margin="0,2">
+                <PathIcon Grid.Row="0" Grid.Column="0" Classes="sev mustAck" VerticalAlignment="Center" Margin="0,0,6,0"
                           Data="{Binding SeverityGlyphKey, Converter={x:Static ResourceKeyToGeometryConverter.Instance}}"/>
-                <StackPanel Grid.Column="1" Spacing="1">
+                <StackPanel Grid.Row="0" Grid.Column="1" Spacing="1">
                   <TextBlock Text="{Binding Path}" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
                   <TextBlock Text="{Binding Detail}" FontSize="10" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                 </StackPanel>
-                <Button Grid.Column="2" Classes="Secondary" FontSize="10" Padding="8,2" VerticalAlignment="Center"
+                <Button Grid.Row="0" Grid.Column="2" Classes="Secondary" FontSize="10" Padding="8,2" VerticalAlignment="Center"
                         Command="{Binding AcknowledgeCommand}"
                         Content="{Binding AckLabel}"
-                        IsEnabled="{Binding !IsAcknowledged}"/>
+                        IsEnabled="{Binding CanAck}"
+                        ToolTip.Tip="{Binding AckTooltip}"/>
+                <!-- The gate's own refusal, verbatim: an acknowledgment that did not take says so here
+                     instead of the row quietly reading as cleared. -->
+                <TextBlock Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Text="{Binding AckNotice}" FontSize="10"
+                           Foreground="{DynamicResource DangerBrush}" TextWrapping="Wrap" Margin="0,2,0,0"
+                           IsVisible="{Binding HasAckNotice}"/>
               </Grid>
             </DataTemplate>
           </ItemsControl.ItemTemplate>

@@ -55,6 +55,89 @@ public class ReviewCockpitRenderHarness
         ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
     }
 
+    /// <summary>
+    /// The DAEMON-backed overlay panel, in every theme — the states the local panel has no way to be in:
+    /// a live item off the daemon's queue projection, an acknowledgment the gate refused (rendered as a
+    /// refusal on the row, never a checkmark), and the notice that says acknowledgments cannot reach the
+    /// gate at all. All three are new visuals; none may use a raw color or assume a dark theme.
+    /// </summary>
+    [AvaloniaFact]
+    public void Capture_ReviewCockpit_LiveDaemonPanel_AllFiveThemes()
+    {
+        foreach (var theme in ThemeKeys)
+        {
+            ThemeManager.Apply(theme, persist: false);
+
+            var refused = BuildLiveCockpit(ackAvailable: true, refuseAck: true);
+            refused.FlaggedPanel.Items[0].AcknowledgeCommand.Execute(null);
+            Dispatcher.UIThread.RunJobs();
+            Assert.True(refused.FlaggedPanel.Items[0].HasAckNotice);
+            Assert.False(refused.FlaggedPanel.Items[0].IsAcknowledged);
+
+            var unreachable = BuildLiveCockpit(ackAvailable: false, refuseAck: true);
+            Assert.True(unreachable.FlaggedPanel.HasUnavailableNotice);
+            Assert.False(unreachable.FlaggedPanel.Items[0].CanAck);
+            Assert.False(unreachable.FlaggedPanel.Items[0].HasAckNotice);
+
+            foreach (var (name, vm) in new[] { ("ack_refused", refused), ("ack_unreachable", unreachable) })
+            {
+                var win = HostWindow(new ReviewCockpitView { DataContext = vm });
+                win.Show();
+                Settle();
+                Assert.True(vm.FlaggedPanel.HasItems);
+                win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), $"review_cockpit_live_{name}_{theme}.png"));
+                HarnessHygiene.Teardown(win);
+            }
+        }
+
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+    }
+
+    private static ReviewCockpitViewModel BuildLiveCockpit(bool ackAvailable, bool refuseAck)
+    {
+        var ctx = new ReviewCockpitContext("loom-9", "Loom-9", "agent/loom-9", Array.Empty<FilePatch>());
+        return new ReviewCockpitViewModel(ctx, live: new HarnessFlaggedSource(ackAvailable, refuseAck));
+    }
+
+    /// <summary>A stand-in for the daemon's flagged-item projection + ack route (render-only).</summary>
+    private sealed class HarnessFlaggedSource : Mainguard.Agents.UI.Services.IFlaggedChangeSource
+    {
+        private readonly bool _ackAvailable;
+        private readonly bool _refuse;
+
+        public HarnessFlaggedSource(bool ackAvailable, bool refuse)
+        {
+            _ackAvailable = ackAvailable;
+            _refuse = refuse;
+        }
+
+        public IReadOnlyList<Mainguard.Agents.Agents.FlaggedItem> FlaggedFor(string agentId) => new[]
+        {
+            new Mainguard.Agents.Agents.FlaggedItem(
+                "changed-test-command", "(verification command)", "ExecutableConfig",
+                "the test command changed on this branch vs main — a branch cannot be allowed to self-green",
+                Acknowledged: false),
+        };
+
+        public bool CanMerge(string agentId, out string reason)
+        {
+            reason = "test command changed on this branch — acknowledge it to merge";
+            return false;
+        }
+
+        public bool CanAcknowledge(out string reason)
+        {
+            reason = _ackAvailable ? "" : "no repository is open in the daemon — acknowledging here would clear nothing.";
+            return _ackAvailable;
+        }
+
+        public Task<Mainguard.Agents.UI.Services.FlaggedAckOutcome> AcknowledgeAsync(
+            string agentId, string itemId, CancellationToken ct)
+            => Task.FromResult(_refuse
+                ? Mainguard.Agents.UI.Services.FlaggedAckOutcome.Refused("the daemon did not record this acknowledgment")
+                : new Mainguard.Agents.UI.Services.FlaggedAckOutcome(true, true, ""));
+    }
+
     private static ReviewCockpitViewModel BuildCockpit()
     {
         FilePatch Patch(string path, params DiffHunk[] hunks) => new()
