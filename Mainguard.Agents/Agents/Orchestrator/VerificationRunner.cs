@@ -204,24 +204,56 @@ public static class VerificationCommandResolver
 /// </summary>
 public sealed class ChangedTestCommandGate : IMergeGate
 {
+    /// <summary>The default flagged item — the verification command text itself.</summary>
+    public const string TestCommandItem = "test command";
+
+    /// <summary>
+    /// The per-repo verification <b>toolchain</b> declaration (<c>.mainguard/toolchain</c>). It rides
+    /// this same gate rather than a parallel one because it is the same class of claim — "the branch
+    /// changed how it is checked" — and because a second, separately-acknowledged gate would let a
+    /// human clear one and merge while the other item was still unread.
+    /// </summary>
+    public const string ToolchainItem = "verification toolchain";
+
     private readonly object _gate = new();
-    private readonly HashSet<string> _flagged = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SortedSet<string>> _flagged = new(StringComparer.Ordinal);
     private readonly HashSet<string> _acknowledged = new(StringComparer.Ordinal);
 
-    /// <summary>Records (or clears) the flag for an agent after a verification resolves its command.</summary>
-    public void SetFlagged(string agentId, bool changed)
+    /// <summary>Records (or clears) the <see cref="TestCommandItem"/> flag for an agent after a
+    /// verification resolves its command.</summary>
+    public void SetFlagged(string agentId, bool changed) => SetFlagged(agentId, TestCommandItem, changed);
+
+    /// <summary>
+    /// Records (or clears) one named drift item for an agent. A <b>newly</b> flagged item re-arms the
+    /// gate (any prior acknowledgment is dropped), which is what stops "I already acknowledged this
+    /// branch once" from covering a later, different change.
+    /// </summary>
+    public void SetFlagged(string agentId, string item, bool changed)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(item);
         lock (_gate)
         {
+            if (!_flagged.TryGetValue(agentId, out var items))
+            {
+                items = new SortedSet<string>(StringComparer.Ordinal);
+                _flagged[agentId] = items;
+            }
+
             if (changed)
             {
-                _flagged.Add(agentId);
-                _acknowledged.Remove(agentId); // a fresh change re-arms the gate.
+                if (items.Add(item))
+                {
+                    _acknowledged.Remove(agentId); // a fresh change re-arms the gate.
+                }
             }
-            else
+            else if (items.Remove(item) && items.Count == 0)
+            {
+                _acknowledged.Remove(agentId);
+            }
+
+            if (items.Count == 0)
             {
                 _flagged.Remove(agentId);
-                _acknowledged.Remove(agentId);
             }
         }
     }
@@ -231,7 +263,7 @@ public sealed class ChangedTestCommandGate : IMergeGate
     {
         lock (_gate)
         {
-            if (_flagged.Contains(agentId))
+            if (_flagged.ContainsKey(agentId))
             {
                 _acknowledged.Add(agentId);
             }
@@ -243,7 +275,17 @@ public sealed class ChangedTestCommandGate : IMergeGate
     {
         lock (_gate)
         {
-            return _flagged.Contains(agentId) && !_acknowledged.Contains(agentId);
+            return _flagged.ContainsKey(agentId) && !_acknowledged.Contains(agentId);
+        }
+    }
+
+    /// <summary>The drift items currently flagged for an agent (empty when none) — what the reviewer
+    /// is being asked to acknowledge.</summary>
+    public IReadOnlyList<string> FlaggedItems(string agentId)
+    {
+        lock (_gate)
+        {
+            return _flagged.TryGetValue(agentId, out var items) ? items.ToArray() : Array.Empty<string>();
         }
     }
 
@@ -251,9 +293,12 @@ public sealed class ChangedTestCommandGate : IMergeGate
     {
         lock (_gate)
         {
-            if (_flagged.Contains(agentId) && !_acknowledged.Contains(agentId))
+            if (_flagged.TryGetValue(agentId, out var items) && items.Count > 0 && !_acknowledged.Contains(agentId))
             {
-                reason = "the test command changed vs main — acknowledge to merge";
+                // Kept word-for-word for the single-item test-command case: this string is read by the
+                // merge-confirm gate and its tests, and a gate that changes its reason when a NEW,
+                // unrelated item is added would be a silent behaviour change in the old path.
+                reason = $"the {string.Join(" and the ", items)} changed vs main — acknowledge to merge";
                 return false;
             }
         }

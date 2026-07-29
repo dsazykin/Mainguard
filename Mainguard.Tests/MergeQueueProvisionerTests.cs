@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using LibGit2Sharp;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
+using Mainguard.Git.Exceptions;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -95,6 +97,204 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.False(ctx.Queue.CanMerge(AgentId, out _));
     }
 
+    // ---- per-repo toolchain declaration (MG-42) --------------------------
+    //
+    // Every claim below is its OWN test on purpose. xUnit stops a test at its first failing assertion,
+    // so a five-assertion test measures assertion one and merely asserts the rest; when each of these
+    // was re-run against a deliberately broken resolver, the split is what showed WHICH control had
+    // stopped working rather than just that something had.
+
+    /// <summary>
+    /// <b>The security property.</b> A branch that edits <c>.mainguard/toolchain</c> does not get its
+    /// toolchain installed — main's is. The observable is which presence probe the daemon ran in the
+    /// jail: main declares <c>dotnet-10</c>, the branch demands <c>rust-stable</c>, and the daemon must
+    /// probe <c>dotnet --version</c> and never <c>cargo --version</c>.
+    ///
+    /// <para>This is the assertion that separates "we flagged the install" from "we never did the
+    /// install". Flagging alone would be worthless here: the package would already have run its install
+    /// scripts as root, inside the jail, before any human saw the diff.</para>
+    /// </summary>
+    [Fact]
+    public async Task ABranchsToolchain_IsNeverTheOneProvisioned()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "rust-stable");
+
+        var ctx = NewProvisioner(exitCode: 0, out var engine).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        var probed = engine.Commands.Select(c => string.Join(' ', c)).ToList();
+        Assert.Contains("dotnet --version", probed);
+        Assert.DoesNotContain("cargo --version", probed);
+    }
+
+    /// <summary>The branch's toolchain edit arms the RT-D2 gate.</summary>
+    [Fact]
+    public async Task BranchThatChangesTheToolchain_IsFlagged()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "rust-stable");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.True(ctx.ChangedTestCommand!.IsUnacknowledged(AgentId));
+    }
+
+    /// <summary>...and the armed gate actually blocks the merge, naming the toolchain specifically —
+    /// a reason that said "test command" would send the reviewer to the wrong file.</summary>
+    [Fact]
+    public async Task BranchThatChangesTheToolchain_CannotMerge_AndTheReasonNamesTheToolchain()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "rust-stable");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("verification toolchain changed vs main", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>The gate is a gate, not a wall: a human acknowledgment clears it.</summary>
+    [Fact]
+    public async Task AcknowledgingTheToolchainChange_UnblocksTheMerge()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "rust-stable");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.False(ctx.Queue.CanMerge(AgentId, out _));
+
+        ctx.ChangedTestCommand!.Acknowledge(AgentId);
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>
+    /// Adding a declaration where main has none is drift too. Without this the cheapest attack — a repo
+    /// that declares nothing, a branch that adds a line — would be the one case that sailed through.
+    /// </summary>
+    [Fact]
+    public async Task BranchThatAddsAToolchainWhereMainHasNone_IsFlagged()
+    {
+        var repoHash = SeedAndProvision("npm test"); // no main-side toolchain at all
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "dotnet-10");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.True(ctx.ChangedTestCommand!.IsUnacknowledged(AgentId));
+    }
+
+    /// <summary>
+    /// The control. Identical declarations on both sides must NOT flag — a gate that fires on every
+    /// branch is noise, and noise trains reviewers to acknowledge without reading.
+    /// </summary>
+    [Fact]
+    public async Task BranchThatLeavesTheToolchainAlone_IsNotFlagged()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "dotnet-10");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.False(ctx.ChangedTestCommand!.IsUnacknowledged(AgentId));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>A comment or a blank line is not toolchain drift; normalisation is real, not decorative.</summary>
+    [Fact]
+    public async Task AComment_IsNotToolchainDrift()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "# why we need this\n\ndotnet-10   # the SDK");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.False(ctx.ChangedTestCommand!.IsUnacknowledged(AgentId));
+    }
+
+    /// <summary>
+    /// Both files drifting must produce BOTH items in the reason. A reason that mentioned only one
+    /// would let a reviewer acknowledge what they read and merge what they did not.
+    /// </summary>
+    [Fact]
+    public async Task CommandDriftAndToolchainDrift_AreBothNamed()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "true", branchToolchain: "rust-stable");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("test command", reason, StringComparison.Ordinal);
+        Assert.Contains("verification toolchain", reason, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The failure mode that matters. A jail that does not actually carry the declared toolchain must
+    /// raise a typed <see cref="ToolchainProvisioningException"/> and run NOTHING — never a
+    /// <c>NoVerificationCommandException</c> ("nothing to check") and never an ordinary failed record
+    /// ("the agent's code is broken"). Both of those read like verdicts.
+    /// </summary>
+    [Fact]
+    public async Task AJailMissingItsDeclaredToolchain_IsATypedProvisioningFailure()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "dotnet-10");
+
+        // The probe fails; every other exec would succeed.
+        var provisioner = NewProvisioner(
+            exitCode: 0, out var engine, new MergeQueueRegistry(),
+            exitFor: cmd => cmd.Count > 0 && cmd[0] == "dotnet" ? 127 : 0);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        var ex = await Assert.ThrowsAsync<ToolchainProvisioningException>(
+            () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
+
+        Assert.Contains("dotnet-10", ex.Message, StringComparison.Ordinal);
+        // The verify command was never launched — a provisioning failure is not a test result.
+        Assert.DoesNotContain("npm test", engine.Commands.Select(c => string.Join(' ', c)));
+    }
+
+    /// <summary>...and that failure leaves the branch unmergeable rather than quietly Verified.</summary>
+    [Fact]
+    public async Task AJailMissingItsDeclaredToolchain_LeavesTheBranchUnmergeable()
+    {
+        var repoHash = SeedAndProvision("npm test", mainToolchain: "dotnet-10");
+        CommitOnAgentBranch(repoHash, "npm test", branchToolchain: "dotnet-10");
+
+        var ctx = NewProvisioner(
+            exitCode: 0, out _, new MergeQueueRegistry(),
+            exitFor: cmd => cmd.Count > 0 && cmd[0] == "dotnet" ? 127 : 0).EnsureQueue(repoHash)!;
+
+        await Assert.ThrowsAsync<ToolchainProvisioningException>(
+            () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
+
+        Assert.NotEqual(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+        Assert.False(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>
+    /// A repo declaring nothing keeps behaving exactly as it did before this feature existed: no
+    /// probes, no extra execs, straight to the verification command.
+    /// </summary>
+    [Fact]
+    public async Task ARepoWithNoToolchainDeclaration_RunsNoProbes()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        CommitOnAgentBranch(repoHash, "npm test");
+
+        var ctx = NewProvisioner(exitCode: 0, out var engine).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.Equal(new[] { "npm test" }, engine.Commands.Select(c => string.Join(' ', c)));
+    }
+
     [Fact]
     public void EnsureQueue_RegistersTheRepo_AndIsIdempotent()
     {
@@ -149,8 +349,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     private MergeQueueProvisioner NewProvisioner(int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry)
+        => NewProvisioner(exitCode, out engine, registry, exitFor: null);
+
+    private MergeQueueProvisioner NewProvisioner(
+        int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry, Func<IReadOnlyList<string>, int>? exitFor)
     {
-        engine = new FakeSandboxEngine(exitCode);
+        engine = new FakeSandboxEngine(exitCode, exitFor);
         return new MergeQueueProvisioner(
             registry: registry,
             repos: new RepoProvisioner(_vmRoot),
@@ -168,7 +372,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>Seeds a source repo carrying a main-side verification config, then provisions its mirror.</summary>
-    private string SeedAndProvision(string mainVerifyCommand)
+    private string SeedAndProvision(string mainVerifyCommand, string? mainToolchain = null)
     {
         Repository.Init(_source);
         using (var repo = new Repository(_source))
@@ -179,6 +383,11 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         }
 
         WriteAndCommit(_source, MergeQueueProvisioner.VerificationConfigPath, mainVerifyCommand + "\n", "seed verify config");
+        if (mainToolchain is not null)
+        {
+            WriteAndCommit(_source, MergeQueueProvisioner.ToolchainConfigPath, mainToolchain + "\n", "seed toolchain config");
+        }
+
         return new RepoProvisioner(_vmRoot).Provision(_source).RepoHash;
     }
 
@@ -188,16 +397,30 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// when the test is exercising drift, so the "left it alone" control is a genuinely untouched config
     /// rather than a rewrite that happens to be identical.
     /// </summary>
-    private void CommitOnAgentBranch(string repoHash, string branchVerifyCommand)
+    private void CommitOnAgentBranch(string repoHash, string branchVerifyCommand, string? branchToolchain = null)
     {
         var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, AgentId);
         WriteAndCommit(worktree, "feature.cs", "public class Feature { }\n", "the agent's actual work");
 
-        var config = Path.Combine(worktree, MergeQueueProvisioner.VerificationConfigPath);
-        if (!string.Equals(File.ReadAllText(config), branchVerifyCommand + "\n", StringComparison.Ordinal))
+        RewriteIfDifferent(worktree, MergeQueueProvisioner.VerificationConfigPath, branchVerifyCommand, "branch verify config");
+        if (branchToolchain is not null)
         {
-            WriteAndCommit(worktree, MergeQueueProvisioner.VerificationConfigPath, branchVerifyCommand + "\n", "branch verify config");
+            RewriteIfDifferent(worktree, MergeQueueProvisioner.ToolchainConfigPath, branchToolchain, "branch toolchain config");
         }
+    }
+
+    /// <summary>Writes only when the content really differs, so the "left it alone" controls are a
+    /// genuinely untouched file rather than a rewrite that happens to be identical.</summary>
+    private static void RewriteIfDifferent(string worktree, string relPath, string content, string message)
+    {
+        var full = Path.Combine(worktree, relPath);
+        var wanted = content + "\n";
+        if (File.Exists(full) && string.Equals(File.ReadAllText(full), wanted, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        WriteAndCommit(worktree, relPath, wanted, message);
     }
 
     private string MainSha(string repoHash)
@@ -249,17 +472,27 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     private sealed class FakeSandboxEngine : ISandboxEngine
     {
         private readonly int _exitCode;
+        private readonly Func<IReadOnlyList<string>, int>? _exitFor;
 
-        public FakeSandboxEngine(int exitCode) => _exitCode = exitCode;
+        public FakeSandboxEngine(int exitCode, Func<IReadOnlyList<string>, int>? exitFor = null)
+        {
+            _exitCode = exitCode;
+            _exitFor = exitFor;
+        }
 
         public string? LastContainerId { get; private set; }
         public IReadOnlyList<string>? LastCommand { get; private set; }
+
+        /// <summary>EVERY exec, in order — the toolchain presence probes run before the verify command,
+        /// so a test that only ever saw the LAST one could not tell which toolchain was probed.</summary>
+        public List<IReadOnlyList<string>> Commands { get; } = new();
 
         public Task<SandboxExecResult> ExecAsync(string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
         {
             LastContainerId = containerId;
             LastCommand = command;
-            return Task.FromResult(new SandboxExecResult(_exitCode, "output", ""));
+            Commands.Add(command);
+            return Task.FromResult(new SandboxExecResult(_exitFor?.Invoke(command) ?? _exitCode, "output", ""));
         }
 
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default) => throw new NotSupportedException();

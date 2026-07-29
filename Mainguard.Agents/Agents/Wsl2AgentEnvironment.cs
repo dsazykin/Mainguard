@@ -76,6 +76,10 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // ContainerSpecBuilder refuses the "host" opt-out on the way out.
         Sandboxes = new DockerSandboxEngine(docker, new SandboxEngineOptions(
             egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap));
+
+        // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
+        // deliberately not through the jail's default-deny segment, and touching no allowlist.
+        ToolchainImages = new DockerToolchainImageBuilder(docker);
     }
 
     public string SubstrateId => "wsl2";
@@ -91,6 +95,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public ISandboxEngine Sandboxes { get; }
 
     public IEgressPolicy Egress { get; }
+
+    public IToolchainImageBuilder? ToolchainImages { get; }
 
     public SyncRemote ResolveSyncRemote(string repoHash)
         => new(Wsl2SyncRemoteName, $@"{_uncPrefix}\{repoHash}.git");

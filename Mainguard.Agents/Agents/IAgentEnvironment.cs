@@ -56,6 +56,16 @@ public interface IAgentEnvironment
     /// <summary>P2-07 default-deny egress policy (allowlist + proxy posture). Added by P2-07 per ESC §1.2.</summary>
     IEgressPolicy Egress { get; }
 
+    /// <summary>
+    /// Builds the per-repo verification-toolchain layer a repository's <c>.mainguard/toolchain</c>
+    /// declares (see <see cref="ToolchainProvisioner"/>). Defaulted to <c>null</c> — a substrate with
+    /// no image-build capability simply cannot provision toolchains, and the spawn path then refuses
+    /// LOUDLY for a repo that declares one rather than jailing it without the tools. The many
+    /// hand-rolled <see cref="IAgentEnvironment"/> doubles in the test tree inherit the default and
+    /// keep their existing behaviour exactly (no declaration ⇒ nothing changes for them).
+    /// </summary>
+    IToolchainImageBuilder? ToolchainImages => null;
+
     /// <summary>Resolve the ONE host-side sync remote for a provisioned repo (name + opaque URL handle).</summary>
     SyncRemote ResolveSyncRemote(string repoHash);
 }

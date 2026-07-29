@@ -51,8 +51,18 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// credential file holds what THIS spawn sent" is distinguishable from "a file was already there".</param>
     /// <param name="oobKey">The OOB session key delivered to the SUPERVISOR-owned 0400 tmpfs. Null
     /// generates a random one.</param>
-    public async Task<SandboxHandle> SpawnAsync(
+    public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
+        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null, CancellationToken ct = default)
+        => SpawnFromImageAsync(ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, ct);
+
+    /// <summary>
+    /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
+    /// the daemon builds is a DERIVED image, and "the jail actually starts from it and is still
+    /// hardened" is only checkable by spawning from it.
+    /// </summary>
+    public async Task<SandboxHandle> SpawnFromImageAsync(
+        string imageRef, string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null, CancellationToken ct = default)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
@@ -71,7 +81,7 @@ public sealed class SandboxFixture : IAsyncDisposable
                 RepoHash: "sandboxfixture" + Guid.NewGuid().ToString("N")[..8],
                 AgentId: agentId,
                 WorktreePath: worktree,
-                ImageRef: ImageRef,
+                ImageRef: imageRef,
                 Limits: new SandboxLimits(1L * 1024 * 1024 * 1024, 256),
                 Secrets: secrets,
                 AgentUid: agentUid,
@@ -87,7 +97,7 @@ public sealed class SandboxFixture : IAsyncDisposable
             // not exist` failure only appeared on the stacked CI job).
             throw new InvalidOperationException(
                 $"SandboxFixture.SpawnAsync failed. worktree='{worktree}' existsOnDisk={Directory.Exists(worktree)} " +
-                $"tempRoot='{Path.GetTempPath()}' image='{ImageRef}': {ex.Message}", ex);
+                $"tempRoot='{Path.GetTempPath()}' image='{imageRef}': {ex.Message}", ex);
         }
     }
 

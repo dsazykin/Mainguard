@@ -1,0 +1,3 @@
+# The toolchains Mainguard's own verification command needs inside the jail.
+# One catalogued toolchain id per line (see ToolchainCatalog); this file SELECTS, it never describes.
+dotnet-10
