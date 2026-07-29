@@ -164,6 +164,79 @@ public class PackageCacheDockerTests
         Assert.Equal(string.Empty, find.Stdout.Trim());
     }
 
+    // ---- The ownership grant, measured where the runner's uid cannot flatter it -------------------------
+
+    /// <summary>
+    /// The regression this exists for, and the reason it runs the jail as <b>uid 1002</b>.
+    ///
+    /// <para>Every other cache test here uses <c>SandboxFixture.NewTempCache</c>, which chmods 0777 to
+    /// take the runner's uid mapping out of the question — deliberately, because those tests are about
+    /// the MOUNT. This one is about the GRANT, so it uses the shipped <see cref="PackageCacheManager"/>
+    /// against an ordinary VM root (default umask, no chmod, no <c>mainguard-jail</c> group), exactly as
+    /// <c>MergeQueueEndToEndDockerTests</c> builds one per test under <c>/tmp</c>.</para>
+    ///
+    /// <para><b>Why uid 1002.</b> Ask of any assertion: could this pass in an environment where the thing
+    /// under test does not exist? At the image's default uid 1000 it could, and did — on this developer
+    /// box the container's uid 1000 IS the daemon's uid, so the jail is the directory's OWNER and writes
+    /// it whatever the group says. That is precisely why the original grant bug was invisible here and
+    /// failed on CI, whose runner uid is not 1000; it is the same shape as MG-3's attack test going green
+    /// for the wrong reason. Running the jail as an identity that owns nothing and is in no shared group
+    /// reproduces the CI position on EVERY machine, so this probe fails before the fix and passes after
+    /// it in both environments rather than only in one.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ACachePreparedByTheShippedManager_IsWritableByAJailWhoseUidOwnsNothing()
+    {
+        await using var fx = new SandboxFixture();
+        var manager = new PackageCacheManager(fx.NewTempVmRoot());
+        var usage = manager.Prepare("repo", "grant-probe");
+        _out.WriteLine(usage.Describe());
+
+        var handle = await fx.SpawnAsync(
+            agentId: "grant-probe", agentUid: 1002, supervisorUid: 1003,
+            packageCachePath: manager.PathFor("repo", "grant-probe"));
+
+        var write = await fx.Engine.ExecAsync(
+            handle.ContainerId,
+            new[] { "sh", "-c", $"echo hello > {PackageCachePolicy.SandboxMount}/probe && echo WROTE" },
+            CancellationToken.None);
+        _out.WriteLine($"write as uid 1002 => exit {write.ExitCode}: {write.Stdout.Trim()} {write.Stderr.Trim()}");
+
+        Assert.Equal("WROTE", write.Stdout.Trim());
+    }
+
+    /// <summary>
+    /// The same grant, one level deeper: a package manager does not write a file at the mount root, it
+    /// creates a tree. Inverted separately because a leaf that is writable but hands its children the
+    /// wrong group (no setgid) breaks on the SECOND level, after restore has already started — which is
+    /// the mid-restore failure this feature exists to remove.
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task AJailWhoseUidOwnsNothing_CanCreateTheNestedTreeARestoreNeeds()
+    {
+        await using var fx = new SandboxFixture();
+        var manager = new PackageCacheManager(fx.NewTempVmRoot());
+        manager.Prepare("repo", "grant-nested");
+
+        var handle = await fx.SpawnAsync(
+            agentId: "grant-nested", agentUid: 1002, supervisorUid: 1003,
+            packageCachePath: manager.PathFor("repo", "grant-nested"));
+
+        var write = await fx.Engine.ExecAsync(
+            handle.ContainerId,
+            new[]
+            {
+                "sh", "-c",
+                $"mkdir -p {PackageCachePolicy.SandboxMount}/nuget/packages/pkg/1.0.0 "
+                + $"&& echo x > {PackageCachePolicy.SandboxMount}/nuget/packages/pkg/1.0.0/.nupkg.metadata "
+                + "&& echo WROTE",
+            },
+            CancellationToken.None);
+        _out.WriteLine($"nested write as uid 1002 => exit {write.ExitCode}: {write.Stdout.Trim()} {write.Stderr.Trim()}");
+
+        Assert.Equal("WROTE", write.Stdout.Trim());
+    }
+
     // ---- Cross-tenant isolation, in real containers -----------------------------------------------------
 
     [RequiresDockerFact]

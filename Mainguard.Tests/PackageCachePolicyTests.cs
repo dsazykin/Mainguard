@@ -329,6 +329,66 @@ public class PackageCachePolicyTests
         // largest such tree by far.
         => Assert.DoesNotContain("chown -R", UsernsRemapPolicy.MountOwnershipScript("/vm"), StringComparison.Ordinal);
 
+    // ---- The ownership grant (MG-17) --------------------------------------------------------------
+
+    [Fact]
+    public void ACacheRootOwnedByTheJailGroup_TakesTheSharedGroupGrant()
+        // The production substrate: MountOwnershipScript made caches/ `2775 mainguard:mainguard-jail`,
+        // so the setgid parent hands that group down and group-write is the whole grant.
+        => Assert.Equal(
+            PackageCacheGrant.SharedJailGroup,
+            PackageCachePolicy.DecideGrant(UsernsRemapPolicy.AgentHostGid));
+
+    [Theory]
+    [InlineData(1000)]   // a developer box: the daemon's own group
+    [InlineData(1001)]   // a GitHub Actions runner
+    [InlineData(0)]      // root-owned, never provisioned
+    [InlineData(-1)]     // the gid could not be read at all
+    public void ACacheRootNotOwnedByTheJailGroup_TakesTheModeOnlyGrant(int gid)
+        // Every one of these is a machine where no group the daemon can name reaches the jail. Asserted
+        // per gid rather than as one "anything else" case: -1 in particular is the read-failure path, and
+        // a decision function that threw or defaulted the other way there would take the product down.
+        => Assert.Equal(PackageCacheGrant.ModeOnly, PackageCachePolicy.DecideGrant(gid));
+
+    [Fact]
+    public void TheSharedGroupGrant_DoesNotMakeTheLeafWorldWritable()
+        // The production posture, pinned. If a future edit made the fallback unconditional, THIS is the
+        // assertion that says so — the shipped substrate must never widen past its group.
+        => Assert.False(
+            PackageCachePolicy.LeafMode(PackageCacheGrant.SharedJailGroup).HasFlag(UnixFileMode.OtherWrite));
+
+    [Fact]
+    public void TheModeOnlyGrant_DoesMakeTheLeafWorldWritable()
+        // …and the converse, because "not world-writable" is also satisfied by a fallback that does
+        // nothing at all, which is exactly the bug this replaced.
+        => Assert.True(
+            PackageCachePolicy.LeafMode(PackageCacheGrant.ModeOnly).HasFlag(UnixFileMode.OtherWrite));
+
+    [Theory]
+    [InlineData(PackageCacheGrant.SharedJailGroup)]
+    [InlineData(PackageCacheGrant.ModeOnly)]
+    public void EveryGrant_KeepsSetgidOnTheLeaf(PackageCacheGrant grant)
+        // Without setgid the leaf's group stops propagating and a restore fails on the SECOND directory
+        // it creates — mid-restore, which is the failure mode this whole feature exists to remove.
+        => Assert.True(PackageCachePolicy.LeafMode(grant).HasFlag(UnixFileMode.SetGroup));
+
+    [Theory]
+    [InlineData(PackageCacheGrant.SharedJailGroup)]
+    [InlineData(PackageCacheGrant.ModeOnly)]
+    public void EveryGrant_KeepsGroupWriteOnTheLeaf(PackageCacheGrant grant)
+        => Assert.True(PackageCachePolicy.LeafMode(grant).HasFlag(UnixFileMode.GroupWrite));
+
+    [Fact]
+    public void TheParentDirectories_AreNeverWorldWritable_UnderAnyGrant()
+    {
+        // The blast radius of the fallback is ONE leaf. The cache root and the per-repo directory are
+        // never mounted into any jail, so they never need the "other" write bit, and keeping it off them
+        // is what stops "the fallback" meaning "the whole cache tree is world-writable".
+        Assert.False(PackageCachePolicy.ParentMode.HasFlag(UnixFileMode.OtherWrite));
+        Assert.True(PackageCachePolicy.ParentMode.HasFlag(UnixFileMode.OtherExecute), "the kernel must still traverse to the leaf");
+        Assert.True(PackageCachePolicy.ParentMode.HasFlag(UnixFileMode.SetGroup));
+    }
+
     // ---- The budget's floor ----------------------------------------------------------------------
 
     [Fact]

@@ -57,14 +57,20 @@ public class VerifyInJailDockerTests
 
         var e2eRoot = E2ERoot();
         var worktree = Path.Combine(e2eRoot, "workspace");
-        var cacheDir = Path.Combine(e2eRoot, PackageCachePolicy.CachesDirectoryName, "verify-e2e", "agent-1");
-        Directory.CreateDirectory(cacheDir);
-        MakeGroupAndWorldWritable(cacheDir);
+
+        // The cache comes from the SHIPPED manager, against an ordinary VM root with no group
+        // provisioning — so the grant this run depends on is the product's, not a chmod the test did.
+        // (The worktree still gets one below: making /workspace reachable is MG-3/MG-17's business, not
+        // this test's, and there is no product code path that grants it outside the boot step.)
+        var caches = new PackageCacheManager(e2eRoot, log: _out.WriteLine);
+        var cacheUsage = caches.Prepare("verify-e2e", "agent-1");
+        var cacheDir = caches.PathFor("verify-e2e", "agent-1");
+        _out.WriteLine(cacheUsage.Describe());
 
         // A clean copy of the tracked tree — never the live worktree, and never with bin/obj carried in
         // (a stale Debug output is exactly the "MSBuild skipped the rebuild" trap this suite warns about).
         CopyTrackedTree(repoRoot, worktree, _out.WriteLine);
-        MakeGroupAndWorldWritable(worktree);
+        MakeJailWritable(worktree);
 
         await using var fx = new SandboxFixture();
 
@@ -252,7 +258,7 @@ public class VerifyInJailDockerTests
     /// daemon itself cannot chown into the remapped range). Making the mode permissive removes the
     /// runner's uid mapping from the question so this test measures the CACHE rather than the box.
     /// </summary>
-    private static void MakeGroupAndWorldWritable(string root)
+    private static void MakeJailWritable(string root)
     {
         if (OperatingSystem.IsWindows())
         {

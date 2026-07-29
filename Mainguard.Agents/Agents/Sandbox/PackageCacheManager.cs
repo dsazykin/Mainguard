@@ -26,7 +26,8 @@ public sealed record PackageCacheUsage(
     long BudgetBytes,
     IReadOnlyList<PackageCacheEntry> Entries,
     int EvictedCount,
-    long EvictedBytes)
+    long EvictedBytes,
+    PackageCacheGrant Grant = PackageCacheGrant.SharedJailGroup)
 {
     /// <summary>Percent of budget consumed (0 when the budget is somehow zero — never a divide).</summary>
     public double PercentUsed => BudgetBytes <= 0 ? 0 : 100d * UsedBytes / BudgetBytes;
@@ -35,7 +36,7 @@ public sealed record PackageCacheUsage(
     public string Describe() => string.Create(CultureInfo.InvariantCulture,
         $"package cache {RootPath}: {PackageCachePolicy.Bytes(UsedBytes)} of "
         + $"{PackageCachePolicy.Bytes(BudgetBytes)} ({PercentUsed:0.#}%) across {Entries.Count} cache(s); "
-        + $"evicted {EvictedCount} ({PackageCachePolicy.Bytes(EvictedBytes)}) this pass");
+        + $"evicted {EvictedCount} ({PackageCachePolicy.Bytes(EvictedBytes)}) this pass; grant {Grant}");
 }
 
 /// <summary>
@@ -88,6 +89,9 @@ public sealed class PackageCacheManager
     /// <summary>The caches this daemon currently owns a live jail for; never evicted.</summary>
     private readonly HashSet<string> _leases = new(StringComparer.Ordinal);
 
+    /// <summary>Resolved once; see <see cref="Grant"/>.</summary>
+    private PackageCacheGrant? _grant;
+
     /// <param name="vmRoot">The VM base directory, shared with the provisioner and worktree manager.</param>
     /// <param name="budgetBytes">The ceiling for the whole cache root. Refused below
     /// <see cref="PackageCachePolicy.MinimumBudgetBytes"/> — see that constant for why a too-small
@@ -116,6 +120,8 @@ public sealed class PackageCacheManager
     /// <summary>The cache root the budget is measured over.</summary>
     public string RootPath => PackageCachePolicy.CacheRoot(_vmRoot);
 
+    private string CacheRootPath => RootPath;
+
     /// <summary>The budget in force.</summary>
     public long BudgetBytes => _budgetBytes;
 
@@ -138,23 +144,35 @@ public sealed class PackageCacheManager
 
             try
             {
-                Directory.CreateDirectory(path);
+                // The WHOLE chain, each level shared as it is created. The MG-17 invariant is a property
+                // of the PARENT — a setgid parent hands its group to everything made underneath — so
+                // creating the leaf alone and sharing only that leaves the chain unformed on any VM root
+                // the boot step never provisioned. That is not hypothetical: it is exactly how this
+                // failed against the merge-queue end-to-end suite, which builds a fresh VM root under
+                // /tmp per test, where the daemon's umask 022 left the leaf 0755 owned by the test user
+                // and the jail — a different uid, in no shared group — could not write it.
+                ApplyGrantLocked(Directory.CreateDirectory(CacheRootPath), PackageCachePolicy.ParentMode);
+                ApplyGrantLocked(
+                    Directory.CreateDirectory(PackageCachePolicy.RepoCacheDirectory(_vmRoot, repoHash)),
+                    PackageCachePolicy.ParentMode);
+                ApplyGrantLocked(Directory.CreateDirectory(path), PackageCachePolicy.LeafMode(Grant));
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 throw new PackageCacheUnavailableException(RootPath, path, $"it could not be created: {ex.Message}");
             }
 
-            // The daemon's umask is 022 and umask is not inherited from a parent directory, so the setgid
-            // group that `caches/` hands down is only half the grant — the jail also needs the write bit.
-            // Same reasoning, and the same fix, as the per-agent git dir's core.sharedRepository=group.
-            TryGroupShare(path);
-
+            // NOTE: this checks the DAEMON's own access, and it is deliberately not the guard for the
+            // jail's. The daemon owns the directory, so on any machine it passes regardless of whether
+            // the jail can write a byte — that is precisely the "green for the wrong reason" shape MG-3
+            // was burned by. It is here only to turn a broken disk / read-only mount into a failure the
+            // daemon can name. The jail's access is proven where it can actually be observed: by
+            // DockerSandboxEngine's probe, INSIDE the started container.
             if (!IsWritableDirectory(path))
             {
                 throw new PackageCacheUnavailableException(RootPath, path,
-                    "the daemon cannot write to it, so the jail (which reaches it through the shared "
-                    + $"'{UsernsRemapPolicy.JailGroupName}' group, not as its owner) certainly cannot");
+                    "even the daemon, which owns it, cannot write to it — the filesystem is read-only, "
+                    + "full, or the mode was changed underneath us");
             }
 
             MarkUsed(repoHash, agentId);
@@ -196,7 +214,7 @@ public sealed class PackageCacheManager
         lock (_gate)
         {
             var entries = ReadEntriesLocked();
-            return new PackageCacheUsage(RootPath, entries.Sum(e => e.Bytes), _budgetBytes, entries, 0, 0);
+            return new PackageCacheUsage(RootPath, entries.Sum(e => e.Bytes), _budgetBytes, entries, 0, 0, Grant);
         }
     }
 
@@ -208,7 +226,7 @@ public sealed class PackageCacheManager
         var used = entries.Sum(e => e.Bytes);
         if (used <= _budgetBytes)
         {
-            return new PackageCacheUsage(RootPath, used, _budgetBytes, entries, 0, 0);
+            return new PackageCacheUsage(RootPath, used, _budgetBytes, entries, 0, 0, Grant);
         }
 
         var evicted = 0;
@@ -240,7 +258,7 @@ public sealed class PackageCacheManager
                 RootPath, remainingBytes, _budgetBytes, remaining.Count(e => e.InUse));
         }
 
-        return new PackageCacheUsage(RootPath, remainingBytes, _budgetBytes, remaining, evicted, evictedBytes);
+        return new PackageCacheUsage(RootPath, remainingBytes, _budgetBytes, remaining, evicted, evictedBytes, Grant);
     }
 
     private IReadOnlyList<PackageCacheEntry> ReadEntriesLocked()
@@ -483,12 +501,13 @@ public sealed class PackageCacheManager
     }
 
     /// <summary>
-    /// Group-rwx + setgid on the cache directory itself (MG-17). Deliberately NOT recursive and
-    /// deliberately not a chown: the daemon runs unprivileged and cannot chown into the remapped range,
-    /// and the CONTENT below is written by the jail — as the remapped uid, under the group the setgid bit
-    /// hands down — so it is already correct without the daemon touching it.
+    /// Applies <paramref name="mode"/> to one directory in the cache chain. Deliberately NOT recursive
+    /// and deliberately not a chown: the daemon runs unprivileged and cannot chown into the remapped
+    /// range, and the CONTENT below is written by the jail — as its own uid, under the group the setgid
+    /// bit hands down — so it is already correct without the daemon touching it. Re-applied on every
+    /// spawn, so a mode changed underneath the daemon heals rather than festering.
     /// </summary>
-    private void TryGroupShare(string path)
+    private void ApplyGrantLocked(DirectoryInfo directory, UnixFileMode mode)
     {
         if (OperatingSystem.IsWindows())
         {
@@ -497,14 +516,77 @@ public sealed class PackageCacheManager
 
         try
         {
-            var mode = File.GetUnixFileMode(path)
-                       | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
-                       | UnixFileMode.SetGroup;
-            File.SetUnixFileMode(path, mode);
+            File.SetUnixFileMode(directory.FullName, mode);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
         {
-            _log?.Invoke($"package cache could not set group sharing on '{path}': {ex.Message}");
+            _log?.Invoke($"package cache could not set mode on '{directory.FullName}': {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Which grant this cache root actually supports — resolved ONCE per manager and then reported on
+    /// every spawn (see <see cref="PackageCacheGrant"/> for what each rung means and why the fallback
+    /// does not weaken the cross-tenant property).
+    ///
+    /// <para>Resolved from the cache root's group id, which is the one observable that answers the
+    /// question, and read with <c>stat -c %g</c> — the same tool, on the same fact, that
+    /// <see cref="UsernsRemapPolicy.MountOwnershipScript"/> already guards its own recursive pass with.
+    /// .NET exposes a file's MODE but not its owning gid, so there is no managed alternative short of a
+    /// libc P/Invoke whose symbol name is not stable across the distributions this ships to.</para>
+    ///
+    /// <para>Cached because it cannot change under a running daemon: the only thing that sets it is the
+    /// boot step, which runs before the daemon starts and restarts it when it changes the group.</para>
+    /// </summary>
+    public PackageCacheGrant Grant => _grant ??= ResolveGrant();
+
+    private PackageCacheGrant ResolveGrant()
+    {
+        var gid = ReadGroupId(CacheRootPath);
+        var grant = PackageCachePolicy.DecideGrant(gid);
+        _log?.Invoke(string.Create(CultureInfo.InvariantCulture,
+            $"package cache grant for '{CacheRootPath}': {grant} (root gid {gid}, jail gid "
+            + $"{UsernsRemapPolicy.AgentHostGid})"));
+        return grant;
+    }
+
+    /// <summary>The directory's owning gid, or -1 when it cannot be read (Windows, no <c>stat</c>, an
+    /// error). -1 is a value <see cref="PackageCachePolicy.DecideGrant"/> handles explicitly.</summary>
+    private static int ReadGroupId(string path)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return -1;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(path);
+            var psi = new System.Diagnostics.ProcessStartInfo("stat")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            psi.ArgumentList.Add("-c");
+            psi.ArgumentList.Add("%g");
+            psi.ArgumentList.Add(path);
+
+            using var process = System.Diagnostics.Process.Start(psi);
+            if (process is null)
+            {
+                return -1;
+            }
+
+            var output = process.StandardOutput.ReadToEnd();
+            process.WaitForExit(5000);
+            return int.TryParse(output.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var gid)
+                ? gid
+                : -1;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+                                       or System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return -1;
         }
     }
 }

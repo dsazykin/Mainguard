@@ -96,6 +96,83 @@ public class PackageCacheManagerTests : IDisposable
         Assert.True(File.Exists(blob));
     }
 
+    // ---- The ownership grant is applied to the WHOLE chain -------------------------------------------
+
+    [Fact]
+    public void Prepare_AppliesTheGrantToTheLeaf()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        // The bug this replaced: only the leaf was touched, and only with `g+rwX`, so on a VM root the
+        // boot step never provisioned the leaf stayed 0755 owned by the daemon — and a jail that is
+        // neither the owner nor in its group (every CI runner) could not write a byte.
+        var manager = NewManager();
+        manager.Prepare("repo1", "agent-a");
+
+        Assert.Equal(
+            PackageCachePolicy.LeafMode(manager.Grant),
+            File.GetUnixFileMode(manager.PathFor("repo1", "agent-a")));
+    }
+
+    [Fact]
+    public void Prepare_AppliesTheGrantToTheCacheRoot()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        // The MG-17 invariant is a property of the PARENT, so the chain has to be formed from the root
+        // down. Asserted separately from the leaf: creating the leaf correctly while leaving the root at
+        // whatever umask produced passes the assertion above and still breaks the setgid propagation.
+        var manager = NewManager();
+        manager.Prepare("repo1", "agent-a");
+
+        Assert.Equal(PackageCachePolicy.ParentMode, File.GetUnixFileMode(manager.RootPath));
+    }
+
+    [Fact]
+    public void Prepare_AppliesTheGrantToThePerRepoDirectory()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var manager = NewManager();
+        manager.Prepare("repo1", "agent-a");
+
+        Assert.Equal(
+            PackageCachePolicy.ParentMode,
+            File.GetUnixFileMode(Path.GetDirectoryName(manager.PathFor("repo1", "agent-a"))!));
+    }
+
+    [Fact]
+    public void OnAMachineWithNoJailGroup_TheGrantIsModeOnly()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        // A temp root under /tmp is owned by the test process's own group, never gid 101000 — the same
+        // position as a CI runner and as the merge-queue end-to-end suite's per-test VM root. The grant
+        // has to resolve to the rung that actually reaches the jail there, or nothing does.
+        Assert.Equal(PackageCacheGrant.ModeOnly, NewManager().Grant);
+    }
+
+    [Fact]
+    public void TheGrant_IsReportedInTheUsageLine()
+        // A fallback that is taken quietly is the failure class this codebase keeps finding. It has to
+        // be in the line the spawn path logs, so a production daemon sitting on the wrong rung says so.
+        => Assert.Contains(
+            NewManager().Prepare("repo1", "agent-a").Grant.ToString(),
+            NewManager().Prepare("repo1", "agent-b").Describe(),
+            StringComparison.Ordinal);
+
     // ---- Release ------------------------------------------------------------------------------------
 
     [Fact]

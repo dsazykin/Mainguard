@@ -8,6 +8,51 @@ using System.Linq;
 namespace Mainguard.Agents.Agents.Sandbox;
 
 /// <summary>
+/// MG-43 — how the daemon hands a bind-mount source to an identity it cannot name.
+///
+/// <para>The jail's HOST-side identity is not knowable to the daemon: with MG-17's userns-remap in force
+/// the agent runs as host uid/gid <see cref="UsernsRemapPolicy.AgentHostUid"/> (101000), and without it
+/// the container's uid 1000 is host uid 1000. The daemon is unprivileged either way — it cannot chown
+/// into the remapped range, and .NET gives it no way to chgrp at all — so there are exactly two
+/// mechanisms by which a directory it owns can be made writable by that identity, and which one applies
+/// is a property of the machine, not a preference.</para>
+/// </summary>
+public enum PackageCacheGrant
+{
+    /// <summary>
+    /// The MG-17 grant: the cache root is group-owned by <see cref="UsernsRemapPolicy.JailGroupName"/>
+    /// (gid <see cref="UsernsRemapPolicy.AgentHostGid"/>), so a setgid parent hands that group down to
+    /// every directory created under it and group-write is all the jail needs. This is the shipped
+    /// substrate, provisioned at boot by <see cref="UsernsRemapPolicy.MountOwnershipScript"/>, and the
+    /// cache leaf stays <c>2775</c> — NOT writable by anything outside the group.
+    /// </summary>
+    SharedJailGroup,
+
+    /// <summary>
+    /// The grant of last resort, used when the cache root is <b>not</b> group-owned by the jail gid — a
+    /// developer box, a CI runner, or any VM root the boot step never provisioned (the merge-queue
+    /// end-to-end suite builds one per test under <c>/tmp</c>). There is no group the daemon can name
+    /// that the jail is in, so the only remaining channel is the mode's "other" bits, and the cache LEAF
+    /// alone becomes <c>2777</c>.
+    ///
+    /// <para><b>Why this is not a weakened security property.</b> The leaf is reachable from a jail only
+    /// through that jail's own bind mount — no jail mounts the root or the per-repo directory, and inside
+    /// a container <c>..</c> from a bind-mount root is the container's parent, not the host's. So the
+    /// cross-tenant property this subsystem exists to hold (agent A cannot write agent B's cache) is
+    /// unchanged: it rests on the mount topology, not on the mode. What the "other" bits add is reach for
+    /// other <i>host</i> users, and on MainguardEnv there are none besides root, which is omnipotent
+    /// regardless. On the machines where this rung is actually taken — a dev box, a CI runner — every
+    /// other bind-mount source in the test (the worktree, the per-agent repo) is already owned by the
+    /// same unprivileged test user.</para>
+    ///
+    /// <para>It is nevertheless <b>reported</b> on every spawn (<c>PackageCacheUsage.Describe()</c>)
+    /// rather than taken quietly, because a production daemon that finds itself here has a boot step that
+    /// did not run, and that is worth seeing in a log.</para>
+    /// </summary>
+    ModeOnly,
+}
+
+/// <summary>
 /// MG-43 — the pure, IO-free heart of the daemon-owned package cache: where it lives on the VM, where
 /// it appears in the jail, what a package manager is told to put in it, how big it may get, and how a
 /// jail proves it really has one. Everything here is a constant or a string builder, so the whole policy
@@ -185,6 +230,51 @@ public static class PackageCachePolicy
 
         return false;
     }
+
+    // ---- The ownership grant (pure decision; the IO lives in PackageCacheManager) -----------------
+
+    /// <summary>
+    /// Which grant applies, given the group id the cache ROOT actually carries on disk.
+    ///
+    /// <para>The root's gid is the one observable that answers the question. MG-17 provisions
+    /// <c>caches/</c> as <c>2775 mainguard:mainguard-jail</c>, so a root whose gid IS
+    /// <see cref="UsernsRemapPolicy.AgentHostGid"/> proves both that the group exists and that the daemon
+    /// can reach the jail through it (boot adds the daemon to that group in the same step, and the
+    /// setgid bit propagates it to every child). Any other gid means that provisioning did not happen for
+    /// THIS root, and no amount of group-permission setting by an unprivileged daemon will reach the
+    /// jail.</para>
+    ///
+    /// <para><paramref name="cacheRootGid"/> is negative when the gid could not be read at all. That
+    /// resolves to <see cref="PackageCacheGrant.ModeOnly"/> — the rung that works everywhere — because
+    /// the alternative is a jail that cannot write its cache and a spawn that refuses, i.e. an
+    /// unreadable stat taking the whole product down. The choice is reported either way.</para>
+    /// </summary>
+    public static PackageCacheGrant DecideGrant(int cacheRootGid)
+        => cacheRootGid == UsernsRemapPolicy.AgentHostGid
+            ? PackageCacheGrant.SharedJailGroup
+            : PackageCacheGrant.ModeOnly;
+
+    /// <summary>
+    /// The mode the per-agent cache LEAF carries under <paramref name="grant"/>: <c>2775</c> for
+    /// <see cref="PackageCacheGrant.SharedJailGroup"/>, <c>2777</c> for
+    /// <see cref="PackageCacheGrant.ModeOnly"/>. setgid in both cases, so whatever group the leaf has
+    /// keeps propagating to the package directories the jail creates under it.
+    /// </summary>
+    public static UnixFileMode LeafMode(PackageCacheGrant grant)
+        => ParentMode | (grant == PackageCacheGrant.ModeOnly
+            ? UnixFileMode.OtherWrite
+            : UnixFileMode.None);
+
+    /// <summary>
+    /// <c>2775</c> — the mode for the cache ROOT and the per-repo directory, under either grant. These
+    /// are never mounted into any jail, so they need no "other" write bit even when the leaf does; the
+    /// "other" read+execute they keep is only so the kernel can traverse to the leaf.
+    /// </summary>
+    public static UnixFileMode ParentMode =>
+        UnixFileMode.SetGroup
+        | UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+        | UnixFileMode.OtherRead | UnixFileMode.OtherExecute;
 
     // ---- What a package manager is told (pure) ---------------------------------------------------
 

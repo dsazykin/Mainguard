@@ -312,6 +312,19 @@ public sealed class SandboxFixture : IAsyncDisposable
         return path;
     }
 
+    /// <summary>
+    /// MG-43 — a fresh, ordinary VM root (default umask, no chmod, no group provisioning), the way the
+    /// merge-queue end-to-end suite builds one per test. Handed to a real <c>PackageCacheManager</c> so
+    /// the SHIPPED grant logic is what makes the cache reachable, rather than a test helper's 0777.
+    /// </summary>
+    public string NewTempVmRoot()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-vm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        _tempWorktrees.Add(path);
+        return path;
+    }
+
     /// <summary>MG-43 — a cache directory NOTHING can write, whatever uid the runner maps the jail to.
     /// The point of mode 0500 (rather than "owned by someone else") is that it is unwritable to the
     /// owner too, so the refusal it provokes cannot be an artefact of this box's uid mapping.</summary>
