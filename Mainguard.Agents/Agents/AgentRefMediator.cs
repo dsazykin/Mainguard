@@ -91,6 +91,10 @@ public sealed class AgentRefMediator
     private readonly Func<string, string> _bareRepoPathFor;
     private readonly Action<AgentRefPublishResult>? _observer;
 
+    // One in-flight publish per agent. Bounded by the agents this mediator has ever published (one
+    // mediator per WorktreeManager, one small object per agent id); see Publish for why it exists.
+    private readonly ConcurrentDictionary<(string RepoHash, string AgentId), object> _gates = new();
+
     /// <param name="agentRepos">Locates each agent's own repository (the fetch source).</param>
     /// <param name="bareRepoPathFor">repoHash → the shared mirror (the fetch destination).</param>
     /// <param name="observer">Receives every outcome; refusals are the interesting half.</param>
@@ -107,10 +111,33 @@ public sealed class AgentRefMediator
     /// <summary>Carries <c>refs/heads/agent/&lt;id&gt;</c> from the agent's own repository into the
     /// mirror, subject to the four rules. Never throws: an unreadable repo is an outcome, not an
     /// exception, because every caller is on a path (verification, a review, a watcher tick) that must
-    /// not be taken down by housekeeping.</summary>
+    /// not be taken down by housekeeping.
+    ///
+    /// <para><b>One publish per agent at a time.</b> Design §7 resolved the fetch trigger to "both", so
+    /// two publishes for the SAME agent overlapping is not an edge case — it is the normal shape: the
+    /// watcher sweeps on its own clock while the merge queue and the review cockpit publish immediately
+    /// before they read the mirror. Overlapped, nothing unsafe happens (every rule is re-checked against
+    /// what was actually read, and the final move is still a compare-and-swap), but the outcome stops
+    /// telling the truth: both publishes share the one quarantine ref
+    /// <c>refs/mainguard/incoming/&lt;id&gt;</c> and each deletes it in its <c>finally</c>, so the loser
+    /// either resolves a ref the winner already removed (<see cref="AgentRefPublishOutcome.NothingToPublish"/>,
+    /// "the fetched ref resolved to nothing") or loses the CAS (<see cref="AgentRefPublishOutcome.Failed"/>)
+    /// — for a mirror that is in fact carrying exactly the tip the caller asked for. That matters because
+    /// <c>Current</c> is what <c>PublishAgentBranch</c> returns and what the watcher uses to decide
+    /// whether the agent is caught up. Serializing here makes the answer match the mirror. The CAS is
+    /// unchanged and still load-bearing: it is what covers a second <i>process</i>, which no lock can.</para>
+    /// </summary>
     public AgentRefPublishResult Publish(string repoHash, string agentId)
     {
-        var result = PublishCore(repoHash, agentId);
+        var gate = _gates.GetOrAdd((repoHash, agentId), static _ => new object());
+        AgentRefPublishResult result;
+        lock (gate)
+        {
+            result = PublishCore(repoHash, agentId);
+        }
+
+        // Outside the lock: the observer is the audit/warning sink, and housekeeping must not hold a
+        // publish gate while someone else's I/O runs.
         _observer?.Invoke(result);
         return result;
     }
@@ -257,7 +284,11 @@ public sealed class AgentRefMediator
 ///
 /// <para><see cref="PollOnce"/> is public and does one complete sweep, so the behaviour is testable
 /// without sleeping on a background loop — a timing-dependent test is a flake generator, and a test
-/// that sleeps "long enough" is exactly the kind that keeps passing after the loop stops running.</para>
+/// that sleeps "long enough" is exactly the kind that keeps passing after the loop stops running.
+/// <b>But <see cref="Watch"/> starts the loop</b>, so calling <see cref="PollOnce"/> on a watcher built
+/// with a real interval means competing with the watcher's own sweep for the same snapshot delta — the
+/// caller's sweep then sees nothing (the loop consumed the change) or collides with it. A caller that
+/// needs its sweep to be the only mover must build the watcher with <see cref="DriveManually"/>.</para>
 /// </summary>
 public sealed class AgentRefWatcher : IDisposable
 {
@@ -265,11 +296,28 @@ public sealed class AgentRefWatcher : IDisposable
     /// idle agents cost nothing measurable.</summary>
     public static readonly TimeSpan DefaultInterval = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// Interval sentinel: run NO background sweep loop — the caller drives <see cref="PollOnce"/> itself
+    /// and is therefore the only thing that can move the mirror.
+    ///
+    /// <para>This is not "the loop off for convenience". A caller that hand-cranks <see cref="PollOnce"/>
+    /// while <see cref="Watch"/> has also started the 1 Hz loop is racing itself: the change signal is a
+    /// snapshot delta, so whichever sweep gets there first consumes it and the other observes nothing —
+    /// which under load turns "the ref moved" into an intermittent no-op. Making the absence of the loop
+    /// explicit is what lets such a caller assert on its own sweep at all.</para>
+    ///
+    /// <para>The daemon never uses this, and the seam cannot hide a dead loop: the background sweep is
+    /// covered on its own by a test that starts a real watcher, touches nothing else, and waits for the
+    /// publish to arrive.</para>
+    /// </summary>
+    public static readonly TimeSpan DriveManually = Timeout.InfiniteTimeSpan;
+
     private readonly ConcurrentDictionary<(string RepoHash, string AgentId), string> _watched = new();
     private readonly AgentRefMediator _mediator;
     private readonly AgentRepoManager _agentRepos;
     private readonly TimeSpan _interval;
     private readonly CancellationTokenSource _stop = new();
+    private readonly object _loopGate = new();
     private Task? _loop;
 
     public AgentRefWatcher(AgentRefMediator mediator, AgentRepoManager agentRepos, TimeSpan? interval = null)
@@ -369,39 +417,77 @@ public sealed class AgentRefWatcher : IDisposable
 
     private void EnsureLoopRunning()
     {
-        if (_loop is not null || _stop.IsCancellationRequested)
+        if (_interval == DriveManually || _loop is not null || _stop.IsCancellationRequested)
         {
             return;
         }
 
-        _loop = Task.Run(async () =>
+        // Watch() is called once per spawning agent and spawns run in parallel, so the check-then-assign
+        // has to be atomic — two loops would double every sweep, and two sweeps of the same agent are
+        // exactly the collision AgentRefMediator.Publish now has to serialize away.
+        lock (_loopGate)
         {
-            while (!_stop.IsCancellationRequested)
+            if (_loop is not null || _stop.IsCancellationRequested)
             {
-                try
-                {
-                    PollOnce();
-                }
-                catch
-                {
-                    // A watcher must never be the thing that takes the daemon down.
-                }
-
-                try
-                {
-                    await Task.Delay(_interval, _stop.Token).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
+                return;
             }
-        });
+
+            var token = _stop.Token;
+            _loop = Task.Run(async () =>
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    try
+                    {
+                        PollOnce();
+                    }
+                    catch
+                    {
+                        // A watcher must never be the thing that takes the daemon down.
+                    }
+
+                    try
+                    {
+                        await Task.Delay(_interval, token).ConfigureAwait(false);
+                    }
+                    catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException)
+                    {
+                        return;
+                    }
+                }
+            });
+        }
     }
 
+    /// <summary>
+    /// Stops the sweep loop and waits for the sweep in flight before releasing anything.
+    ///
+    /// <para>The wait is the point. Cancelling and returning leaves a <see cref="PollOnce"/> mid-git
+    /// against directories the caller is usually about to delete (teardown, or a test's temp VM root),
+    /// and disposing the <see cref="CancellationTokenSource"/> underneath a loop parked on
+    /// <c>Task.Delay(_stop.Token)</c> throws <see cref="ObjectDisposedException"/> out of it — not the
+    /// <see cref="OperationCanceledException"/> the loop is written to expect — faulting the task
+    /// unobserved.</para>
+    /// </summary>
     public void Dispose()
     {
         _stop.Cancel();
+
+        Task? loop;
+        lock (_loopGate)
+        {
+            loop = _loop;
+        }
+
+        try
+        {
+            loop?.Wait(TimeSpan.FromSeconds(10));
+        }
+        catch
+        {
+            // A cancelled or faulted sweep is not a disposal failure.
+        }
+
         _stop.Dispose();
     }
 }
