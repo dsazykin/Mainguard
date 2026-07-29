@@ -64,6 +64,7 @@ public partial class ReviewCockpitViewModel : ViewModelBase
 {
     private readonly ReviewCockpitContext _ctx;
     private readonly MergeQueue? _queue;
+    private readonly Services.IFlaggedChangeSource? _live;
     private readonly Func<string, CancellationToken, Task>? _bringLocal;
     private readonly Action<string>? _onMerge;
     private readonly List<ReviewHunkRowViewModel> _flatHunks = new();
@@ -99,39 +100,76 @@ public partial class ReviewCockpitViewModel : ViewModelBase
     /// <param name="ctx">The composed review inputs.</param>
     /// <param name="flaggedGate">The P2-11 flagged gate (its per-agent store is loaded here); null builds a private one.</param>
     /// <param name="changedGate">The P2-10 RT-D2 changed-test-command gate (rendered/acked here).</param>
-    /// <param name="queue">The live merge queue (drives <c>CanMerge</c>); null leaves merge disabled.</param>
+    /// <param name="queue">The in-process merge queue (drives <c>CanMerge</c>); null leaves merge disabled.</param>
     /// <param name="bringLocal">T-29 fetch-into-worktree hand-back (agentId, ct).</param>
     /// <param name="onMerge">The human foreground merge action (agentId).</param>
+    /// <param name="live">
+    /// The daemon-backed flagged-item source + ack route. <b>When supplied it replaces the local gates
+    /// entirely</b> — the flagged panel renders the daemon's items and its acknowledgments go to the
+    /// daemon-side gate that actually blocks the merge, and <c>CanMerge</c> is read from the same place.
+    /// <para>The overlay used to be built with none of this: no queue, no changed-test-command gate, and a
+    /// private in-process <c>AcknowledgmentStore</c>. It surfaced no daemon-flagged item at all, and had it
+    /// surfaced one, the checkmark would have cleared a store no merge consults — telling a human they had
+    /// unblocked a merge that was still blocked. Leaving <paramref name="live"/> null keeps the local
+    /// composition, which is honest only where that store IS the gate (the design/render harness).</para>
+    /// </param>
     public ReviewCockpitViewModel(
         ReviewCockpitContext ctx,
         FlaggedChangeGate? flaggedGate = null,
         ChangedTestCommandGate? changedGate = null,
         MergeQueue? queue = null,
         Func<string, CancellationToken, Task>? bringLocal = null,
-        Action<string>? onMerge = null)
+        Action<string>? onMerge = null,
+        Services.IFlaggedChangeSource? live = null)
     {
         _ctx = ctx ?? throw new ArgumentNullException(nameof(ctx));
         _queue = queue;
+        _live = live;
         _bringLocal = bringLocal;
         _onMerge = onMerge;
 
-        flaggedGate ??= new FlaggedChangeGate();
-        var store = flaggedGate.StoreFor(ctx.AgentId);
-
-        // Compose the flagged set from pure Core: risk hunks + F6 scope + lockfile rows.
-        var items = new List<FlaggedChange>(FlaggedChangeDetector.DetectFlagged(ctx.MergeDiff, ctx.ApprovedPlan, ctx.Managed));
-        if (ctx.LockfileFlags is { Count: > 0 })
+        if (live is not null)
         {
-            items.AddRange(ctx.LockfileFlags);
+            // No shadow store is built: a second, local ledger of the same items is exactly how a surface
+            // ends up disagreeing with the gate it is supposed to be rendering.
+            FlaggedPanel = new FlaggedChangesPanelViewModel(ctx.AgentId, live, RefreshGate);
         }
+        else
+        {
+            flaggedGate ??= new FlaggedChangeGate();
+            var store = flaggedGate.StoreFor(ctx.AgentId);
 
-        store.SetFlagged(items);
-        changedGate?.SetFlagged(ctx.AgentId, ctx.ChangedTestCommand);
+            // Compose the flagged set from pure Core: risk hunks + F6 scope + lockfile rows.
+            var items = new List<FlaggedChange>(FlaggedChangeDetector.DetectFlagged(ctx.MergeDiff, ctx.ApprovedPlan, ctx.Managed));
+            if (ctx.LockfileFlags is { Count: > 0 })
+            {
+                items.AddRange(ctx.LockfileFlags);
+            }
 
-        FlaggedPanel = new FlaggedChangesPanelViewModel(store, ctx.AgentId, changedGate, ctx.ChangedTestCommand, RefreshGate);
+            store.SetFlagged(items);
+            changedGate?.SetFlagged(ctx.AgentId, ctx.ChangedTestCommand);
+
+            FlaggedPanel = new FlaggedChangesPanelViewModel(store, ctx.AgentId, changedGate, ctx.ChangedTestCommand, RefreshGate);
+        }
 
         BuildRows();
         BuildHeader();
+        RefreshGate();
+    }
+
+    /// <summary>
+    /// Re-reads the daemon projection (items + their acknowledged flags + the gate's merge answer). The
+    /// surface is driven by the queue stream, and an acknowledgment moves no queue state — the daemon
+    /// re-pushes the stream after one specifically so this refresh has something to read.
+    /// </summary>
+    public void RefreshFromQueue()
+    {
+        if (_live is null)
+        {
+            return;
+        }
+
+        FlaggedPanel.Refresh();
         RefreshGate();
     }
 
@@ -221,6 +259,15 @@ public partial class ReviewCockpitViewModel : ViewModelBase
 
     private void RefreshGate()
     {
+        // The daemon's gate is the one that blocks the merge, so when it is bound it is the only answer.
+        if (_live is not null)
+        {
+            CanMerge = _live.CanMerge(_ctx.AgentId, out var liveReason);
+            MergeReason = CanMerge ? "ready to merge" : liveReason;
+            MergeCommand.NotifyCanExecuteChanged();
+            return;
+        }
+
         if (_queue is null)
         {
             CanMerge = false;
