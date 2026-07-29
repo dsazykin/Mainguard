@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams } from 'react-router';
 import { Turnstile } from '../components/Turnstile';
 import { SuccessGate } from '../components/SuccessGate';
 import { postJson } from '../lib/api';

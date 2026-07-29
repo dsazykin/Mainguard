@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { Reveal } from '../lib/Reveal';
 import { PatrolSpine } from '../components/PatrolSpine';
 import { CloudVignette, WindowFrame } from '../components/vignettes';
