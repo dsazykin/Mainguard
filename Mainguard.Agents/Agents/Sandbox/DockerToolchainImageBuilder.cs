@@ -1,7 +1,9 @@
 using System;
 using System.Collections.Generic;
 using System.Formats.Tar;
+using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -61,6 +63,91 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
         }
     }
 
+    public async Task<IReadOnlyList<string>?> RootFsLayersAsync(string imageRef, CancellationToken ct = default)
+    {
+        try
+        {
+            var inspect = await _docker.Images.InspectImageAsync(imageRef, ct).ConfigureAwait(false);
+            var layers = inspect.RootFS?.Layers;
+            return layers is null ? null : layers.ToArray();
+        }
+        catch (DockerImageNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The facts that would have made the "pull access denied" CI failure a one-read diagnosis: which
+    /// engine and image store are speaking, whether the pinned base digest is present <b>as a local
+    /// image</b>, and what identity the engine holds for the base by NAME — specifically its
+    /// <c>RepoDigests</c>, whose emptiness on a classic image store is the entire reason a
+    /// <c>name@sha256:…</c> FROM turns into a registry pull.
+    /// </summary>
+    public async Task<string> DescribeBuildContextAsync(
+        string baseDigest, string baseImageName, CancellationToken ct = default)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("---- engine ----");
+
+        try
+        {
+            var info = await _docker.System.GetSystemInfoAsync(ct).ConfigureAwait(false);
+            var version = await _docker.System.GetVersionAsync(ct).ConfigureAwait(false);
+            sb.AppendLine(CultureInfo.InvariantCulture,
+                $"server={version.Version} api={version.APIVersion} os={version.Os}/{version.Arch} driver={info.Driver}");
+        }
+        catch (Exception ex)
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"server=<unavailable: {ex.GetType().Name}>");
+        }
+
+        sb.AppendLine(CultureInfo.InvariantCulture, $"FROM {baseDigest}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"  base-by-digest present={await PresentAsync(baseDigest, ct).ConfigureAwait(false)}");
+        sb.Append(await DescribeImageAsync(baseImageName + ":latest", ct).ConfigureAwait(false));
+        return sb.ToString();
+    }
+
+    private async Task<string> PresentAsync(string imageRef, CancellationToken ct)
+    {
+        try
+        {
+            await _docker.Images.InspectImageAsync(imageRef, ct).ConfigureAwait(false);
+            return "true";
+        }
+        catch (DockerImageNotFoundException)
+        {
+            return "false";
+        }
+        catch (Exception ex)
+        {
+            return $"<unknown: {ex.GetType().Name}>";
+        }
+    }
+
+    private async Task<string> DescribeImageAsync(string imageRef, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Images.InspectImageAsync(imageRef, ct).ConfigureAwait(false);
+            var repoDigests = inspect.RepoDigests is { Count: > 0 }
+                ? string.Join(",", inspect.RepoDigests)
+                : "[] (a locally built image has no registry manifest digest — a `name@sha256:` FROM "
+                  + "cannot resolve against this and the engine will try to PULL)";
+            return $"  base-by-name '{imageRef}' id={inspect.ID}\n"
+                   + $"    repoTags={string.Join(",", inspect.RepoTags ?? new List<string>())}\n"
+                   + $"    repoDigests={repoDigests}\n";
+        }
+        catch (DockerImageNotFoundException)
+        {
+            return $"  base-by-name '{imageRef}' ABSENT from this engine's image store\n";
+        }
+        catch (Exception ex)
+        {
+            return $"  base-by-name '{imageRef}' <unknown: {ex.GetType().Name}: {ex.Message}>\n";
+        }
+    }
+
     public async Task BuildAsync(
         string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels, CancellationToken ct = default)
     {
@@ -79,9 +166,27 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
                 error ??= message.ErrorMessage;
             }
 
+            // ErrorDetail carries the engine's own code alongside the text; on a resolve failure it is
+            // the difference between "denied" and knowing WHICH stage denied it.
+            if (message.Error is { } detail && !string.IsNullOrEmpty(detail.Message))
+            {
+                error ??= detail.Message;
+                Append(output, $"[errorDetail{(detail.Code != 0 ? " code=" + detail.Code.ToString(CultureInfo.InvariantCulture) : string.Empty)}] {detail.Message}\n");
+            }
+
+            // The CI failure retained ONE line, because a build that dies resolving its FROM emits its
+            // step line as `stream` and everything else — the pull attempt, the auth refusal — as
+            // `status`/`progress`/`id`. Keeping only `stream` threw away the whole story and left a
+            // "build log (tail)" that contained the one line nobody needed.
             if (!string.IsNullOrEmpty(message.Stream))
             {
                 Append(output, message.Stream!);
+            }
+
+            if (!string.IsNullOrEmpty(message.Status))
+            {
+                var id = string.IsNullOrEmpty(message.ID) ? string.Empty : message.ID + ": ";
+                Append(output, $"[status] {id}{message.Status}\n");
             }
         });
 
@@ -141,7 +246,11 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
 
     private static string Tail(string text)
     {
-        const int max = 4000;
+        // 4 KiB was tuned for a compile error at the end of a long build. A resolve failure at step 1
+        // produces far less than that, and the earlier bug was never truncation — it was that only
+        // `stream` messages were retained at all. Keep it generous: the build container is gone by the
+        // time anyone reads this, so this text IS the diagnosis.
+        const int max = 16000;
         return text.Length <= max ? text : text[^max..];
     }
 }

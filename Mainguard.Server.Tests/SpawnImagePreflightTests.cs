@@ -216,6 +216,7 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
     private sealed class FakeToolchainBuilder : IToolchainImageBuilder
     {
         private readonly Dictionary<string, Dictionary<string, string>> _images = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, IReadOnlyList<string>> _layers = new(StringComparer.Ordinal);
 
         public List<string> Built { get; } = new();
 
@@ -224,6 +225,22 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
         public Task<IReadOnlyDictionary<string, string>?> InspectLabelsAsync(string imageRef, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyDictionary<string, string>?>(
                 _images.TryGetValue(imageRef, out var labels) ? labels : null);
+
+        /// <summary>
+        /// Models layer inheritance the way a real engine produces it: a built image's chain is the
+        /// base's chain plus the new steps. The provisioner proves parentage from this rather than from
+        /// the labels, so a fake that answered null here would make the proof vacuous.
+        /// </summary>
+        public Task<IReadOnlyList<string>?> RootFsLayersAsync(string imageRef, CancellationToken ct = default)
+        {
+            if (SandboxImageDigest.IsDigest(imageRef) && !_images.ContainsKey(imageRef) && !_layers.ContainsKey(imageRef))
+            {
+                // The BASE digest: the launcher resolved it off the engine, so it is not one of ours.
+                return Task.FromResult<IReadOnlyList<string>?>(new[] { "sha256:base-layer" });
+            }
+
+            return Task.FromResult(_layers.TryGetValue(imageRef, out var layers) ? layers : null);
+        }
 
         public Task<string?> ResolveDigestAsync(string imageRef, CancellationToken ct = default)
         {
@@ -244,8 +261,16 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
         {
             Built.Add(imageRef);
             _images[imageRef] = new Dictionary<string, string>(labels, StringComparer.Ordinal);
+            var chain = new[] { "sha256:base-layer", "sha256:toolchain-" + imageRef };
+            _layers[imageRef] = chain;
+            _layers[DigestOf(imageRef)] = chain;
             return Task.CompletedTask;
         }
+
+        private static string DigestOf(string imageRef) =>
+            "sha256:" + Convert.ToHexString(
+                System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(imageRef)))
+                .ToLowerInvariant();
     }
 
     // ---- rig (SpawnErrorMappingTests' in-proc pattern, engine scripted per image) -------------

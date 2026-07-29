@@ -271,11 +271,32 @@ public class ToolchainDeclarationTests
         var dockerfile = ToolchainProvisioner.RenderDockerfile(
             BaseDigest, new[] { ToolchainCatalog.TryGet("dotnet-10")! });
 
-        Assert.Contains($"FROM {SandboxImageVersions.AgentBaseName}@{BaseDigest}", dockerfile, StringComparison.Ordinal);
+        Assert.Contains($"FROM {BaseDigest}", dockerfile, StringComparison.Ordinal);
         // No COPY/ADD: the build context is a single generated file, so the layer can absorb nothing
         // from the host.
         Assert.DoesNotContain("\nCOPY ", dockerfile, StringComparison.Ordinal);
         Assert.DoesNotContain("\nADD ", dockerfile, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The CI regression, pinned. <c>FROM name@sha256:…</c> is a canonical REGISTRY reference: the
+    /// engine matches it against an image's <c>RepoDigests</c> and, finding none — which is the normal
+    /// state of a locally built image on a classic overlay2 store — tries to PULL, giving
+    /// <c>pull access denied for mainguard-agent-base</c> at step 1. It passed locally only because
+    /// this box's containerd image store synthesises a <c>RepoDigests</c> entry equal to the image's own
+    /// Id. A bare digest is an IMAGE ID reference, resolved against the local store on both engines.
+    /// </summary>
+    [Fact]
+    public void TheGeneratedDockerfile_UsesABareImageId_NotAResolvableRegistryReference()
+    {
+        var dockerfile = ToolchainProvisioner.RenderDockerfile(
+            BaseDigest, new[] { ToolchainCatalog.TryGet("dotnet-10")! });
+
+        var from = dockerfile.Split('\n').Single(l => l.StartsWith("FROM ", StringComparison.Ordinal)).Trim();
+
+        Assert.Equal($"FROM {BaseDigest}", from);
+        Assert.DoesNotContain("@", from, StringComparison.Ordinal);
+        Assert.DoesNotContain(SandboxImageVersions.AgentBaseName, from, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -421,6 +442,64 @@ public class ToolchainDeclarationTests
             () => new ToolchainProvisioner(builder).EnsureAsync(Repo, declaration, BaseDigest));
     }
 
+    /// <summary>
+    /// The pin PROVEN rather than requested. The provenance label says which base the image claims;
+    /// only the layer chain says what it is made of. An image that carries the right labels and is not
+    /// built on the verified base must be refused — that is the case a label check cannot reach, and
+    /// the case that matters if the engine ever resolves the <c>FROM</c> to something else.
+    /// </summary>
+    [Fact]
+    public async Task ALayerNotActuallyBuiltOnTheVerifiedBase_IsRefused_DespiteCorrectLabels()
+    {
+        var builder = new RecordingBuilder { BuildOnAForeignBase = true };
+        var declaration = ToolchainDeclarationResolver.Parse("dotnet-10\n");
+
+        var ex = await Assert.ThrowsAsync<ToolchainProvisioningException>(
+            () => new ToolchainProvisioner(builder).EnsureAsync(Repo, declaration, BaseDigest));
+
+        Assert.Contains("NOT built on the verified base", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// "We could not check" must not read the same as "we checked and it was fine". An engine that will
+    /// not answer for the base's layer chain is a refusal — otherwise the proof quietly evaporates on
+    /// exactly the engine where it was needed, which is the shape of this whole CI failure.
+    /// </summary>
+    [Fact]
+    public async Task AnUnreadableBaseLayerChain_IsRefused_NotSilentlySkipped()
+    {
+        var builder = new RecordingBuilder { HideBaseLayers = true };
+        var declaration = ToolchainDeclarationResolver.Parse("dotnet-10\n");
+
+        var ex = await Assert.ThrowsAsync<ToolchainProvisioningException>(
+            () => new ToolchainProvisioner(builder).EnsureAsync(Repo, declaration, BaseDigest));
+
+        Assert.Contains("cannot be proven", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The inheritance proof runs on the CACHE-HIT path too, so a layer that stops matching the
+    /// currently-verified base is caught on the next spawn rather than at its next rebuild.</summary>
+    [Fact]
+    public async Task TheInheritanceProof_AlsoRunsOnACacheHit()
+    {
+        var builder = new RecordingBuilder();
+        var provisioner = new ToolchainProvisioner(builder);
+        var declaration = ToolchainDeclarationResolver.Parse("dotnet-10\n");
+
+        await provisioner.EnsureAsync(Repo, declaration, BaseDigest);
+        Assert.Single(builder.Built);
+
+        // The base's chain moves under the cached layer; the second call is a cache hit by label, and
+        // must still refuse.
+        builder.RebaseBaseLayers(new[] { "sha256:a-different-base" });
+
+        var ex = await Assert.ThrowsAsync<ToolchainProvisioningException>(
+            () => provisioner.EnsureAsync(Repo, declaration, BaseDigest));
+
+        Assert.Contains("NOT built on the verified base", ex.Message, StringComparison.Ordinal);
+        Assert.Single(builder.Built); // it refused; it did not silently rebuild
+    }
+
     [Fact]
     public async Task TheSpawnRefIsTheLayersDIGEST_NotItsTag()
     {
@@ -450,12 +529,29 @@ public class ToolchainDeclarationTests
         return dir!.FullName;
     }
 
-    /// <summary>An in-memory image store: records builds, answers labels, mints digests.</summary>
+    /// <summary>An in-memory image store: records builds, answers labels, mints digests, and models
+    /// layer inheritance (a built image's chain = the base's chain plus one).</summary>
     private sealed class RecordingBuilder : IToolchainImageBuilder
     {
         private readonly Dictionary<string, Dictionary<string, string>> _images = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, IReadOnlyList<string>> _layers = new(StringComparer.Ordinal);
+
+        public RecordingBuilder()
+        {
+            // The base image's chain. Everything built here extends it, which is what a real engine
+            // produces and what the provisioner's prefix check reads.
+            _layers[BaseDigest] = new[] { "sha256:layer-a", "sha256:layer-b" };
+        }
 
         public List<string> Built { get; } = new();
+
+        /// <summary>When set, a build produces an image whose chain does NOT extend the base — the
+        /// shape of a layer built on something other than the image the preflight verified.</summary>
+        public bool BuildOnAForeignBase { get; set; }
+
+        /// <summary>When set, the base image's layer chain cannot be read (an engine that will not
+        /// answer). The provisioner must refuse rather than skip the check.</summary>
+        public bool HideBaseLayers { get; set; }
 
         /// <summary>When set, <see cref="BuildAsync"/> throws with this message.</summary>
         public string? FailWith { get; set; }
@@ -465,12 +561,26 @@ public class ToolchainDeclarationTests
 
         public void Squat(string tag, Dictionary<string, string> labels) => _images[tag] = labels;
 
+        /// <summary>Moves the base image's layer chain — what a re-pointed or rebuilt base looks like to
+        /// an already-cached layer.</summary>
+        public void RebaseBaseLayers(IReadOnlyList<string> layers) => _layers[BaseDigest] = layers;
+
         public Task<IReadOnlyDictionary<string, string>?> InspectLabelsAsync(string imageRef, CancellationToken ct = default) =>
             Task.FromResult<IReadOnlyDictionary<string, string>?>(
                 _images.TryGetValue(imageRef, out var labels) ? labels : null);
 
         public Task<string?> ResolveDigestAsync(string imageRef, CancellationToken ct = default) =>
             Task.FromResult<string?>(_images.ContainsKey(imageRef) ? FakeDigest(imageRef) : null);
+
+        public Task<IReadOnlyList<string>?> RootFsLayersAsync(string imageRef, CancellationToken ct = default)
+        {
+            if (HideBaseLayers && string.Equals(imageRef, BaseDigest, StringComparison.Ordinal))
+            {
+                return Task.FromResult<IReadOnlyList<string>?>(null);
+            }
+
+            return Task.FromResult(_layers.TryGetValue(imageRef, out var layers) ? layers : null);
+        }
 
         public Task BuildAsync(
             string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels, CancellationToken ct = default)
@@ -484,6 +594,16 @@ public class ToolchainDeclarationTests
             if (!SwallowBuilds)
             {
                 _images[imageRef] = new Dictionary<string, string>(labels, StringComparer.Ordinal);
+
+                // A real engine stacks the new steps on the parent's chain. `BuildOnAForeignBase`
+                // models the one thing the label cannot detect: an image that claims this base and is
+                // not made of it.
+                var parent = BuildOnAForeignBase
+                    ? new[] { "sha256:someone-elses-layer" }
+                    : _layers[BaseDigest].ToArray();
+                var chain = parent.Append("sha256:toolchain-" + imageRef).ToArray();
+                _layers[imageRef] = chain;
+                _layers[FakeDigest(imageRef)] = chain; // resolvable by digest too
             }
 
             return Task.CompletedTask;
