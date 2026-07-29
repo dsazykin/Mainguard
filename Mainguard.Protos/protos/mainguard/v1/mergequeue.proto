@@ -51,6 +51,22 @@ message QueueEntry {
   // P2-13 carried-in from P2-12 (additive): the entry origin (MergeEntryOrigin name — Local/External)
   // so the activity list can badge intake'd external-PR entries as such.
   string origin = 6;
+  // P2-11 step 4: the must-acknowledge items currently blocking this entry's merge. The gate that owns
+  // them is daemon-side, and AcknowledgeFlaggedChange is addressed BY ITEM ID — so without them on the
+  // wire the review surface has a blocked branch, a reason string, and no item to acknowledge. That is
+  // not a gate, it is a permanently unmergeable branch: the daemon can evaluate it and no human can
+  // clear it. Empty for an entry with nothing flagged.
+  repeated FlaggedItem flagged_items = 7;
+}
+
+// One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the
+// id is what AcknowledgeFlaggedChange takes, so client and daemon address the same item by name.
+message FlaggedItem {
+  string id = 1;           // the ack address (e.g. "changed-test-command")
+  string path = 2;         // what the item is about, for the row's first column
+  string category = 3;     // risk category name (render hint only)
+  string fact = 4;         // the one-sentence claim the human is acknowledging
+  bool acknowledged = 5;   // already cleared by a human on the daemon
 }
 
 message RunVerificationRequest {
