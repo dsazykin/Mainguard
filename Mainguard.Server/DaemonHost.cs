@@ -165,6 +165,10 @@ public static class DaemonHost
         // server-side, so a coordinator agent cannot fan out unlimited workers via mainguard-agent spawn.
         builder.Services.AddSingleton(new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits());
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
+        // Which repositories this daemon has provisioned, and where the user's copy of each one is. The
+        // repo hash is one-way, so without this the daemon could not name the repo a handle refers to —
+        // which is exactly why the external-PR intake's target resolver was hardwired to null.
+        builder.Services.AddSingleton<Runtime.ActiveRepoIndex>();
 
         // P2-47 #7: the merge-diff bridge behind MergeQueueService.GetMergeDiff — the agent-branch-vs-main
         // diff the review cockpit renders (StreamQueue doesn't carry it). Reuses the audited git path +

@@ -33,6 +33,10 @@ public class ExternalPrIntakeTests
     {
         public List<PullRequestItem> Open { get; } = new();
         public bool ThrowRateLimit { get; set; }
+
+        /// <summary>A non-rate-limit transport failure (an absent/expired host token is the realistic one).</summary>
+        public bool ThrowAuthFailure { get; set; }
+
         public int ListCalls { get; private set; }
         public int MutatingCalls { get; private set; }
 
@@ -43,6 +47,8 @@ public class ExternalPrIntakeTests
             ListCalls++;
             if (ThrowRateLimit)
                 throw new GitOperationException("GitHub API rate limit reached: API rate limit exceeded");
+            if (ThrowAuthFailure)
+                throw new AuthenticationRequiredException("No stored token for github.com.", "github.com");
             return Task.FromResult<IReadOnlyList<PullRequestItem>>(Open.ToList());
         }
 
@@ -97,15 +103,73 @@ public class ExternalPrIntakeTests
         public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
     }
 
+    /// <summary>
+    /// The intake's spawn seam, standing in for the daemon's <c>ExternalPrWorkerHost</c>: it creates the
+    /// worktree exactly as the real spawn chain's launcher does, records who got a jail, and can be told
+    /// to refuse (the MG-2 gates) or fail (no provisioned mirror / Docker down). Release tears the
+    /// worktree down — the real one tears down the jail, its network segment and its cache too.
+    /// </summary>
+    private sealed class FakePrWorkerHost : IPrWorkerHost
+    {
+        private readonly FakeWorktreeManager _worktrees;
+        private readonly HashSet<string> _live = new(StringComparer.Ordinal);
+
+        public FakePrWorkerHost(FakeWorktreeManager worktrees) => _worktrees = worktrees;
+
+        /// <summary>When set, every ensure is refused with this reason (a gate said no).</summary>
+        public string? RefuseWith { get; set; }
+
+        /// <summary>When set, every ensure fails with this reason (a provisioning failure).</summary>
+        public string? FailWith { get; set; }
+
+        /// <summary>Every (agentId, prNumber) an ensure was asked for, in order — including repeats.</summary>
+        public List<(string AgentId, int PrNumber)> Requests { get; } = new();
+
+        /// <summary>The agent ids that actually got a jail.</summary>
+        public List<string> Jailed { get; } = new();
+
+        public List<string> Released { get; } = new();
+
+        public Task<PrWorkerResult> EnsureWorkerAsync(string repoHash, string agentId, int prNumber, CancellationToken ct)
+        {
+            Requests.Add((agentId, prNumber));
+
+            if (_live.Contains(agentId))
+                return Task.FromResult(PrWorkerResult.AlreadyLive());
+            if (RefuseWith is not null)
+                return Task.FromResult(PrWorkerResult.Refused(RefuseWith));
+            if (FailWith is not null)
+                return Task.FromResult(PrWorkerResult.Failed(FailWith));
+
+            _worktrees.CreateAgentWorktree(repoHash, agentId);
+            _live.Add(agentId);
+            Jailed.Add(agentId);
+            return Task.FromResult(PrWorkerResult.Spawned());
+        }
+
+        public Task ReleaseWorkerAsync(string repoHash, string agentId, CancellationToken ct)
+        {
+            Released.Add(agentId);
+            _live.Remove(agentId);
+            _worktrees.RemoveAgentWorktree(repoHash, agentId, force: true);
+            return Task.CompletedTask;
+        }
+    }
+
     /// <summary>Returns whatever head SHA the test currently maps a PR number to; counts fetches.</summary>
     private sealed class FakeHeadFetcher : IPrHeadFetcher
     {
         public Dictionary<int, string> Heads { get; } = new();
         public int Fetches { get; private set; }
 
+        /// <summary>PR numbers whose fetch throws (an unreachable host / a deleted head).</summary>
+        public HashSet<int> FailFor { get; } = new();
+
         public Task<string> FetchHeadAsync(ExternalPrSource source, string repoHash, string agentId, int prNumber, CancellationToken ct)
         {
             Fetches++;
+            if (FailFor.Contains(prNumber))
+                throw new GitOperationException($"could not fetch pull/{prNumber}/head");
             return Task.FromResult(Heads.TryGetValue(prNumber, out var sha) ? sha : "unknown");
         }
     }
@@ -114,6 +178,7 @@ public class ExternalPrIntakeTests
     {
         public RecordingPrService Pr = new();
         public FakeWorktreeManager Worktrees = new();
+        public FakePrWorkerHost Workers;
         public FakeHeadFetcher Fetcher = new();
         public InMemoryPrIntakeStore Store = new();
         public InMemoryAuditLog Audit = new();
@@ -136,8 +201,9 @@ public class ExternalPrIntakeTests
             Queue = new MergeQueue(RepoHash, "sha0", stateStore, verStore, run,
                 requeue: (id, ct) => Task.CompletedTask);
 
+            Workers = new FakePrWorkerHost(Worktrees);
             Intake = new ExternalPrIntake(
-                Pr, Store, Worktrees, Fetcher,
+                Pr, Store, Workers, Fetcher,
                 resolveTarget: _ => new PrIntakeTarget(RepoPath, RepoHash, Queue),
                 audit: Audit,
                 clock: () => Now);
@@ -291,5 +357,177 @@ public class ExternalPrIntakeTests
         var pr = new PullRequestItem { Number = 1, Author = author, State = PullRequestState.Open };
 
         Assert.Equal(expected, h.Intake.MatchesAuthor(pr, source));
+    }
+
+    // ---- The spawn seam: no jail, no entry ------------------------------
+
+    /// <summary>
+    /// The materialization now BEGINS with a jail. Before this the intake created a worktree and an entry
+    /// and spawned nothing, and since verification runs in the worker's own jail (host execution is a
+    /// rejection trigger) the entry could never leave <c>Working</c>.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_NewMatchingPr_ShouldAskForAJail_ForThatPrsOwnAgentId()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { ("pr-7", 7) }, h.Workers.Requests);
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Jailed);
+    }
+
+    /// <summary>
+    /// MG-2, at the intake. An arriving bot pull request is a spawn request from outside the machine, so
+    /// when a gate refuses it (kill switch / worker cap / memory admission) the intake must materialize
+    /// <b>nothing</b> — no worktree, no queue entry, and crucially no seen-head, because a recorded head
+    /// would make the next poll treat the PR as already materialized and never retry. An entry admitted
+    /// without a jail is an entry that can never be verified; an unbounded external queue that spawned
+    /// regardless would be a denial of service on the user's own box.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_WhenAGateRefusesTheSpawn_ShouldMaterializeNothing_AndRetryOnALaterPoll()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        h.Workers.RefuseWith = "Worker cap reached — 6/6 managed workers running.";
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Empty(h.Workers.Jailed);
+        Assert.Empty(h.Worktrees.Created);                              // no worktree
+        Assert.DoesNotContain("pr-7", h.Queue.Agents);                  // no queue entry
+        Assert.Null(h.Store.GetSeenHead(Harness.Source.Key, 7));        // nothing marked as seen
+        Assert.Equal(0, h.Fetcher.Fetches);                             // and the head was never fetched
+
+        // The refusal is not terminal: when capacity frees, the same PR materializes normally.
+        h.Workers.RefuseWith = null;
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Jailed);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
+        Assert.Equal(MergeEntryOrigin.External, h.Queue.GetOrigin("pr-7"));
+        Assert.Equal("sha-7a", h.Store.GetSeenHead(Harness.Source.Key, 7));
+    }
+
+    /// <summary>A provisioning failure (no mirror, image preflight, Docker down) is treated exactly like a
+    /// refusal — nothing is materialized — and it does not propagate out of the poll.</summary>
+    [Fact]
+    public async Task PollOnce_WhenTheSpawnFails_ShouldMaterializeNothing_AndNotThrow()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        h.Workers.FailWith = "no provisioned mirror";
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.DoesNotContain("pr-7", h.Queue.Agents);
+        Assert.Null(h.Store.GetSeenHead(Harness.Source.Key, 7));
+        Assert.Contains(h.Audit.Read(), e => e.Type == "external_pr_worker_unavailable");
+    }
+
+    /// <summary>
+    /// The ensure is re-asked on every poll and is a no-op for a live worker: a repeat poll must not spawn
+    /// a second jail, and must not consume a second slot of the worker cap.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_RepeatedPolls_ShouldNotSpawnASecondJail()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(3, h.Workers.Requests.Count);       // asked every poll…
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Jailed); // …and spawned exactly once
+    }
+
+    /// <summary>
+    /// Closed upstream ⇒ the whole WORKER is released, not just the worktree. In the daemon that is what
+    /// reclaims the jail's MG-36 network segment; Docker's local bridge pool is ~32 deep, so a segment
+    /// leaked per closed pull request eventually makes every spawn on the box fail.
+    /// </summary>
+    [Fact]
+    public async Task PrClosedUpstream_ShouldReleaseTheWorker_NotJustTheWorktree()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        h.Pr.Open.Clear();
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Released);
+    }
+
+    /// <summary>
+    /// The head fetch is a network operation against the host, so it can fail per PULL REQUEST. One
+    /// unreachable head must cost that pull request its cycle and nothing more — not the other open PRs
+    /// on the same source, and certainly not the daemon's intake loop (<c>RunAsync</c> catches only
+    /// cancellation). Nothing is recorded as seen, so the failed one is retried next poll.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_WhenOnePrsHeadFetchFails_TheOthersStillMaterialize()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Pr.Open.Add(h.Bot(8));
+        h.Fetcher.Heads[8] = "sha-8a";
+        h.Fetcher.FailFor.Add(7);
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);   // must not throw
+
+        Assert.DoesNotContain("pr-7", h.Queue.Agents);
+        Assert.Null(h.Store.GetSeenHead(Harness.Source.Key, 7));
+        Assert.Contains(h.Audit.Read(), e => e.Type == "external_pr_materialize_failed");
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-8"));
+        Assert.Equal("sha-8a", h.Store.GetSeenHead(Harness.Source.Key, 8));
+
+        // …and the failed one recovers on the next poll over its already-live jail.
+        h.Fetcher.FailFor.Clear();
+        h.Fetcher.Heads[7] = "sha-7a";
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
+    }
+
+    /// <summary>
+    /// Wiring the production target resolver makes the transport's non-rate-limit failures reachable for
+    /// the first time (an absent host token is the obvious one). <c>RunAsync</c> catches only cancellation,
+    /// so an escaping exception permanently killed the daemon's entire intake loop. One faulting source
+    /// must cost that source's cycle and nothing else.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_WhenTheTransportFaults_ShouldNotThrow_AndShouldKeepPolling()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.ThrowAuthFailure = true;
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);   // must not throw
+        Assert.Contains(h.Audit.Read(), e => e.Type == "external_pr_poll_failed");
+
+        // NOT a rate limit, so no backoff window is opened and the next poll really does poll again.
+        Assert.Null(h.Intake.BackoffUntil(Harness.Source));
+        h.Pr.ThrowAuthFailure = false;
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
     }
 }
