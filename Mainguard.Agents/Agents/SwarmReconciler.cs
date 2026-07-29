@@ -52,9 +52,16 @@ public sealed record ReconcileReport(
 ///   <c>RemoveAgentWorktree(force:true)</c>) and mark the row <c>Dead</c> with a disposal reason.</item>
 ///   <item>Live but not expected (orphan, e.g. it survived a daemon crash) → adopt or stop per
 ///   <see cref="OrphanPolicy"/> (default adopt).</item>
+///   <item>Live and kept (adopted, or already expected) → handed to the MG-3 ref watcher
+///   (<see cref="TryWatchAgentRef"/>), because the spawn path is the only OTHER thing that ever starts a
+///   watch and a survivor never runs it again.</item>
 /// </list>
 /// It reads <b>no</b> process-id or on-disk liveness state. Deleting any on-disk daemon state and
 /// rebooting yields the same outcome, because the truth is Docker's container list.
+///
+/// <para>Every diff is keyed on <b>both</b> labels — <c>(mainguard.repo, mainguard.agent)</c> — the same
+/// identity the live session store and the jail lookup use, since an agent id is unique only inside a
+/// repository.</para>
 /// </summary>
 public sealed class SwarmReconciler
 {
@@ -87,9 +94,21 @@ public sealed class SwarmReconciler
     public async Task<ReconcileReport> ReconcileAsync(CancellationToken ct = default)
     {
         var containers = await _listContainers(ct).ConfigureAwait(false);
-        var live = containers
-            .Where(c => c.Running)
-            .ToDictionary(c => c.AgentId, StringComparer.Ordinal);
+
+        // Keyed by BOTH labels, never by the agent id alone. A bare id like `pr-7` (the external-PR
+        // intake names its workers after the pull-request number) is unique only INSIDE a repository,
+        // which is why the live session store is keyed the same way. Agent-id-only keying collapsed two
+        // repositories' jails into one entry — and `ToDictionary` threw ArgumentException on the
+        // duplicate, out of a boot sequence that is fail-fast, so two repos each running a `pr-7` took
+        // the whole daemon boot down.
+        var live = new Dictionary<(string RepoHash, string AgentId), AgentContainerState>();
+        foreach (var container in containers)
+        {
+            if (container.Running)
+            {
+                live[(container.RepoHash, container.AgentId)] = container;
+            }
+        }
 
         var pruned = new List<string>();
         var adopted = new List<string>();
@@ -103,7 +122,7 @@ public sealed class SwarmReconciler
                 continue; // already accounted for.
             }
 
-            if (!live.ContainsKey(agent.AgentId))
+            if (!live.ContainsKey((agent.RepoHash, agent.AgentId)))
             {
                 TryPruneWorktree(agent.RepoHash, agent.AgentId);
                 _expected.MarkDead(agent.RepoHash, agent.AgentId,
@@ -113,13 +132,17 @@ public sealed class SwarmReconciler
         }
 
         // 2. Live containers the daemon did not expect → adopt or stop.
-        var expectedIds = new HashSet<string>(
-            _expected.All().Select(a => a.AgentId), StringComparer.Ordinal);
+        var expectedKeys = new HashSet<(string RepoHash, string AgentId)>(
+            _expected.All().Select(a => (a.RepoHash, a.AgentId)));
 
         foreach (var container in live.Values)
         {
-            if (expectedIds.Contains(container.AgentId))
+            if (expectedKeys.Contains((container.RepoHash, container.AgentId)))
             {
+                // Already accounted for, still running — the steady state after the FIRST restart, since
+                // the expected table is SQLite-backed and keeps the row this pass wrote last time. It is
+                // no less a live agent for having a row, so it needs the watch just the same.
+                TryWatchAgentRef(container);
                 continue;
             }
 
@@ -127,6 +150,7 @@ public sealed class SwarmReconciler
             {
                 _expected.Upsert(container.RepoHash, container.AgentId, "Adopted");
                 adopted.Add(container.AgentId);
+                TryWatchAgentRef(container);
             }
             else
             {
@@ -136,6 +160,36 @@ public sealed class SwarmReconciler
         }
 
         return new ReconcileReport(pruned, adopted, stopped);
+    }
+
+    /// <summary>
+    /// MG-3 — hand a jail that is alive right now to the ref watcher, so its own
+    /// <c>refs/heads/agent/&lt;id&gt;</c> keeps being published into the mirror.
+    ///
+    /// <para><b>Why this belongs on the boot path.</b> The only other caller of
+    /// <c>WatchAgentRef</c> is the spawn path (<c>SandboxAgentLauncher.LaunchAsync</c>), which an agent
+    /// that survived a daemon restart never runs again — jails are persistent by design and the watcher's
+    /// sweep set is in-process, so every survivor came back unwatched for the rest of its life. Nothing
+    /// failed: the pre-verification publish (design §7's other half) still catches up whenever a
+    /// verification runs, so the symptom was a review cockpit, queue projection and stale cascade sitting
+    /// on a tip the agent had already moved past — "the UI is stale / the agent looks idle" rather than an
+    /// error. This is the reconcile counterpart of the prune branch's <c>RemoveAgentWorktree</c>:
+    /// each disposition finishes its own housekeeping.</para>
+    ///
+    /// <para>Best-effort, exactly like <see cref="TryPruneWorktree"/> — the boot sequence is fail-fast, so
+    /// an exception from registering a sweep entry would turn housekeeping into a daemon that will not
+    /// start. <c>Watch</c> is idempotent, so a repeat pass costs nothing.</para>
+    /// </summary>
+    private void TryWatchAgentRef(AgentContainerState container)
+    {
+        try
+        {
+            _worktrees.WatchAgentRef(container.RepoHash, container.AgentId);
+        }
+        catch (Exception)
+        {
+            // The mirror still catches up at verification time; boot must not fail over the sweep.
+        }
     }
 
     private void TryPruneWorktree(string repoHash, string agentId)
