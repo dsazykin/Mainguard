@@ -42,6 +42,13 @@ public sealed record SandboxSecrets(
 /// proxy holds a different address on each, and the jail's pinned dnsmasq cannot answer the proxy's
 /// name differently per client, so the jail is given the address directly. Null keeps the engine's
 /// configured URL.</param>
+/// <param name="PackageCachePath">MG-43 — this agent's own daemon-owned package cache on ext4,
+/// bind-mounted READ-WRITE at <see cref="PackageCachePolicy.SandboxMount"/>: the writable, un-tmpfs'd,
+/// out-of-worktree place a real dependency closure can be restored into. Null = no cache mount (the
+/// pre-MG-43 behaviour the substrate-less test doubles keep). When it IS supplied,
+/// <see cref="DockerSandboxEngine"/> proves in the started container that the mount is really there and
+/// really writable before handing the jail back — see <see cref="PackageCachePolicy.WritabilityProbe"/>
+/// for why the daemon's own record of the request is not evidence about the container.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -56,7 +63,8 @@ public sealed record SandboxSpawnRequest(
     string? BareRepoPath = null,
     string? NetworkName = null,
     string? ProxyUrl = null,
-    string? AgentRepoPath = null);
+    string? AgentRepoPath = null,
+    string? PackageCachePath = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

@@ -114,6 +114,15 @@ public sealed record CredTmpfsSpec(
 /// is blocked" control is a no-op. Mandatory whenever the jail sits on the default-deny agent network
 /// (see <see cref="EgressProxyConfigurator.AgentNetworkName"/>); null only for the ad-hoc engines that
 /// run outside that network (merge-queue/lifecycle harnesses on <c>bridge</c>).</param>
+/// <param name="PackageCachePath">MG-43 — this agent's own daemon-owned package cache
+/// (<c>&lt;vmRoot&gt;/caches/&lt;repoHash&gt;/&lt;agentId&gt;</c>), bind-mounted READ-WRITE at
+/// <see cref="PackageCachePolicy.SandboxMount"/> — on ext4, outside <c>/workspace</c>, and outside the
+/// 256 MiB tmpfs <c>$HOME</c>. It is what lets a real dependency closure (1.7 GB for this repository)
+/// be restored at all, without putting a gigabyte of untracked files inside the tree that verification
+/// measures. One cache, one jail: see <see cref="PackageCachePolicy"/> for why it is never shared.
+/// Null/empty = no cache mount, and then the cache environment is not set either — the two travel
+/// together by construction, because an environment that names a mount the container has not got is
+/// exactly the silent fall-through this feature must not have.</param>
 public sealed record ContainerSpecRequest(
     string RepoHash,
     string AgentId,
@@ -128,7 +137,8 @@ public sealed record ContainerSpecRequest(
     string? IpcDirPath = null,
     string? BareRepoPath = null,
     string? DnsServerAddress = null,
-    string? AgentRepoPath = null);
+    string? AgentRepoPath = null,
+    string? PackageCachePath = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -250,6 +260,36 @@ public static class ContainerSpecBuilder
             });
         }
 
+        if (!string.IsNullOrEmpty(request.PackageCachePath))
+        {
+            RejectNonExt4Source(request.PackageCachePath);
+
+            // MG-43 + MG-3: the ONE structural fact this pure builder can check about a writable
+            // daemon-side mount is WHICH tree it names. A package-cache mount may only ever name
+            // something inside a `caches/` tree — so this mount can never be edited into a second
+            // writable path at the mirror, the per-agent git dir, or anywhere else under the daemon's
+            // home. That is the guard that keeps MG-3 closed while adding a read-write mount.
+            if (!PackageCachePolicy.IsInsideACacheTree(request.PackageCachePath))
+                throw new SandboxSpecException(
+                    $"MG-43: refusing '{request.PackageCachePath}' as a package cache source. A package cache mount "
+                    + $"is READ-WRITE, so it may only ever name a path inside a '{PackageCachePolicy.CachesDirectoryName}/' "
+                    + "tree; any other source would be a second writable path into daemon-owned state (MG-3).");
+
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = request.PackageCachePath,
+                // A FIXED target, not the source path: unlike the mirror and the per-agent repo (whose
+                // in-jail paths are named by git metadata and must therefore match the VM's), nothing
+                // refers to the cache by absolute VM path — the package managers are told where it is
+                // through the environment. A fixed target is what lets that environment be a constant.
+                Target = PackageCachePolicy.SandboxMount,
+                // READ-WRITE by definition: a package manager that cannot write its cache is worse off
+                // than one with no cache at all, because it fails halfway instead of at the start.
+                ReadOnly = false,
+            });
+        }
+
         return mounts;
     }
 
@@ -269,6 +309,16 @@ public static class ContainerSpecBuilder
             throw new SandboxSpecException("G2 control 1: supervisor uid must differ from the agent uid.");
 
         var env = BuildProxyEnv(request.ProxyUrl);
+
+        // MG-43: the cache environment travels WITH the cache mount and never without it. Telling a
+        // package manager to put 1.7 GB at /var/cache/mainguard when nothing is mounted there points it
+        // at the read-only rootfs — a confusing mid-restore failure — so the two are set together here
+        // and re-asserted together by AssertPackageCache below.
+        if (!string.IsNullOrEmpty(request.PackageCachePath))
+        {
+            env.AddRange(PackageCachePolicy.EnvironmentList());
+        }
+
         var dns = ResolveDnsPinning(request);
 
         var hostConfig = new HostConfig
@@ -364,8 +414,98 @@ public static class ContainerSpecBuilder
         AssertResourceCeilings(create);
         AssertDnsPinned(create, request);
         AssertUsernsRemapped(create);
+        AssertPackageCache(create, request);
 
         return create;
+    }
+
+    /// <summary>
+    /// MG-43 — re-asserts the package cache's shape on the finished request, in the same style as the G2
+    /// quartet. Four separate properties, each individually a way for the feature to be quietly wrong:
+    ///
+    /// <list type="number">
+    ///   <item><b>The cache is not inside the verified worktree.</b> A cache under
+    ///   <see cref="WorkspaceTarget"/> puts gigabytes of untracked files in the tree an agent commits
+    ///   from and the merge queue verifies — one <c>git add -A</c> from being in a reviewed diff. This is
+    ///   the explicitly-rejected non-solution, so it is a typed builder error rather than a convention.</item>
+    ///   <item><b>The cache is not inside <see cref="AgentHome"/>.</b> <c>$HOME</c> is the 256 MiB tmpfs
+    ///   whose exhaustion is the entire reason this exists; a target under it would leave the feature
+    ///   looking wired up and changing nothing.</item>
+    ///   <item><b>The mount is read-write.</b> A read-only package cache fails a restore halfway with a
+    ///   permission error rather than at the start with a clear one.</item>
+    ///   <item><b>Environment and mount agree, in both directions.</b> Environment naming a cache that is
+    ///   not mounted points a package manager at the read-only rootfs; a mount with no environment is
+    ///   1.7 GB of bind mount that nothing uses while the tmpfs fills up anyway. Either one is a change
+    ///   that looks applied and is not — the recurring bug class here — so both directions are checked.</item>
+    /// </list>
+    /// </summary>
+    private static void AssertPackageCache(CreateContainerParameters create, ContainerSpecRequest request)
+    {
+        var mounts = create.HostConfig.Mounts ?? new List<Mount>();
+        var cacheMount = mounts.FirstOrDefault(m =>
+            string.Equals(m.Target, PackageCachePolicy.SandboxMount, StringComparison.Ordinal));
+        var env = create.Env ?? new List<string>();
+        var envNames = PackageCachePolicy.EnvironmentNames();
+        var envPresent = envNames.Any(name =>
+            env.Any(e => e.StartsWith(name + "=", StringComparison.Ordinal)));
+
+        if (string.IsNullOrEmpty(request.PackageCachePath))
+        {
+            // No cache requested: nothing may claim there is one.
+            if (cacheMount is not null)
+                throw new SandboxSpecException(
+                    $"MG-43: no package cache was requested, but a mount targets '{PackageCachePolicy.SandboxMount}'.");
+            if (envPresent)
+                throw new SandboxSpecException(
+                    "MG-43: no package cache was requested, but the environment names one — a package manager "
+                    + $"pointed at '{PackageCachePolicy.SandboxMount}' with nothing mounted there writes into the "
+                    + "read-only rootfs and fails mid-restore.");
+            return;
+        }
+
+        if (cacheMount is null)
+            throw new SandboxSpecException(
+                $"MG-43: a package cache at '{request.PackageCachePath}' was requested but no mount targets "
+                + $"'{PackageCachePolicy.SandboxMount}'.");
+
+        if (IsWithin(cacheMount.Target, WorkspaceTarget))
+            throw new SandboxSpecException(
+                $"MG-43: the package cache is mounted at '{cacheMount.Target}', inside the verified worktree "
+                + $"'{WorkspaceTarget}'. That is the rejected non-solution: it puts the dependency closure in the "
+                + "tree the agent commits from and the merge queue verifies.");
+
+        if (IsWithin(cacheMount.Target, AgentHome))
+            throw new SandboxSpecException(
+                $"MG-43: the package cache is mounted at '{cacheMount.Target}', inside the tmpfs $HOME "
+                + $"'{AgentHome}' whose 256 MiB ceiling is the reason the cache exists.");
+
+        if (cacheMount.ReadOnly)
+            throw new SandboxSpecException(
+                "MG-43: the package cache mount is read-only; a package manager that cannot write its cache "
+                + "fails partway through a restore instead of at the start.");
+
+        foreach (var name in envNames)
+        {
+            if (!env.Any(e => e.StartsWith(name + "=", StringComparison.Ordinal)))
+                throw new SandboxSpecException(
+                    $"MG-43: the package cache is mounted but '{name}' is not in the environment, so that package "
+                    + "manager still fills the 256 MiB tmpfs $HOME and the cache changes nothing for it.");
+        }
+    }
+
+    /// <summary>Whole-segment containment for container paths: <c>/workspace-cache</c> is not inside
+    /// <c>/workspace</c>, while <c>/workspace</c> and <c>/workspace/x</c> both are.</summary>
+    private static bool IsWithin(string? path, string ancestor)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return false;
+        }
+
+        var trimmed = path.TrimEnd('/');
+        var root = ancestor.TrimEnd('/');
+        return string.Equals(trimmed, root, StringComparison.Ordinal)
+               || trimmed.StartsWith(root + "/", StringComparison.Ordinal);
     }
 
     /// <summary>The stable per-repo/per-agent container name (drives the persistent-jail lookup).</summary>

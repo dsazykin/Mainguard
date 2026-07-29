@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Docker.DotNet;
 using Docker.DotNet.Models;
+using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
 
 namespace Mainguard.Agents.Agents.Sandbox;
@@ -142,11 +143,18 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // MG-36: a jail created before segmentation (or on another segment) must move — its network
             // is fixed at create, so an unsegmented jail would otherwise sit on the flat network forever.
             var wrongNetwork = !await AttachedToAsync(existing.ID, networkName, ct).ConfigureAwait(false);
+            // MG-43: a jail created before the package cache existed has no cache mount, and mounts are
+            // fixed at create. Reusing it would leave every restore filling the 256 MiB tmpfs $HOME —
+            // the exact failure this closes — while the daemon logged a healthy cache it was not using.
+            var missingCacheMount = !string.IsNullOrEmpty(request.PackageCachePath)
+                && (existing.Mounts is null
+                    || existing.Mounts.All(m => m.Destination != PackageCachePolicy.SandboxMount));
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
             if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
-                || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork)
+                || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
+                || missingCacheMount)
             {
                 await _docker.Containers.RemoveContainerAsync(existing.ID,
                     new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
@@ -159,6 +167,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // state. Write-if-absent, so a still-running jail's fresher tokens are never
                 // clobbered by the host keychain's older copy.
                 await RestoreCliCredentialsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
+                // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
+                // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
+                // reused jail is exactly the path that never re-checks anything.
+                await AssertPackageCacheUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
                 return new SandboxHandle(existing.ID, Reused: true);
             }
         }
@@ -167,7 +180,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
-            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath);
+            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
+            request.PackageCachePath);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
@@ -177,6 +191,13 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         var envContent = CredentialInjector.BuildEnvFileContent(request.Secrets.AgentEnv);
         try
         {
+            // MG-43: before anything else touches this container, prove the package cache is really
+            // there and really writable FROM INSIDE IT. The daemon asked for the mount; that is not
+            // evidence about the container (MG-42 paid for that conflation once already). Ordered first
+            // so a jail with no usable cache is destroyed on the same path a failed secret write uses,
+            // rather than being handed out to run a verification that would die at ENOSPC.
+            await AssertPackageCacheUsableAsync(created.ID, request, ct).ConfigureAwait(false);
+
             await WriteSecretFileAsync(created.ID, credentials.CredentialPath,
                 Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
             await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
@@ -363,6 +384,55 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
         // The name filter is a substring match; require an exact "/name" entry.
         return list.FirstOrDefault(c => c.Names.Any(n => n == "/" + name));
+    }
+
+    /// <summary>
+    /// MG-43 — proves, in the started container, that the package cache mount is present and writable by
+    /// the agent uid; throws <see cref="PackageCacheUnavailableException"/> otherwise.
+    ///
+    /// <para><b>Why the request is not evidence.</b> "The daemon put a mount in the create request" and
+    /// "the container has a writable directory there" are different facts, and MG-42 is the standing
+    /// receipt for what happens when they are conflated: our records said provisioned, the container said
+    /// otherwise, and the difference surfaced as an exit-127 that read like the agent's code being
+    /// broken. Here the equivalent failure is worse, because it is silent for a while — restore starts
+    /// writing into the tmpfs <c>$HOME</c> or the read-only rootfs and dies partway with <c>ENOSPC</c> or
+    /// <c>EROFS</c> in a merge-queue log, and the queue records a failed verification.</para>
+    ///
+    /// <para>A no-cache request (the substrate-less doubles and the ad-hoc harnesses) is not probed: they
+    /// have no cache by design, and <see cref="ContainerSpecBuilder"/> has already refused any spec that
+    /// claims one without mounting it. This method is deliberately NOT wrapped in a catch-all — an
+    /// unusable cache is a spawn failure, never a warning.</para>
+    /// </summary>
+    private async Task AssertPackageCacheUsableAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(request.PackageCachePath))
+            return;
+
+        SandboxExecResult probe;
+        try
+        {
+            probe = await ExecAsync(containerId, PackageCachePolicy.WritabilityProbe(), ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            throw new PackageCacheUnavailableException(
+                PackageCachePolicy.SandboxMount, request.PackageCachePath,
+                $"the in-jail probe could not be run at all: {ex.Message}");
+        }
+
+        var failure = PackageCachePolicy.DescribeProbeFailure(probe.Stdout, probe.ExitCode);
+        if (failure is not null)
+        {
+            throw new PackageCacheUnavailableException(
+                PackageCachePolicy.SandboxMount, request.PackageCachePath,
+                failure + $" (probe exit {probe.ExitCode.ToString(CultureInfo.InvariantCulture)}, "
+                + $"stderr: {probe.Stderr.Trim()})");
+        }
     }
 
     /// <summary>

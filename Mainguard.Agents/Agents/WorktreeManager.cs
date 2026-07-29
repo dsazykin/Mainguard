@@ -70,6 +70,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private readonly Func<string, (int ExitCode, string Output)> _pnpmRunner;
     private readonly Action<string>? _warningSink;
     private readonly IAuditLog? _audit;
+    private readonly Sandbox.PackageCacheManager? _packageCaches;
     private readonly AgentRepoManager _agentRepos;
     private readonly AgentRefMediator _refs;
     private readonly Lazy<AgentRefWatcher> _watcher;
@@ -88,16 +89,25 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// published, or an id that failed the layout gate, must leave a durable record rather than only a
     /// log line — the whole finding was a control that looked applied and was not.
     /// </param>
+    /// <param name="packageCaches">
+    /// MG-43 — the daemon-owned package cache, so a retired agent's cache is reclaimed on the ONE
+    /// teardown path every caller already goes through (<see cref="RemoveAgentWorktree"/> — the swarm
+    /// reconciler, the external-PR intake, the sync service and the launcher's own cleanup all land
+    /// here). Without it a cache would only ever be reclaimed by budget eviction, which is the residue
+    /// path, not the ordinary one. Null (every existing test double) simply keeps no cache.
+    /// </param>
     public WorktreeManager(
         string? vmRoot = null,
         Func<string, (int ExitCode, string Output)>? pnpmRunner = null,
         Action<string>? warningSink = null,
-        IAuditLog? audit = null)
+        IAuditLog? audit = null,
+        Sandbox.PackageCacheManager? packageCaches = null)
     {
         _vmRoot = vmRoot ?? DefaultVmRoot();
         _pnpmRunner = pnpmRunner ?? RealPnpmInstall;
         _warningSink = warningSink;
         _audit = audit;
+        _packageCaches = packageCaches;
         _agentRepos = new AgentRepoManager(_vmRoot);
         _refs = new AgentRefMediator(_agentRepos, BareRepoPathFor, OnPublishOutcome);
         _watcher = new Lazy<AgentRefWatcher>(() => new AgentRefWatcher(_refs, _agentRepos));
@@ -361,6 +371,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // by every publish (a fetch across a local transport transfers objects; the mirror borrows from
         // nobody), so deleting it can never strand a commit the mirror's refs still name.
         _agentRepos.Remove(repoHash, agentId);
+
+        // MG-43: and so does its package cache. The cache is derived, disposable content that only this
+        // agent's jail ever mounted, so a retired agent has no claim on the gigabytes it holds — and
+        // reclaiming here is what keeps budget eviction a residue path (a crashed daemon, an unclean
+        // removal) rather than the routine one.
+        _packageCaches?.Release(repoHash, agentId);
 
         // §4 gc policy: this is the natural idle point — if that was the last borrower, unreachable
         // objects in the mirror may finally be pruned.

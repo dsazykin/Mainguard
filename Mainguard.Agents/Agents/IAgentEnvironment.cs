@@ -66,6 +66,17 @@ public interface IAgentEnvironment
     /// </summary>
     IToolchainImageBuilder? ToolchainImages => null;
 
+    /// <summary>
+    /// MG-43 — the daemon-owned package cache (<see cref="PackageCacheManager"/>) whose per-agent
+    /// directory is bind-mounted into each jail on ext4, outside the worktree and outside the 256 MiB
+    /// tmpfs <c>$HOME</c>. Defaulted to <c>null</c> for the same reason
+    /// <see cref="ToolchainImages"/> is: a substrate with no daemon-side filesystem has no cache to
+    /// hand out, and the many hand-rolled test doubles keep their existing behaviour exactly (no cache
+    /// mount, no cache environment — a combination <see cref="ContainerSpecBuilder"/> accepts and
+    /// asserts is self-consistent).
+    /// </summary>
+    PackageCacheManager? PackageCaches => null;
+
     /// <summary>Resolve the ONE host-side sync remote for a provisioned repo (name + opaque URL handle).</summary>
     SyncRemote ResolveSyncRemote(string repoHash);
 }

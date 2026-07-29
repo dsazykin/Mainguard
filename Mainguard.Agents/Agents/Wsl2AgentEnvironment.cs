@@ -52,7 +52,13 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // MG-3: the worktree manager owns the mediated publish, so it gets the audit sink — a REFUSED
         // publish (an agent rewriting history the mirror already carries) is a security event and has to
         // leave a durable record, not just a log line.
-        Worktrees = new WorktreeManager(vmRoot, audit: audit);
+        // MG-43: the package cache root is a sibling of repos/worktrees/agents under the SAME vmRoot,
+        // so it inherits the MG-17 group-share the boot step provisions. The worktree manager is handed
+        // the manager (not just the root) because a retired agent's cache is that agent's, and the one
+        // teardown path every caller already goes through is RemoveAgentWorktree.
+        var packageCaches = new PackageCacheManager(vmRoot);
+        PackageCaches = packageCaches;
+        Worktrees = new WorktreeManager(vmRoot, audit: audit, packageCaches: packageCaches);
         // Auto-permit on install: the proxy config also permits the hosts each installed agent CLI
         // declared it needs (read fresh per spawn from the registry markers), so an installed CLI
         // reaches its own service hosts (e.g. claude-code → platform.claude.com) with no hand-editing.
@@ -97,6 +103,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public IEgressPolicy Egress { get; }
 
     public IToolchainImageBuilder? ToolchainImages { get; }
+
+    public PackageCacheManager? PackageCaches { get; }
 
     public SyncRemote ResolveSyncRemote(string repoHash)
         => new(Wsl2SyncRemoteName, $@"{_uncPrefix}\{repoHash}.git");
