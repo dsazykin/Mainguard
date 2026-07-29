@@ -20,6 +20,11 @@ public class SwarmReconcilerTests
     {
         public List<(string Repo, string Agent, bool Force)> Removed { get; } = new();
 
+        /// <summary>Every <c>(repo, agent)</c> handed to the MG-3 ref watcher, in call order — the seam
+        /// <c>SandboxAgentLauncher</c> uses at spawn, so watching it here asserts the real wiring rather
+        /// than a reconciler-only bookkeeping list.</summary>
+        public List<(string Repo, string Agent)> Watched { get; } = new();
+
         public string CreateAgentWorktree(string repoHash, string agentId) => $"/wt/{repoHash}/{agentId}";
 
         public void RemoveAgentWorktree(string repoHash, string agentId, bool force) =>
@@ -28,6 +33,8 @@ public class SwarmReconcilerTests
         public void Prune(string repoHash) { }
 
         public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
+
+        public void WatchAgentRef(string repoHash, string agentId) => Watched.Add((repoHash, agentId));
     }
 
     private static Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> Docker(
@@ -126,6 +133,148 @@ public class SwarmReconcilerTests
         Assert.Equal(new[] { "a1", "a2", "a3" }, report.Adopted.OrderBy(x => x).ToArray());
         Assert.Equal(3, wiped.All().Count);
         Assert.All(wiped.All(), a => Assert.Equal("Adopted", a.Disposition));
+    }
+
+    /// <summary>
+    /// MG-3 — an agent that survives a daemon restart must be handed to the ref watcher by the boot
+    /// reconcile, because the ONLY other place <c>WatchAgentRef</c> is called is
+    /// <c>SandboxAgentLauncher.LaunchAsync</c>, which a survivor never runs again. Without this, every
+    /// agent alive across a restart spends the rest of its life unwatched: its own
+    /// <c>refs/heads/agent/&lt;id&gt;</c> moves and nothing publishes it into the mirror, so the review
+    /// cockpit, the queue projection and the stale cascade see the old tip until some verification
+    /// happens to re-fetch. That failure presents as "the UI is stale / the agent looks idle", never as
+    /// an error — which is why it needs an assertion rather than a log line.
+    /// </summary>
+    [Fact]
+    public async Task AdoptedOrphan_IsHandedToTheRefWatcher()
+    {
+        var worktrees = new FakeWorktreeManager();
+        var reconciler = new SwarmReconciler(
+            Docker(Live("orphan")), new InMemoryExpectedAgentStore(), worktrees, policy: OrphanPolicy.Adopt);
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "orphan" }, report.Adopted);
+        Assert.Equal(new[] { ("repo1", "orphan") }, worktrees.Watched);
+    }
+
+    /// <summary>
+    /// The same guarantee for the case the adopt branch does NOT cover, which is the steady state: the
+    /// expected-agents table is SQLite-backed, so the second restart of a long-lived agent finds a row
+    /// already there (the first restart's <c>Upsert(..., "Adopted")</c>) and takes the
+    /// already-expected path. A live jail is a live agent whichever branch it arrives on, so watching
+    /// only the newly-adopted ones would fix the first restart and nothing after it.
+    /// </summary>
+    [Fact]
+    public async Task LiveContainerAlreadyInTheExpectedTable_IsStillHandedToTheRefWatcher()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repo1", "survivor", "Adopted");
+        var worktrees = new FakeWorktreeManager();
+
+        var reconciler = new SwarmReconciler(Docker(Live("survivor")), expected, worktrees);
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Empty(report.Pruned);   // its container is up; nothing to prune
+        Assert.Empty(report.Adopted);  // already expected — not a new adoption
+        Assert.Equal(new[] { ("repo1", "survivor") }, worktrees.Watched);
+    }
+
+    /// <summary>An orphan the stricter posture STOPS is not watched — watching a jail we just killed
+    /// would leave a sweep entry publishing from a repository about to be pruned.</summary>
+    [Fact]
+    public async Task StoppedOrphan_IsNotWatched()
+    {
+        var worktrees = new FakeWorktreeManager();
+        var reconciler = new SwarmReconciler(
+            Docker(Live("orphan")), new InMemoryExpectedAgentStore(), worktrees,
+            stopContainer: (_, _) => Task.CompletedTask,
+            policy: OrphanPolicy.Stop);
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "orphan" }, report.Stopped);
+        Assert.Empty(worktrees.Watched);
+    }
+
+    /// <summary>
+    /// The #281 scoping bug, in the reconciler. A bare agent id like <c>pr-7</c> is unique only INSIDE a
+    /// repository (the intake names external-PR workers after the pull-request number), so keying the
+    /// live set by the <c>mainguard.agent</c> label alone collapses two repositories' jails into one
+    /// entry — and <c>ToDictionary</c> on the duplicate key throws, out of a boot sequence that is
+    /// fail-fast. Both labels are the key, exactly as <c>AgentSessionKey</c> and <c>ResolveRunningJail</c>
+    /// already do it, so both jails are adopted and both are watched independently.
+    /// </summary>
+    [Fact]
+    public async Task SameAgentIdInTwoRepos_IsTwoAgents_BothAdoptedAndBothWatched()
+    {
+        var worktrees = new FakeWorktreeManager();
+        var reconciler = new SwarmReconciler(
+            Docker(Live("pr-7", "repoA"), Live("pr-7", "repoB")),
+            new InMemoryExpectedAgentStore(), worktrees);
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "pr-7", "pr-7" }, report.Adopted);
+        Assert.Equal(
+            new[] { ("repoA", "pr-7"), ("repoB", "pr-7") },
+            worktrees.Watched.OrderBy(w => w.Repo).ToArray());
+    }
+
+    /// <summary>
+    /// The prune half of the same scoping bug: repo A's <c>pr-7</c> is gone, repo B's is running. Keyed
+    /// by agent id alone, repo B's live container answers for repo A's dead one — so a dead agent's
+    /// worktree is never pruned and its row never marked Dead, and the UI keeps reporting it live.
+    /// </summary>
+    [Fact]
+    public async Task DeadAgentInOneRepo_IsPruned_EvenWhenAnotherRepoRunsTheSameId()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repoA", "pr-7", "Live");
+        var worktrees = new FakeWorktreeManager();
+
+        var reconciler = new SwarmReconciler(Docker(Live("pr-7", "repoB")), expected, worktrees);
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "pr-7" }, report.Pruned);
+        Assert.Contains(("repoA", "pr-7", true), worktrees.Removed);
+        Assert.Equal("Dead", expected.All().Single(a => a.RepoHash == "repoA").Disposition);
+
+        // repo B's jail is untouched: adopted, watched, not pruned.
+        Assert.DoesNotContain(worktrees.Removed, r => r.Repo == "repoB");
+        Assert.Contains(("repoB", "pr-7"), worktrees.Watched);
+    }
+
+    /// <summary>A watcher that throws must not take the daemon down: the boot sequence is fail-fast, so
+    /// an exception out of the sweep registration would turn a housekeeping failure into a daemon that
+    /// does not start. The rest of the pass still happens.</summary>
+    [Fact]
+    public async Task WatchFailure_DoesNotFailTheReconcile()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        var reconciler = new SwarmReconciler(
+            Docker(Live("orphan")), expected, new ThrowingWatchManager());
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "orphan" }, report.Adopted);
+        Assert.Equal("Adopted", expected.All().Single().Disposition);
+    }
+
+    private sealed class ThrowingWatchManager : IAgentWorktreeManager
+    {
+        public string CreateAgentWorktree(string repoHash, string agentId) => string.Empty;
+
+        public void RemoveAgentWorktree(string repoHash, string agentId, bool force) { }
+
+        public void Prune(string repoHash) { }
+
+        public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
+
+        public void WatchAgentRef(string repoHash, string agentId) =>
+            throw new InvalidOperationException("the watcher is unavailable");
     }
 
     [Fact]
