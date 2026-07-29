@@ -82,6 +82,38 @@ public sealed class KillContainmentTests
         Assert.Equal(KillAgentOutcome.Paused, report.Agents.Single(a => a.AgentId == agentId).Outcome);
     }
 
+    /// <summary>
+    /// A session's identity is (repo, agent id), so two repositories can each hold <c>pr-7</c> — the
+    /// external-PR intake names its workers after the pull request number. <see cref="IKillTarget"/> is an
+    /// id-only contract, so the emergency stop must fan out over EVERY session behind an id: containing one
+    /// and leaving the other's jail running would be MG-8's original failure (a state word instead of
+    /// containment) reintroduced through a lookup.
+    /// </summary>
+    [Fact]
+    public async Task Engage_WhenTwoReposShareAnAgentId_PausesBothJails_AndSnapshotsWithoutThrowing()
+    {
+        using var rig = new KillRig();
+        rig.AddLiveAgent("ctr-repo-a", "repo-a", "pr-7");
+        rig.AddLiveAgent("ctr-repo-b", "repo-b", "pr-7");
+
+        var report = await rig.KillSwitch.EngageAsync();
+
+        // Both jails frozen — not one of them.
+        Assert.Contains("ctr-repo-a", rig.Engine.Paused);
+        Assert.Contains("ctr-repo-b", rig.Engine.Paused);
+
+        // Both sessions marked, each under its own repo.
+        Assert.Equal("Paused", rig.Store.Find("repo-a", "pr-7")!.State);
+        Assert.Equal("Paused", rig.Store.Find("repo-b", "pr-7")!.State);
+
+        // The id is offered to the fan-out ONCE (a repeated id would pause twice and report twice), and
+        // the journal snapshot — a dictionary keyed by agent id — is built rather than throwing on the
+        // duplicate key.
+        Assert.Equal("pr-7", Assert.Single(report.Agents).AgentId);
+        Assert.Equal(KillAgentOutcome.Paused, report.Agents[0].Outcome);
+        Assert.Equal("Paused", rig.Target.CaptureStates()["pr-7"]);
+    }
+
     /// <summary>The wiring half of MG-8: a containing target that is not the one the daemon resolves fixes
     /// nothing, so assert the composition root itself.</summary>
     [Fact]
@@ -124,12 +156,24 @@ public sealed class KillContainmentTests
 
         public KillSwitch KillSwitch { get; }
 
-        /// <summary>A spawned session with a jail attached and a leader-owned PTY — a live worker.</summary>
-        public string AddLiveAgent(string containerId)
+        /// <summary>A spawned session with a jail attached and a leader-owned PTY — a live worker. The repo
+        /// goes in at spawn because it is half of the session's identity (see <c>AgentSessionKey</c>); the
+        /// sandbox then attaches to that same (repo, id) rather than re-homing the record.</summary>
+        public string AddLiveAgent(string containerId, string repoHash = "repohash")
         {
-            var id = Store.Spawn("claude").Id;
-            Store.AttachSandbox(id, containerId, "repohash");
-            Leader.Register(new LeaderSession(id, "repohash", containerId, 80, 24, SocketPath: string.Empty));
+            var id = Store.Spawn("claude", repoHash: repoHash).Id;
+            Store.AttachSandbox(id, containerId, repoHash);
+            Leader.Register(new LeaderSession(id, repoHash, containerId, 80, 24, SocketPath: string.Empty));
+            return id;
+        }
+
+        /// <summary>The same, under a caller-chosen id — the intake's <c>pr-&lt;n&gt;</c> shape, which two
+        /// repos can both hold.</summary>
+        public string AddLiveAgent(string containerId, string repoHash, string agentId)
+        {
+            var id = Store.Spawn("claude", agentId: agentId, repoHash: repoHash).Id;
+            Store.AttachSandbox(id, containerId, repoHash);
+            Leader.Register(new LeaderSession(id, repoHash, containerId, 80, 24, SocketPath: string.Empty));
             return id;
         }
 

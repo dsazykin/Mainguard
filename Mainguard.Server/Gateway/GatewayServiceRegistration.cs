@@ -100,32 +100,7 @@ public static class GatewayServiceRegistration
             repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
             leases: sp.GetRequiredService<IMergeLeaseStore>(),
             resolveContainerId: (repoHash, agentId) =>
-            {
-                // Verification runs in the worker's OWN jail (§3.2 — host execution is a rejection
-                // trigger). Scoped by repo hash too, so one repo's queue can never reach into another's
-                // container even if agent ids ever collide.
-                var session = sp.GetRequiredService<AgentSessionStore>().Find(agentId);
-                if (session is not null
-                    && string.Equals(session.RepoHash, repoHash, StringComparison.Ordinal)
-                    && !string.IsNullOrEmpty(session.ContainerId))
-                {
-                    return session.ContainerId;
-                }
-
-                // …and when the session store has no answer, ASK THE CONTAINER RUNTIME, which P2-08 already
-                // designates the sole source of truth for jail liveness (there are no PID/lock files).
-                //
-                // This is not belt-and-braces. AgentSessionStore is memory-only and is written by exactly
-                // one thing, AgentSpawnService — while the jails are persistent (a restart re-STARTS a
-                // stopped container rather than recreating it) and the merge queue rehydrates its state
-                // from SQLite in its constructor. So after a daemon restart the queue resumed knowing
-                // about every branch, every jail was still running, and the session store was empty: every
-                // verification on the box refused with "no live sandbox", ResumeAfterRestartAsync drove
-                // each interrupted run straight back to Working, and the stale cascade's auto re-verify
-                // failed for every branch. The queue came back up permanently unable to verify anything
-                // until each agent was spawned again — with no error naming the actual cause.
-                return ResolveRunningJail(repoHash, agentId);
-            },
+                ResolveVerificationJail(sp.GetRequiredService<AgentSessionStore>(), repoHash, agentId),
             queueStore: queueStoreFactory,
             verificationStore: verificationStoreFactory,
             sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
@@ -391,6 +366,44 @@ public static class GatewayServiceRegistration
     }
 
     /// <summary>
+    /// The jail a repo's merge queue verifies <paramref name="agentId"/> in — the ONE production answer to
+    /// "does this agent have a live sandbox", named rather than inlined so a test can ask the daemon's own
+    /// resolver instead of a re-implementation of it.
+    ///
+    /// <para>Verification runs in the worker's OWN jail (§3.2 — host execution is a rejection trigger).
+    /// Scoped by repo hash, so one repo's queue can never reach into another's container even if agent ids
+    /// ever collide. Agent ids now DO collide — an intake'd <c>pr-&lt;n&gt;</c> is unique only inside a
+    /// repo — so the session lookup is by the full (repo, id) identity, and the repo-hash comparison is
+    /// kept as that same guard restated: it can no longer fail, and it starts failing again the moment the
+    /// key stops carrying the repo.</para>
+    ///
+    /// <para>When the session store has no answer, ASK THE CONTAINER RUNTIME, which P2-08 already
+    /// designates the sole source of truth for jail liveness (there are no PID/lock files). This is not
+    /// belt-and-braces. <see cref="AgentSessionStore"/> is memory-only and is written by exactly one
+    /// thing, <c>AgentSpawnService</c> — while the jails are persistent (a restart re-STARTS a stopped
+    /// container rather than recreating it) and the merge queue rehydrates its state from SQLite in its
+    /// constructor. So after a daemon restart the queue resumed knowing about every branch, every jail was
+    /// still running, and the session store was empty: every verification on the box refused with "no live
+    /// sandbox", <c>ResumeAfterRestartAsync</c> drove each interrupted run straight back to Working, and
+    /// the stale cascade's auto re-verify failed for every branch. The queue came back up permanently
+    /// unable to verify anything until each agent was spawned again — with no error naming the actual
+    /// cause. That fallback matches on BOTH labels, so it disambiguates two repos' <c>pr-7</c> the same way
+    /// the session key does.</para>
+    /// </summary>
+    internal static string? ResolveVerificationJail(AgentSessionStore sessions, string repoHash, string agentId)
+    {
+        var session = sessions.Find(new AgentSessionKey(repoHash, agentId));
+        if (session is not null
+            && string.Equals(session.RepoHash, repoHash, StringComparison.Ordinal)
+            && !string.IsNullOrEmpty(session.ContainerId))
+        {
+            return session.ContainerId;
+        }
+
+        return ResolveRunningJail(repoHash, agentId);
+    }
+
+    /// <summary>
     /// The RUNNING jail for one (repo, agent), read off the <c>mainguard.repo</c>/<c>mainguard.agent</c>
     /// labels P2-07 stamps on every container — the same listing the swarm reconciler treats as the sole
     /// source of truth. Null when no such jail is up, which keeps the "no jail ⇒ no verification, never the
@@ -399,7 +412,7 @@ public static class GatewayServiceRegistration
     /// container. Best-effort by construction — an unreachable Docker endpoint answers "no jail", which is
     /// the same refusal the caller would otherwise have produced.
     /// </summary>
-    private static string? ResolveRunningJail(string repoHash, string agentId)
+    internal static string? ResolveRunningJail(string repoHash, string agentId)
     {
         try
         {

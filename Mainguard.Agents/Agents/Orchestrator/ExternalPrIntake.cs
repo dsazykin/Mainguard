@@ -392,6 +392,11 @@ public sealed class ExternalPrIntake : IExternalPrIntake
     /// <summary>The agent id an intake'd pull request takes: <c>pr-&lt;n&gt;</c>. It is the worktree name,
     /// the <c>agent/pr-&lt;n&gt;</c> branch, the jail's <c>mainguard.agent</c> label, the package-cache
     /// directory and the merge-queue key — one id all the way down, which is what lets an external entry
-    /// use the identical verify path as a local agent rather than a parallel one.</summary>
+    /// use the identical verify path as a local agent rather than a parallel one.
+    ///
+    /// <para><b>It is unique only WITHIN a repo</b>, which is why every one of those is paired with the
+    /// repo handle (the container name, its <c>mainguard.repo</c> label, the cache directory, the queue)
+    /// and why <see cref="IPrWorkerHost"/> takes <c>repoHash</c> on both of its methods. Two subscribed
+    /// repositories that each have a pull request #7 are two different workers, not a collision.</para>
     public static string AgentIdFor(int prNumber) => $"pr-{prNumber}";
 }

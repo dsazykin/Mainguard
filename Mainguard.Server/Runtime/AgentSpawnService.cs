@@ -154,7 +154,13 @@ public sealed class AgentSpawnService
         // Record the session first (its id names the worktree + container), then run the real
         // P2-06/P2-07 spawn chain. A provisioned repo takes the real-jail path; an unprovisioned
         // handle degrades to a session-only record (no fabricated jail).
-        var session = _store.Spawn(agentKind, role, parentAgentId, agentId);
+        //
+        // The repo goes in at SPAWN, not at AttachSandbox: it is half of the session's identity. An
+        // intake-named `pr-<n>` id is unique only inside a repo, so keying by id alone made two
+        // subscribed repositories with a pull request of the same number contend for one session — the
+        // second was refused by name and never got a jail at all.
+        var session = _store.Spawn(agentKind, role, parentAgentId, agentId, repoHandle);
+        var key = session.Key;
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
         // renders as (agentId) in the file format, so one grep follows the whole chain.
@@ -203,7 +209,7 @@ public sealed class AgentSpawnService
             var bound = false;
             if (launch is not null)
             {
-                _store.AttachSandbox(session.Id, launch.ContainerId, repoHandle);
+                _store.AttachSandbox(key, launch.ContainerId);
 
                 // MG-10: a jailed agent has a worktree + agent/<id> branch in a provisioned repo, so it is
                 // a merge-queue member from this moment. Registering here (as well as on CreateWorktree)
@@ -246,17 +252,26 @@ public sealed class AgentSpawnService
             // A user-cancelled launch stays quiet — the client's Stop path owns that messaging.
             if (ex is not OperationCanceledException)
             {
-                _store.MarkState(session.Id, "Dead", ex.Message);
+                _store.MarkState(key, "Dead", ex.Message);
             }
 
-            if (ipcDir is not null)
+            _store.Stop(key);
+
+            // The PTY binder, the coordinator IPC endpoint and the terminal input lock are still keyed by
+            // agent id ALONE. Now that two repos can hold one id, tearing them down unconditionally would
+            // sever the other repo's live session — so they go only once this stop has removed the LAST
+            // holder of the id.
+            if (_store.FindAll(session.Id).Count == 0)
             {
-                _ipc.CloseEndpoint(session.Id);
+                if (ipcDir is not null)
+                {
+                    _ipc.CloseEndpoint(session.Id);
+                }
+
+                _binder.ClearBindPending(session.Id); // spawn failed → no bind coming; don't leave attaches waiting
+                _locks.Unlock(session.Id);
             }
 
-            _binder.ClearBindPending(session.Id); // spawn failed → no bind coming; don't leave attaches waiting
-            _locks.Unlock(session.Id);
-            _store.Stop(session.Id);
             throw;
         }
     }
@@ -305,16 +320,36 @@ public sealed class AgentSpawnService
     /// The jail's tmpfs $HOME dies with the teardown, so the CLI's login-state files (the adapter's
     /// declared <c>credentialPaths</c>) are harvested FIRST and handed back in the result — the
     /// client persists them into the host OS keychain (the daemon stores nothing).</summary>
-    public async Task<AgentStopResult> StopAsync(string agentId, CancellationToken ct)
+    public Task<AgentStopResult> StopAsync(string agentId, CancellationToken ct)
     {
+        // The daemon-global entry point (the StopAgent RPC): the operator names an agent by id alone.
+        // Resolve it to ONE (repo, id) session rather than guessing — an id held by two repos stops
+        // nothing and reports Stopped=false, because tearing down the wrong repo's jail is unrecoverable.
+        var session = _store.Find(agentId);
+        return StopAsync(session?.Key ?? new AgentSessionKey(string.Empty, agentId), ct);
+    }
+
+    /// <summary>The repo-scoped stop. Every caller that knows which repository the agent belongs to —
+    /// the external-PR intake's release, the spawn chain's own rollback — comes through here, so one
+    /// repo's <c>pr-&lt;n&gt;</c> can never tear down another's.</summary>
+    public async Task<AgentStopResult> StopAsync(AgentSessionKey key, CancellationToken ct)
+    {
+        var agentId = key.AgentId;
+
         // Capture the session (with its container id/repo hash) BEFORE removing it, so a real jail +
         // worktree can be torn down after the record is gone.
-        var session = _store.Find(agentId);
-        var stopped = _store.Stop(agentId);
+        var session = _store.Find(key);
+        var stopped = _store.Stop(key);
 
-        _binder.Release(agentId);
-        _ipc.CloseEndpoint(agentId);
-        _locks.Unlock(agentId);
+        // Id-keyed subsystems (see the spawn rollback above): released only when no session anywhere on
+        // the daemon still answers to this id, so stopping repo A's `pr-7` cannot unlock, unbind or
+        // un-endpoint repo B's.
+        if (_store.FindAll(agentId).Count == 0)
+        {
+            _binder.Release(agentId);
+            _ipc.CloseEndpoint(agentId);
+            _locks.Unlock(agentId);
+        }
 
         IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile> credentials =
             Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>();
@@ -355,6 +390,10 @@ public sealed class AgentSpawnService
                     return new AgentIpcResponse(Ok: false, Error: "an agent kind is required (mainguard-agent spawn <agent-kind>)");
                 }
 
+                // Id-only by necessity: the shim's identity is positional (only that coordinator's jail
+                // has the socket) and the socket carries no repo. Safe — a coordinator id is always a
+                // minted GUID; the only ids that repeat across repos are the intake's `pr-<n>`, and an
+                // external-PR worker is Managed, so it never gets an IPC endpoint to ask through.
                 var coordinator = _store.Find(coordinatorAgentId);
                 if (coordinator is null)
                 {
@@ -369,6 +408,12 @@ public sealed class AgentSpawnService
                 // MG-2: the wired shim spawn is the agent-reachable path, so the hard caps that live in
                 // the (un-wired) CoordinatorTools must be re-applied here server-side — a coordinator
                 // must not be able to fan out unlimited Managed workers or spawn under memory pressure.
+                //
+                // MaxActiveWorkers is a BOX-wide allowance (as is the AdmissionController's agent count),
+                // so the counted population is every Managed session on the daemon, unchanged by the
+                // (repo, id) key — List() still returns one entry per session. It is now strictly more
+                // accurate: a second repo's `pr-7` is a real session that consumes a slot, where before it
+                // could not be recorded at all and so was invisible to the cap.
                 var activeManaged = _store.List().Count(s => s.Role == AgentRoles.Managed);
                 var refusal = CoordinatorSpawnGate.Evaluate(activeManaged, _limits.MaxActiveWorkers, _admission);
                 if (refusal is not null)

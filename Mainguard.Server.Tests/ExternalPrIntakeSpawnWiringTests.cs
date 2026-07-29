@@ -41,11 +41,12 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     {
         var store = new AgentSessionStore(new InMemoryAuditLog());
 
-        var external = store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9");
+        var external = store.Spawn(
+            ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
         Assert.Equal("pr-9", external.Id);
-        Assert.Equal("pr-9", store.Find("pr-9")?.Id);
+        Assert.Equal("pr-9", store.Find("repo-a", "pr-9")?.Id);
 
-        var minted = store.Spawn("worker");
+        var minted = store.Spawn("worker", repoHash: "repo-a");
         Assert.NotEqual("pr-9", minted.Id);
         Assert.Equal(32, minted.Id.Length); // still a GUID "N" for every other caller
     }
@@ -54,19 +55,21 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     /// A caller-chosen id can collide with a live session in a way a GUID never could. Overwriting would
     /// drop the running jail's container id, leaking the container, its MG-36 network segment and its
     /// package-cache lease with nothing left able to name them — so the store refuses instead, and the
-    /// FIRST session is the one that survives.
+    /// FIRST session is the one that survives. Scoping sessions by (repo, id) did not soften this: the
+    /// duplicate that is refused is a duplicate of the FULL key.
     /// </summary>
     [Fact]
     public void Spawn_WithAnIdThatIsAlreadyLive_IsRefused_AndTheLiveSessionSurvives()
     {
         var store = new AgentSessionStore(new InMemoryAuditLog());
-        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9");
+        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
         store.AttachSandbox("pr-9", "container-original", "repo-a");
 
         Assert.Throws<InvalidOperationException>(
-            () => store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9"));
+            () => store.Spawn(
+                ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a"));
 
-        Assert.Equal("container-original", store.Find("pr-9")?.ContainerId);
+        Assert.Equal("container-original", store.Find("repo-a", "pr-9")?.ContainerId);
         Assert.Single(store.List());
     }
 
@@ -81,7 +84,7 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     {
         using var daemon = new DaemonFixture();
         var store = daemon.Services.GetRequiredService<AgentSessionStore>();
-        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9");
+        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
         store.AttachSandbox("pr-9", "container-9", "repo-a");
 
         var host = NewHost(daemon, resolveRunningJail: (_, _) => null);
@@ -92,29 +95,32 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     }
 
     /// <summary>
-    /// <c>pr-&lt;n&gt;</c> is the right id INSIDE a repo — worktree, branch and queue entry are all
-    /// per-repo — but the session store is daemon-global, so two subscribed repositories that each have a
-    /// pull request #n contend for one id. That is refused, by name: the alternative is a second repo's
-    /// untrusted head sharing (or evicting) the first repo's jail.
+    /// <b>The defect this scoping fixes.</b> <c>pr-&lt;n&gt;</c> is the right id INSIDE a repo — worktree,
+    /// branch, container labels and queue entry are all per-repo — but the session store was
+    /// daemon-global, so two subscribed repositories that each had a pull request #n contended for one id.
+    /// The second was refused BY NAME ("already taken by repo …") and its pull request was never intake'd
+    /// at all. With sessions keyed by (repo, id) the second repo is simply a different session: it is not
+    /// refused, and it does not adopt, evict or otherwise touch the first repo's jail.
     /// </summary>
     [Fact]
-    public async Task EnsureWorker_WhenAnotherRepoHoldsTheSameId_Fails_AndDoesNotTouchTheOtherRepoSJail()
+    public async Task EnsureWorker_WhenAnotherRepoHoldsTheSameId_IsNotRefusedForTheId_AndLeavesThatJailAlone()
     {
         using var daemon = new DaemonFixture();
         var store = daemon.Services.GetRequiredService<AgentSessionStore>();
-        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9");
+        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
         store.AttachSandbox("pr-9", "container-repo-a", "repo-a");
 
         var host = NewHost(daemon, resolveRunningJail: (_, _) => null);
-        var result = await host.EnsureWorkerAsync("repo-b", "pr-9", 9, CancellationToken.None);
+        var result = await host.EnsureWorkerAsync(UnprovisionedRepo, "pr-9", 9, CancellationToken.None);
 
-        Assert.Equal(PrWorkerOutcome.Failed, result.Outcome);
-        Assert.False(result.HasJail);
-        Assert.Contains("already taken", result.Reason);
+        // It gets PAST the id and into the spawn chain, then fails for the honest reason (this handle has
+        // no provisioned mirror). The old failure named the id; nothing may name it now.
+        Assert.DoesNotContain("already taken", result.Reason ?? string.Empty);
+        Assert.Contains("no provisioned mirror", result.Reason ?? string.Empty);
 
-        // repo-a's jail is untouched — not adopted, not replaced.
-        Assert.Equal("container-repo-a", store.Find("pr-9")?.ContainerId);
-        Assert.Equal("repo-a", store.Find("pr-9")?.RepoHash);
+        // repo-a's jail is untouched — not adopted, not replaced, not stopped by the other repo's rollback.
+        Assert.Equal("container-repo-a", store.Find("repo-a", "pr-9")?.ContainerId);
+        Assert.Equal("repo-a", store.Find("repo-a", "pr-9")?.RepoHash);
     }
 
     /// <summary>
@@ -128,7 +134,7 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     {
         using var daemon = new DaemonFixture();
         var store = daemon.Services.GetRequiredService<AgentSessionStore>();
-        Assert.Null(store.Find("pr-9")); // no session at all — a restarted daemon
+        Assert.Null(store.Find("repo-a", "pr-9")); // no session at all — a restarted daemon
 
         var host = NewHost(daemon, resolveRunningJail: (repo, agent) =>
             repo == "repo-a" && agent == "pr-9" ? "container-9" : null);
@@ -163,7 +169,7 @@ public sealed class ExternalPrIntakeSpawnWiringTests
         Assert.Equal(PrWorkerOutcome.Refused, result.Outcome);
         Assert.False(result.HasJail);
         Assert.Contains("cap", result.Reason, StringComparison.OrdinalIgnoreCase);
-        Assert.Null(store.Find("pr-9"));
+        Assert.Null(store.Find("repo-a", "pr-9"));
         Assert.Equal(2, store.List().Count);
     }
 
@@ -201,7 +207,7 @@ public sealed class ExternalPrIntakeSpawnWiringTests
 
         Assert.Equal(PrWorkerOutcome.Failed, result.Outcome);
         Assert.False(result.HasJail);
-        Assert.Null(store.Find("pr-9"));
+        Assert.Null(store.Find(UnprovisionedRepo, "pr-9"));
         Assert.DoesNotContain(store.List(), s => s.Role == AgentRoles.Managed);
     }
 

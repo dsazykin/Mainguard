@@ -68,7 +68,14 @@ public sealed class SandboxKillTarget : IKillTarget
             .CreateLogger(DaemonLogCategories.KillSwitch);
     }
 
-    public IReadOnlyList<string> ActiveAgentIds => _store.List().Select(s => s.Id).ToList();
+    /// <summary>
+    /// The agents in scope for the kill, by id. <see cref="IKillTarget"/> is an id-only contract while a
+    /// session's identity is (repo, id), so an id two repos both hold appears ONCE here and
+    /// <see cref="PauseAsync"/> fans out over every session behind it — the emergency stop must contain
+    /// both jails, and it must not ask for the same id twice.
+    /// </summary>
+    public IReadOnlyList<string> ActiveAgentIds =>
+        _store.List().Select(s => s.Id).Distinct(StringComparer.Ordinal).ToList();
 
     public Task<bool> RequestYieldAsync(string agentId, TimeSpan timeout, CancellationToken ct)
     {
@@ -84,40 +91,74 @@ public sealed class SandboxKillTarget : IKillTarget
         _locks.Lock(agentId);
         _leader.PauseInput(agentId);
 
-        var containerId = _store.Find(agentId)?.ContainerId;
-        if (string.IsNullOrEmpty(containerId))
+        // EVERY session behind this id, across repos. An agent id is unique only within a repository (the
+        // external-PR intake names its sessions `pr-<n>` after the pull request number), so resolving one
+        // session here would leave the other repo's jail RUNNING through an emergency stop — the exact
+        // failure MG-8 exists to prevent, reintroduced by a lookup rather than by a placeholder.
+        var sessions = _store.FindAll(agentId);
+        if (sessions.Count == 0)
         {
-            // A session-only record: the spawn chain degraded (unprovisioned repo / failed bind) and no jail
-            // was ever attached, so there is no container to freeze and no worker process to stop. The input
-            // sever is the whole of the available containment; reporting PauseFailed here would cry wolf on
-            // every degraded spawn and bury the failures that DO mean an agent is still running.
-            _store.MarkState(agentId, "Paused", "Kill switch engaged — no jail bound; terminal input severed.");
-            _log.LogWarning("kill: agent={Agent} has no container — terminal input severed only", agentId);
+            // Raced with a stop between ActiveAgentIds and here. The input sever above already happened;
+            // there is no session left to mark.
+            _log.LogWarning("kill: agent={Agent} has no session — terminal input severed only", agentId);
             return;
         }
 
-        try
+        System.Runtime.ExceptionServices.ExceptionDispatchInfo? failure = null;
+        foreach (var session in sessions)
         {
-            await _sandboxes.PauseAsync(containerId, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // MG-8's core lesson: an uncontained worker must NEVER project as "Paused". "Unresponsive" is
-            // the honest word and, unlike an invented one, survives the client's state mapping instead of
-            // falling into its Working default. Rethrow so the KillSwitch records PauseFailed in the report
-            // and the journal snapshot — the kill still completes, it just tells the truth about this agent.
-            _store.MarkState(agentId, "Unresponsive",
-                $"Kill switch engaged — docker pause FAILED ({ex.Message}); the jail may still be running.");
-            _log.LogError(ex,
-                "kill: docker pause FAILED agent={Agent} container={Container} — the jail may still be RUNNING",
-                agentId, containerId);
-            throw;
+            var containerId = session.ContainerId;
+            if (string.IsNullOrEmpty(containerId))
+            {
+                // A session-only record: the spawn chain degraded (unprovisioned repo / failed bind) and no
+                // jail was ever attached, so there is no container to freeze and no worker process to stop.
+                // The input sever is the whole of the available containment; reporting PauseFailed here
+                // would cry wolf on every degraded spawn and bury the failures that DO mean an agent is
+                // still running.
+                _store.MarkState(session.Key, "Paused", "Kill switch engaged — no jail bound; terminal input severed.");
+                _log.LogWarning("kill: agent={Agent} repo={Repo} has no container — terminal input severed only",
+                    agentId, session.RepoHash);
+                continue;
+            }
+
+            try
+            {
+                await _sandboxes.PauseAsync(containerId, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // MG-8's core lesson: an uncontained worker must NEVER project as "Paused". "Unresponsive"
+                // is the honest word and, unlike an invented one, survives the client's state mapping
+                // instead of falling into its Working default. The failure is rethrown after the loop so
+                // the KillSwitch records PauseFailed — but only AFTER every other session behind this id
+                // has been contained, because a first jail that refuses to pause must not spare a second.
+                _store.MarkState(session.Key, "Unresponsive",
+                    $"Kill switch engaged — docker pause FAILED ({ex.Message}); the jail may still be running.");
+                _log.LogError(ex,
+                    "kill: docker pause FAILED agent={Agent} repo={Repo} container={Container} — the jail may still be RUNNING",
+                    agentId, session.RepoHash, containerId);
+                failure ??= System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex);
+                continue;
+            }
+
+            _store.MarkState(session.Key, "Paused",
+                "Kill switch engaged — jail paused, terminal input severed (recoverable).");
+            _log.LogWarning("kill: agent={Agent} repo={Repo} container={Container} paused; terminal input severed",
+                agentId, session.RepoHash, containerId);
         }
 
-        _store.MarkState(agentId, "Paused", "Kill switch engaged — jail paused, terminal input severed (recoverable).");
-        _log.LogWarning("kill: agent={Agent} container={Container} paused; terminal input severed", agentId, containerId);
+        failure?.Throw();
     }
 
+    /// <summary>A point-in-time state word per agent id for the journal snapshot. Grouped by id because
+    /// two repos can hold one (<c>pr-&lt;n&gt;</c>): a plain <c>ToDictionary</c> would throw on the
+    /// duplicate key and take the whole kill's snapshot down with it. When an id really is held twice and
+    /// the two differ, both words are reported rather than one silently winning.</summary>
     public IReadOnlyDictionary<string, string> CaptureStates() =>
-        _store.List().ToDictionary(s => s.Id, s => s.State, StringComparer.Ordinal);
+        _store.List()
+            .GroupBy(s => s.Id, StringComparer.Ordinal)
+            .ToDictionary(
+                g => g.Key,
+                g => string.Join("/", g.Select(s => s.State).Distinct(StringComparer.Ordinal)),
+                StringComparer.Ordinal);
 }
