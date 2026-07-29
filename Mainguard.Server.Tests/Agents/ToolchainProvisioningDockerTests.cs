@@ -183,7 +183,15 @@ public class ToolchainProvisioningDockerTests
     /// environment?" required reasoning from an error string instead of reading a fact. It is an
     /// observation, not a gate — asserting a particular engine version would fail the suite on every
     /// runner-image bump for no safety benefit — but the empty/non-empty <c>RepoDigests</c> line is the
-    /// one that explains this whole class of failure, so it is printed unconditionally.</para>
+    /// one that explains this whole class of failure.</para>
+    ///
+    /// <para><b>Why it does not rely on <see cref="ITestOutputHelper"/> alone.</b> The first version of
+    /// this test did, and recorded nothing: at the <c>--verbosity normal</c> the workflow uses, xUnit
+    /// prints a test's output only when it FAILS. An instrument whose whole job is to report on green
+    /// runs, which reports only on red ones, is not a diagnostic — it is the same class of lie this
+    /// suite has been burned by before. So the facts also go to <c>$GITHUB_STEP_SUMMARY</c>, which lands
+    /// them on the run's summary page regardless of verbosity or outcome, and is simply absent (a no-op)
+    /// on a developer machine.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task RecordTheEngineAndItsImageStoreBehaviour()
@@ -197,19 +205,55 @@ public class ToolchainProvisioningDockerTests
 
         var repoDigests = inspect.RepoDigests is { Count: > 0 }
             ? string.Join(",", inspect.RepoDigests)
-            : "[] — a `<name>@sha256:` FROM CANNOT resolve against this store and would attempt a PULL";
+            : "[] — EMPTY: a `<name>@sha256:` FROM cannot resolve against this store and would attempt a PULL";
 
-        _out.WriteLine($"engine    : {version.Version} (api {version.APIVersion}, {version.Os}/{version.Arch})");
-        _out.WriteLine($"driver    : {info.Driver}");
-        _out.WriteLine($"base ref  : {fx.ImageRef}");
-        _out.WriteLine($"base id   : {inspect.ID}");
-        _out.WriteLine($"repoTags  : {string.Join(",", inspect.RepoTags ?? new List<string>())}");
-        _out.WriteLine($"repoDigests: {repoDigests}");
+        var lines = new[]
+        {
+            $"engine     : {version.Version} (api {version.APIVersion}, {version.Os}/{version.Arch})",
+            $"driver     : {info.Driver}",
+            $"base ref   : {fx.ImageRef}",
+            $"base id    : {inspect.ID}",
+            $"repoTags   : {string.Join(",", inspect.RepoTags ?? new List<string>())}",
+            $"repoDigests: {repoDigests}",
+        };
+
+        foreach (var line in lines)
+        {
+            _out.WriteLine(line);
+        }
+
+        WriteToJobSummary("Docker engine + image store (MG-42)", lines);
 
         // The only thing worth asserting here: the base resolves to a content digest at all, which is
         // the input the whole pin is built on. Everything else above is evidence for the next reader.
         Assert.True(SandboxImageDigest.IsDigest(SandboxImageDigest.Normalize(inspect.ID)),
             $"the base image's id '{inspect.ID}' is not a usable content digest");
+    }
+
+    /// <summary>
+    /// Appends a fenced block to the GitHub Actions run summary when running under Actions; a no-op
+    /// anywhere else. Best-effort by construction — a diagnostic must never be the reason a suite fails.
+    /// </summary>
+    private static void WriteToJobSummary(string heading, IReadOnlyList<string> lines)
+    {
+        var path = Environment.GetEnvironmentVariable("GITHUB_STEP_SUMMARY");
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return;
+        }
+
+        try
+        {
+            System.IO.File.AppendAllText(
+                path,
+                $"### {heading}\n\n```\n{string.Join("\n", lines)}\n```\n\n");
+        }
+        catch (System.IO.IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     // ---- harness ---------------------------------------------------------
