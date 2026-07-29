@@ -70,7 +70,7 @@ mirrors the existing `token_<host>` convention.
 | **Create** | `Mainguard.App.Shell/Views/CliOAuthTosDialog.axaml(.cs)` + `Mainguard.App.Shell/ViewModels/CliOAuthTosDialogViewModel.cs` |
 | **Edit** | settings navigation (wherever `AccountsViewModel`/`SshKeysViewModel` are registered) to add the "AI Providers" page |
 | **Create** | `Mainguard.Tests/ApiKeyHealthServiceTests.cs`, `Mainguard.Tests/CredentialInjectorTests.cs`, `Mainguard.Tests/SecureKeyStoreTests.cs`, `Mainguard.Tests/ApiKeySettingsViewModelTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map — every file above indexed in the same PR |
+| **Edit** | `docs/repo-map/` index — every file above indexed in the same PR |
 
 ---
 
@@ -319,4 +319,4 @@ grep -rn "Redact" Mainguard.Agents/ | grep -v "RedactionExtensions\|GitHubApiCli
 - [ ] `CredentialInjector` pure + newline rejection.
 - [ ] Settings page (masked entry, validate-on-save, per-provider delete, health line) + ToS dialog + migration.
 - [ ] All edge-matrix rows and invariants tested; reviewer script clean.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-01**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-01**, base `phase2`.

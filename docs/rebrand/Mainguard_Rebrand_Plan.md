@@ -94,7 +94,7 @@ available.)
 - EF Core: namespace moves must not perturb migrations — keep migration class names/ids frozen;
   verify `dotnet ef migrations list` and a cold DB creation. The SQLite file name itself is
   Phase 4.
-- `AGENTS.md` Repository Map: wholesale path update in the same PR (the map must never drift).
+- `docs/repo-map/` index: wholesale path update in the same PR (the map must never drift).
 - CI greps that name paths (`grep -rn … Mainguard.Agents/ Mainguard.Server/ installer/` in G-12 etc.)
   and `docs/phase-2/**` verification scripts: update the literal paths in the same PR, or CI
   goes green-but-vacuous. This is the sneakiest part of the phase — audit every reviewer-check

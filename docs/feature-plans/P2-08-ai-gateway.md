@@ -65,7 +65,7 @@ for swarm state.
 | **Edit** | `Mainguard.Server/Services/GatewayGrpcService.cs` (stubs → bodies: budgets get/set, spend stream) |
 | **Edit** | P2-07 proxy config — model-API traffic routes through the gateway listener |
 | **Create** | `Mainguard.Tests/TokenBucketTests.cs`, `AdmissionControllerTests.cs`, `SwarmReconcilerTests.cs`, `BudgetLedgerTests.cs`, `Mainguard.Tests/Integration/Fake429EndpointTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -203,4 +203,4 @@ grep -rn "\.pid\|lockfile" Mainguard.Agents/Agents/SwarmReconciler.cs           
 - [ ] In-path 429 interception with PTY pause/resume; fake-endpoint integration green.
 - [ ] Budgets + persisted spend + `StreamSpend`; cost-join hook for P2-10.
 - [ ] Admission control with honest messaging; boot reconciler (Docker-as-truth).
-- [ ] All edge rows tested; `AGENTS.md` Repository Map updated. One task = one PR linking **P2-08**, base `phase2`.
+- [ ] All edge rows tested; `docs/repo-map/` index updated. One task = one PR linking **P2-08**, base `phase2`.

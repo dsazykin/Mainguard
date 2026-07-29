@@ -75,7 +75,7 @@ client-side `DaemonClient` with reconnect.
 | **Create** | `Mainguard.Server.Tests/Fixtures/AuditProbe.cs` (wraps `IAuditLog`; `AssertSequence(...)`/`AssertExactlyOne(...)` — every G-17 touchpoint test asserts through it, never log-text grep). `SandboxFixture` follows in P2-07 when `SandboxEngine` exists |
 | **Create** | `Mainguard.Tests/DaemonAuthTests.cs`, `DaemonStreamTests.cs`, `SecretMaskTests.cs`, `DaemonClientReconnectTests.cs` (thin client-side pieces; server-side twins live in `Mainguard.Server.Tests`) |
 | **Edit** | CI workflow (`.github/workflows/ci.yml`) — daemon `--local-dev` smoke job on Windows runner |
-| **Edit** | `AGENTS.md` Repository Map (all new files + the two new projects) |
+| **Edit** | `docs/repo-map/` index (all new files + the two new projects) |
 
 ---
 
@@ -242,4 +242,4 @@ dotnet run --project Mainguard.Server -- --local-dev & # starts, prints nothing,
 - [ ] Token-file auth, loopback bind, `--local-dev`, typed port-bound failure.
 - [ ] `DaemonClient` with backoff reconnect + connection-state enum.
 - [ ] All edge-matrix rows tested; CI runs the Windows `--local-dev` smoke.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-02**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-02**, base `phase2`.

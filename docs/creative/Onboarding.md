@@ -20,7 +20,7 @@ The whole design pivots on one line from PRODUCT.md: success today is *"git oper
 
 ## 1. First-run storyboard
 
-Every row names a real surface from the AGENTS.md Repository Map, the copy (with its Bible rule), and the motion (restrained, within the M-3 budget). No cell is blank.
+Every row names a real surface from the `docs/repo-map/` index, the copy (with its Bible rule), and the motion (restrained, within the M-3 budget). No cell is blank.
 
 | # | Step | Surface (real view/control) | What the user sees / does | Copy (rule) | Motion (rule) | Aha beat |
 |---|---|---|---|---|---|---|
@@ -103,7 +103,7 @@ When the swarm features land, the first time a user brings up an agent should in
 
 | Gate | Result |
 |---|---|
-| Storyboard names only real views/controls | Pass — `MainWindow`, `CloneDashboardView`/`CloneDashboardViewModel` (T-21), `ICloneService`/`CloneProgress`, `RepoDashboardView`, `CommitGraphCanvas`, `StagingPanelView`, `DiffViewerView`, `CommitTimelineView`/`CommitRowViewModel`, `CommitComposerView` (T-31), `PreCommitFindingsView` (T-30), `CommandPaletteView` + `ShortcutMap` (T-18), `ThemeManager` — all from the AGENTS.md Repository Map |
+| Storyboard names only real views/controls | Pass — `MainWindow`, `CloneDashboardView`/`CloneDashboardViewModel` (T-21), `ICloneService`/`CloneProgress`, `RepoDashboardView`, `CommitGraphCanvas`, `StagingPanelView`, `DiffViewerView`, `CommitTimelineView`/`CommitRowViewModel`, `CommitComposerView` (T-31), `PreCommitFindingsView` (T-30), `CommandPaletteView` + `ShortcutMap` (T-18), `ThemeManager` — all from the `docs/repo-map/` index |
 | Every step cites Bible rules | Pass — V-1/V-2/V-3/V-4/V-5/V-6, ES-1/ES-2/ES-3/ES-4, T-1, TT-1/TT-2/TT-3, M-1/M-2/M-3/M-4/M-6/M-7, N-1/N-4/N-6 |
 | Motion restrained (120–150ms, no bounce, no layout shift) | Pass — only earned motion is one ~140ms clone pill (M-1) and calm fades; graph render and theme switch are explicitly silent (M-2/M-4); reduced motion honored (M-7) |
 | Aha ties to PRODUCT.md success definition | Pass — §3 anchors the aha to *"faster and less error-prone than the CLI… zero `.git/index.lock`-style footguns"*; the proof beat is the lock that never fires |

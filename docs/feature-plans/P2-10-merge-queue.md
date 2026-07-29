@@ -68,7 +68,7 @@ auto-merge, ever.
 | **Edit** | P2-09 `KeepAliveRebaser` wiring (`NotifyMainMoved` → yield → rebase → re-verify) |
 | **Create** | `Mainguard.App.Shell/ViewModels/MergeQueueViewModel.cs` + view (queue panel: states, merge button, override affordance) |
 | **Create** | `Mainguard.Tests/MergeQueueStateMachineTests.cs`, `VerificationRunnerTests.cs`, `ForegroundMergeServiceTests.cs`, `Mainguard.Tests/Integration/StaleCascadeTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -297,4 +297,4 @@ grep -rn "install" Mainguard.Agents/Services/ForegroundMergeService.cs | grep -v
 - [ ] RT-D1 `BeginMerge`/`ConfirmMerge` lease + boot journal-replay reconciliation, ordered before admission; guard tests 10–12 green (**M7 does not exit without them**).
 - [ ] Queue panel streaming states per ControlCenterDesign §3 (state chips naming `main@sha`, visible re-verification wave, `CanMerge` reason vocabulary, §9 badges); composable merge-gate hook for P2-11.
 - [ ] Test contract satisfied as the **union** of §6 and TI-P2-10.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-10**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-10**, base `phase2`.

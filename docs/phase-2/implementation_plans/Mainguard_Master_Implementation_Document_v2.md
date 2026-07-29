@@ -1650,7 +1650,7 @@ P2-01…P2-14 are each built and unit-tested **as components behind fixtures/sea
 - [ ] Launch → spawn a real sandboxed agent → drive → verify → review → human-merge works when run from source.
 - [ ] The deferred-wiring items from P2-09 / P2-11 / P2-12 / P2-13 / P2-14 are all closed (cross-referenced in the PR).
 - [ ] No mock services remain in the shipped control-center path; the daemon composition root resolves the full graph.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-47**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-47**, base `phase2`.
 
 ### Process fix (so this never re-accumulates)
 
@@ -1684,7 +1684,7 @@ P2-21 is explicitly **"installer part 1"** — the provisioning *machinery* (dia
 ### Definition of done
 - Double-click one packaged executable on a fresh Win11 machine → OOBE wizard → provisioned → control center, with **no command line at any point**.
 - P2-21's console driver retired in favor of the in-app wizard (or kept only as a `--headless` dev fallback).
-- `AGENTS.md` Repository Map + release ladder updated. One task = one PR linking **P2-48**, base `phase2`.
+- `docs/repo-map/` index + release ladder updated. One task = one PR linking **P2-48**, base `phase2`.
 
 ---
 
@@ -1740,7 +1740,7 @@ With user-chosen latest, integrity rests on the npm registry's integrity metadat
 ### Definition of done
 - A user can update a CLI on their terms, see that an update exists without it being applied, and revert a bad update in one click **with the network off**.
 - §J-5's manifest/pin machinery is amended (not abandoned): every install remains a concrete, recorded version.
-- `AGENTS.md` Repository Map + release ladder updated. One task = one PR linking **P2-49**, base `phase2`.
+- `docs/repo-map/` index + release ladder updated. One task = one PR linking **P2-49**, base `phase2`.
 
 ---
 

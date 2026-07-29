@@ -61,7 +61,7 @@ golden transcripts replayed deterministically, driving **both** engines through 
 | **Create** | `Mainguard.Tests/Transcripts/` — recorded byte streams + committed goldens: `claude-code.bytes/.golden`, `opencode.bytes/.golden`, `vim.bytes/.golden`, `htop-60s.bytes/.golden`, `tmux.bytes/.golden` |
 | **Create** | `Mainguard.Tests/Terminal/TranscriptRecorder.cs` + a small recording entry point (dev tool to (re)capture transcripts through a PTY) |
 | **Create** | CI guard: `.github/workflows/ci.yml` step — allowlist may only shrink (diff check vs base) |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -202,4 +202,4 @@ grep -rn "Thread.Sleep\|Task.Delay" Mainguard.Tests/Terminal/   # 0 hits in comp
 - [ ] vttest/esctest scripted suites + checked-in shrink-only allowlist + CI guard.
 - [ ] Five recorded transcripts + goldens; byte-order-only replay; regen determinism test.
 - [ ] Full coverage matrix (7 areas) green.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-04**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-04**, base `phase2`.

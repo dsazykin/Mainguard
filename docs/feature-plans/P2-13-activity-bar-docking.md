@@ -68,7 +68,7 @@ New dependency (App): `Dock.Avalonia`. Keep it out of `Mainguard.Agents`.
 | **Edit** | the prototype's mock services → `DaemonClient`-backed implementations behind the same interfaces (zero View changes — the §0 acceptance) |
 | **Edit** | `Themes/*.axaml` ×5 (new status tokens) + `App.axaml` (classes/icons) |
 | **Create** | `Mainguard.Tests/AgentStatusBrushTests.cs`, `ActivityBarOrderingTests.cs`, `AttentionDerivationTests.cs`, `DockTeardownMemoryTests.cs`, `ActivityBarRenderTests.cs` (headless PNG) |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -178,4 +178,4 @@ grep -rn "Dock.Avalonia\|DockControl" Mainguard.Agents/    # 0 hits
 - [ ] 50× teardown memory test green; headless theme PNGs attached to the PR.
 - [ ] Integrated per ControlCenterDesign §0: section rail in MainWindow (no separate window), kill-switch slot at the rail foot in every section, exactly two layouts persisted as `UserPreferences.WorkspaceLayout`, prototype mock services swapped for `DaemonClient` with zero View changes.
 - [ ] Test contract = union of the table above and TI-P2-13 (incl. the 50× memory harness and the five-theme render PNGs).
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-13**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-13**, base `phase2`.

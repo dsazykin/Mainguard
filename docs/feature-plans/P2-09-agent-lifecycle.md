@@ -63,7 +63,7 @@ durability, and teardown.
 | **Create** | `Mainguard.Agents/Agents/Orchestrator/SessionLeader.cs` + `LeaderRegistry.cs` (persistent PTY leader in the VM; daemon reattach) |
 | **Edit** | `Mainguard.Server/Services/AgentGrpcService.cs` (spawn/stop wire the full lifecycle; events stream state changes) |
 | **Create** | `Mainguard.Tests/YieldProtocolTests.cs`, `GitMutationGuardTests.cs`, `KeepAliveRebaserTests.cs`, `TeardownResidueTests.cs`, `LeaderReattachTests.cs` (Docker-tagged where needed) |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -201,4 +201,4 @@ grep -rn "rebase --abort" Mainguard.Agents/Agents/Orchestrator/KeepAliveRebaser.
 - [ ] Yield protocol (ready + pause paths) as the sole mutation gateway; guard + lock backoff pure-tested.
 - [ ] Keep-alive rebase cycle with conflict → T-04 handoff; wired for P2-10's `NotifyMainMoved`.
 - [ ] Session leader + reattach; teardown with residue verification.
-- [ ] All edge rows tested; `AGENTS.md` Repository Map updated. One task = one PR linking **P2-09**, base `phase2`.
+- [ ] All edge rows tested; `docs/repo-map/` index updated. One task = one PR linking **P2-09**, base `phase2`.
