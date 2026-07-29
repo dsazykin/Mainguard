@@ -914,8 +914,20 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>P2-11 step 4 — acknowledge one flagged item on the DAEMON, which is where the merge gate
     /// reads acknowledgments from. This was <c>Task.CompletedTask</c>: the cockpit's acks lived only in its
     /// own in-process store, so nothing a human acknowledged ever reached the gate. No active repo → nothing
-    /// to acknowledge against; a transport failure surfaces through ConnectionState like every other call.</summary>
-    public async Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
+    /// to acknowledge against; a transport failure surfaces through ConnectionState like every other call.
+    /// <para>The seam-shaped overload returns nothing, so it cannot tell a caller whether the gate actually
+    /// moved — see <see cref="AcknowledgeFlaggedChangeReportedAsync"/>, which both surfaces' acks now run
+    /// through. One path, one RPC; only the reporting differs.</para></summary>
+    public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
+        => AcknowledgeFlaggedChangeReportedAsync(agentId, itemId, CancellationToken.None);
+
+    /// <summary>
+    /// Whether an acknowledgment made right now could actually reach the daemon's gate. There is exactly
+    /// one way it cannot: no repo is active, so there is no handle to address the RPC with and
+    /// <see cref="AcknowledgeFlaggedChangeReportedAsync"/> has nothing to call. A surface that renders an
+    /// enabled acknowledge control in that state is claiming to have unblocked a merge it never touched.
+    /// </summary>
+    public bool CanAcknowledgeFlaggedChange(out string reason)
     {
         string? repoHandle;
         lock (_gate)
@@ -925,11 +937,48 @@ public sealed class DaemonBackedOrchestrator :
 
         if (string.IsNullOrWhiteSpace(repoHandle))
         {
-            return;
+            reason = "no repository is open in the daemon — acknowledging here would clear nothing.";
+            return false;
         }
 
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        await _client.AcknowledgeFlaggedChangeAsync(repoHandle!, agentId, itemId, cts.Token).ConfigureAwait(false);
+        reason = "";
+        return true;
+    }
+
+    /// <summary>
+    /// The same acknowledgment RPC, with the daemon's OWN answer handed back: whether the gate recorded
+    /// the acknowledgment, whether the merge is now permitted, and the gate's reason verbatim. The
+    /// merge-blocking gate is daemon-side, so "the call was made" is not evidence the item was cleared —
+    /// an id the gate does not recognise is accepted by the transport and clears nothing.
+    /// </summary>
+    public async Task<FlaggedAckOutcome> AcknowledgeFlaggedChangeReportedAsync(
+        string agentId, string itemId, CancellationToken ct)
+    {
+        if (!CanAcknowledgeFlaggedChange(out var unavailable))
+        {
+            return FlaggedAckOutcome.Refused(unavailable);
+        }
+
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, ct);
+            var response = await _client
+                .AcknowledgeFlaggedChangeAsync(repoHandle!, agentId, itemId, cts.Token)
+                .ConfigureAwait(false);
+            return new FlaggedAckOutcome(response.Acknowledged, response.CanMerge, response.Reason ?? "");
+        }
+        catch (Exception ex)
+        {
+            // The daemon never heard it. Reported as a refusal rather than swallowed, so the surface says
+            // so instead of drawing a checkmark over a gate that is still shut.
+            return FlaggedAckOutcome.Refused($"the daemon did not record this acknowledgment — {ex.Message}");
+        }
     }
 
     /// <summary>P2-47 #7: fetch the agent-branch-vs-main diff (over the new GetMergeDiff RPC) so the review

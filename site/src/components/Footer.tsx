@@ -1,4 +1,4 @@
-import { Link } from 'react-router-dom';
+import { Link } from 'react-router';
 import { Wordmark } from './Wordmark';
 import { IconGitHub } from './Icons';
 import { GITHUB_URL } from '../config';
