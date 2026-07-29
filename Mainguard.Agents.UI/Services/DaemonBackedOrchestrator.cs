@@ -764,7 +764,9 @@ public sealed class DaemonBackedOrchestrator :
     /// </summary>
     /// <exception cref="InvalidOperationException">The merge did not happen; the message is the reason,
     /// already phrased for display. Queue state is unchanged in every one of those cases.</exception>
-    public async Task ConfirmMergeAsync(string agentId)
+    /// <returns>What the merge did — the origin whose transport landed it, and the sha main really moved
+    /// to. Only a merge that reached RT-D1 step 3 returns; every other path throws.</returns>
+    public async Task<MergeOutcome> ConfirmMergeAsync(string agentId)
     {
         string? repoHandle;
         string? repoPath;
@@ -868,6 +870,11 @@ public sealed class DaemonBackedOrchestrator :
         // the two legs is refused there rather than papered over here.
         await _client.ConfirmMergeAsync(repoHandle!, agentId, begun.LeaseId, result.NewMainSha!, cts.Token)
             .ConfigureAwait(false);
+
+        // The origin that actually ran the merge, reported with the sha main really moved to. It is the
+        // SAME `origin` the transport was chosen by above — read once, under the lock — so what the human
+        // is told cannot describe a transport other than the one that ran.
+        return new MergeOutcome(origin, agentId, MainBranchName, result.NewMainSha!);
     }
 
     /// <summary>

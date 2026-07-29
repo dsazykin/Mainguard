@@ -507,9 +507,10 @@ public sealed class MockOrchestrator :
         return true;
     }
 
-    public Task ConfirmMergeAsync(string agentId)
+    public Task<MergeOutcome> ConfirmMergeAsync(string agentId)
     {
         var raised = new List<AgentEvent>();
+        MergeOutcome outcome;   // the mock spawns no external entries — every mock merge is a local one.
         lock (_gate)
         {
             if (!CanMergeCore(agentId, out var reason)) throw new InvalidOperationException($"Can't merge — {reason}.");
@@ -527,10 +528,11 @@ public sealed class MockOrchestrator :
                 other.Cooldown = 5 + _rng.Next(4);
             }
             _transcript.Add(new ChatLine(ChatLineKind.SystemLine, $"{a.Name} merged into main ({_mainSha}) — stale cascade re-queued {_agents.Count(x => x.Merge == WorkerMergeState.StaleVerified)} branch(es)", DateTimeOffset.Now));
+            outcome = new MergeOutcome(MergeEntryOrigin.Local, agentId, "main", _mainSha);
         }
         foreach (var e in raised) EventReceived?.Invoke(e);
         Changed?.Invoke();
-        return Task.CompletedTask;
+        return Task.FromResult(outcome);
     }
 
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
