@@ -22,6 +22,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// agent-base image. Gated on Docker-daemon presence only, so a Docker-less dev box skips cleanly.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class AgentLifecycleDockerTests
 {
     private const string TrivialImage = "busybox:latest";

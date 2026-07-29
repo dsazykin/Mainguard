@@ -30,6 +30,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// exactly what a proxy that never reloads at all would also report.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class EgressProxyReloadDockerTests
 {
     private readonly ITestOutputHelper _output;

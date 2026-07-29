@@ -31,6 +31,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// (or a file that "happened to already be 0400") cannot satisfy it either.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SecretDeliveryDockerTests
 {
     /// <summary>The jail path the credential env-file lands on (tmpfs, mode 0711, inside a read-only

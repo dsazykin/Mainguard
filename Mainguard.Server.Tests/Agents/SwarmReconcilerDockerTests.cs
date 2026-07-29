@@ -22,6 +22,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// Gated on Docker-daemon presence only, so a Docker-less dev box skips cleanly.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SwarmReconcilerDockerTests
 {
     private const string TrivialImage = "busybox:latest";
