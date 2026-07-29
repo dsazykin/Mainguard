@@ -39,8 +39,13 @@ public interface IMergeQueueService
     string MainSha { get; }
     IReadOnlyList<QueueEntry> GetQueue();
     bool CanMerge(string agentId, out string reason);
-    /// <summary>The human foreground merge; fires the NotifyMainMoved stale cascade.</summary>
-    Task ConfirmMergeAsync(string agentId);
+    /// <summary>
+    /// The human foreground merge; fires the NotifyMainMoved stale cascade.
+    /// <para>Returns <see cref="MergeOutcome"/> rather than a bare task because a merge that landed is not
+    /// self-describing: the entry's <see cref="MergeEntryOrigin"/> decides <i>where</i> it landed, and a
+    /// caller that cannot see the origin can only report the local fast-forward's shape for both.</para>
+    /// </summary>
+    Task<MergeOutcome> ConfirmMergeAsync(string agentId);
     Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId);
 }
 

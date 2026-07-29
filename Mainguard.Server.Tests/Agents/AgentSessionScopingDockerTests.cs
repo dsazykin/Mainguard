@@ -28,6 +28,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// test's own dictionary has two keys.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public sealed class AgentSessionScopingDockerTests
 {
     private const string SharedAgentId = "pr-7";

@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Services;
 using Mainguard.Agents.UI.Editions;
 
 namespace Mainguard.Agents.UI.Services;
@@ -19,6 +20,12 @@ namespace Mainguard.Agents.UI.Services;
 /// <para>The reasons are rendered verbatim (§3.4 vocabulary) — they are the daemon's words, not a
 /// re-worded summary — and a refusal is a warning toast, not an error dialog: nothing was damaged, the
 /// queue is exactly as it was, and the human can act on the reason and press Merge again.</para>
+///
+/// <para><b>The confirmation is origin-aware too.</b> Every refusal already said which origin it came
+/// from; the success line did not, so an external pull request merged upstream (P2-12) reported
+/// <c>Merged agent/pr-7 into main</c> — the LOCAL fast-forward's shape, and a description of something
+/// that did not happen. The two origins land a merge in two different places, so they get two
+/// sentences.</para>
 /// </summary>
 public static class MergeActionRunner
 {
@@ -37,8 +44,8 @@ public static class MergeActionRunner
 
         try
         {
-            await queue.ConfirmMergeAsync(agentId).ConfigureAwait(false);
-            sink($"Merged agent/{agentId} into main.", false);
+            var outcome = await queue.ConfirmMergeAsync(agentId).ConfigureAwait(false);
+            sink(Confirmation(outcome), false);
         }
         catch (OperationCanceledException)
         {
@@ -51,6 +58,47 @@ public static class MergeActionRunner
             sink(ex.Message, true);
         }
     }
+
+    /// <summary>
+    /// The one visible sentence a landed merge produces, in the terms of the origin that landed it.
+    ///
+    /// <para><b>Local</b> — "Merged agent/x into main." The user's own <c>refs/heads/main</c> was
+    /// fast-forwarded onto the agent branch, which is exactly what the sentence describes.</para>
+    ///
+    /// <para><b>External</b> — "Merged pull request #7 upstream — main fast-forwarded onto a1b2c3d." Both
+    /// halves are said because both halves are what P2-12 guarantees, and neither alone is the whole truth:
+    /// the merge was performed by the HOST (this app never fast-forwards a bot PR's mirrored branch into
+    /// main and calls it merged), and the checkout then converged onto it. It is stated as fact only
+    /// because nothing reaches here otherwise — the executor records a merge only once the host named a
+    /// merge commit, that commit was proven reachable from the host remote's main by
+    /// <c>merge-base --is-ancestor</c> after a fetch, and local main fast-forwarded onto it. Upstream is
+    /// authoritative, not trusted; <paramref name="outcome"/>'s sha is the one main really moved to.</para>
+    /// </summary>
+    internal static string Confirmation(MergeOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+
+        // External is the case that must never wear the local sentence, so it is the case named
+        // explicitly — the same shape MergeDispatch routes the transports with.
+        if (outcome.Origin == MergeEntryOrigin.External)
+        {
+            // The number IS the pull request (the queue key and the PR it merges cannot disagree). An id
+            // that names none can't reach here — the external executor refuses it before calling the host —
+            // but the fallback stays inside the external sentence rather than borrowing the local one.
+            var pullRequest = ExternalPrMergeService.PrNumberFor(outcome.AgentId) is int number
+                ? $"pull request #{number}"
+                : "the pull request";
+
+            return $"Merged {pullRequest} upstream — {outcome.MainBranch} fast-forwarded onto "
+                + $"{ShortSha(outcome.NewMainSha)}.";
+        }
+
+        return $"Merged agent/{outcome.AgentId} into {outcome.MainBranch}.";
+    }
+
+    /// <summary>7-char sha, the display form every other Mainguard surface uses.</summary>
+    private static string ShortSha(string sha) =>
+        string.IsNullOrEmpty(sha) || sha.Length <= 7 ? sha : sha[..7];
 
     private static void DefaultReport(string message, bool isWarning)
     {

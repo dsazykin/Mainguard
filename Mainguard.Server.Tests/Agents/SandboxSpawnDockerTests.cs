@@ -25,6 +25,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// agent-base image), so a Docker-less dev box skips and the CI <c>sandbox-security</c> Linux leg runs it.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SandboxSpawnDockerTests
 {
     [RequiresDockerFact]

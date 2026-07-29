@@ -23,6 +23,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// test so they cannot drift apart.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SandboxNetworkIsolationDockerTests
 {
     private readonly ITestOutputHelper _output;
