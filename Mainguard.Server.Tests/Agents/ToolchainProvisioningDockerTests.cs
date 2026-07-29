@@ -29,6 +29,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// asserted below.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class ToolchainProvisioningDockerTests
 {
     private const string RepoHandle = "toolchain-docker-test";

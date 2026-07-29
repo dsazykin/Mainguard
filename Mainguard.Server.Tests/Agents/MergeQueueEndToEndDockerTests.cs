@@ -52,6 +52,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// vacuous.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
 {
     private static readonly TimeSpan Timeout = TimeSpan.FromMinutes(3);

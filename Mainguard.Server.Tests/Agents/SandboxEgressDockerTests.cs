@@ -16,6 +16,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// because the git host is absent from the agent allowlist). Gated on Docker availability.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SandboxEgressDockerTests
 {
     // A non-allowlisted destination must be refused within this budget — refused, not hung.

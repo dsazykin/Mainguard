@@ -26,6 +26,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// runs them.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class MergeQueueDockerTests
 {
     private const string Image = "busybox:latest";

@@ -20,6 +20,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// the full CI leg (needs the git CLI).
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class DaemonGitProxyDockerTests : IDisposable
 {
     private readonly string _upstream;
