@@ -269,6 +269,24 @@ public sealed class AgentRefMediator
 }
 
 /// <summary>
+/// What a probe of an agent's own repository actually ESTABLISHED — as opposed to
+/// <see cref="Directory.Exists"/>, which answers <c>false</c> both for "it is not there" and for "I could
+/// not tell" (permission denied, a transient I/O error, a path the OS refused). The distinction is
+/// load-bearing wherever absence is read as a reason to stop doing something.
+/// </summary>
+public enum AgentRepoPresence
+{
+    /// <summary>The directory is there.</summary>
+    Present,
+
+    /// <summary>The filesystem answered, and the answer was that nothing is at that path.</summary>
+    Absent,
+
+    /// <summary>The filesystem did not answer. This is <b>not</b> evidence of absence.</summary>
+    Unreadable,
+}
+
+/// <summary>
 /// MG-3 — the other half of the resolved fetch trigger (design §7, "both"): the daemon watches each
 /// agent's own ref move and publishes on the spot.
 ///
@@ -312,19 +330,92 @@ public sealed class AgentRefWatcher : IDisposable
     /// </summary>
     public static readonly TimeSpan DriveManually = Timeout.InfiniteTimeSpan;
 
+    /// <summary>How many CONSECUTIVE probes must say "absent" before an agent is evicted from the sweep.
+    /// One tick of corroboration costs a second of latency on a teardown nobody is watching; getting it
+    /// wrong unwatches a live agent forever.</summary>
+    private const int AbsencesBeforeEviction = 2;
+
+    /// <summary>The <see cref="_absences"/> value that means "the last probe could not read the repo"
+    /// (and has already been reported), as distinct from any count of established absences.</summary>
+    private const int UnreadableMark = -1;
+
     private readonly ConcurrentDictionary<(string RepoHash, string AgentId), string> _watched = new();
+
+    // Only holds entries for agents whose last probe was NOT Present; a healthy probe removes the entry,
+    // so this is bounded by the agents currently in trouble rather than by the agents ever watched.
+    private readonly ConcurrentDictionary<(string RepoHash, string AgentId), int> _absences = new();
+
     private readonly AgentRefMediator _mediator;
     private readonly AgentRepoManager _agentRepos;
     private readonly TimeSpan _interval;
+    private readonly Action<string>? _warningSink;
+    private readonly Func<string, AgentRepoPresence> _probe;
     private readonly CancellationTokenSource _stop = new();
     private readonly object _loopGate = new();
     private Task? _loop;
 
-    public AgentRefWatcher(AgentRefMediator mediator, AgentRepoManager agentRepos, TimeSpan? interval = null)
+    /// <param name="mediator">Publishes an agent's tip into the mirror.</param>
+    /// <param name="agentRepos">Locates each agent's own repository.</param>
+    /// <param name="interval">Sweep period, or <see cref="DriveManually"/> for no background loop.</param>
+    /// <param name="warningSink">
+    /// Receives the events that would otherwise be invisible: an agent evicted from the sweep, and a
+    /// repository the daemon could not read. An agent that silently stops being watched is the one state
+    /// this class can reach where work stops flowing and nothing anywhere says so.
+    /// </param>
+    /// <param name="presenceProbe">
+    /// How the repository's presence is established; defaults to <see cref="ProbeRepo"/>. Injected so a
+    /// test can simulate an I/O failure deterministically — the eviction path cannot be proven safe with
+    /// a probe that only ever reports the two outcomes a temp directory can produce.
+    /// </param>
+    public AgentRefWatcher(
+        AgentRefMediator mediator,
+        AgentRepoManager agentRepos,
+        TimeSpan? interval = null,
+        Action<string>? warningSink = null,
+        Func<string, AgentRepoPresence>? presenceProbe = null)
     {
         _mediator = mediator ?? throw new ArgumentNullException(nameof(mediator));
         _agentRepos = agentRepos ?? throw new ArgumentNullException(nameof(agentRepos));
         _interval = interval ?? DefaultInterval;
+        _warningSink = warningSink;
+        _probe = presenceProbe ?? ProbeRepo;
+    }
+
+    /// <summary>
+    /// Establishes whether an agent's repository is there, <b>distinguishing absence from an unanswered
+    /// question</b>.
+    ///
+    /// <para><see cref="Directory.Exists"/> cannot be used for a decision like eviction: it returns
+    /// <c>false</c> on ANY error — <c>EACCES</c> on the directory or a parent, a transient I/O error, a
+    /// path the platform rejects — so a momentary filesystem hiccup under load is indistinguishable from
+    /// a teardown. <see cref="File.GetAttributes(string)"/> asks the same one <c>stat</c>, but THROWS
+    /// instead of collapsing: only the two not-found exceptions establish absence, and everything else is
+    /// explicitly "I could not tell".</para>
+    /// </summary>
+    public static AgentRepoPresence ProbeRepo(string agentRepoPath)
+    {
+        try
+        {
+            // A plain file where a repository should be is not a repository to publish from; it is also
+            // not something a retry will fix, so it counts as absence rather than as an unread answer.
+            return File.GetAttributes(agentRepoPath).HasFlag(FileAttributes.Directory)
+                ? AgentRepoPresence.Present
+                : AgentRepoPresence.Absent;
+        }
+        catch (FileNotFoundException)
+        {
+            return AgentRepoPresence.Absent;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return AgentRepoPresence.Absent;
+        }
+        catch (Exception)
+        {
+            // UnauthorizedAccessException, IOException, PathTooLongException, a bad argument out of a
+            // caller bug — none of them are evidence that the agent is gone.
+            return AgentRepoPresence.Unreadable;
+        }
     }
 
     /// <summary>Start watching an agent. Idempotent. The first tick after this always publishes, because
@@ -333,11 +424,20 @@ public sealed class AgentRefWatcher : IDisposable
     public void Watch(string repoHash, string agentId)
     {
         _watched[(repoHash, agentId)] = string.Empty;
+
+        // A fresh watch starts a fresh streak: whatever the last watch of this id saw (a half-counted
+        // absence from its teardown, an unreadable mark already reported) must not count towards
+        // evicting the agent now being watched.
+        _absences.TryRemove((repoHash, agentId), out _);
         EnsureLoopRunning();
     }
 
     /// <summary>Stop watching (teardown). Idempotent.</summary>
-    public void Unwatch(string repoHash, string agentId) => _watched.TryRemove((repoHash, agentId), out _);
+    public void Unwatch(string repoHash, string agentId)
+    {
+        _watched.TryRemove((repoHash, agentId), out _);
+        _absences.TryRemove((repoHash, agentId), out _);
+    }
 
     /// <summary>The agents currently watched.</summary>
     public IReadOnlyCollection<(string RepoHash, string AgentId)> Watched => _watched.Keys.ToArrayShim();
@@ -353,15 +453,8 @@ public sealed class AgentRefWatcher : IDisposable
             try
             {
                 var agentRepoPath = _agentRepos.PathFor(key.RepoHash, key.AgentId);
-                if (!Directory.Exists(agentRepoPath))
+                if (!StillPresent(key, agentRepoPath))
                 {
-                    // The agent's repository is gone — a teardown, or the swarm reconciler disposing an
-                    // orphan directly (SwarmReconciler calls RemoveAgentWorktree without going through
-                    // the launcher, so nothing else unwatches it). Self-evict rather than retry forever:
-                    // a vanished repo publishes NothingToPublish, which is not Current, so the snapshot
-                    // would never be recorded and this entry would spawn a git process every tick for
-                    // the life of the daemon.
-                    _watched.TryRemove(key, out _);
                     continue;
                 }
 
@@ -390,6 +483,68 @@ public sealed class AgentRefWatcher : IDisposable
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Whether this tick may go on to snapshot the agent's repository — and the ONE place an agent is
+    /// evicted from the sweep.
+    ///
+    /// <para><b>Eviction has to be earned.</b> The reason to evict at all is cost: a repository that is
+    /// really gone publishes <see cref="AgentRefPublishOutcome.NothingToPublish"/>, which is not
+    /// <c>Current</c>, so its snapshot is never recorded and the entry would spawn a git process every
+    /// tick for the life of the daemon (the swarm reconciler disposes an orphan by calling
+    /// <c>RemoveAgentWorktree</c> directly, so nothing else unwatches it). But eviction is the one
+    /// outcome this class has that is <b>not</b> self-correcting: every other non-<c>Current</c> outcome
+    /// leaves the snapshot unrecorded so the next tick retries and the mirror converges — and an evicted
+    /// agent has no next tick. So the cost argument justifies evicting a repository that is GONE; it
+    /// justifies nothing about a repository we merely failed to read, which used to be the same
+    /// <c>bool</c>.</para>
+    ///
+    /// <para>Two independent guards, because they fail differently: the probe refuses to turn an I/O
+    /// error into an absence at all, and a corroborating second consecutive absence covers the residue
+    /// (an error some platform reports as not-found, an unmount mid-sweep). Waiting one extra tick costs
+    /// a second of git process on a dead agent; skipping the wait costs a live agent its watch, forever,
+    /// silently.</para>
+    /// </summary>
+    private bool StillPresent((string RepoHash, string AgentId) key, string agentRepoPath)
+    {
+        switch (_probe(agentRepoPath))
+        {
+            case AgentRepoPresence.Present:
+                _absences.TryRemove(key, out _);
+                return true;
+
+            case AgentRepoPresence.Unreadable:
+                // Keep watching, and say so once per streak rather than every tick: a watch that is
+                // being kept but can never publish is otherwise indistinguishable from an idle agent.
+                if (!_absences.TryGetValue(key, out var state) || state != UnreadableMark)
+                {
+                    _absences[key] = UnreadableMark;
+                    _warningSink?.Invoke(
+                        $"MG-3: the ref watcher could not read agent repository '{agentRepoPath}' for agent "
+                        + $"'{key.AgentId}' in repo '{key.RepoHash}'. The watch is KEPT — an unreadable "
+                        + "repository is not evidence the agent is gone.");
+                }
+
+                return false;
+
+            default:
+                // Absent. Corroborate before acting: a single absence starts a streak, it does not evict.
+                var absences = _absences.AddOrUpdate(key, 1, static (_, prior) => prior < 0 ? 1 : prior + 1);
+                if (absences < AbsencesBeforeEviction)
+                {
+                    return false;
+                }
+
+                _watched.TryRemove(key, out _);
+                _absences.TryRemove(key, out _);
+                _warningSink?.Invoke(
+                    $"MG-3: stopped watching agent '{key.AgentId}' in repo '{key.RepoHash}' — its repository "
+                    + $"'{agentRepoPath}' was absent on {AbsencesBeforeEviction} consecutive sweeps. If that "
+                    + "agent is still live, its commits now reach the mirror only when a verification or a "
+                    + "review publishes them.");
+                return false;
+        }
     }
 
     /// <summary>
