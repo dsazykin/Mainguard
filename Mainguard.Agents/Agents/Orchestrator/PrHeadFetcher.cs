@@ -19,18 +19,32 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 public sealed class PrHeadFetcher : IPrHeadFetcher
 {
     private readonly Func<string, string, string> _resolveWorktreePath;
+    private readonly Func<ExternalPrSource, string> _hostUrl;
 
     /// <param name="resolveWorktreePath">Maps (repoHash, agentId) → the agent's worktree path
     /// (e.g. <see cref="WorktreeManager.WorktreePathFor"/>).</param>
-    public PrHeadFetcher(Func<string, string, string> resolveWorktreePath)
+    /// <param name="hostUrl">
+    /// Maps a source to the URL the PR head is fetched from; defaults to the host's HTTPS clone URL.
+    /// Overridable so the end-to-end suite can point the REAL fetcher at a local fixture host instead of
+    /// substituting a fetcher of its own — the fetch/reset/rev-parse mechanics under test stay production
+    /// code and only the origin changes.
+    /// </param>
+    public PrHeadFetcher(
+        Func<string, string, string> resolveWorktreePath,
+        Func<ExternalPrSource, string>? hostUrl = null)
     {
         _resolveWorktreePath = resolveWorktreePath ?? throw new ArgumentNullException(nameof(resolveWorktreePath));
+        _hostUrl = hostUrl ?? HttpsCloneUrl;
     }
 
     public Task<string> FetchHeadAsync(ExternalPrSource source, string repoHash, string agentId, int prNumber, CancellationToken ct)
     {
         var worktreePath = _resolveWorktreePath(repoHash, agentId);
-        var (_, kind) = GitHostDetector.Detect(HostUrl(source));
+        var fetchUrl = _hostUrl(source);
+        // The host KIND is always classified from the canonical host name, never from the (possibly
+        // overridden) fetch URL: which ref names a pull request head is a property of the host, and a
+        // local fixture URL must not silently reclassify it.
+        var (_, kind) = GitHostDetector.Detect(HttpsCloneUrl(source));
         var headRef = GitService.PullRequestHeadRef(kind, prNumber); // throws typed for an unsupported host
 
         return Task.Run(() =>
@@ -38,12 +52,12 @@ public sealed class PrHeadFetcher : IPrHeadFetcher
             // TODO(P2-12 human-review): the live-credential slice — a private-repo fetch must inject the
             // stored host token via git's credential env (never argv/URL), mirroring the T-29 checklist.
             // The fetch + reset mechanics are exercised offline over a file:// fixture remote in the tests.
-            AgentGitCommand.Run(worktreePath, "fetch", HostUrl(source), $"+{headRef}");
+            AgentGitCommand.Run(worktreePath, "fetch", fetchUrl, $"+{headRef}");
             AgentGitCommand.Run(worktreePath, "reset", "--hard", "FETCH_HEAD");
             return AgentGitCommand.Run(worktreePath, "rev-parse", "HEAD").Trim();
         }, ct);
     }
 
-    private static string HostUrl(ExternalPrSource source) =>
+    private static string HttpsCloneUrl(ExternalPrSource source) =>
         $"https://{source.Host}/{source.Owner}/{source.Repo}.git";
 }

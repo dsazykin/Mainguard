@@ -76,9 +76,56 @@ public sealed class CompositionRootResolutionTests
         Assert.NotNull(sp.GetRequiredService<Mainguard.Git.Services.IPullRequestService>());
         Assert.NotNull(sp.GetRequiredService<IPrHeadFetcher>());
 
+        // The two links that were missing: something that can give an intake'd pull request a jail, and
+        // something that can say which repository a subscribed source belongs to.
+        Assert.NotNull(sp.GetRequiredService<IPrWorkerHost>());
+        Assert.NotNull(sp.GetRequiredService<PrIntakeTargetResolver>());
+        Assert.NotNull(sp.GetRequiredService<ActiveRepoIndex>());
+
         // The scheduler slot is present and will now run (it starts the intake engine's RunAsync).
         var hosted = sp.GetServices<IHostedService>().ToList();
         Assert.Contains(hosted, h => h is PrIntakeHostedService);
         Assert.Contains(hosted, h => h is GatewayHostedService);
+    }
+
+    /// <summary>
+    /// The intake's per-source target resolver was the literal <c>_ =&gt; null</c>, which makes every poll
+    /// list-and-skip: the poll loop ran, subscriptions persisted, and the intake materialized nothing in
+    /// production, ever. A hardwired constant is invisible from the outside — the engine resolves, the
+    /// hosted service starts, and every anti-idle assertion above still passes — so it is pinned here at
+    /// the only place it is observable: the delegate the registered engine actually holds.
+    /// </summary>
+    [Fact]
+    public void ExternalPrIntake_TargetResolver_IsTheRealResolver_NotAHardwiredNull()
+    {
+        using var host = new DaemonFixture();
+        var sp = host.Services;
+
+        var intake = Assert.IsType<ExternalPrIntake>(sp.GetRequiredService<IExternalPrIntake>());
+        var resolve = (System.Delegate)typeof(ExternalPrIntake)
+            .GetField("_resolveTarget", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(intake)!;
+
+        Assert.Same(sp.GetRequiredService<PrIntakeTargetResolver>(), resolve.Target);
+        Assert.Equal(nameof(PrIntakeTargetResolver.Resolve), resolve.Method.Name);
+    }
+
+    /// <summary>
+    /// …and the same for the spawn seam: the engine must hold the DAEMON's worker host, because the whole
+    /// defect was an intake that materialized entries and spawned nothing.
+    /// </summary>
+    [Fact]
+    public void ExternalPrIntake_HoldsTheDaemonsWorkerHost()
+    {
+        using var host = new DaemonFixture();
+        var sp = host.Services;
+
+        var intake = sp.GetRequiredService<IExternalPrIntake>();
+        var workers = typeof(ExternalPrIntake)
+            .GetField("_workers", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+            .GetValue(intake);
+
+        Assert.IsType<ExternalPrWorkerHost>(workers);
+        Assert.Same(sp.GetRequiredService<IPrWorkerHost>(), workers);
     }
 }
