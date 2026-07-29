@@ -173,6 +173,45 @@ public class ToolchainProvisioningDockerTests
         Assert.NotEqual(0, probe.ExitCode);
     }
 
+    /// <summary>
+    /// Records WHICH engine and image store produced this run's results, in the test output, on every
+    /// run — pass or fail.
+    ///
+    /// <para>This exists because of a concrete gap: four of these tests failed on CI and passed locally,
+    /// the deciding difference was the image store's <c>RepoDigests</c> behaviour, and <b>the runner's
+    /// Docker version appears nowhere in the workflow logs</b>. Answering "what was different about that
+    /// environment?" required reasoning from an error string instead of reading a fact. It is an
+    /// observation, not a gate — asserting a particular engine version would fail the suite on every
+    /// runner-image bump for no safety benefit — but the empty/non-empty <c>RepoDigests</c> line is the
+    /// one that explains this whole class of failure, so it is printed unconditionally.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task RecordTheEngineAndItsImageStoreBehaviour()
+    {
+        await using var fx = new SandboxFixture();
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
+
+        var version = await fx.Docker.System.GetVersionAsync(cts.Token);
+        var info = await fx.Docker.System.GetSystemInfoAsync(cts.Token);
+        var inspect = await fx.Docker.Images.InspectImageAsync(fx.ImageRef, cts.Token);
+
+        var repoDigests = inspect.RepoDigests is { Count: > 0 }
+            ? string.Join(",", inspect.RepoDigests)
+            : "[] — a `<name>@sha256:` FROM CANNOT resolve against this store and would attempt a PULL";
+
+        _out.WriteLine($"engine    : {version.Version} (api {version.APIVersion}, {version.Os}/{version.Arch})");
+        _out.WriteLine($"driver    : {info.Driver}");
+        _out.WriteLine($"base ref  : {fx.ImageRef}");
+        _out.WriteLine($"base id   : {inspect.ID}");
+        _out.WriteLine($"repoTags  : {string.Join(",", inspect.RepoTags ?? new List<string>())}");
+        _out.WriteLine($"repoDigests: {repoDigests}");
+
+        // The only thing worth asserting here: the base resolves to a content digest at all, which is
+        // the input the whole pin is built on. Everything else above is evidence for the next reader.
+        Assert.True(SandboxImageDigest.IsDigest(SandboxImageDigest.Normalize(inspect.ID)),
+            $"the base image's id '{inspect.ID}' is not a usable content digest");
+    }
+
     // ---- harness ---------------------------------------------------------
 
     private async Task<ProvisionedToolchain> BuildLayerAsync(SandboxFixture fx, string declarationText, CancellationToken ct)
