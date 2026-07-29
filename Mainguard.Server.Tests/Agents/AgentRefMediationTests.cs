@@ -320,15 +320,21 @@ public sealed class AgentRefMediationTests
     /// unwatches it. A vanished repo publishes `NothingToPublish`, which is not `Current`, so the
     /// snapshot would never be recorded and the entry would spawn a git process every tick for the life
     /// of the daemon.
+    ///
+    /// <para>Eviction now takes TWO consecutive absences, so this also pins the half that makes the
+    /// guard real: after the first sweep the agent is still watched. A fix that simply stopped evicting
+    /// would pass the second half of this test and fail nothing — hence the assertion that it does go,
+    /// and that it says so on the way out.</para>
     /// </summary>
     [Fact]
-    public void Watcher_DropsAnAgentWhoseRepositoryIsGone_RatherThanRetryingForever()
+    public void Watcher_DropsAnAgentWhoseRepositoryIsGone_ButOnlyOnACorroboratedAbsence()
     {
         using var env = new MediationEnv();
         var hash = env.Provision();
         env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var warnings = new List<string>();
         using var watcher = new AgentRefWatcher(
-            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually, warnings.Add);
         watcher.Watch(hash, "a1");
         Assert.True(Assert.Single(watcher.PollOnce()).Current);
         Assert.Contains((hash, "a1"), watcher.Watched);
@@ -336,8 +342,118 @@ public sealed class AgentRefMediationTests
         // Teardown by a path that does not unwatch (the reconciler's).
         env.Worktrees.RemoveAgentWorktree(hash, "a1", force: true);
 
+        // One absence is not enough: a single filesystem answer is exactly what used to be able to
+        // unwatch a live agent for good.
+        Assert.Empty(watcher.PollOnce());
+        Assert.Contains((hash, "a1"), watcher.Watched);
+        Assert.Empty(warnings);
+
+        // Corroborated — now it goes, and the eviction is on the record rather than silent.
         Assert.Empty(watcher.PollOnce());
         Assert.DoesNotContain((hash, "a1"), watcher.Watched);
+        Assert.Contains(warnings, w => w.Contains("stopped watching agent 'a1'", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// <b>The defect this class was carrying.</b> <c>Directory.Exists</c> returns false on ANY error —
+    /// permission denied, a transient I/O error, a path the OS rejects — so one bad moment under load
+    /// could unwatch a LIVE agent permanently. Every other non-<c>Current</c> outcome is self-correcting
+    /// (the snapshot goes unrecorded and the next tick retries); eviction is the one that has no next
+    /// tick, which is why it is the only path where an agent's work can silently stop reaching the
+    /// mirror between verifications.
+    ///
+    /// <para>The failure is injected through the presence probe rather than by breaking a real directory,
+    /// because it must be an I/O ERROR and not a deletion — the two are the same <c>bool</c> in the code
+    /// being fixed, and a test that deletes the directory would prove nothing about the difference. That
+    /// the real probe tells them apart is asserted separately, against a real denied directory, in
+    /// <see cref="ProbeRepo_TellsAnUnreadableRepositoryApartFromAnAbsentOne"/>.</para>
+    /// </summary>
+    [Fact]
+    public void Watcher_WhenTheRepositoryCannotBeRead_KeepsTheWatch_AndCatchesUpOnceItCan()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var warnings = new List<string>();
+        var failing = true;
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually, warnings.Add,
+            path => failing ? AgentRepoPresence.Unreadable : AgentRefWatcher.ProbeRepo(path));
+        watcher.Watch(hash, "a1");
+
+        // The agent is alive and working throughout: it commits while the daemon cannot read its repo.
+        var tip = env.CommitInWorktree(worktree, "one.txt", "one\n");
+
+        // Sweeps under the failure publish nothing (there is nothing readable to publish) …
+        for (var i = 0; i < 5; i++)
+        {
+            Assert.Empty(watcher.PollOnce());
+        }
+
+        // … but the agent is STILL WATCHED. This is the assertion the old code failed on the first tick.
+        Assert.Contains((hash, "a1"), watcher.Watched);
+
+        // The condition is reported — once per streak, not once per tick, or a 1 Hz loop would bury the
+        // log it is meant to raise. Asserted as the ONE warning and by its content, which together also
+        // say that nothing reported an eviction: a "stopped watching" line here would be a second
+        // warning, and the only warning is this one.
+        Assert.Single(warnings);
+        Assert.Contains("could not read agent repository", warnings[0], StringComparison.Ordinal);
+
+        // The watch is not merely present in a dictionary: once the filesystem answers again, the very
+        // next sweep carries the commit made during the outage into the mirror.
+        failing = false;
+        var recovered = Assert.Single(watcher.PollOnce());
+        Assert.Equal(AgentRefPublishOutcome.Published, recovered.Outcome);
+        Assert.Equal(tip, AgentTestGit.RunChecked(env.BarePath(hash), "rev-parse", "refs/heads/agent/a1").Trim());
+    }
+
+    /// <summary>
+    /// The probe itself, on a real filesystem: an absent path is <c>Absent</c>, a present one is
+    /// <c>Present</c>. Absence must still be established, or the fix would just be "never evict".
+    /// </summary>
+    [Fact]
+    public void ProbeRepo_ReportsAbsence_WhenTheFilesystemReallySaysSo()
+    {
+        var root = AgentTestGit.NewVmRoot();
+        try
+        {
+            Assert.Equal(AgentRepoPresence.Present, AgentRefWatcher.ProbeRepo(root));
+            Assert.Equal(AgentRepoPresence.Absent, AgentRefWatcher.ProbeRepo(Path.Combine(root, "gone.git")));
+        }
+        finally
+        {
+            AgentTestGit.DeleteTree(root);
+        }
+    }
+
+    /// <summary>
+    /// The other half, against a directory the OS genuinely refuses to answer about: <c>Unreadable</c>,
+    /// NOT <c>Absent</c>. The last assertion is the defect in one line — <c>Directory.Exists</c> answers
+    /// the identical situation with the same <c>false</c> it uses for "deleted", which is what made an
+    /// I/O error able to evict a live agent.
+    /// </summary>
+    [RequiresAccessDeniedFact]
+    public void ProbeRepo_TellsAnUnreadableRepositoryApartFromAnAbsentOne()
+    {
+        var root = AgentTestGit.NewVmRoot();
+        var agentRepo = Path.Combine(root, "denied", "a1.git");
+        try
+        {
+            Directory.CreateDirectory(agentRepo);
+            using (AccessDenialSupport.Deny(Path.Combine(root, "denied")))
+            {
+                Assert.Equal(AgentRepoPresence.Unreadable, AgentRefWatcher.ProbeRepo(agentRepo));
+                Assert.False(
+                    Directory.Exists(agentRepo),
+                    "Directory.Exists answered TRUE for a denied path, so this run never exercised the "
+                    + "collapse the probe exists to avoid.");
+            }
+        }
+        finally
+        {
+            AgentTestGit.DeleteTree(root);
+        }
     }
 
     /// <summary>
