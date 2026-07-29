@@ -197,6 +197,19 @@ public sealed class MergeQueue : IMergeQueue
     /// <summary>Raised (off any lock) after any state change so the gRPC stream / UI can re-read.</summary>
     public event Action? Changed;
 
+    /// <summary>
+    /// Republishes the queue to every observer <b>without moving any state</b> — for the case where the
+    /// gate's ANSWER changed and the state machine did not.
+    ///
+    /// <para>A human acknowledging a flagged item flips <see cref="CanMerge"/> from false to true, empties
+    /// the gate reason, and marks that item acknowledged. All three reach the client only on the queue
+    /// stream, and the stream re-pushes only on <see cref="Changed"/> — which an acknowledgment does not
+    /// raise, because it is not a transition. So the ack landed daemon-side while the review surface went
+    /// on rendering a blocked branch and a disabled Merge button until some unrelated transition happened
+    /// to fire: the human acknowledged, and nothing they could see changed.</para>
+    /// </summary>
+    public void NotifyGateChanged() => Changed?.Invoke();
+
     /// <summary>Every agent this queue currently tracks (for stream snapshots).</summary>
     public IReadOnlyList<string> Agents
     {

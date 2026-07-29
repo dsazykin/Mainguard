@@ -105,9 +105,26 @@ public static class GatewayServiceRegistration
                 // trigger). Scoped by repo hash too, so one repo's queue can never reach into another's
                 // container even if agent ids ever collide.
                 var session = sp.GetRequiredService<AgentSessionStore>().Find(agentId);
-                return session is not null && string.Equals(session.RepoHash, repoHash, StringComparison.Ordinal)
-                    ? session.ContainerId
-                    : null;
+                if (session is not null
+                    && string.Equals(session.RepoHash, repoHash, StringComparison.Ordinal)
+                    && !string.IsNullOrEmpty(session.ContainerId))
+                {
+                    return session.ContainerId;
+                }
+
+                // …and when the session store has no answer, ASK THE CONTAINER RUNTIME, which P2-08 already
+                // designates the sole source of truth for jail liveness (there are no PID/lock files).
+                //
+                // This is not belt-and-braces. AgentSessionStore is memory-only and is written by exactly
+                // one thing, AgentSpawnService — while the jails are persistent (a restart re-STARTS a
+                // stopped container rather than recreating it) and the merge queue rehydrates its state
+                // from SQLite in its constructor. So after a daemon restart the queue resumed knowing
+                // about every branch, every jail was still running, and the session store was empty: every
+                // verification on the box refused with "no live sandbox", ResumeAfterRestartAsync drove
+                // each interrupted run straight back to Working, and the stale cascade's auto re-verify
+                // failed for every branch. The queue came back up permanently unable to verify anything
+                // until each agent was spawned again — with no error naming the actual cause.
+                return ResolveRunningJail(repoHash, agentId);
             },
             queueStore: queueStoreFactory,
             verificationStore: verificationStoreFactory,
@@ -342,6 +359,33 @@ public static class GatewayServiceRegistration
         {
             // Absent table / unreadable file — nothing to clear.
             log?.Invoke("no lock table");
+        }
+    }
+
+    /// <summary>
+    /// The RUNNING jail for one (repo, agent), read off the <c>mainguard.repo</c>/<c>mainguard.agent</c>
+    /// labels P2-07 stamps on every container — the same listing the swarm reconciler treats as the sole
+    /// source of truth. Null when no such jail is up, which keeps the "no jail ⇒ no verification, never the
+    /// host" rule exactly as it was: this widens where the daemon LOOKS for a jail, never whether one is
+    /// required. Both the repo hash and the agent id must match, so one repo can never reach into another's
+    /// container. Best-effort by construction — an unreachable Docker endpoint answers "no jail", which is
+    /// the same refusal the caller would otherwise have produced.
+    /// </summary>
+    private static string? ResolveRunningJail(string repoHash, string agentId)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var jails = BuildContainerLister()(cts.Token).GetAwaiter().GetResult();
+            return jails.FirstOrDefault(j =>
+                    j.Running
+                    && string.Equals(j.AgentId, agentId, StringComparison.Ordinal)
+                    && string.Equals(j.RepoHash, repoHash, StringComparison.Ordinal))
+                ?.ContainerId;
+        }
+        catch (Exception)
+        {
+            return null;
         }
     }
 
