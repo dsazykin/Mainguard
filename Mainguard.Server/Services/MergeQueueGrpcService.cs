@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -52,11 +53,11 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         queue.Changed += OnChanged;
         try
         {
-            await responseStream.WriteAsync(Snapshot(queue)).ConfigureAwait(false);
+            await responseStream.WriteAsync(Snapshot(ctx)).ConfigureAwait(false);
             while (!context.CancellationToken.IsCancellationRequested)
             {
                 await signal.WaitAsync(context.CancellationToken).ConfigureAwait(false);
-                await responseStream.WriteAsync(Snapshot(queue)).ConfigureAwait(false);
+                await responseStream.WriteAsync(Snapshot(ctx)).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -69,10 +70,36 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         }
     }
 
+    /// <summary>
+    /// Runs the repo's verification command in the agent's own jail.
+    ///
+    /// <para><b>Every way this can refuse is now a typed, quotable refusal.</b> It previously had no
+    /// mapping at all, so the three reasons a verification cannot even START — the agent has no live jail
+    /// (host execution is a rejection trigger), the repo configures no verification command, and the jail
+    /// does not carry the toolchain main declared — all reached the operator as gRPC <c>Unknown:
+    /// "Exception was thrown by handler."</c>. That is worse than unhelpful on this particular RPC: the one
+    /// distinction the merge decision rests on is <i>provisioning failed</i> versus <i>the branch's tests
+    /// failed</i>, and an opaque fault erases it. A genuinely failing test suite is NOT an error here — it
+    /// is a successful run with <c>Passed:false</c>, and stays that way.</para>
+    /// </summary>
     public override async Task<RunVerificationResponse> RunVerification(RunVerificationRequest request, ServerCallContext context)
     {
         var ctx = Resolve(request.RepoHandle);
-        var record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
+        Mainguard.Agents.Agents.Orchestrator.VerificationRecord record;
+        try
+        {
+            record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is NoVerificationCommandException
+            or Mainguard.Git.Exceptions.ToolchainProvisioningException
+            or InvalidOperationException)
+        {
+            _log.LogWarning("RunVerification refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, ex.Message);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+
         return new RunVerificationResponse
         {
             AgentId = record.AgentId,
@@ -246,6 +273,14 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             acknowledged = !changed.IsUnacknowledged(request.AgentId);
         }
 
+        if (acknowledged)
+        {
+            // The gate's answer changed but no state did, so nothing else re-pushes the queue stream —
+            // and that stream is where the review surface reads CanMerge, the gate reason and the item's
+            // own acknowledged flag from. See MergeQueue.NotifyGateChanged.
+            ctx.Queue.NotifyGateChanged();
+        }
+
         var can = ctx.Queue.CanMerge(request.AgentId, out var reason);
         _log.LogInformation(
             "AcknowledgeFlaggedChange repo={Repo} agent={Agent} item={Item} acknowledged={Ack} canMerge={Can}",
@@ -299,13 +334,14 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 $"No active merge queue for repo handle '{repoHandle}'."));
     }
 
-    private static QueueUpdate Snapshot(MergeQueue queue)
+    private static QueueUpdate Snapshot(MergeQueueContext ctx)
     {
+        var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
         foreach (var agentId in queue.Agents)
         {
             var can = queue.CanMerge(agentId, out var reason);
-            update.Entries.Add(new QueueEntry
+            var entry = new QueueEntry
             {
                 AgentId = agentId,
                 State = queue.GetState(agentId).ToString(),
@@ -314,9 +350,46 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 GateReason = reason,
                 // P2-13 carried-in from P2-12: badge external-PR intake entries as such.
                 Origin = queue.GetOrigin(agentId).ToString(),
-            });
+            };
+
+            entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));
+            update.Entries.Add(entry);
         }
 
         return update;
+    }
+
+    /// <summary>
+    /// The must-acknowledge items blocking <paramref name="agentId"/>, as the review surface has to render
+    /// them. <b>These never used to leave the daemon.</b> The RT-D2 gate lives here, the acknowledgment RPC
+    /// is addressed by item id, and the client's queue projection hardcoded an empty list — so a branch the
+    /// daemon had flagged reached the cockpit as "cannot merge" with no item to clear, and the only route
+    /// out was an ack call for an id nothing had told the client about.
+    /// </summary>
+    private static IEnumerable<FlaggedItem> FlaggedItemsFor(MergeQueueContext ctx, string agentId)
+    {
+        if (ctx.ChangedTestCommand is not { } changed)
+        {
+            yield break;
+        }
+
+        var drifted = changed.FlaggedItems(agentId);
+        if (drifted.Count == 0)
+        {
+            yield break;
+        }
+
+        // One row, addressed by the id the daemon's own AcknowledgeFlaggedChange accepts. The gate
+        // acknowledges its drift items together (a human clearing one while another went unread is the
+        // failure it was shaped to prevent), so it presents as one item naming everything that drifted.
+        yield return new FlaggedItem
+        {
+            Id = ChangedTestCommandItemId,
+            Path = "(verification command)",
+            Category = "ExecutableConfig",
+            Fact = $"the {string.Join(" and the ", drifted)} changed on this branch vs main "
+                + "— a branch cannot be allowed to self-green",
+            Acknowledged = !changed.IsUnacknowledged(agentId),
+        };
     }
 }
