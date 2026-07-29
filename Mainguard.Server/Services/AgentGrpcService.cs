@@ -87,6 +87,16 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
             _log.LogError("SpawnAgent failed (sandbox image missing): {Message}", ex.Message);
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
+        catch (ToolchainProvisioningException ex)
+        {
+            // MG-42: the repo declared a verification toolchain and it could not be put in the jail.
+            // FailedPrecondition, named, and never a degraded spawn — a jail without the tools its
+            // repo's verify command needs produces verification failures that read like the agent's
+            // code is broken, which is the one misreading that decides merges.
+            _log.LogError(ex, "SpawnAgent failed (toolchain provisioning): repo={Repo} ids={Ids}",
+                ex.RepoHandle, string.Join(",", ex.ToolchainIds));
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
         catch (Docker.DotNet.DockerImageNotFoundException ex)
         {
             // Field failure 2026-07-17: the hardened jail image ships via CI/release, and an

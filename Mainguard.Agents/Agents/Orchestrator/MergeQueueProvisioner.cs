@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Audit;
+using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -36,6 +37,14 @@ public sealed class MergeQueueProvisioner
     /// </summary>
     public const string VerificationConfigPath = ".mainguard/verify";
 
+    /// <summary>
+    /// The tracked, in-tree file naming the toolchains the verification command needs inside the jail
+    /// (<see cref="RepoToolchainConfig.Path"/>). Read out of git for BOTH trees, exactly like
+    /// <see cref="VerificationConfigPath"/> — but with one asymmetry the verify command does not have:
+    /// only main's copy is ever <i>provisioned</i>. See <see cref="ToolchainDeclarationResolver"/>.
+    /// </summary>
+    public const string ToolchainConfigPath = RepoToolchainConfig.Path;
+
     private readonly object _gate = new();
     private readonly MergeQueueRegistry _registry;
     private readonly IRepoProvisioner _repos;
@@ -43,6 +52,7 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, string, string?> _resolveContainerId;
     private readonly Func<string, IMergeQueueStore> _queueStore;
     private readonly Func<string, IVerificationStore> _verificationStore;
+    private readonly ISandboxEngine _sandboxes;
     private readonly VerificationRunner _runner;
     private readonly IAuditLog _audit;
     private readonly Action<string>? _log;
@@ -87,8 +97,9 @@ public sealed class MergeQueueProvisioner
         _resolveContainerId = resolveContainerId ?? throw new ArgumentNullException(nameof(resolveContainerId));
         _queueStore = queueStore ?? throw new ArgumentNullException(nameof(queueStore));
         _verificationStore = verificationStore ?? throw new ArgumentNullException(nameof(verificationStore));
+        _sandboxes = sandboxes ?? throw new ArgumentNullException(nameof(sandboxes));
         _runner = new VerificationRunner(
-            sandboxes ?? throw new ArgumentNullException(nameof(sandboxes)),
+            _sandboxes,
             artifactDirectory ?? throw new ArgumentNullException(nameof(artifactDirectory)));
         _audit = audit ?? new InMemoryAuditLog();
         _log = log;
@@ -230,9 +241,26 @@ public sealed class MergeQueueProvisioner
             branchConfigContent: ShowFile(barePath, "agent/" + agentId, VerificationConfigPath),
             mainConfigContent: ShowFile(barePath, mainBranch, VerificationConfigPath));
 
+        // The same RT-D2 question asked of the TOOLCHAIN declaration. Note the argument order is
+        // identical to the line above — branch vs main — but the resolver's answer is not symmetric:
+        // what it hands back to provision is always main's, and the branch's copy only decides the flag.
+        var toolchain = ToolchainDeclarationResolver.Resolve(
+            branchConfigContent: ShowFile(barePath, "agent/" + agentId, ToolchainConfigPath),
+            mainConfigContent: ShowFile(barePath, mainBranch, ToolchainConfigPath),
+            repoHandle: repoHandle);
+
         // Arm (or clear) the RT-D2 gate BEFORE the run: a branch whose command drifted is unmergeable from
         // the moment we know, not from whenever a UI happens to look.
-        changedGate.SetFlagged(agentId, resolution.ChangedVsMain);
+        changedGate.SetFlagged(agentId, ChangedTestCommandGate.TestCommandItem, resolution.ChangedVsMain);
+        changedGate.SetFlagged(agentId, ChangedTestCommandGate.ToolchainItem, toolchain.ChangedVsMain);
+
+        // ...and before running anything, confirm the jail REALLY carries what main declared. This is a
+        // daemon-observed exec in the worker's own container, not a lookup in the daemon's own
+        // bookkeeping: the failure being defended against is precisely the one where our records say the
+        // layer was provisioned and the container is running something else. Without it, a jail missing
+        // its toolchain produces exit 127 and an ordinary "verification failed" — indistinguishable from
+        // the agent's code being broken, on the one screen where that distinction decides a merge.
+        await EnsureToolchainPresentAsync(repoHandle, containerId!, toolchain.Provisioned, ct).ConfigureAwait(false);
 
         // Pin the record to the queue's authoritative main — the same value CanMerge compares against, so a
         // pass here is a pass against the main this branch will actually merge into.
@@ -241,6 +269,56 @@ public sealed class MergeQueueProvisioner
                 agentId, containerId!, queue.CurrentMainSha,
                 resolution.Command, resolution.ResolvedCommand, resolution.ConfigHash),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Runs each declared toolchain's catalogued probe inside the worker's jail. Every probe must exit
+    /// zero; the first that does not raises <see cref="ToolchainProvisioningException"/> and the
+    /// verification never runs.
+    /// </summary>
+    private async Task EnsureToolchainPresentAsync(
+        string repoHandle, string containerId, ToolchainDeclaration declaration, CancellationToken ct)
+    {
+        if (declaration.IsEmpty)
+        {
+            return;
+        }
+
+        foreach (var id in declaration.Ids)
+        {
+            var recipe = ToolchainCatalog.TryGet(id)
+                ?? throw new UnknownToolchainException(repoHandle, id, ToolchainCatalog.KnownIds);
+
+            SandboxExecResult probe;
+            try
+            {
+                probe = await _sandboxes.ExecAsync(containerId, recipe.Probe, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                    $"could not probe '{id}' in the worker's jail: {ex.Message}");
+            }
+
+            if (probe.ExitCode != 0)
+            {
+                throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                    $"'{id}' is declared but absent from the worker's jail — the probe "
+                    + $"`{string.Join(' ', recipe.Probe)}` exited {probe.ExitCode}. "
+                    + "Verification was NOT run; this is a provisioning failure, not a failing test. "
+                    + $"stderr: {Trim(probe.Stderr)}");
+            }
+        }
+    }
+
+    private static string Trim(string? text)
+    {
+        var s = (text ?? string.Empty).Trim();
+        return s.Length <= 400 ? s : s[^400..];
     }
 
     // `git show <ref>:<path>` — null when the ref or the path is absent (an absent branch-side config is

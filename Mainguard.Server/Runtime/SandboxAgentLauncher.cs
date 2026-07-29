@@ -139,6 +139,23 @@ public sealed class SandboxAgentLauncher
         var spawnImageRef = pinnedImageRef ?? _imageRef;
         _log.LogInformation("preflight ok: jail images present and current; pinned image={Image}", spawnImageRef);
 
+        // Per-repo toolchain (MG-42). The repo's MAIN-side .mainguard/toolchain — never a branch's —
+        // decides what the verification jail carries beyond the curated base image. Resolved and built
+        // HERE, before the container exists, because a live jail's image cannot be changed underneath
+        // it (and because a docker build during a live session severs the agent PTY, G-16).
+        //
+        // A failure is loud and stops the spawn. The alternative is a jail that quietly lacks the tools
+        // the repo's verify command names, whose every verification then fails at exit 127 in a way
+        // that reads like the agent's code is broken.
+        var toolchain = await EnsureToolchainAsync(repoHandle, barePath, pinnedImageRef, ct).ConfigureAwait(false);
+        if (toolchain is not null)
+        {
+            spawnImageRef = toolchain.ImageRef;
+            _log.LogInformation(
+                "toolchain layer ready: repo={Repo} ids={Ids} image={Image} base={Base}",
+                repoHandle, string.Join(",", toolchain.Ids), toolchain.ImageRef, toolchain.BaseDigest);
+        }
+
         // agentKind → the CLI the user dynamically installed. Resolved BEFORE the worktree so an
         // unknown kind costs nothing; the jail still spawns without a launch command (the operator
         // gets a shell in a correct sandbox rather than a failed spawn), and the caller surfaces it.
@@ -213,6 +230,36 @@ public sealed class SandboxAgentLauncher
             TryRemoveWorktree(repoHandle, agentId);
             throw;
         }
+    }
+
+    /// <summary>
+    /// Resolves the repo's MAIN-side toolchain declaration and ensures its layer exists, returning what
+    /// to jail from — or <c>null</c> when the repo declares nothing (the overwhelming common case: the
+    /// base image is the answer and this costs one <c>git show</c> that finds no file).
+    ///
+    /// <para>The substrate having no image-build capability is <b>not</b> a reason to continue: a repo
+    /// that declared a toolchain and got a jail without it has no verification signal, only a
+    /// convincing-looking failed one.</para>
+    /// </summary>
+    private async Task<ProvisionedToolchain?> EnsureToolchainAsync(
+        string repoHandle, string barePath, string? baseDigest, CancellationToken ct)
+    {
+        var declaration = RepoToolchainConfig.ReadMainBaseline(barePath, repoHandle);
+        if (declaration.IsEmpty)
+        {
+            return null;
+        }
+
+        var builder = _environment.ToolchainImages;
+        if (builder is null)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this substrate ('{_environment.SubstrateId}') cannot build toolchain layers, so the jail "
+                + "would start without the tools the repository's verification command needs.");
+        }
+
+        return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m))
+            .EnsureAsync(repoHandle, declaration, baseDigest, ct).ConfigureAwait(false);
     }
 
     /// <summary>Best-effort teardown of a launched agent: remove the jail, then its MG-36 network

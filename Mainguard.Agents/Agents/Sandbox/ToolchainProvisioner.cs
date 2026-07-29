@@ -1,0 +1,278 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Globalization;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Mainguard.Git.Exceptions;
+
+namespace Mainguard.Agents.Agents.Sandbox;
+
+/// <summary>
+/// What a built per-repo toolchain layer is: the image ref to spawn from, and the provenance that
+/// makes it checkable.
+/// </summary>
+/// <param name="ImageRef">The ref the jail is created from — a <c>sha256:</c> digest when the builder
+/// can resolve one, exactly like the base image's pin.</param>
+/// <param name="BaseDigest">The base-image digest this layer was built ON. The whole point of MG-27 is
+/// that the bytes that were checked are the bytes that run; a derived layer keeps that only if it
+/// records, and re-checks, which base it derives from.</param>
+/// <param name="Ids">The toolchains in the layer.</param>
+public sealed record ProvisionedToolchain(string ImageRef, string BaseDigest, ImmutableArray<string> Ids);
+
+/// <summary>
+/// The image-store operations <see cref="ToolchainProvisioner"/> needs, kept behind a seam so the
+/// provisioner's decision logic (cache hit / cache miss / poisoned tag / failed build) is testable
+/// without a Docker daemon — and so a future non-Docker engine can supply its own.
+/// </summary>
+public interface IToolchainImageBuilder
+{
+    /// <summary>The labels on <paramref name="imageRef"/>, or null when the image is absent.</summary>
+    Task<IReadOnlyDictionary<string, string>?> InspectLabelsAsync(string imageRef, CancellationToken ct = default);
+
+    /// <summary>The immutable content digest <paramref name="imageRef"/> resolves to, or null.</summary>
+    Task<string?> ResolveDigestAsync(string imageRef, CancellationToken ct = default);
+
+    /// <summary>
+    /// Builds <paramref name="dockerfile"/> and tags it <paramref name="imageRef"/>, stamping
+    /// <paramref name="labels"/>. Throws on a build failure — the caller turns that into the typed
+    /// <see cref="ToolchainProvisioningException"/>.
+    /// </summary>
+    Task BuildAsync(
+        string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels, CancellationToken ct = default);
+}
+
+/// <summary>
+/// Builds — once — the per-repo toolchain layer a repository's <c>.mainguard/toolchain</c> asks for,
+/// and hands the spawn path an image ref to jail from.
+///
+/// <para><b>Where this runs, and why that is the whole egress answer.</b> The build is a
+/// <c>docker build</c> issued by the daemon, on the VM's own network. It is NOT the jail's network:
+/// the jail sits on a per-agent <c>internal</c> segment whose only other member is the egress proxy,
+/// and it reaches the world solely through that proxy's default-deny allowlist with a pinned
+/// NXDOMAIN-by-default resolver and an iptables backstop. Nothing in this file touches
+/// <see cref="EgressAllowlist"/>. The recipes reach <c>github.com</c> and <c>cache.nixos.org</c> (nix)
+/// and <c>builds.dotnet.microsoft.com</c> (.NET) — <b>at build time, from the VM</b>, which is exactly
+/// where <c>images/mainguard-agent-base/Dockerfile</c> already reaches them to bake its own curated
+/// toolchain. A jail can reach none of those, before or after this change, and in particular the git
+/// host stays off the agent allowlist (A6) — which is precisely why the toolchain cannot be installed
+/// from inside the jail and has to be a layer.</para>
+///
+/// <para><b>Timing (G-16).</b> This is a PROVISIONING-time build, on the spawn path before any
+/// container exists. G-16 forbids a <c>docker build</c> during a live agent session because it severs
+/// the PTY; there is no session yet when this runs. It is also why the layer is chosen at SPAWN and not
+/// at verification: a live jail's image cannot be changed underneath it.</para>
+///
+/// <para><b>Cost.</b> First build for a given (base digest × declaration) pair is a real build — a
+/// couple of minutes and about a gigabyte for the .NET SDK. Every spawn after that, for every agent on
+/// every repo with the same declaration, is a label inspect and a digest resolve: two Docker API calls,
+/// tens of milliseconds, no network. The cache key is content-addressed rather than repo-scoped
+/// precisely so that N repos declaring <c>dotnet-10</c> share one layer instead of building N.</para>
+/// </summary>
+public sealed class ToolchainProvisioner
+{
+    /// <summary>The image repository per-repo toolchain layers are tagged under.</summary>
+    public const string ImageName = "mainguard-agent-toolchain";
+
+    /// <summary>Label: the base-image digest the layer was built on.</summary>
+    public const string BaseDigestLabel = "mainguard.toolchain.base-digest";
+
+    /// <summary>Label: the newline-joined toolchain ids in the layer.</summary>
+    public const string SpecLabel = "mainguard.toolchain.spec";
+
+    private readonly IToolchainImageBuilder _builder;
+    private readonly Action<string>? _log;
+    private readonly SemaphoreSlim _buildGate = new(1, 1);
+
+    public ToolchainProvisioner(IToolchainImageBuilder builder, Action<string>? log = null)
+    {
+        _builder = builder ?? throw new ArgumentNullException(nameof(builder));
+        _log = log;
+    }
+
+    /// <summary>
+    /// Ensures the layer for <paramref name="declaration"/> over <paramref name="baseDigest"/> exists,
+    /// and returns what to spawn from. Returns <c>null</c> for an empty declaration — the repo needs
+    /// nothing beyond the base image and the caller stays on the base digest, unchanged.
+    /// </summary>
+    /// <exception cref="ToolchainProvisioningException">The layer could not be produced. Never
+    /// swallowed, never degraded: see the exception's own summary.</exception>
+    public async Task<ProvisionedToolchain?> EnsureAsync(
+        string repoHandle, ToolchainDeclaration declaration, string? baseDigest, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(declaration);
+        if (declaration.IsEmpty)
+        {
+            return null;
+        }
+
+        if (!SandboxImageDigest.IsDigest(baseDigest))
+        {
+            // A layer built on an unpinned base would be a layer whose provenance stops at a mutable
+            // tag — the exact gap MG-27 closed for the base image. Refuse rather than quietly widen it.
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"the agent base image did not resolve to a content digest (got '{baseDigest ?? "<null>"}'); "
+                + "a per-repo toolchain layer is only built on a digest-pinned base.");
+        }
+
+        var recipes = declaration.Ids
+            .Select(id => ToolchainCatalog.TryGet(id) ?? throw new UnknownToolchainException(repoHandle, id, ToolchainCatalog.KnownIds))
+            .ToImmutableArray();
+
+        var tag = ImageTagFor(baseDigest!, declaration, recipes);
+        var expectedLabels = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            [BaseDigestLabel] = baseDigest!,
+            [SpecLabel] = declaration.Normalized,
+        };
+
+        // Serialised: two agents spawning into the same repo at once would otherwise race two identical
+        // multi-minute builds, and Docker would happily run both.
+        await _buildGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false);
+            if (hit is null)
+            {
+                var dockerfile = RenderDockerfile(baseDigest!, recipes);
+                _log?.Invoke($"toolchain build begin: repo={repoHandle} image={tag} ids={declaration.Normalized.Replace('\n', ',')}");
+                try
+                {
+                    await _builder.BuildAsync(tag, dockerfile, expectedLabels, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    throw new ToolchainProvisioningException(repoHandle, declaration.Ids, Describe(ex));
+                }
+
+                hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false)
+                      ?? throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                          $"the build of '{tag}' reported success but the image is absent or carries the wrong provenance labels.");
+
+                _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
+            }
+
+            return new ProvisionedToolchain(hit, baseDigest!, declaration.Ids);
+        }
+        finally
+        {
+            _buildGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// The content-addressed tag for a layer: <c>mainguard-agent-toolchain:&lt;16 hex&gt;</c> over the
+    /// base digest AND the complete generated build spec.
+    ///
+    /// <para>All three inputs matter and each was learned the hard way. The <b>base digest</b>: a layer
+    /// built on last week's base is a different artefact even when the id list is identical, and reusing
+    /// it would silently unpin the base. The <b>declaration</b>: obviously. The <b>recipes</b>: hashing
+    /// only the ids meant a fix to a recipe produced the same tag as the broken version, so the cache
+    /// served the broken layer forever and the fix could never ship. That is not hypothetical — the
+    /// first real-jail run of this feature found the <c>dotnet-10</c> recipe missing libicu, and
+    /// correcting it did not change the id list. Hashing the rendered Dockerfile covers install steps,
+    /// PATH, environment and ordering in one stroke, because the Dockerfile IS the build spec.</para>
+    /// </summary>
+    public static string ImageTagFor(string baseDigest, ToolchainDeclaration declaration) =>
+        ImageTagFor(baseDigest, declaration, ResolveRecipes(declaration));
+
+    /// <summary>Testable core — takes the recipes rather than looking them up, so "a recipe change
+    /// changes the tag" is assertable without mutating the catalog.</summary>
+    internal static string ImageTagFor(
+        string baseDigest, ToolchainDeclaration declaration, IReadOnlyList<ToolchainRecipe> recipes)
+    {
+        var material = baseDigest + "\n" + declaration.Normalized + "\n" + RenderDockerfile(baseDigest, recipes);
+        var hex = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(material))).ToLowerInvariant();
+        return ImageName + ":" + hex[..16];
+    }
+
+    private static IReadOnlyList<ToolchainRecipe> ResolveRecipes(ToolchainDeclaration declaration) =>
+        declaration.Ids
+            .Select(id => ToolchainCatalog.TryGet(id)
+                ?? throw new UnknownToolchainException(string.Empty, id, ToolchainCatalog.KnownIds))
+            .ToImmutableArray();
+
+    /// <summary>
+    /// The generated Dockerfile. Deliberately boring and fully derived: the only inputs a repository
+    /// contributes are the catalogued <i>ids</i>, so every line below comes from product source.
+    /// </summary>
+    internal static string RenderDockerfile(string baseDigest, IReadOnlyList<ToolchainRecipe> recipes)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# Generated by Mainguard ToolchainProvisioner — do not edit, do not commit.");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"FROM {SandboxImageVersions.AgentBaseName}@{baseDigest}");
+        sb.AppendLine();
+        // The base image ends on USER agent; installs need root, and the layer must end back on the
+        // non-root agent uid or the jail's whole hardening posture changes.
+        sb.AppendLine("USER root");
+        foreach (var recipe in recipes)
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"# --- {recipe.Id}: {recipe.Summary}");
+            foreach (var step in recipe.InstallSteps)
+            {
+                sb.AppendLine(CultureInfo.InvariantCulture, $"RUN {step}");
+            }
+        }
+
+        sb.AppendLine("USER agent");
+
+        var pathEntries = recipes.SelectMany(r => r.PathEntries).ToArray();
+        if (pathEntries.Length > 0)
+        {
+            // Prepended, but AFTER the adapters mount stays first is not a concern here: this simply
+            // puts the per-repo toolchain ahead of the base image's curated one so a repo that declares
+            // a language gets ITS version, not an incidental base-image collision.
+            sb.AppendLine(CultureInfo.InvariantCulture, $"ENV PATH={string.Join(':', pathEntries)}:$PATH");
+        }
+
+        foreach (var (name, value) in recipes.SelectMany(r => r.Environment))
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"ENV {name}={value}");
+        }
+
+        sb.AppendLine("WORKDIR /workspace");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// A cache hit is an image that exists AND whose provenance labels match what we would have built.
+    /// The label check is not ceremony: the tag is a local name, so "an image already holds this tag"
+    /// is not evidence about its contents. A mismatch is treated as a miss and rebuilt over.
+    /// </summary>
+    private async Task<string?> TryUseCachedAsync(
+        string tag, IReadOnlyDictionary<string, string> expected, CancellationToken ct)
+    {
+        var labels = await _builder.InspectLabelsAsync(tag, ct).ConfigureAwait(false);
+        if (labels is null)
+        {
+            return null;
+        }
+
+        foreach (var (key, value) in expected)
+        {
+            if (!labels.TryGetValue(key, out var actual) || !string.Equals(actual, value, StringComparison.Ordinal))
+            {
+                _log?.Invoke($"toolchain cache miss: image={tag} label '{key}' is '{actual ?? "<absent>"}', expected '{value}'");
+                return null;
+            }
+        }
+
+        // Same pin as the base image: resolve the ref to its digest and hand THAT back, so the layer we
+        // just checked is the layer the container is created from.
+        return await _builder.ResolveDigestAsync(tag, ct).ConfigureAwait(false) ?? tag;
+    }
+
+    private static string Describe(Exception ex)
+    {
+        var text = ex.Message?.Trim() ?? ex.GetType().Name;
+        const int max = 2000;
+        return text.Length <= max ? text : string.Concat(text.AsSpan(text.Length - max), "");
+    }
+}

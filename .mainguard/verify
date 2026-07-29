@@ -1,0 +1,1 @@
+dotnet test Mainguard.slnx --configuration Release
