@@ -121,7 +121,20 @@ public static class ToolchainCatalog
             // run — a verification jail must not quietly disagree with the developer's machine about
             // what string comparison means. The apt fetch is signed-and-checksummed by apt itself, the
             // same discipline (and the same archive) the base image's own apt line relies on.
-            "apt-get update && apt-get install -y --no-install-recommends libicu72 "
+            //
+            // libfontconfig1 is the same class of finding, one layer further along, and it was found the
+            // same way — by running a real repository's real verify command in a real jail. With the
+            // cache in place `dotnet test Mainguard.slnx --configuration Release` finally RESTORED and
+            // BUILT inside the jail, and then 169 of 2716 tests failed identically:
+            // `libfontconfig.so.1: cannot open shared object file` → SkiaSharp's native load fails →
+            // every Avalonia headless render test dies in a type initialiser. It is not a Mainguard
+            // quirk: Skia is how Avalonia, MAUI and every headless-rendering .NET suite draws, and
+            // bookworm-slim ships no fontconfig. A repository cannot fix this itself — the catalog is a
+            // CLOSED set by design (a declaration that could describe an installation would be an
+            // install-time arbitrary-code-execution surface in a file an agent can write) — so a
+            // catalogued ".NET SDK" that cannot run a mainstream .NET test suite is the catalog's bug,
+            // not the repository's. Two small packages, from the same signed archive as the line above.
+            "apt-get update && apt-get install -y --no-install-recommends libicu72 libfontconfig1 "
             + "&& rm -rf /var/lib/apt/lists/*",
             "curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/dotnet-sdk.tar.gz "
             + $"\"https://builds.dotnet.microsoft.com/dotnet/Sdk/{DotnetSdkVersion}/dotnet-sdk-{DotnetSdkVersion}-linux-x64.tar.gz\""

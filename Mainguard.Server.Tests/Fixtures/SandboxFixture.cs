@@ -51,10 +51,14 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// credential file holds what THIS spawn sent" is distinguishable from "a file was already there".</param>
     /// <param name="oobKey">The OOB session key delivered to the SUPERVISOR-owned 0400 tmpfs. Null
     /// generates a random one.</param>
+    /// <param name="packageCachePath">MG-43 — the per-agent package cache to bind-mount at
+    /// <see cref="PackageCachePolicy.SandboxMount"/>. Null keeps the pre-MG-43 jail (no cache mount, no
+    /// cache environment); <see cref="NewTempCache"/> makes one.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
-        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null, CancellationToken ct = default)
-        => SpawnFromImageAsync(ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, ct);
+        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
+        string? packageCachePath = null, CancellationToken ct = default)
+        => SpawnFromImageAsync(ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -63,7 +67,8 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// </summary>
     public async Task<SandboxHandle> SpawnFromImageAsync(
         string imageRef, string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
-        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null, CancellationToken ct = default)
+        IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
+        string? packageCachePath = null, CancellationToken ct = default)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
@@ -85,7 +90,8 @@ public sealed class SandboxFixture : IAsyncDisposable
                 Limits: new SandboxLimits(1L * 1024 * 1024 * 1024, 256),
                 Secrets: secrets,
                 AgentUid: agentUid,
-                SupervisorUid: supervisorUid), ct).ConfigureAwait(false);
+                SupervisorUid: supervisorUid,
+                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
 
             _containerIds.Add(handle.ContainerId);
             return handle;
@@ -113,8 +119,15 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// the spec — capabilities, seccomp, read-only rootfs, the MG-7 resolver pin, the segment — comes
     /// from the same builder the daemon uses.</para>
     /// </summary>
+    /// <param name="packageCachePath">MG-43 — an optional per-agent cache to bind-mount (see
+    /// <see cref="NewTempCache"/>).</param>
+    /// <param name="mutateForTest">MG-43 — a last hook to alter the create request AFTER the production
+    /// builder has approved it. It exists for exactly one case: proving the in-jail probe distinguishes
+    /// an unwritable mount from a missing one, which the builder (correctly) refuses to construct. Never
+    /// use it to bypass a control the builder enforces — the thing under test there would be the builder.</param>
     public async Task<(string ContainerId, AgentSegment Segment)> CreateJailOnSegmentAsync(
-        string repoHash, string agentId, CancellationToken ct = default)
+        string repoHash, string agentId, CancellationToken ct = default,
+        string? packageCachePath = null, Action<CreateContainerParameters>? mutateForTest = null)
     {
         await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
         var segment = await Egress.EnsureAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false);
@@ -128,13 +141,31 @@ public sealed class SandboxFixture : IAsyncDisposable
             NetworkName: segment.NetworkName,
             Credentials: CredTmpfsSpec.Create(1000, 1001),
             ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)!,
-            DnsServerAddress: segment.ProxyAddress));
+            DnsServerAddress: segment.ProxyAddress,
+            PackageCachePath: packageCachePath));
+
+        mutateForTest?.Invoke(create);
 
         var created = await Docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
         _containerIds.Add(created.ID);
         _segments.Add((repoHash, agentId));
         await Docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
         return (created.ID, segment);
+    }
+
+    /// <summary>
+    /// Creates and starts a container from an already-built create request, tracking it (and its
+    /// segment) for teardown. For the MG-43 verification leg, which needs ceilings the ordinary spawn
+    /// helpers fix — a Release build of a 15-project solution is not an agent CLI's working set.
+    /// </summary>
+    public async Task<string> CreateAndStartAsync(
+        CreateContainerParameters create, string repoHash, string agentId, CancellationToken ct = default)
+    {
+        var created = await Docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
+        _containerIds.Add(created.ID);
+        _segments.Add((repoHash, agentId));
+        await Docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+        return created.ID;
     }
 
     /// <summary>The container's IPv4 on <paramref name="networkName"/> (its segment).</summary>
@@ -249,6 +280,64 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// <summary>Inspects a spawned container (mounts, host config, state).</summary>
     public Task<ContainerInspectResponse> InspectAsync(string containerId, CancellationToken ct = default)
         => Docker.Containers.InspectContainerAsync(containerId, ct);
+
+    /// <summary>
+    /// MG-43 — a per-agent package cache directory on the same ext4 temp filesystem the worktrees use,
+    /// laid out under a <c>caches/</c> parent so it satisfies the builder's MG-3 structural guard.
+    ///
+    /// <para><b>Why it is chmod 0777 and why that is honest.</b> In production the jail reaches this tree
+    /// through the MG-17 group whose gid IS the remapped agent gid, provisioned at boot by
+    /// <c>UsernsRemapPolicy.MountOwnershipScript</c> — a VM-level fact no test process can reproduce
+    /// (the daemon itself cannot chown into the remapped range). Leaving the directory at the default
+    /// 0700 would make these tests measure the RUNNER's uid mapping instead of the cache: on a
+    /// userns-remapped runner the jail is host uid 101000 and could write nothing, and on this box it is
+    /// uid 1000 and could write everything — the same green/red split that made MG-3's attack test pass
+    /// for the wrong reason. 0777 removes the uid mapping from the question entirely, so what these
+    /// tests measure is the MOUNT. That the production grant is really provisioned is asserted
+    /// separately, and environment-independently, by <c>PackageCachePolicyTests</c> against the boot
+    /// script's text.</para>
+    /// </summary>
+    public string NewTempCache(string agentId = "agent-1")
+    {
+        var path = Path.Combine(
+            Path.GetTempPath(), "mainguard-sbx-cache-" + Guid.NewGuid().ToString("N"),
+            PackageCachePolicy.CachesDirectoryName, "repo", agentId);
+        Directory.CreateDirectory(path);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, (UnixFileMode)0b111_111_111);
+        }
+
+        _tempWorktrees.Add(path);
+        return path;
+    }
+
+    /// <summary>
+    /// MG-43 — a fresh, ordinary VM root (default umask, no chmod, no group provisioning), the way the
+    /// merge-queue end-to-end suite builds one per test. Handed to a real <c>PackageCacheManager</c> so
+    /// the SHIPPED grant logic is what makes the cache reachable, rather than a test helper's 0777.
+    /// </summary>
+    public string NewTempVmRoot()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-vm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        _tempWorktrees.Add(path);
+        return path;
+    }
+
+    /// <summary>MG-43 — a cache directory NOTHING can write, whatever uid the runner maps the jail to.
+    /// The point of mode 0500 (rather than "owned by someone else") is that it is unwritable to the
+    /// owner too, so the refusal it provokes cannot be an artefact of this box's uid mapping.</summary>
+    public string NewUnwritableTempCache(string agentId = "agent-1")
+    {
+        var path = NewTempCache(agentId);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        }
+
+        return path;
+    }
 
     private string NewTempWorktree()
     {

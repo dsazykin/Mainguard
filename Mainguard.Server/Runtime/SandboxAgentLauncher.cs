@@ -170,6 +170,19 @@ public sealed class SandboxAgentLauncher
         _log.LogInformation("worktree ready: {Path} agentRepo={AgentRepo}", worktreePath, agentRepoPath);
         try
         {
+            // MG-43: this agent's own package cache on ext4, prepared BEFORE the container exists (its
+            // mounts are fixed at create). A failure here is typed and stops the spawn — deliberately
+            // NOT caught and degraded, because the alternative is a jail whose restore fills the 256 MiB
+            // tmpfs $HOME and dies at ENOSPC, which the merge queue records as an ordinary failed
+            // verification indistinguishable from the agent's code being broken.
+            string? packageCachePath = null;
+            if (_environment.PackageCaches is { } caches)
+            {
+                var usage = caches.Prepare(repoHandle, agentId);
+                packageCachePath = caches.PathFor(repoHandle, agentId);
+                _log.LogInformation("package cache ready: {Path} — {Usage}", packageCachePath, usage.Describe());
+            }
+
             // The default-deny network + allowlist proxy must exist before the jail joins the network.
             await _environment.Egress.EnsureReadyAsync(ct).ConfigureAwait(false);
             _log.LogInformation("egress ready (default-deny network + proxy)");
@@ -210,7 +223,10 @@ public sealed class SandboxAgentLauncher
                 // rather than the proxy's NAME because one dnsmasq cannot answer the same name with a
                 // different address per segment, and every other segment's address is unreachable.
                 NetworkName: segment.NetworkName,
-                ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort)), ct).ConfigureAwait(false);
+                ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort),
+                // MG-43: the daemon-owned package cache for THIS agent, read-write at
+                // /var/cache/mainguard — on ext4, outside the worktree, outside the tmpfs $HOME.
+                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only

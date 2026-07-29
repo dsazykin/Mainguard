@@ -39,6 +39,37 @@ public sealed class RequiresDockerDaemonFactAttribute : FactAttribute
     }
 }
 
+/// <summary>
+/// MG-43 — a <see cref="RequiresDockerFactAttribute"/> that ALSO requires <c>MAINGUARD_VERIFY_E2E=1</c>.
+///
+/// <para>It gates the one test that runs a repository's real <c>.mainguard/verify</c> end to end inside
+/// a jail: a full Release restore + build + test of <c>Mainguard.slnx</c>, which is a ~1.7 GB download
+/// and tens of minutes. That is the right thing to measure and the wrong thing to put in every PR run,
+/// so it is opt-in and its result is reported in the PR that changes the cache.</para>
+///
+/// <para>Skipping is expressed by setting <see cref="FactAttribute.Skip"/> from the constructor, NOT by
+/// throwing: this repo is on xunit 2.9.3 (v2 core), where <c>Assert.Skip</c>/<c>SkipException.ForSkip</c>
+/// does not exist as a skip at all and reports as a FAILURE.</para>
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class RequiresDockerAndOptInFactAttribute : FactAttribute
+{
+    /// <summary>The environment variable that opts a run in.</summary>
+    public const string OptInVariable = "MAINGUARD_VERIFY_E2E";
+
+    public RequiresDockerAndOptInFactAttribute()
+    {
+        if (!DockerAvailability.IsReady)
+        {
+            Skip = DockerAvailability.SkipReason;
+        }
+        else if (Environment.GetEnvironmentVariable(OptInVariable) != "1")
+        {
+            Skip = $"Set {OptInVariable}=1 to run the full in-jail verification (minutes, ~1.7 GB of packages).";
+        }
+    }
+}
+
 internal static class DockerAvailability
 {
     /// <summary>The agent base image the RequiresDocker leg needs (matches <c>SandboxFixture.ImageRef</c>).</summary>

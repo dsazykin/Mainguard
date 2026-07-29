@@ -296,10 +296,20 @@ public static class UsernsRemapPolicy
     /// <summary>
     /// Brings the bind-mount sources to the shared-ownership invariant, idempotently.
     ///
-    /// <para><b>repos/ + worktrees/ + agents/</b> (bind-mounted READ-WRITE): group
+    /// <para><b>repos/ + worktrees/ + agents/ + caches/</b> (bind-mounted READ-WRITE): group
     /// <see cref="JailGroupName"/>, group-rwX, setgid on every directory so new children inherit the
     /// group. Guarded on the top directory's own gid so the recursive pass runs ONCE — on an
-    /// already-migrated VM this is three <c>stat</c>s, not a walk of every worktree on every boot.</para>
+    /// already-migrated VM this is four <c>stat</c>s, not a walk of every worktree on every boot.</para>
+    ///
+    /// <para><c>caches/</c> (MG-43) is the daemon-owned package cache root
+    /// (<see cref="PackageCachePolicy.CacheRoot"/>). It is here for exactly the reason <c>agents/</c> is:
+    /// the invariant that makes a per-agent directory correct is a property of the PARENT, so
+    /// <c>&lt;caches&gt;/&lt;repoHash&gt;/&lt;agentId&gt;</c> inherits gid <see cref="AgentHostGid"/> and
+    /// the setgid bit with no work at all from the code that creates it. The daemon still cannot chown
+    /// into the remapped range and does not try; the jail writes gigabytes here as host uid 101000 while
+    /// owning neither the tree nor any parent of it. Note the recursive pass is guarded on the ROOT's
+    /// gid, so this costs nothing on a VM already provisioned — and on the boot that first creates
+    /// <c>caches/</c> the tree is empty, so the walk is one directory.</para>
     ///
     /// <para><c>agents/</c> holds nothing yet. It is created and grouped HERE, ahead of use, because
     /// <c>docs/design/mg-3-mediated-ref-updates.md</c> (the approved plan of record, which names this
@@ -327,14 +337,14 @@ public static class UsernsRemapPolicy
         return
             "set -u; "
             + $"root='{vmRoot}'; gid={gid}; "
-            + "mkdir -p \"$root/repos\" \"$root/worktrees\" \"$root/agents\" || exit 1; "
+            + $"mkdir -p \"$root/repos\" \"$root/worktrees\" \"$root/agents\" \"$root/{PackageCachePolicy.CachesDirectoryName}\" || exit 1; "
             // Owner only, and NEVER -R: a recursive chown would strip the remapped uid off every file
             // the jails legitimately wrote, on every boot. `mkdir -p` as root can create these three
             // root-owned on a fresh VM, which is the only ownership this has to repair.
             + $"chown {RemapUser}:{RemapUser} \"$root\" 2>/dev/null || true; "
-            + $"chown {RemapUser} \"$root/repos\" \"$root/worktrees\" \"$root/agents\" 2>/dev/null || true; "
+            + $"chown {RemapUser} \"$root/repos\" \"$root/worktrees\" \"$root/agents\" \"$root/{PackageCachePolicy.CachesDirectoryName}\" 2>/dev/null || true; "
             + "chmod 0755 \"$root\" || exit 1; "
-            + "for d in \"$root/repos\" \"$root/worktrees\" \"$root/agents\"; do "
+            + $"for d in \"$root/repos\" \"$root/worktrees\" \"$root/agents\" \"$root/{PackageCachePolicy.CachesDirectoryName}\"; do "
             + "  cur=$(stat -c %g \"$d\" 2>/dev/null || echo -1); "
             + "  if [ \"$cur\" != \"$gid\" ]; then "
             + "    chgrp -R \"$gid\" \"$d\" || exit 1; "
