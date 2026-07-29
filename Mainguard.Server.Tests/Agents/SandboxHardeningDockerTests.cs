@@ -13,6 +13,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// Gated by <see cref="RequiresDockerFactAttribute"/> so a Docker-less dev box skips; Linux CI runs them.
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class SandboxHardeningDockerTests
 {
     [RequiresDockerFact]

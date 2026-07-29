@@ -27,6 +27,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// verdicts.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class PackageCacheDockerTests
 {
     private readonly ITestOutputHelper _out;

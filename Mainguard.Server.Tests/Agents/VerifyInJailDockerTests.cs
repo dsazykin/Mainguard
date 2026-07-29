@@ -35,6 +35,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// which is ext4 on the substrate this ships to.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class VerifyInJailDockerTests
 {
     private static readonly TimeSpan Budget = TimeSpan.FromMinutes(90);

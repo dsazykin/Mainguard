@@ -56,6 +56,7 @@ namespace Mainguard.Server.Tests.Agents;
 /// answer on its own.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public class MirrorReadOnlyDockerTests
 {
     // Each fact is wrapped in its own sentinel frame, printed by the SHELL and not by the command being
