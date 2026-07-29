@@ -766,7 +766,11 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
             var head = _prHeadSha!;
             Git(Upstream!, "update-ref", $"refs/pull/{prNumber}/head", head);
 
-            // The REAL intake engine over the daemon's REAL worker host.
+            // The REAL intake engine over the daemon's REAL worker host. The intake deliberately swallows
+            // per-source and per-PR faults (one bad pull request must not end the daemon's poll loop), so
+            // its audit is the only place a failure surfaces — read below rather than left to become an
+            // unexplained null three assertions later.
+            var audit = new InMemoryAuditLog();
             var listed = new StubPrList(prNumber, head);
             var intake = new ExternalPrIntake(
                 prService: listed,
@@ -779,13 +783,21 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
                     // canonical host name.
                     _ => Upstream!),
                 resolveTarget: _ => new PrIntakeTarget(Checkout, RepoHandle, Queue),
-                audit: new InMemoryAuditLog());
+                audit: audit);
             intake.Subscribe(PrSource);
 
             await intake.PollOnceAsync(CancellationToken.None);
 
             if (expectMaterialized)
             {
+                var failure = audit.Read().FirstOrDefault(e =>
+                    e.Type is "external_pr_worker_unavailable" or "external_pr_materialize_failed"
+                        or "external_pr_poll_failed");
+                Assert.True(
+                    failure is null,
+                    $"the intake did not materialize PR {prNumber}: {failure?.Type} — "
+                        + string.Join(", ", failure?.Fields.Select(f => $"{f.Key}={f.Value}") ?? Array.Empty<string>()));
+
                 var session = _host.Services.GetRequiredService<AgentSessionStore>().Find(agentId);
                 Assert.NotNull(session);
                 Assert.False(string.IsNullOrEmpty(session!.ContainerId),
