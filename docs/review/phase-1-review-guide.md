@@ -104,10 +104,14 @@ dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj \
 dotnet run --project Mainguard.Pro.App    # the Pro head (not the shell library)
 ```
 
-`RequiresDocker` (77 tests) needs Docker and **must be run alone** — those suites share
-host-global state (`~/mainguard`, fixed container names, host iptables). A fix for that is in
-flight. If you run it while something else uses Docker, expect false failures; that is the known
-tax, not a regression.
+`RequiresDocker` (~79 tests) needs Docker. **Concurrent runs are now safe** (#278): every
+`RequiresDocker` class joins a collection whose fixture takes a host-global, cross-process lock for
+the window its Docker tests run, so a second run queues rather than colliding. The resources
+themselves stay shared on purpose — the egress proxy is a singleton by design, and
+`mainguard-agents`/`mainguard-egress` are addressed by literal name from MG-7's resolver pin and
+MG-18's posture gate, so renaming them per run would switch those security gates off for the
+renamed topology. A pair of concurrent full runs takes roughly twice the wall clock of one; that
+gap is the queueing, not a hang.
 
 **Environment now working that was not before:** `git-lfs` installed, `MAINGUARD_LIBVTERM` set in
 `~/.profile`, Windows SDK 10.0.302 installed per-user (Windows had 10.0.300, which cannot satisfy
@@ -118,13 +122,25 @@ until that was fixed).
 
 ## 5. Known-not-working — do not chase these
 
-- **`pr-<n>` ids are daemon-global.** Two subscribed repos each with a PR #7 contend for one id.
-  Fails safe (second refused, first untouched). Fix in flight.
-- **Docker suites are not isolated between concurrent runs.** Not a product defect — CI is clean.
-  Fix in flight.
-- **`AgentRefWatcher` self-eviction** on any `Directory.Exists` failure. Fix in flight.
-- **External merge success toast** says "Merged agent/pr-7 into main". Cosmetic; refusals are
-  already correct. Fix in flight.
+**All four items previously listed here are now fixed and merged.** Kept as a record of what was
+open when this guide was written, because two of them turned out to be worse than their tickets:
+
+| was | now |
+|---|---|
+| `pr-<n>` ids daemon-global | fixed (#281) — and it exposed that the **kill switch would have thrown, with a jail left running** |
+| Docker suites not isolated between concurrent runs | fixed (#278) — two concurrent full runs now both hit 77/0/1 |
+| `AgentRefWatcher` self-eviction on any `Directory.Exists` failure | fixed (#279) |
+| external merge toast said "Merged agent/pr-7 into main" | fixed (#280) |
+
+### Still open, tracked, not blocking review
+
+- **Agents adopted at daemon boot are never ref-watched.** `WatchAgentRef` is only called from
+  `SandboxAgentLauncher.LaunchAsync`, so a jail that survives a daemon restart is adopted but never
+  watched. Not data loss — MG-3's "both" trigger degrades to verification-time fetch only — but
+  nothing reports it. Belongs in `SwarmReconciler`.
+- **`TerminalSessionManager`'s bind-pending set is still keyed by id alone.** Confined to terminal
+  attach for `external-pr` workers, which bind no CLI and whose terminals are locked read-only.
+  Documented rather than re-keyed, to keep the terminal subsystem out of that change's scope.
 
 ---
 
