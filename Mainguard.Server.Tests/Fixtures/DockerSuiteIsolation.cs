@@ -179,11 +179,14 @@ public sealed class DockerSuiteFixture : IDisposable
     {
         var lockPath = DockerSuiteLock.DefaultPath;
 
-        // Announced on BOTH streams, because a run that queues behind another one is otherwise
-        // indistinguishable from a hung run — and "the suite hangs at the first Docker test" is exactly
-        // the kind of unexplained symptom this change exists to stop costing people an investigation.
-        // vstest surfaces the test host's streams only in some configurations, so the wait is also
-        // readable after the fact from the lock file's own presence at the path named here.
+        // A run that queues behind another one is otherwise indistinguishable from a hung run, and "the
+        // suite hangs at the first Docker test" is exactly the kind of unexplained symptom this change
+        // exists to stop costing people an investigation. So it is announced — on BOTH streams, though
+        // be warned that `dotnet test` swallows the test host's stdout AND stderr (measured: neither
+        // line reaches the console under the VSTest runner). The reliable live answer to "is it waiting
+        // or wedged?" is therefore who holds the lock file named here: `fuser <path>` on Linux names the
+        // holding process, and the queued run's own wall time exceeding its reported test Duration is
+        // the same fact after the fact.
         Announce($"[docker-suite] waiting for exclusive use of the Docker daemon ({lockPath})…");
         _lock = DockerSuiteLock.Acquire(lockPath);
         Announce(
