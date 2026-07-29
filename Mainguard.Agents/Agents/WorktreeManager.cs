@@ -110,7 +110,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         _packageCaches = packageCaches;
         _agentRepos = new AgentRepoManager(_vmRoot);
         _refs = new AgentRefMediator(_agentRepos, BareRepoPathFor, OnPublishOutcome);
-        _watcher = new Lazy<AgentRefWatcher>(() => new AgentRefWatcher(_refs, _agentRepos));
+        // The warning sink is what keeps an eviction from the sweep visible: an agent that silently stops
+        // being watched still reaches the mirror at verification time, so nothing fails — the watcher
+        // half of design §7 just quietly stops, which is exactly the shape of failure MG-3 exists to
+        // avoid producing more of.
+        _watcher = new Lazy<AgentRefWatcher>(
+            () => new AgentRefWatcher(_refs, _agentRepos, interval: null, warningSink: _warningSink));
     }
 
     /// <summary>The G-17 audit type for a refused publish (MG-3).</summary>
