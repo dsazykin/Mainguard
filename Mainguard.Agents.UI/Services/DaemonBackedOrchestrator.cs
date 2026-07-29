@@ -475,9 +475,22 @@ public sealed class DaemonBackedOrchestrator :
 
                 var state = Enum.TryParse<WorkerMergeState>(entry.State, ignoreCase: true, out var s)
                     ? s : WorkerMergeState.Working;
+
+                // P2-11 step 4: the daemon's must-acknowledge items. This was hardcoded to an EMPTY list,
+                // which made the review surface structurally unable to show what was blocking a merge: the
+                // gate is daemon-side, the acknowledgment RPC is addressed by item id, and the only place
+                // an id could have come from was this projection. A blocked branch therefore rendered with
+                // no acknowledge control at all — the daemon refused the merge and the human had no way to
+                // clear it.
+                var flagged = entry.FlaggedItems.Count == 0
+                    ? Array.Empty<FlaggedItem>()
+                    : entry.FlaggedItems
+                        .Select(f => new FlaggedItem(f.Id, f.Path, f.Category, f.Fact, f.Acknowledged))
+                        .ToArray();
+
                 _queue.Add(new QueueEntry(
                     entry.AgentId, entry.AgentId, $"agent/{entry.AgentId}", state,
-                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: Array.Empty<FlaggedItem>()));
+                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
