@@ -57,12 +57,32 @@ public sealed class AgentSessionStore
         }
     }
 
-    public AgentSession Spawn(string kind, string role = "", string? parentAgentId = null)
+    /// <param name="agentId">
+    /// An explicit session id, or null for the usual minted GUID. The ONE caller that names its own id is
+    /// the external-PR intake, whose entries must be <c>pr-&lt;n&gt;</c>: that id is simultaneously the
+    /// worktree name, the <c>agent/pr-&lt;n&gt;</c> branch, the jail's <c>mainguard.agent</c> label, the
+    /// per-agent package-cache directory and the merge-queue key, so the id has to be derivable from the
+    /// pull request rather than minted. Before this the store could only mint GUIDs, which is why an
+    /// intake'd pull request could not be given a jail at all.
+    /// </param>
+    /// <exception cref="InvalidOperationException">
+    /// <paramref name="agentId"/> is already live. Deliberately loud rather than a silent overwrite:
+    /// replacing the record would drop the running jail's container id on the floor, leaking the
+    /// container, its MG-36 network segment and its package-cache lease with no way left to find them.
+    /// </exception>
+    public AgentSession Spawn(string kind, string role = "", string? parentAgentId = null, string? agentId = null)
     {
         var session = new AgentSession(
-            Guid.NewGuid().ToString("N"), kind, "Starting", Role: role ?? "", ParentAgentId: parentAgentId);
+            string.IsNullOrWhiteSpace(agentId) ? Guid.NewGuid().ToString("N") : agentId,
+            kind, "Starting", Role: role ?? "", ParentAgentId: parentAgentId);
         lock (_gate)
         {
+            if (_sessions.ContainsKey(session.Id))
+            {
+                throw new InvalidOperationException(
+                    $"An agent session with id '{session.Id}' is already live.");
+            }
+
             _sessions[session.Id] = session;
         }
 
