@@ -169,7 +169,7 @@ public sealed class AgentSpawnService
         // A CLI bind is expected (container start + docker-exec-under-PTY takes a few seconds). Mark it
         // NOW — before the slow launch — so an attach that races in while the agent is still "Starting"
         // waits for the bind instead of latching into echo. Cleared below if no CLI actually binds.
-        _binder.MarkBindPending(session.Id);
+        _binder.MarkBindPending(key);
         string? ipcDir = null;
         try
         {
@@ -229,7 +229,7 @@ public sealed class AgentSpawnService
             {
                 // Session-only (unprovisioned repo), a jail with no CLI, or a failed bind — no CLI will
                 // bind, so release the pending-bind flag: a terminal attach should echo now, not wait.
-                _binder.ClearBindPending(session.Id);
+                _binder.ClearBindPending(key);
             }
 
             if (role == AgentRoles.Managed)
@@ -257,10 +257,13 @@ public sealed class AgentSpawnService
 
             _store.Stop(key);
 
-            // The PTY binder, the coordinator IPC endpoint and the terminal input lock are still keyed by
-            // agent id ALONE. Now that two repos can hold one id, tearing them down unconditionally would
-            // sever the other repo's live session — so they go only once this stop has removed the LAST
-            // holder of the id.
+            // Repo-scoped, so it runs unconditionally: this spawn failed, so THIS session's attaches must
+            // stop waiting — and doing so can no longer reach another repo's `pr-7`.
+            _binder.ClearBindPending(key); // spawn failed → no bind coming; don't leave attaches waiting
+
+            // The coordinator IPC endpoint and the terminal input lock are still keyed by agent id ALONE.
+            // Now that two repos can hold one id, tearing them down unconditionally would sever the other
+            // repo's live session — so they go only once this stop has removed the LAST holder of the id.
             if (_store.FindAll(session.Id).Count == 0)
             {
                 if (ipcDir is not null)
@@ -268,7 +271,6 @@ public sealed class AgentSpawnService
                     _ipc.CloseEndpoint(session.Id);
                 }
 
-                _binder.ClearBindPending(session.Id); // spawn failed → no bind coming; don't leave attaches waiting
                 _locks.Unlock(session.Id);
             }
 
@@ -341,12 +343,17 @@ public sealed class AgentSpawnService
         var session = _store.Find(key);
         var stopped = _store.Stop(key);
 
-        // Id-keyed subsystems (see the spawn rollback above): released only when no session anywhere on
-        // the daemon still answers to this id, so stopping repo A's `pr-7` cannot unlock, unbind or
-        // un-endpoint repo B's.
+        // The terminal session is repo-keyed, so it is released unconditionally — and must be. Under the
+        // old last-holder-of-the-id guard, stopping repo A's `pr-7` while repo B ran one released NOTHING:
+        // repo A's CLI PTY, its replay ring and its pending-bind flag all leaked until repo B stopped too.
+        _binder.Release(key);
+
+        // Still-id-keyed subsystems (the SessionLeader PTY registry, the coordinator IPC endpoint, the
+        // terminal input lock): released only when no session anywhere on the daemon still answers to this
+        // id, so stopping repo A's `pr-7` cannot unlock, unregister or un-endpoint repo B's.
         if (_store.FindAll(agentId).Count == 0)
         {
-            _binder.Release(agentId);
+            _binder.ReleaseLeader(agentId);
             _ipc.CloseEndpoint(agentId);
             _locks.Unlock(agentId);
         }
