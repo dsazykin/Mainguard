@@ -98,33 +98,96 @@ distribution. The ordering was deliberate: it is now a build-property change, no
 
 ```bash
 dotnet build                              # 0 errors expected
-dotnet test Mainguard.Tests/Mainguard.Tests.csproj              # ~2860 pass
+dotnet test Mainguard.Tests/Mainguard.Tests.csproj              # 2883 pass
 dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj \
-  --filter "Category!=RequiresDocker"                            # ~358 pass
+  --filter "Category!=RequiresDocker"                            # 408 pass
 dotnet run --project Mainguard.Pro.App    # the Pro head (not the shell library)
 ```
 
-`RequiresDocker` (77 tests) needs Docker and **must be run alone** — those suites share
-host-global state (`~/mainguard`, fixed container names, host iptables). A fix for that is in
-flight. If you run it while something else uses Docker, expect false failures; that is the known
-tax, not a regression.
+`RequiresDocker` (~79 tests) needs Docker. **Concurrent runs are now safe** (#278): every
+`RequiresDocker` class joins a collection whose fixture takes a host-global, cross-process lock for
+the window its Docker tests run, so a second run queues rather than colliding. The resources
+themselves stay shared on purpose — the egress proxy is a singleton by design, and
+`mainguard-agents`/`mainguard-egress` are addressed by literal name from MG-7's resolver pin and
+MG-18's posture gate, so renaming them per run would switch those security gates off for the
+renamed topology. A pair of concurrent full runs takes roughly twice the wall clock of one; that
+gap is the queueing, not a hang.
 
 **Environment now working that was not before:** `git-lfs` installed, `MAINGUARD_LIBVTERM` set in
 `~/.profile`, Windows SDK 10.0.302 installed per-user (Windows had 10.0.300, which cannot satisfy
 `global.json`'s `10.0.301`/`latestPatch` pin — so **no Windows verification was possible at all**
 until that was fixed).
 
+**Both test suites now run against their own data root** (#287, #288). Before that, `Mainguard.Tests`
+was *unrunnable* — every Avalonia-headless harness hung on the migration lock — and both suites
+read and wrote the real `~/.mainguard`: the live `mainguard.db` and `config.json`, and from
+`Mainguard.Server.Tests` the daemon token, **the live mTLS identity** (`daemon-client.pfx` /
+`daemon-server.cer`), the plan and leader-session stores, and 13 fresh `agent-ipc/<id>/` socket
+directories per run (about 1,170 had accumulated). A run now leaves the real data root
+byte-identical; there is a test that fails if that stops being true.
+
+If you have a pre-#287 `~/.mainguard`, two bits of residue may remain: the orphaned
+`__EFMigrationsLock` row (cleared automatically on the next launch of a `phase2` build) and the
+accumulated `agent-ipc/` directories (harmless, ~9 MB, safe to delete).
+
 ---
 
 ## 5. Known-not-working — do not chase these
 
-- **`pr-<n>` ids are daemon-global.** Two subscribed repos each with a PR #7 contend for one id.
-  Fails safe (second refused, first untouched). Fix in flight.
-- **Docker suites are not isolated between concurrent runs.** Not a product defect — CI is clean.
-  Fix in flight.
-- **`AgentRefWatcher` self-eviction** on any `Directory.Exists` failure. Fix in flight.
-- **External merge success toast** says "Merged agent/pr-7 into main". Cosmetic; refusals are
-  already correct. Fix in flight.
+**All four items previously listed here are now fixed and merged.** Kept as a record of what was
+open when this guide was written, because two of them turned out to be worse than their tickets:
+
+| was | now |
+|---|---|
+| `pr-<n>` ids daemon-global | fixed (#281) — and it exposed that the **kill switch would have thrown, with a jail left running** |
+| Docker suites not isolated between concurrent runs | fixed (#278) — two concurrent full runs now both hit 77/0/1 |
+| `AgentRefWatcher` self-eviction on any `Directory.Exists` failure | fixed (#279) |
+| external merge toast said "Merged agent/pr-7 into main" | fixed (#280) |
+
+The two items this section listed as *still open* were then fixed as well (#284, #286), along with
+three more found while fixing them (#285, #287, #288). **The known-defect list is empty.**
+
+| was | now |
+|---|---|
+| agents adopted at daemon boot never ref-watched | fixed (#284) |
+| `TerminalSessionManager` keyed by agent id alone | fixed (#286) |
+| external-PR adopt path never watched the jail it adopted | fixed (#285) |
+| the test suite read and wrote the developer's real `~/.mainguard` | fixed (#287, #288) |
+| the desktop head hung forever on an orphaned `__EFMigrationsLock` row | fixed (#287) |
+
+### Read these two before you review anything else
+
+Both are cases where the *ticket* was wrong, not just the code — which is the useful thing to know
+about how this codebase fails.
+
+**1. The boot-adoption fix (#284) was nearly a no-op.** The ticket said "wire the adopt branch".
+But nothing in production `Upsert`s into the expected-agents table except the reconciler itself, and
+it is SQLite-backed: restart #1 adopts and writes a row, and **every restart after that** takes the
+already-expected `continue` path and is not an adoption at all. Fixing only the adopt branch would
+have looked applied and regressed on the second restart. The fix watches every live jail the pass
+*keeps*, on both branches. The same change found a second defect in that method — it keyed its diff
+on the agent label alone, so two repos each running `pr-7` made `ToDictionary` **throw** out of a
+fail-fast boot sequence: the daemon would not start.
+
+**2. The migration hang (#287) was not a lock.** The error message said *"Another Mainguard
+instance may be holding the database lock — close it and relaunch"* and that was a **guess, and
+wrong**. Nothing held an OS lock (`BEGIN IMMEDIATE` succeeded in 0.7 ms), no process was running,
+and there were zero pending migrations. The cause was one orphaned row in `__EFMigrationsLock`,
+which EF claims *before* checking for pending migrations and then polls for forever. "Close it and
+relaunch" cannot clear a row in a file. The daemon already had this fix; the desktop shell did not.
+
+Both belong to the pattern this project keeps producing: **something that looks applied but is
+not**, and **an error that asserts a cause it never checked**. When reviewing, treat any confident
+diagnostic message as an unverified claim until you see the check behind it.
+
+### Two judgment calls recorded, not resolved
+
+- **`DockerStdinRegressionGuardTests`** failed twice with `IOException: Cannot allocate memory`
+  under four concurrent test suites; passes on re-run and in CI. Recorded as environmental. That is
+  a judgment, not a proof — if it recurs without load, it deserves a ticket.
+- **The same key-collision class was fixed three times** (#281 session ids, #284 reconciler, #286
+  terminal sessions), each in a different subsystem, each found only by looking. A fourth site may
+  exist; nobody has swept for it.
 
 ---
 
