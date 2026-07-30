@@ -98,9 +98,9 @@ distribution. The ordering was deliberate: it is now a build-property change, no
 
 ```bash
 dotnet build                              # 0 errors expected
-dotnet test Mainguard.Tests/Mainguard.Tests.csproj              # ~2860 pass
+dotnet test Mainguard.Tests/Mainguard.Tests.csproj              # 2883 pass
 dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj \
-  --filter "Category!=RequiresDocker"                            # ~358 pass
+  --filter "Category!=RequiresDocker"                            # 408 pass
 dotnet run --project Mainguard.Pro.App    # the Pro head (not the shell library)
 ```
 
@@ -118,6 +118,18 @@ gap is the queueing, not a hang.
 `global.json`'s `10.0.301`/`latestPatch` pin — so **no Windows verification was possible at all**
 until that was fixed).
 
+**Both test suites now run against their own data root** (#287, #288). Before that, `Mainguard.Tests`
+was *unrunnable* — every Avalonia-headless harness hung on the migration lock — and both suites
+read and wrote the real `~/.mainguard`: the live `mainguard.db` and `config.json`, and from
+`Mainguard.Server.Tests` the daemon token, **the live mTLS identity** (`daemon-client.pfx` /
+`daemon-server.cer`), the plan and leader-session stores, and 13 fresh `agent-ipc/<id>/` socket
+directories per run (about 1,170 had accumulated). A run now leaves the real data root
+byte-identical; there is a test that fails if that stops being true.
+
+If you have a pre-#287 `~/.mainguard`, two bits of residue may remain: the orphaned
+`__EFMigrationsLock` row (cleared automatically on the next launch of a `phase2` build) and the
+accumulated `agent-ipc/` directories (harmless, ~9 MB, safe to delete).
+
 ---
 
 ## 5. Known-not-working — do not chase these
@@ -132,15 +144,50 @@ open when this guide was written, because two of them turned out to be worse tha
 | `AgentRefWatcher` self-eviction on any `Directory.Exists` failure | fixed (#279) |
 | external merge toast said "Merged agent/pr-7 into main" | fixed (#280) |
 
-### Still open, tracked, not blocking review
+The two items this section listed as *still open* were then fixed as well (#284, #286), along with
+three more found while fixing them (#285, #287, #288). **The known-defect list is empty.**
 
-- **Agents adopted at daemon boot are never ref-watched.** `WatchAgentRef` is only called from
-  `SandboxAgentLauncher.LaunchAsync`, so a jail that survives a daemon restart is adopted but never
-  watched. Not data loss — MG-3's "both" trigger degrades to verification-time fetch only — but
-  nothing reports it. Belongs in `SwarmReconciler`.
-- **`TerminalSessionManager`'s bind-pending set is still keyed by id alone.** Confined to terminal
-  attach for `external-pr` workers, which bind no CLI and whose terminals are locked read-only.
-  Documented rather than re-keyed, to keep the terminal subsystem out of that change's scope.
+| was | now |
+|---|---|
+| agents adopted at daemon boot never ref-watched | fixed (#284) |
+| `TerminalSessionManager` keyed by agent id alone | fixed (#286) |
+| external-PR adopt path never watched the jail it adopted | fixed (#285) |
+| the test suite read and wrote the developer's real `~/.mainguard` | fixed (#287, #288) |
+| the desktop head hung forever on an orphaned `__EFMigrationsLock` row | fixed (#287) |
+
+### Read these two before you review anything else
+
+Both are cases where the *ticket* was wrong, not just the code — which is the useful thing to know
+about how this codebase fails.
+
+**1. The boot-adoption fix (#284) was nearly a no-op.** The ticket said "wire the adopt branch".
+But nothing in production `Upsert`s into the expected-agents table except the reconciler itself, and
+it is SQLite-backed: restart #1 adopts and writes a row, and **every restart after that** takes the
+already-expected `continue` path and is not an adoption at all. Fixing only the adopt branch would
+have looked applied and regressed on the second restart. The fix watches every live jail the pass
+*keeps*, on both branches. The same change found a second defect in that method — it keyed its diff
+on the agent label alone, so two repos each running `pr-7` made `ToDictionary` **throw** out of a
+fail-fast boot sequence: the daemon would not start.
+
+**2. The migration hang (#287) was not a lock.** The error message said *"Another Mainguard
+instance may be holding the database lock — close it and relaunch"* and that was a **guess, and
+wrong**. Nothing held an OS lock (`BEGIN IMMEDIATE` succeeded in 0.7 ms), no process was running,
+and there were zero pending migrations. The cause was one orphaned row in `__EFMigrationsLock`,
+which EF claims *before* checking for pending migrations and then polls for forever. "Close it and
+relaunch" cannot clear a row in a file. The daemon already had this fix; the desktop shell did not.
+
+Both belong to the pattern this project keeps producing: **something that looks applied but is
+not**, and **an error that asserts a cause it never checked**. When reviewing, treat any confident
+diagnostic message as an unverified claim until you see the check behind it.
+
+### Two judgment calls recorded, not resolved
+
+- **`DockerStdinRegressionGuardTests`** failed twice with `IOException: Cannot allocate memory`
+  under four concurrent test suites; passes on re-run and in CI. Recorded as environmental. That is
+  a judgment, not a proof — if it recurs without load, it deserves a ticket.
+- **The same key-collision class was fixed three times** (#281 session ids, #284 reconciler, #286
+  terminal sessions), each in a different subsystem, each found only by looking. A fourth site may
+  exist; nobody has swept for it.
 
 ---
 
