@@ -63,6 +63,46 @@ public interface IAgentWorktreeManager
     void UnwatchAgentRef(string repoHash, string agentId) { }
 }
 
+/// <summary>
+/// MG-3 — the one best-effort wrapper around <see cref="IAgentWorktreeManager.WatchAgentRef"/>, for the
+/// paths that <b>take responsibility for a jail they did not spawn</b>.
+///
+/// <para><b>Why a shared helper rather than a call per site.</b> The spawn path
+/// (<c>SandboxAgentLauncher.LaunchAsync</c>) is the only place a watch starts as part of creating the
+/// agent; every OTHER way the daemon comes to own a live jail is an <i>adoption</i> — the boot
+/// <c>SwarmReconciler</c> keeping a survivor, the external-PR intake finding its <c>pr-&lt;n&gt;</c>
+/// container still up — and an adoption that skips this leaves the agent unwatched for the rest of its
+/// life. Nothing errors when it does: the pre-verification publish (design §7's other half) still carries
+/// the tip into the mirror whenever a verification happens to run, so the symptom is a review cockpit,
+/// merge-queue projection and stale cascade sitting on a tip the agent already moved past. Each site
+/// rolling its own <c>try</c> is how the second one got forgotten.</para>
+///
+/// <para><b>Best-effort by contract.</b> Both callers sit on paths where a throw is worse than a missed
+/// watch — the boot sequence is fail-fast (an exception here is a daemon that will not start) and the
+/// intake poll must survive one bad pull request. <c>Watch</c> is idempotent and keyed on
+/// <c>(repoHash, agentId)</c>, so calling it again on a later pass costs nothing and one repository's
+/// <c>pr-7</c> never stands in for another's.</para>
+/// </summary>
+public static class AgentRefWatchRegistration
+{
+    /// <summary>Registers <paramref name="agentId"/> in <paramref name="repoHash"/> with the MG-3 ref
+    /// sweep, swallowing any failure. Returns true when the watch was accepted — for callers that want to
+    /// log or assert it, never as something to branch the caller's own outcome on.</summary>
+    public static bool TryWatch(IAgentWorktreeManager worktrees, string repoHash, string agentId)
+    {
+        try
+        {
+            worktrees.WatchAgentRef(repoHash, agentId);
+            return true;
+        }
+        catch (Exception)
+        {
+            // The mirror still catches up at verification time; no caller may fail over the sweep.
+            return false;
+        }
+    }
+}
+
 /// <inheritdoc cref="IAgentWorktreeManager"/>
 public sealed class WorktreeManager : IAgentWorktreeManager
 {

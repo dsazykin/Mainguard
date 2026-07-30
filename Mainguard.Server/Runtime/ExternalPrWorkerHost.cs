@@ -50,9 +50,16 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
     private readonly AdmissionController _admission;
     private readonly CoordinatorLimits _limits;
     private readonly Func<string, string, string?> _resolveRunningJail;
+    private readonly IAgentWorktreeManager _worktrees;
     private readonly IAuditLog _audit;
     private readonly ILogger _log;
 
+    /// <param name="worktrees">
+    /// The substrate's worktree manager, held for ONE reason: the MG-3 ref sweep
+    /// (<see cref="AgentRefWatchRegistration.TryWatch"/>) that <see cref="EnsureWorkerAsync"/>'s adopt
+    /// branch has to start. Adoption bypasses <c>SandboxAgentLauncher.LaunchAsync</c>, which is where a
+    /// spawned agent's watch is registered, so without this an adopted worker is never swept.
+    /// </param>
     /// <param name="resolveRunningJail">
     /// (repoHash, agentId) → the container id of a RUNNING jail for that pair, read off the
     /// <c>mainguard.repo</c>/<c>mainguard.agent</c> labels — the same lookup the merge queue uses to
@@ -68,6 +75,7 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
         AdmissionController admission,
         CoordinatorLimits limits,
         Func<string, string, string?> resolveRunningJail,
+        IAgentWorktreeManager worktrees,
         IAuditLog audit,
         ILoggerFactory loggerFactory)
     {
@@ -77,6 +85,7 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
         _admission = admission ?? throw new ArgumentNullException(nameof(admission));
         _limits = limits ?? throw new ArgumentNullException(nameof(limits));
         _resolveRunningJail = resolveRunningJail ?? throw new ArgumentNullException(nameof(resolveRunningJail));
+        _worktrees = worktrees ?? throw new ArgumentNullException(nameof(worktrees));
         _audit = audit ?? throw new ArgumentNullException(nameof(audit));
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _log = loggerFactory.CreateLogger(DaemonLogCategories.Intake);
@@ -112,6 +121,25 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
         // verify without a respawn.
         if (_resolveRunningJail(repoHash, agentId) is { Length: > 0 })
         {
+            // MG-3. Adopting means taking over an agent whose watch was never started HERE, so the sweep
+            // has to be started HERE. `WatchAgentRef` is called in exactly two other places — the spawn
+            // path (LaunchAsync), which this branch is defined by not taking, and the boot SwarmReconciler.
+            // Neither answers for this one:
+            //
+            //   * boot's container listing is best-effort with NO retry (BuildContainerLister swallows an
+            //     unreachable Docker into an EMPTY list, and GatewayHostedService swallows the boot
+            //     failure so the daemon serves anyway). A daemon that starts before dockerd is ready
+            //     therefore reconciles nothing, watches nothing, and never sweeps again — while this poll
+            //     loop keeps running and adopts the very jails boot could not see;
+            //   * and boot only ever runs once, so it cannot answer for a jail adopted MID-life. That case
+            //     is reachable without any restart: StopAsync removes the session record BEFORE tearing
+            //     down, and TeardownAsync unwatches while swallowing a failed container removal — so a
+            //     release that half-fails leaves the container up, the session gone and the ref unwatched,
+            //     which is exactly the state the next poll adopts.
+            //
+            // Keyed on both labels, like the lookup immediately above: a bare `pr-7` is unique only inside
+            // a repository. Best-effort — one poll must never take the intake loop down over a sweep entry.
+            AgentRefWatchRegistration.TryWatch(_worktrees, repoHash, agentId);
             _log.LogInformation(
                 "external PR worker: adopting still-running jail agent={Agent} repo={Repo}", agentId, repoHash);
             return PrWorkerResult.AlreadyLive();

@@ -148,7 +148,11 @@ public sealed class AgentCliBinder
         var agentId = spec.AgentId;
         Func<bool>? isInputLocked = locks is null ? null : () => locks.IsLocked(agentId);
         var bound = new BoundTerminalSession(spec.AgentId, session, _engine, DefaultCols, DefaultRows, isInputLocked);
-        _terminals.Bind(spec.AgentId, bound);
+        // (repo, agent id), never the id alone: an intake-named `pr-<n>` is unique only inside a repo, and
+        // Bind DISPOSES whatever it replaces — id-only keying let this bind kill another repository's
+        // still-running worker CLI.
+        var key = new AgentSessionKey(spec.RepoHash, spec.AgentId);
+        _terminals.Bind(key, bound);
         _log.LogInformation(
             "cli bound agent={Agent} container={Container} engine={Engine}",
             spec.AgentId, spec.ContainerId, _engine.Engine);
@@ -165,32 +169,43 @@ public sealed class AgentCliBinder
             ["container_id"] = spec.ContainerId,
         }));
 
-        _ = WatchExitAsync(spec.AgentId, bound);
+        _ = WatchExitAsync(key, bound);
         return true;
     }
 
-    /// <summary>Kills + unregisters the agent's CLI session (StopAgent / teardown). Idempotent.</summary>
-    public void Release(string agentId)
+    /// <summary>Kills + unregisters this session's CLI (StopAgent / teardown). Idempotent. Repo-scoped, so
+    /// stopping repo A's <c>pr-7</c> leaves repo B's <c>pr-7</c> terminal alone — and, unlike the previous
+    /// id-keyed shape, actually releases repo A's rather than skipping the teardown while a second holder
+    /// of the id exists.
+    ///
+    /// <para><see cref="SessionLeader"/> is still keyed by agent id alone, so its kill stays id-only; it is
+    /// guarded by the caller's last-holder-of-the-id check in <see cref="AgentSpawnService"/>.</para></summary>
+    public void Release(AgentSessionKey key)
     {
-        _leader.Kill(agentId);
-        _terminals.Release(agentId);
-        _terminals.ClearBindPending(agentId); // torn down before it bound → no attach should keep waiting
+        _terminals.Release(key);
+        _terminals.ClearBindPending(key); // torn down before it bound → no attach should keep waiting
     }
 
-    /// <summary>Marks that a CLI bind is expected for <paramref name="agentId"/> (spawn in-flight) so an
+    /// <summary>The id-keyed half of a release: the <see cref="SessionLeader"/> PTY registry entry. Split
+    /// out because the leader has no repo in its key, so the caller must only reach it once NO session
+    /// anywhere on the daemon still answers to the id.</summary>
+    public void ReleaseLeader(string agentId) => _leader.Kill(agentId);
+
+    /// <summary>Marks that a CLI bind is expected for this session (spawn in-flight) so an
     /// early attach waits for it instead of falling into echo — the attach-before-bind race. Cleared by a
     /// successful <see cref="TryBind"/> or by <see cref="ClearBindPending"/> on a session-only/failed spawn.</summary>
-    public void MarkBindPending(string agentId) => _terminals.MarkBindPending(agentId);
+    public void MarkBindPending(AgentSessionKey key) => _terminals.MarkBindPending(key);
 
     /// <summary>Clears the pending-bind flag (no CLI will bind for this agent — an attach should echo).</summary>
-    public void ClearBindPending(string agentId) => _terminals.ClearBindPending(agentId);
+    public void ClearBindPending(AgentSessionKey key) => _terminals.ClearBindPending(key);
 
     /// <summary>Cap on the last-output tail carried into the death reason/audit — enough to name
     /// the cause ("the input device is not a TTY", "Not logged in …", a stack-trace head).</summary>
     internal const int ExitTailChars = 400;
 
-    private async Task WatchExitAsync(string agentId, BoundTerminalSession bound)
+    private async Task WatchExitAsync(AgentSessionKey key, BoundTerminalSession bound)
     {
+        var agentId = key.AgentId;
         int exitCode;
         try
         {
@@ -201,8 +216,10 @@ public sealed class AgentCliBinder
             exitCode = -1;
         }
 
-        // Only reflect a natural CLI exit; a Release/Stop already removed the session record.
-        if (_terminals.TryGetBound(agentId) is not null)
+        // Only reflect a natural CLI exit; a Release/Stop already removed the session record. Checked
+        // against THIS session's key: id-only, another repo's live `pr-7` answered here for a session that
+        // had already been released, so a stopped agent got a spurious Dead-with-tail broadcast.
+        if (_terminals.TryGetBound(key) is not null)
         {
             // The CLI's dying words (from the replay ring) are the diagnosis — a bare exit code
             // told the field NOTHING when the coordinator died at launch. They go to the audit
@@ -216,7 +233,10 @@ public sealed class AgentCliBinder
                 ["exit_code"] = exitCode.ToString(System.Globalization.CultureInfo.InvariantCulture),
                 ["output_tail"] = tail,
             }));
-            _store.MarkState(agentId, "Dead",
+            // Keyed, not id-only: the id-only MarkState is a documented no-op when two repos hold the id,
+            // so a `pr-7` CLI dying in either repo used to change no state at all — the card stayed
+            // "Working" over a dead CLI. With the key in hand the right session is marked every time.
+            _store.MarkState(key, "Dead",
                 tail.Length > 0 ? $"CLI exited ({exitCode}): {tail}" : $"CLI exited ({exitCode}).");
         }
     }

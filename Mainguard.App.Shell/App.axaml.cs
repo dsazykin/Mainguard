@@ -101,22 +101,32 @@ public partial class App : Application
         ViewLocator.ViewAssemblies = ComposeViewAssemblies(Edition);
 
         // Ensure SQLite database is created and migrations are applied. This runs before any window
-        // exists, so a bare Migrate() that blocks on a locked database would leave a windowless,
-        // dead-looking process (see the single-instance guard in ShellEntryPoint). Bound it: if the DB is
-        // held by something else we fail loudly and fast instead of hanging invisibly forever.
+        // exists, so a bare Migrate() that blocks would leave a windowless, dead-looking process (see the
+        // single-instance guard in ShellEntryPoint). The block is not hypothetical, and it is not the
+        // OS-level lock this comment used to assume: EF Core claims a row in __EFMigrationsLock before it
+        // even checks for pending migrations and then polls for it forever, so a head killed mid-migration
+        // wedges EVERY later launch with nothing running. The daemon already fixed this on its own database
+        // (GatewayServiceRegistration.TryPrepareDatabase); the shell does the same now — clear the orphaned
+        // row (safe: we hold the single-instance mutex, so this process is the only writer), then migrate
+        // under a watchdog that, if it still fires, LOOKS at the database instead of guessing at a cause.
+        var migrationTimeout = TimeSpan.FromSeconds(20);
+        var databasePath = "(unresolved)";
         try
         {
+            // Inside the try: an unresolvable data root throws with its own named remedy, and that
+            // message deserves the same console line as any other migration failure.
+            databasePath = Path.Combine(MainguardPaths.DataRoot(), AppDbContext.DatabaseFileName);
+            MigrationLock.TryClearOrphanedLock(databasePath);
+
             var migration = System.Threading.Tasks.Task.Run(() =>
             {
                 using var dbContext = new AppDbContext();
                 dbContext.Database.Migrate();
             });
 
-            if (!migration.Wait(TimeSpan.FromSeconds(20)))
+            if (!migration.Wait(migrationTimeout))
             {
-                throw new TimeoutException(
-                    "Timed out applying database migrations. Another Mainguard instance may be holding "
-                    + "the database lock — close it and relaunch.");
+                throw new TimeoutException(MigrationLock.DescribeStall(databasePath, migrationTimeout));
             }
 
             // Re-throw any exception the migration task captured on this thread.

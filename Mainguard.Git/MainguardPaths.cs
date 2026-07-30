@@ -24,6 +24,15 @@ namespace Mainguard.Git;
 /// <para><b>Locations:</b> <c>%LocalAppData%\Mainguard</c> on Windows; <c>~/.mainguard</c> elsewhere
 /// (the same directory that holds <c>daemon.token</c> — one place to look in the VM). The in-VM daemon
 /// identity is <c>/home/mainguard/.mainguard</c> (the systemd unit's <c>Environment=HOME</c>).</para>
+///
+/// <para><b>Relocation seam:</b> <c>MAINGUARD_DATA_ROOT</c> (see <see cref="DataRootOverrideVariable"/>)
+/// replaces the resolved root wholesale, for contexts that must not read or write the real user's data —
+/// principally the test suites, which set it once per run to a throwaway directory
+/// (<c>Mainguard.Tests/TestDataRootIsolation.cs</c>). Unset in normal use, so shipping behaviour is
+/// unchanged. It is deliberately an environment variable rather than a static property: the value must
+/// reach spawned child processes (a head, the daemon, the scripted-agent harness) too, and a static could
+/// not. The value must be an ABSOLUTE path — a relative one is rejected loudly, because "relative data
+/// root" is precisely the bug class this type exists to prevent.</para>
 /// </summary>
 public static class MainguardPaths
 {
@@ -31,12 +40,44 @@ public static class MainguardPaths
     private const string WindowsFolder = "Mainguard";
 
     /// <summary>
+    /// Environment variable that relocates <see cref="DataRoot"/> wholesale. Set by the test suites to a
+    /// per-run temp directory so no test reads or writes <c>~/.mainguard</c>; unset in shipping use.
+    /// </summary>
+    public const string DataRootOverrideVariable = "MAINGUARD_DATA_ROOT";
+
+    /// <summary>
     /// Mainguard's per-user data root. Always absolute; never verified-to-exist (callers create what
-    /// they need). Throws <see cref="InvalidOperationException"/> with an actionable message when
-    /// the base cannot be resolved — a service context must set <c>HOME</c> (or run as a user with
-    /// a passwd entry) rather than let a relative path escape.
+    /// they need). Honours the <see cref="DataRootOverrideVariable"/> relocation seam when set. Throws
+    /// <see cref="InvalidOperationException"/> with an actionable message when the base cannot be
+    /// resolved — a service context must set <c>HOME</c> (or run as a user with a passwd entry) rather
+    /// than let a relative path escape.
     /// </summary>
     public static string DataRoot()
+    {
+        var overridden = Environment.GetEnvironmentVariable(DataRootOverrideVariable);
+        if (!string.IsNullOrWhiteSpace(overridden))
+        {
+            overridden = overridden.Trim();
+            if (!Path.IsPathRooted(overridden))
+            {
+                throw new InvalidOperationException(
+                    $"{DataRootOverrideVariable} must be an absolute path — a relative data root resolves "
+                    + "against the process working directory, which is the crash-loop bug class this type "
+                    + $"exists to prevent. (Value: '{overridden}'.)");
+            }
+
+            return Path.GetFullPath(overridden);
+        }
+
+        return RealUserDataRoot();
+    }
+
+    /// <summary>
+    /// The data root Mainguard would use with no relocation in effect — i.e. the REAL per-user root. Only
+    /// interesting to the isolation guard test, which asserts the running suite is not pointed at it; no
+    /// shipping caller should prefer this over <see cref="DataRoot"/>.
+    /// </summary>
+    public static string RealUserDataRoot()
     {
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
