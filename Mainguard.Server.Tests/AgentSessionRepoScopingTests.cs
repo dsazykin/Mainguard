@@ -357,6 +357,7 @@ public sealed class AgentSessionRepoScopingTests
                 // No container runtime in this tier: every "already live" answer must come from the
                 // session store, so the store is what these tests actually measure.
                 resolveRunningJail: (_, _) => null,
+                worktrees: Environment.Worktrees,
                 audit: _host.Services.GetRequiredService<IAuditLog>(),
                 loggerFactory: NullLoggerFactory.Instance);
         }
