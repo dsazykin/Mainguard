@@ -224,6 +224,9 @@ public static class GatewayServiceRegistration
             admission: sp.GetRequiredService<AdmissionController>(),
             limits: sp.GetRequiredService<CoordinatorLimits>(),
             resolveRunningJail: ResolveRunningJail,
+            // The SAME worktree manager the boot reconciler watches through (above) — one MG-3 sweep, so
+            // an adopted `pr-<n>` is registered in the same set a spawned agent's watch lands in.
+            worktrees: sp.GetRequiredService<IAgentEnvironment>().Worktrees,
             audit: sp.GetRequiredService<IAuditLog>(),
             loggerFactory: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()));
 

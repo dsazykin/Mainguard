@@ -178,19 +178,12 @@ public sealed class SwarmReconciler
     ///
     /// <para>Best-effort, exactly like <see cref="TryPruneWorktree"/> — the boot sequence is fail-fast, so
     /// an exception from registering a sweep entry would turn housekeeping into a daemon that will not
-    /// start. <c>Watch</c> is idempotent, so a repeat pass costs nothing.</para>
+    /// start. That swallow now lives in <see cref="AgentRefWatchRegistration.TryWatch"/>, shared with the
+    /// external-PR intake's adopt path, which is the OTHER way the daemon takes over a jail it did not
+    /// spawn. <c>Watch</c> is idempotent, so a repeat pass costs nothing.</para>
     /// </summary>
-    private void TryWatchAgentRef(AgentContainerState container)
-    {
-        try
-        {
-            _worktrees.WatchAgentRef(container.RepoHash, container.AgentId);
-        }
-        catch (Exception)
-        {
-            // The mirror still catches up at verification time; boot must not fail over the sweep.
-        }
-    }
+    private void TryWatchAgentRef(AgentContainerState container) =>
+        AgentRefWatchRegistration.TryWatch(_worktrees, container.RepoHash, container.AgentId);
 
     private void TryPruneWorktree(string repoHash, string agentId)
     {
