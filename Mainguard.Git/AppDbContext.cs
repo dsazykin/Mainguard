@@ -8,6 +8,11 @@ namespace Mainguard.Git;
 
 public class AppDbContext : DbContext
 {
+    /// <summary>The SQLite file name under <see cref="MainguardPaths.DataRoot"/>. Named once so callers
+    /// that must talk about the default database (the startup watchdog's stall diagnosis) cannot drift
+    /// from the file this context actually opens.</summary>
+    public const string DatabaseFileName = "mainguard.db";
+
     private readonly string? _dbPath;
 
     public DbSet<WorkspaceCategory> WorkspaceCategories { get; set; } = null!;
@@ -29,7 +34,7 @@ public class AppDbContext : DbContext
     {
         // MainguardPaths, not GetFolderPath: the latter returns "" on Unix for a not-yet-materialized
         // home subdir, silently producing a relative DB path (the mainguardd crash-loop class of bug).
-        _dbPath = Path.Combine(MainguardPaths.DataRoot(), "mainguard.db");
+        _dbPath = Path.Combine(MainguardPaths.DataRoot(), DatabaseFileName);
     }
 
     public AppDbContext(string dbPath)
@@ -45,7 +50,7 @@ public class AppDbContext : DbContext
     {
         if (!optionsBuilder.IsConfigured)
         {
-            var dbPath = _dbPath ?? Path.Combine(MainguardPaths.DataRoot(), "mainguard.db");
+            var dbPath = _dbPath ?? Path.Combine(MainguardPaths.DataRoot(), DatabaseFileName);
             var directory = Path.GetDirectoryName(dbPath);
             if (!string.IsNullOrEmpty(directory))
             {
