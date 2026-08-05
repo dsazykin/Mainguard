@@ -537,6 +537,19 @@
   - **`BoundGridSessionTests.cs`** — the same through the REAL `BoundTerminalSession` pump: atomic
     snapshot+deltas mirror a scripted CLI, OSC 52 clipboard frames (queries never), raw subscribers +
     `TailText` intact alongside the engine, resize → PTY+vterm+snapshot, `GetScrollback`.
+- **`Mainguard.Server.Tests/CliLoginHarvestWiringTests.cs`** — the **caller** of the CLI-login
+  harvest, which is what was missing: `DaemonBackedOrchestrator.PersistLiveAgentLoginsAsync` had no
+  callers anywhere in the repo, so only an explicit in-app Stop ever wrote a `cli_login_*` keychain
+  entry and every other teardown (app close, daemon/VM restart, crash) lost the login. Both new legs
+  are asserted through the SHIPPED orchestrator against the real in-proc daemon and the real
+  `HarvestAgentCredentials` RPC, and **neither test calls `PersistLiveAgentLoginsAsync` itself** — that
+  would recreate the exact blind spot. `StartedOrchestrator_SweepsALiveAgentsLogin_IntoTheHostKeychain`
+  drives the periodic pump (200 ms interval) and asserts the harvested bytes land in the injected
+  keychain; `Dispose_HarvestsOneLastTime_SoClosingTheAppKeepsTheLogin` sets a 30-minute interval so the
+  vault can only be written by the shutdown sweep. The rig is Docker-free: a fake substrate whose
+  sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
+  login bytes, and only for the path the temp install marker declares. The real-jail leg is
+  `Agents/CliLoginRoundTripDockerTests.cs`.
 - **`Mainguard.Server.Tests/MergeExecutionPathTests.cs`** — the GUI Merge button actually merges,
   end to end through the real composition (in-proc daemon + shipped `DaemonClient` + shipped
   `DaemonBackedOrchestrator` + a real git repo on disk). **Asserts repository state, never RPC
@@ -1095,7 +1108,16 @@
   a stale or coincidentally-0400 file cannot satisfy it. A third test pins the *reason* the archive
   API is unusable by asserting Docker really does refuse `ExtractArchiveToContainerAsync` into the
   read-only-rootfs jail — if that ever starts passing, the transport can be revisited),
-  `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
+  **`Agents/CliLoginRoundTripDockerTests.cs`** (`[RequiresDockerFact]` — the **CLI-login round-trip**
+  end to end against real jails: a per-run nonce is written into jail #1's tmpfs `$HOME` at the one
+  path a temp install marker DECLARES, `SandboxAgentLauncher.HarvestCliCredentialsAsync` reads it back
+  out, `CliLoginVault.MergeAndSerialize` produces the exact string the OS keychain would hold, jail #1
+  is removed (the tmpfs dies with it), and a FRESH jail spawned with those restored files is probed
+  with a sentinel-framed `cat`. Docker rather than a fake because all three hops — the tmpfs overlay,
+  the harvest exec running as the agent uid against a 0600 file, and the exec-stdin restore that
+  `docker cp` cannot do (it writes UNDER the tmpfs and reports success) — are invisible to a fake
+  engine. The CALLER that drives this in the shipped app is pinned separately by
+  `CliLoginHarvestWiringTests`), `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
   proceeds to the engine; a missing `mainguard-agent-base`/`mainguard-egress-proxy` answers
   `FailedPrecondition` naming exactly that image + the repair BEFORE any worktree/jail work — the
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
