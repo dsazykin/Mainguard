@@ -117,6 +117,20 @@ public sealed class WorkerPlanGate : IMergeGate
     /// Releases the withheld task prompt — <b>only</b> when this worker holds an approved plan. Returns
     /// false and yields nothing otherwise; there is no override parameter, because an override is how a
     /// gate becomes decorative.
+    ///
+    /// <para><b>Idempotent, and the two halves of that word are load-bearing in opposite directions.</b>
+    /// This is called more than once by design: <c>mainguard-plan await &lt;id&gt;</c> is the documented
+    /// re-attach after a worker crash or a daemon restart, and the daemon answers it by asking the gate
+    /// again. So a repeat call must keep <b>answering</b> the same — a re-attached worker that holds an
+    /// approved plan and gets an empty prompt back is stranded with no way to learn its task. But the
+    /// <b>side effects</b> of the release happen exactly once: the <c>worker_task_released</c> audit record
+    /// exists to prove this gate authorised this worker's task one time, and a second copy of it is not
+    /// extra evidence but corrupted evidence; and <see cref="TaskReleased"/> is the daemon's instruction to
+    /// deliver, so firing it twice is the same task handed out twice.</para>
+    ///
+    /// <para>The once-only decision is made <i>under the lock</i>, not by a read-then-write around it: the
+    /// racing-callers case is exactly the one the re-attach path produces (a reconnecting worker while the
+    /// approval is still landing), and a check-then-act there lets every racer believe it won.</para>
     /// </summary>
     public bool TryReleaseTask(string workerAgentId, out string taskPrompt)
     {
@@ -131,6 +145,7 @@ public sealed class WorkerPlanGate : IMergeGate
             return false;
         }
 
+        bool isFirstRelease;
         lock (_gate)
         {
             if (!_held.TryGetValue(workerAgentId, out var task))
@@ -139,7 +154,17 @@ public sealed class WorkerPlanGate : IMergeGate
             }
 
             taskPrompt = task.TaskPrompt;
-            _held[workerAgentId] = task with { Released = true };
+            isFirstRelease = !task.Released;
+            if (isFirstRelease)
+            {
+                _held[workerAgentId] = task with { Released = true };
+            }
+        }
+
+        if (!isFirstRelease)
+        {
+            // Already handed over. Answer truthfully, record nothing, announce nothing.
+            return true;
         }
 
         _audit.Append(new AuditEvent("worker_task_released", new Dictionary<string, string>

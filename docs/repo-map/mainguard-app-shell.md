@@ -534,8 +534,12 @@
     produce another plan; an `EscalatedPlanViewModel` card has **deliberately no buttons** — the loop is
     over and the next move is the human's; and `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
     the daemon's stall line, since a coordinator that has quietly stopped spawning is indistinguishable
-    from a hang. Built entirely from existing theme tokens — a warning and a stop are things the design
-    system already has words for), `AgentDocumentViewModel` +
+    from a hang. Both decisions run through one `PlanCardViewModel.DecideAsync` that resets `IsDeciding` in
+    a `finally` and reports a failure in `DecisionErrorText`/`HasDecisionError`: this gate is *blocking*, so
+    a card that latched its buttons disabled — on a throw, or on a decision that returned while the plan
+    stayed pending with the same id/revision and `Refresh` therefore kept the same instance mounted — took
+    away the operator's only means of clearing backpressure. Built entirely from existing theme tokens — a
+    warning, a stop and a failure are things the design system already has words for), `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
     Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
@@ -729,7 +733,10 @@
     than re-deriving them — a client-side count can disagree with the number that actually refuses the
     coordinator. `SubmitPlanDecisionAsync`'s rejection reason is now the worker's feedback; an empty one
     is sent as an explicit "rejected without written feedback" rather than a silent blank, because it
-    costs a round of the revision budget either way. `CreateBundle()` is the shipped-app factory
+    costs a round of the revision budget either way — and it **propagates a failure** instead of the
+    blanket `catch (Exception) {}` it used to end in: that swallow made a decision which never reached the
+    daemon indistinguishable from one that landed, so the panel could not tell the human their approval was
+    lost while the worker stayed blocked. `CreateBundle()` is the shipped-app factory
     (`OrchestratorServices` over a loopback `DaemonClient`). **PR3:** it also implements `ICliAgentHost`
     — `ListInstalledClisAsync` (the `ListInstalledAdapters` RPC), `StartCoordinatorAsync` (keystore key
     resolved via `ApiKeyProviderMap` from the adapter's declared env-var name — no provider mapping

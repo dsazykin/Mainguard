@@ -742,7 +742,17 @@
   escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
   a branch that verified GREEN**, the paired negative that agents the gate never held are NOT blocked,
   and the backpressure text — including a negative that refuses to claim a saturated cap when there is
-  headroom),
+  headroom, plus the **release-exactly-once** pair: a repeat `TryReleaseTask` still hands back the task —
+  `mainguard-plan await <id>` is the documented crash re-attach, and answering it with an empty prompt
+  would strand a worker holding an approved plan — while auditing `worker_task_released` and raising
+  `TaskReleased` only on the first call, asserted sequentially and under 25 rounds of 32 racing threads),
+  **`CoordinatorPlanDecisionTests`** (phase 2 — the human half of the same gate: Approve/Reject must never
+  latch disabled, since the blocked worker on the card holds its jail and its slot against the worker cap
+  and the click is the only thing that clears it. Covers the decision throwing, the decision returning
+  while the plan stays pending with the same id/revision — the case where `Refresh` keeps the *same*
+  `PlanCardViewModel` mounted — the card naming a failure instead of reverting silently, a successful retry
+  clearing the stale message, and the shipped `DaemonBackedOrchestrator` **propagating** a failed decision
+  rather than swallowing it),
   `KillSwitchTests` (`FanOutUnder5s`+snapshot+frozen; the **RT-D4 `HardCeiling_IndependentOfRtt`**
   clamp with the A3 spike; the **SA-1/F4 `FreezesQueueBeforeFanOut`** timeline; the **RT-D3
   audit-outage→recovery `killswitch_audit_gap`**), and `Integration/ScriptedCoordinatorEndToEndTests`

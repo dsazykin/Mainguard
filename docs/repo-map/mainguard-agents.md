@@ -992,7 +992,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
       a spawned worker's task **without giving it to the worker**; `TryReleaseTask` yields it only against
-      an approved plan (no override parameter — an override is how a gate becomes decorative); `MayWork` /
+      an approved plan (no override parameter — an override is how a gate becomes decorative) and is
+      **idempotent in both directions**: it keeps answering with the task on a repeat call, because
+      `mainguard-plan await <id>` is the documented re-attach after a worker crash or daemon restart and an
+      empty prompt there strands a worker holding an approved plan — while the audit record and the
+      `TaskReleased` event fire exactly once, decided under the gate's lock so racing callers cannot both
+      win (a second `TaskReleased` is the same task handed out twice); `MayWork` /
       `MayReceivePrompt` / `MayRequestVerification` deny steering and verification at the gate; and the
       type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
       approved cannot merge even if it verified green. Also owns the legible-stall text —
