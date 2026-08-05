@@ -152,6 +152,17 @@ public static class ProDesktopHost
         if (ProComposition.Settings?.Current.StopVmOnExit != true)
             return;
 
+        // Same veto the visualized shutdown applies (AppShutdownSequence): never terminate the distro
+        // while a sandbox-image build is running in it. Repeated here because this backstop can fire on
+        // a path that never reaches the sequence (OS logoff), and it is the terminate — not which code
+        // called it — that kills the build.
+        if (SandboxImageProvisioningTracker.Shared.IsProvisioning)
+        {
+            ProComposition.LogOobe("exit backstop: a sandbox image build is still running — leaving "
+                + "MainguardEnv up (StopVmOnExit skipped)");
+            return;
+        }
+
         StopVmScopedAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 

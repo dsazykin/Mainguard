@@ -18,6 +18,19 @@ public sealed record SandboxImagePreflightProblem(string ImageRef, bool Stale);
 /// repair, so the failure is one actionable <c>FailedPrecondition</c> regardless of whether the
 /// agent-base or the egress-proxy image is the culprit (the latter previously surfaced as an opaque
 /// create failure inside the egress setup).
+///
+/// <para><b>What this message must not do (field failure 2026-08-05).</b> It previously told the user
+/// to "restart Mainguard and wait for the 'Sandbox images installed' notice", and offered a manual
+/// <c>docker build</c> fallback. Every clause of that was wrong in a way that cost the user an hour:
+/// restarting ENDED the in-flight build (the exit path terminated the distro out from under it — see
+/// <c>AppShutdownSequence</c> — which is what kept the images stale across every attempt);
+/// a stale image's notice reads "updated", never "installed", so the notice named here could not
+/// appear; the fallback's <c>&lt;Mainguard dir&gt;/payload/images/</c> path does not exist inside the
+/// distro (the sources live on the Windows side, reached via <c>/mnt/…</c>); and the command omitted
+/// <c>--label mainguard.image.version=&lt;hash&gt;</c>, so even run against the right path it produced an
+/// unlabelled image that the very next probe re-rejects as stale. A manual command that cannot
+/// succeed is worse than no manual command, so there is none: this message now names only what was
+/// actually checked and the repairs that actually run.</para>
 /// </summary>
 public class SandboxImageMissingException : MainguardException
 {
@@ -50,8 +63,10 @@ public class SandboxImageMissingException : MainguardException
         }
 
         return $"Mainguard OS sandbox image(s) need provisioning ({string.Join("; ", parts)}). Mainguard "
-            + "installs and updates these at startup — restart Mainguard and wait for the 'Sandbox images "
-            + "installed' notice, or use Tools → Rebuild sandbox images. Manual fallback: "
-            + "wsl -d MainguardEnv -- docker build -t <image>:latest <Mainguard dir>/payload/images/<image>.";
+            + "builds these inside Mainguard OS automatically — it starts after launch and takes several "
+            + "minutes per image. Leave Mainguard running until the 'Sandbox images installed/updated' "
+            + "notice appears — an interrupted build starts over from the beginning. You can also start "
+            + "it from Tools → Rebuild sandbox images. If it keeps failing, the per-step build output and "
+            + "the docker error are in oobe.log.";
     }
 }

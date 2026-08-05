@@ -62,8 +62,17 @@ public sealed class ProToolsSurface : IProToolsSurface
         // Per-step build/load lines go to oobe.log; the final Installed/Updated/InstallFailed toast is
         // published by the installer's outcome sink (single-sourced with the startup path).
         var progress = new System.Progress<string>(line => ProComposition.LogOobe($"sandbox images (rebuild): {line}"));
-        _ = Task.Run(() =>
-            ProComposition.RebuildSandboxImages?.Invoke(ProComposition.LogOobe, progress, true) ?? Task.CompletedTask);
+
+        // Through the shared tracker, so this repair cannot start a second docker build on top of the
+        // startup auto-provision (the user did exactly that on 2026-08-05: two concurrent builds of
+        // mainguard-agent-base:latest, both then killed by the VM terminate on exit). If a run is
+        // already in flight it IS this rebuild's work — the same images from the same sources — so
+        // joining it satisfies the request without a rival build.
+        _ = Mainguard.Agents.Agents.Bootstrap.SandboxImageProvisioningTracker.Shared.RunExclusiveAsync(
+            () => ProComposition.RebuildSandboxImages?.Invoke(ProComposition.LogOobe, progress, true)
+                  ?? Task.CompletedTask,
+            onJoinedExisting: () => ProComposition.LogOobe(
+                "sandbox images (rebuild): a build is already running — joined it instead of starting a second"));
         return Task.CompletedTask;
     }
 }

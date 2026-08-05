@@ -446,7 +446,15 @@
     quieter is toast-silent), `SandboxImageProvisionerTests` (v1 sandbox-image provisioning over a fake
     `IWslRunner`: probe parsing, exact distro-scoped `/mnt`-translated build argv + G-12 proof,
     serialized builds, per-image failure isolation, missing-sources skips, the auto-provision
-    outcome/toast policy), `VmUpgradeOrchestratorTests` (the tier-2 in-place VM upgrade:
+    outcome/toast policy), `SandboxImageProvisioningTrackerTests` (the 2026-08-05 auto-provisioning fix:
+    the tracker's in-flight state, a second request JOINING the run already going instead of starting a
+    rival `docker build` of the same tag, a faulted run not wedging the gate — plus
+    `SandboxImageMissingMessageTests`, which pins the spawn-preflight banner to only what was actually
+    checked: no manual `docker build` fallback (the old one named an in-distro path that does not exist
+    AND omitted `--label mainguard.image.version`, so an image built by it was re-rejected as stale
+    immediately), no "restart Mainguard" advice (restarting CANCELS the in-flight build — the reason the
+    images stayed stale through every attempt), and no promise of an "installed" notice a stale image
+    never emits), `VmUpgradeOrchestratorTests` (the tier-2 in-place VM upgrade:
     `VmUpgradePolicy` older/equal/newer/garbage — installed-newer is NEVER offered a downgrade — the
     `MainguardOsReleaseStamp` parser, the new staging-scoped/tar-transport builders' exact argv,
     `VmUpgradeCheck` (daemon answer → in-distro `/etc/mainguardos-release` fallback → unknown = no

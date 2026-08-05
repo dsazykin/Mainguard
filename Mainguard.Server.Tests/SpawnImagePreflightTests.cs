@@ -62,8 +62,15 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
 
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
         Assert.Contains("mainguard-agent-base", ex.Status.Detail);
-        Assert.Contains("restart Mainguard", ex.Status.Detail);
-        Assert.Contains("docker build", ex.Status.Detail);
+
+        // The repair the banner names must be one that WORKS. It used to say "restart Mainguard" and
+        // offer a manual `docker build`; both were actively wrong (restarting cancels the in-flight
+        // build, and the command named a path absent inside the distro while omitting the version
+        // label), so the message now points at leaving the app running and Tools → Rebuild instead.
+        // Full wording is pinned in Mainguard.Tests/SandboxImageProvisioningTrackerTests.cs.
+        Assert.Contains("Leave Mainguard running", ex.Status.Detail);
+        Assert.Contains("Tools → Rebuild sandbox images", ex.Status.Detail);
+        Assert.DoesNotContain("docker build", ex.Status.Detail);
         Assert.Equal(0, rig.Environment.Engine.SpawnCalls); // preflight fires before any jail work
 
         // The Spawn category records the preflight failure naming the missing image.
