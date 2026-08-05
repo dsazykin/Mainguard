@@ -225,8 +225,14 @@ public sealed class SandboxAgentLauncher
                 Secrets: secrets,
                 AgentUid: AgentUid,
                 SupervisorUid: SupervisorUid,
-                // Mount the shared CLI root read-only ONLY when CLIs are actually installed.
-                AdaptersRootPath: _adapters.HasAny() ? AdapterPaths.VmRoot : null,
+                // Mount the shared CLI root read-only ONLY when CLIs are actually installed — and mount
+                // THIS CATALOG'S root, not the fixed VM path. The catalog is injectable while the mount
+                // source was hardcoded, so the two could describe different directories: the daemon
+                // would answer "claude-code is installed" from one location and hand the jail another.
+                // Identical in production (the default catalog's root IS AdapterPaths.VmRoot); the
+                // difference only shows up where they were already inconsistent, as a container-create
+                // failure on a bind source that does not exist.
+                AdaptersRootPath: _adapters.HasAny() ? _adapters.Root : null,
                 // Coordinator-role jails only: the daemon-served spawn-channel dir (read-only mount).
                 IpcDirPath: ipcDirPath,
                 // The shared mirror at its identical VM path so the per-agent repo's alternates pointer

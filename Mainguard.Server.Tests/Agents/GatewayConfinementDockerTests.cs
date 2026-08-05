@@ -122,6 +122,16 @@ public sealed class GatewayConfinementDockerTests
         var spec = string.Join("\n", inspect.Config.Env ?? new List<string>());
         Assert.DoesNotContain(RealKey, spec, StringComparison.Ordinal);
 
+        // The jail mounts THIS catalog's adapters root, read-only. Pinned because the launcher used to
+        // mount the fixed /home/mainguard/mainguard/adapters regardless of where its catalog pointed:
+        // on a box that happens to have that directory the mismatch is invisible, and on one that does
+        // not the container create fails outright. CI found it; this assertion is what makes it visible
+        // here.
+        var adapters = Assert.Single(
+            inspect.Mounts, m => m.Destination == Mainguard.Agents.Agents.Adapters.AdapterPaths.SandboxMount);
+        Assert.Equal(world.AdaptersRoot, adapters.Source);
+        Assert.False(adapters.RW, "the adapters root must be mounted read-only");
+
         var secrets = await world.ReadSecretsFileAsync(jail);
         Assert.DoesNotContain(RealKey, secrets, StringComparison.Ordinal);
 
@@ -239,7 +249,7 @@ public sealed class GatewayConfinementDockerTests
 
         var vmRoot = NewScratchDir("mainguard-mg4-unreach-vm-");
         var sourceRepo = NewScratchDir("mainguard-mg4-unreach-src-");
-        var registryDir = NewScratchDir("mainguard-mg4-unreach-reg-");
+        var registryDir = ConfinementWorld.NewAdapterRegistryDir("mainguard-mg4-unreach-adapters-");
         ConfinementWorld.SeedRepoAt(sourceRepo);
         ConfinementWorld.WriteAdapterMarkerIn(registryDir);
 
@@ -286,7 +296,7 @@ public sealed class GatewayConfinementDockerTests
             }
 
             await ConfinementWorld.RemoveEgressForAsync(docker, repoHash, agentId);
-            foreach (var dir in new[] { vmRoot, sourceRepo, registryDir })
+            foreach (var dir in new[] { vmRoot, sourceRepo, Path.GetDirectoryName(registryDir)! })
             {
                 try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
             }
@@ -327,7 +337,9 @@ public sealed class GatewayConfinementDockerTests
             _vmRoot = vmRoot;
             _sourceRepo = sourceRepo;
             _registryDir = registryDir;
-            _tempDirs.AddRange(new[] { vmRoot, sourceRepo, registryDir });
+            // The registry's PARENT is the adapters root this world created, so that is what gets
+            // removed — deleting only the registry would leave the root behind on every run.
+            _tempDirs.AddRange(new[] { vmRoot, sourceRepo, Path.GetDirectoryName(registryDir)! });
         }
 
         public TestDaemonHost.RunningDaemon Daemon { get; private set; } = null!;
@@ -340,6 +352,9 @@ public sealed class GatewayConfinementDockerTests
 
         public string RepoHash { get; private set; } = string.Empty;
 
+        /// <summary>The adapters root this world created — what the jail must bind-mount.</summary>
+        public string AdaptersRoot => Path.GetDirectoryName(_registryDir)!;
+
         public static async Task<ConfinementWorld> StartAsync(BudgetCaps caps)
         {
             var provider = new FakeModelEndpoint();
@@ -347,7 +362,7 @@ public sealed class GatewayConfinementDockerTests
                 provider,
                 NewTempDir("mainguard-mg4-vm-"),
                 NewTempDir("mainguard-mg4-src-"),
-                NewTempDir("mainguard-mg4-registry-"));
+                NewAdapterRegistryDir("mainguard-mg4-adapters-"));
 
             try
             {
@@ -628,6 +643,20 @@ public sealed class GatewayConfinementDockerTests
                 }
                 catch { /* best effort */ }
             }
+        }
+
+        /// <summary>
+        /// A registry dir INSIDE a real adapters root, because the spawn path bind-mounts the ROOT
+        /// (the registry's parent) read-only into the jail. A bare temp dir would name a root that
+        /// does not exist and Docker refuses the container outright — which is exactly how CI caught
+        /// this: it passes on a box that happens to have /home/mainguard/mainguard/adapters and fails
+        /// on one that does not.
+        /// </summary>
+        internal static string NewAdapterRegistryDir(string prefix)
+        {
+            var registry = Path.Combine(NewTempDir(prefix), "registry");
+            Directory.CreateDirectory(registry);
+            return registry;
         }
 
         private static string NewTempDir(string prefix)
