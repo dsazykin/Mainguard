@@ -33,7 +33,12 @@ public sealed record InstalledAdapterMarker(
     /// <see cref="AdapterSpec.BaseUrlEnvVar"/>), carried across the host/VM boundary so the spawn path
     /// can point the CLI at the daemon's model gateway (MG-4). Null on markers written before this
     /// field existed — re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null)
+    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null,
+    /// <summary>The provider host this CLI's model traffic goes to (see
+    /// <see cref="AdapterSpec.ModelHost"/>), carried across the host/VM boundary so the spawn path can
+    /// record the agent's gateway upstream binding. Null on markers written before this field existed —
+    /// re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("modelHost")] string? ModelHost = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 

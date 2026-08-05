@@ -202,7 +202,8 @@ public static class DaemonHost
         Gateway.GatewayServiceRegistration.Register(
             builder,
             ResolveDataPath(options, builder.Configuration, tokenPath),
-            log: message => migration.LogInformation("{Milestone}", message));
+            log: message => migration.LogInformation("{Milestone}", message),
+            options: options);
 
         builder.Services.AddGrpc(o =>
         {
@@ -414,9 +415,36 @@ public static class DaemonHost
         });
 
         var app = builder.Build();
+        UseModelGateway(app, options);
         MapServices(app);
         RegisterLifecycleLogging(app, options);
         return app;
+    }
+
+    /// <summary>
+    /// Puts <see cref="Gateway.ModelProxyMiddleware"/> on the request path — the wiring whose absence
+    /// meant the P2-08 gateway had no production data path at all (no <c>UseMiddleware</c> call existed
+    /// anywhere in the daemon, so <c>BudgetLedger</c> was only ever written from tests).
+    ///
+    /// <para><b>Branched on the gateway port, and that is load-bearing.</b> The gRPC control plane and
+    /// the model gateway share one Kestrel host but are different trust surfaces: the control plane is
+    /// loopback + mutual TLS (MG-19), while the gateway is a private-address HTTP listener authenticated
+    /// by a per-agent token. Running this middleware on the control port would put an unauthenticated
+    /// HTTP shim in front of mutually-authenticated gRPC. <see cref="UseWhen"/> keeps it strictly on the
+    /// gateway listener, and the branch is not added at all when the gateway is disabled.</para>
+    /// </summary>
+    internal static void UseModelGateway(WebApplication app, DaemonOptions options)
+    {
+        if (string.IsNullOrWhiteSpace(options.GatewayBindAddress))
+        {
+            return; // gateway disabled (the default) — the pipeline is exactly what it was.
+        }
+
+        var gatewayPort = options.GatewayPort;
+        app.UseWhen(
+            context => context.Connection.LocalPort == gatewayPort,
+            branch => branch.UseMiddleware<Gateway.ModelProxyMiddleware>(
+                (object)Gateway.ModelHosts.All));
     }
 
     /// <summary>
