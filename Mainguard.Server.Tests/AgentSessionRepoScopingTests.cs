@@ -125,6 +125,50 @@ public sealed class AgentSessionRepoScopingTests
     }
 
     /// <summary>
+    /// A reason-only change is broadcast. It used to be swallowed — <c>changed</c> compared the state
+    /// word alone — which silently dropped every update that reports progress WITHIN a state, and that
+    /// is the only shape a long step has.
+    ///
+    /// <para>The coordinator sits in <c>Starting</c> for the several minutes its toolchain image builds
+    /// (~2.9 GB), so each progress line died here, the client heard nothing at all, and after 45 s the
+    /// surface could only conclude the daemon had stopped responding — then offered Stop, which killed
+    /// the build. The last line asserts the other half: a repeated identical reason is still not
+    /// broadcast, so a caller reporting in a loop cannot flood the stream.</para>
+    /// </summary>
+    [Fact]
+    public async Task MarkState_WithANewReasonButTheSameState_IsBroadcast_AndARepeatedOneIsNot()
+    {
+        var store = new AgentSessionStore(new InMemoryAuditLog());
+        var session = store.Spawn("claude-code", AgentRoles.Coordinator, agentId: "coord-1", repoHash: RepoA);
+        var reader = store.Subscribe(out var unsubscribe);
+        try
+        {
+            // Drain the snapshot-then-deltas prologue so what follows is only what THIS test caused.
+            while (reader.TryRead(out _)) { }
+
+            store.MarkState(session.Key, "Starting", "Building this repository's toolchain image (dotnet-10).");
+            store.MarkState(session.Key, "Starting", "Building this repository's toolchain image (dotnet-10).");
+            store.MarkState(session.Key, "Starting", "Toolchain image ready — starting the sandbox.");
+
+            var reasons = new List<string?>();
+            while (reader.TryRead(out var delta))
+            {
+                reasons.Add(delta.Reason);
+                Assert.Equal("Starting", delta.Payload); // the STATE never moved; only the reason did
+            }
+
+            Assert.Equal(2, reasons.Count); // three calls, one of them a repeat
+            Assert.Contains("Building this repository's toolchain image (dotnet-10).", reasons);
+            Assert.Contains("Toolchain image ready — starting the sandbox.", reasons);
+            await Task.CompletedTask;
+        }
+        finally
+        {
+            unsubscribe();
+        }
+    }
+
+    /// <summary>
     /// The id-only entry points the daemon still has (the <c>StopAgent</c> RPC, the PTY binder's exit
     /// watcher) must refuse an ambiguous id rather than pick one. Guessing would tear down or relabel
     /// whichever repo's jail happened to be enumerated first.

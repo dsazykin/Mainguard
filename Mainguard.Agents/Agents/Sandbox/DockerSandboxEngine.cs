@@ -485,8 +485,34 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
     /// <summary>
     /// Writes secret bytes to <paramref name="path"/> inside the container as a mode-0400 file owned by
-    /// <paramref name="ownerUid"/>. Content flows over the exec's stdin (never argv/env), the shell
-    /// tightens the umask first, and the exec runs as root so it can chown to the supervisor uid.
+    /// <paramref name="ownerUid"/>. Content flows over the exec's stdin (never argv/env), and the shell
+    /// tightens the umask first.
+    ///
+    /// <para><b>The exec runs AS THE OWNER, and there is no <c>chown</c>.</b> It used to run as uid 0
+    /// and chown the file to its owner afterwards — "root, so chown to the supervisor uid is
+    /// permitted". That premise was false for this container's whole life, and it is what broke the
+    /// coordinator: a jail is created with a non-root <c>User</c> AND <c>no-new-privileges</c>, and
+    /// Docker hands an exec in such a container an EMPTY permitted/effective capability set even when
+    /// the exec asks for uid 0. Measured on the shipping engine (Docker 20.10.24): that exec reports
+    /// <c>uid=0</c> and <c>CapPrm: 0000000000000000</c> against a bounding set of <c>fb</c>, and its
+    /// <c>chown</c> fails with <c>EPERM</c> — <c>chown: changing ownership of
+    /// '/run/secrets/agent.env.partial': Operation not permitted</c>. Removing EITHER the non-root user
+    /// or no-new-privileges restores <c>CapPrm: fb</c> and the chown succeeds; both are controls we
+    /// keep (G-15, G2 control 4), so the chown is what had to go.</para>
+    ///
+    /// <para><b>Why nothing caught it.</b> The behaviour is engine-specific: the identical container on
+    /// Engine 29.4.3 — what CI and Docker Desktop run — gives that exec <c>CapPrm: fb</c> and the chown
+    /// succeeded, so the RequiresDocker leg that delivers both secrets end to end was green throughout.
+    /// It only ever failed on <c>MainguardEnv</c>'s Docker 20.10.24, and there it was silent until the
+    /// exec's exit status started being read. That is why the guard for this lives in the no-Docker
+    /// leg (<c>ContainerSpecBuilderTests</c>, <c>SandboxSecretWriteTimeoutTests</c>): it is the only one
+    /// that does not depend on which engine happens to be under the runner.</para>
+    ///
+    /// <para>What replaces it is ownership by construction: <see cref="ContainerSpecBuilder"/> mounts
+    /// each secret's directory as a tmpfs that Docker creates — daemon-side, as real root — already
+    /// owned by that secret's uid, so the owner simply CREATES its own file and <c>chmod 0400</c>s it
+    /// (permitted to a file's owner with no capability at all). Nothing on this path depends on a
+    /// capability, on uid 0, or on whether dockerd is userns-remapped.</para>
     ///
     /// <para>The shell <b>stages and renames</b> rather than writing the destination directly, and reads
     /// an exact byte count instead of to EOF. Both changes exist for the timeout: <c>cat &gt; "$1"</c>
@@ -499,23 +525,27 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// </summary>
     internal Task WriteSecretFileAsync(string containerId, string path, byte[] content, int ownerUid, CancellationToken ct)
     {
-        var uid = ownerUid.ToString(CultureInfo.InvariantCulture);
         var length = content.Length.ToString(CultureInfo.InvariantCulture);
         var exec = new ExecStdinRequest(
             containerId,
-            "0", // root, so chown to the supervisor uid is permitted; the file ends 0400/uid.
-                 // path/uid/length are not secret (argv-safe); the secret content is piped via stdin only.
+            // The OWNER writes its own secret into its own tmpfs directory, so the file is correctly
+            // owned the moment it exists and no privileged step is needed to hand it over.
+            // path/length are not secret (argv-safe); the secret content is piped via stdin only.
+            ownerUid.ToString(CultureInfo.InvariantCulture),
             new[]
             {
                 "sh", "-c",
                 "umask 0377\n"
-                + "head -c \"$3\" > \"$1.partial\" || exit 74\n"
+                + "head -c \"$2\" > \"$1.partial\" || exit 74\n"
                 // Short read ⇒ the endpoint stopped delivering. Destroy the scratch file and fail; the
                 // destination is never created, so there is nothing readable to leak.
-                + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$3\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
-                + "chown \"$2\" \"$1.partial\" && chmod 0400 \"$1.partial\" || { rm -f \"$1.partial\"; exit 74; }\n"
+                + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$2\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
+                // Redundant against `umask 0377` and deliberately kept: the mode is the G-13 control,
+                // and a umask is a property of the shell we happen to get rather than of the file we
+                // promised. Owner-chmod needs no capability.
+                + "chmod 0400 \"$1.partial\" || { rm -f \"$1.partial\"; exit 74; }\n"
                 + "mv \"$1.partial\" \"$1\"\n",
-                "sh", path, uid, length,
+                "sh", path, length,
             },
             content);
 
@@ -560,9 +590,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 {
                     var result = await _stdin.RunAsync(exec, token).ConfigureAwait(false);
 
-                    // The exec's exit status was previously never read, so a short write, a failed chown
-                    // or a full tmpfs all reported success and produced a jail with no credentials and no
-                    // explanation. The staged-write shells signal exactly that with 74/75.
+                    // The exec's exit status was previously never read, so a short write, a failed
+                    // chmod or a full tmpfs all reported success and produced a jail with no credentials
+                    // and no explanation. The staged-write shells signal exactly that with 74/75.
                     if (result.ExitCode != 0)
                     {
                         throw new InvalidOperationException(
@@ -570,7 +600,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                             + $"'{containerId}' — the destination was NOT written (the shell stages to "
                             + "'<path>.partial' and only renames a complete file into place). Exit 75 means "
                             + "the endpoint delivered fewer bytes than promised; 74 means the file could not "
-                            + "be created, chowned or chmodded."
+                            + "be created or chmodded — the exec runs as the secret's owner uid in a tmpfs "
+                            + "directory Docker mounted owned by that uid, so a permission error here means "
+                            + "that mount is missing or owned by someone else."
                             + (string.IsNullOrWhiteSpace(result.Output)
                                 ? " The command printed nothing."
                                 : $" It printed: {result.Output}"));

@@ -61,9 +61,21 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private CancellationTokenSource? _connectWatchdogCts;
 
     /// <summary>How long the coordinator may sit "connecting" (spawning, or live-but-not-yet-drawing)
-    /// before the loader admits it's stalled and points at Stop. Deliberately generous — a first-launch
-    /// sandbox build is slow — and never auto-kills. Shortened by tests.</summary>
+    /// <b>in silence</b> before the loader admits it's stalled. Never auto-kills. Shortened by tests.</summary>
     internal static TimeSpan CoordinatorConnectTimeout { get; set; } = TimeSpan.FromSeconds(45);
+
+    /// <summary>
+    /// The budget that applies instead once the daemon has SAID what it is doing
+    /// (<see cref="CoordinatorStartDetail"/>).
+    ///
+    /// <para>45 s is the right budget for silence and badly wrong for work: a first-run toolchain image
+    /// build downloads ~2.9 GB and runs for minutes inside the spawn call, so the old single budget
+    /// declared a perfectly healthy launch unresponsive and offered a remedy that would have destroyed
+    /// the build. A progress line is evidence, so it buys a much longer budget — but not an unlimited
+    /// one, because evidence goes stale and a jail that wedges AFTER the build must still be reported.
+    /// Each new progress line re-arms the timer, so a step that keeps reporting is never cut off.</para>
+    /// </summary>
+    internal static TimeSpan CoordinatorWorkingTimeout { get; set; } = TimeSpan.FromMinutes(20);
 
     public ObservableCollection<AgentRowViewModel> Agents { get; } = new();
 
@@ -173,10 +185,27 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private bool _isCoordinatorConnecting;
 
     /// <summary>The connecting state has outlasted <see cref="CoordinatorConnectTimeout"/> with no first
-    /// frame and no death — a startup that failed silently (the root of the "loads forever" trap). The
-    /// loader stops pretending and says so, pointing at Stop; we never auto-kill, since a real first-launch
-    /// sandbox build can legitimately be slow.</summary>
+    /// frame, no death <b>and no word from the daemon about what it is doing</b> — a startup that failed
+    /// silently (the root of the "loads forever" trap). The loader stops pretending and says so; we never
+    /// auto-kill.
+    ///
+    /// <para>The "no word from the daemon" clause is the fix for the case that actually bit: the 45 s
+    /// budget expires long before a first-run toolchain image build (~2.9 GB, minutes) finishes, so a
+    /// perfectly healthy launch was reported as unresponsive — and the remedy on offer would have
+    /// destroyed the build. While <see cref="CoordinatorStartDetail"/> is telling us what the daemon is
+    /// working on, silence is not the diagnosis, so this stays false.</para></summary>
     [ObservableProperty] private bool _coordinatorConnectTimedOut;
+
+    /// <summary>What the daemon says it is doing while the coordinator starts (currently: the per-repo
+    /// toolchain image build, which is the only step that runs for minutes). Empty when it has said
+    /// nothing. Fed by the launch-progress state deltas, which carry a new <c>reason</c> while the
+    /// session stays in <c>Starting</c>.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasCoordinatorStartDetail))]
+    private string _coordinatorStartDetail = "";
+
+    /// <summary>Whether the loader has a real progress line to show instead of the generic explainer.</summary>
+    public bool HasCoordinatorStartDetail => CoordinatorStartDetail.Length > 0;
 
     /// <summary>Stop is reachable whenever there is something to stop OR cancel: a live coordinator, a
     /// start still in flight, or a stalled connect. This is the escape hatch that keeps a wedged launch
@@ -402,6 +431,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         // The exit reason of a dead coordinator (so a death isn't a silent revert), and the loading state.
         CoordinatorDeadReason = IsCoordinatorDead ? (coordinators.FirstOrDefault()?.Detail ?? "") : "";
+
+        // The live coordinator's Detail while it is still starting: the daemon's launch-progress line
+        // (currently the toolchain image build). Taken only from a LIVE, not-yet-drawn coordinator, so a
+        // dead one's exit reason can never leak into the loader as if it were progress.
+        SetCoordinatorStartDetail(live is not null && !IsCoordinatorDead ? live.Detail ?? "" : "");
         UpdateConnecting();
     }
 
@@ -418,31 +452,69 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     // re-arm, so a slow-but-real launch gets the full budget and a healthy one clears it early.
     partial void OnIsCoordinatorConnectingChanged(bool value)
     {
-        _connectWatchdogCts?.Cancel();
-        _connectWatchdogCts?.Dispose();
-        _connectWatchdogCts = null;
         CoordinatorConnectTimedOut = false;
-
-        if (value)
+        if (!value)
         {
-            var cts = new CancellationTokenSource();
-            _connectWatchdogCts = cts;
-            _ = ConnectWatchdogAsync(cts.Token);
+            CoordinatorStartDetail = "";
+        }
+
+        ArmConnectWatchdog(value);
+    }
+
+    /// <summary>
+    /// Records the daemon's latest launch-progress line, and treats it as what it is: proof the daemon
+    /// is working rather than wedged.
+    ///
+    /// <para>A new line clears an already-raised stall banner and re-arms the watchdog on the longer
+    /// <see cref="CoordinatorWorkingTimeout"/>. That is the whole reason the line is plumbed across the
+    /// gRPC boundary at all — without it the surface cannot tell a 3-minute image build from a dead
+    /// launch, and it guessed wrong in the direction that destroyed the build.</para>
+    /// </summary>
+    private void SetCoordinatorStartDetail(string detail)
+    {
+        if (string.Equals(CoordinatorStartDetail, detail, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        CoordinatorStartDetail = detail;
+
+        if (detail.Length > 0 && IsCoordinatorConnecting)
+        {
+            CoordinatorConnectTimedOut = false;
+            ArmConnectWatchdog(true);
         }
     }
 
-    /// <summary>After <see cref="CoordinatorConnectTimeout"/>, if the surface is STILL connecting (no first
-    /// frame, no death), flip <see cref="CoordinatorConnectTimedOut"/> so the loader stops pretending and
-    /// points the user at Stop — the honest end of the old "loads forever" trap. Never auto-kills.</summary>
-    private async Task ConnectWatchdogAsync(CancellationToken ct)
+    // Armed on the false→true edge of connecting and re-armed on every new progress line; disarmed on
+    // true→false. One timer at a time, so a slow-but-real launch gets a full budget from its most recent
+    // proof of life and a healthy one clears it early.
+    private void ArmConnectWatchdog(bool arm)
+    {
+        _connectWatchdogCts?.Cancel();
+        _connectWatchdogCts?.Dispose();
+        _connectWatchdogCts = null;
+
+        if (arm)
+        {
+            var cts = new CancellationTokenSource();
+            _connectWatchdogCts = cts;
+            _ = ConnectWatchdogAsync(HasCoordinatorStartDetail ? CoordinatorWorkingTimeout : CoordinatorConnectTimeout, cts.Token);
+        }
+    }
+
+    /// <summary>After the applicable budget, if the surface is STILL connecting (no first frame, no death,
+    /// and nothing newer from the daemon), flip <see cref="CoordinatorConnectTimedOut"/> so the loader
+    /// stops pretending — the honest end of the old "loads forever" trap. Never auto-kills.</summary>
+    private async Task ConnectWatchdogAsync(TimeSpan budget, CancellationToken ct)
     {
         try
         {
-            await Task.Delay(CoordinatorConnectTimeout, ct).ConfigureAwait(false);
+            await Task.Delay(budget, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            return; // connecting cleared (drew a frame / died / stopped) — the watchdog is moot
+            return; // connecting cleared, or a fresh progress line re-armed us — this timer is moot
         }
 
         await Dispatcher.UIThread.InvokeAsync(() =>

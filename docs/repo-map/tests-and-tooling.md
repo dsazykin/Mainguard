@@ -756,7 +756,11 @@
   whole repo's queue) and specifically does not normalise into equality with main; the generated
   Dockerfile's digest-pinned `FROM`, its absent `COPY`/`ADD`, and its return to `USER agent`; the
   content-addressed tag's sensitivity to base digest and declaration but not to comments; and the
-  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths) plus, in
+  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths), `ToolchainProvisionerProgressTests`
+  (the user-facing progress line: reported BEFORE the build rather than after — asserted by snapshotting
+  the builder's call count at report time, not by statement order — the ready line after, nothing at all
+  on a cache hit, and a null sink changing nothing; this is the daemon end of the channel that turns a
+  multi-minute first-run image build into visible progress instead of a hang) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
   claim per test on purpose, since xUnit stops at the first failing assertion and a five-assertion
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares
@@ -1145,7 +1149,14 @@
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
   (docker-inspect shows no Windows mounts + live userns/limits, persistent-jail start-not-recreate,
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
-  supervisor-owned `/run/secrets/oob.key`), `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
+  supervisor-owned `/run/secrets/supervisor/oob.key`). **These RequiresDocker legs only ever run against
+  a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
+  EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
+  plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on
+  Engine 29 it does not. The guards for that live in the no-Docker leg
+  (`ContainerSpecBuilderTests.Build_EachSecretLivesInATmpfsOwnedByItsOwnUid_SoNoChownIsEverNeeded`,
+  `SandboxSecretWriteTimeoutTests.SecretWrite_RunsAsTheSecretsOwner_AndNeverChowns`), which is the only
+  leg that is engine-independent. `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
   the per-repo toolchain layer built by the SHIPPED `ToolchainProvisioner` against a real runtime and
   then run in a real hardened jail: the premise asserted rather than assumed (`command -v dotnet`
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),

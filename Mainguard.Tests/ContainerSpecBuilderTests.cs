@@ -97,7 +97,7 @@ public class ContainerSpecBuilderTests
         var creds = CredTmpfsSpec.Create(AgentUid, SupervisorUid);
         Assert.NotEqual(creds.AgentUid, creds.SupervisorUid);
         Assert.Equal(0b100_000_000, creds.Mode); // 0400
-        Assert.Equal("/run/secrets/oob.key", creds.OobKeyPath);
+        Assert.Equal("/run/secrets/supervisor/oob.key", creds.OobKeyPath);
 
         // The container process runs as the agent uid (it cannot read the supervisor-owned K file).
         var create = ContainerSpecBuilder.Build(ValidRequest());
@@ -108,6 +108,91 @@ public class ContainerSpecBuilderTests
     public void CredTmpfsSpec_SharedUid_ThrowsTyped()
     {
         Assert.Throws<SandboxSpecException>(() => CredTmpfsSpec.Create(1000, 1000));
+    }
+
+    /// <summary>
+    /// Every secret's directory is a tmpfs Docker mounts ALREADY OWNED by the uid that writes into it.
+    ///
+    /// <para>This is the property that makes the in-jail secret write possible at all, and it replaced a
+    /// <c>chown</c> that could never succeed. A jail is created with a non-root <c>User</c> AND
+    /// <c>no-new-privileges</c>, and on Docker 20.10.24 — the engine <c>MainguardEnv</c> actually ships —
+    /// an exec in such a container gets an EMPTY permitted/effective capability set even when it asks for
+    /// uid 0. Measured on that engine: the exec reports <c>uid=0</c> with <c>CapPrm:
+    /// 0000000000000000</c> against a bounding set of <c>fb</c>, and its chown fails
+    /// <c>EPERM</c>. So the daemon mounts each secret's directory owned by its owner and the owner
+    /// creates its own file — no capability, no uid 0, and no dependence on a userns remap.</para>
+    ///
+    /// <para><b>Why this lives in the no-Docker leg.</b> The RequiresDocker test that delivers both
+    /// secrets end to end asserts the right thing and could not have caught this: it only ever runs
+    /// against a modern engine (Docker Desktop / CI, Engine 29.4.3), where the same exec DOES get
+    /// <c>CapPrm: fb</c> and the old chown succeeded. The bug lived exclusively on the shipping VM's
+    /// engine, so the guard has to be engine-independent — which means it has to be here.</para>
+    /// </summary>
+    [Fact]
+    public void Build_EachSecretLivesInATmpfsOwnedByItsOwnUid_SoNoChownIsEverNeeded()
+    {
+        var create = ContainerSpecBuilder.Build(ValidRequest());
+        var tmpfs = create.HostConfig.Tmpfs;
+
+        // The parent stays root-owned and merely traversable: nothing is created directly in it.
+        Assert.Equal("size=1m,mode=0711", tmpfs[CredTmpfsSpec.SecretsRoot]);
+
+        // Read the directory off the PATH rather than the constant, so a spec that moved a secret
+        // somewhere unmounted cannot satisfy this by naming the right dictionary key.
+        var credentialDir = CredTmpfsSpec.DirectoryOf(CredTmpfsSpec.DefaultCredentialPath);
+        var oobDir = CredTmpfsSpec.DirectoryOf(CredTmpfsSpec.DefaultOobKeyPath);
+
+        Assert.Equal($"size=1m,mode=0700,uid={AgentUid},gid={AgentUid}", tmpfs[credentialDir]);
+        Assert.Equal($"size=1m,mode=0700,uid={SupervisorUid},gid={SupervisorUid}", tmpfs[oobDir]);
+
+        // G2 control 1 as a property of the LAYOUT: one directory would put both secrets under a single
+        // owner and give the agent uid write access to K's directory.
+        Assert.NotEqual(credentialDir, oobDir);
+    }
+
+    /// <summary>
+    /// The builder refuses a spec whose secret does not sit in a directory its owner owns — the exact
+    /// state that produced <c>chown … Operation not permitted</c> inside a live jail. Rejecting it here
+    /// turns a runtime EPERM behind a container boundary into a typed error before creation.
+    /// </summary>
+    [Fact]
+    public void Build_RejectsASecretWhoseDirectoryIsNotOwnedByItsWriter()
+    {
+        var request = ValidRequest();
+
+        // Both secrets back in one shared directory: the pre-fix layout, which needs a chown.
+        var shared = request with
+        {
+            Credentials = request.Credentials with
+            {
+                CredentialPath = CredTmpfsSpec.SecretsRoot + "/agent.env",
+                OobKeyPath = CredTmpfsSpec.SecretsRoot + "/oob.key",
+            },
+        };
+        var flat = Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(shared));
+        Assert.Contains(CredTmpfsSpec.SecretsRoot, flat.Message, StringComparison.Ordinal);
+
+        // A per-secret directory that exists and is a tmpfs, but belongs to the OTHER uid: K would land
+        // inside the AGENT's own directory, unwritable by the supervisor and readable by the agent.
+        var swapped = request with
+        {
+            Credentials = request.Credentials with
+            {
+                OobKeyPath = CredTmpfsSpec.AgentSecretsDir + "/oob.key",
+            },
+        };
+        var wrongOwner = Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(swapped));
+        Assert.Contains(CredTmpfsSpec.AgentSecretsDir, wrongOwner.Message, StringComparison.Ordinal);
+        Assert.Contains($"uid {SupervisorUid} OWNS it", wrongOwner.Message, StringComparison.Ordinal);
+
+        // A directory with no tmpfs behind it at all — on a read-only rootfs the write cannot even
+        // create the file, and the failure would surface as an EPERM inside a running jail.
+        var unmounted = request with
+        {
+            Credentials = request.Credentials with { CredentialPath = "/opt/secrets/agent.env" },
+        };
+        var missing = Assert.Throws<SandboxSpecException>(() => ContainerSpecBuilder.Build(unmounted));
+        Assert.Contains("is not a tmpfs on the create request", missing.Message, StringComparison.Ordinal);
     }
 
     [Theory]

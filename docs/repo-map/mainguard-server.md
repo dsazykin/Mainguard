@@ -97,7 +97,11 @@
   event fan-out (host state, not transport); the gRPC classes dispatch here. Appends `spawn`/`stop`
   audit events via `IAuditLog`; `MarkState(agentId, state, reason)` (P2-09) updates a session's state
   + broadcasts a state delta (the sink the real supervisor drives so a pause/rate-limit streams to
-  clients). **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
+  clients) — and broadcasts when the **reason** changed as well as the state word, holding the last one
+  on `AgentSession.Detail` so a new reason is told from a repeat. Comparing only the state word silently
+  swallowed every update reporting progress WITHIN a state, which is the only shape a long step has: a
+  coordinator sits in `Starting` for the minutes its toolchain image builds, so each progress line died
+  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
   `ContainerId`/`RepoHash` (never serialized), and `AttachSandbox` binds a real jail to a spawned
   session (state → `Working`, `sandbox_attach` audit). **`Spawn` takes an optional explicit
   `agentId`** — it could previously only MINT GUIDs, so a session (and therefore a jail) named
