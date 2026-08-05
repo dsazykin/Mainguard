@@ -32,7 +32,10 @@
 - **`Views/`** — one `.axaml` (+ `.axaml.cs`) per screen/dialog. Paired 1:1 with `ViewModels/`. Secondary dialogs/panels derive from `Mainguard.UI`'s `ChromedWindow` and place its `CustomTitleBar` in row 0 for one consistent hand-drawn title bar (both moved to `Mainguard.UI` in step 2c; the derived windows stay here in the same `Mainguard.App.Shell.Views` namespace, resolving cross-assembly).
   - Shell: `MainWindow` (top nav, sidebar, overlays: command palette / delete-confirm / invalid-repo
     / the bottom-right shell-toast stack bound to `MainWindowViewModel.Toasts` — window-wide,
-    auto-dismissing, mirrors RepoDashboard's #85 toast styles). The command-palette overlay hosts
+    auto-dismissing, mirrors RepoDashboard's #85 toast styles; its `Grid.Row="1"` is load-bearing —
+    without it the host falls into the Auto-sized title-bar row and `VerticalAlignment="Bottom"`
+    renders the stack in the TOP-right corner, the 2026-08 regression pinned by
+    `Headless/MainWindowShellRenderHarness.ShellToasts_*`). The command-palette overlay hosts
     `CommandPaletteView` (T-18: a reusable palette card — query box + ranked/highlighted result rows
     with category headers, category chips, and gesture chips) bound to
     `MainWindowViewModel.CommandPalette`;
@@ -562,7 +565,11 @@
     Cancel works, and a catalog-read failure explains itself instead of throwing; now the Settings
     **Agent CLIs** page — the old repo actions menu → **Agent CLIs…** entry and
     `RepoDashboardViewModel.ManageAgentClisAsync` are gone, and `AgentCliSettingsViewModel` implements
-    `ISettingsPage` (`OnActivated` kicks `RefreshAsync`)), `VmUpgradeOfferViewModel` (the tier-2 upgrade
+    `ISettingsPage` (`OnActivated` kicks `RefreshAsync`); Install/Update/Revert are parent commands
+    whose `CanExecute` reads ROW state, so the VM watches `Clis` + each row's `PropertyChanged` and
+    re-publishes `NotifyCanExecuteChanged()` — `[NotifyCanExecuteChangedFor]` on `IsBusy` alone left
+    the buttons visible-but-dead (`Headless/RowCommandEnablementTests`); add a row property to
+    `RowCommandInputs` whenever a new row-reading `CanExecute` lands), `VmUpgradeOfferViewModel` (the tier-2 upgrade
     offer/progress VM: starts in the consent state (`IsOffering`), `UpgradeCommand` runs the injected
     `IVmUpgradeOrchestrator` off the UI thread and advances the `VmUpgradePlan`-seeded
     `BootstrapStageViewModel` checklist from the orchestrator's `IProgress<string>` lines (a line
