@@ -145,6 +145,107 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     }
 
     /// <summary>
+    /// MG-3 — <b>adopting a jail has to start its ref sweep</b>, because adoption is by definition the case
+    /// where <c>SandboxAgentLauncher.LaunchAsync</c> (the only place a spawn registers the watch) did not
+    /// run. An adopted worker that is never swept has its <c>refs/heads/agent/pr-&lt;n&gt;</c> move with
+    /// nothing publishing it into the mirror, so the review cockpit, the merge-queue projection and the
+    /// stale cascade sit on a tip the worker already moved past until some verification forces a fetch.
+    /// Nothing errors, which is why it needs an assertion rather than a log line.
+    ///
+    /// <para>The boot <c>SwarmReconciler</c> does not answer for this. Its container listing is best-effort
+    /// with no retry — an unreachable Docker becomes an EMPTY list and the boot failure is swallowed so the
+    /// daemon serves anyway — so a daemon that starts before dockerd is ready watches nothing and never
+    /// sweeps again, while this poll loop keeps adopting. And boot runs once, so it cannot cover a jail
+    /// adopted mid-life: a release whose teardown half-fails leaves the container up, the session removed
+    /// and the ref unwatched, which is exactly the state the next poll adopts.</para>
+    /// </summary>
+    [Fact]
+    public async Task EnsureWorker_WhenItAdoptsAStillRunningJail_HandsItToTheRefWatcher()
+    {
+        using var daemon = new DaemonFixture();
+        var worktrees = new RecordingWorktrees();
+
+        var host = NewHost(
+            daemon,
+            resolveRunningJail: (repo, agent) => repo == "repo-a" && agent == "pr-9" ? "container-9" : null,
+            worktrees: worktrees);
+        var result = await host.EnsureWorkerAsync("repo-a", "pr-9", 9, CancellationToken.None);
+
+        Assert.Equal(PrWorkerOutcome.AlreadyLive, result.Outcome);
+        Assert.Equal(new[] { ("repo-a", "pr-9") }, worktrees.Watched);
+    }
+
+    /// <summary>
+    /// The control for the assertion above: an "already live" answer that comes from THIS daemon's session
+    /// store is not an adoption — that jail was spawned in-process, so <c>LaunchAsync</c> already watched
+    /// it. Without this, a host that watched unconditionally on every early return would pass the adopt
+    /// test for the wrong reason.
+    /// </summary>
+    [Fact]
+    public async Task EnsureWorker_WhenTheSessionStoreAlreadyHoldsTheJail_StartsNoWatchHere()
+    {
+        using var daemon = new DaemonFixture();
+        var store = daemon.Services.GetRequiredService<AgentSessionStore>();
+        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
+        store.AttachSandbox("pr-9", "container-9", "repo-a");
+        var worktrees = new RecordingWorktrees();
+
+        var host = NewHost(daemon, resolveRunningJail: (_, _) => null, worktrees: worktrees);
+        var result = await host.EnsureWorkerAsync("repo-a", "pr-9", 9, CancellationToken.None);
+
+        Assert.Equal(PrWorkerOutcome.AlreadyLive, result.Outcome);
+        Assert.Empty(worktrees.Watched);
+    }
+
+    /// <summary>
+    /// The #281 / #284 scoping rule, on the adopt path: the watch is keyed on BOTH labels. A bare
+    /// <c>pr-7</c> is unique only INSIDE a repository — two subscribed repos each with an open pull request
+    /// #7 is ordinary — so one repo's adoption must register its own <c>(repo, agent)</c> and never stand
+    /// in for the other's. Each is adopted from its own jail and each is swept separately.
+    /// </summary>
+    [Fact]
+    public async Task EnsureWorker_AdoptingTheSameIdInTwoRepos_WatchesEachRepoSeparately()
+    {
+        using var daemon = new DaemonFixture();
+        var worktrees = new RecordingWorktrees();
+
+        // Both repos really have a jail named pr-7; only the (repo, agent) pair tells them apart.
+        var host = NewHost(
+            daemon,
+            resolveRunningJail: (repo, agent) => agent == "pr-7" ? $"container-{repo}" : null,
+            worktrees: worktrees);
+
+        Assert.Equal(
+            PrWorkerOutcome.AlreadyLive,
+            (await host.EnsureWorkerAsync("repo-a", "pr-7", 7, CancellationToken.None)).Outcome);
+        Assert.Equal(
+            PrWorkerOutcome.AlreadyLive,
+            (await host.EnsureWorkerAsync("repo-b", "pr-7", 7, CancellationToken.None)).Outcome);
+
+        Assert.Equal(
+            new[] { ("repo-a", "pr-7"), ("repo-b", "pr-7") },
+            worktrees.Watched.OrderBy(w => w.Repo).ToArray());
+    }
+
+    /// <summary>A ref watcher that throws must not fail the poll. The intake loop runs unattended over an
+    /// untrusted source: one bad housekeeping call may not cost the pull request its adoption, which is
+    /// what keeps the daemon from trying to spawn a duplicate jail on every poll thereafter.</summary>
+    [Fact]
+    public async Task EnsureWorker_WhenTheRefWatcherThrows_StillAdoptsTheJail()
+    {
+        using var daemon = new DaemonFixture();
+
+        var host = NewHost(
+            daemon,
+            resolveRunningJail: (_, _) => "container-9",
+            worktrees: new ThrowingWatchWorktrees());
+        var result = await host.EnsureWorkerAsync("repo-a", "pr-9", 9, CancellationToken.None);
+
+        Assert.Equal(PrWorkerOutcome.AlreadyLive, result.Outcome);
+        Assert.Empty(daemon.Services.GetRequiredService<AgentSessionStore>().List());
+    }
+
+    /// <summary>
     /// <b>The worker cap applies to intake spawns, over the same population.</b> An arriving bot pull
     /// request is a spawn request the machine did not ask for, so it draws from the one
     /// <c>MaxActiveWorkers</c> allowance that already caps a coordinator's fan-out rather than a private
@@ -410,7 +511,8 @@ public sealed class ExternalPrIntakeSpawnWiringTests
     private static ExternalPrWorkerHost NewHost(
         DaemonFixture daemon,
         Func<string, string, string?> resolveRunningJail,
-        CoordinatorLimits? limits = null)
+        CoordinatorLimits? limits = null,
+        IAgentWorktreeManager? worktrees = null)
         => new(
             spawns: daemon.Services.GetRequiredService<AgentSpawnService>(),
             sessions: daemon.Services.GetRequiredService<AgentSessionStore>(),
@@ -418,8 +520,42 @@ public sealed class ExternalPrIntakeSpawnWiringTests
             admission: daemon.Services.GetRequiredService<AdmissionController>(),
             limits: limits ?? daemon.Services.GetRequiredService<CoordinatorLimits>(),
             resolveRunningJail: resolveRunningJail,
+            worktrees: worktrees ?? daemon.Services.GetRequiredService<IAgentEnvironment>().Worktrees,
             audit: daemon.Services.GetRequiredService<IAuditLog>(),
             loggerFactory: NullLoggerFactory.Instance);
+
+    /// <summary>Records every <c>(repo, agent)</c> handed to the MG-3 ref sweep — the same seam
+    /// <c>SandboxAgentLauncher</c> registers a SPAWNED agent through, so watching it here asserts the real
+    /// wiring rather than a bookkeeping list this host keeps for itself.</summary>
+    private sealed class RecordingWorktrees : IAgentWorktreeManager
+    {
+        public List<(string Repo, string Agent)> Watched { get; } = new();
+
+        public string CreateAgentWorktree(string repoHash, string agentId) => $"/wt/{repoHash}/{agentId}";
+
+        public void RemoveAgentWorktree(string repoHash, string agentId, bool force) { }
+
+        public void Prune(string repoHash) { }
+
+        public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
+
+        public void WatchAgentRef(string repoHash, string agentId) => Watched.Add((repoHash, agentId));
+    }
+
+    /// <summary>A substrate whose ref watcher is down. The adopt path must still adopt.</summary>
+    private sealed class ThrowingWatchWorktrees : IAgentWorktreeManager
+    {
+        public string CreateAgentWorktree(string repoHash, string agentId) => string.Empty;
+
+        public void RemoveAgentWorktree(string repoHash, string agentId, bool force) { }
+
+        public void Prune(string repoHash) { }
+
+        public IReadOnlyList<WorktreeItem> List(string repoHash) => Array.Empty<WorktreeItem>();
+
+        public void WatchAgentRef(string repoHash, string agentId) =>
+            throw new InvalidOperationException("the watcher is unavailable");
+    }
 
     private static Func<string, IReadOnlyList<GitRemoteItem>> Remotes(Dictionary<string, string> originByPath)
         => path => originByPath.TryGetValue(path, out var url)
