@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Audit;
 using Mainguard.Git.Exceptions;
+using Mainguard.Git.Review;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -57,6 +58,8 @@ public sealed class MergeQueueProvisioner
     private readonly IAuditLog _audit;
     private readonly Action<string>? _log;
     private readonly Func<string, string, bool>? _publishAgentRef;
+    private readonly IMergeBranchDiffService _mergeDiff;
+    private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
@@ -69,8 +72,28 @@ public sealed class MergeQueueProvisioner
     /// <param name="verificationStore">repoHash → the immutable verification-record store.</param>
     /// <param name="sandboxes">The engine that runs the test command and reports the container-runtime exit.</param>
     /// <param name="artifactDirectory">Daemon-owned directory the verification log artifacts land in.</param>
+    /// <param name="mergeDiff">
+    /// P2-11 — the branch-vs-main diff the flagged-change review classifies. <b>Required, deliberately.</b>
+    /// Made optional it would have to be null-checked at the point the gate is composed, and a gate that is
+    /// only wired when some collaborator happens to be present is the failure mode this whole change exists
+    /// to remove (phase 2 found a gate check made unreachable by an <c>if</c>). With no way to construct a
+    /// provisioner that cannot run the review, there is no way to construct one whose queue silently lacks
+    /// the gate.
+    /// </param>
     /// <param name="audit">Audit sink threaded into every queue (the loud <c>stale_override_used</c> path).</param>
     /// <param name="log">Optional milestone sink (daemon Merge log category).</param>
+    /// <param name="resolveApprovedPlan">
+    /// SA-1/F6 — agentId → the managed worker's human-approved <see cref="TaskPlan"/>, or null when the
+    /// agent has none. Supplying it turns on the <c>out-of-approved-scope</c> arm of the detector: every
+    /// file the branch touches outside <c>TaskPlan.Scope</c> becomes its own must-acknowledge item.
+    ///
+    /// <para><b>Null in the daemon today, and that is a statement of fact rather than a default.</b> There is
+    /// no agent→approved-plan binding anywhere in the running daemon: <c>PlanApprovalService.PlanApproved</c>
+    /// has no production subscriber, no spawn path accepts or records a plan id, and <c>AgentSession</c>
+    /// carries none — so no honest implementation of this callback exists yet to pass. The scope comparison
+    /// is therefore wired, tested and inert, waiting on the plan-authorship pipeline; it is NOT reported as
+    /// enforced. See the PR body and <c>docs/design/coordinator-phase-2-decisions.md</c> §3a.</para>
+    /// </param>
     /// <param name="publishAgentRef">
     /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
     /// Called immediately BEFORE every verification, which is the second half of the resolved
@@ -87,9 +110,11 @@ public sealed class MergeQueueProvisioner
         Func<string, IVerificationStore> verificationStore,
         ISandboxEngine sandboxes,
         string artifactDirectory,
+        IMergeBranchDiffService mergeDiff,
         IAuditLog? audit = null,
         Action<string>? log = null,
-        Func<string, string, bool>? publishAgentRef = null)
+        Func<string, string, bool>? publishAgentRef = null,
+        Func<string, TaskPlan?>? resolveApprovedPlan = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -101,9 +126,11 @@ public sealed class MergeQueueProvisioner
         _runner = new VerificationRunner(
             _sandboxes,
             artifactDirectory ?? throw new ArgumentNullException(nameof(artifactDirectory)));
+        _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
         _audit = audit ?? new InMemoryAuditLog();
         _log = log;
         _publishAgentRef = publishAgentRef;
+        _resolveApprovedPlan = resolveApprovedPlan;
     }
 
     /// <summary>
@@ -191,20 +218,34 @@ public sealed class MergeQueueProvisioner
         // the human's; sharing one across repos would let one repo's ack clear another's flag.
         var changedTestCommand = new ChangedTestCommandGate();
 
+        // P2-11, and the point of this change: the flagged-change gate is per-repo-queue for the same
+        // reason the RT-D2 one is — its acknowledgments are per-branch and belong to the human who read
+        // that branch's diff. It shipped complete and was constructed nowhere outside the test projects and
+        // one dead ViewModel branch, so the daemon ANDed a single gate into CanMerge and the entire
+        // human-diff-review boundary (executable config, CI workflows, git hooks, security-sensitive paths,
+        // and the plan's approved scope) was evaluated by nothing. Adding it here is what makes the review
+        // a merge precondition rather than a rendering.
+        var flaggedChanges = new FlaggedChangeGate(_audit);
+
         MergeQueue queue = null!;
         queue = new MergeQueue(
             repoHash: repoHandle,
             currentMainSha: mainSha,
             store: _queueStore(repoHandle),
             verifications: _verificationStore(repoHandle),
-            runVerification: (agentId, ct) => RunVerificationAsync(repoHandle, agentId, queue, changedTestCommand, ct),
+            runVerification: (agentId, ct) =>
+                RunVerificationAsync(repoHandle, agentId, queue, changedTestCommand, flaggedChanges, ct),
             // Null requeue = re-verify, which is the production stale-cascade behaviour (§3.3): a staled
             // branch re-runs its own verification against the new main rather than sitting stale forever.
             requeue: null,
-            gates: new IMergeGate[] { changedTestCommand },
+            gates: new IMergeGate[] { changedTestCommand, flaggedChanges },
             audit: _audit);
 
-        return new MergeQueueContext(queue, _leases) { ChangedTestCommand = changedTestCommand };
+        return new MergeQueueContext(queue, _leases)
+        {
+            ChangedTestCommand = changedTestCommand,
+            FlaggedChanges = flaggedChanges,
+        };
     }
 
     /// <summary>
@@ -219,7 +260,8 @@ public sealed class MergeQueueProvisioner
     /// <see cref="VerificationRecord"/> the queue persists.</para>
     /// </summary>
     private async Task<VerificationRecord> RunVerificationAsync(
-        string repoHandle, string agentId, MergeQueue queue, ChangedTestCommandGate changedGate, CancellationToken ct)
+        string repoHandle, string agentId, MergeQueue queue, ChangedTestCommandGate changedGate,
+        FlaggedChangeGate flaggedGate, CancellationToken ct)
     {
         var containerId = _resolveContainerId(repoHandle, agentId);
         if (string.IsNullOrEmpty(containerId))
@@ -254,6 +296,14 @@ public sealed class MergeQueueProvisioner
         changedGate.SetFlagged(agentId, ChangedTestCommandGate.TestCommandItem, resolution.ChangedVsMain);
         changedGate.SetFlagged(agentId, ChangedTestCommandGate.ToolchainItem, toolchain.ChangedVsMain);
 
+        // ...and arm the P2-11 flagged-change gate from the same committed trees, at the same moment, for
+        // the same reason: a branch that edits a CI workflow, a git hook, an executable config or a
+        // security-sensitive path — or that reaches outside its approved scope — is unmergeable from the
+        // instant the daemon can know it, not from whenever a UI happens to look at it. Verification time is
+        // also the correct cadence: the acknowledgment binds to the flagged set's content hash, so a branch
+        // that pushes new work re-verifies, re-classifies, and drops every ack that covered the old bytes.
+        ArmFlaggedChangeReview(repoHandle, agentId, flaggedGate);
+
         // ...and before running anything, confirm the jail REALLY carries what main declared. This is a
         // daemon-observed exec in the worker's own container, not a lookup in the daemon's own
         // bookkeeping: the failure being defended against is precisely the one where our records say the
@@ -269,6 +319,55 @@ public sealed class MergeQueueProvisioner
                 agentId, containerId!, queue.CurrentMainSha,
                 resolution.Command, resolution.ResolvedCommand, resolution.ConfigHash),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Classifies the branch's merge diff and installs the resulting must-acknowledge set on the agent's
+    /// <see cref="AcknowledgmentStore"/>, which is what <see cref="FlaggedChangeGate"/> reads in
+    /// <c>CanMerge</c>.
+    ///
+    /// <para><b>Every exit from here is fail-closed.</b> If the diff cannot be computed — no mirror, a
+    /// branch the mirror does not carry, a git invocation that fell over — the store is deliberately left
+    /// untouched rather than set to an empty set. An empty set is
+    /// <see cref="AcknowledgmentStore.AllAcknowledged"/>, i.e. indistinguishable from "reviewed and clean",
+    /// and writing one here would hand a merge to precisely the branch whose review just failed. An agent
+    /// with no store is denied by <see cref="FlaggedChangeGate.Allows"/>'s MG-40 default-DENY, and the
+    /// operator gets a named reason instead of a silent pass.</para>
+    ///
+    /// <para>The failure is also kept out of the verification result on purpose: "the review could not run"
+    /// and "this branch's tests failed" are the one distinction the merge decision rests on, and collapsing
+    /// them into a single thrown verification is how that distinction gets erased.</para>
+    /// </summary>
+    private void ArmFlaggedChangeReview(string repoHandle, string agentId, FlaggedChangeGate flaggedGate)
+    {
+        IReadOnlyList<Mainguard.Git.Models.FilePatch> files;
+        try
+        {
+            files = _mergeDiff.Compute(repoHandle, agentId).Files;
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} flagged-change review FAILED "
+                + $"({ex.Message}) — the branch stays unmergeable until it can be classified");
+            return;
+        }
+
+        // SA-1/F6. `managed` is derived from the plan's presence rather than taken as a separate flag: the
+        // scope comparison is meaningful exactly when there is an approved scope to compare against, and a
+        // "managed but plan-less" combination could only ever mean "compare against nothing", which is the
+        // state this change exists to end.
+        var approvedPlan = _resolveApprovedPlan?.Invoke(agentId);
+        var items = FlaggedChangeDetector.DetectFlagged(files, approvedPlan, managed: approvedPlan is not null);
+
+        flaggedGate.StoreFor(agentId).SetFlagged(items);
+
+        if (items.Count > 0)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} flagged {items.Count} change(s) "
+                + "requiring human acknowledgment before merge");
+        }
     }
 
     /// <summary>

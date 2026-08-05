@@ -15,6 +15,15 @@ public sealed record MergeQueueContext(MergeQueue Queue, IMergeLeaseStore Leases
     /// human cannot clear is a permanently unmergeable branch, not a gate.
     /// </summary>
     public ChangedTestCommandGate? ChangedTestCommand { get; init; }
+
+    /// <summary>
+    /// The P2-11 flagged-change gate this repo's queue ANDs into <c>CanMerge</c>. Held here for exactly the
+    /// same reason as <see cref="ChangedTestCommand"/>: the daemon evaluates it, and the human's
+    /// <c>AcknowledgeFlaggedChange</c> RPC has to be able to reach the very store that is blocking the
+    /// merge. A gate reachable only from inside the queue's opaque gate list could be evaluated and never
+    /// cleared.
+    /// </summary>
+    public FlaggedChangeGate? FlaggedChanges { get; init; }
 }
 
 /// <summary>

@@ -868,7 +868,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       that make a repo active (ProvisionRepo / CreateWorktree / a jailed spawn) over the same persisted
       stores and, load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
-      spans origins while they share one store (MG-23).)
+      spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
+      into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
+      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it; `ArmFlaggedChangeReview` runs the
+      required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
+      same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
+      that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
+      writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
+      verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
+      `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
+      agent→approved-plan binding exists yet.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
@@ -879,7 +888,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       §3.6 CVE/script rows in; plus the pure `ScopeMatcher` glob (`**`/`*`/`?`)).
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
-      item-by-item; the security boundary against hostile agent code).
+      item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has
+      never seen (MG-40). **Now actually wired**: `MergeQueueProvisioner.Build` constructs it into every
+      repo queue — it previously existed only in tests and one dead ViewModel branch. `StoreFor` creates
+      on demand and is for the review that classifies a diff; every READ path (the daemon's flagged-item
+      projection, the ack RPC) uses **`PeekStore`**, which never creates — a fresh store holds no items and
+      an empty set is `AllAcknowledged`, so creating one from a read would manufacture the "reviewed and
+      clean" record the default-DENY exists to refuse.)
     - `AgentTraceEmitter.cs` (orchestrator-side provenance: `EmitTrace`/`SerializeTrace` write the
       Cognition/Cursor-style Agent Trace JSON artifact that `Review.ProvenanceReader` reads back, + the
       pure `BuildTrailers` that appends idempotent `Agent:`/`Task:`/`Plan:` commit trailers as the durable

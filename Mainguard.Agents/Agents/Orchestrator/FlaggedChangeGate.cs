@@ -27,6 +27,22 @@ public sealed class FlaggedChangeGate : IMergeGate
     public AcknowledgmentStore StoreFor(string agentId) =>
         _stores.GetOrAdd(agentId ?? string.Empty, id => new AcknowledgmentStore(id, _audit));
 
+    /// <summary>
+    /// The agent's store <b>if one already exists</b>, else null — a strictly read-only lookup that never
+    /// creates one.
+    ///
+    /// <para><b>Why this is not <see cref="StoreFor"/>.</b> Creating a store on demand is correct where the
+    /// caller is about to populate it, and a fail-open hole everywhere else: a brand-new store holds no
+    /// items, and an empty item set is <see cref="AcknowledgmentStore.AllAcknowledged"/> — so a read path
+    /// that reached for <see cref="StoreFor"/> (the flagged-item projection, or an acknowledgment naming an
+    /// unknown agent id) would manufacture the very "reviewed and clean" record that
+    /// <see cref="Allows"/>'s default-DENY exists to refuse. The MG-40 guard would then be defeated by the
+    /// act of rendering the panel. Read paths use this; only the review that has actually classified a diff
+    /// calls <see cref="StoreFor"/>.</para>
+    /// </summary>
+    public AcknowledgmentStore? PeekStore(string agentId) =>
+        _stores.TryGetValue(agentId ?? string.Empty, out var store) ? store : null;
+
     public bool Allows(string agentId, out string reason)
     {
         // Default-DENY on an agent this gate has never seen. The old code treated "no ack store" as
