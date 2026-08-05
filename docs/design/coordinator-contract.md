@@ -92,13 +92,39 @@ Two things make the backpressure tolerable, and both are requirements rather tha
 Neither number is load-bearing for security; both are `CoordinatorLimits` fields and can be retuned
 once there is real usage data.
 
+### 2.1 Budget applies to BYOK workers, and not to OAuth workers
+
+**Stated plainly because this document previously listed "budget" as an unqualified gate, and that was
+not true for every worker.**
+
+A worker's model traffic is metered only when Mainguard holds its credential:
+
+| worker authenticates by | metered? | how |
+|---|---|---|
+| **BYOK** — an API key the user supplied | **yes** | the key stays daemon-side; the jail gets a `mg_sess_` token and its CLI is pointed at the daemon's model gateway, which charges `BudgetLedger` per request and refuses the agent when it is over cap |
+| **interactive OAuth login** — the user signs in inside the terminal | **no** | the CLI holds its own session and talks to the provider directly; there is nothing in the path to meter |
+
+The reason is structural rather than unfinished work: metering happens at a proxy that substitutes the
+credential, and an OAuth CLI authenticates *past* any such proxy with a session Mainguard never sees and
+cannot price. Confining it would mean breaking the login. See
+[`oauth-budgeting.md`](oauth-budgeting.md).
+
+Two consequences worth being explicit about, since both are easy to misread:
+
+- A budget cap configured by the user **does not bound an OAuth worker's spend.** The cap is real, it is
+  enforced daemon-side, and it applies to BYOK workers only.
+- BYOK metering is an **accounting** control, not a network one. The jail no longer holds a usable
+  provider key, so it has nothing to spend against the provider directly — but the model hosts remain
+  reachable on the egress allowlist (OAuth workers need them), so the limit is not enforced by blocking
+  the route. See the residual-bypass note in `oauth-budgeting.md`.
+
 ## 3. The surface — the complete set of coordinator operations
 
 These four already exist as `CoordinatorTools`. The contract is that this list is **exhaustive**.
 
 | tool | purpose | gates applied |
 |---|---|---|
-| `spawn_worker` | start a worker on a described task | kill switch · worker cap · admission · budget |
+| `spawn_worker` | start a worker on a described task | kill switch · worker cap · admission · budget (BYOK only — see §2.1) |
 | `get_worker_status` | status of workers it owns | ownership scope |
 | `send_worker_prompt` | steer a worker it owns | kill switch · ownership scope |
 | `request_verification` | propose a worker's branch for daemon verification | ownership scope |
@@ -156,7 +182,8 @@ on purpose, with the reasoning written down:
   written before a worker existed (§2). Net human interactions are unchanged; the information behind
   each one is better.
 - The spawn path is not ungated: kill switch, worker cap (`MaxActiveWorkers`), admission control, and
-  budget all still apply, and all are enforced daemon-side.
+  budget all still apply, and all are enforced daemon-side — with the budget carrying the **BYOK-only**
+  qualification in §2.1. For an OAuth worker the other three gates apply and the budget one does not.
 - `ApprovePlan`/`RejectPlan` are **not** deleted — they now act on the *worker's* plan, and rejection
   carries feedback the worker revises against rather than terminating it.
 

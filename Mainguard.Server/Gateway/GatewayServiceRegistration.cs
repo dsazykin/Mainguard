@@ -28,7 +28,8 @@ namespace Mainguard.Server.Gateway;
 /// </summary>
 public static class GatewayServiceRegistration
 {
-    public static void Register(WebApplicationBuilder builder, string dbPath, Action<string>? log = null)
+    public static void Register(
+        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null)
     {
         var services = builder.Services;
 
@@ -201,6 +202,36 @@ public static class GatewayServiceRegistration
         // the daemon DB opened, in-memory otherwise, so the daemon always starts.
         RegisterPrIntake(services, dbFactory);
 
+        // ---- the model-proxy data path (MG-4 / P2-08 invariant #1) -------------------------------
+        // These three types existed but were constructed ONLY in tests, so the gateway had no
+        // production data path at all: no credential custody, no forwarder, and therefore no ledger
+        // write on any real request. AiGateway.Acquire/Settle — the only writer to BudgetLedger — was
+        // reachable exclusively from test code. Registering them here is what makes a BYOK agent's
+        // spend actually charge, and an over-budget agent actually refuse.
+        //
+        // Registered unconditionally (not gated on the gateway being enabled) so the spawn path can ask
+        // for credentials and get a coherent "no confinement configured" answer, rather than the DI
+        // container throwing at spawn time on a daemon with the gateway off.
+        services.AddSingleton<AgentGatewayCredentials>();
+        services.AddSingleton<IAgentPortMap, NullAgentPortMap>();
+        services.AddSingleton(sp => new GatewayForwarder(
+            sp.GetRequiredService<AiGateway>(),
+            // One pooled handler for every upstream call — the provider connection is TLS to the real
+            // model host, established here, daemon-side, which is the whole point of the hop: the jail
+            // never holds a credential that works against it.
+            new HttpMessageInvoker(new SocketsHttpHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.None,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            })));
+
+        // The confinement descriptor the spawn path reads. Null base URL ⇒ the gateway is disabled and
+        // BuildSecrets keeps today's behaviour exactly (the raw key goes to the jail), which is what
+        // keeps a daemon started without --gateway-bind byte-identical to before this change.
+        services.AddSingleton(new GatewayConfinementOptions(
+            BaseUrl: BuildGatewayBaseUrl(options),
+            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
+
         services.AddHostedService<GatewayHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
@@ -287,6 +318,22 @@ public static class GatewayServiceRegistration
             return intake;
         });
     }
+
+    /// <summary>
+    /// The base URL a confined jail's CLI is pointed at, or null when the gateway is disabled.
+    ///
+    /// <para>The address is the daemon's own gateway bind address — MEASURED to be reachable from a jail
+    /// only via that jail's egress proxy, never directly (a container on an <c>Internal=true</c> network
+    /// can reach its own bridge's host-side address and nothing else; see
+    /// <c>docs/design/oauth-budgeting.md</c> for the measurements). Plain <c>http</c> is deliberate: the
+    /// hop is jail → its own segment proxy → daemon, entirely inside the VM's private networking, and
+    /// the credential it carries is a Mainguard session token rather than a provider key. The TLS that
+    /// matters is the daemon → provider leg, which the forwarder establishes.</para>
+    /// </summary>
+    internal static string? BuildGatewayBaseUrl(DaemonOptions? options) =>
+        options is null || string.IsNullOrWhiteSpace(options.GatewayBindAddress)
+            ? null
+            : $"http://{options.GatewayBindAddress}:{options.GatewayPort}";
 
     /// <summary>
     /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's

@@ -43,10 +43,18 @@ public sealed class SandboxAgentLauncher
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly ILogger _log;
+    private readonly Gateway.AgentGatewayCredentials? _credentials;
+    private readonly Gateway.GatewayConfinementOptions? _gatewayOptions;
 
     public SandboxAgentLauncher(
-        IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null)
+        IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null,
+        Gateway.AgentGatewayCredentials? credentials = null,
+        Gateway.GatewayConfinementOptions? gatewayOptions = null)
     {
+        // Optional so the many direct-construction tests (and the RequiresDocker spawn tests) keep
+        // compiling unchanged; DI supplies both. Absent ⇒ no confinement ⇒ today's behaviour.
+        _credentials = credentials;
+        _gatewayOptions = gatewayOptions;
         _environment = environment ?? throw new ArgumentNullException(nameof(environment));
         // Single source with the provisioner (SandboxImages.AgentBase) so the daemon preflights/spawns
         // exactly the tag the app builds/labels — including a MAINGUARD_AGENT_IMAGE override.
@@ -198,7 +206,14 @@ public sealed class SandboxAgentLauncher
             _log.LogInformation(
                 "egress segment ready: network={Network} proxy={Proxy}", segment.NetworkName, segment.ProxyAddress);
 
-            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials);
+            // MG-4: mint this agent's gateway confinement — a Mainguard session token for the jail, the
+            // real provider key kept daemon-side, and the agent's UPSTREAM BINDING recorded so the
+            // gateway knows which provider to forward its traffic to. Null when the gateway is disabled
+            // (the default) or the CLI cannot be redirected, and BuildSecrets then keeps today's
+            // behaviour exactly. This argument is what was missing: without it the confinement machinery
+            // below was complete but never invoked, so every BYOK jail received the raw provider key.
+            var confinement = TryConfineToGateway(agentId, modelApiKey, adapter);
+            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement);
             var handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
                 AgentId: agentId,
@@ -310,6 +325,44 @@ public sealed class SandboxAgentLauncher
     {
         try { _environment.Worktrees.RemoveAgentWorktree(repoHash, agentId, force: true); }
         catch { /* best effort */ }
+    }
+
+    /// <summary>
+    /// Mints the MG-4 gateway confinement for one spawn, or null to leave the spawn exactly as it was.
+    ///
+    /// <para>ALL of the following must hold, and each null return is a deliberate refusal rather than a
+    /// degradation:</para>
+    /// <list type="bullet">
+    ///   <item>the daemon actually bound a gateway (<c>--gateway-bind</c>) — otherwise the CLI would be
+    ///   pointed at nothing and a working BYOK agent would break;</item>
+    ///   <item>a provider key was supplied — an interactive-login (OAuth) agent has no key to confine,
+    ///   holds no credential worth stealing, and must keep its direct route untouched;</item>
+    ///   <item>the CLI declares BOTH a base-URL variable (it can be redirected) and a model host (we know
+    ///   where to forward) — a CLI missing either cannot be fronted without breaking it.</item>
+    /// </list>
+    /// </summary>
+    private GatewayConfinement? TryConfineToGateway(
+        string agentId, string? modelApiKey, InstalledAdapterMarker? adapter)
+    {
+        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(modelApiKey)
+            || adapter?.BaseUrlEnvVar is not { Length: > 0 }
+            || adapter.ModelHost is not { Length: > 0 } upstreamHost)
+        {
+            return null;
+        }
+
+        // The one lookup that answers BOTH "who is calling" and "where does it go": the token the jail
+        // receives resolves, gateway-side, to this agent id, its budget, and this upstream host.
+        var token = _credentials.Issue(agentId, modelApiKey, upstreamHost);
+        _log.LogInformation(
+            "gateway confinement issued: agent={Agent} upstream={Upstream} baseUrlVar={Var}",
+            agentId, upstreamHost, adapter.BaseUrlEnvVar);
+        return new GatewayConfinement(gateway.BaseUrl!, token);
     }
 
     /// <summary>

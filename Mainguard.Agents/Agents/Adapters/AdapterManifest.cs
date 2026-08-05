@@ -94,6 +94,13 @@ public sealed record AdapterSpec(
     /// cannot be redirected, so it must talk to the provider directly and BYOK confinement does not
     /// apply to it.</summary>
     [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null,
+    /// <summary>The provider host THIS CLI's model traffic goes to (e.g. <c>api.anthropic.com</c> for
+    /// claude-code). Paired with <see cref="BaseUrlEnvVar"/>: the base-URL variable says the CLI *can* be
+    /// redirected to the gateway, and this says where the gateway must then forward its traffic. Recorded
+    /// as the agent's per-agent upstream binding at spawn, because once the CLI is pointed at the gateway
+    /// the inbound request's Host header names the GATEWAY and can no longer identify the provider. Null =
+    /// no upstream binding, so this CLI is never gateway-confined.</summary>
+    [property: JsonPropertyName("modelHost")] string? ModelHost = null,
     /// <summary>MG-9: how much ORIGIN assurance this CLI's tarball is required to carry —
     /// <c>"npm-build-provenance"</c>, <c>"npm-registry-signature"</c>, or <c>"none"</c>. Mandatory on
     /// every npm-sourced adapter: <see cref="AdapterManifest.Parse"/> refuses a spec that omits it, so

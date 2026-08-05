@@ -959,6 +959,14 @@
   authenticated token instead of the spoofable `x-mainguard-agent` header, injects the daemon-held key
   at the network hop so the agent's own credential never survives it, refuses an unauthenticated
   caller with 401, and filters credential/Mainguard/hop-by-hop headers both directions),
+  `GatewayUpstreamBindingTests` (**the per-agent upstream binding — every request built the way a
+  confined jail actually sends it, i.e. `Host` = the GATEWAY rather than the provider. The custody
+  tests above all use `Host = api.anthropic.com`, a shape production cannot produce once a CLI is
+  pointed at the gateway, which is why they passed while the real path fell through unfronted and
+  charged nothing. Covers: routing to the agent's bound upstream, `BudgetLedger` actually charged,
+  an over-budget agent refused 402 with nothing forwarded, an OAuth agent passing through untouched
+  and NOT 401'd (the regression that would hurt most), and an unknown token on the legacy model-host
+  shape still refused so the pass-through is not an auth bypass**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly

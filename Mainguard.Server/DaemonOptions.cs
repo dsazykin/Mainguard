@@ -101,6 +101,35 @@ public sealed record DaemonOptions
                     options = options with { TerminalEngine = args[i + 1] };
                     i++;
                     break;
+                // MG-4/MG-13: turning the model gateway on. Previously settable ONLY through
+                // MAINGUARD_GATEWAY_BIND, which nothing in the repo ever set — so the listener was
+                // unreachable by every supported way of starting the daemon (systemd unit, installer,
+                // dev loop) and the confinement it enables could not be switched on at all.
+                case "--gateway-bind":
+                    if (i + 1 >= args.Length)
+                    {
+                        throw new ArgumentException(
+                            "--gateway-bind requires a private or loopback IP address (never a wildcard).");
+                    }
+
+                    options = options with { GatewayBindAddress = args[i + 1] };
+                    i++;
+                    break;
+                case "--gateway-port":
+                    // Same loudness rule as --port: an unparseable value must not leave the gateway
+                    // silently on a different port than the operator believes.
+                    if (i + 1 >= args.Length
+                        || !int.TryParse(args[i + 1], out var gatewayPort)
+                        || gatewayPort is < 1 or > 65535)
+                    {
+                        throw new ArgumentException(
+                            "--gateway-port requires a TCP port number (1-65535); got "
+                            + $"'{(i + 1 < args.Length ? args[i + 1] : "<nothing>")}'.");
+                    }
+
+                    options = options with { GatewayPort = gatewayPort };
+                    i++;
+                    break;
             }
         }
 
