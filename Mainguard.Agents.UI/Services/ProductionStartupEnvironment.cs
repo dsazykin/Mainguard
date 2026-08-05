@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Avalonia.Threading;
 using Mainguard.Agents;
 using Mainguard.Agents.Agents.Bootstrap;
+using Mainguard.Agents.Daemon;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.Git;
 using Mainguard.UI.ViewModels;
@@ -66,6 +67,126 @@ internal sealed class ProductionStartupEnvironment : IAppStartupEnvironment
         catch (Exception)
         {
             return false; // unreachable / still booting
+        }
+    }
+
+    /// <summary>
+    /// Walks the connect path leg by leg and reports the FIRST one that is actually broken. Each arm
+    /// returns only what its own check established — the distro list, <c>pgrep</c>, the token file, the
+    /// credential files beside it, then the RPC's own status code. Nothing here infers a cause from a
+    /// neighbouring symptom, because a message that guesses is worse than one that says less.
+    /// </summary>
+    public async Task<DaemonConnectDiagnosis> DiagnoseDaemonConnectAsync(CancellationToken ct)
+    {
+        try
+        {
+            var wsl = new WslRunner();
+
+            // Leg 1 — is the distro even running?
+            var running = await wsl.RunAsync(WslCommands.ListRunning(), stdin: null, ct).ConfigureAwait(false);
+            var isRunning = WslRunner.ParseDistroList(running.StdOut)
+                .Any(d => string.Equals(d, WslCommands.DistroName, StringComparison.OrdinalIgnoreCase));
+            if (!isRunning)
+            {
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.DistroNotRunning,
+                    $"'wsl --list --running' did not list {WslCommands.DistroName}.");
+            }
+
+            // Leg 2 — is the daemon process up inside it?
+            var probe = new WslDaemonHealthProbe(wsl);
+            if (!await probe.IsHealthyAsync(ct).ConfigureAwait(false))
+            {
+                var detail = await probe.DescribeUnhealthyAsync(ct).ConfigureAwait(false);
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.DaemonProcessNotRunning,
+                    detail ?? "'pgrep -x mainguardd' found no process.");
+            }
+
+            // Leg 3 — has it published a session this app can read?
+            var sessionDirectory = DaemonTokenLocator.TryResolveSessionDirectory();
+            if (sessionDirectory is null)
+            {
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.NoSessionToken,
+                    $"Paths probed: {string.Join(", ", DaemonTokenLocator.CandidatePaths())}.");
+            }
+
+            // Leg 4 — is that session one this build can authenticate against? A daemon predating the
+            // pinned-mTLS control plane writes daemon.token and nothing else, so the client refuses it.
+            var serverCertificate = DaemonTransportFiles.ServerCertificatePath(sessionDirectory);
+            var clientCertificate = DaemonTransportFiles.ClientCertificatePath(sessionDirectory);
+            if (!File.Exists(serverCertificate) || !File.Exists(clientCertificate))
+            {
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.TransportCredentialsMissing,
+                    $"Its session directory '{sessionDirectory}' holds a token but not "
+                    + $"{DaemonTransportFiles.ServerCertificateFileName} and "
+                    + $"{DaemonTransportFiles.ClientCertificateFileName}.");
+            }
+
+            // Leg 5 — everything is in place, so let the call's own status code speak.
+            try
+            {
+                using var daemon = DaemonClient.ForLoopback();
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                timeout.CancelAfter(ReachableProbeTimeout);
+                await daemon.GetDaemonInfoAsync(timeout.Token).ConfigureAwait(false);
+                return DaemonConnectDiagnosis.Reachable; // it answered on this attempt
+            }
+            catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+            {
+                return DaemonConnectDiagnosis.Reachable;
+            }
+            catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.PermissionDenied)
+            {
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.TokenRejected, $"The call returned {ex.StatusCode}.");
+            }
+            catch (Grpc.Core.RpcException ex)
+            {
+                return new DaemonConnectDiagnosis(
+                    DaemonConnectStage.NotListening, $"The call returned {ex.StatusCode}.");
+            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Nothing was established — say exactly that, and carry the raw error.
+            return new DaemonConnectDiagnosis(DaemonConnectStage.Undiagnosed, ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Redeploys the bundled daemon payload into the VM over WSL (stop unit → stage → verify → promote
+    /// → start), which is the one repair that clears a pre-mTLS daemon. Reuses the tier-1
+    /// <see cref="DaemonUpdater"/> directly rather than <see cref="DaemonAutoRefresh"/>, because that
+    /// wrapper decides skew by asking the daemon over gRPC — the very thing that cannot be done here.
+    /// </summary>
+    public async Task<DaemonRepairOutcome> RepairDaemonAsync(CancellationToken ct)
+    {
+        var payload = DaemonUpdater.DefaultPayloadDirectory();
+        if (!Directory.Exists(payload))
+        {
+            return new DaemonRepairOutcome(false, $"this build ships no daemon payload at '{payload}'.");
+        }
+
+        try
+        {
+            var result = await new DaemonUpdater(new WslRunner())
+                .RefreshAsync(payload, ct).ConfigureAwait(false);
+            return new DaemonRepairOutcome(result.Succeeded, result.Message);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            return new DaemonRepairOutcome(false, ex.Message);
         }
     }
 

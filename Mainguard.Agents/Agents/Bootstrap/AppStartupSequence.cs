@@ -91,11 +91,19 @@ public static class StartupStatus
     /// <summary>Terminal: everything is ready.</summary>
     public const string Ready = "Mainguard is ready.";
 
+    /// <summary>Stage 2, after the budget lapses: naming which leg of the connect path is broken.</summary>
+    public const string DiagnosingDaemon = "Checking why the Mainguard OS daemon didn't answer…";
+
+    /// <summary>Stage 2: redeploying the bundled daemon over one too old to speak this build's mTLS.</summary>
+    public const string RepairingDaemon = "Installing the matching Mainguard OS daemon…";
+
     /// <summary>The status line shown on the loading screen the moment the daemon budget is exhausted.</summary>
     public const string DaemonUnreachableStatus =
         "Mainguard OS daemon isn't reachable — continuing with limited agent features.";
 
-    /// <summary>The persistent degraded-entry banner the shell shows until the daemon connects.</summary>
+    /// <summary>The last-resort degraded banner, used only when the probe could not attribute the
+    /// failure to a leg. Every attributable failure carries <see cref="DaemonConnectDiagnosis.Banner"/>
+    /// instead — this generic sentence was the whole user-facing error before that existed.</summary>
     public const string DaemonUnreachableBanner =
         "Mainguard OS daemon isn't reachable yet — reconnecting; some agent features are unavailable.";
 }
@@ -120,6 +128,22 @@ public interface IAppStartupEnvironment
     /// <summary>One reachability probe: true when the daemon ANSWERED (including an
     /// <c>Unimplemented</c> pre-RPC daemon), false when unreachable. Never throws.</summary>
     Task<bool> IsDaemonReachableAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Establishes WHICH leg of the connect path is broken, by checking each leg in turn. Called once,
+    /// after the reachability budget lapses — the hot poll above stays a single cheap RPC. Never throws;
+    /// an unattributable failure comes back as <see cref="DaemonConnectStage.Undiagnosed"/> carrying the
+    /// raw error rather than a guess.
+    /// </summary>
+    Task<DaemonConnectDiagnosis> DiagnoseDaemonConnectAsync(CancellationToken ct);
+
+    /// <summary>
+    /// Redeploys the daemon build this app ships into the VM and restarts the unit — the repair for
+    /// <see cref="DaemonConnectStage.TransportCredentialsMissing"/>, which the app cannot recover from by
+    /// waiting. Runs over WSL, needing no daemon connection (the tier-1 refresh that would normally do
+    /// this is gated behind a reachable daemon, which is precisely what is unavailable here). Never throws.
+    /// </summary>
+    Task<DaemonRepairOutcome> RepairDaemonAsync(CancellationToken ct);
 
     /// <summary>Runs the tier-1 daemon fast-path (skew decision + in-place refresh) and returns the
     /// typed outcome. Wraps <see cref="DaemonAutoRefresh"/>; never throws.</summary>
@@ -213,11 +237,12 @@ public sealed class AppStartupSequence
 
         Report(progress, StartupStage.PrepareEnvironment, BootstrapStageState.Done, string.Empty);
 
-        // 3) ConnectDaemon: reachable within the budget, else degrade.
-        var reachable = await ConnectDaemonAsync(progress, _reachableBudget, ct).ConfigureAwait(false);
-        if (!reachable)
+        // 3) ConnectDaemon: reachable within the budget — else diagnose, repair what is repairable,
+        // and degrade carrying the leg that actually failed.
+        var connectFailure = await ConnectWithRepairAsync(progress, ct).ConfigureAwait(false);
+        if (connectFailure is not null)
         {
-            return Degrade(progress);
+            return connectFailure;
         }
 
         // 4) ApplyUpdates: tier-1 refresh, then the consented tier-2 offer.
@@ -273,12 +298,63 @@ public sealed class AppStartupSequence
         }
     }
 
-    /// <summary>Marks the daemon step failed and continues to a degraded entry with the banner.</summary>
-    private StartupResult Degrade(IProgress<StartupProgress>? progress)
+    /// <summary>
+    /// Connect, and when the budget lapses find out why. A verdict the app can act on
+    /// (<see cref="DaemonConnectDiagnosis.IsRepairableByDaemonRefresh"/>) earns exactly one repair
+    /// attempt plus one fresh connect budget; everything else degrades immediately. Returns
+    /// <c>null</c> when the daemon is up, or the degraded result to return from the sequence.
+    /// </summary>
+    private async Task<StartupResult?> ConnectWithRepairAsync(
+        IProgress<StartupProgress>? progress, CancellationToken ct)
+    {
+        if (await ConnectDaemonAsync(progress, _reachableBudget, ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running, StartupStatus.DiagnosingDaemon);
+        var diagnosis = await _env.DiagnoseDaemonConnectAsync(ct).ConfigureAwait(false);
+        _env.Log($"startup: daemon unreachable within budget — {diagnosis.Stage}: {diagnosis.Detail}");
+
+        if (!diagnosis.IsRepairableByDaemonRefresh)
+        {
+            return Degrade(progress, diagnosis);
+        }
+
+        Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running, StartupStatus.RepairingDaemon);
+        var repair = await _env.RepairDaemonAsync(ct).ConfigureAwait(false);
+        _env.Log($"startup: daemon repair {(repair.Repaired ? "succeeded" : "did not complete")} — {repair.Detail}");
+
+        if (!repair.Repaired)
+        {
+            // Report the repair's own failure; never imply the original leg healed.
+            return Degrade(progress, diagnosis with
+            {
+                Detail = $"{diagnosis.Detail} Installing the matching daemon did not complete: {repair.Detail}",
+            });
+        }
+
+        Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running, StartupStatus.ConnectingDaemon);
+        if (await ConnectDaemonAsync(progress, _reachableBudget, ct).ConfigureAwait(false))
+        {
+            return null;
+        }
+
+        // Re-diagnose: after a successful redeploy the pre-repair verdict is stale, and a banner must
+        // describe what is true NOW, not what was true before the app changed the system.
+        var after = await _env.DiagnoseDaemonConnectAsync(ct).ConfigureAwait(false);
+        _env.Log($"startup: daemon still unreachable after repair — {after.Stage}: {after.Detail}");
+        return Degrade(progress, after);
+    }
+
+    /// <summary>Marks the daemon step failed and continues to a degraded entry, carrying the banner
+    /// for the leg that was actually found broken.</summary>
+    private StartupResult Degrade(IProgress<StartupProgress>? progress, DaemonConnectDiagnosis diagnosis)
     {
         Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Failed, StartupStatus.DaemonUnreachableStatus);
-        _env.Log("startup: daemon unreachable within budget — entering degraded mode");
-        return new StartupResult(false, StartupStatus.DaemonUnreachableBanner);
+        _env.Log($"startup: entering degraded mode ({diagnosis.Stage})");
+        var banner = diagnosis.Banner is { Length: > 0 } text ? text : StartupStatus.DaemonUnreachableBanner;
+        return new StartupResult(false, banner);
     }
 
     /// <summary>Tier-1 daemon fast-path — its own internal budget; failure never degrades entry (the
@@ -323,10 +399,10 @@ public sealed class AppStartupSequence
                 _env.Log("startup: tier-2 upgrade completed — re-running daemon steps against the new VM");
                 Report(progress, StartupStage.ConnectDaemon, BootstrapStageState.Running,
                     StartupStatus.ReconnectingAfterUpgrade);
-                var reachable = await ConnectDaemonAsync(progress, _reachableBudget, ct).ConfigureAwait(false);
-                if (!reachable)
+                var connectFailure = await ConnectWithRepairAsync(progress, ct).ConfigureAwait(false);
+                if (connectFailure is not null)
                 {
-                    return Degrade(progress);
+                    return connectFailure;
                 }
 
                 Report(progress, StartupStage.ApplyUpdates, BootstrapStageState.Running, StartupStatus.CheckingDaemon);

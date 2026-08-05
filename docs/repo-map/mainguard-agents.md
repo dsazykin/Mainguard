@@ -229,6 +229,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       idle-terminates the distro seconds after its last wsl.exe client exits (gRPC connections don't
       count), which stopped mainguardd between RPCs and once killed it mid-migration; G-12-safe, Dispose
       kills the holder).
+    - `DaemonConnectDiagnosis.cs` (the app→daemon connect path's per-leg verdict: `DaemonConnectStage`
+      (distro not running / daemon process down / no session token / transport credentials missing /
+      not listening / token rejected / undiagnosed), the `DaemonConnectDiagnosis` record whose `Banner`
+      is built FROM the observation that produced it, and `DaemonRepairOutcome`. Exists because every
+      one of those legs used to surface as one sentence — "daemon isn't reachable" — and the
+      credentials-missing leg (a daemon predating MG-19's pinned mTLS, which publishes a token but no
+      certificates) could never heal, since the tier-1 refresh that installs the matching daemon only
+      runs AFTER a successful connect. `IsRepairableByDaemonRefresh` marks the one leg the app may
+      repair itself.)
     - `DaemonUpdater.cs` (the tier-1 daemon fast-path — the field-outage fix for the daemon baked into the
       MainguardOS tarball never advancing with the app, so every new RPC answered `Unimplemented`:
       `DaemonVersionInfo` (the proto-free `GetDaemonInfo` result), `DaemonUpdatePolicy` (pure skew
