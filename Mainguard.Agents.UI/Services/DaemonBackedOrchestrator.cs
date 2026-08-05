@@ -49,6 +49,19 @@ public sealed class DaemonBackedOrchestrator :
 
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
+    /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
+    /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
+    /// and the window it bounds is how much of a fresh interactive login a hard crash can lose.
+    /// </summary>
+    private static readonly TimeSpan DefaultLoginHarvestInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>How long <see cref="Dispose"/> will wait for the FINAL harvest before giving up. App
+    /// close must stay responsive, so this is a budget, not a guarantee — the periodic sweep is what
+    /// makes the keychain warm enough that losing this one costs at most the last interval.</summary>
+    private static readonly TimeSpan ShutdownHarvestBudget = TimeSpan.FromSeconds(5);
+
     /// <summary>SpawnAgent runs the daemon's whole provision chain (worktree + hardened container +
     /// CLI bind under a PTY) — on a cold start that is well past the client's 10 s RPC default, whose
     /// expiry cancelled the server-side spawn mid-provision and tore it down (the "never starts on
@@ -64,6 +77,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Func<Mainguard.Git.Services.IOperationJournal> _journalFactory;
     private readonly Lazy<Mainguard.Agents.Services.IHostPullRequestGateway> _hostPullRequests;
     private readonly CancellationTokenSource _cts = new();
+    private readonly TimeSpan _loginHarvestInterval;
     private readonly object _gate = new();
 
     // ---- projections (all guarded by _gate) ----
@@ -91,6 +105,7 @@ public sealed class DaemonBackedOrchestrator :
     private Task? _spendPump;
     private Task? _conversationPump;
     private Task? _queuePump;
+    private Task? _loginHarvestPump;
     private CancellationTokenSource? _queuePumpCts;
     private long _seq;
 
@@ -113,14 +128,22 @@ public sealed class DaemonBackedOrchestrator :
     /// runs here, exactly like the local leg's <c>git merge</c>. Injectable so tests drive a fake host and
     /// never the live GitHub API.</para>
     /// </param>
+    /// <param name="loginHarvestInterval">How often the background login-harvest pump sweeps live agents
+    /// into the keychain (defaults to <see cref="DefaultLoginHarvestInterval"/>). Injectable so the
+    /// round-trip test can drive a sweep in seconds instead of minutes; it changes the CADENCE only,
+    /// never whether the sweep happens.</param>
     public DaemonBackedOrchestrator(
         DaemonClient client, bool ownsClient = true, Func<string, string?>? keystoreLookup = null,
         Func<string, IReadOnlyList<string>>? keystoreList = null,
         Action<string, string>? keystoreSave = null,
         Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null,
-        Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null)
+        Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null,
+        TimeSpan? loginHarvestInterval = null)
     {
         _client = client ?? throw new ArgumentNullException(nameof(client));
+        _loginHarvestInterval = loginHarvestInterval is { } interval && interval > TimeSpan.Zero
+            ? interval
+            : DefaultLoginHarvestInterval;
         _ownsClient = ownsClient;
         _keystoreLookup = keystoreLookup ?? DefaultKeystoreLookup;
         _keystoreList = keystoreList ?? DefaultKeystoreList;
@@ -212,6 +235,7 @@ public sealed class DaemonBackedOrchestrator :
         _planPump = Task.Run(() => PlanPumpAsync(_cts.Token));
         _spendPump = Task.Run(() => SpendPumpAsync(_cts.Token));
         _conversationPump = Task.Run(() => ConversationPumpAsync(_cts.Token));
+        _loginHarvestPump = Task.Run(() => LoginHarvestPumpAsync(_cts.Token));
     }
 
     /// <summary>P2-47 #5: a live terminal gateway over the daemon's <c>TerminalService.Attach</c> bidi stream,
@@ -328,6 +352,51 @@ public sealed class DaemonBackedOrchestrator :
                 ApplyConversationUpdate(update);
             }
         }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The login-harvest pump — the production caller of <see cref="PersistLiveAgentLoginsAsync"/>.
+    ///
+    /// <para><b>Why this exists.</b> The round-trip's durable half is the host OS keychain, and the only
+    /// thing that ever wrote to it was <see cref="EndAgentAsync"/>: the client persisted whatever the
+    /// <c>StopAgent</c> RPC handed back. <see cref="PersistLiveAgentLoginsAsync"/> — the sweep that keeps
+    /// the keychain warm while agents RUN — had no callers anywhere in the repository, so every path that
+    /// is not an explicit in-app Stop lost the login outright: app close, a daemon restart, a VM stop, a
+    /// crash, or simply leaving the agent running. The user then had to sign in again inside the jail on
+    /// every single session, which is the exact symptom the credentialPaths round-trip was built to
+    /// remove. Restore was wired; harvest was not.</para>
+    ///
+    /// <para>Best-effort and silent by construction: a down daemon, an agent with no jail, and a CLI that
+    /// has not been signed into yet all yield nothing, and an empty harvest never clobbers a good
+    /// keychain entry (<see cref="PersistHarvestedLogin"/> ignores it). Nothing here stores a credential
+    /// agent-side — the bytes go from the jail's tmpfs straight into the host keychain.</para>
+    /// </summary>
+    private async Task LoginHarvestPumpAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(_loginHarvestInterval, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                await PersistLiveAgentLoginsAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception)
+            {
+                // A failed sweep must never end the pump — the next one retries.
+            }
+        }
     }
 
     private async Task QueuePumpAsync(string repoHandle, CancellationToken ct)
@@ -653,9 +722,13 @@ public sealed class DaemonBackedOrchestrator :
 
     /// <summary>
     /// Pulls the CURRENT login state of every live agent into the host OS keychain, without stopping
-    /// anything. Call this periodically while agents run and on app shutdown: harvest otherwise only
-    /// happens on an explicit StopAgent, so a daemon shutdown / VM stop / crash lost the login
-    /// entirely and the user had to sign in again on every launch.
+    /// anything. Harvest otherwise only happens on an explicit StopAgent, so a daemon shutdown / VM
+    /// stop / crash lost the login entirely and the user had to sign in again on every launch.
+    ///
+    /// <para>Driven from exactly two places, and both are load-bearing: <see cref="LoginHarvestPumpAsync"/>
+    /// (periodically, while agents run) and <see cref="Dispose"/> (once more at app close). This method
+    /// existed with NO callers at all, which made the whole round-trip inert outside an in-app Stop —
+    /// so a change that removes either caller is removing the fix, not tidying it.</para>
     ///
     /// <para>Best-effort by design — a daemon that is down or an agent that has not signed in yet
     /// simply yields nothing, and an empty harvest never clobbers a good keychain entry
@@ -1256,12 +1329,27 @@ public sealed class DaemonBackedOrchestrator :
 
     public void Dispose()
     {
+        // The LAST harvest, BEFORE anything is cancelled — this is the app-close leg of the login
+        // round-trip. Closing Mainguard with agents still running used to lose every login performed in
+        // this session (the jail's $HOME is tmpfs and dies with the VM/containers), so the sweep runs
+        // once more here on its OWN token: _cts is cancelled immediately below, and a harvest bound to
+        // it would be cancelled before it could issue a single RPC. Bounded by ShutdownHarvestBudget and
+        // run off the calling thread, so a wedged daemon delays the exit by seconds rather than hanging
+        // the UI thread on a sync-over-async wait.
+        try
+        {
+            using var shutdownHarvest = new CancellationTokenSource(ShutdownHarvestBudget);
+            Task.Run(() => PersistLiveAgentLoginsAsync(shutdownHarvest.Token), shutdownHarvest.Token)
+                .Wait(ShutdownHarvestBudget);
+        }
+        catch { /* a failed final harvest costs at most the last sweep interval — never the exit */ }
+
         _cts.Cancel();
         try { _queuePumpCts?.Cancel(); } catch { /* ignore */ }
         try
         {
             Task.WaitAll(
-                new[] { _agentPump, _planPump, _spendPump, _conversationPump, _queuePump }
+                new[] { _agentPump, _planPump, _spendPump, _conversationPump, _queuePump, _loginHarvestPump }
                     .Where(t => t is not null).Select(t => t!).ToArray(),
                 TimeSpan.FromSeconds(2));
         }
