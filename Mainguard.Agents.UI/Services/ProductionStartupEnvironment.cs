@@ -315,12 +315,36 @@ internal sealed class ProductionStartupEnvironment : IAppStartupEnvironment
 
     public void KickSandboxImageBuild(System.Collections.Generic.IReadOnlyList<SandboxImageSpec> missing)
     {
-        // Fire-and-forget: the (minutes-long) build must never hold the loading screen. Reuses the
-        // existing installer so the Installed/Updated/InstallFailed shell toast still fires. It
-        // re-probes cheaply; that keeps the toast path single-sourced. The progress sink (previously
-        // discarded) now leaves per-step build/load breadcrumbs in oobe.log while it runs.
+        // Not awaited (the minutes-long build must never hold the loading screen) but no longer
+        // DISCARDED: the run is registered with the shared tracker, which is what lets the shutdown
+        // sequence refuse to terminate MainguardEnv underneath it and what stops a Tools rebuild from
+        // starting a rival docker build of the same tag. Reuses the existing installer so the
+        // Installed/Updated/InstallFailed shell toast still fires; it re-probes cheaply, which keeps
+        // the toast path single-sourced.
         var progress = new Progress<string>(line => _log($"sandbox images: {line}"));
-        _ = Task.Run(() => SandboxImageInstaller.RunAsync(_log, progress));
+
+        // `joined` is set by the callback, which RunExclusiveAsync invokes SYNCHRONOUSLY inside its lock
+        // before returning — unlike the work lambda, which is dispatched to the pool and would still be
+        // unobserved here.
+        var joined = false;
+        _ = SandboxImageProvisioningTracker.Shared.RunExclusiveAsync(
+            () => SandboxImageInstaller.RunAsync(_log, progress),
+            onJoinedExisting: () =>
+            {
+                joined = true;
+                _log("startup: a sandbox image build is already running — joined it instead of starting a second");
+            });
+
+        // Tell the user a MULTI-MINUTE build just began. Until now the startup path was silent until it
+        // finished, so the only signal was the coordinator refusing to start — and the natural reaction
+        // (quit and relaunch) killed the build. The Tools rebuild already announces itself; this makes
+        // the automatic path equally honest, and the wording matches the preflight banner's advice.
+        if (!joined)
+        {
+            Dispatcher.UIThread.Post(() => Editions.ProComposition.ShowShellToast(
+                "Updating sandbox images — this takes a few minutes. Leave Mainguard running.",
+                false));
+        }
     }
 
     private static async Task<DaemonVersionInfo?> QueryDaemonInfoAsync(DaemonClient daemon, CancellationToken ct)
