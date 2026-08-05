@@ -424,7 +424,11 @@ public sealed class ExternalPrIntakeSpawnWiringTests
                     queueStore: _ => new InMemoryMergeQueueStore(),
                     verificationStore: _ => new InMemoryVerificationStore(),
                     sandboxes: new NeverRunSandboxEngine(),
-                    artifactDirectory: NewDir("mainguard-prtarget-artifacts-")),
+                    artifactDirectory: NewDir("mainguard-prtarget-artifacts-"),
+                    // The production diff service over the same mirror. This resolver test never runs a
+                    // verification, so the flagged-change review is never armed here — it only has to be
+                    // constructible.
+                    mergeDiff: new MergeBranchDiffService(new RepoProvisioner(_vmRoot))),
                 // The production remote reader, not a fake.
                 path => new Mainguard.Git.Services.GitService().GetRemotes(path));
         }
