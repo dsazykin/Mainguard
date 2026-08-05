@@ -76,9 +76,12 @@
 
         </Grid>
 
-        <!-- Floating notification toasts (#85): stacked, newest at the bottom, capped at 3 (see
-             RepoDashboardViewModel.ShowNotification/Toasts). -->
-        <ItemsControl Grid.Row="1" ItemsSource="{Binding Toasts}" ZIndex="100"
+        <!-- Floating notification toasts (#85): bottom-right, stacked upward with the newest nearest
+             the corner, capped at 3 (see RepoDashboardViewModel.ShowNotification/Toasts). Row 0 is the
+             whole surface — the enclosing Grid defines exactly one row, so the previous Grid.Row="1"
+             was out of range (Avalonia clamped it back to 0) and only worked by accident. Same corner
+             as MainWindow's shell-level toast host, deliberately. -->
+        <ItemsControl Grid.Row="0" ItemsSource="{Binding Toasts}" ZIndex="100"
                       HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="20">
             <ItemsControl.ItemsPanel>
                 <ItemsPanelTemplate>

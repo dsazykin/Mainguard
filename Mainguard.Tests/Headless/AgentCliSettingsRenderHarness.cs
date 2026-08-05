@@ -35,6 +35,7 @@ public class AgentCliSettingsRenderHarness
                 Settle();
 
                 Capture(theme.Key, "list", new AgentCliSettingsViewModel(ListMix()));
+                Capture(theme.Key, "updatable", UpdatableVm());
                 Capture(theme.Key, "installing", InstallingVm());
                 Capture(theme.Key, "failure", new AgentCliSettingsViewModel(FailureMix()));
                 Capture(theme.Key, "loading", new AgentCliSettingsViewModel(
@@ -59,6 +60,24 @@ public class AgentCliSettingsRenderHarness
         new AgentCliRowViewModel("opencode", "OpenCode", "1.18.1"),
         new AgentCliRowViewModel("long", "An Agent CLI With A Deliberately Very Long Product Name That Truncates", "10.20.300-rc.4+build.99"),
     };
+
+    /// <summary>The Mainguard-managed updater's annotations, applied AFTER construction exactly as
+    /// <c>AnnotateUpdatesAsync</c> does — so this state also exercises the row → command
+    /// <c>CanExecuteChanged</c> bridge that keeps Update/Revert clickable (the "visible but disabled"
+    /// regression; <see cref="RowCommandEnablementTests"/> asserts the enablement, this shows it).</summary>
+    private static AgentCliSettingsViewModel UpdatableVm()
+    {
+        var rows = new[]
+        {
+            new AgentCliRowViewModel("claude-code", "Claude Code", "2.1.210", isInstalled: true),
+            new AgentCliRowViewModel("codex", "OpenAI Codex CLI", "0.144.4", isInstalled: true),
+            new AgentCliRowViewModel("opencode", "OpenCode", "1.18.1"),
+        };
+        var vm = new AgentCliSettingsViewModel(rows);
+        vm.Clis[0].UpdateAvailableVersion = "2.1.220";              // update offered
+        vm.Clis[1].PreviousVersion = "0.144.3";                     // revert offered
+        return vm;
+    }
 
     private static AgentCliSettingsViewModel InstallingVm()
     {

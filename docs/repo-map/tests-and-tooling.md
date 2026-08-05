@@ -22,6 +22,23 @@
     themes × list/installing/failure/loading/load-error →
     `artifacts_headless/agent_cli_settings_<Theme>_<state>.png` (`OobeWizardRenderHarness` gained the
     picker's `clis_pick`/`clis_installing`/`clis_results` states).
+  - **`Mainguard.Tests/Headless/RowCommandEnablementTests.cs`** — the "visible but permanently
+    disabled button" regression (owner: *"the update cli button isn't clickable"*). Renders the real
+    `AgentCliSettingsView`, flips a row's `UpdateAvailableVersion` / `PreviousVersion` / `IsInstalled`,
+    and asserts the rendered `Button.IsEffectivelyEnabled` — deliberately NOT visibility, which is the
+    half that always worked. Pins the whole class: the per-row Install/Update/Revert commands live on
+    `AgentCliSettingsViewModel` but their `CanExecute` reads ROW state, so the parent must bridge row
+    `PropertyChanged` → `…Command.NotifyCanExecuteChanged()` (`[NotifyCanExecuteChangedFor]` on the
+    parent's `IsBusy` covers only half of it). The ViewModel-level twins that pin the notification
+    itself live in `AgentCliUiTests.Settings_Row*`.
+  - **`Mainguard.Tests/Headless/MainWindowShellRenderHarness.cs`** — the real `MainWindow` shell:
+    top-nav/toolbar + opening overlay (`mainwindow_shell.png`), the Settings window's pinned-menu
+    picker (`settings_window.png`), and BOTH toast hosts pinned to the **bottom-right** corner with
+    measured geometry (not eyeballed) plus five-theme PNGs — the dashboard stack
+    (`toasts_stacked_<Theme>.png`) and the shell-level stack
+    (`shell_toasts_bottom_right_<Theme>.png`), the latter also covering upward stacking order. The
+    position tests exist because the shell host lost its `Grid.Row="1"` and rendered top-right out of
+    the title-bar row; they fail with the measured y-offset rather than a bare boolean.
   - `StartupShutdownRenderHarness` (owner design 2026-07-17) renders `StartupWindow` + `ShutdownWindow`
     in all five themes across the key states (`loading_early`, `upgrade_consent`, `upgrade_running`,
     `degraded`, and the shutdown `stopping_vm`/`releasing`), plus the `MainWindow` degraded banner —

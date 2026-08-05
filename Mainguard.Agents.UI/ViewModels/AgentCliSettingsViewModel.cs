@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -32,6 +34,7 @@ public partial class AgentCliSettingsViewModel : ViewModelBase, ISettingsPage
     /// Mainguard-managed updater that annotates rows with newer registry releases and one-step revert.</summary>
     public AgentCliSettingsViewModel(AgentCliInstaller installer, AgentCliUpdateService? updater = null)
     {
+        WatchRows();
         _installer = installer ?? throw new ArgumentNullException(nameof(installer));
         _updater = updater;
     }
@@ -39,6 +42,7 @@ public partial class AgentCliSettingsViewModel : ViewModelBase, ISettingsPage
     /// <summary>Design/render constructor: fixed representative rows, no service behind them.</summary>
     public AgentCliSettingsViewModel(IEnumerable<AgentCliRowViewModel> rows, bool isLoading = false, string? loadError = null)
     {
+        WatchRows();
         foreach (var row in rows)
             Clis.Add(row);
         _isLoading = isLoading;
@@ -46,6 +50,60 @@ public partial class AgentCliSettingsViewModel : ViewModelBase, ISettingsPage
     }
 
     public ObservableCollection<AgentCliRowViewModel> Clis { get; } = new();
+
+    // ---- per-row command enablement --------------------------------------------------------------
+    //
+    // Install/Update/Revert are commands on THIS view model, but their CanExecute predicates read
+    // state off the ROW passed as CommandParameter (row.CanInstall / row.HasUpdate / row.HasPrevious).
+    // [NotifyCanExecuteChangedFor] on IsBusy only covers half of that: when a row changed — the
+    // updater annotating it with a newer release, a probe flipping IsInstalled — the row raised
+    // PropertyChanged (so the button turned VISIBLE, which always worked) while the command never
+    // re-published CanExecuteChanged. A Button caches its last CanExecute result, so it rendered
+    // visible and permanently DISABLED. Bridging row notifications to the commands is the fix; do not
+    // add a row-state-reading CanExecute without adding its property here.
+
+    /// <summary>Rows we have subscribed to. <c>Clear()</c> raises Reset with no OldItems, so the
+    /// subscriptions have to be tracked rather than recovered from the event.</summary>
+    private readonly List<AgentCliRowViewModel> _watched = new();
+
+    /// <summary>Row properties every per-row command's CanExecute reads.</summary>
+    private static readonly HashSet<string> RowCommandInputs = new(StringComparer.Ordinal)
+    {
+        nameof(AgentCliRowViewModel.CanInstall),
+        nameof(AgentCliRowViewModel.HasUpdate),
+        nameof(AgentCliRowViewModel.HasPrevious),
+    };
+
+    private void WatchRows() => Clis.CollectionChanged += OnClisChanged;
+
+    private void OnClisChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        foreach (var row in _watched)
+            row.PropertyChanged -= OnRowChanged;
+        _watched.Clear();
+        foreach (var row in Clis)
+        {
+            row.PropertyChanged += OnRowChanged;
+            _watched.Add(row);
+        }
+
+        NotifyRowCommands();
+        OnPropertyChanged(nameof(ShowEmpty)); // ShowEmpty reads Clis.Count, which does not notify
+    }
+
+    private void OnRowChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        // A null/empty name means "everything changed" (INotifyPropertyChanged convention).
+        if (string.IsNullOrEmpty(e.PropertyName) || RowCommandInputs.Contains(e.PropertyName))
+            NotifyRowCommands();
+    }
+
+    private void NotifyRowCommands()
+    {
+        InstallCommand.NotifyCanExecuteChanged();
+        UpdateCommand.NotifyCanExecuteChanged();
+        RevertCommand.NotifyCanExecuteChanged();
+    }
 
     /// <summary>True while the channel + per-CLI probes are read — a named "checking" line shows.</summary>
     [ObservableProperty]
