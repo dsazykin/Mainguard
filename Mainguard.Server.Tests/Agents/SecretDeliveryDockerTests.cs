@@ -79,8 +79,12 @@ public class SecretDeliveryDockerTests
         // it would pin an incidental rather than the control.
 
         // The second write goes to a DIFFERENT uid. Asserting only the first would pass against an
-        // implementation that ignored the owner argument entirely and chowned everything to the agent.
-        var oob = await ReadFileFactsAsync(fixture, handle.ContainerId, OobKeyPath, ct);
+        // implementation that ignored the owner argument entirely and gave everything to the agent.
+        //
+        // Probed AS THE SUPERVISOR, because K now lives in the supervisor uid's own 0700 directory: the
+        // agent cannot see it at all, and asking the agent would conflate "not delivered" with "properly
+        // hidden". The two questions are asked separately, of the two uids that can answer them.
+        var oob = await ReadFileFactsAsync(fixture, handle.ContainerId, OobKeyPath, ct, asUid: 1001);
         Assert.True(oob.Ran, "the in-jail probe did not run for the OOB key path. Raw: " + oob.Raw);
         Assert.True(oob.Exists, $"'{OobKeyPath}' was not delivered. Raw: " + oob.Raw);
         Assert.Equal("400", oob.Mode);
@@ -89,6 +93,18 @@ public class SecretDeliveryDockerTests
         // G2 control 1, stated as the relationship rather than as two constants: the OOB key must not be
         // readable by the uid the (potentially prompt-injected) agent CLI runs as.
         Assert.NotEqual(credential.Uid, oob.Uid);
+
+        // …and demonstrated, not merely inferred from the modes: the SAME probe, run as the agent, cannot
+        // reach K — it does not even resolve, because the supervisor's directory denies the agent uid
+        // before the file's own 0400 is ever consulted. The control now holds one level earlier than it
+        // did when both secrets shared a traversable 0711 directory.
+        var oobFromAgent = await ReadFileFactsAsync(fixture, handle.ContainerId, OobKeyPath, ct);
+        Assert.True(oobFromAgent.Ran,
+            "the in-jail probe did not run as the agent, so 'the agent cannot reach K' is unmeasured. Raw: "
+            + oobFromAgent.Raw);
+        Assert.False(oobFromAgent.Exists,
+            "the agent uid can reach the supervisor-owned OOB key. Raw: " + oobFromAgent.Raw);
+        Assert.DoesNotContain(nonce, oobFromAgent.Raw, StringComparison.Ordinal);
     }
 
     [RequiresDockerFact]
@@ -174,8 +190,9 @@ public class SecretDeliveryDockerTests
     private sealed record FileFacts(
         bool Ran, bool Exists, string Content, string Bytes, string Mode, string Uid, string Gid, string Raw);
 
+    /// <param name="asUid">The uid to run the probe as. Null = the container's own user (the agent).</param>
     private static async Task<FileFacts> ReadFileFactsAsync(
-        SandboxFixture fixture, string containerId, string path, CancellationToken ct)
+        SandboxFixture fixture, string containerId, string path, CancellationToken ct, int? asUid = null)
     {
         // The frame opener is printed by the shell itself, unconditionally, BEFORE anything can fail —
         // so a missing frame proves the probe never ran rather than that the answer was "no".
@@ -193,10 +210,12 @@ public class SecretDeliveryDockerTests
 
         // Read-only exec — no stdin. This probe must not depend on the very channel under test, or a
         // broken transport would take the measurement down with it and report nothing at all.
-        var result = await fixture.Engine.ExecAsync(
-            containerId, new[] { "sh", "-c", script, "sh", path }, ct).ConfigureAwait(false);
-
-        var raw = result.Stdout + result.Stderr;
+        //
+        // The uid matters now that each secret lives in its OWNER'S own 0700 directory: a probe run as
+        // the agent reports the supervisor's key ABSENT, which is the isolation working rather than a
+        // delivery failure. So "was it delivered?" is asked as the owner, and "can the agent get it?"
+        // is asked separately, as the agent — see the caller.
+        var raw = await ProbeAsAsync(fixture, containerId, script, path, asUid, ct).ConfigureAwait(false);
         var start = raw.IndexOf(FactFrame, StringComparison.Ordinal);
         if (start < 0)
             return new FileFacts(false, false, "", "", "", "", "", raw);
@@ -217,5 +236,32 @@ public class SecretDeliveryDockerTests
             Uid: parts.Length > 4 ? parts[4] : "",
             Gid: parts.Length > 5 ? parts[5] : "",
             Raw: raw);
+    }
+
+    /// <summary>Runs the probe as a chosen uid. The engine's own <c>ExecAsync</c> deliberately sets no
+    /// user (every jail exec is the agent), so the per-owner read goes through the Docker client the
+    /// fixture already exposes rather than widening a production signature for a test.</summary>
+    private static async Task<string> ProbeAsAsync(
+        SandboxFixture fixture, string containerId, string script, string path, int? asUid, CancellationToken ct)
+    {
+        if (asUid is null)
+        {
+            var engineResult = await fixture.Engine.ExecAsync(
+                containerId, new[] { "sh", "-c", script, "sh", path }, ct).ConfigureAwait(false);
+            return engineResult.Stdout + engineResult.Stderr;
+        }
+
+        var exec = await fixture.Docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+        {
+            User = asUid.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            AttachStdout = true,
+            AttachStderr = true,
+            Cmd = new List<string> { "sh", "-c", script, "sh", path },
+        }, ct).ConfigureAwait(false);
+
+        using var stream = await fixture.Docker.Exec
+            .StartAndAttachContainerExecAsync(exec.ID, tty: false, ct).ConfigureAwait(false);
+        var (stdout, stderr) = await stream.ReadOutputToEndAsync(ct).ConfigureAwait(false);
+        return stdout + stderr;
     }
 }

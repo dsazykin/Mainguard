@@ -781,7 +781,11 @@
   whole repo's queue) and specifically does not normalise into equality with main; the generated
   Dockerfile's digest-pinned `FROM`, its absent `COPY`/`ADD`, and its return to `USER agent`; the
   content-addressed tag's sensitivity to base digest and declaration but not to comments; and the
-  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths) plus, in
+  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths), `ToolchainProvisionerProgressTests`
+  (the user-facing progress line: reported BEFORE the build rather than after — asserted by snapshotting
+  the builder's call count at report time, not by statement order — the ready line after, nothing at all
+  on a cache hit, and a null sink changing nothing; this is the daemon end of the channel that turns a
+  multi-minute first-run image build into visible progress instead of a hang) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
   claim per test on purpose, since xUnit stops at the first failing assertion and a five-assertion
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares
@@ -1008,14 +1012,18 @@
   does NOT leak onto the mutually-authenticated gRPC control port**),
   `Agents/GatewayConfinementDockerTests.cs` (**MG-4 end to end against REAL containers
   (`[RequiresDockerFact]`) — the layer the in-process gateway tests structurally cannot reach. The model
-  request is issued FROM INSIDE a real hardened jail, sourced from the same `/run/secrets/agent.env` the
-  CLI sources and routed through the container's own `HTTP_PROXY`, so nothing about its shape is
+  request is issued FROM INSIDE a real hardened jail, sourced from the same
+  `CredTmpfsSpec.DefaultCredentialPath` the CLI sources (spelled through the constant — a stale copy of
+  the path would make `. <path>` yield an empty environment SILENTLY) and routed through the container's
+  own `HTTP_PROXY`, so nothing about its shape is
   constructed by the test. That is what exposed the defect the change fixes: a confined request reaches
   tinyproxy naming the GATEWAY as its destination, and the default-deny filter had no entry for the
   daemon's own address, so Mainguard's own proxy answered 403 — switching the gateway on would have
   BROKEN every BYOK agent rather than metering it. Five legs: the traffic transits the gateway and the
   ledger is charged 41 tokens; the provider key is absent from the container spec, the credential tmpfs
-  AND the agent's effective environment; a second call over a 1-token cap is refused 402 with nothing
+  AND the agent's effective environment — the tmpfs sweep runs as BOTH owner uids, because each secret
+  now lives in its owner's own `0700` directory and a sweep as the agent alone would silently stop
+  covering the supervisor's; a second call over a 1-token cap is refused 402 with nothing
   reaching the provider; an OAuth agent is unconfined with its login restored and its provider host still
   carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
   it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key
@@ -1185,7 +1193,19 @@
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
   (docker-inspect shows no Windows mounts + live userns/limits, persistent-jail start-not-recreate,
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
-  supervisor-owned `/run/secrets/oob.key`), `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
+  supervisor-owned `/run/secrets/supervisor/oob.key` — probed as EACH SECRET'S OWNER, since the agent
+  cannot see into the supervisor's `0700` directory at all and asking it would conflate "not delivered"
+  with "properly hidden"; plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
+  container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
+  and no network is recreated by the checks that already existed, and that first version stayed green
+  with the new check disabled). **These RequiresDocker legs only ever run against
+  a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
+  EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
+  plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on
+  Engine 29 it does not. The guards for that live in the no-Docker leg
+  (`ContainerSpecBuilderTests.Build_EachSecretLivesInATmpfsOwnedByItsOwnUid_SoNoChownIsEverNeeded`,
+  `SandboxSecretWriteTimeoutTests.SecretWrite_RunsAsTheSecretsOwner_AndNeverChowns`), which is the only
+  leg that is engine-independent. `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
   the per-repo toolchain layer built by the SHIPPED `ToolchainProvisioner` against a real runtime and
   then run in a real hardened jail: the premise asserted rather than assumed (`command -v dotnet`
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),

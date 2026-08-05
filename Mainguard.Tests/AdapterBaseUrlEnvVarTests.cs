@@ -7,7 +7,7 @@ namespace Mainguard.Tests;
 /// MG-4 stage 2 — the adapter declares which env var its CLI reads its API <b>base URL</b> from.
 ///
 /// <para>This is the seam that makes BYOK confinement possible at all. The provider key is written
-/// verbatim into the agent-readable <c>/run/secrets/agent.env</c> today; to stop that, the CLI has to
+/// verbatim into the agent-readable <c>/run/secrets/agent/agent.env</c> today; to stop that, the CLI has to
 /// be pointed at the daemon's model gateway so the jail can hold a Mainguard session token while the
 /// real key stays daemon-side and is injected at the network hop. A CLI can only be redirected if we
 /// know the variable it honours (<c>ANTHROPIC_BASE_URL</c>, <c>OPENAI_BASE_URL</c>, …), and that fact

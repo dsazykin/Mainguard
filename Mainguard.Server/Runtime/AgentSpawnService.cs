@@ -202,10 +202,17 @@ public sealed class AgentSpawnService
             var launchCredentials = withoutHostCredentials
                 ? null
                 : cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind);
+            // Launch progress → a state delta on THIS session, so the several minutes a first-run
+            // toolchain image build takes read as progress in the client instead of as a hang. The
+            // session stays in "Starting"; only the reason moves, which is exactly the update
+            // AgentSessionStore.MarkState used to swallow. Reported synchronously (not through
+            // System.Progress<T>, which hops to the thread pool) so the deltas reach the stream in the
+            // order the launcher produced them.
             var launch = await _launcher.TryLaunchAsync(
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
                 extraEnv: launchEnv,
-                cliCredentials: launchCredentials).ConfigureAwait(false);
+                cliCredentials: launchCredentials,
+                progress: new InlineProgress(m => _store.MarkState(key, session.State, m))).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -464,5 +471,14 @@ public sealed class AgentSpawnService
             default:
                 return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
         }
+    }
+
+    /// <summary>An <see cref="IProgress{T}"/> that invokes on the reporting thread. <see cref="Progress{T}"/>
+    /// captures a <see cref="SynchronizationContext"/> or falls back to the thread pool, which in a daemon
+    /// means progress lines can be delivered out of order and after the step they describe has finished —
+    /// the one thing a progress line must not do.</summary>
+    private sealed class InlineProgress(Action<string> report) : IProgress<string>
+    {
+        public void Report(string value) => report(value);
     }
 }

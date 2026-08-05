@@ -8,7 +8,7 @@ namespace Mainguard.Server.Gateway;
 /// MG-4 / MG-20 — the daemon-side custody boundary for model credentials.
 ///
 /// <para><b>The defect.</b> <c>SandboxAgentLauncher.BuildSecrets</c> writes the raw BYOK provider key
-/// verbatim into <c>/run/secrets/agent.env</c>, which is agent-uid-owned mode 0400 — i.e. readable by
+/// verbatim into <c>/run/secrets/agent/agent.env</c>, which is agent-uid-owned mode 0400 — i.e. readable by
 /// the agent. The intended confinement (the agent holds only a Mainguard token; a gateway injects the
 /// real key at the network hop) did not exist: <c>ModelProxyMiddleware.BuildUpstreamRequest</c> passed
 /// inbound headers straight through with no key substitution, and there was no Mainguard-token concept

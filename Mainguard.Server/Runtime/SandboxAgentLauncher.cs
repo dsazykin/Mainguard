@@ -76,7 +76,8 @@ public sealed class SandboxAgentLauncher
         string repoHandle, string agentId, string agentKind, string? modelApiKey,
         string? ipcDirPath = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IProgress<string>? progress = null)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -155,7 +156,10 @@ public sealed class SandboxAgentLauncher
         // A failure is loud and stops the spawn. The alternative is a jail that quietly lacks the tools
         // the repo's verify command names, whose every verification then fails at exit 127 in a way
         // that reads like the agent's code is broken.
-        var toolchain = await EnsureToolchainAsync(repoHandle, barePath, pinnedImageRef, ct).ConfigureAwait(false);
+        // `progress` is threaded ONLY here. This build is the one step of a launch that runs for
+        // minutes, and it does so inside the spawn RPC with nothing on the wire saying so — which is
+        // why the UI could only conclude "not responding".
+        var toolchain = await EnsureToolchainAsync(repoHandle, barePath, pinnedImageRef, progress, ct).ConfigureAwait(false);
         if (toolchain is not null)
         {
             spawnImageRef = toolchain.ImageRef;
@@ -281,7 +285,7 @@ public sealed class SandboxAgentLauncher
     /// convincing-looking failed one.</para>
     /// </summary>
     private async Task<ProvisionedToolchain?> EnsureToolchainAsync(
-        string repoHandle, string barePath, string? baseDigest, CancellationToken ct)
+        string repoHandle, string barePath, string? baseDigest, IProgress<string>? progress, CancellationToken ct)
     {
         var declaration = RepoToolchainConfig.ReadMainBaseline(barePath, repoHandle);
         if (declaration.IsEmpty)
@@ -297,7 +301,7 @@ public sealed class SandboxAgentLauncher
                 + "would start without the tools the repository's verification command needs.");
         }
 
-        return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m))
+        return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m), progress)
             .EnsureAsync(repoHandle, declaration, baseDigest, ct).ConfigureAwait(false);
     }
 

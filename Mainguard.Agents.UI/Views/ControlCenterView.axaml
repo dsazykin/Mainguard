@@ -122,19 +122,46 @@
                                      Foreground="{DynamicResource TextPrimary}" Background="{DynamicResource SurfaceDeep}"/>
                         <TextBlock Text="Starting the coordinator…" FontSize="13" HorizontalAlignment="Center"
                                    Foreground="{DynamicResource TextPrimary}"/>
+                        <!-- The generic explainer, shown only while the daemon has said nothing specific. -->
                         <TextBlock Text="Launching its sandbox and connecting the CLI." FontSize="11"
+                                   TextWrapping="Wrap" TextAlignment="Center"
+                                   IsVisible="{Binding !HasCoordinatorStartDetail}"
+                                   HorizontalAlignment="Center" Foreground="{DynamicResource TextMuted}"/>
+                        <!-- …replaced by what the daemon is ACTUALLY doing as soon as it tells us. Today
+                             that is the per-repo toolchain image build, the one launch step that runs for
+                             minutes; before this line existed the surface had nothing to show for it and
+                             fell through to "the coordinator isn't responding". -->
+                        <TextBlock Text="{Binding CoordinatorStartDetail}" FontSize="11"
+                                   TextWrapping="Wrap" TextAlignment="Center"
+                                   IsVisible="{Binding HasCoordinatorStartDetail}"
                                    HorizontalAlignment="Center" Foreground="{DynamicResource TextMuted}"/>
                       </StackPanel>
 
                       <!-- stalled: outlasted the connect budget with no first frame and no death — the honest
-                           end of the old "loads forever" trap. Points at Stop (always reachable above). -->
-                      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10" MaxWidth="420"
+                           end of the old "loads forever" trap.
+
+                           The copy DELIBERATELY no longer recommends Stop. The 45s budget expires long
+                           before a first-run toolchain image build finishes (the daemon logs
+                           `toolchain build begin: … ids=dotnet-10`; that build is ~2.9 GB and runs for
+                           minutes INSIDE the spawn call), so the old advice — "Use Stop to cancel and try
+                           again" — was offered precisely when following it destroyed the build that was
+                           about to unblock the coordinator, and the next attempt started the same build
+                           over. Same shape as the sandbox-image loop closed in PR #300, where the offered
+                           recovery guaranteed the failure repeated.
+
+                           This is a STOPGAP, not the fix: the UI still cannot distinguish "building" from
+                           "hung" because the daemon's build progress never crosses the gRPC boundary. The
+                           real fix is to publish that state as a coordinator delta and show it as
+                           progress; it needs a daemon-side protocol change and is tracked separately.
+                           Until then the honest thing is to describe both possibilities and NOT to
+                           recommend the destructive one. Stop stays reachable above for a real hang. -->
+                      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10" MaxWidth="440"
                                   IsVisible="{Binding CoordinatorConnectTimedOut}">
-                        <TextBlock Text="The coordinator isn't responding" FontSize="14" FontWeight="SemiBold"
+                        <TextBlock Text="Still starting the coordinator" FontSize="14" FontWeight="SemiBold"
                                    HorizontalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
                         <TextBlock TextWrapping="Wrap" TextAlignment="Center" FontSize="12"
                                    Foreground="{DynamicResource TextMuted}"
-                                   Text="Its sandbox has been starting for a while without drawing a terminal. It may still come up — or the launch may have failed. Use Stop to cancel and try again; if it keeps happening, check the daemon logs (oobe.log)."/>
+                                   Text="Its sandbox has been starting for a while without drawing a terminal. The first start for a repository also builds its toolchain image, which takes several minutes — leave Mainguard running and it should come up on its own. Stopping now cancels that build and the next attempt starts it over. If it never comes up, check the daemon logs (oobe.log)."/>
                       </StackPanel>
                     </Panel>
                   </Border>

@@ -107,14 +107,45 @@ public sealed class ToolchainProvisioner
     /// <summary>Label: the newline-joined toolchain ids in the layer.</summary>
     public const string SpecLabel = "mainguard.toolchain.spec";
 
+    /// <summary>
+    /// The human-readable line reported through <see cref="ToolchainProvisioner"/>'s progress sink when
+    /// a layer actually has to be BUILT (never on a cache hit — a cache hit is not slow and saying
+    /// "building" for it would train people to ignore the message).
+    ///
+    /// <para>It exists because this build is the one part of a coordinator start that takes minutes: a
+    /// <c>dotnet-10</c> layer pulls ~2.9 GB, and it runs INSIDE the spawn call with nothing on the wire
+    /// to say so. The UI showed a blank pane and then, after 45 s, "the coordinator isn't responding —
+    /// use Stop to cancel and try again" — advice that killed the very build about to unblock it. This
+    /// string is what turns that wait into progress, so it is written for the person waiting, not for a
+    /// log grep (the log line next to it keeps the machine-readable ids/tag).</para>
+    /// </summary>
+    public static string BuildingMessage(ToolchainDeclaration declaration)
+    {
+        ArgumentNullException.ThrowIfNull(declaration);
+        var ids = declaration.Normalized.Replace('\n', ',');
+        return $"Building this repository's toolchain image ({ids}). The first start downloads a few GB "
+             + "and takes several minutes — leave Mainguard running.";
+    }
+
+    /// <summary>The progress line reported once the layer is in hand and the jail can be created.</summary>
+    public const string BuiltMessage = "Toolchain image ready — starting the sandbox.";
+
     private readonly IToolchainImageBuilder _builder;
     private readonly Action<string>? _log;
+    private readonly IProgress<string>? _progress;
     private readonly SemaphoreSlim _buildGate = new(1, 1);
 
-    public ToolchainProvisioner(IToolchainImageBuilder builder, Action<string>? log = null)
+    /// <param name="log">The daemon log sink (machine-readable lines: repo, tag, ids).</param>
+    /// <param name="progress">The USER-FACING sink. Separate from <paramref name="log"/> on purpose:
+    /// the daemon log wants the tag and the base digest, and the person staring at a blank pane wants
+    /// to know that a multi-minute download is running and must not be interrupted. Optional, so every
+    /// existing caller and every test double is unaffected.</param>
+    public ToolchainProvisioner(
+        IToolchainImageBuilder builder, Action<string>? log = null, IProgress<string>? progress = null)
     {
         _builder = builder ?? throw new ArgumentNullException(nameof(builder));
         _log = log;
+        _progress = progress;
     }
 
     /// <summary>
@@ -163,6 +194,8 @@ public sealed class ToolchainProvisioner
             {
                 var dockerfile = RenderDockerfile(baseDigest!, recipes);
                 _log?.Invoke($"toolchain build begin: repo={repoHandle} image={tag} ids={declaration.Normalized.Replace('\n', ',')}");
+                // Reported BEFORE the build, not after: the whole point is to be visible during it.
+                _progress?.Report(BuildingMessage(declaration));
                 try
                 {
                     await _builder.BuildAsync(tag, dockerfile, expectedLabels, ct).ConfigureAwait(false);
@@ -188,6 +221,7 @@ public sealed class ToolchainProvisioner
                           + await SafeDescribeAsync(baseDigest!, ct).ConfigureAwait(false));
 
                 _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
+                _progress?.Report(BuiltMessage);
             }
 
             // The pin, PROVEN rather than requested. Everything above only decides which base we ASKED

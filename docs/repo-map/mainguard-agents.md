@@ -422,7 +422,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `(repoHash,agentId,worktreePath,imageRef,limits,networkName,CredTmpfsSpec,proxyUrl,usernsMode)` → a
       hardened `CreateContainerParameters`: `no-new-privileges` + the G2 seccomp denylist,
       `CapDrop ALL`/no `CAP_SYS_PTRACE`, userns, memory/pids, `ReadonlyRootfs`, ext4-only `/workspace`
-      bind, `/dev/shm`+`/run/secrets` tmpfs, proxy-only `Env`; **MG-3** adds the `AgentRepoPath` mount
+      bind, `/dev/shm`+`/run/secrets` tmpfs, proxy-only `Env`; **each secret now lives in its OWNER'S own
+      tmpfs directory** (`/run/secrets/agent` `uid=<agent>`, `/run/secrets/supervisor` `uid=<supervisor>`,
+      both `0700`, under a root-owned `0711` `/run/secrets`) and `AssertSecretDirsOwned` re-derives each
+      directory from the secret's actual path and refuses a spec where the two disagree — that layout is
+      what removed an in-jail `chown` which could **never** succeed: a non-root `User` plus
+      `no-new-privileges` leaves even a uid-0 exec with an EMPTY permitted set on Docker 20.10.24 (the
+      engine `MainguardEnv` ships), so every secret write died `EPERM` and no coordinator could start;
+      **MG-3** adds the `AgentRepoPath` mount
       (the per-agent repository, READ-WRITE at its identical VM path so the worktree's `gitdir:` pointer
       resolves in-jail — the ONE git dir the jail may write, and exactly one jail mounts it) and turns the
       shared-mirror mount into a READ-ONLY one gated by the named `MirrorMountReadOnly` constant (the
@@ -481,8 +488,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       workers get no spawn channel), and `SandboxCliLaunch.cs` is the pure `docker exec -i -t` argv
       builder that starts an installed CLI inside its jail under a daemon-side PTY (agent uid, an explicit
       in-jail `TERM` via `-e TERM=xterm-256color` (`InJailTerm` — never docker's implicit bare `xterm`),
-      `/workspace` workdir, and a fixed argv-safe `sh -c` wrapper that sources `/run/secrets/agent.env`
-      and puts the IPC mount on PATH before `exec "$@"`). **Engine-agnostic seams (no Docker.DotNet in the
+      `/workspace` workdir, and a fixed argv-safe `sh -c` wrapper that sources
+      `CredTmpfsSpec.DefaultCredentialPath` — `/run/secrets/agent/agent.env`, spelled through the constant
+      because the wrapper's `[ -r … ]` guard makes a stale copy of the path fail SILENTLY — and puts the
+      IPC mount on PATH before `exec "$@"`). **Engine-agnostic seams (no Docker.DotNet in the
       signature):**
     - `ISandboxEngine.cs` (`SpawnAsync`/`ExecAsync`/`PauseAsync`/`UnpauseAsync` (P2-09 yield-timeout
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
@@ -546,7 +555,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `DockerSandboxEngine.cs` (persistent jail keyed by repo+agent — `docker start` a stopped one,
       recreate on base-image change; **no runtime image-build** — G-16; writes secrets to per-owner 0400
       tmpfs via stdin exec, never argv/env — that stdin rides `ExecStdinTransport.cs` and NOT
-      Docker.DotNet) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      Docker.DotNet. **The write execs AS THE SECRET'S OWNER and never chowns** — a non-root `User` plus
+      `no-new-privileges` leaves even a uid-0 exec with an EMPTY permitted set on Docker 20.10.24, so the
+      old "root, so chown is permitted" premise was false and every spawn died `EPERM`; the owner instead
+      creates its own file in the tmpfs directory Docker mounted owned by it. `HasOwnedSecretDirsAsync`
+      adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
+      reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
+      resurrecting the same EPERM for every container that outlived the upgrade) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -607,7 +622,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `RepoToolchainConfig.cs` (reads the declaration out of git —
       `git show <mainBranch>:.mainguard/toolchain` against the daemon-side bare mirror, which no jail can
       write).
-    - `ToolchainProvisioner.cs` (builds the layer
+    - `ToolchainProvisioner.cs` (takes an optional `IProgress<string>` alongside its daemon-log sink and
+      reports `BuildingMessage(declaration)` **before** the build and `BuiltMessage` after, only on a real
+      build and never on a cache hit — this is the one launch step that runs for MINUTES, and without a
+      user-facing line for it the coordinator surface had nothing to show and fell through to "the
+      coordinator isn't responding … use Stop to cancel and try again", which killed the build; builds the
+      layer
       `FROM <the bare digest the spawn preflight just resolved>`, so **MG-27's pin is inherited rather
       than bypassed**, and hands the launcher the layer's OWN content digest. **The FROM is a BARE digest
       and never `<name>@sha256:…`** — that form is a canonical REGISTRY reference, matched against an

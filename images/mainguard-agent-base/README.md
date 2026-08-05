@@ -16,8 +16,12 @@ The daemon spawns this image with the hardened spec from `ContainerSpecBuilder`:
 - network egress only through `mainguard-egress-proxy` (default-deny)
 
 Two distinct non-root users are baked in (G2 control 1): `agent` (uid 1000) runs the agent CLI;
-`supervisor` (uid 1001) solely owns `/run/secrets/oob.key` (mode 0400) so the agent uid can never read
-the OOB session key `K`.
+`supervisor` (uid 1001) solely owns `/run/secrets/supervisor/oob.key` (mode 0400) so the agent uid can
+never read the OOB session key `K`. Each uid gets its OWN `0700` tmpfs directory under a root-owned
+`0711` `/run/secrets` (`/run/secrets/agent`, `/run/secrets/supervisor`), mounted by Docker already owned
+by that uid — so each secret is created by its owner and never has to be `chown`ed to it. The jail's
+`no-new-privileges` plus its non-root `User` leave even a uid-0 `docker exec` with no `CAP_CHOWN` on
+Docker 20.10.24, so a directory the writer already owns is the only layout that works.
 
 `seccomp.json` **is** the profile and the single source of truth: it is embedded into
 `Mainguard.Agents` and returned verbatim by `SeccompProfile.Json`, which `ContainerSpecBuilder` passes to
