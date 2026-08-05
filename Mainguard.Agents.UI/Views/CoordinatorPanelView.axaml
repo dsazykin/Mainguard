@@ -124,6 +124,12 @@
                    FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
                    IsVisible="{Binding NextRejectionEscalates}"/>
 
+        <!-- A decision that did not land says so here. Without this the card is indistinguishable from a
+             card whose approval worked, and the human waits on a worker that is still blocked. -->
+        <TextBlock Text="{Binding DecisionErrorText}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource DangerBrush}"
+                   IsVisible="{Binding HasDecisionError}"/>
+
         <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
           <Button Classes="Secondary" Content="{Binding RejectButtonText}" FontSize="12"
                   Command="{Binding RejectCommand}" IsEnabled="{Binding !IsDeciding}"/>

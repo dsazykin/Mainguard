@@ -105,6 +105,11 @@ public static class GatewayServiceRegistration
             verificationStore: verificationStoreFactory,
             sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
             artifactDirectory: ResolveVerificationArtifactDir(dbPath),
+            // P2-11: the branch-vs-main diff the flagged-change review classifies at verification time.
+            // The SAME service GetMergeDiff serves the cockpit from, so the diff a human is shown is the
+            // diff the gate decided on — two diff paths would eventually disagree, and the disagreement
+            // would be invisible.
+            mergeDiff: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IMergeBranchDiffService>(),
             audit: sp.GetRequiredService<IAuditLog>(),
             log: log,
             // MG-3: the daemon-side publish. The queue's input contract is refs/heads/agent/<id> in the
@@ -113,8 +118,17 @@ public static class GatewayServiceRegistration
             publishAgentRef: (repoHash, agentId) =>
                 sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId),
             // Phase 2 backstop: a worker whose own plan was never approved cannot merge, whatever it
-            // verified. ANDed into every repo's queue alongside the RT-D2 changed-test-command gate.
+            // verified. ANDed into every repo's queue alongside the RT-D2 changed-test-command gate and the
+            // P2-11 flagged-change gate — the three are independent, and all three must say yes.
             planGate: sp.GetRequiredService<WorkerPlanGate>()));
+        // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
+        // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
+        // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
+        // no production subscriber, no spawn path accepts or records a plan id, and AgentSession carries
+        // none. Passing a lambda that guessed (say, "any approved plan from this worker's coordinator")
+        // would compare diffs against the wrong scope and report it as enforcement — worse than the honest
+        // gap. The arm is wired and tested; it lights up when the plan-authorship pipeline supplies the
+        // binding. Everything else the flagged-change gate blocks on is live now.
 
         services.AddSingleton(sp =>
         {

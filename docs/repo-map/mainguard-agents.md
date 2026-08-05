@@ -888,9 +888,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       that make a repo active (ProvisionRepo / CreateWorktree / a jailed spawn) over the same persisted
       stores and, load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
-      spans origins while they share one store (MG-23). **Phase 2** adds an optional `planGate`
-      `IMergeGate` ANDed into every repo's queue beside the RT-D2 changed-test-command gate — the backstop
-      that stops a worker whose own plan was never approved from merging, whatever it verified.)
+      spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
+      into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
+      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it; `ArmFlaggedChangeReview` runs the
+      required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
+      same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
+      that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
+      writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
+      verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
+      `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
+      agent→approved-plan binding exists yet. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
+      ANDed in beside those two — the backstop that stops a worker whose own plan was never approved from
+      merging, whatever it verified. All three gates are independent and all three must say yes.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
@@ -901,7 +910,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       §3.6 CVE/script rows in; plus the pure `ScopeMatcher` glob (`**`/`*`/`?`)).
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
-      item-by-item; the security boundary against hostile agent code).
+      item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has
+      never seen (MG-40). **Now actually wired**: `MergeQueueProvisioner.Build` constructs it into every
+      repo queue — it previously existed only in tests and one dead ViewModel branch. `StoreFor` creates
+      on demand and is for the review that classifies a diff; every READ path (the daemon's flagged-item
+      projection, the ack RPC) uses **`PeekStore`**, which never creates — a fresh store holds no items and
+      an empty set is `AllAcknowledged`, so creating one from a read would manufacture the "reviewed and
+      clean" record the default-DENY exists to refuse.)
     - `AgentTraceEmitter.cs` (orchestrator-side provenance: `EmitTrace`/`SerializeTrace` write the
       Cognition/Cursor-style Agent Trace JSON artifact that `Review.ProvenanceReader` reads back, + the
       pure `BuildTrailers` that appends idempotent `Agent:`/`Task:`/`Plan:` commit trailers as the durable
@@ -984,7 +999,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
       a spawned worker's task **without giving it to the worker**; `TryReleaseTask` yields it only against
-      an approved plan (no override parameter — an override is how a gate becomes decorative); `MayWork` /
+      an approved plan (no override parameter — an override is how a gate becomes decorative) and is
+      **idempotent in both directions**: it keeps answering with the task on a repeat call, because
+      `mainguard-plan await <id>` is the documented re-attach after a worker crash or daemon restart and an
+      empty prompt there strands a worker holding an approved plan — while the audit record and the
+      `TaskReleased` event fire exactly once, decided under the gate's lock so racing callers cannot both
+      win (a second `TaskReleased` is the same task handed out twice); `MayWork` /
       `MayReceivePrompt` / `MayRequestVerification` deny steering and verification at the gate; and the
       type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
       approved cannot merge even if it verified green. Also owns the legible-stall text —

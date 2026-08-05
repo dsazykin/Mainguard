@@ -326,7 +326,13 @@
   list can badge external-PR entries; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
-  typed `NOT_FOUND` when the mirror/branch is missing) — validation/dispatch only (no business logic —
+  typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the
+  `FlaggedChangeGate`'s items (risk-hunk + out-of-approved-scope rows, addressed by
+  `FlaggedChange.Id` = `kind|path|contentHash`) alongside the RT-D2 row — it read
+  `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
+  clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
+  `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
+  record and bypass the gate's default-DENY) — validation/dispatch only (no business logic —
   rejection trigger). **P2-14:**
   - `MergeQueueGrpcService.BeginMerge`/`ConfirmMerge` and `AgentGrpcService.SpawnAgent` now consult the
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);

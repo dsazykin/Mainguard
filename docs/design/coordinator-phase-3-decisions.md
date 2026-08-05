@@ -269,6 +269,43 @@ TheDaemonSpawnsACoordinatorWithNoRepositoryAccess_AndAWorkerWithIt [FAIL]
 Failed!  - Failed: 1, Passed: 28, Skipped: 0, Total: 29
 ```
 
+### 3.0 Re-verified after merging the updated phase-2 base
+
+Phase 2 moved under this branch after phase 3 was written: PR #291 wired `FlaggedChangeGate` into the
+merge spine, and two Copilot-found bugs were fixed on the phase-2 branch — `TryReleaseTask` was not
+idempotent, and the approve/reject buttons latched disabled. Merging that in produced three conflicts,
+one of them **on the exact three lines phase 3 had re-keyed**: `TryReleaseTask`'s write-back.
+
+That is the highest-risk kind of conflict this project has, so the reconciled code was re-mutated rather
+than assumed:
+
+| # | enforcement removed | result |
+|---|---|---|
+| M9 | write-back under `("", id)` instead of the resolved key | **2 failed** / 17 passed |
+| M8 | the phase-2 once-only guard (did *their* fix survive?) | **3 failed** / 16 passed |
+| M3 | the phase-3 composite key (did *mine* survive?) | **2 failed** / 17 passed |
+| M1 | the §3 exhaustive deny (re-run) | **18 failed** / 11 passed |
+| M2 | ownership scoping (re-run) | **5 failed** / 24 passed |
+| M10 | `FlaggedChangeGate` dropped from the ANDed gates array | **4 failed** / 18 passed |
+
+**M9 found a real gap the merge created, and it is the reason this section exists.** On its first run only
+*one* test caught the wrong key — and not one of the release-once tests. Every pre-existing release-once
+test holds at the **default empty repo hash**, where the wrong key `("", id)` and the right key coincide,
+so all of them stay green against a write-back that silently stops latching `Released`. The interaction
+was untested by both sides: phase 2's tests never used a repo hash, phase 3's key tests never released
+twice. `ReleasingTwiceForARepoScopedWorker_StillAuditsAndAnnouncesOnce` closes it, and M9 re-run then
+fails **2** tests instead of 1.
+
+**M10** covers the instruction that all three gates survive the merge. They AND and are independent —
+`ChangedTestCommandGate`, `FlaggedChangeGate`, and the plan gate — and dropping the flagged-change gate to
+simplify the array is caught by four of phase 2's own provisioner tests.
+
+*(A note on a hazard that turned out not to be one: taking phase 2's write-back line verbatim —
+`_held[workerAgentId]` — does **not** compile once the dictionary is tuple-keyed, so that particular
+mistake is caught by the type system rather than by a test. The comment on that line originally claimed
+otherwise and was corrected. The silent version is a write-back under a *different composite* key, which
+is what M9 exercises.)*
+
 ### 3.1 A second vacuous assertion, found the same way
 
 `ACoordinator_NeverBecomesAMergeQueueMember` asserted the coordinator was absent from its repo's merge

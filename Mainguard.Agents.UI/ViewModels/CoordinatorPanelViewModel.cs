@@ -161,6 +161,13 @@ public partial class PlanCardViewModel : ViewModelBase
 
     [ObservableProperty] private bool _isDeciding;
 
+    /// <summary>Why the last decision did not land (empty when there is nothing wrong).</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasDecisionError))]
+    private string _decisionErrorText = "";
+
+    public bool HasDecisionError => DecisionErrorText.Length > 0;
+
     /// <summary>What the human types back to the worker on a rejection.</summary>
     [ObservableProperty] private string _feedbackText = "";
 
@@ -185,9 +192,50 @@ public partial class PlanCardViewModel : ViewModelBase
         FactsText = $"Written by {worker} · budget ${plan.BudgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
     }
 
-    [RelayCommand] private Task ApproveAsync() { IsDeciding = true; return _decide(PlanId, true, null); }
+    [RelayCommand] private Task ApproveAsync() => DecideAsync(approve: true, feedback: null);
 
-    [RelayCommand] private Task RejectAsync() { IsDeciding = true; return _decide(PlanId, false, FeedbackText); }
+    [RelayCommand] private Task RejectAsync() => DecideAsync(approve: false, feedback: FeedbackText);
+
+    /// <summary>
+    /// The one exit for both decisions, and the reason it exists is that <c>IsDeciding</c> must come back
+    /// down on <b>every</b> path out of here.
+    ///
+    /// <para>Leaving it latched is not a cosmetic bug on this surface. The plan gate is a blocking human
+    /// gate: the worker on this card is stopped, holding its jail and its slot against the worker cap, and
+    /// clicking Approve is the only thing that clears it. A card whose buttons never come back therefore
+    /// does not merely look broken — it removes the operator's ability to relieve backpressure, and the
+    /// coordinator stays stopped spawning until the app is restarted. Two ways that used to happen: the
+    /// decision threw, or it returned while the plan stayed pending with the same id and revision, in which
+    /// case <see cref="CoordinatorPanelViewModel.Refresh"/> keeps this exact instance mounted rather than
+    /// replacing it with a fresh, enabled one.</para>
+    ///
+    /// <para>A failure is <b>said out loud</b> rather than reverted quietly, because the two outcomes look
+    /// identical on this card otherwise: the plan sits there either way, and a human who is not told will
+    /// wait on a worker they believe they already unblocked.</para>
+    /// </summary>
+    private async Task DecideAsync(bool approve, string? feedback)
+    {
+        if (IsDeciding)
+        {
+            return; // a double-click is one decision, not two
+        }
+
+        IsDeciding = true;
+        DecisionErrorText = "";
+        try
+        {
+            await _decide(PlanId, approve, feedback);
+        }
+        catch (Exception ex)
+        {
+            var verb = approve ? "Approval" : "Rejection";
+            DecisionErrorText = $"{verb} was not recorded — {ex.Message}. The worker is still blocked; try again.";
+        }
+        finally
+        {
+            IsDeciding = false;
+        }
+    }
 }
 
 /// <summary>

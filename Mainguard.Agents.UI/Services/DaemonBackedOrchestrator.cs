@@ -1088,27 +1088,34 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
+    /// <summary>
+    /// Submits the human's decision — and <b>lets a failure be seen</b>.
+    ///
+    /// <para>This used to end in <c>catch (Exception) { }</c>, justified as "surfaced via ConnectionState".
+    /// It was not surfaced anywhere the operator was looking: a decision that never reached the daemon
+    /// completed the same way a successful one did, so the panel had no way to distinguish "approved" from
+    /// "silently lost" and no way to say which had happened. And the cost of guessing wrong is specific —
+    /// the worker on that plan stays blocked, holding its jail and its slot against the worker cap, while
+    /// the human believes they just unblocked it. "Already decided" deserves a message too, for the same
+    /// reason. The caller reports it; swallowing it here made that impossible.</para>
+    /// </summary>
     public async Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        try
+        if (approve)
         {
-            if (approve)
-            {
-                await _client.ApprovePlanAsync(planId, cts.Token).ConfigureAwait(false);
-            }
-            else
-            {
-                // The reason is delivered to the worker as the feedback it revises against, so an empty
-                // one is a wasted round of the revision budget. The placeholder is honest about that
-                // rather than pretending the operator said something useful.
-                var reason = string.IsNullOrWhiteSpace(feedback)
-                    ? "Rejected without written feedback — revise the plan and be more specific."
-                    : feedback!;
-                await _client.RejectPlanAsync(planId, reason, cts.Token).ConfigureAwait(false);
-            }
+            await _client.ApprovePlanAsync(planId, cts.Token).ConfigureAwait(false);
         }
-        catch (Exception) { /* daemon unreachable / already decided — surfaced via ConnectionState. */ }
+        else
+        {
+            // The reason is delivered to the worker as the feedback it revises against, so an empty
+            // one is a wasted round of the revision budget. The placeholder is honest about that
+            // rather than pretending the operator said something useful.
+            var reason = string.IsNullOrWhiteSpace(feedback)
+                ? "Rejected without written feedback — revise the plan and be more specific."
+                : feedback!;
+            await _client.RejectPlanAsync(planId, reason, cts.Token).ConfigureAwait(false);
+        }
     }
 
     // ---- ICliAgentHost (PR3: coordinator-as-CLI) --------------------------

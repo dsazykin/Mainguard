@@ -324,4 +324,140 @@ public class WorkerPlanGateTests
         Assert.Equal("repo A task", released);
         Assert.Equal("Repo A title", gate.PlanningBriefFor("pr-7"));
     }
+
+    /// <summary>
+    /// <b>Where the release-exactly-once fix and the (RepoHash, AgentId) re-key meet.</b>
+    ///
+    /// <para>Every other release-once test holds at the DEFAULT empty repo hash, where the composite key
+    /// is <c>("", id)</c> — so a write-back that used <c>("", id)</c> instead of the resolved key would be
+    /// indistinguishable from a correct one, and all of them would stay green. This test holds under a real
+    /// repo hash, which is the only arrangement where the two keys differ and the wrong one is visible: the
+    /// <c>Released</c> flag would never latch on the held entry, every repeat call would look like a first
+    /// release, and the task would be audited and announced once per call.</para>
+    ///
+    /// <para>It exists because merging phase 3 onto the idempotence fix put both changes on the same three
+    /// lines, and a conflict resolution is exactly the moment an enforcement quietly re-opens.</para>
+    /// </summary>
+    [Fact]
+    public void ReleasingTwiceForARepoScopedWorker_StillAuditsAndAnnouncesOnce()
+    {
+        var audit = new InMemoryAuditLog();
+        var (plans, gate) = Rig(audit);
+        var announced = new List<string>();
+        gate.TaskReleased += (workerId, prompt) => announced.Add($"{workerId}:{prompt}");
+
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        var planId = plans.Present("pr-7", "coord-a", "Repo A title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        // The re-attach, under a repo-scoped hold: same answer every time…
+        Assert.True(gate.TryReleaseTask("pr-7", out var first));
+        Assert.Equal("repo A task", first);
+        Assert.True(gate.TryReleaseTask("pr-7", out var second));
+        Assert.Equal("repo A task", second);
+        Assert.True(gate.TryReleaseTask("pr-7", out var third));
+        Assert.Equal("repo A task", third);
+
+        // …authorised, recorded and announced exactly once.
+        Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+        Assert.Equal(new[] { "pr-7:repo A task" }, announced);
+        Assert.True(gate.TaskWasReleased("pr-7"));
+    }
+
+    // ---- Release happens exactly once ------------------------------------
+
+    /// <summary>
+    /// A worker reaches this path more than once by design, not by malfunction: <c>mainguard-plan await
+    /// &lt;id&gt;</c> is the documented re-attach after a worker crash or a daemon restart, and the daemon
+    /// answers it by asking the gate again. So the second call must still hand back the task — a
+    /// re-attached worker holding an approved plan and an empty prompt is stranded — while the two things
+    /// that must NOT repeat are the ones a repeat corrupts: the <c>worker_task_released</c> audit record
+    /// that exists to prove the gate authorised this exactly once, and the <see cref="WorkerPlanGate.TaskReleased"/>
+    /// event, whose subscriber delivers the task and would deliver it twice.
+    /// </summary>
+    [Fact]
+    public void ReleasingTwice_YieldsTheTaskAgain_ButAuditsAndAnnouncesItOnlyOnce()
+    {
+        var audit = new InMemoryAuditLog();
+        var (plans, gate) = Rig(audit);
+        var announced = new List<string>();
+        gate.TaskReleased += (workerId, prompt) => announced.Add($"{workerId}:{prompt}");
+
+        gate.Hold("w-1", "coord-1", "T", "rewrite TokenClock", 1m);
+        var planId = plans.Present("w-1", "coord-1", "T", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        Assert.True(gate.TryReleaseTask("w-1", out var first));
+        Assert.Equal("rewrite TokenClock", first);
+
+        // The re-attach: same answer, because the worker still needs its task.
+        Assert.True(gate.TryReleaseTask("w-1", out var second));
+        Assert.Equal("rewrite TokenClock", second);
+        Assert.True(gate.TryReleaseTask("w-1", out var third));
+        Assert.Equal("rewrite TokenClock", third);
+
+        // …but authorised, recorded and announced exactly once.
+        Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+        Assert.Equal(new[] { "w-1:rewrite TokenClock" }, announced);
+    }
+
+    /// <summary>
+    /// The same claim under a race: the winner must be decided <i>under the gate's lock</i>, not by a
+    /// check-then-act around it that the scheduler can interleave — a duplicate
+    /// <see cref="WorkerPlanGate.TaskReleased"/> is the same task handed out twice.
+    ///
+    /// <para><b>Why this runs rounds instead of one race.</b> A racy implementation does not lose every
+    /// time; when this test was first written against a deliberately check-then-act version it caught it in
+    /// roughly four runs out of five, which is a detector that a real regression can slip past. Repeating
+    /// the race makes a miss vanishingly unlikely while staying deterministic against the correct
+    /// implementation, whose lock leaves no interleaving to find. Each round gets a fresh gate, because a
+    /// gate that has already released has nothing left to race over.</para>
+    /// </summary>
+    [Fact]
+    public void ConcurrentReleases_AnnounceAndAuditExactlyOnce()
+    {
+        const int rounds = 25;
+        const int racers = 32;
+
+        for (var round = 0; round < rounds; round++)
+        {
+            var audit = new InMemoryAuditLog();
+            var (plans, gate) = Rig(audit);
+            var announced = 0;
+            gate.TaskReleased += (_, _) => Interlocked.Increment(ref announced);
+
+            gate.Hold("w-1", "coord-1", "T", "the work", 1m);
+            var planId = plans.Present("w-1", "coord-1", "T", Fields(), "", 1m).PlanId!;
+            plans.Approve(planId, "uid:1000");
+
+            // Spin on a volatile flag rather than parking on an event: a kernel wait wakes the racers one
+            // at a time, which lets the first caller finish before the rest have started and hides the very
+            // interleaving this test is looking for. Spinning keeps all of them hot and releases them
+            // together. `ready` makes the starter wait until every racer is already spinning.
+            var prompts = new string[racers];
+            var results = new bool[racers];
+            var go = false;
+            var ready = 0;
+            var threads = Enumerable.Range(0, racers).Select(i => new Thread(() =>
+            {
+                Interlocked.Increment(ref ready);
+                while (!Volatile.Read(ref go)) Thread.SpinWait(1);
+                results[i] = gate.TryReleaseTask("w-1", out var prompt);
+                prompts[i] = prompt;
+            })).ToList();
+
+            foreach (var t in threads) t.Start();
+            while (Volatile.Read(ref ready) < racers) Thread.SpinWait(1);
+            Volatile.Write(ref go, true);
+            foreach (var t in threads) t.Join();
+
+            // Every racer gets a truthful answer…
+            Assert.All(results, Assert.True);
+            Assert.All(prompts, p => Assert.Equal("the work", p));
+
+            // …and exactly one of them was the release.
+            Assert.Equal(1, announced);
+            Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+        }
+    }
 }
