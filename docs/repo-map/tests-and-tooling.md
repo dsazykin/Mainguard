@@ -1149,7 +1149,12 @@
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
   (docker-inspect shows no Windows mounts + live userns/limits, persistent-jail start-not-recreate,
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
-  supervisor-owned `/run/secrets/supervisor/oob.key`). **These RequiresDocker legs only ever run against
+  supervisor-owned `/run/secrets/supervisor/oob.key` — probed as EACH SECRET'S OWNER, since the agent
+  cannot see into the supervisor's `0700` directory at all and asking it would conflate "not delivered"
+  with "properly hidden"; plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
+  container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
+  and no network is recreated by the checks that already existed, and that first version stayed green
+  with the new check disabled). **These RequiresDocker legs only ever run against
   a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
   EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
   plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on

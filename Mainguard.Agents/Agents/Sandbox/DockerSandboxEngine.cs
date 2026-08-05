@@ -115,6 +115,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         // MG-36 a different address per segment).
         var dnsServer = await ResolveDnsServerAsync(networkName, ct).ConfigureAwait(false);
 
+        // Built before the reuse check, not just before the create: the reuse check has to know
+        // which per-owner secret directories THIS spawn expects (see staleSecretLayout below).
+        var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
+
         var existing = await FindByNameAsync(name, ct).ConfigureAwait(false);
         if (existing is not null)
         {
@@ -149,10 +153,23 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             var missingCacheMount = !string.IsNullOrEmpty(request.PackageCachePath)
                 && (existing.Mounts is null
                     || existing.Mounts.All(m => m.Destination != PackageCachePolicy.SandboxMount));
+            // A jail created before the secrets moved into per-owner directories carries the old flat
+            // /run/secrets tmpfs, and tmpfs entries — like mounts — are fixed at create. Reusing one
+            // would leave the write path execing as a non-root owner into a directory that does not
+            // exist and is not writable by it: the very EPERM the per-owner layout removes, resurrected
+            // for every container that outlived the upgrade. Caught here rather than at the write,
+            // because recreating is the only way to change the tmpfs set.
+            //
+            // Measured, not theorised: the RequiresDocker secret-delivery test failed on exactly this —
+            // a jail left behind by a pre-change run was reused, and the supervisor's key had nowhere to
+            // land — then passed once the stale container was gone.
+            var staleSecretLayout =
+                !await HasOwnedSecretDirsAsync(existing.ID, credentials, ct).ConfigureAwait(false);
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
-            if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
+            if (staleSecretLayout
+                || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
                 || missingCacheMount)
             {
@@ -176,7 +193,6 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
         }
 
-        var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
@@ -347,6 +363,40 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
             var networks = inspect.NetworkSettings?.Networks;
             return networks is not null && networks.ContainsKey(networkName);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// True when an existing jail already carries a per-owner tmpfs for BOTH secrets — i.e. it was
+    /// created by a build that knows secrets are written by their owners rather than chowned into place.
+    ///
+    /// <para>Read from <c>HostConfig.Tmpfs</c> rather than by looking inside the container: the question
+    /// is what the container was CREATED with (tmpfs entries are fixed at create, like mounts), and an
+    /// in-jail <c>stat</c> would need an exec — on the very container whose usability is in doubt.</para>
+    ///
+    /// <para>A container that vanished under us counts as satisfying this, so the caller's own recreate
+    /// path — not this probe — decides what to do about it. Same convention as the sibling probes.</para>
+    /// </summary>
+    private async Task<bool> HasOwnedSecretDirsAsync(string containerId, CredTmpfsSpec credentials, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            var tmpfs = inspect.HostConfig?.Tmpfs;
+            if (tmpfs is null)
+            {
+                return false;
+            }
+
+            // The directory of each ACTUAL secret path, exactly as AssertSecretDirsOwned derives it —
+            // so "was this container built for the layout this spawn uses?" is one question, not two
+            // that can drift.
+            return tmpfs.ContainsKey(CredTmpfsSpec.DirectoryOf(credentials.CredentialPath))
+                && tmpfs.ContainsKey(CredTmpfsSpec.DirectoryOf(credentials.OobKeyPath));
         }
         catch (DockerContainerNotFoundException)
         {

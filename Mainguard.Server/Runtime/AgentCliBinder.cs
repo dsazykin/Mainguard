@@ -83,7 +83,7 @@ public sealed class AgentCliBinder
     /// an unauthenticated CLI opens its interactive login instead of printing a non-interactive
     /// refusal and exiting), an explicit sane <c>TERM</c> on both sides of the exec, and a positive
     /// terminal size. The environment is minimal and secret-free (G-13) — the CLI's credentials come
-    /// from the in-container <c>/run/secrets/agent.env</c> the launch wrapper sources.
+    /// from the in-container <c>/run/secrets/agent/agent.env</c> the launch wrapper sources.
     /// </summary>
     internal static CliPtyLaunch BuildPtyLaunch(AgentCliLaunchSpec spec)
     {

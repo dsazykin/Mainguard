@@ -551,7 +551,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `DockerSandboxEngine.cs` (persistent jail keyed by repo+agent — `docker start` a stopped one,
       recreate on base-image change; **no runtime image-build** — G-16; writes secrets to per-owner 0400
       tmpfs via stdin exec, never argv/env — that stdin rides `ExecStdinTransport.cs` and NOT
-      Docker.DotNet) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      Docker.DotNet. **The write execs AS THE SECRET'S OWNER and never chowns** — a non-root `User` plus
+      `no-new-privileges` leaves even a uid-0 exec with an EMPTY permitted set on Docker 20.10.24, so the
+      old "root, so chown is permitted" premise was false and every spawn died `EPERM`; the owner instead
+      creates its own file in the tmpfs directory Docker mounted owned by it. `HasOwnedSecretDirsAsync`
+      adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
+      reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
+      resurrecting the same EPERM for every container that outlived the upgrade) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
