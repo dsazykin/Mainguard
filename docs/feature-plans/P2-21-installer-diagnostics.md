@@ -62,7 +62,7 @@ New surface: an `installer/` tree (OOBE app + elevated helper) — likely a sepa
 | **Create** | `build/mainguardos/` (reproducible tarball build: Dockerfile/mkosi + pinned inputs + `/etc/mainguardos-release` stamp) + CI job |
 | **Create** | `docs/mainguardos-updates.md` (CVE patch cadence) |
 | **Create** | `Mainguard.Tests/WslStatusParserTests.cs`, `SystemDiagnosticsTests.cs`, `OobeStateMachineTests.cs`, VM upgrade test script |
-| **Edit** | `Mainguard.slnx` (installer projects), `AGENTS.md` Repository Map |
+| **Edit** | `Mainguard.slnx` (installer projects), `docs/repo-map/` index |
 
 ---
 
@@ -168,4 +168,4 @@ grep -rn -- "--shutdown" installer/      # 0 hits (G-12)
 - [ ] Diagnostics (hard-stop, actionable, ARM64 gate) + fixture-tested parsers.
 - [ ] Unelevated OOBE + single-UAC elevated helper + Scheduled-Task reboot-resume + state file.
 - [ ] Reproducible tarball CI build + upgrade path test + `docs/mainguardos-updates.md`.
-- [ ] Manual VM matrix evidenced in the PR. `AGENTS.md` Repository Map updated. One task = one PR linking **P2-21**, base `phase2`.
+- [ ] Manual VM matrix evidenced in the PR. `docs/repo-map/` index updated. One task = one PR linking **P2-21**, base `phase2`.

@@ -60,7 +60,7 @@ whole agent platform moves repo data **only** as Git objects across this boundar
 | **Edit** | `Mainguard.Server/Services/RepoSyncGrpcService.cs` (stubs → real bodies; validation/dispatch only) |
 | **Edit** | `Mainguard.App.Shell` project-open path — register the `mainguard-vm` remote idempotently (via existing `AddRemote`) |
 | **Create** | `Mainguard.Tests/RepoProvisionerTests.cs`, `AgentWorktreeManagerTests.cs`, `RepoPathHasherTests.cs`, `VmRoundTripTests.cs` (Linux CI tagged) |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -222,4 +222,4 @@ grep -rn "token_\|Authorization" Mainguard.Agents/Agents/RepoProvisioner.cs Main
 - [ ] Quarantine remotes with non-FF/delete denial on the mirror; remotes test green.
 - [ ] `RepoSyncService` bodies replace stubs; Windows sync-remote registration idempotent and **SC-2-resolved** (never a hardcoded literal).
 - [ ] Round-trip invariant proven (SHA-identical); all edge rows tested on Linux CI.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-06**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-06**, base `phase2`.

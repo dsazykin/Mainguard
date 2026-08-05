@@ -64,7 +64,7 @@ foreground merge.
 | **Edit** | daemon scheduler (poll timer; interval setting) + `AgentService`/queue protos (external entries visible with origin metadata) |
 | **Create** | `Mainguard.App.Shell/ViewModels/PrIntakeSettingsViewModel.cs` + view section (sources, author filters, poll interval) |
 | **Create** | `Mainguard.Tests/ExternalPrIntakeTests.cs`, `MergeDispatchTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -182,4 +182,4 @@ grep -rn "HttpClient" Mainguard.Agents/Agents/Orchestrator/ExternalPrIntake.cs  
 - [ ] `IExternalPrIntake` per contract; subscriptions + seen-sha store; configurable bot filter + interval.
 - [ ] Materialize → verify → cockpit → host-API merge; dispatch seam unit-tested.
 - [ ] Force-push/closure/idempotency/rate-limit rows green; zero upstream writes proven.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-12**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-12**, base `phase2`.

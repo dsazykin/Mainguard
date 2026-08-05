@@ -61,7 +61,7 @@ user's machine exactly as found (minus Mainguard).
 | **Create** | `installer/` additions: Explorer context-menu registration ("Open in Mainguard"), uninstaller (`Mainguard.Uninstall`) |
 | **Edit** | existing host-auth flows → route token acquisition through `LoopbackOAuthListener` (one listener implementation, everywhere) |
 | **Create** | `Mainguard.Tests/PkceTests.cs`, `LoopbackOAuthListenerTests.cs`, `DeepLinkHandlerTests.cs`, `AdapterManifestTests.cs`, `AdapterPinSimulationTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -176,4 +176,4 @@ grep -rn -- "--shutdown" installer/                                             
 - [ ] `mainguard://` non-secret handler + registration; secret-pattern guard.
 - [ ] Adapter channel: schema, hash verification, in-VM pinned installs, config shims, health probes, pin simulation.
 - [ ] Explorer menus + clean uninstall (evidence matrix with a personal distro).
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-22**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-22**, base `phase2`.

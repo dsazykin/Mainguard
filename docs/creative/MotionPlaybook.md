@@ -224,7 +224,7 @@ Applied to all twelve briefs before publish:
 - **Duration in budget:** all timed motion is 120–150ms (hover fixed 130; theme switch is a deliberate 0ms instant re-resolve, `M-4`). ✔
 - **Easing named, no overshoot:** ease-out / ease-in / linear only; `Back`/`Bounce`/`Elastic` explicitly banned (§1, "never animate" #3). ✔
 - **No layout animation:** no `Width`/`Height`/`Margin` moves; space is reserved (rail column, badge slot) — verified in every "Stays STILL" cell. ✔
-- **Real surface + real token:** each moment names a control from the AGENTS.md Repository Map and tokens from the DESIGN.md/AGENTS.md contract. ✔
+- **Real surface + real token:** each moment names a control from the `docs/repo-map/` index and tokens from the DESIGN.md/AGENTS.md contract. ✔
 - **Bible rule cited:** every brief cites its `M-#` (and supporting `V-#`/`T-#`/`TT-#`/`N-#`). ✔
 - **Delight is earned by restraint:** exactly the moments Bible `M-1` sanctions earn a fade (toast/merge §2.5/§2.10, clone honesty §2.6, [Horizon] verification §2.12); everything else stays silent per `M-2`. ✔
 - **Ghost-flash avoided:** selection, drop-target, and badge reveals fade an opacity layer, never a brush up from `Transparent`. ✔

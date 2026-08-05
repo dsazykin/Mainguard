@@ -37,7 +37,7 @@ Three projects in `Mainguard.slnx` (a `.slnx`, not `.sln`):
 
 1. **LibGit2Sharp only through `IGitService.ExecuteWithRepo(...)`.** It is the single audited place a repo handle is opened/disposed, and it owns the index.lock retry (ADR-001 in `docs/phase-2/ADRs.md`). A raw `new Repository(...)` anywhere else leaks native handles and re-creates the `.git/index.lock` collisions this app exists to prevent.
 2. **No raw colors in UI.** Bind semantic tokens with `{DynamicResource …}` (never `StaticResource` for colors — it won't follow live theme switches). Pick a `Button.*`/`Border.*` component class by role. A new token goes into **every** `Themes/*.axaml` (five themes — Midnight Loom, Daylight Loom, Command Deck, Atelier, Loom Aurora). Never assume dark: Daylight Loom is light, and every surface must read in all five. Custom-drawn controls resolve tokens at render time and invalidate on `ThemeManager.ThemeChanged` (see `CommitGraphCanvas`).
-3. **Keep the AGENTS.md Repository Map current.** Create/move/rename/delete a file → update its map entry in the same change. An unindexed file is an incomplete change.
+3. **Keep the [`docs/repo-map/`](docs/repo-map/README.md) index current.** Create/move/rename/delete a file → update its entry in the matching per-project file in the same change. An unindexed file is an incomplete change.
 4. **Caches are bounded and typed errors only.** Any cache states its bound (LRU + capacity — see `BlameCache`/`CommitStatsCache`); failures reaching a ViewModel are typed (`GitOperationException` etc.), never raw library exceptions. Secrets/tokens never appear in argv, URLs, logs, or exception text.
 5. **Don't commit to `main`.** Branch, PR, review. v1 client fixes target `main`; agent-platform work targets `phase2` (see the branching section in AGENTS.md).
 
@@ -58,7 +58,7 @@ Three projects in `Mainguard.slnx` (a `.slnx`, not `.sln`):
 
 ## Orientation shortcuts
 
-- **"Where is X?"** — the Repository Map in AGENTS.md is the index; grep second.
+- **"Where is X?"** — [`docs/repo-map/`](docs/repo-map/README.md) is the per-file index (its README routes you to the right project file); grep second.
 - **The design system** — `docs/design/DesignSystem.md` (tokens, shape/spacing/type scales, icon gates); voice and strings — `docs/creative/`.
 - **Why is it built this way?** — `docs/phase-2/ADRs.md` for recorded decisions; `docs/phase-2/implementation_plans/Mainguard_Master_Implementation_Document_v2.md` is the binding phase-2 spec.
 - **Performance budgets** — `docs/phase-2/Mainguard_Performance_Hotspot_Register.md`; H1–H3 govern the client paths you're most likely to touch.

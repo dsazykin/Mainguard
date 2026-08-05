@@ -36,7 +36,7 @@ in build order (**T-02 → T-22**, plus **T-23** = direct PR/MR integration). Ea
    `git checkout main`, `git pull --ff-only`, `git stash pop`, and delete the local branch.)*
 3. **Merge `origin/main` into your working branch** — right after branching and again before
    finalizing: `git fetch origin && git merge origin/main --no-edit`. `origin/main` moves; keep
-   branches synced. Resolve conflicts (usually just the AGENTS.md Repository Map — combine both sides).
+   branches synced. Resolve conflicts (usually just the `docs/repo-map/` index — combine both sides).
 4. **Update `docs/test_implementation_plan/Mainguard_User_Testing_Guide.md` after every feature.** Add a section for the new
    task with hands-on steps; mark the interaction/animation/native-dialog items **⚠️ PRIORITY**
    (those are what the human pass exists for). This is part of "done," same as the Repository Map.
@@ -143,7 +143,7 @@ drive, but can't judge for *feel* — hence the come-back.
 
 ## 7. Key files added across the conflict-resolution → interactive-rebase sessions
 
-(See the `AGENTS.md` Repository Map for the authoritative index.)
+(See the `docs/repo-map/` index for the authoritative index.)
 
 - **Core models:** `MergeChunk`, `ConflictedFile`, `ConflictSide`, `GitTagItem`,
   `DiffLine`/`DiffHunk`/`FilePatch` (`DiffHunk.cs`), `WorktreeItem`, `RebaseTodoItem`.

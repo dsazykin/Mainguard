@@ -66,7 +66,7 @@ starts, daemon-enforced terminal locking for managed workers, and one always-vis
 | **Create** | `Mainguard.App.Shell/ViewModels/Agents/CoordinatorChatViewModel.cs`, `PlanApprovalViewModel.cs`, kill-switch command surfaced in `ActivityBarViewModel` |
 | **Create** | corresponding Views (`CoordinatorChatView`, `PlanApprovalView`) |
 | **Create** | `Mainguard.Tests/TaskPlanSchemaTests.cs`, `PlanApprovalTests.cs`, `CoordinatorToolCapTests.cs`, `InputLockGrpcTests.cs`, `KillSwitchTests.cs`, `Mainguard.Tests/Integration/ScriptedCoordinatorEndToEndTests.cs` |
-| **Edit** | protos (coordinator chat bridge, plan approval RPCs, kill switch RPC) + `AGENTS.md` Repository Map |
+| **Edit** | protos (coordinator chat bridge, plan approval RPCs, kill switch RPC) + `docs/repo-map/` index |
 
 ---
 
@@ -232,4 +232,4 @@ grep -rn "IsReadOnly" Mainguard.App.Shell/ViewModels/Agents/ | grep -i terminal 
 - [ ] Coordinator chat + TaskPlan approval card + rail-foot kill switch per ControlCenterDesign §5/§0.
 - [ ] Scripted end-to-end green incl. stale re-verify between merges; guard tests 9–13 green (**M7 does not exit without 9–11**).
 - [ ] Test contract satisfied as the **union** of §6 and TI-P2-14.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-14**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-14**, base `phase2`.

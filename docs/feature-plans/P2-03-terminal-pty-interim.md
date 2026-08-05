@@ -65,7 +65,7 @@ that seam is the whole point of the design.
 | **Create** | `Mainguard.App.Shell/ViewModels/TerminalViewModel.cs` + `Mainguard.App.Shell/Views/TerminalView.axaml(.cs)` |
 | **Edit** | `Mainguard.slnx` if the vendored code is a separate project |
 | **Create** | `Mainguard.Tests/VtBoundaryDetectorTests.cs`, `PtySessionTests.cs`, `TerminalStreamerTests.cs`, `TerminalScrollbackTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -242,7 +242,7 @@ allowlist may have entries, but it must exist and be green.
 - [ ] `TerminalStreamer` with 16 ms pooled batching + 4 KB holdback cap, wired into `TerminalService.Attach`.
 - [ ] Vendored renderer behind `TerminalControl` + grid-readback hook; `TerminalViewModel`/`TerminalView` with keys, resize, 10k scrollback.
 - [ ] All edge-matrix rows + invariants tested; split-at-every-offset corpus green; P2-04 harness runs.
-- [ ] `AGENTS.md` Repository Map updated (incl. `external/`). One task = one PR linking **P2-03**, base `phase2`.
+- [ ] `docs/repo-map/` index updated (incl. `external/`). One task = one PR linking **P2-03**, base `phase2`.
 
 ---
 

@@ -69,7 +69,7 @@ Dependencies to add (daemon only): `Docker.DotNet`. The UI must never reference 
 | **Edit** | `Mainguard.Server` wiring (engine construction; spawn path consumes P2-06 worktrees) |
 | **Create** | `Mainguard.App.Shell/ViewModels/EgressAllowlistViewModel.cs` + view (user-visible/editable allowlist; changes logged) |
 | **Create** | `Mainguard.Tests/ContainerSpecBuilderTests.cs`, `EgressAllowlistTests.cs`, `Mainguard.Tests/Integration/EgressMatrixTests.cs` (tagged `RequiresDocker`), `SandboxInspectTests.cs` (tagged `RequiresDocker`) |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -340,4 +340,4 @@ docker inspect <agent> | grep -i "mnt/c\|drvfs"          # 0 hits — paste into
 - [ ] Credentials on per-agent tmpfs 0400; `K` on its own supervisor-uid tmpfs; no secrets in env/argv/spec.
 - [ ] Full egress matrix + A6 suite + G2 key-custody test + inspect assertions green in Docker CI; evidence pasted in the PR (incl. proxy config + push refusal audit event).
 - [ ] Test contract satisfied as the **union** of §6 and TI-P2-07.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-07**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-07**, base `phase2`.

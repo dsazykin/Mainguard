@@ -69,7 +69,7 @@ changes. External PR branches (P2-12) flow through the same cockpit.
 | **Create** | `Mainguard.App.Shell/ViewModels/ReviewCockpitViewModel.cs` + `Mainguard.App.Shell/Views/ReviewCockpitView.axaml(.cs)` |
 | **Create** | `Mainguard.App.Shell/ViewModels/FlaggedChangesPanelViewModel.cs` (+ panel section in the cockpit view) |
 | **Create** | `Mainguard.Tests/RiskClassifierTests.cs`, `ProvenanceReaderTests.cs`, `FlaggedChangeDetectorTests.cs`, `AcknowledgmentTests.cs`, `LockfileSemanticDiffTests.cs`, `Mainguard.Tests/Integration/PoisonedBranchGateTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -256,4 +256,4 @@ grep -rn "RiskCategory" Mainguard.App.Shell/Views/            # rendering only �
 - [ ] F6 out-of-approved-Scope items + RT-D2 changed-test-command items flow through the same must-acknowledge mechanism (guard tests 9–10 green — RT-D2 is an M7 exit criterion with P2-10).
 - [ ] Semantic lockfile diff + OSV flags; review-sprint mode emitting viewed-state events.
 - [ ] All edge rows + poisoned-branch end-to-end green; test contract = union of §6 and TI-P2-11.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-11**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-11**, base `phase2`.

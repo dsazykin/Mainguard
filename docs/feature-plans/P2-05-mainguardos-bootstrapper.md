@@ -61,7 +61,7 @@ enabled — enablement is P2-21's job) to a running `mainguardd` health-checked 
 | **Create** | `Mainguard.Agents/Agents/Bootstrap/WslConfigMerger.cs` (pure INI merge) |
 | **Create** | `Mainguard.App.Shell/ViewModels/BootstrapProgressViewModel.cs` + `Mainguard.App.Shell/Views/BootstrapProgressView.axaml(.cs)` (staged checklist UI) |
 | **Create** | `Mainguard.Tests/WslConfigMergerTests.cs`, `BootstrapStateMachineTests.cs` |
-| **Edit** | `AGENTS.md` Repository Map |
+| **Edit** | `docs/repo-map/` index |
 
 ---
 
@@ -221,4 +221,4 @@ grep -rn "cmd.exe\|/bin/sh -c" Mainguard.Agents/Agents/Bootstrap/               
 - [ ] `kernel.yama.ptrace_scope=2` provisioned VM-wide at first boot + persisted + check-phase asserted (G2 control 2 — P2-07 depends on it).
 - [ ] Idempotent end-to-end: fresh import, resume, healthy no-op — manual matrix in the PR description (incl. the ptrace_scope output).
 - [ ] All edge rows + invariants tested; G-12 grep clean; test contract = union of §6 and TI-P2-05.
-- [ ] `AGENTS.md` Repository Map updated. One task = one PR linking **P2-05**, base `phase2`.
+- [ ] `docs/repo-map/` index updated. One task = one PR linking **P2-05**, base `phase2`.

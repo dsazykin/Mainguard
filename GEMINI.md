@@ -10,7 +10,7 @@ This file provides guidance to Gemini (and the Gemini CLI) when working with cod
 
 A working native Git GUI (**.NET 10**, Avalonia 11 + MVVM via `CommunityToolkit.Mvvm`, `LibGit2Sharp`, SQLite/EF Core). The multi-agent / sandbox / terminal features in `README.md` and the roadmap docs are **planned, not built** — don't implement them into the code unless asked. The docs are the destination; the code is the current state.
 
-Solution is `Mainguard.slnx` (a `.slnx`, not `.sln`). The app now ships as **two edition heads over one shared shell library** — a free Git client and a Pro build — so you run a *head*, never the shell. **[`AGENTS.md`](AGENTS.md) holds the full Repository Map (source of truth)**; the projects that matter most:
+Solution is `Mainguard.slnx` (a `.slnx`, not `.sln`). The app now ships as **two edition heads over one shared shell library** — a free Git client and a Pro build — so you run a *head*, never the shell. **[`AGENTS.md`](AGENTS.md) is the architecture source of truth; the per-file index lives in [`docs/repo-map/`](docs/repo-map/README.md)** — open its routing table and read only the project you are touching. The projects that matter most:
 
 - **`Mainguard.Git`** — git engine + EF/`AppDbContext` + `IGitService` (the all-editions base; put git logic here).
 - **`Mainguard.UI`** — design system + the five themes + the edition seams (`IEditionManifest` / `IAgentPlatformSurface`) + `ViewModelBase` + `ViewLocator`.
@@ -62,6 +62,6 @@ Commit the migration + snapshot together; never hand-edit an applied migration.
 
 - **LibGit2Sharp only through `IGitService.ExecuteWithRepo(...)`** — it opens/disposes the native handle deterministically. Ad-hoc or long-lived `Repository` handles leak and cause `.git/index.lock` collisions (the exact bug this app exists to prevent).
 - **No raw colors in UI.** Bind design tokens with `{DynamicResource …}` (never `StaticResource` for colors — it won't follow live theme switches). Pick a `Button.*` / `Border.*` component class by role instead of setting `Background`/`Foreground`. New tokens go in **every** `Themes/*.axaml`; new classes/icons go in `App.axaml`. There is one design system with five switchable color themes — never assume "dark" (Daylight Loom is light).
-- **Keep the Repository Map in AGENTS.md current.** When you create/move/rename/delete a file, update its entry in the same change — an unindexed file is an incomplete change.
+- **Keep the [`docs/repo-map/`](docs/repo-map/README.md) index current.** When you create/move/rename/delete a file, update its entry in the matching per-project file in the same change — an unindexed file is an incomplete change.
 - **No DI container** currently: `App` exposes a static `Settings`; `MainWindowViewModel` is constructed directly. Follow the pattern.
 - **Do not commit or push, and never touch `main` directly.** Make the edits, verify with `dotnet build` (+ `dotnet test` for `Mainguard.Git`), then hand back a detailed proposed commit message (`type: summary` convention) for the human to commit via PR.
