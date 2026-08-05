@@ -54,11 +54,16 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// <param name="packageCachePath">MG-43 — the per-agent package cache to bind-mount at
     /// <see cref="PackageCachePolicy.SandboxMount"/>. Null keeps the pre-MG-43 jail (no cache mount, no
     /// cache environment); <see cref="NewTempCache"/> makes one.</param>
+    /// <param name="cliCredentials">The CLI login-state files to RESTORE into the jail's tmpfs
+    /// <c>$HOME</c> at spawn (the host-keychain half of the credentialPaths round-trip). Null keeps the
+    /// jail's home empty, which is every other suite's expectation.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
-        string? packageCachePath = null, CancellationToken ct = default)
-        => SpawnFromImageAsync(ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct);
+        string? packageCachePath = null, CancellationToken ct = default,
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        => SpawnFromImageAsync(
+            ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct, cliCredentials);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -68,7 +73,8 @@ public sealed class SandboxFixture : IAsyncDisposable
     public async Task<SandboxHandle> SpawnFromImageAsync(
         string imageRef, string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
-        string? packageCachePath = null, CancellationToken ct = default)
+        string? packageCachePath = null, CancellationToken ct = default,
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
@@ -78,7 +84,8 @@ public sealed class SandboxFixture : IAsyncDisposable
         var worktree = NewTempWorktree();
         var secrets = new SandboxSecrets(
             agentEnv ?? new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
-            OobKey: oobKey ?? RandomKey());
+            OobKey: oobKey ?? RandomKey(),
+            CliCredentialFiles: cliCredentials);
 
         try
         {

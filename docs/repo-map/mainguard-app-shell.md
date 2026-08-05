@@ -730,7 +730,14 @@
     stored vault without erasing files the harvest didn't return; `DaemonBackedOrchestrator` restores
     the vault on `StartCoordinatorAsync` (`SpawnAgent.cli_credentials`) and persists `StopAgent`'s
     harvested files back through its injectable `keystoreSave` seam — secrets live ONLY in the host OS
-    keychain, never agent-side. `VmExitGuard.cs` — the pure full-exit-warning decision
+    keychain, never agent-side. **The harvest half is now DRIVEN**: `Start()` runs a `LoginHarvestPump`
+    that calls `PersistLiveAgentLoginsAsync` every `loginHarvestInterval` (default 1 min, injectable for
+    tests), and `Dispose()` runs one FINAL sweep on its own bounded token before `_cts` is cancelled.
+    Before this, `PersistLiveAgentLoginsAsync` had no callers anywhere in the repo, so only an explicit
+    in-app Stop ever wrote a `cli_login_*` entry — app close, a daemon/VM restart or a crash lost the
+    login and the user re-authenticated inside the jail every session. Pinned by
+    `CliLoginHarvestWiringTests` (the caller) and `CliLoginRoundTripDockerTests` (the round-trip).
+    `VmExitGuard.cs` — the pure full-exit-warning decision
     (`ShouldConfirm(stopVmOnExit, liveAgents)`) + dialog copy: a VM-stopping full exit under live agents
     confirms first; `App.RequestFullExitGuardedAsync` is the guarded path every user-facing exit takes
     (tray Exit, File → Exit, the X with close-to-tray off — `MainWindow.OnClosing` reroutes that X
