@@ -967,6 +967,12 @@
   an over-budget agent refused 402 with nothing forwarded, an OAuth agent passing through untouched
   and NOT 401'd (the regression that would hurt most), and an unknown token on the legacy model-host
   shape still refused so the pass-through is not an auth bypass**),
+  `GatewayPipelineWiringTests` (**that the gateway is SERVING, not merely bound — the bind tests pass
+  in a world where the port answers 404 to everything, which is exactly what the daemon did before
+  the middleware was wired. Issues a real HTTP request over the real Kestrel listener, because
+  ASP.NET activates middleware lazily and a constructor whose arguments cannot be resolved from DI
+  would start the daemon happily and only fail on an agent's first call. Also pins that the branch
+  does NOT leak onto the mutually-authenticated gRPC control port**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly
