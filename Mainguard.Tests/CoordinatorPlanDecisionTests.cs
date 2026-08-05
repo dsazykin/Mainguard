@@ -135,7 +135,7 @@ public class CoordinatorPlanDecisionTests
         using var client = new DaemonClient(
             () => throw new InvalidOperationException("no daemon in a unit test"),
             () => "token");
-        var orchestrator = new DaemonBackedOrchestrator(client);
+        using var orchestrator = new DaemonBackedOrchestrator(client, ownsClient: false);
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => orchestrator.SubmitPlanDecisionAsync("plan-7", approve: true));
