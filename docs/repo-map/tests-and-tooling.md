@@ -743,7 +743,15 @@
   ran in the jail), the flag/block/reason/acknowledge quartet, comment-edits-are-not-drift,
   both-files-drifted-names-both, and the typed `ToolchainProvisioningException` when the jail does not
   actually carry what main declared (asserting the verify command was never launched — a provisioning
-  failure is not a test result). **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
+  failure is not a test result). **P2-11 flagged-change gate wiring** lives in the same class because
+  the detector was never broken and the spine was, so only wiring-level tests over the real mirror can
+  see it: `BranchThatPoisonsPackageJson_…` (a GREEN, Verified branch blocked by a postinstall until the
+  item is acked), `BranchOutsideItsApprovedScope_…` (SA-1/F6 — a *benign* `Source` edit that is
+  flag-worthy for one reason only, the approved `TaskPlan.Scope`) with
+  `BranchInsideItsApprovedScope_IsNotFlagged` as its paired negative control, `ANewPayloadOnTheBranch_…`
+  (a new payload + the stale cascade's re-verify produces a new content hash and drops the ack), and
+  `AGreenBranchWhoseReviewCouldNotRun_IsDenied` (fail-closed: an otherwise perfectly mergeable branch
+  whose diff could not be classified is denied, and the verification result is untouched). **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
   holder — distro-scoped argv with no lifecycle verbs (G-12), restart-on-exit with capped backoff,
   start failures swallowed and retried, Dispose cancels a live holder session promptly). **Daemon
   fast-path:** `DaemonUpdaterTests` (the tier-1 skew decision + `/mnt` translation + the exact
@@ -917,7 +925,17 @@
   gate** then permits the merge it was refusing — asserted on `ChangedTestCommandGate` state and
   `MergeQueue.CanMerge`, never on "the RPC was invoked" — plus the negative that a wrong item id
   clears nothing, and that with no active repo the acknowledgment is refused out loud rather than
-  silently dropped)**. **`Gateway/`** (TI-P2-08): `Fake429EndpointTests` (invariant #1 end-to-end —
+  silently dropped)**, `FlaggedChangeMergeGateTests` (**P2-11 — the flagged-change gate refuses the
+  merge AT THE DAEMON.** The gate had no production wiring at all, so every assertion here goes
+  through the gRPC surface rather than a ViewModel — a ViewModel is precisely where this check used to
+  live while the daemon waved the merge through. The decisive case is an out-of-approved-scope change:
+  `CanMerge` refuses, the item reaches the human on `StreamQueue` addressed by the id the ack RPC
+  accepts, `BeginMerge` is refused *and hands the lease back*, and only after
+  `AcknowledgeFlaggedChange` — the act contract §4 denies the coordinator — is the merge granted. Plus
+  the poisoned-executable-config arm (live today; it needs no plan), one-item-acked-leaves-the-other-
+  blocking, an unknown item id clears nothing, and the fail-open guard: acknowledging for an agent
+  whose review never ran must not CREATE its store, since an empty store reads as fully acknowledged
+  and would bypass the MG-40 default-DENY)**. **`Gateway/`** (TI-P2-08): `Fake429EndpointTests` (invariant #1 end-to-end —
   `FakeModelEndpoint` returns 429-then-200, the `GatewayForwarder` returns exactly one delayed 200,
   PTY paused then resumed, agent `RateLimited` then cleared, lease settled from the usage body),
   `GatewaySpendRpcTests` (budgets get/set round-trip + `StreamSpend`/snapshot totals reconcile, on a

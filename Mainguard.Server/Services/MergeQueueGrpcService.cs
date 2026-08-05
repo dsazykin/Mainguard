@@ -272,6 +272,15 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             changed.Acknowledge(request.AgentId);
             acknowledged = !changed.IsUnacknowledged(request.AgentId);
         }
+        else if (ctx.FlaggedChanges is { } flagged)
+        {
+            // P2-11: every other item id addresses one row in the branch's flagged set, acknowledged
+            // item-by-item (AcknowledgmentStore exposes no "ack all" — a global checkbox is a rejection
+            // trigger). PeekStore, never StoreFor: an ack naming an agent the review never ran for must
+            // not CREATE that agent's store, because an empty store reads as fully acknowledged and would
+            // turn this RPC into the bypass around the gate's default-DENY.
+            acknowledged = flagged.PeekStore(request.AgentId)?.Acknowledge(request.ItemId) ?? false;
+        }
 
         if (acknowledged)
         {
@@ -368,28 +377,50 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// </summary>
     private static IEnumerable<FlaggedItem> FlaggedItemsFor(MergeQueueContext ctx, string agentId)
     {
-        if (ctx.ChangedTestCommand is not { } changed)
+        if (ctx.ChangedTestCommand is { } changed)
+        {
+            var drifted = changed.FlaggedItems(agentId);
+            if (drifted.Count > 0)
+            {
+                // One row, addressed by the id the daemon's own AcknowledgeFlaggedChange accepts. The gate
+                // acknowledges its drift items together (a human clearing one while another went unread is
+                // the failure it was shaped to prevent), so it presents as one item naming everything that
+                // drifted.
+                yield return new FlaggedItem
+                {
+                    Id = ChangedTestCommandItemId,
+                    Path = "(verification command)",
+                    Category = "ExecutableConfig",
+                    Fact = $"the {string.Join(" and the ", drifted)} changed on this branch vs main "
+                        + "— a branch cannot be allowed to self-green",
+                    Acknowledged = !changed.IsUnacknowledged(agentId),
+                };
+            }
+        }
+
+        // P2-11: the risk-hunk and out-of-approved-scope rows the flagged-change gate is blocking on. These
+        // used to have no daemon-side source at all — the gate was constructed nowhere in the daemon — so a
+        // branch touching a CI workflow or a git hook reached the human with nothing to review. PeekStore
+        // rather than StoreFor: rendering the queue must never manufacture an "already reviewed" record for
+        // an agent whose diff was never classified (see FlaggedChangeGate.PeekStore).
+        var store = ctx.FlaggedChanges?.PeekStore(agentId);
+        if (store is null)
         {
             yield break;
         }
 
-        var drifted = changed.FlaggedItems(agentId);
-        if (drifted.Count == 0)
+        foreach (var item in store.Items)
         {
-            yield break;
+            yield return new FlaggedItem
+            {
+                // FlaggedChange.Id is kind|path|contentHash — stable within a flagged set and content-bound,
+                // so an ack cannot survive the push that changes the bytes it was granted for.
+                Id = item.Id,
+                Path = item.Path,
+                Category = item.Category.ToString(),
+                Fact = item.Detail,
+                Acknowledged = store.IsAcknowledged(item.Id),
+            };
         }
-
-        // One row, addressed by the id the daemon's own AcknowledgeFlaggedChange accepts. The gate
-        // acknowledges its drift items together (a human clearing one while another went unread is the
-        // failure it was shaped to prevent), so it presents as one item naming everything that drifted.
-        yield return new FlaggedItem
-        {
-            Id = ChangedTestCommandItemId,
-            Path = "(verification command)",
-            Category = "ExecutableConfig",
-            Fact = $"the {string.Join(" and the ", drifted)} changed on this branch vs main "
-                + "— a branch cannot be allowed to self-green",
-            Acknowledged = !changed.IsUnacknowledged(agentId),
-        };
     }
 }
