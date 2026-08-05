@@ -39,7 +39,24 @@ public sealed class WorkerPlanGate : IMergeGate
     private readonly PlanApprovalService _plans;
     private readonly IAuditLog _audit;
     private readonly object _gate = new();
-    private readonly Dictionary<string, HeldTask> _held = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Held tasks, keyed by <b>(RepoHash, AgentId)</b> — never the bare agent id.
+    ///
+    /// <para>An agent id is unique only <i>within</i> a repo. Minted GUIDs happen to be unique everywhere,
+    /// but the external-PR intake names its sessions <c>pr-&lt;n&gt;</c>, and two subscribed repositories
+    /// that each have a pull request #7 both want <c>pr-7</c>. Keying by id alone is the bug this codebase
+    /// has now fixed three times (#281 <c>AgentSessionStore</c>, #284 <c>SwarmReconciler</c>, #286
+    /// <c>TerminalSessionManager</c>), and it would land here in a particularly bad form: <see cref="Hold"/>
+    /// is idempotent per key, so a second repo's <c>pr-7</c> would silently <i>inherit the first repo's
+    /// held task</i> — and approving one repo's plan would authorise the other repo's worker.</para>
+    ///
+    /// <para><b>Not reachable today, fixed at the key anyway.</b> The only plan-gated spawn path is the
+    /// coordinator's <c>spawn</c> op, which never names an id, so every held worker currently has a minted
+    /// GUID. That is a property of one call site, not of this type — and "the caller happens not to do the
+    /// dangerous thing" is exactly the kind of reasoning that stops being true without anyone noticing.</para>
+    /// </summary>
+    private readonly Dictionary<(string RepoHash, string AgentId), HeldTask> _held = new();
 
     public WorkerPlanGate(PlanApprovalService plans, IAuditLog? audit = null)
     {
@@ -48,7 +65,52 @@ public sealed class WorkerPlanGate : IMergeGate
     }
 
     /// <summary>A task prompt withheld from a worker until its plan is approved.</summary>
-    private sealed record HeldTask(string CoordinatorId, string Title, string TaskPrompt, decimal BudgetUsd, bool Released);
+    private sealed record HeldTask(
+        string RepoHash, string CoordinatorId, string Title, string TaskPrompt, decimal BudgetUsd, bool Released);
+
+    /// <summary>
+    /// Resolves a bare agent id to its held-task key, <b>unique-or-nothing</b>.
+    ///
+    /// <para>Most entry points here receive an id with no repo attached (the worker's IPC socket carries no
+    /// repo — identity is positional). Following the <c>AgentSessionStore.Find(agentId)</c> precedent, an
+    /// id held by two repos resolves to <i>nothing</i> rather than to an arbitrary one of them: every
+    /// caller of this treats "no held task" as "not authorised", so ambiguity fails closed. Returning
+    /// either candidate would be the aliasing bug wearing a lookup's clothes.</para>
+    /// </summary>
+    private (string RepoHash, string AgentId)? ResolveKeyLocked(string agentId)
+    {
+        (string RepoHash, string AgentId)? found = null;
+        foreach (var key in _held.Keys)
+        {
+            if (!string.Equals(key.AgentId, agentId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (found is not null)
+            {
+                return null; // ambiguous — two repos hold this id; refuse rather than guess.
+            }
+
+            found = key;
+        }
+
+        return found;
+    }
+
+    /// <summary>The held task for a bare agent id, or null when unknown or ambiguous.</summary>
+    private HeldTask? FindLocked(string agentId) =>
+        ResolveKeyLocked(agentId) is { } key ? _held[key] : null;
+
+    /// <summary>
+    /// How many (repo, agent id) tasks this gate is holding. Exposed because it is the only way to observe
+    /// that two repositories each hold their <i>own</i> task for the same agent id — the distinction the
+    /// composite key exists to preserve, and one that no id-keyed accessor can show.
+    /// </summary>
+    public int HeldTaskCount
+    {
+        get { lock (_gate) { return _held.Count; } }
+    }
 
     /// <summary>Raised (off any lock) when a worker's task is released, so the daemon can deliver it.</summary>
     public event Action<string, string>? TaskReleased;
@@ -57,27 +119,32 @@ public sealed class WorkerPlanGate : IMergeGate
     /// Records the work a worker was spawned for <b>without giving it to the worker</b>. Called on the
     /// spawn path; idempotent per worker id.
     /// </summary>
-    public void Hold(string workerAgentId, string coordinatorId, string title, string taskPrompt, decimal budgetUsd)
+    public void Hold(
+        string workerAgentId, string coordinatorId, string title, string taskPrompt, decimal budgetUsd,
+        string repoHash = "")
     {
         if (string.IsNullOrWhiteSpace(workerAgentId))
         {
             throw new ArgumentException("workerAgentId is required.", nameof(workerAgentId));
         }
 
+        var key = (repoHash ?? string.Empty, workerAgentId);
         lock (_gate)
         {
-            if (_held.ContainsKey(workerAgentId))
+            if (_held.ContainsKey(key))
             {
                 return;
             }
 
-            _held[workerAgentId] = new HeldTask(coordinatorId ?? "", title ?? "", taskPrompt ?? "", budgetUsd, Released: false);
+            _held[key] = new HeldTask(
+                repoHash ?? string.Empty, coordinatorId ?? "", title ?? "", taskPrompt ?? "", budgetUsd, Released: false);
         }
 
         _audit.Append(new AuditEvent("worker_task_withheld", new Dictionary<string, string>
         {
             ["worker_agent_id"] = workerAgentId,
             ["coordinator_id"] = coordinatorId ?? "",
+            ["repo_hash"] = repoHash ?? string.Empty,
         }));
     }
 
@@ -91,7 +158,7 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            return _held.TryGetValue(workerAgentId, out var task) ? task.Title : null;
+            return FindLocked(workerAgentId)?.Title;
         }
     }
 
@@ -100,7 +167,7 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            return _held.TryGetValue(workerAgentId, out var task) ? task.CoordinatorId : null;
+            return FindLocked(workerAgentId)?.CoordinatorId;
         }
     }
 
@@ -109,7 +176,7 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            return _held.TryGetValue(workerAgentId, out var task) ? task.BudgetUsd : 0m;
+            return FindLocked(workerAgentId)?.BudgetUsd ?? 0m;
         }
     }
 
@@ -133,13 +200,14 @@ public sealed class WorkerPlanGate : IMergeGate
 
         lock (_gate)
         {
-            if (!_held.TryGetValue(workerAgentId, out var task))
+            if (ResolveKeyLocked(workerAgentId) is not { } key)
             {
                 return false;
             }
 
+            var task = _held[key];
             taskPrompt = task.TaskPrompt;
-            _held[workerAgentId] = task with { Released = true };
+            _held[key] = task with { Released = true };
         }
 
         _audit.Append(new AuditEvent("worker_task_released", new Dictionary<string, string>
@@ -155,7 +223,7 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            return _held.TryGetValue(workerAgentId, out var task) && task.Released;
+            return FindLocked(workerAgentId) is { Released: true };
         }
     }
 
@@ -164,7 +232,10 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            _held.Remove(workerAgentId);
+            if (ResolveKeyLocked(workerAgentId) is { } key)
+            {
+                _held.Remove(key);
+            }
         }
     }
 
@@ -212,7 +283,7 @@ public sealed class WorkerPlanGate : IMergeGate
         // every unknown id would silently block every non-coordinated branch in the queue.
         lock (_gate)
         {
-            if (!_held.ContainsKey(agentId))
+            if (ResolveKeyLocked(agentId) is null)
             {
                 reason = string.Empty;
                 return true;
@@ -230,7 +301,7 @@ public sealed class WorkerPlanGate : IMergeGate
         var blocked = _plans.BlockedWorkerIds();
         lock (_gate)
         {
-            return blocked.Where(_held.ContainsKey).ToList();
+            return blocked.Where(id => ResolveKeyLocked(id) is not null).ToList();
         }
     }
 
@@ -245,7 +316,7 @@ public sealed class WorkerPlanGate : IMergeGate
             var escalated = _plans.EscalatedWorkerIds();
             lock (_gate)
             {
-                return escalated.Count(_held.ContainsKey);
+                return escalated.Count(id => ResolveKeyLocked(id) is not null);
             }
         }
     }

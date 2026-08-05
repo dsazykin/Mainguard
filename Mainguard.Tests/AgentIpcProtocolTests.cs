@@ -52,12 +52,20 @@ public class AgentIpcProtocolTests
     public void ShimScript_SpeaksTheProtocol_AtTheFixedMountPath()
     {
         // The script is python3 (part of the pre-baked jail toolchain — G-16: nothing is baked into
-        // the image), dials the fixed in-jail socket path by default, and emits the two ops.
+        // the image), dials the fixed in-jail socket path by default, and emits the contract's ops.
         Assert.StartsWith("#!/usr/bin/env python3", AgentSpawnShim.Script, StringComparison.Ordinal);
         Assert.Contains(AgentIpcPaths.SandboxSocketPath, AgentSpawnShim.Script, StringComparison.Ordinal);
-        Assert.Contains("\"op\": \"spawn\"", AgentSpawnShim.Script, StringComparison.Ordinal);
-        Assert.Contains("\"op\": \"list\"", AgentSpawnShim.Script, StringComparison.Ordinal);
         Assert.Contains("MAINGUARD_IPC_SOCKET", AgentSpawnShim.Script, StringComparison.Ordinal);
+
+        // Phase 3 — the shim emits the coordinator contract §3 surface. `list` is still accepted on the
+        // command line as an alias of `status` (an existing coordinator transcript keeps working), but it
+        // is no longer an op ON THE WIRE: both spellings send `status`, so the daemon has one code path
+        // to scope and one to test.
+        Assert.Contains("\"op\": \"spawn\"", AgentSpawnShim.Script, StringComparison.Ordinal);
+        Assert.Contains("\"op\": \"status\"", AgentSpawnShim.Script, StringComparison.Ordinal);
+        Assert.Contains("\"op\": \"prompt\"", AgentSpawnShim.Script, StringComparison.Ordinal);
+        Assert.Contains("\"op\": \"verify\"", AgentSpawnShim.Script, StringComparison.Ordinal);
+        Assert.Contains("(\"status\", \"list\")", AgentSpawnShim.Script, StringComparison.Ordinal);
     }
 
     [Fact]

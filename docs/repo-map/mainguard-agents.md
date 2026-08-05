@@ -93,10 +93,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
     with `daemon.sock` + **the one shim that agent's role is allowed** — plus `AgentIpcEndpointRole`
     (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
-    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`),
+    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`.
+    **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
+    object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
+    two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
+    happens to reach — so "the list is exhaustive" is one testable thing instead of a property of control
+    flow. Adding a member is a deliberate contract change),
     `AgentSpawnShim.cs` (the `mainguard-agent` python3 shim script the daemon writes into the
     **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
-    G-16) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
+    G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
+    <text>` / `verify <id>`, with `list` kept as an alias of `status` — and its docstring says plainly that
+    there is no fifth) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
     **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>`.
     `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker

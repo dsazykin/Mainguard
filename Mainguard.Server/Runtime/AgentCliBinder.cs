@@ -199,6 +199,40 @@ public sealed class AgentCliBinder
     /// <summary>Clears the pending-bind flag (no CLI will bind for this agent — an attach should echo).</summary>
     public void ClearBindPending(AgentSessionKey key) => _terminals.ClearBindPending(key);
 
+    /// <summary>
+    /// Delivers a coordinator's steering prompt to a managed worker's live CLI (coordinator contract §3,
+    /// <c>send_worker_prompt</c>). Returns false when no CLI is bound for that session — the caller reports
+    /// that rather than pretending the prompt landed.
+    ///
+    /// <para><b>Why this deliberately does not consult <see cref="Mainguard.Server.Auth.TerminalLockRegistry"/>.</b>
+    /// That lock exists to sever <i>human</i> keyboard input to a managed worker (P2-14): a worker's terminal
+    /// is read-only in the UI so steering goes through the sanctioned channel instead of a human typing into
+    /// an agent's session. This IS that sanctioned channel. Honouring the lock here would make
+    /// <c>send_worker_prompt</c> permanently impossible, since every worker a coordinator owns is Managed
+    /// and therefore locked — the tool would be a contract entry that could never once succeed.</para>
+    ///
+    /// <para>The ownership and plan-gate checks that make this safe are applied by the caller
+    /// (<c>AgentSpawnService.PromptAsync</c>): the target must be a live child of the calling coordinator in
+    /// the same repo, and must already hold an approved plan. This method is the delivery mechanism, not the
+    /// gate — it is <c>internal</c> so no other transport can reach it without going through those checks.</para>
+    /// </summary>
+    internal async Task<bool> TrySendPromptAsync(AgentSessionKey key, string prompt, CancellationToken ct)
+    {
+        var bound = _terminals.TryGetBound(key);
+        if (bound is null)
+        {
+            return false;
+        }
+
+        // A CLI reads a prompt as a line: the trailing newline is what submits it. Without it the text
+        // sits in the agent's input buffer and nothing happens — a silent no-op that would look like a
+        // delivered prompt to everything upstream.
+        var line = prompt.EndsWith('\n') ? prompt : prompt + "\n";
+        await bound.WriteInputAsync(System.Text.Encoding.UTF8.GetBytes(line), ct).ConfigureAwait(false);
+        _log.LogInformation("coordinator prompt delivered to worker={Agent} ({Bytes} bytes)", key.AgentId, line.Length);
+        return true;
+    }
+
     /// <summary>Cap on the last-output tail carried into the death reason/audit — enough to name
     /// the cause ("the input device is not a TTY", "Not logged in …", a stack-trace head).</summary>
     internal const int ExitTailChars = 400;

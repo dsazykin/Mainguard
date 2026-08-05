@@ -64,11 +64,20 @@ public sealed class SandboxAgentLauncher
     /// when the repo is not provisioned (session-only path). On a failure <i>after</i> the worktree exists,
     /// the half-made worktree is cleaned up so no residue survives, then the failure propagates.
     /// </summary>
+    /// <param name="withoutRepositoryAccess">
+    /// Coordinator contract §2/§8 — the role lock. A coordinator is <i>only</i> an orchestrator: it gets no
+    /// worktree, no per-agent git repo, no mirror mount and no package cache, because "the coordinator has
+    /// no worktree, no git credentials and no view of repository contents". Set for
+    /// <see cref="AgentRoles.Coordinator"/> and nothing else; <see cref="ContainerSpecBuilder"/> re-asserts
+    /// it fail-closed, so a caller that later passes a repository path alongside this flag gets a typed
+    /// spawn failure rather than silently regaining the capability.
+    /// </param>
     public async Task<SandboxLaunchResult?> TryLaunchAsync(
         string repoHandle, string agentId, string agentKind, string? modelApiKey,
         string? ipcDirPath = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        bool withoutRepositoryAccess = false)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -162,12 +171,24 @@ public sealed class SandboxAgentLauncher
         var adapter = _adapters.TryGet(agentKind);
         var launchCommand = adapter?.Launch;
 
-        var worktreePath = _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
+        // Coordinator contract §2: a coordinator has no worktree. Note this skips CREATING one, not just
+        // mounting it — provisioning a worktree the jail can never see would leave a branch and a
+        // directory per coordinator for no reason, and a later change that started mounting it would find
+        // the content already there.
+        var worktreePath = withoutRepositoryAccess
+            ? string.Empty
+            : _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
         // MG-3: the per-agent repository the worktree is linked off — the ONE git dir this jail may
         // write. Resolved AFTER creation so an implementation that has no per-agent repo (the test
         // doubles' default) simply reports none and the jail carries no such mount.
-        var agentRepoPath = _environment.Worktrees.AgentRepoPathFor(repoHandle, agentId);
-        _log.LogInformation("worktree ready: {Path} agentRepo={AgentRepo}", worktreePath, agentRepoPath);
+        var agentRepoPath = withoutRepositoryAccess
+            ? null
+            : _environment.Worktrees.AgentRepoPathFor(repoHandle, agentId);
+        _log.LogInformation(
+            withoutRepositoryAccess
+                ? "repository-less jail (coordinator role): no worktree, no agent repo, no mirror, no cache"
+                : "worktree ready: {Path} agentRepo={AgentRepo}",
+            worktreePath, agentRepoPath);
         try
         {
             // MG-43: this agent's own package cache on ext4, prepared BEFORE the container exists (its
@@ -176,7 +197,9 @@ public sealed class SandboxAgentLauncher
             // tmpfs $HOME and dies at ENOSPC, which the merge queue records as an ordinary failed
             // verification indistinguishable from the agent's code being broken.
             string? packageCachePath = null;
-            if (_environment.PackageCaches is { } caches)
+            // A coordinator builds nothing, so it has no use for a package cache — and a cache is a
+            // read-write bind mount, which is exactly the kind of capability the role lock removes.
+            if (!withoutRepositoryAccess && _environment.PackageCaches is { } caches)
             {
                 var usage = caches.Prepare(repoHandle, agentId);
                 packageCachePath = caches.PathFor(repoHandle, agentId);
@@ -215,7 +238,9 @@ public sealed class SandboxAgentLauncher
                 // The shared mirror at its identical VM path so the per-agent repo's alternates pointer
                 // resolves in-jail (field bug 2026-07-23: every in-jail git command died "not a git
                 // repository"). MG-3 stage 3 makes this mount read-only.
-                BareRepoPath: barePath,
+                // Coordinator contract §2: repository-less jails get no mirror either — read-only is
+                // still a "view of repository contents", which is precisely what the role lock denies.
+                BareRepoPath: withoutRepositoryAccess ? null : barePath,
                 // MG-3: the per-agent repository, at its identical VM path so the worktree's gitdir
                 // pointer resolves. Read-write, and mounted into exactly this one jail.
                 AgentRepoPath: string.IsNullOrEmpty(agentRepoPath) ? null : agentRepoPath,
@@ -226,13 +251,19 @@ public sealed class SandboxAgentLauncher
                 ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort),
                 // MG-43: the daemon-owned package cache for THIS agent, read-write at
                 // /var/cache/mainguard — on ext4, outside the worktree, outside the tmpfs $HOME.
-                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
+                PackageCachePath: packageCachePath,
+                // The role lock itself, re-asserted inside the pure spec builder (fail-closed).
+                WithoutRepositoryAccess: withoutRepositoryAccess), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
             // after the jail is up, so a failed spawn leaves no watcher behind; the pre-verification
             // re-fetch is the other half and neither replaces the other.
-            _environment.Worktrees.WatchAgentRef(repoHandle, agentId);
+            // A repository-less jail has no refs/heads/agent/<id> to watch — it has no git dir at all.
+            if (!withoutRepositoryAccess)
+            {
+                _environment.Worktrees.WatchAgentRef(repoHandle, agentId);
+            }
 
             _log.LogInformation(
                 "jail started: container={Container} reused={Reused} launchCmd={HasLaunch}",
@@ -242,8 +273,13 @@ public sealed class SandboxAgentLauncher
         catch (Exception ex)
         {
             // Leave no residue: remove the worktree we just created before surfacing the failure.
+            // A repository-less jail never created one, so there is nothing to remove.
             _log.LogError(ex, "jail start failed after worktree — cleaning up worktree: repo={Repo}", repoHandle);
-            TryRemoveWorktree(repoHandle, agentId);
+            if (!withoutRepositoryAccess)
+            {
+                TryRemoveWorktree(repoHandle, agentId);
+            }
+
             throw;
         }
     }

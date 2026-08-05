@@ -486,7 +486,14 @@
   - `ContainerSpecBuilderTests` (every hardening flag on the create request + the G2 quartet — seccomp
     denies `process_vm_readv`/`process_vm_writev`/`ptrace`, `CapDrop ALL`/no `CAP_SYS_PTRACE`,
     supervisor-uid ≠ agent-uid 0400 tmpfs — the `/mnt/c`/`C:\`/UNC typed-rejection theory,
-    no-secret-in-Env, and `ptrace_scope`-absent-from-request), `EgressSegmentationTests` (**MG-36,
+    no-secret-in-Env, and `ptrace_scope`-absent-from-request),
+  - `CoordinatorJailSpecTests` (**phase 3, contract §8 step 1 — the role lock in the create request**: a
+    coordinator jail mounts NO worktree, NO mirror, NO per-agent git dir and NO package cache, keeping
+    only the two READ-ONLY capability mounts (adapters + IPC), so it has no writable bind mount at all;
+    `/workspace` is an empty agent-owned tmpfs so `docker exec -w /workspace` still lands; the builder
+    REFUSES any repository path supplied alongside the flag (fail-closed — a future caller cannot quietly
+    hand the capability back); paired negative proving a WORKER's jail is unchanged),
+    `EgressSegmentationTests` (**MG-36,
     pure**: per-agent segment naming is distinct/stable/docker-safe; `IsDefaultDenyAgentNetwork` covers
     the shared network AND every segment but never the egress leg; **a jail on a segment with no
     resolver pin is still refused** — the MG-7 gate would have silently stopped applying when the
@@ -742,7 +749,10 @@
   escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
   a branch that verified GREEN**, the paired negative that agents the gate never held are NOT blocked,
   and the backpressure text — including a negative that refuses to claim a saturated cap when there is
-  headroom),
+  headroom; **phase 3** — held tasks are keyed by `(RepoHash, AgentId)`, so two repos may each hold a task
+  for the same `pr-7`, and a bare id held by two repos resolves UNIQUE-OR-NOTHING: `TryReleaseTask` refuses
+  rather than letting one repo's approval release another repo's withheld task, with a paired positive
+  proving an unambiguous id still releases normally),
   `KillSwitchTests` (`FanOutUnder5s`+snapshot+frozen; the **RT-D4 `HardCeiling_IndependentOfRtt`**
   clamp with the A3 spike; the **SA-1/F4 `FreezesQueueBeforeFanOut`** timeline; the **RT-D3
   audit-outage→recovery `killswitch_audit_gap`**), and `Integration/ScriptedCoordinatorEndToEndTests`
@@ -909,7 +919,20 @@
   how the first run failed, and a pleasant way to be reminded the cap is real). **`WorkerCapDaemonEnforcementTests`**
   is its own class, and therefore its own rig, because it asserts a daemon-global population: the cap is
   refused **in the daemon's shim handler, on the wire, counting workers that are doing nothing but
-  waiting on the human**, with the refusal naming that),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
+  waiting on the human**, with the refusal naming that),**
+  **`CoordinatorRoleLockTests` (phase 3, contract §8 — THE ROLE LOCK, over the same real Unix socket. The
+  coordinator's surface is now the contract's four tools and the allow-list is asserted as an object
+  (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4
+  capability by its RPC spelling (`BeginMerge`, `ConfirmMerge`, `AbandonMerge`,
+  `AcknowledgeFlaggedChange`, `ApprovePlan`, `RejectPlan`, `GetScrollback`), every worker plan-gate op,
+  and assorted others — are each refused, and removing the deny turns ALL 18 red. §7 ownership scoping is
+  keyed `(RepoHash, AgentId)`: two repos each running `pr-7` under different coordinators do not see each
+  other (the test that only a second repo can express), a stranger's worker cannot be read, steered or
+  proposed for verification, and "not yours" is answered IDENTICALLY to "no such worker" so the channel is
+  not an existence oracle. Also: a coordinator is never a merge-queue member, cannot name itself, and the
+  daemon really does spawn it with `WithoutRepositoryAccess` while a worker keeps its worktree — asserted
+  on the recorded `SandboxSpawnRequest`, because a correct spec builder nobody passes the flag to is the
+  MG-12 shape. Over its own two-repo `RoleLockRig`),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
   sequence), `FixtureAcceptanceTests` (the TI-P2-00 fixture smokes),
   **`CompositionRootResolutionTests` (P2-47 integration proof #1 — every mapped gRPC service's ctor
   graph resolves via `ActivatorUtilities`, the gateway+governance singletons resolve, and the P2-12
@@ -984,7 +1007,10 @@
   (MG-12/MG-30 — a coordinator token now genuinely AUTHENTICATES and is then denied by the ROLE layer
   for `BeginMerge`/`ConfirmMerge`/`ApprovePlan` **and `GetScrollback`**, asserted on the role gate's
   own message so a bearer-layer rejection can no longer satisfy it; the operator token passes to
-  `NOT_FOUND` and may still read scrollback; an unregistered token is still rejected outright),
+  `NOT_FOUND` and may still read scrollback; an unregistered token is still rejected outright; **phase 3
+  adds the three §4 RPCs that were in `CoordinatorDeniedMethods` with NO test — `AbandonMerge`,
+  `AcknowledgeFlaggedChange` (merge power by another name) and `RejectPlan` — so dropping any of them from
+  the set would now be caught**),
   `ConnectionRoleRegistryTests` (MG-12 — `Resolve` fails CLOSED: only a constant-time match on the
   operator token yields Operator, unknown/null yield least privilege),
   `AttachInputLockInterceptorTests` (MG-31 — the interceptor's input-lock layer severs input for BOTH

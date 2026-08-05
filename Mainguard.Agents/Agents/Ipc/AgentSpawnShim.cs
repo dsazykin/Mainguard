@@ -18,11 +18,23 @@ public static class AgentSpawnShim
     /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon).</summary>
     public const string Script = """"
 #!/usr/bin/env python3
-"""mainguard-agent: spawn Mainguard sub-agents through the daemon.
+"""mainguard-agent: the Mainguard Coordinator's complete set of operations.
+
+These four tools are ALL you can do. There is no fifth. You cannot merge, approve or reject
+a plan, read another agent's terminal, or act on a worker you did not spawn — the daemon
+refuses those, so there is nothing to be gained by trying.
 
 Usage:
-  mainguard-agent spawn <agent-kind> [task prompt ...]
-  mainguard-agent list
+  mainguard-agent spawn <agent-kind> [task prompt ...]   spawn_worker
+  mainguard-agent status [<agent-id>]                    get_worker_status
+  mainguard-agent prompt <agent-id> <text ...>           send_worker_prompt
+  mainguard-agent verify <agent-id>                      request_verification
+
+  mainguard-agent list                                   alias of `status`
+
+A spawned worker does NOT receive its task until a human approves the plan the worker
+itself authors after inspecting the repository. Until then `prompt` and `verify` are
+refused for it, and that is the gate working, not an error to route around.
 """
 import json
 import os
@@ -49,8 +61,14 @@ def call(request):
 def main(argv):
     if len(argv) >= 3 and argv[1] == "spawn":
         request = {"op": "spawn", "agentKind": argv[2], "taskPrompt": " ".join(argv[3:])}
-    elif len(argv) >= 2 and argv[1] == "list":
-        request = {"op": "list"}
+    elif len(argv) >= 2 and argv[1] in ("status", "list"):
+        # `list` is the pre-phase-3 spelling of the same tool, kept so an existing coordinator
+        # transcript does not break. Both carry an optional agent id.
+        request = {"op": "status", "agentId": argv[2] if len(argv) >= 3 else None}
+    elif len(argv) >= 4 and argv[1] == "prompt":
+        request = {"op": "prompt", "agentId": argv[2], "prompt": " ".join(argv[3:])}
+    elif len(argv) >= 3 and argv[1] == "verify":
+        request = {"op": "verify", "agentId": argv[2]}
     else:
         sys.stderr.write(__doc__ or "usage: mainguard-agent spawn <agent-kind> [prompt]\n")
         return 2
@@ -66,6 +84,8 @@ def main(argv):
             print(response["agentId"])
         for agent in response.get("agents") or []:
             print(agent)
+        if response.get("status") and not response.get("agents") and not response.get("agentId"):
+            print(response["status"])
         return 0
 
     sys.stderr.write("mainguard-agent: %s\n" % response.get("error", "request refused"))

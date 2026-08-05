@@ -69,6 +69,59 @@ public class RoleInterceptorTests
         Assert.Contains(RoleDenialMarker, ex2.Status.Detail);
     }
 
+    /// <summary>
+    /// Phase 3, contract §4 — the two merge-power RPCs the existing cases never covered.
+    /// <c>AbandonMerge</c> is the third leg of the merge conversation, and
+    /// <c>AcknowledgeFlaggedChange</c> is the human review act that unblocks a merge, i.e. merge power by
+    /// another name. Both were in <c>CoordinatorDeniedMethods</c> and neither had a test, so nothing would
+    /// have noticed either being dropped from the set.
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesTheRestOfTheMergeConversationToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+        var coordinatorHeaders = fixture.AuthHeaders(CoordinatorToken);
+
+        var abandon = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AbandonMergeAsync(
+                new AbandonMergeRequest { RepoHandle = "repo", AgentId = "a" }, coordinatorHeaders).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, abandon.StatusCode);
+        Assert.Contains(RoleDenialMarker, abandon.Status.Detail);
+
+        // MG-11: acknowledging a flagged change unblocks a merge, so it is merge power by another name.
+        var ack = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AcknowledgeFlaggedChangeAsync(
+                new AcknowledgeFlaggedChangeRequest { RepoHandle = "repo", AgentId = "a", ItemId = "i" },
+                coordinatorHeaders).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, ack.StatusCode);
+        Assert.Contains(RoleDenialMarker, ack.Status.Detail);
+    }
+
+    /// <summary>
+    /// §4 plan approval, the REJECT half. <c>ApprovePlan</c> had a test; <c>RejectPlan</c> did not — and a
+    /// coordinator that can reject plans holds the gate just as surely as one that can approve them (it can
+    /// burn a worker's revision budget to escalation at will).
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesPlanRejectionToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            plans.RejectPlanAsync(
+                new RejectPlanRequest { PlanId = "any", Reason = "no" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
     [Fact]
     public async Task RoleInterceptor_DeniesPlanApprovalToCoordinator()
     {

@@ -64,7 +64,8 @@ public sealed record SandboxSpawnRequest(
     string? NetworkName = null,
     string? ProxyUrl = null,
     string? AgentRepoPath = null,
-    string? PackageCachePath = null);
+    string? PackageCachePath = null,
+    bool WithoutRepositoryAccess = false);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

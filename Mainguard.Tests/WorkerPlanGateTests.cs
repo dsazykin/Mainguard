@@ -254,4 +254,74 @@ public class WorkerPlanGateTests
         Assert.Equal(0, gate.BlockedWorkerCount);
         Assert.False(gate.TryReleaseTask("w-1", out _));
     }
+
+    // ---- phase 3 · the held task is keyed by (RepoHash, AgentId), never the bare id -----------
+
+    /// <summary>
+    /// Two repositories, each with a worker called <c>pr-7</c> — the id collision the external-PR intake
+    /// produces, and the one this codebase has already fixed three times elsewhere (#281, #284, #286).
+    ///
+    /// <para>Keyed by the bare id, <see cref="WorkerPlanGate.Hold"/> is idempotent per id, so repo B's
+    /// <c>pr-7</c> would silently inherit repo A's held task and repo B's own task would be dropped on the
+    /// floor. Keyed by (repo, id) they are two distinct holds, which is what this asserts.</para>
+    /// </summary>
+    [Fact]
+    public void TwoRepositoriesMayEachHoldATaskForTheSameAgentId()
+    {
+        var (_, gate) = Rig();
+
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        gate.Hold("pr-7", "coord-b", "Repo B title", "repo B task", 1m, repoHash: "repo-b");
+
+        // Both holds exist independently. Under the bare-id key the second Hold returned early and repo
+        // B's task never existed at all — HeldTaskCount would be 1.
+        Assert.Equal(2, gate.HeldTaskCount);
+    }
+
+    /// <summary>
+    /// The fail-closed half. An id held by two repos is <b>ambiguous</b>, and every question about it is
+    /// answered "not authorised" rather than answered from whichever repo happened to be found first.
+    ///
+    /// <para>This is the security-relevant direction: approving repo B's plan must never release repo A's
+    /// withheld task. Resolving an ambiguous id to an arbitrary candidate is the aliasing bug wearing a
+    /// lookup's clothes, so the resolver returns nothing and the gate refuses.</para>
+    /// </summary>
+    [Fact]
+    public void AnAmbiguousAgentId_FailsClosed_RatherThanResolvingToEitherRepo()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        gate.Hold("pr-7", "coord-b", "Repo B title", "repo B task", 1m, repoHash: "repo-b");
+
+        // A plan approved for the *bare* id must not hand either repo's task over.
+        var planId = plans.Present("pr-7", "coord-b", "Repo B title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        Assert.False(
+            gate.TryReleaseTask("pr-7", out var released),
+            "an ambiguous agent id released a withheld task — one repo's approval authorised another's worker.");
+        Assert.Equal(string.Empty, released);
+
+        // And the brief/budget lookups refuse too, rather than serving repo A's title to repo B.
+        Assert.Null(gate.PlanningBriefFor("pr-7"));
+        Assert.Null(gate.CoordinatorFor("pr-7"));
+    }
+
+    /// <summary>
+    /// The paired positive, so the test above cannot pass by the gate simply refusing everything: an
+    /// UNambiguous id still resolves and still releases on approval.
+    /// </summary>
+    [Fact]
+    public void AnUnambiguousAgentId_StillResolvesAndReleasesNormally()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+
+        var planId = plans.Present("pr-7", "coord-a", "Repo A title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        Assert.True(gate.TryReleaseTask("pr-7", out var released));
+        Assert.Equal("repo A task", released);
+        Assert.Equal("Repo A title", gate.PlanningBriefFor("pr-7"));
+    }
 }

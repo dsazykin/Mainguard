@@ -183,7 +183,11 @@ public sealed class AgentSpawnService
         var planGated = heldTaskTitle is not null || heldTaskPrompt is not null;
         if (planGated)
         {
-            _planGate.Hold(session.Id, parentAgentId ?? "", heldTaskTitle ?? "Untitled task", heldTaskPrompt ?? "", heldBudgetUsd);
+            // The repo is half the key (see WorkerPlanGate._held): a held task belongs to (repo, agent id),
+            // never to the bare id.
+            _planGate.Hold(
+                session.Id, parentAgentId ?? "", heldTaskTitle ?? "Untitled task", heldTaskPrompt ?? "",
+                heldBudgetUsd, session.RepoHash ?? string.Empty);
         }
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
@@ -246,10 +250,16 @@ public sealed class AgentSpawnService
             var launchCredentials = withoutHostCredentials
                 ? null
                 : cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind);
+            // Coordinator contract §8 step 1 — the role lock. A coordinator's jail carries none of the
+            // repository capabilities a worker's does. This is the ONE place the role decides it, and the
+            // spec builder re-asserts it fail-closed, so the two cannot drift into the shape where a
+            // control looks present and is not (MG-12).
+            var isCoordinator = role == AgentRoles.Coordinator;
             var launch = await _launcher.TryLaunchAsync(
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
                 extraEnv: launchEnv,
-                cliCredentials: launchCredentials).ConfigureAwait(false);
+                cliCredentials: launchCredentials,
+                withoutRepositoryAccess: isCoordinator).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -259,7 +269,15 @@ public sealed class AgentSpawnService
                 // a merge-queue member from this moment. Registering here (as well as on CreateWorktree)
                 // covers the real spawn chain, which provisions the worktree inside the launcher rather
                 // than through the RepoSync RPC — a coordinator-spawned worker takes only this path.
-                _mergeQueues.EnsureEntry(repoHandle, session.Id, queueOrigin);
+                //
+                // Phase 3: NOT for a coordinator. It has no worktree and no agent/<id> branch, so a queue
+                // entry for it would name a branch that does not exist — and contract §4 denies it
+                // "declaring its own work merge-ready". A coordinator with a queue row is precisely the
+                // surface that denial is about, so it never gets one.
+                if (!isCoordinator)
+                {
+                    _mergeQueues.EnsureEntry(repoHandle, session.Id, queueOrigin);
+                }
                 if (launch.LaunchCommand is { Count: > 0 })
                 {
                     // The core P2-47→P2-03/09 wiring: the CLI starts inside the jail on a real TTY
@@ -520,19 +538,204 @@ public sealed class AgentSpawnService
                 }
 
             case AgentIpcRequest.ListOp:
-                // MG-37: this returned EVERY session on the daemon — a coordinator could enumerate other
-                // coordinators' workers (and other repos' agents) through its own jail's IPC socket.
-                // Scope it to the sessions this coordinator actually spawned. A worker's endpoint serves
-                // only the plan ops (phase 2), so a worker still cannot spawn anything and "children"
-                // remains the full descendant set.
-                var agents = _store.List()
-                    .Where(s => string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal))
-                    .Select(s => $"{s.Id}\t{s.Kind}\t{s.State}\t{s.Role}")
-                    .ToArray();
-                return new AgentIpcResponse(Ok: true, Agents: agents);
+            case AgentIpcRequest.StatusOp:
+                return Status(request, coordinatorAgentId);
+
+            case AgentIpcRequest.PromptOp:
+                return await PromptAsync(request, coordinatorAgentId, ct).ConfigureAwait(false);
+
+            case AgentIpcRequest.VerifyOp:
+                return await VerifyAsync(request, coordinatorAgentId, ct).ConfigureAwait(false);
 
             default:
+                // Contract §3 is EXHAUSTIVE: "Anything not on this list is denied." This is the whole of
+                // the coordinator's deny path, and it is deny-by-default — an op is served only because a
+                // case above names it, never because nothing refused it. CoordinatorSurfaceLockTests walks
+                // every op name in the protocol (including the worker's) plus the RPC names §4 forbids and
+                // asserts each one lands here.
                 return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
+        }
+    }
+
+    /// <summary>
+    /// Resolves a worker a coordinator op named, <b>scoped to that coordinator's own fan-out</b>
+    /// (coordinator contract §7). Returns null when the id names nothing the caller owns.
+    ///
+    /// <para><b>Ownership is (RepoHash, AgentId), never a bare id.</b> A bare agent id is unique only
+    /// within a repo — the external-PR intake names its sessions <c>pr-&lt;n&gt;</c>, and two subscribed
+    /// repositories that each have a pull request #7 both want <c>pr-7</c>. That collision has been fixed
+    /// three times in this codebase already (#281 <c>AgentSessionStore</c>, #284 <c>SwarmReconciler</c>,
+    /// #286 <c>TerminalSessionManager</c>), so this check does not re-introduce it: the target must be a
+    /// child of this coordinator <i>and</i> live in this coordinator's repo. Matching on
+    /// <c>ParentAgentId</c> alone would let a coordinator in repo A steer repo B's identically-named
+    /// worker.</para>
+    ///
+    /// <para><b>A stranger's worker is answered as a missing one.</b> Same message either way, so the
+    /// channel cannot be used to probe which agent ids exist elsewhere on the daemon — an ownership check
+    /// that distinguishes "not yours" from "no such worker" is an existence oracle for every other
+    /// coordinator's fan-out.</para>
+    /// </summary>
+    private AgentSession? OwnedWorker(string? namedAgentId, string coordinatorAgentId)
+    {
+        if (string.IsNullOrWhiteSpace(namedAgentId))
+        {
+            return null;
+        }
+
+        var coordinator = _store.Find(coordinatorAgentId);
+        if (coordinator is null)
+        {
+            return null;
+        }
+
+        var scope = coordinator.RepoHash ?? string.Empty;
+        return _store.List().FirstOrDefault(s =>
+            string.Equals(s.Id, namedAgentId, StringComparison.Ordinal)
+            && string.Equals(s.RepoHash ?? string.Empty, scope, StringComparison.Ordinal)
+            && string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal));
+    }
+
+    /// <summary>Every worker this coordinator owns, in its own repo (contract §7).</summary>
+    private List<AgentSession> OwnedWorkers(string coordinatorAgentId)
+    {
+        var coordinator = _store.Find(coordinatorAgentId);
+        if (coordinator is null)
+        {
+            return new List<AgentSession>();
+        }
+
+        var scope = coordinator.RepoHash ?? string.Empty;
+        return _store.List()
+            .Where(s => string.Equals(s.RepoHash ?? string.Empty, scope, StringComparison.Ordinal)
+                        && string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal))
+            .ToList();
+    }
+
+    /// <summary>
+    /// <c>get_worker_status</c> (contract §3). All owned workers, or one when the request names it.
+    /// Each row carries the plan-gate reason, so "why is this worker not doing anything" is answered in
+    /// the same call rather than tempting the coordinator toward a capability it does not have.
+    /// </summary>
+    private AgentIpcResponse Status(AgentIpcRequest request, string coordinatorAgentId)
+    {
+        if (!string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            var owned = OwnedWorker(request.AgentId, coordinatorAgentId);
+            if (owned is null)
+            {
+                return new AgentIpcResponse(Ok: false, Error: $"no worker '{request.AgentId}'");
+            }
+
+            return new AgentIpcResponse(Ok: true, Agents: new[] { Row(owned) });
+        }
+
+        var workers = OwnedWorkers(coordinatorAgentId);
+        var rows = workers.Select(Row).ToArray();
+        var backpressure = _planGate.BackpressureSignal(workers.Count, _limits.MaxActiveWorkers);
+        return new AgentIpcResponse(Ok: true, Agents: rows, Status: backpressure);
+    }
+
+    /// <summary>One status row: id, kind, state, role, and the plan-gate reason when it is blocked.</summary>
+    private string Row(AgentSession s)
+    {
+        var gate = _planGate.MayWork(s.Id, out var reason) ? string.Empty : "\t" + reason;
+        return $"{s.Id}\t{s.Kind}\t{s.State}\t{s.Role}{gate}";
+    }
+
+    /// <summary>
+    /// <c>send_worker_prompt</c> (contract §3) — steer a worker this coordinator owns. Refused while the
+    /// worker sits at the plan gate: otherwise the coordinator could simply hand over the task the daemon
+    /// is deliberately withholding (phase-2 decision 2.2, point 3).
+    /// </summary>
+    private async Task<AgentIpcResponse> PromptAsync(
+        AgentIpcRequest request, string coordinatorAgentId, CancellationToken ct)
+    {
+        if (_killGate.IsFrozen)
+        {
+            return new AgentIpcResponse(Ok: false, Error: "Everything is frozen (kill switch engaged) — resume first.");
+        }
+
+        var owned = OwnedWorker(request.AgentId, coordinatorAgentId);
+        if (owned is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: $"no worker '{request.AgentId}'");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Prompt))
+        {
+            return new AgentIpcResponse(Ok: false, Error: "a prompt is required (mainguard-agent prompt <agent-id> <text>)");
+        }
+
+        if (!_planGate.MayReceivePrompt(owned.Id, out var planReason))
+        {
+            return new AgentIpcResponse(Ok: false, Error: planReason);
+        }
+
+        var delivered = await _binder.TrySendPromptAsync(owned.Key, request.Prompt, ct).ConfigureAwait(false);
+        if (!delivered)
+        {
+            return new AgentIpcResponse(Ok: false, Error: $"{owned.Id} has no live CLI to steer.");
+        }
+
+        _audit.Append(new AuditEvent("coordinator_worker_prompt", new Dictionary<string, string>
+        {
+            ["coordinator_id"] = coordinatorAgentId,
+            ["worker_agent_id"] = owned.Id,
+            ["repo_hash"] = owned.RepoHash ?? string.Empty,
+        }));
+
+        return new AgentIpcResponse(Ok: true, AgentId: owned.Id, Status: "PromptSent");
+    }
+
+    /// <summary>
+    /// <c>request_verification</c> (contract §3) — <b>propose</b> an owned worker's branch. The daemon
+    /// verifies and decides; the coordinator cannot enqueue and cannot merge (§4, "Declaring its own work
+    /// merge-ready"). Refused for a worker with no approved plan: there is no authorised work to verify.
+    /// </summary>
+    private async Task<AgentIpcResponse> VerifyAsync(
+        AgentIpcRequest request, string coordinatorAgentId, CancellationToken ct)
+    {
+        var owned = OwnedWorker(request.AgentId, coordinatorAgentId);
+        if (owned is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: $"no worker '{request.AgentId}'");
+        }
+
+        if (!_planGate.MayRequestVerification(owned.Id, out var planReason))
+        {
+            return new AgentIpcResponse(Ok: false, Error: planReason);
+        }
+
+        if (owned.RepoHash is not { Length: > 0 } repoHandle)
+        {
+            return new AgentIpcResponse(Ok: false, Error: $"{owned.Id} has no provisioned repo to verify against.");
+        }
+
+        var ctx = _mergeQueues.EnsureQueue(repoHandle);
+        if (ctx is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: $"{owned.Id} has no merge queue to verify against.");
+        }
+
+        _audit.Append(new AuditEvent("coordinator_verification_requested", new Dictionary<string, string>
+        {
+            ["coordinator_id"] = coordinatorAgentId,
+            ["worker_agent_id"] = owned.Id,
+            ["repo_hash"] = repoHandle,
+        }));
+
+        try
+        {
+            var record = await ctx.Queue.RunVerificationAsync(owned.Id, ct).ConfigureAwait(false);
+
+            // The daemon decides. The coordinator is told the outcome and nothing else moves because it
+            // asked — a green record is what lets the item into the queue, and a human still merges it.
+            return new AgentIpcResponse(
+                Ok: true, AgentId: owned.Id, Status: record.Passed ? "Verified" : "VerificationFailed");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new AgentIpcResponse(Ok: false, Error: ex.Message);
         }
     }
 

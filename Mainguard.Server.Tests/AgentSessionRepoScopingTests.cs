@@ -385,11 +385,23 @@ public sealed class AgentSessionRepoScopingTests
     internal sealed class RecordingEngine : ISandboxEngine
     {
         private readonly List<(string Repo, string Agent)> _spawns = new();
+        private readonly List<SandboxSpawnRequest> _requests = new();
         private readonly List<string> _removed = new();
 
         public IReadOnlyList<(string Repo, string Agent)> Spawns
         {
             get { lock (_spawns) return _spawns.ToList(); }
+        }
+
+        /// <summary>
+        /// The full spawn requests, so a test can assert what the jail was actually asked for rather than
+        /// only that a spawn happened. Phase 3 needs this: the coordinator role lock is expressed entirely
+        /// in the request's mount fields, and "a coordinator was spawned" says nothing about whether it was
+        /// handed a worktree.
+        /// </summary>
+        public IReadOnlyList<SandboxSpawnRequest> Requests
+        {
+            get { lock (_spawns) return _requests.ToList(); }
         }
 
         public IReadOnlyList<string> Removed
@@ -402,6 +414,7 @@ public sealed class AgentSessionRepoScopingTests
             lock (_spawns)
             {
                 _spawns.Add((request.RepoHash, request.AgentId));
+                _requests.Add(request);
             }
 
             return Task.FromResult(new SandboxHandle($"ctr-{request.RepoHash}-{request.AgentId}", Reused: false));

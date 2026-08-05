@@ -50,7 +50,7 @@ public static class AgentIpcPaths
 /// <summary>Which shim an IPC endpoint publishes, and therefore which ops the daemon will serve on it.</summary>
 public enum AgentIpcEndpointRole
 {
-    /// <summary>A coordinator jail: <c>spawn</c> / <c>list</c>.</summary>
+    /// <summary>A coordinator jail: the four tools of coordinator contract §3, and nothing else.</summary>
     Coordinator,
 
     /// <summary>A managed worker jail: the plan gate ops.</summary>
@@ -59,17 +59,58 @@ public enum AgentIpcEndpointRole
 
 /// <summary>One line-delimited JSON request from an in-jail shim.</summary>
 /// <param name="PlanJson">A worker-authored plan document, validated against <c>TaskPlanSchema</c>.</param>
+/// <param name="AgentId">
+/// The worker a coordinator op names (<c>status</c> / <c>prompt</c> / <c>verify</c>). Phase 3: this is the
+/// ONLY field on the wire that names another agent, and it is never trusted — every op that reads it
+/// resolves the target through <c>OwnedWorker</c>, which requires the session to be a live child of the
+/// calling coordinator <b>in the calling coordinator's own repo</b> (contract §7). A coordinator naming a
+/// stranger's worker is answered exactly as it is for a worker that does not exist, so the channel is not
+/// an existence oracle for other coordinators' fan-out.
+/// </param>
+/// <param name="Prompt">The steering text of a <c>prompt</c> op (contract §3 <c>send_worker_prompt</c>).</param>
 public sealed record AgentIpcRequest(
     [property: JsonPropertyName("op")] string Op,
     [property: JsonPropertyName("agentKind")] string? AgentKind = null,
     [property: JsonPropertyName("taskPrompt")] string? TaskPrompt = null,
     [property: JsonPropertyName("planId")] string? PlanId = null,
     [property: JsonPropertyName("title")] string? Title = null,
-    [property: JsonPropertyName("planJson")] string? PlanJson = null)
+    [property: JsonPropertyName("planJson")] string? PlanJson = null,
+    [property: JsonPropertyName("agentId")] string? AgentId = null,
+    [property: JsonPropertyName("prompt")] string? Prompt = null)
 {
-    // Coordinator ops.
+    // ---- Coordinator ops — coordinator contract §3, and the list is EXHAUSTIVE -----------------
+    //
+    // These four constants ARE the coordinator's surface. `CoordinatorOps` below is the allow-list the
+    // daemon dispatches against; anything absent from it is refused by name. Adding a member here is a
+    // deliberate contract change (§3: "Adding to this list is a deliberate contract change, reviewed as
+    // such — not an implementation detail"), which is why the set is asserted against the contract
+    // document itself by CoordinatorSurfaceLockTests.
+
+    /// <summary><c>spawn_worker</c> — start a worker on a described task.</summary>
     public const string SpawnOp = "spawn";
+
+    /// <summary><c>get_worker_status</c> — status of the workers this coordinator owns.</summary>
     public const string ListOp = "list";
+
+    /// <summary><c>get_worker_status</c>, single-worker form. Same tool, scoped to one owned worker.</summary>
+    public const string StatusOp = "status";
+
+    /// <summary><c>send_worker_prompt</c> — steer a worker this coordinator owns.</summary>
+    public const string PromptOp = "prompt";
+
+    /// <summary><c>request_verification</c> — propose an owned worker's branch for daemon verification.</summary>
+    public const string VerifyOp = "verify";
+
+    /// <summary>
+    /// The complete set of ops a coordinator endpoint will serve (contract §3). The daemon dispatches
+    /// against this set rather than against a <c>switch</c>'s reachable cases, so "the list is exhaustive"
+    /// is one testable object instead of a property of control flow that has to be re-read to be believed.
+    /// </summary>
+    public static readonly System.Collections.Generic.IReadOnlySet<string> CoordinatorOps =
+        new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+        {
+            SpawnOp, ListOp, StatusOp, PromptOp, VerifyOp,
+        };
 
     // Worker plan-gate ops (phase 2).
 
@@ -84,6 +125,17 @@ public sealed record AgentIpcRequest(
 
     /// <summary>Block until the human decides. This call is the worker's gate.</summary>
     public const string AwaitDecisionOp = "await_decision";
+
+    /// <summary>
+    /// The complete set of ops a worker endpoint will serve. Disjoint from <see cref="CoordinatorOps"/>
+    /// by construction — the two sets share no member, and a test pins that, because the whole point of
+    /// fixing the role on the endpoint is that neither role can reach the other's operations.
+    /// </summary>
+    public static readonly System.Collections.Generic.IReadOnlySet<string> WorkerOps =
+        new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+        {
+            BriefOp, PresentPlanOp, RevisePlanOp, AwaitDecisionOp,
+        };
 }
 
 /// <summary>

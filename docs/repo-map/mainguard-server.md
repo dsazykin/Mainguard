@@ -59,9 +59,14 @@
 - **`Auth/RoleInterceptor.cs`** (P2-14) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
-  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`) and the human-only
-  plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
-  or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
+  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`), the flagged-item
+  acknowledgment (`AcknowledgeFlaggedChange` — MG-11, merge power by another name), the human-only
+  plan-approval RPCs (`ApprovePlan`/`RejectPlan`) and the scrollback read (`GetScrollback` — MG-30) with
+  `PermissionDenied` (the coordinator can't merge or approve its own plans). **Note the honest caveat
+  recorded in `coordinator-phase-3-decisions.md` §6:** `ConnectionRoleRegistry.IssueCoordinatorToken` has
+  NO production callers, so this governs a credential class nothing currently mints — moot today only
+  because the in-jail coordinator has no gRPC route at all (its only channel is the IPC socket, which is
+  where phase 3 put the enforceable surface). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
   rejected server-side while the read/output stream flows — never UI-only.
 - **`Auth/ConnectionRoleRegistry.cs`** (P2-14) — maps a bearer token → `ConnectionRole` (primary
@@ -165,6 +170,14 @@
     failure) → worktree+jail
     (`SandboxAgentLauncher`) → CLI bind → managed-worker terminal lock (P2-14); stop tears down record,
     PTY, endpoint, lock, jail, worktree. Typed `AgentSpawnRefusedException` keeps it transport-agnostic.
+    **Phase 3 — the role lock (coordinator contract §8).** The coordinator shim handler now serves the
+    contract's four tools and nothing else: `spawn` / `status` (+`list`) / `prompt` / `verify`, with a
+    deny-by-default `default:` case. Every op naming an agent resolves it through `OwnedWorker`, scoped
+    `(RepoHash, AgentId)` to the caller's own fan-out — a stranger's worker is refused with the SAME string
+    as a nonexistent one, so the channel is not an existence oracle. A coordinator spawn now sets
+    `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
+    and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
+    merge-ready).
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
