@@ -524,9 +524,18 @@
     test-delta strip, `CanMerge`-gated Merge + T-29 `BringBranchLocal`, and review-sprint mode
     (j/k/a/space + risk budget → `ViewedStateEvent`s, unviewed for deferred hunks for P2-38); the
     `SeverityVocabulary` glyph map is a rendering-only projection — no rule logic),
-    `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel` (P2-14 conversation + the
-    TaskPlan approval card; Approve is the panel's accent — **retained but no longer mounted on the
-    coordinator surface, which is the inline terminal now**), `AgentDocumentViewModel` +
+    `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel`/`EscalatedPlanViewModel`
+    (the coordinator conversation + the **worker-authored** plan approval card; Approve is the panel's
+    accent — **retained but no longer mounted on the coordinator surface, which is the inline terminal
+    now**. **Phase 2** renders the three states the plan gate otherwise makes invisible: the card names
+    the worker that wrote the plan and says it is *blocked until you decide*; Reject carries a feedback
+    box, because that text is delivered back to the worker to revise against, plus the revision counter
+    against the daemon's budget and a warning when the next rejection would stop the worker rather than
+    produce another plan; an `EscalatedPlanViewModel` card has **deliberately no buttons** — the loop is
+    over and the next move is the human's; and `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
+    the daemon's stall line, since a coordinator that has quietly stopped spawning is indistinguishable
+    from a hang. Built entirely from existing theme tokens — a warning and a stop are things the design
+    system already has words for), `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
     Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
@@ -713,7 +722,14 @@
     `ListAgents()`, and routes `EndAgentAsync`→`StopAgent`; construction never blocks on the daemon. It
     is NOT a mock — surfaces whose gRPC contract does not exist yet (merge-queue projection, coordinator
     conversation, kill switch, telemetry, Vibe) return empty/neutral state with a marked
-    `P2-47 residual` and light up as their RPCs are added. `CreateBundle()` is the shipped-app factory
+    `P2-47 residual` and light up as their RPCs are added. **Phase 2:** `ApplyPlanUpdate` also keeps
+    **escalated** plans in the projection (a worker that stopped after spending its revision budget is
+    the state that most needs a human and would otherwise vanish from the surface), exposes
+    `GetWorkerPlans()`/`GetBackpressure()`, and carries the daemon's backpressure numbers verbatim rather
+    than re-deriving them — a client-side count can disagree with the number that actually refuses the
+    coordinator. `SubmitPlanDecisionAsync`'s rejection reason is now the worker's feedback; an empty one
+    is sent as an explicit "rejected without written feedback" rather than a silent blank, because it
+    costs a round of the revision budget either way. `CreateBundle()` is the shipped-app factory
     (`OrchestratorServices` over a loopback `DaemonClient`). **PR3:** it also implements `ICliAgentHost`
     — `ListInstalledClisAsync` (the `ListInstalledAdapters` RPC), `StartCoordinatorAsync` (keystore key
     resolved via `ApiKeyProviderMap` from the adapter's declared env-var name — no provider mapping

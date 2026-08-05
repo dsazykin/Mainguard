@@ -50,6 +50,15 @@ public sealed class MockOrchestrator :
     private readonly List<AgentState> _agents = new();
     private readonly List<ChatLine> _transcript = new();
     private readonly List<TaskPlan> _pendingPlans = new();
+
+    /// <summary>The revision budget the prototype mirrors from <c>CoordinatorLimits.MaxPlanRevisions</c>.</summary>
+    private const int MockMaxPlanRevisions = 3;
+
+    /// <summary>The phase-2 worker-authored plan cards (pending + escalated) this prototype renders.</summary>
+    private readonly List<WorkerPlanCard> _workerPlans = new();
+
+    /// <summary>Mock worker cap, so the prototype can render a saturated-by-blocked-plans stall.</summary>
+    private const int MockMaxActiveWorkers = 6;
     private readonly List<SandboxEvent> _sandbox = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly List<Checkpoint> _checkpoints = new();
@@ -153,18 +162,29 @@ public sealed class MockOrchestrator :
     {
         var t = DateTimeOffset.Now.AddMinutes(-9);
         _transcript.Add(new ChatLine(ChatLineKind.Human, "Split the auth work from the search work and run them in parallel.", t));
-        _transcript.Add(new ChatLine(ChatLineKind.Coordinator, "Two independent tasks: the token-refresh fix touches src/Auth only; the search index touches Core/Search. Drafting a plan for the refresh work — the search worker is already running.", t.AddSeconds(20)));
+        _transcript.Add(new ChatLine(ChatLineKind.Coordinator, "Two independent tasks: the token-refresh fix and the search index. Starting a worker for the refresh work — it will inspect the repo and write its own plan; the search worker is already running.", t.AddSeconds(20)));
         _transcript.Add(new ChatLine(ChatLineKind.ToolCall, "get_worker_status(loom-1)", t.AddSeconds(22)));
         _transcript.Add(new ChatLine(ChatLineKind.ToolCall, "spawn_worker(fix/token-expiry)", t.AddSeconds(31)));
         _transcript.Add(new ChatLine(ChatLineKind.SystemLine, "Loom-1 verifying against d4e1f9a — 12 of 58 tests run", t.AddMinutes(2)));
-        _pendingPlans.Add(new TaskPlan(
+        var plan = new TaskPlan(
             "plan-7", "Fix token expiry off-by-one",
             new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
             "Extract the clock behind ITokenClock; inject a fixed clock in tests; correct the expiry comparison.",
             "AuthTests green plus two new expiry-boundary cases.",
-            1.50m, DateTimeOffset.Now.AddMinutes(-2)));
-        _transcript.Add(new ChatLine(ChatLineKind.PlanCard, "TaskPlan #7 — Fix token expiry off-by-one", DateTimeOffset.Now.AddMinutes(-2), "plan-7"));
+            1.50m, DateTimeOffset.Now.AddMinutes(-2));
+        _pendingPlans.Add(plan);
+        // Phase 2: the plan on the card is the WORKER's, written after it inspected the repository.
+        _workerPlans.Add(Card(plan, "loom-4", "Pending", revision: 0, feedback: ""));
+        _transcript.Add(new ChatLine(ChatLineKind.SystemLine, "Loom-4 presented its plan and is blocked awaiting your approval.", DateTimeOffset.Now.AddMinutes(-2)));
+        _transcript.Add(new ChatLine(ChatLineKind.PlanCard, "Loom-4's plan — Fix token expiry off-by-one", DateTimeOffset.Now.AddMinutes(-2), "plan-7"));
     }
+
+    private WorkerPlanCard Card(TaskPlan plan, string workerId, string status, int revision, string feedback) => new(
+        plan.PlanId, workerId, "coordinator", plan.Title, plan.Scope, plan.Approach, plan.TestStrategy,
+        plan.BudgetUsd, plan.DraftedAt, status, revision,
+        RevisionsRemaining: Math.Max(0, MockMaxPlanRevisions - revision),
+        MaxRevisions: MockMaxPlanRevisions,
+        RejectionFeedback: feedback);
 
     private void SeedTelemetryAndCheckpoints()
     {
@@ -565,14 +585,88 @@ public sealed class MockOrchestrator :
         return Task.CompletedTask;
     }
 
-    public Task SubmitPlanDecisionAsync(string planId, bool approve)
+    public IReadOnlyList<WorkerPlanCard> GetWorkerPlans() { lock (_gate) return _workerPlans.ToList(); }
+
+    public OrchestrationBackpressure GetBackpressure()
+    {
+        lock (_gate)
+        {
+            var blocked = _workerPlans.Count(p => p.IsPending);
+            var escalated = _workerPlans.Count(p => p.IsEscalated);
+            var active = _agents.Count + blocked;
+            var signal = blocked == 0 && escalated == 0
+                ? ""
+                : BuildMockSignal(blocked, escalated, active);
+            return new OrchestrationBackpressure(
+                blocked, escalated, active, MockMaxActiveWorkers, MockMaxPlanRevisions, signal);
+        }
+    }
+
+    private static string BuildMockSignal(int blocked, int escalated, int active)
+    {
+        var parts = new List<string>();
+        if (blocked > 0) parts.Add($"{blocked} {(blocked == 1 ? "worker is" : "workers are")} waiting on your approval");
+        if (escalated > 0) parts.Add($"{escalated} escalated after {MockMaxPlanRevisions} rejected plans");
+        var head = string.Join(" · ", parts);
+        return blocked > 0 && active >= MockMaxActiveWorkers
+            ? $"{head}. The worker cap ({active}/{MockMaxActiveWorkers}) is full — the coordinator has stopped spawning until you clear plans."
+            : head + ".";
+    }
+
+    /// <summary>
+    /// Phase 2: rejection is feedback, not death. The prototype models the real loop — a rejected plan
+    /// goes back to its worker, which revises and re-presents, until the revision budget is spent and the
+    /// worker escalates. Approval is the only path that starts work.
+    /// </summary>
+    public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
     {
         var raised = new List<AgentEvent>();
         lock (_gate)
         {
             var plan = _pendingPlans.FirstOrDefault(p => p.PlanId == planId);
             if (plan is null) return Task.CompletedTask;
+            var card = _workerPlans.FirstOrDefault(c => c.PlanId == planId);
+
+            if (!approve && card is not null)
+            {
+                // Rejected: either the worker revises and re-presents, or the budget is spent and it stops.
+                var nextRevision = card.Revision + 1;
+                var text = string.IsNullOrWhiteSpace(feedback) ? "(no feedback given)" : feedback!;
+                _workerPlans.Remove(card);
+                if (nextRevision > MockMaxPlanRevisions)
+                {
+                    _workerPlans.Add(card with { Status = "Escalated", RejectionFeedback = text, RevisionsRemaining = 0 });
+                    _transcript.Add(new ChatLine(ChatLineKind.SystemLine,
+                        $"{card.WorkerAgentId} stopped after {MockMaxPlanRevisions} rejected plans and escalated to you.",
+                        DateTimeOffset.Now));
+                    raised.Add(NewEvent("plan_decided", "coordinator", $"{planId}=escalated"));
+                }
+                else
+                {
+                    _workerPlans.Add(card with
+                    {
+                        Status = "Pending",
+                        Revision = nextRevision,
+                        RevisionsRemaining = Math.Max(0, MockMaxPlanRevisions - nextRevision),
+                        RejectionFeedback = text,
+                    });
+                    _transcript.Add(new ChatLine(ChatLineKind.SystemLine,
+                        $"{card.WorkerAgentId} revised its plan against your feedback (revision {nextRevision} of {MockMaxPlanRevisions}).",
+                        DateTimeOffset.Now));
+                    raised.Add(NewEvent("plan_decided", "coordinator", $"{planId}=rejected"));
+                }
+
+                foreach (var e in raised) EventReceived?.Invoke(e);
+                Changed?.Invoke();
+                return Task.CompletedTask;
+            }
+
             _pendingPlans.Remove(plan);
+            if (card is not null)
+            {
+                _workerPlans.Remove(card);
+            }
+
             if (approve)
             {
                 raised.Add(NewEvent("plan_decided", "coordinator", $"{planId}=approved"));
@@ -589,13 +683,8 @@ public sealed class MockOrchestrator :
                     Plan = plan.Scope.Select(s => ("Touch " + s, false)).ToList(),
                 };
                 _agents.Add(a);
-                _transcript.Add(new ChatLine(ChatLineKind.SystemLine, $"Plan #7 approved — Loom-5 spawned on fix/token-expiry", DateTimeOffset.Now));
+                _transcript.Add(new ChatLine(ChatLineKind.SystemLine, "Plan approved — Loom-4 released to start work on fix/token-expiry", DateTimeOffset.Now));
                 raised.Add(NewEvent("agent_state", a.Id, "Requested→Provisioning"));
-            }
-            else
-            {
-                raised.Add(NewEvent("plan_decided", "coordinator", $"{planId}=rejected"));
-                _transcript.Add(new ChatLine(ChatLineKind.SystemLine, "Plan #7 rejected — no worker spawned, no worktree created", DateTimeOffset.Now));
             }
         }
         foreach (var e in raised) EventReceived?.Invoke(e);

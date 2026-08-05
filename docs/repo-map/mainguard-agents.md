@@ -59,9 +59,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   Docker, no real agents).
   - `OrchestrationModels.cs` (enums/records shaped like the future gRPC contract: `AgentLifecycleState`
     per OPS §4.1, `WorkerMergeState` per P2-10,
-    `AgentInfo`/`QueueEntry`/`VerificationRecord`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`),
+    `AgentInfo`/`QueueEntry`/`VerificationRecord`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`,
+    plus the **phase-2** `WorkerPlanCard` (a worker-authored plan as the approval card needs it —
+    authorship, revision-against-budget, and the feedback the last rejection sent back) and
+    `OrchestrationBackpressure` (blocked/escalated/active counts + the daemon's rendered stall line;
+    `CapSaturatedByBlockedWorkers` is what turns the banner urgent)),
     `IOrchestrationServices.cs` (the service interfaces the control-center ViewModels consume:
-    `IAgentService`, `IMergeQueueService`, `ICoordinatorService`, `IKillSwitchService`,
+    `IAgentService`, `IMergeQueueService`, `ICoordinatorService` (**phase 2** adds `GetWorkerPlans()` and
+    `GetBackpressure()`, and `SubmitPlanDecisionAsync` gained a `feedback` argument — on a rejection that
+    text is *delivered to the worker* to revise against, so an empty one costs a round of the budget),
+    `IKillSwitchService`,
     `ITelemetryService` (**P2-47 #4** adds `GetSpendBudgetAsync`/`SetSpendBudgetAsync` over the Core
     `SpendBudget` DTO so the Resource Monitor displays + edits the per-day cap, round-tripping the whole
     cap record through the `SetBudgets` RPC), `IVibeService` — designed so a `DaemonClient` adapter can
@@ -84,10 +91,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `AgentRoles.cs` — the shared role-string contract (""/`coordinator`/`managed`) for
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
-    with `daemon.sock` + the shim — plus the newline-delimited JSON request/response codec) and
+    with `daemon.sock` + **the one shim that agent's role is allowed** — plus `AgentIpcEndpointRole`
+    (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
+    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`),
     `AgentSpawnShim.cs` (the `mainguard-agent` python3 shim script the daemon writes into the
-    coordinator's IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
-    G-16).
+    **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
+    G-16) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
+    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>`.
+    `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
+    the response carries the task prompt the daemon had been withholding, which is what makes "the worker
+    does not start before approval" a property of the system rather than a request in a prompt).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -868,7 +881,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       that make a repo active (ProvisionRepo / CreateWorktree / a jailed spawn) over the same persisted
       stores and, load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
-      spans origins while they share one store (MG-23).)
+      spans origins while they share one store (MG-23). **Phase 2** adds an optional `planGate`
+      `IMergeGate` ANDed into every repo's queue beside the RT-D2 changed-test-command gate — the backstop
+      that stops a worker whose own plan was never approved from merging, whatever it verified.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
@@ -940,21 +955,54 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       triple; **unknown top-level fields are rejected** (forward-compat honesty) + oversized guards; the
       fields combine into the ONE canonical `Mainguard.Agents.Agents.TaskPlan` the whole stack shares —
       there is deliberately no second `TaskPlan` type).
-    - `PlanApprovalService.cs` (the pending-plan queue + approve/reject; **the approver identity is passed
-      in daemon-derived, never client-supplied (SA-1/F2)** and persisted with the plan; restart-safe via
-      `JsonPlanApprovalStore` (a second instance rehydrates every plan + identity — no EF migration,
-      mirrors `LeaderRegistry`); the **S-8** anti-approval-fatigue caps live here — `Draft` enforces the
-      per-coordinator concurrent-`PlanPending` ceiling + a drafting rate limit, excess →
-      `ResourceExhausted` + `plan_draft_rejected` audit, and `PressureSignal` renders the "N plans
-      pending" fact line; `Approve` fires `PlanApproved` so the P2-09 spawn proceeds (admission+budget
-      apply THERE — a pending plan consumes neither); `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
-    - `CoordinatorTools.cs` (the four capped tools — `SpawnWorker` (the two-phase gate:
-      frozen-queue/active-worker-cap/admission/per-day-budget checks, then **drafts a pending plan — never
-      spawns directly**), `GetWorkerStatus`, `SendWorkerPromptAsync`, `RequestVerificationAsync` — over an
-      `IWorkerControl` seam; `CoordinatorToolResult{Ok,Rejected,ResourceExhausted}`; the coordinator has
-      no worktree/credentials/code/merge power).
+    - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`
+      now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
+      approval** — it is a resource cap and a blocked worker still holds its jail/tmpfs/network
+      segment/worktree) and `MaxPlanRevisions` (3; the reject→revise budget, with the arithmetic pinned in
+      prose: reject → revise ×3, and the **4th rejection escalates**). Never in a prompt — a limit an agent
+      is merely told about is a suggestion (contract §5)).
+    - `PlanApprovalService.cs` (the **worker-authored** plan queue + approve/reject/revise; **the approver
+      identity is passed in daemon-derived, never client-supplied (SA-1/F2)** and persisted with the plan;
+      restart-safe via `JsonPlanApprovalStore` (a second instance rehydrates every plan, identity,
+      revision count and rejection feedback — no EF migration, mirrors `LeaderRegistry`). **Phase 2
+      inverted authorship:** `Draft` (the coordinator's entry point) was **removed**, not left dormant;
+      `Present(workerAgentId, …)` is how a worker lands the plan it wrote after inspecting the repo, and
+      `AwaitDecisionAsync` is the blocking gate it parks on. `Reject` is **not terminal** — it records the
+      human's text as `RejectionFeedback` and the worker `Revise`s against it, until the rejection that
+      would exceed `MaxPlanRevisions`, which moves the plan to `Escalated` instead. One live plan per
+      worker replaces the removed S-8 per-coordinator caps (keeping those would have deadlocked the Nth
+      worker the worker cap admitted). `PressureSignal` renders the "N plans pending" fact line;
+      `PlanApproved`/`PlanRejected`/`PlanEscalated` events; `PlanStatus{Pending,Approved,Rejected,
+      Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+    - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
+      a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
+      a spawned worker's task **without giving it to the worker**; `TryReleaseTask` yields it only against
+      an approved plan (no override parameter — an override is how a gate becomes decorative); `MayWork` /
+      `MayReceivePrompt` / `MayRequestVerification` deny steering and verification at the gate; and the
+      type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
+      approved cannot merge even if it verified green. Also owns the legible-stall text —
+      `BlockedWorkerCount`/`EscalatedWorkerCount`/`BackpressureSignal` render "6 workers are waiting on
+      your approval … the coordinator has stopped spawning", which the contract makes a requirement).
+    - `WorkerPlanAuthor.cs` (**phase 2 — the worker side.** `IWorkerPlanDrafter` (author a plan from the
+      repo, and from the human's feedback on a revision), `IWorkerPlanChannel` (present/revise/await —
+      `LocalWorkerPlanChannel` in-process, the `mainguard-plan` shim in a jail), and `WorkerPlanAuthor`,
+      the loop: author → present → **block** → on rejection revise against the feedback and re-present →
+      until approved or until the DAEMON says the budget is spent. The loop has **no local bound**: it
+      stops when `Escalated` comes back, because a worker counting its own rounds would be enforcing a
+      limit on the honour system. `ScriptedWorkerPlanDrafter` is the deterministic drafter the scripted
+      end-to-end runs use).
+    - `CoordinatorTools.cs` (the four capped tools — `SpawnWorkerAsync(title, taskPrompt, budget)`
+      (**phase 2: it now SPAWNS**, within the caps, with no human approval — frozen-queue /
+      active-worker-cap / admission / per-day-budget, and it takes **no plan fields at all**, because plan
+      authorship belongs to the worker), `GetWorkerStatus`, `SendWorkerPromptAsync`,
+      `RequestVerificationAsync` — the latter two refused for a worker still at the plan gate — over an
+      `IWorkerControl` seam that gained `SpawnWorkerAsync`; `CoordinatorToolResult{Ok,Rejected,
+      ResourceExhausted}`; the cap refusal **names the blocked-worker count** rather than saying "let one
+      finish", which is a lie when nothing is going to finish without the human).
     - `CoordinatorAgent.cs` (the system-prompted chat tool-loop over the P2-08 gateway —
-      `ICoordinatorModel` seam, per-turn lease, dispatch through `CoordinatorTools`; provider-agnostic).
+      `ICoordinatorModel` seam, per-turn lease, dispatch through `CoordinatorTools`; provider-agnostic.
+      The spawn dispatch **discards any plan fields the model supplies** rather than honouring them —
+      silently accepting a coordinator-authored scope would reinstate the inverted gate by the back door).
     - `CoordinatorConversation.cs` (**P2-47 #9** — the daemon-side coordinator conversation
       `CoordinatorService` streams: the real seq-ordered transcript store + `Changed` event; `SendAsync`
       appends the human turn, drives the optional `ICoordinatorReplyEngine` — the production

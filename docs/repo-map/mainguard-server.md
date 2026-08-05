@@ -159,7 +159,10 @@
     attaching to the dead agent's terminal still replays its final output (the why).
   - **`Runtime/AgentSpawnService.cs`** (PR3) — the ONE spawn/stop workflow behind BOTH entry points (the
     `SpawnAgent` RPC and the coordinator's in-jail `mainguard-agent` shim): kill-gate → session record
-    (with role) → coordinator-only IPC endpoint (best-effort, audited on failure) → worktree+jail
+    (with role) → **the phase-2 task withhold** (`WorkerPlanGate.Hold`, armed the instant the id is
+    minted and BEFORE any jail exists — a gate armed after the spawn returns is armed most of the time)
+    → IPC endpoint (spawn shim for a coordinator, **plan shim for a worker**; best-effort, audited on
+    failure) → worktree+jail
     (`SandboxAgentLauncher`) → CLI bind → managed-worker terminal lock (P2-14); stop tears down record,
     PTY, endpoint, lock, jail, worktree. Typed `AgentSpawnRefusedException` keeps it transport-agnostic.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`
@@ -167,23 +170,40 @@
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
     `External` and route an upstream PR's merge into a local fast-forward), and `withoutHostCredentials`
     (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*` nor any
-    harvested CLI login, and seeds neither).
-  - **`Runtime/CoordinatorIpcServer.cs`** (PR3) — the coordinator→daemon spawn channel: one Unix-domain
-    socket per coordinator served from a daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un
-    limit) that also carries the executable `mainguard-agent` shim; the dir is created BEFORE the jail
-    (it is a read-only mount source) and removed on stop. Identity is positional — only that
-    coordinator's jail has the mount. One newline-delimited JSON request per connection
-    (`AgentIpcProtocol`); malformed input gets an error response.
+    harvested CLI login, and seeds neither). **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
+    `heldBudgetUsd` (the work the daemon withholds until the worker's own plan is approved — the shim's
+    `taskPrompt` was previously parsed off the wire and then silently dropped, so a coordinator-spawned
+    worker received no task at all) and `HandleWorkerPlanRequestAsync`, the worker plan shim's handler:
+    `brief` / `present_plan` / `revise_plan` / `await_decision`, where present and revise **do not return
+    until a human decides** and an approval is the only thing that yields the task prompt. Plan ownership
+    is checked daemon-side and a foreign plan id answers "no plan '<id>'" — the same answer as a plan
+    that does not exist, so the channel is not an existence oracle for other agents' work.
+  - **`Runtime/AgentIpcServer.cs`** (PR3; renamed from `CoordinatorIpcServer.cs` in **phase 2**, because
+    it now serves both roles and being named for one of its two clients would mislead about which agents
+    have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
+    daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un limit) that also carries **the one shim
+    that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker.
+    The dir is created BEFORE the jail (it is a read-only mount source) and removed on stop. Identity is
+    positional — only that agent's jail has the mount — and the **role is fixed on the endpoint**, so a
+    worker cannot reach a coordinator op by naming it and vice versa. One newline-delimited JSON request
+    per connection (`AgentIpcProtocol`); malformed input gets an error response. Each connection is served
+    on its own task, which is what lets a worker's plan presentation **park on the socket for hours**
+    without blocking the accept loop or another agent's request.
   - **`Runtime/SessionKeyCache.cs`** (PR3) — memory-only per-kind model-key cache (the daemon has no
     keystore; keys only arrive on `SpawnAgent`), so a coordinator-initiated worker of the same kind
     reuses the client-supplied key; also caches the per-kind CLI login-state files a client spawn
     restored (and a stop harvested), so an IPC-spawned worker boots signed in too; never persisted,
     never logged.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
-  coordinator's in-jail spawn shim: `Evaluate(activeManagedWorkers, maxActiveWorkers, admission)`
-  returns a refusal reason or `null`. The cap is checked **before** admission, so a coordinator cannot
-  fan out past `maxActiveWorkers` by racing the admission controller — the shim path previously had no
-  approval, cap, admission or budget gate at all. **It now has a second caller:
+  coordinator's in-jail spawn shim:
+  `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or
+  `null`. The cap is checked **before** admission, so a coordinator cannot fan out past
+  `maxActiveWorkers` by racing the admission controller — the shim path previously had no approval, cap,
+  admission or budget gate at all. **Phase 2:** workers blocked on plan approval were already inside the
+  counted population (they are live Managed sessions, and the cap is a resource cap), but the refusal
+  said *"let one finish before spawning another"* — wrong and unactionable when nothing is going to
+  finish without the human. With a `planGate` it now names the cause and the count; without one it keeps
+  the generic wording rather than asserting a cause it never checked. **It also has a second caller:
   `Runtime/ExternalPrWorkerHost.cs`**, so both daemon-driven spawn paths are admitted by one evaluator
   over one population.
 - **`Runtime/ExternalPrWorkerHost.cs`** — the daemon's `IPrWorkerHost`: gives an intake'd upstream
@@ -299,20 +319,29 @@
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
   - `TerminalGrpcService` writes a read-only banner + defensively rejects input `data` frames for a
     `TerminalLockRegistry`-locked agent.
-  - **`Services/PlanApprovalGrpcService.cs`** (P2-14: `StreamPlans`/`ApprovePlan`/`RejectPlan` over the
+  - **`Services/PlanApprovalGrpcService.cs`** (`StreamPlans`/`ApprovePlan`/`RejectPlan` over the
     daemon `PlanApprovalService`; **`ApprovePlan` resolves the approver via `IApproverIdentityResolver`
-    from the connection — the request has no identity field**, SA-1/F2) and
+    from the connection — the request has no identity field**, SA-1/F2. **Phase 2:** the streamed
+    `PlanEntry` carries the authoring worker, the revision index and the rejection feedback; `RejectPlan`
+    reports whether that rejection **escalated** (spent the budget) rather than a bare `rejected: true`,
+    which could not distinguish "the worker will revise" from "the worker has stopped"; and `PlanUpdate`
+    carries the **backpressure** counts + the daemon's rendered stall line, taken from the same
+    `WorkerPlanGate` and Managed-session population that refuses the coordinator a spawn — a surface that
+    re-derived its own number could disagree with the gate it is rendering) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
   - **`Runtime/SessionStoreKillTarget.cs`** — the interim `IKillTarget` over `AgentSessionStore` (marks
     live sessions `Paused` on a kill; the real cooperative-yield→`docker pause` target swaps in behind
     the seam).
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
-    `IApproverIdentityResolver`, `PlanApprovalService` over a restart-safe `JsonPlanApprovalStore`, the
+    `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe
+    `JsonPlanApprovalStore` (**limits injected** — the revision budget is enforced there, not prompted),
+    the phase-2 `WorkerPlanGate` (also wired into `MergeQueueProvisioner` as an `IMergeGate` by
+    `GatewayServiceRegistration`), the
     shared `KillSwitchGate`, `IKillTarget`, `KillSwitch`) + the `RoleInterceptor`, the P2-47
     `SandboxAgentLauncher` (real spawn chain) + `IMergeBranchDiffService` (merge-diff bridge)
     singletons, the PR3 CLI-agent singletons (shared `InstalledAdapterCatalog`, `SessionKeyCache`,
-    `AgentCliBinder`, `CoordinatorIpcServer` rooted next to the test-isolated session token,
+    `AgentCliBinder`, `AgentIpcServer` rooted next to the test-isolated session token,
     `AgentSpawnService`), the `DaemonInfoProvider` instance (default release-file path; tests override
     with a temp-file provider), and maps the gRPC services;
   - `GatewayServiceRegistration` wires the `IMergeQueueRegistry`, the `IMergeLeaseStore`, and the real

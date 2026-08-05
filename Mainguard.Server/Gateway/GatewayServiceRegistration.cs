@@ -111,7 +111,10 @@ public static class GatewayServiceRegistration
             // mirror; with the agent now committing into its OWN repository, this is what carries it
             // there — immediately before verification, so the verified bytes are current (design §7).
             publishAgentRef: (repoHash, agentId) =>
-                sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId)));
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId),
+            // Phase 2 backstop: a worker whose own plan was never approved cannot merge, whatever it
+            // verified. ANDed into every repo's queue alongside the RT-D2 changed-test-command gate.
+            planGate: sp.GetRequiredService<WorkerPlanGate>()));
 
         services.AddSingleton(sp =>
         {

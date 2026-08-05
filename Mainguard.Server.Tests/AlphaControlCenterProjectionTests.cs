@@ -43,7 +43,7 @@ public sealed class AlphaControlCenterProjectionTests
     }
 
     [Fact]
-    public async Task Plans_DraftedOnDaemon_ProjectThroughAdapter_ThenReject()
+    public async Task Plans_PresentedOnDaemon_ProjectThroughAdapter_ThenRejectSendsItBackForRevision()
     {
         using var daemon = new DaemonFixture();
         _ = daemon.Token; // force a single synchronous host build before the pumps race on it
@@ -51,22 +51,36 @@ public sealed class AlphaControlCenterProjectionTests
         using var adapter = new DaemonBackedOrchestrator(client, ownsClient: false);
         adapter.Start();
 
-        // Draft a pending plan directly on the daemon-side service (the coordinator's spawn_worker path).
+        // Present a worker-authored plan directly on the daemon-side service (where the worker's plan
+        // shim lands it).
+        //
+        // The worker id is unique per run, and has to be: TestDataRootIsolation gives the whole ASSEMBLY
+        // one data root, so every DaemonFixture in the suite rehydrates from the same restart-safe plan
+        // store. A literal id shared with another test therefore trips the daemon's one-live-plan-per-
+        // worker invariant — which is the invariant doing its job, in the wrong place.
+        var workerId = "worker-" + Guid.NewGuid().ToString("N")[..8];
         var plans = daemon.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>();
-        var draft = plans.Draft(
-            coordinatorId: "coordinator-1", title: "Fix the flaky test",
+        var presented = plans.Present(
+            workerAgentId: workerId, coordinatorId: "coordinator-1", title: "Fix the flaky test",
             fields: new TaskPlanFields(new[] { "tests/FlakyTests.cs" }, "stabilize the clock", "green twice"),
             taskPrompt: "fix it", budgetUsd: 1.25m);
-        Assert.True(draft.IsDrafted);
+        Assert.True(presented.IsPresented, presented.Message);
 
         var projected = await WaitUntilAsync(
-            () => adapter.GetPendingPlans().Any(p => p.PlanId == draft.PlanId));
-        Assert.True(projected, "the adapter did not project the drafted plan off StreamPlans");
+            () => adapter.GetPendingPlans().Any(p => p.PlanId == presented.PlanId));
+        Assert.True(projected, "the adapter did not project the presented plan off StreamPlans");
+        Assert.Contains(adapter.GetWorkerPlans(), c => c.PlanId == presented.PlanId && c.WorkerAgentId == workerId);
 
-        // Reject through the real RejectPlan RPC → the plan leaves the pending projection.
-        await adapter.SubmitPlanDecisionAsync(draft.PlanId!, approve: false);
-        var gone = await WaitUntilAsync(() => adapter.GetPendingPlans().All(p => p.PlanId != draft.PlanId));
-        Assert.True(gone, "reject did not clear the plan from the live projection");
+        // Reject through the real RejectPlan RPC. Phase 2: this does NOT end the plan — it leaves the
+        // approvable set (the worker owes a revision) and the feedback travels with it.
+        await adapter.SubmitPlanDecisionAsync(presented.PlanId!, approve: false, feedback: "narrow the scope");
+        var gone = await WaitUntilAsync(() => adapter.GetPendingPlans().All(p => p.PlanId != presented.PlanId));
+        Assert.True(gone, "reject did not clear the plan from the approvable projection");
+
+        var stored = plans.Get(presented.PlanId!);
+        Assert.NotNull(stored);
+        Assert.Equal(Mainguard.Agents.Agents.Orchestrator.PlanStatus.Rejected, stored!.Status);
+        Assert.Equal("narrow the scope", stored.RejectionFeedback);
     }
 
     [Fact]

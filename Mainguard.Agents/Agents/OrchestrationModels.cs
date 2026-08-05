@@ -82,6 +82,66 @@ public sealed record TaskPlan(
     decimal BudgetUsd,
     DateTimeOffset DraftedAt);
 
+/// <summary>
+/// The UI-facing projection of a <b>worker-authored</b> plan awaiting a human decision (contract §2).
+///
+/// <para>Distinct from <see cref="TaskPlan"/> because the approval card now has to render things a plan
+/// record does not carry: <i>who wrote it</i>, which revision this is against the daemon-side budget, and
+/// the feedback the last rejection sent back. Those are what make the card a decision rather than a
+/// notification — a human rejecting a plan for the third time needs to see that the next rejection stops
+/// the worker.</para>
+/// </summary>
+/// <param name="Status">PlanStatus name: Pending / Approved / Rejected / Escalated.</param>
+/// <param name="Revision">0 for the original presentation.</param>
+/// <param name="RevisionsRemaining">Revisions still permitted before the worker must escalate.</param>
+public sealed record WorkerPlanCard(
+    string PlanId,
+    string WorkerAgentId,
+    string CoordinatorId,
+    string Title,
+    IReadOnlyList<string> Scope,
+    string Approach,
+    string TestStrategy,
+    decimal BudgetUsd,
+    DateTimeOffset PresentedAt,
+    string Status,
+    int Revision,
+    int RevisionsRemaining,
+    int MaxRevisions,
+    string RejectionFeedback)
+{
+    public bool IsPending => string.Equals(Status, "Pending", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsEscalated => string.Equals(Status, "Escalated", StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// The backpressure fact the coordinator surface must render when workers are held at the plan gate
+/// (contract §2 — "the stall must be legible").
+///
+/// <para>A blocked worker counts against the worker cap, so a full cap of blocked workers means the
+/// coordinator has stopped spawning. That is intended behaviour, and it is indistinguishable from a hang
+/// unless the UI says so — which is why <see cref="Signal"/> is carried from the daemon rather than
+/// re-derived in the client: the number that refuses the coordinator and the number the human reads must
+/// be the same number.</para>
+/// </summary>
+public sealed record OrchestrationBackpressure(
+    int BlockedWorkerCount,
+    int EscalatedWorkerCount,
+    int ActiveWorkerCount,
+    int MaxActiveWorkers,
+    int MaxPlanRevisions,
+    string Signal)
+{
+    public static readonly OrchestrationBackpressure None = new(0, 0, 0, 0, 0, "");
+
+    /// <summary>True when the worker cap is full and blocked plans are why.</summary>
+    public bool CapSaturatedByBlockedWorkers =>
+        BlockedWorkerCount > 0 && MaxActiveWorkers > 0 && ActiveWorkerCount >= MaxActiveWorkers;
+
+    public bool HasSignal => Signal.Length > 0;
+}
+
 public enum ChatLineKind
 {
     Human,        // the operator's message

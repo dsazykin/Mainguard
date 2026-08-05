@@ -58,6 +58,14 @@ public sealed class MergeQueueProvisioner
     private readonly Action<string>? _log;
     private readonly Func<string, string, bool>? _publishAgentRef;
 
+    /// <summary>
+    /// The phase-2 plan gate, ANDed into every repo's queue: a worker whose own plan was never approved
+    /// cannot merge, whatever it verified. This is the <i>backstop</i> half of "a worker does not start
+    /// work before its plan is approved" — the primary half is that the daemon never handed it the task.
+    /// Shared across repos on purpose: it is keyed by agent id and every agent id is daemon-global.
+    /// </summary>
+    private readonly IMergeGate? _planGate;
+
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
     /// <param name="leases">The RT-D1 merge-lease store. <b>Must be the same singleton</b> the foreground
@@ -89,7 +97,8 @@ public sealed class MergeQueueProvisioner
         string artifactDirectory,
         IAuditLog? audit = null,
         Action<string>? log = null,
-        Func<string, string, bool>? publishAgentRef = null)
+        Func<string, string, bool>? publishAgentRef = null,
+        IMergeGate? planGate = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -104,6 +113,7 @@ public sealed class MergeQueueProvisioner
         _audit = audit ?? new InMemoryAuditLog();
         _log = log;
         _publishAgentRef = publishAgentRef;
+        _planGate = planGate;
     }
 
     /// <summary>
@@ -190,6 +200,9 @@ public sealed class MergeQueueProvisioner
         // The RT-D2 gate is per-repo-queue because its flag state is per-branch and its acknowledgment is
         // the human's; sharing one across repos would let one repo's ack clear another's flag.
         var changedTestCommand = new ChangedTestCommandGate();
+        var gates = _planGate is null
+            ? new IMergeGate[] { changedTestCommand }
+            : new[] { changedTestCommand, _planGate };
 
         MergeQueue queue = null!;
         queue = new MergeQueue(
@@ -201,7 +214,7 @@ public sealed class MergeQueueProvisioner
             // Null requeue = re-verify, which is the production stale-cascade behaviour (§3.3): a staled
             // branch re-runs its own verification against the new main rather than sitting stale forever.
             requeue: null,
-            gates: new IMergeGate[] { changedTestCommand },
+            gates: gates,
             audit: _audit);
 
         return new MergeQueueContext(queue, _leases) { ChangedTestCommand = changedTestCommand };
