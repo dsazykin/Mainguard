@@ -1,3 +1,5 @@
+using System;
+using System.Linq;
 using System.Net;
 
 namespace Mainguard.Server.Gateway;
@@ -55,6 +57,63 @@ internal static class GatewayBindPolicy
         reason = $"'{address}' is a routable public address — the model gateway may only bind loopback "
                + "or a private (RFC 1918) address such as the Docker bridge.";
         return false;
+    }
+
+    /// <summary>
+    /// MG-4 — the address the gateway binds when nothing was configured: a private, non-loopback IPv4 on
+    /// an interface that is up. Null when the host has none.
+    ///
+    /// <para><b>Loopback is deliberately not a candidate.</b> It is permitted by
+    /// <see cref="IsPermitted"/> for an operator who knows what they are doing, but as a DEFAULT it is
+    /// the worst possible choice: it binds successfully, passes every in-process check, and is reachable
+    /// by nothing that matters — from inside a container <c>127.0.0.1</c> is the container. A gateway
+    /// there would look configured and confine nothing.</para>
+    ///
+    /// <para>Link-local (169.254/16) is excluded for the same reason in reverse: on a host with no real
+    /// network it is the address the OS invents, and it is not a route a Docker bridge shares. A
+    /// deterministic order (lowest address first) keeps the choice stable across daemon restarts, which
+    /// matters because the address is written into every confined jail's base-URL variable.</para>
+    ///
+    /// <para>This picks an address; it does not prove a jail can reach it. That is measured, per spawn,
+    /// by <c>IEgressPolicy.CanProxyReachAsync</c> before any agent is confined — so a wrong guess here
+    /// costs a skipped confinement, never a broken agent.</para>
+    /// </summary>
+    /// <summary>
+    /// Resolved once per process. <see cref="DaemonOptions"/> is a record whose default runs this in a
+    /// property initialiser, so every construction — and the test suites build hundreds — would otherwise
+    /// enumerate every network interface. The host's addresses do not change under a daemon in any way
+    /// that would make a re-resolve safe anyway: the chosen address is written into every confined jail's
+    /// base-URL variable, so it has to stay stable for the life of the process.
+    /// </summary>
+    private static readonly Lazy<string?> Resolved = new(ResolvePrivateHostAddress, isThreadSafe: true);
+
+    internal static string? TryResolvePrivateHostAddress() => Resolved.Value;
+
+    private static string? ResolvePrivateHostAddress()
+    {
+        try
+        {
+            var candidates =
+                from nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
+                where nic.OperationalStatus == System.Net.NetworkInformation.OperationalStatus.Up
+                      && nic.NetworkInterfaceType != System.Net.NetworkInformation.NetworkInterfaceType.Loopback
+                from unicast in nic.GetIPProperties().UnicastAddresses
+                let address = unicast.Address
+                where address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                      && !IPAddress.IsLoopback(address)
+                      && IsPrivate(address)
+                      && address.GetAddressBytes()[0] != 169
+                orderby address.ToString(), StringComparer.Ordinal
+                select address.ToString();
+
+            return candidates.FirstOrDefault();
+        }
+        catch (System.Net.NetworkInformation.NetworkInformationException)
+        {
+            // A host whose interfaces cannot be enumerated has no gateway address to offer. Disabled is
+            // the correct answer, not a startup failure.
+            return null;
+        }
     }
 
     /// <summary>RFC 1918 / RFC 3927 / unique-local — i.e. not routable on the public internet.</summary>

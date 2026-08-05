@@ -510,7 +510,15 @@
     every ACCEPT destination-constrained, and still terminates in DROP), `SandboxImageDigestTests`
     (**MG-27, pure** — see the jail-image note above), `EgressAllowlistTests` (defaults carry **no
     git-host entry**, add/remove round-trips + `allowlist_changed` audit events, a git-host entry
-    flagged `DefeatsA6`, JSON persistence round-trip), `DeclaredDependencyResolverTests` (F5:
+    flagged `DefeatsA6`, JSON persistence round-trip), `GatewayReachabilityPolicyTests` (**MG-4, pure:
+    the rendered egress policy that lets a CONFINED jail reach the model gateway, and the two things it
+    must not disturb. The gateway's own host must appear in the tinyproxy filter as a bare host (a
+    `host:port` pattern can never match, the same silent-no-op class as a wrong base-URL variable);
+    enabling confinement must add NO `upstream` directive, because an `upstream` is keyed on the
+    destination host on the one proxy every agent shares and would drag OAuth traffic through the gateway
+    to be 401'd — the highest-value assertion in the file; the provider hosts stay allowlisted; the
+    no-gateway default renders byte-identical policy; and the gateway entry does not trip the A6
+    warning**), `DeclaredDependencyResolverTests` (F5:
     `go.mod`/`package.json`/`package-lock.json` → the exact module set, subpath allow, out-of-scope
     typed denial), `DaemonGitProxyTests` (A6: allowlisted fetch succeeds + transparency line,
     non-allowlisted refused + audited, `git-receive-pack` push refused structurally + audited, and a
@@ -998,6 +1006,21 @@
   ASP.NET activates middleware lazily and a constructor whose arguments cannot be resolved from DI
   would start the daemon happily and only fail on an agent's first call. Also pins that the branch
   does NOT leak onto the mutually-authenticated gRPC control port**),
+  `Agents/GatewayConfinementDockerTests.cs` (**MG-4 end to end against REAL containers
+  (`[RequiresDockerFact]`) — the layer the in-process gateway tests structurally cannot reach. The model
+  request is issued FROM INSIDE a real hardened jail, sourced from the same `/run/secrets/agent.env` the
+  CLI sources and routed through the container's own `HTTP_PROXY`, so nothing about its shape is
+  constructed by the test. That is what exposed the defect the change fixes: a confined request reaches
+  tinyproxy naming the GATEWAY as its destination, and the default-deny filter had no entry for the
+  daemon's own address, so Mainguard's own proxy answered 403 — switching the gateway on would have
+  BROKEN every BYOK agent rather than metering it. Five legs: the traffic transits the gateway and the
+  ledger is charged 41 tokens; the provider key is absent from the container spec, the credential tmpfs
+  AND the agent's effective environment; a second call over a 1-token cap is refused 402 with nothing
+  reaching the provider; an OAuth agent is unconfined with its login restored and its provider host still
+  carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
+  it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key
+  and its working direct route — the precondition that makes gateway-on-by-default safe. Only the
+  provider itself is faked, via the `DaemonHost` `configureServices` seam**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly

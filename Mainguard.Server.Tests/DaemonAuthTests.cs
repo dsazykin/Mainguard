@@ -115,7 +115,27 @@ public sealed class DaemonAuthTests : IClassFixture<DaemonFixture>
         {
             var uri = new Uri(address);
             Assert.True(IPAddress.TryParse(uri.Host, out var ip), $"host not an IP: {uri.Host}");
-            Assert.True(IPAddress.IsLoopback(ip!), $"not loopback: {uri.Host}");
+
+            // Invariant 2, stated precisely now that MG-4 enables the model gateway by default. The
+            // CONTROL PLANE is still loopback-only and unconditionally so — that is where the mTLS
+            // session boundary lives. The gateway listener is the one deliberate relaxation (see
+            // GatewayBindPolicy): a jail on an Internal network cannot reach loopback, so a gateway
+            // there would confine nothing. Relaxed to "private", never to "any": this asserts the
+            // policy holds for whatever the auto-resolution picked, so a wildcard or public bind
+            // sneaking into the default still fails here.
+            if (uri.Port == daemon.Port)
+            {
+                Assert.True(IPAddress.IsLoopback(ip!), $"control plane is not loopback: {uri.Host}");
+                continue;
+            }
+
+            Assert.Equal(daemon.GatewayPort, uri.Port);
+            Assert.True(
+                Mainguard.Server.Gateway.GatewayBindPolicy.IsPermitted(ip, out var reason),
+                $"the default gateway bind is impermissible: {reason}");
+            Assert.False(
+                ip!.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any),
+                $"the gateway bound a wildcard: {uri.Host}");
         }
     }
 

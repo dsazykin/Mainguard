@@ -493,7 +493,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `IEgressPolicy.cs` (`Allowlist`/`NetworkName`/`ProxyUrl`/`EnsureReadyAsync`/`Evaluate` + the
       **MG-36** `EnsureAgentSegmentAsync`/`RemoveAgentSegmentAsync` →
       `AgentSegment(NetworkName, ProxyAddress)`; both are default-implemented as "do not segment" so the
-      substrate-less test doubles keep compiling, and the shipped configurator always segments).
+      substrate-less test doubles keep compiling, and the shipped configurator always segments; **MG-4:**
+      `CanProxyReachAsync(hostPort)` — can the egress proxy actually open a TCP connection to the daemon's
+      model gateway? The caller's contract is **false ⇒ do not confine**, because a confined jail has no
+      other route and pointing it at an address the proxy cannot dial is an outage, not a degradation.
+      Default-implemented as `true` for the test doubles, which never run with a gateway configured).
     - `UsernsRemapPolicy.cs` (**MG-17**, pure — the ONE definition of what "user-namespaced" means for
       MainguardEnv: `userns-remap: mainguard` with a PINNED `/etc/subuid`+`/etc/subgid` range
       `100000:65536`, so container uid 0 → host 100000 and the agent's uid 1000 → host 101000; `HostIdFor`
@@ -548,6 +552,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
       egress hosts (`EgressAllowlist.CombinedWith`, direct-route `AgentService` kind) at render time —
       **auto-permit on install**, so e.g. claude-code reaches `platform.claude.com` with no hand-editing.
+      **MG-4 — `gatewayReachableAt`:** a SEPARATE ctor arg from `gatewayUpstream`, and the separation is
+      load-bearing. It adds the gateway's own host to the rendered filter as a direct-route entry
+      (`CombineGatewayHost`/`GatewayHostOf`, port stripped — tinyproxy filters on hostname) and emits no
+      `upstream` directive, so a confined jail can reach the daemon while every existing host keeps the
+      route it had. `gatewayUpstream` would instead front the model hosts for EVERY agent, dragging OAuth
+      traffic through the gateway to be 401'd, which is why production passes only the former.
+      `CanProxyReachAsync` performs the real connect from inside the proxy (bash `/dev/tcp`; the proxy
+      image has no HTTP client), cached on success only.
       **MG-36 — per-agent segmentation:** every jail used to attach to the one flat `mainguard-agents`
       network, so agent A could dial agent B's container IP and ports;
       `EnsureAgentSegmentAsync(repoHash, agentId)` now gives each agent its OWN internal network
@@ -1058,7 +1070,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       carried across the manifest → marker → daemon hop so the spawn path can point a CLI at the daemon's
       model gateway, which is what allows the jail to hold only a Mainguard session token while the real
       provider key stays daemon-side. Null = this CLI cannot be redirected, so BYOK confinement does not
-      apply to it. `AdapterBaseUrlEnvVarTests` covers parse/validate/round-trip + legacy markers).
+      apply to it. `AdapterBaseUrlEnvVarTests` covers parse/validate/round-trip + legacy markers) and
+      **`modelHost`** (the provider host the gateway forwards that CLI's traffic to; the pair is
+      all-or-nothing because `TryConfineToGateway` requires both).
+      **The bundled channel now declares the pair**, verified 2026-08-05 against the pinned tarballs
+      themselves rather than vendor docs: `claude-code` → `ANTHROPIC_BASE_URL`/`api.anthropic.com`,
+      `gemini-cli` → `GOOGLE_GEMINI_BASE_URL`/`generativelanguage.googleapis.com`; `codex`, `qwen-code`
+      and `opencode` declare NEITHER because no usable base-URL env var exists in their shipped binaries
+      (codex takes its endpoint from `config.toml` only) — a plausible-looking name would produce a
+      confinement that silently does nothing. `AdapterBaseUrlEnvVarTests` pins that table as a change
+      detector and enforces the all-or-nothing invariant; `docs/design/oauth-budgeting.md` carries the
+      evidence.
     - `AdapterSpec` gained `payloadUrl` + `launch`, and later `credentialPaths` — the $HOME-relative files
       where the CLI keeps its interactive-login state (validated by
       `AdapterManifest.IsHomeRelativeFilePath`: relative, no `..`/`~`/backslash — the ONE gate every

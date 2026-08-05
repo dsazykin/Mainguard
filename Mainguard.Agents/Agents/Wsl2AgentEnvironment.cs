@@ -28,9 +28,18 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     /// <param name="distroName">The WSL distro name in the UNC path (defaults to <c>MainguardEnv</c>).</param>
     /// <param name="dockerClient">The daemon-side Docker client (defaults to the local socket; connects lazily).</param>
     /// <param name="auditLog">Audit sink for allowlist-change events (defaults to the in-memory journal).</param>
+    /// <param name="gatewayEndpoint">
+    /// MG-4 — the daemon's model-gateway <c>host:port</c>, or null when the gateway is disabled (the
+    /// default, and byte-identical to the pre-gateway behaviour). Handed to the egress proxy so the
+    /// rendered tinyproxy filter PERMITS the gateway's own address: a confined jail reaches the gateway
+    /// through the proxy it already routes through, and without this entry that request is refused by
+    /// Mainguard's own default-deny filter. Passing it here rather than deriving it inside the
+    /// configurator keeps the daemon the single source of the address it actually bound.
+    /// </param>
     public Wsl2AgentEnvironment(
         string? vmRoot = null, string? userName = null, string? distroName = null,
-        IDockerClient? dockerClient = null, IAuditLog? auditLog = null)
+        IDockerClient? dockerClient = null, IAuditLog? auditLog = null,
+        string? gatewayEndpoint = null)
     {
         var user = string.IsNullOrEmpty(userName)
             ? Environment.GetEnvironmentVariable("USER") ?? Environment.GetEnvironmentVariable("USERNAME") ?? "mainguard"
@@ -69,6 +78,11 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         var declaredHosts = LoadBundledEgressHosts();
         var egress = new EgressProxyConfigurator(
             docker, EgressAllowlist.WithDefaults(audit),
+            // NOT the configurator's `gatewayUpstream:` — that emits tinyproxy `upstream` directives for
+            // every model host, which would drag OAuth agents' traffic through the gateway and 401 it.
+            // Confinement is per-agent and BYOK-only; the proxy just has to be willing to CARRY a
+            // confined jail's request to the daemon, which is one allowlist entry.
+            gatewayReachableAt: string.IsNullOrWhiteSpace(gatewayEndpoint) ? null : gatewayEndpoint,
             installedAdapterHosts: () => adapters.List()
                 .SelectMany(m => m.EgressHosts
                     ?? (declaredHosts.TryGetValue(m.Id, out var fallback) ? fallback : Array.Empty<string>()))

@@ -78,13 +78,30 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     private readonly IDockerClient _docker;
     private readonly string _proxyImageRef;
     private readonly string? _gatewayUpstream;
+    private readonly string? _gatewayReachableAt;
     private readonly Func<IReadOnlyList<string>>? _installedAdapterHosts;
     private readonly IExecStdinTransport _stdin;
 
     /// <param name="gatewayUpstream">
     /// The P2-08 AI-gateway <c>host:port</c> the proxy routes model-API hosts through (gateway
-    /// fronting). Null disables fronting (the model hosts would then reach the provider directly — a
-    /// rejection trigger in production; null is for the P2-07-only tests that predate the gateway).
+    /// fronting), via tinyproxy <c>upstream</c> directives.
+    ///
+    /// <para><b>Null in production, and that is a decision rather than an oversight.</b> An
+    /// <c>upstream</c> is configured per DESTINATION HOST on the one proxy every agent shares, so
+    /// fronting <c>api.anthropic.com</c> this way captures the traffic of OAuth agents too — agents that
+    /// hold a provider session Mainguard never issued and cannot recognise, whose requests the gateway
+    /// would then 401. That breaks interactive login, which is the one path that must not change. Use
+    /// <paramref name="gatewayReachableAt"/> for MG-4 confinement instead: it is per-AGENT (the CLI's own
+    /// base URL is redirected, and only when that agent is BYOK), so an OAuth agent is never routed
+    /// anywhere new. This parameter remains for the P2-08 fronting tests and for a future deployment that
+    /// genuinely has no OAuth agents.</para>
+    /// </param>
+    /// <param name="gatewayReachableAt">
+    /// MG-4 — the model gateway's own <c>host:port</c>, permitted through the filter as a direct-route
+    /// entry so a CONFINED jail's request can actually get there. Adds an allowlist entry and nothing
+    /// else: no <c>upstream</c> directive is emitted, so every host keeps the route it had and an agent
+    /// that was not confined sees no change at all. Null (the default) renders byte-identical policy to
+    /// before the gateway existed.
     /// </param>
     /// <param name="installedAdapterHosts">
     /// The hosts the currently-installed agent CLIs declared they need (auto-permit on install —
@@ -102,12 +119,14 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         string proxyImageRef = DefaultImageRef,
         string? gatewayUpstream = null,
         Func<IReadOnlyList<string>>? installedAdapterHosts = null,
-        IExecStdinTransport? stdin = null)
+        IExecStdinTransport? stdin = null,
+        string? gatewayReachableAt = null)
     {
         _docker = docker ?? throw new ArgumentNullException(nameof(docker));
         Allowlist = allowlist ?? throw new ArgumentNullException(nameof(allowlist));
         _proxyImageRef = proxyImageRef;
         _gatewayUpstream = gatewayUpstream;
+        _gatewayReachableAt = gatewayReachableAt;
         _installedAdapterHosts = installedAdapterHosts;
         _stdin = stdin ?? DockerSocketExecStdinTransport.For(docker);
     }
@@ -964,6 +983,47 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         return list.FirstOrDefault(c => c.Names.Any(n => n == "/" + name));
     }
 
+    /// <summary>
+    /// MG-4 — unions the model gateway's own host into the rendered allowlist, so tinyproxy will carry a
+    /// confined jail's request to it. Pure and internal so the rendered policy is assertable without a
+    /// running proxy (the same reason <see cref="EgressProxyConfig"/> is pure).
+    ///
+    /// <para>Only the HOST is taken. tinyproxy's <c>Filter</c> matches the destination hostname, not the
+    /// port, so rendering <c>10.0.0.5:5251</c> would produce <c>^10\.0\.0\.5:5251$</c> — a pattern no
+    /// request can ever match, which is precisely the silent-no-op failure this whole change exists to
+    /// remove. A blank/whitespace upstream (the gateway disabled — the default) returns the allowlist
+    /// untouched, so a daemon with no gateway renders byte-identical policy to before.</para>
+    /// </summary>
+    internal static EgressAllowlist CombineGatewayHost(EgressAllowlist allowlist, string? gatewayReachableAt)
+    {
+        var host = GatewayHostOf(gatewayReachableAt);
+        return host is null
+            ? allowlist
+            : allowlist.CombinedWith(new[] { host }, EgressEntryKind.AgentService, "Mainguard model gateway");
+    }
+
+    /// <summary>The host part of a <c>host:port</c> gateway endpoint, or null when there is none.</summary>
+    internal static string? GatewayHostOf(string? gatewayEndpoint)
+    {
+        if (string.IsNullOrWhiteSpace(gatewayEndpoint))
+        {
+            return null;
+        }
+
+        var value = gatewayEndpoint.Trim();
+        // Bracketed IPv6 literal ("[::1]:5251"). Kept whole minus the brackets; the gateway is
+        // constrained to loopback or a private address, but the parse must not silently mangle one.
+        if (value.StartsWith('['))
+        {
+            var close = value.IndexOf(']');
+            return close > 1 ? value[1..close] : null;
+        }
+
+        var colon = value.LastIndexOf(':');
+        var host = colon > 0 ? value[..colon] : value;
+        return string.IsNullOrWhiteSpace(host) ? null : host;
+    }
+
     /// <summary>The tmpfs directory the daemon renders policy into. It moved off <c>/etc/mainguard</c>
     /// when the proxy gained a read-only rootfs (MG-25): the image's scripts stay on the immutable
     /// layer, only the rendered policy is writable.</summary>
@@ -981,6 +1041,28 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         var effective = _installedAdapterHosts is null
             ? Allowlist
             : Allowlist.CombinedWith(_installedAdapterHosts(), EgressEntryKind.AgentService, "Agent CLI");
+
+        // MG-4: the gateway's OWN address has to be in the filter, or confinement is unreachable.
+        //
+        // This is the step whose absence made the whole confinement mechanism inert end to end. A
+        // confined CLI has its base-URL variable pointed at http://<gateway>:<port>, and the jail's
+        // HTTP_PROXY/HTTPS_PROXY point at tinyproxy (NO_PROXY covers only loopback + the internal git
+        // proxy), so that request arrives at tinyproxy naming the GATEWAY as its destination host.
+        // tinyproxy runs FilterDefaultDeny with an anchored allowlist built from the entries above —
+        // which contain provider hosts and CLI service hosts, and never the daemon's own address. The
+        // request was therefore refused by our own proxy: the jail would be pointed at an endpoint it
+        // is structurally forbidden to reach, i.e. turning the gateway on would have broken every BYOK
+        // agent it touched rather than metering it.
+        //
+        // Added as a DIRECT-ROUTE AgentService entry, deliberately not ModelApi: a ModelApi entry also
+        // emits an `upstream` directive, which would make the proxy forward the gateway's own address
+        // back to the gateway. Direct route is also correct on the merits — the proxy dials the daemon,
+        // and the daemon (not the proxy) establishes the TLS leg to the provider.
+        //
+        // This is ONE ADDED ALLOWLIST ENTRY and nothing else. It moves no existing host's route, so an
+        // OAuth agent — which is never confined, never given a base-URL override, and never given a
+        // gateway token — reaches api.anthropic.com by exactly the path it does today.
+        effective = CombineGatewayHost(effective, _gatewayReachableAt);
 
         // MG-7/MG-18/MG-36: both the pinned-DNS self-record and the backstop's destination constraint
         // need the proxy's own addresses. Resolved here, after the container is up and every segment is
@@ -1143,6 +1225,108 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
         var (stdout, _) = await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
         return stdout;
+    }
+
+    /// <summary>
+    /// MG-4 — a REAL TCP connect from inside the proxy container to the daemon's gateway. See
+    /// <see cref="IEgressPolicy.CanProxyReachAsync"/> for why the caller must treat false as "do not
+    /// confine" rather than as a warning.
+    ///
+    /// <para>Probed from the proxy rather than from the daemon because the daemon can always reach its
+    /// own listener — that answer would be true everywhere and useful nowhere. The proxy is the hop that
+    /// actually has to make the connection. <c>bash</c>'s <c>/dev/tcp</c> is used because the proxy image
+    /// carries no HTTP client (the same reason the existing egress tests probe it that way).</para>
+    ///
+    /// <para>Cached per endpoint after a SUCCESS only. A negative is not cached: the daemon may come up
+    /// before the proxy is fully settled, and permanently refusing to confine because of one early miss
+    /// would silently downgrade every later spawn for the life of the process.</para>
+    /// </summary>
+    public async Task<bool> CanProxyReachAsync(string hostPort, CancellationToken ct = default)
+    {
+        if (GatewayHostOf(hostPort) is not { } host || !TryPortOf(hostPort, out var port))
+        {
+            return false;
+        }
+
+        // The host is interpolated into a shell command below, so it is constrained to the character
+        // set a hostname/IP literal can contain. In production this value is the daemon's own bind
+        // address (already parsed as an IPAddress by GatewayBindPolicy), but this method is public and
+        // the guard costs nothing — an injected argument here would execute as root inside the proxy.
+        if (!host.All(c => char.IsAsciiLetterOrDigit(c) || c is '.' or '-' or ':'))
+        {
+            return false;
+        }
+
+        if (_reachable.ContainsKey(hostPort))
+        {
+            return true;
+        }
+
+        try
+        {
+            var proxy = await FindContainerAsync(ProxyContainerName, ct).ConfigureAwait(false);
+            if (proxy is null)
+            {
+                return false;
+            }
+
+            // exit 0 iff the connect succeeded. Bounded by the proxy's own timeout so a blackholed
+            // address fails fast instead of stalling the spawn.
+            var exit = await ExecExitCodeAsync(
+                proxy.ID,
+                new[] { "bash", "-c", $"timeout 5 bash -c 'exec 3<>/dev/tcp/{host}/{port}'" },
+                ct).ConfigureAwait(false);
+
+            if (exit == 0)
+            {
+                _reachable[hostPort] = true;
+                return true;
+            }
+
+            return false;
+        }
+        catch (Exception)
+        {
+            // Unreachable-by-failure is still unreachable: refuse to confine rather than point a jail
+            // at an endpoint we could not confirm.
+            return false;
+        }
+    }
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> _reachable =
+        new(StringComparer.Ordinal);
+
+    private static bool TryPortOf(string hostPort, out int port)
+    {
+        port = 0;
+        var colon = hostPort.LastIndexOf(':');
+        return colon > 0 && colon < hostPort.Length - 1
+               && int.TryParse(hostPort[(colon + 1)..], out port)
+               && port is > 0 and <= 65535;
+    }
+
+    private async Task<long> ExecExitCodeAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(ExecTimeout);
+        var bounded = timeout.Token;
+
+        var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+        {
+            User = "0",
+            AttachStdout = true,
+            AttachStderr = true,
+            Cmd = cmd.ToList(),
+        }, bounded).ConfigureAwait(false);
+
+        using (var stream = await _docker.Exec
+                   .StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false))
+        {
+            await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+        }
+
+        var inspect = await _docker.Exec.InspectContainerExecAsync(exec.ID, bounded).ConfigureAwait(false);
+        return inspect.ExitCode;
     }
 
     private async Task ExecAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)

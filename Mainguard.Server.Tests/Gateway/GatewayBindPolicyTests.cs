@@ -73,4 +73,64 @@ public sealed class GatewayBindPolicyTests
     {
         Assert.False(GatewayBindPolicy.IsPermitted(IPAddress.Parse(ip), out _));
     }
+
+    // ---- MG-4 item 3: the gateway is ON by default -----------------------------------------------
+
+    /// <summary>
+    /// The default posture. This is the whole point of MG-4 item 3: the gateway used to be reachable
+    /// only through <c>MAINGUARD_GATEWAY_BIND</c>, which nothing in the repo ever set, so a BYOK jail
+    /// received the raw provider key in every supported deployment.
+    ///
+    /// <para>Written as an implication rather than "is not null" so it is honest on a host with no
+    /// private address (where disabled IS the correct answer): if the resolver found one, the default
+    /// must be it, and it must satisfy the bind policy.</para>
+    /// </summary>
+    [Fact]
+    public void ByDefault_TheGatewayBinds_WhateverTheResolverFound()
+    {
+        var resolved = GatewayBindPolicy.TryResolvePrivateHostAddress();
+
+        Assert.Equal(resolved, new DaemonOptions().GatewayBindAddress);
+
+        if (resolved is not null)
+        {
+            Assert.True(GatewayBindPolicy.IsPermitted(IPAddress.Parse(resolved), out var reason), reason);
+            Assert.False(IPAddress.IsLoopback(IPAddress.Parse(resolved)),
+                "loopback is unreachable from a container, so it must never be the auto-resolved default");
+        }
+    }
+
+    /// <summary>
+    /// The escape hatch has to keep working, from either source, or "purely additive" is not true for an
+    /// operator who wants the old posture back.
+    /// </summary>
+    [Theory]
+    [InlineData("off", null)]
+    [InlineData("OFF", null)]
+    [InlineData("  off  ", null)]
+    [InlineData("172.17.0.1", "172.17.0.1")]
+    [InlineData("127.0.0.1", "127.0.0.1")]
+    public void ResolveBindAddress_HonoursOffAndExplicitAddresses(string configured, string? expected)
+        => Assert.Equal(expected, DaemonOptions.ResolveBindAddress(configured));
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("auto")]
+    [InlineData("AUTO")]
+    public void ResolveBindAddress_UnsetOrAuto_ResolvesTheSameAddress(string? configured)
+        => Assert.Equal(
+            GatewayBindPolicy.TryResolvePrivateHostAddress(),
+            DaemonOptions.ResolveBindAddress(configured));
+
+    /// <summary>
+    /// An impermissible EXPLICIT address must still reach the policy and fail startup loudly — the
+    /// resolver must not quietly swallow it into an auto-resolved one.
+    /// </summary>
+    [Fact]
+    public void ResolveBindAddress_PassesAnImpermissibleAddressThrough_SoStartupCanRefuseIt()
+    {
+        Assert.Equal("0.0.0.0", DaemonOptions.ResolveBindAddress("0.0.0.0"));
+        Assert.False(GatewayBindPolicy.IsPermitted(IPAddress.Parse("0.0.0.0"), out _));
+    }
 }
