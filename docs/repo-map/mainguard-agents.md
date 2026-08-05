@@ -229,6 +229,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       idle-terminates the distro seconds after its last wsl.exe client exits (gRPC connections don't
       count), which stopped mainguardd between RPCs and once killed it mid-migration; G-12-safe, Dispose
       kills the holder).
+    - `SandboxImageProvisioningTracker.cs` (process-wide "is an image build running right now?" gate —
+      the 2026-08-05 field fix. Provisioning a stale jail image is a MINUTES-long `docker build` (the
+      agent-base `nix profile install` layer pulls a toolchain from cache.nixos.org, ~4-5 min, and it is
+      a SINGLE layer so a kill mid-download discards all of it). Both entry points — the startup
+      auto-provision (`KickSandboxImageBuild`) and Tools → Rebuild — were discarded `Task.Run`s that
+      nothing tracked, so (a) they could run two builds of the same tag at once, and (b) nothing stopped
+      the shutdown sequence's `StopVmOnExit` leg from running `wsl --terminate MainguardEnv` straight
+      through an in-flight build — killing it ~10ms after the terminate, every launch, so the images
+      could never become current and the coordinator kept refusing to start. `RunExclusiveAsync` makes a
+      concurrent request JOIN the run already in flight (same images, same sources) instead of starting a
+      rival build, and `IsProvisioning` is the signal `AppShutdownSequence` (and the framework-Exit
+      backstop in `ProDesktopHost`) vetoes the VM terminate on.)
     - `DaemonConnectDiagnosis.cs` (the app→daemon connect path's per-leg verdict: `DaemonConnectStage`
       (distro not running / daemon process down / no session token / transport credentials missing /
       not listening / token rejected / undiagnosed), the `DaemonConnectDiagnosis` record whose `Banner`

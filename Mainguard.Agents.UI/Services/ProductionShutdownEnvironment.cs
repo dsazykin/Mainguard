@@ -38,5 +38,9 @@ internal sealed class ProductionShutdownEnvironment : IAppShutdownEnvironment
 
     public Task StopVmAsync(CancellationToken ct) => _stopVm(ct);
 
+    // The shared tracker both provisioning entry points register with — see AppShutdownSequence for why
+    // an in-flight build vetoes the terminate.
+    public bool SandboxProvisioningInFlight => SandboxImageProvisioningTracker.Shared.IsProvisioning;
+
     public void Log(string message) => _log(message);
 }
