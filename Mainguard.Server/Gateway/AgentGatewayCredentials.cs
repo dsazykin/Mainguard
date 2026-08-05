@@ -34,14 +34,25 @@ public sealed class AgentGatewayCredentials
     private readonly ConcurrentDictionary<string, string> _agentByToken = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _tokenByAgent = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, string> _providerKeyByAgent = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, string> _upstreamHostByAgent = new(StringComparer.Ordinal);
 
     /// <summary>
     /// Issues (or re-issues) this agent's gateway token and takes custody of its real provider key.
     /// The returned token is what the jail receives; <paramref name="providerApiKey"/> stays here.
     /// A null/blank provider key still yields a token — the agent may be using an interactive CLI
     /// login rather than BYOK, and the gateway simply has no key to inject for it.
+    ///
+    /// <para><paramref name="upstreamHost"/> is the PER-AGENT UPSTREAM BINDING, and it is what makes the
+    /// gateway reachable at all. Once a CLI's base URL points at the gateway, the inbound request's
+    /// <c>Host</c> is the GATEWAY — not <c>api.anthropic.com</c> — so a middleware that decides "is this a
+    /// model request?" by matching the Host header against a model-host list never matches, and every real
+    /// request falls through unfronted. Nothing else in the daemon records which provider a given agent's
+    /// traffic belongs to, so it is captured HERE, at spawn, from the adapter that was launched: the agent's
+    /// authenticated token is the key, and the upstream is a property of the agent rather than of the
+    /// request. That also closes the obvious abuse — an agent cannot redirect its own traffic to an
+    /// arbitrary host by setting a header, because it never gets a say in its upstream.</para>
     /// </summary>
-    public string Issue(string agentId, string? providerApiKey)
+    public string Issue(string agentId, string? providerApiKey, string? upstreamHost = null)
     {
         if (string.IsNullOrWhiteSpace(agentId))
         {
@@ -63,8 +74,22 @@ public sealed class AgentGatewayCredentials
             _providerKeyByAgent[agentId] = providerApiKey;
         }
 
+        if (!string.IsNullOrWhiteSpace(upstreamHost))
+        {
+            _upstreamHostByAgent[agentId] = upstreamHost;
+        }
+
         return token;
     }
+
+    /// <summary>
+    /// The provider host this agent's model traffic is forwarded to, or null when the agent has no
+    /// upstream binding (it was not spawned under gateway confinement). Null is a REFUSAL, never a
+    /// default: guessing a provider would forward one vendor's request to another's endpoint with the
+    /// daemon's key attached.
+    /// </summary>
+    public string? UpstreamHostFor(string? agentId) =>
+        !string.IsNullOrEmpty(agentId) && _upstreamHostByAgent.TryGetValue(agentId, out var host) ? host : null;
 
     /// <summary>
     /// The authenticated agent behind a presented gateway token, or null when the token is unknown.
@@ -96,5 +121,6 @@ public sealed class AgentGatewayCredentials
         }
 
         _providerKeyByAgent.TryRemove(agentId, out _);
+        _upstreamHostByAgent.TryRemove(agentId, out _);
     }
 }

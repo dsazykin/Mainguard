@@ -212,12 +212,24 @@ public interface IAgentPortMap
 }
 
 /// <summary>
-/// The ASP.NET wrapper that puts <see cref="GatewayForwarder"/> on the egress proxy's forward path.
-/// Attribution is by <b>per-agent listener port</b> (simplest + test-friendly): the local port the
-/// request arrived on maps to an agent id, with an <c>x-mainguard-agent</c> header fallback. Requests to
-/// non-model hosts pass through untouched; model hosts are fronted by the gateway (an allowlist entry
-/// for a model host without this fronting is a rejection trigger). The forwarding core is
-/// <see cref="GatewayForwarder"/> so the no-raw-429 invariant is asserted without spinning a listener.
+/// The ASP.NET wrapper that puts <see cref="GatewayForwarder"/> on the model-request path.
+///
+/// <para><b>Attribution and routing both come from the agent's authenticated token</b>
+/// (<see cref="AgentGatewayCredentials"/>), with a per-agent listener port as a fallback. This is not a
+/// stylistic choice: a confined BYOK CLI is pointed at the gateway by its base-URL variable, so the
+/// inbound <c>Host</c> header names the GATEWAY. Deciding "is this model traffic?" from that header
+/// therefore never matched in production and every real request fell through unfronted. The upstream
+/// provider is instead recorded per agent at spawn and looked up here.</para>
+///
+/// <para><b>Scope — BYOK only.</b> An agent that authenticates its CLI interactively (OAuth) holds no
+/// API key, is given no gateway token and no base-URL override, and never transits this middleware; its
+/// traffic goes to the provider directly exactly as before. Such an agent is deliberately NOT metered —
+/// a session the agent authenticates past cannot be attributed or priced at a proxy. See
+/// <c>docs/design/oauth-budgeting.md</c>.</para>
+///
+/// <para>Requests that neither carry an upstream binding nor target a model host pass through untouched.
+/// The forwarding core is <see cref="GatewayForwarder"/> so the no-raw-429 invariant is asserted without
+/// spinning a listener.</para>
 /// </summary>
 public sealed class ModelProxyMiddleware
 {
@@ -243,20 +255,34 @@ public sealed class ModelProxyMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        var host = context.Request.Host.Host;
-        if (!IsModelHost(host))
-        {
-            await _next(context).ConfigureAwait(false);
-            return;
-        }
-
         // MG-20: identity comes from the agent's own Mainguard gateway token (presented as its API key),
         // or from a per-agent listener port. The client-supplied `x-mainguard-agent` header is NEVER
         // trusted — an agent could set it to another agent's id to dodge its own budget or attribute
-        // spend and 429-pauses to a victim. An unauthenticated caller is refused outright.
+        // spend and 429-pauses to a victim.
+        //
+        // Identity is resolved BEFORE any host check, and that ordering is the fix for the defect that
+        // made this middleware unreachable in production. A confined BYOK CLI has its base URL pointed at
+        // the gateway, so the inbound `Host` is the GATEWAY's address; matching that against the model-host
+        // list never succeeded and every real request fell through to `_next` unfronted — the invariant in
+        // this file's own doc comment was false. The upstream is therefore taken from the agent's
+        // spawn-time binding (see AgentGatewayCredentials.Issue), and the Host header is not consulted for
+        // a confined agent at all.
         var presentedToken = ExtractPresentedToken(context);
         var agentId = _credentials.ResolveAgent(presentedToken)
                       ?? _portMap.AgentForPort(context.Connection.LocalPort);
+
+        var boundUpstream = _credentials.UpstreamHostFor(agentId);
+        var requestHost = context.Request.Host.Host;
+
+        // The upstream to forward to: the agent's spawn-time binding first; otherwise the legacy
+        // proxy-shaped request whose Host IS a model host (the tinyproxy-upstream route, still supported).
+        var upstreamHost = boundUpstream ?? (IsModelHost(requestHost) ? requestHost : null);
+        if (upstreamHost is null)
+        {
+            // Not model traffic this gateway fronts — hand it on untouched.
+            await _next(context).ConfigureAwait(false);
+            return;
+        }
 
         if (string.IsNullOrEmpty(agentId))
         {
@@ -264,7 +290,7 @@ public sealed class ModelProxyMiddleware
             return;
         }
 
-        using var request = BuildUpstreamRequest(context, host, _credentials.ProviderKeyFor(agentId));
+        using var request = BuildUpstreamRequest(context, upstreamHost, _credentials.ProviderKeyFor(agentId));
         int? estimate = TryReadEstimate(context);
 
         try
