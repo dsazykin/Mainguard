@@ -52,12 +52,58 @@ public sealed record DaemonOptions
     /// work without one. <see cref="Gateway.GatewayBindPolicy"/> constrains this to loopback or a
     /// private address and refuses a wildcard or public bind.</para>
     ///
-    /// <para>Disabled by default, deliberately: with no gateway there is nothing to redirect a CLI to,
-    /// so the spawn path keeps injecting the provider key exactly as before. Enabling the gateway is
-    /// what turns on the confinement.</para>
+    /// <para><b>ON by default (MG-4 item 3).</b> It used to be off, settable only through
+    /// <c>MAINGUARD_GATEWAY_BIND</c>, which nothing in the repo ever set — so in every supported
+    /// deployment a BYOK jail received the raw provider API key, which is the thing MG-4 exists to stop,
+    /// and it mattered most for agents spawned from untrusted external-PR content. The default is now
+    /// <see cref="AutoBind"/>: the daemon picks a private host address the jails' egress proxy can dial.
+    /// Set <c>MAINGUARD_GATEWAY_BIND=off</c> (or <c>--gateway-bind off</c>) to restore the old posture,
+    /// or name an explicit address to pin it.</para>
+    ///
+    /// <para><b>Turning it on cannot break a working agent, and that is enforced rather than hoped.</b>
+    /// Confinement engages only for a BYOK agent (a key was supplied) whose CLI declares both a
+    /// base-URL variable and a model host, <i>and</i> only once the jail's own egress proxy has been
+    /// measured able to reach this address (<c>IEgressPolicy.CanProxyReachAsync</c>). Any of those
+    /// failing leaves the spawn exactly as it was before the gateway existed. An interactive-OAuth agent
+    /// holds no key, so it is never confined and never touches the gateway at all.</para>
     /// </summary>
     public string? GatewayBindAddress { get; init; }
-        = Environment.GetEnvironmentVariable("MAINGUARD_GATEWAY_BIND");
+        = ResolveBindAddress(Environment.GetEnvironmentVariable("MAINGUARD_GATEWAY_BIND"));
+
+    /// <summary>The sentinel meaning "pick a private host address the agents' egress proxy can reach".</summary>
+    public const string AutoBind = "auto";
+
+    /// <summary>The sentinel meaning "no gateway listener" — the pre-MG-4 posture.</summary>
+    public const string DisabledBind = "off";
+
+    /// <summary>
+    /// Turns a configured bind value (or the absence of one) into the address Kestrel binds, or null for
+    /// "disabled".
+    ///
+    /// <para>An explicit address is passed through untouched, so <see cref="Gateway.GatewayBindPolicy"/>
+    /// still gets to refuse a wildcard or public one loudly. <c>off</c> disables. Anything else —
+    /// including the default of no configuration at all — auto-resolves.</para>
+    ///
+    /// <para><b>Auto-resolution failing yields null, not an exception.</b> A host with no private IPv4
+    /// has nowhere to put a gateway a container can reach; refusing to start the daemon over that would
+    /// turn a missing OPTIMISATION into an outage, so the gateway is simply absent and every spawn
+    /// behaves as it did before.</para>
+    /// </summary>
+    internal static string? ResolveBindAddress(string? configured)
+    {
+        var value = configured?.Trim();
+        if (string.Equals(value, DisabledBind, StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrEmpty(value) && !string.Equals(value, AutoBind, StringComparison.OrdinalIgnoreCase))
+        {
+            return value;
+        }
+
+        return Gateway.GatewayBindPolicy.TryResolvePrivateHostAddress();
+    }
 
     /// <summary>The model-gateway listener port (only used when <see cref="GatewayBindAddress"/> is set).</summary>
     public int GatewayPort { get; init; } = DefaultGatewayPort;
@@ -109,10 +155,14 @@ public sealed record DaemonOptions
                     if (i + 1 >= args.Length)
                     {
                         throw new ArgumentException(
-                            "--gateway-bind requires a private or loopback IP address (never a wildcard).");
+                            "--gateway-bind requires a private or loopback IP address, 'auto', or 'off' "
+                            + "(never a wildcard).");
                     }
 
-                    options = options with { GatewayBindAddress = args[i + 1] };
+                    // Routed through the same resolver as the environment variable so 'auto' and 'off'
+                    // mean the same thing from either source — a flag that silently meant something
+                    // different from the env var would be its own defect.
+                    options = options with { GatewayBindAddress = ResolveBindAddress(args[i + 1]) };
                     i++;
                     break;
                 case "--gateway-port":

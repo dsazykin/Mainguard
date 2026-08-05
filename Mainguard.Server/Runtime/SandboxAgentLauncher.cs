@@ -208,11 +208,13 @@ public sealed class SandboxAgentLauncher
 
             // MG-4: mint this agent's gateway confinement — a Mainguard session token for the jail, the
             // real provider key kept daemon-side, and the agent's UPSTREAM BINDING recorded so the
-            // gateway knows which provider to forward its traffic to. Null when the gateway is disabled
-            // (the default) or the CLI cannot be redirected, and BuildSecrets then keeps today's
-            // behaviour exactly. This argument is what was missing: without it the confinement machinery
-            // below was complete but never invoked, so every BYOK jail received the raw provider key.
-            var confinement = TryConfineToGateway(agentId, modelApiKey, adapter);
+            // gateway knows which provider to forward its traffic to. Null when the gateway is disabled,
+            // when the CLI cannot be redirected, or when the proxy cannot reach the gateway — and
+            // BuildSecrets then keeps the pre-gateway behaviour exactly. This argument is what was
+            // missing in #298: without it the confinement machinery below was complete but never
+            // invoked, so every BYOK jail received the raw provider key.
+            var confinement = await TryConfineToGatewayAsync(agentId, modelApiKey, adapter, ct)
+                .ConfigureAwait(false);
             var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement);
             var handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
@@ -333,16 +335,18 @@ public sealed class SandboxAgentLauncher
     /// <para>ALL of the following must hold, and each null return is a deliberate refusal rather than a
     /// degradation:</para>
     /// <list type="bullet">
-    ///   <item>the daemon actually bound a gateway (<c>--gateway-bind</c>) — otherwise the CLI would be
-    ///   pointed at nothing and a working BYOK agent would break;</item>
+    ///   <item>the daemon actually bound a gateway (on by default; <c>--gateway-bind off</c> disables)
+    ///   — otherwise the CLI would be pointed at nothing and a working BYOK agent would break;</item>
+    ///   <item>that gateway is REACHABLE from this jail's egress proxy, measured rather than assumed —
+    ///   the jail's segment is <c>Internal</c>, so the proxy is its only route to the daemon;</item>
     ///   <item>a provider key was supplied — an interactive-login (OAuth) agent has no key to confine,
     ///   holds no credential worth stealing, and must keep its direct route untouched;</item>
     ///   <item>the CLI declares BOTH a base-URL variable (it can be redirected) and a model host (we know
     ///   where to forward) — a CLI missing either cannot be fronted without breaking it.</item>
     /// </list>
     /// </summary>
-    private GatewayConfinement? TryConfineToGateway(
-        string agentId, string? modelApiKey, InstalledAdapterMarker? adapter)
+    private async Task<GatewayConfinement?> TryConfineToGatewayAsync(
+        string agentId, string? modelApiKey, InstalledAdapterMarker? adapter, CancellationToken ct)
     {
         if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
         {
@@ -356,6 +360,23 @@ public sealed class SandboxAgentLauncher
             return null;
         }
 
+        // The gateway must be REACHABLE from this jail's egress proxy before we point the CLI at it.
+        // A confined jail has no other route (its segment is Internal), so confining against an
+        // address the proxy cannot dial does not degrade the agent, it breaks it — and the failure is a
+        // proxy error that reads like a provider outage. Refusing here falls back to the exact
+        // behaviour the agent had before the gateway existed, which works. This is what makes it safe
+        // to have the gateway enabled without the operator having verified the address by hand.
+        var endpoint = GatewayEndpointOf(gateway.BaseUrl!);
+        if (!await _environment.Egress.CanProxyReachAsync(endpoint, ct).ConfigureAwait(false))
+        {
+            _log.LogWarning(
+                "gateway confinement SKIPPED: agent={Agent} endpoint={Endpoint} is not reachable from the "
+                + "egress proxy, so the jail keeps its direct provider route (and its own key). MG-4 is "
+                + "not in effect for this agent.",
+                agentId, endpoint);
+            return null;
+        }
+
         // The one lookup that answers BOTH "who is calling" and "where does it go": the token the jail
         // receives resolves, gateway-side, to this agent id, its budget, and this upstream host.
         var token = _credentials.Issue(agentId, modelApiKey, upstreamHost);
@@ -364,6 +385,10 @@ public sealed class SandboxAgentLauncher
             agentId, upstreamHost, adapter.BaseUrlEnvVar);
         return new GatewayConfinement(gateway.BaseUrl!, token);
     }
+
+    /// <summary>The <c>host:port</c> inside a gateway base URL — the shape the egress probe wants.</summary>
+    internal static string GatewayEndpointOf(string baseUrl) =>
+        Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) ? $"{uri.Host}:{uri.Port}" : baseUrl;
 
     /// <summary>
     /// The credential env-file entries (P2-01), written to the agent-owned 0400 tmpfs — never
