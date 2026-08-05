@@ -1012,14 +1012,18 @@
   does NOT leak onto the mutually-authenticated gRPC control port**),
   `Agents/GatewayConfinementDockerTests.cs` (**MG-4 end to end against REAL containers
   (`[RequiresDockerFact]`) — the layer the in-process gateway tests structurally cannot reach. The model
-  request is issued FROM INSIDE a real hardened jail, sourced from the same `/run/secrets/agent.env` the
-  CLI sources and routed through the container's own `HTTP_PROXY`, so nothing about its shape is
+  request is issued FROM INSIDE a real hardened jail, sourced from the same
+  `CredTmpfsSpec.DefaultCredentialPath` the CLI sources (spelled through the constant — a stale copy of
+  the path would make `. <path>` yield an empty environment SILENTLY) and routed through the container's
+  own `HTTP_PROXY`, so nothing about its shape is
   constructed by the test. That is what exposed the defect the change fixes: a confined request reaches
   tinyproxy naming the GATEWAY as its destination, and the default-deny filter had no entry for the
   daemon's own address, so Mainguard's own proxy answered 403 — switching the gateway on would have
   BROKEN every BYOK agent rather than metering it. Five legs: the traffic transits the gateway and the
   ledger is charged 41 tokens; the provider key is absent from the container spec, the credential tmpfs
-  AND the agent's effective environment; a second call over a 1-token cap is refused 402 with nothing
+  AND the agent's effective environment — the tmpfs sweep runs as BOTH owner uids, because each secret
+  now lives in its owner's own `0700` directory and a sweep as the agent alone would silently stop
+  covering the supervisor's; a second call over a 1-token cap is refused 402 with nothing
   reaching the provider; an OAuth agent is unconfined with its login restored and its provider host still
   carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
   it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key

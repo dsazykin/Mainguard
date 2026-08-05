@@ -31,7 +31,8 @@ namespace Mainguard.Server.Tests.Agents;
 /// shape a confined jail cannot produce. This suite is the answer to the same question one layer out:
 /// the request is issued <i>from inside a real hardened jail</i>, through the container's own
 /// <c>HTTP_PROXY</c>, carrying the token and base URL that the real spawn path wrote into
-/// <c>/run/secrets/agent.env</c>. Nothing about the request is constructed by the test.</para>
+/// <see cref="CredTmpfsSpec.DefaultCredentialPath"/>. Nothing about the request is constructed by
+/// the test.</para>
 ///
 /// <para>That immediately found the defect this change fixes. The jail's proxy env points at tinyproxy
 /// and <c>NO_PROXY</c> covers only loopback plus the internal git proxy, so a confined request reaches
@@ -50,6 +51,13 @@ namespace Mainguard.Server.Tests.Agents;
 [Collection(DockerSuiteCollection.Name)]
 public sealed class GatewayConfinementDockerTests
 {
+    /// <summary>The in-jail credential file, spelled through the constant. Secrets live in their
+    /// OWNER'S own 0700 directory (a non-root User plus no-new-privileges leaves even a uid-0 exec with
+    /// no CAP_CHOWN, so a secret has to be created by its owner rather than chowned to it), and a
+    /// hand-written path here would go on sourcing a file the spec no longer creates — silently,
+    /// because `. &lt;path&gt;` in these scripts simply yields an empty environment.</summary>
+    private const string CredentialPath = CredTmpfsSpec.DefaultCredentialPath;
+
     /// <summary>The BYOK key the user supplied. It must never appear inside a container.</summary>
     private const string RealKey = "sk-ant-REAL-PROVIDER-KEY-DO-NOT-LEAK";
 
@@ -138,14 +146,21 @@ public sealed class GatewayConfinementDockerTests
         // The environment the CLI itself runs with, after the wrapper sources the env file — the last
         // place the key could survive.
         var effective = await world.ExecAsync(
-            jail, "set -a; . /run/secrets/agent.env; set +a; env");
+            jail, "set -a; . " + CredentialPath + "; set +a; env");
         Assert.DoesNotContain(RealKey, effective, StringComparison.Ordinal);
         Assert.Contains("mg_sess_", effective, StringComparison.Ordinal);
 
-        // A grep of the whole writable credential mount, in case a future change writes the key to a
-        // sibling file rather than the env file.
-        var swept = await world.ExecAsync(jail, "grep -rl 'sk-ant-REAL' /run/secrets 2>/dev/null; echo SWEPT");
-        Assert.Equal("SWEPT", swept.Trim());
+        // A grep of the whole credential tmpfs, in case a future change writes the key to a sibling
+        // file rather than the env file. Each secret now lives in its OWNER'S own 0700 directory, so
+        // the agent uid can only see its own — sweeping as the agent would silently narrow the search
+        // this assertion exists to widen. Swept from BOTH owners instead, so the supervisor's
+        // directory is covered too.
+        foreach (var uid in new[] { 1000, 1001 })
+        {
+            var swept = await world.ExecAsync(
+                jail, "grep -rl 'sk-ant-REAL' " + CredTmpfsSpec.SecretsRoot + " 2>/dev/null; echo SWEPT", asUid: uid);
+            Assert.Equal("SWEPT", swept.Trim());
+        }
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -273,7 +288,7 @@ public sealed class GatewayConfinementDockerTests
             Assert.NotNull(launch);
 
             var exec = await environment.Sandboxes.ExecAsync(
-                launch!.ContainerId, new[] { "sh", "-c", "cat /run/secrets/agent.env" }, CancellationToken.None);
+                launch!.ContainerId, new[] { "sh", "-c", "cat " + CredentialPath }, CancellationToken.None);
             var secrets = exec.Stdout ?? string.Empty;
 
             // Fell back to exactly the pre-gateway behaviour: the real key, and no redirection.
@@ -465,20 +480,38 @@ public sealed class GatewayConfinementDockerTests
             return new Jail(agentId, launch.ContainerId);
         }
 
-        public Task<string> ReadSecretsFileAsync(Jail jail) => ExecAsync(jail, "cat /run/secrets/agent.env");
+        public Task<string> ReadSecretsFileAsync(Jail jail) => ExecAsync(jail, "cat " + CredentialPath);
 
-        /// <summary>Runs a shell line inside the jail, as the agent uid, with the container's own env.</summary>
-        public async Task<string> ExecAsync(Jail jail, string script)
+        /// <summary>Runs a shell line inside the jail, as the agent uid by default, with the container's
+        /// own env. <paramref name="asUid"/> overrides the identity for the assertions that must look at
+        /// a directory the agent deliberately cannot open.</summary>
+        public async Task<string> ExecAsync(Jail jail, string script, int? asUid = null)
         {
-            var environment = Daemon.Services.GetRequiredService<IAgentEnvironment>();
-            var result = await environment.Sandboxes.ExecAsync(
-                jail.ContainerId, new[] { "sh", "-c", script }, CancellationToken.None);
-            return result.Stdout ?? string.Empty;
+            if (asUid is null)
+            {
+                var environment = Daemon.Services.GetRequiredService<IAgentEnvironment>();
+                var result = await environment.Sandboxes.ExecAsync(
+                    jail.ContainerId, new[] { "sh", "-c", script }, CancellationToken.None);
+                return result.Stdout ?? string.Empty;
+            }
+
+            var exec = await Docker.Exec.ExecCreateContainerAsync(jail.ContainerId, new ContainerExecCreateParameters
+            {
+                User = asUid.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                AttachStdout = true,
+                AttachStderr = true,
+                Cmd = new List<string> { "sh", "-c", script },
+            }, CancellationToken.None);
+
+            using var stream = await Docker.Exec.StartAndAttachContainerExecAsync(
+                exec.ID, tty: false, CancellationToken.None);
+            var (stdout, _) = await stream.ReadOutputToEndAsync(CancellationToken.None);
+            return stdout ?? string.Empty;
         }
 
         /// <summary>The confined CLI's request, sourced and routed exactly as the CLI would.</summary>
         public Task<string> CurlFromJailAsync(Jail jail, string curl) =>
-            ExecAsync(jail, "set -a; . /run/secrets/agent.env; set +a; " + curl);
+            ExecAsync(jail, "set -a; . " + CredentialPath + "; set +a; " + curl);
 
         public Task<string> PostFromJailAsync(Jail jail) => CurlFromJailAsync(
             jail,
