@@ -41,8 +41,10 @@ internal static class TestDaemonHost
     /// Starts a daemon from <paramref name="template"/> with a freshly leased control port (and, when the
     /// gateway is enabled, a freshly leased gateway port), retrying on address-in-use.
     /// </summary>
-    public static Task<RunningDaemon> StartAsync(DaemonOptions template, CancellationToken ct = default)
-        => StartAsync(template, TestPorts.Lease, ct);
+    public static Task<RunningDaemon> StartAsync(
+        DaemonOptions template, CancellationToken ct = default,
+        Action<IServiceCollection>? configureServices = null)
+        => StartAsync(template, TestPorts.Lease, ct, configureServices);
 
     /// <summary>
     /// The port-source seam. Only the allocator's own tests pass <paramref name="leasePort"/> — it is how
@@ -50,7 +52,8 @@ internal static class TestDaemonHost
     /// succeeds on the next one.
     /// </summary>
     internal static async Task<RunningDaemon> StartAsync(
-        DaemonOptions template, Func<int> leasePort, CancellationToken ct = default)
+        DaemonOptions template, Func<int> leasePort, CancellationToken ct = default,
+        Action<IServiceCollection>? configureServices = null)
     {
         var failures = new List<Exception>();
 
@@ -64,7 +67,7 @@ internal static class TestDaemonHost
 
             try
             {
-                var app = await DaemonHost.StartAsync(options, ct);
+                var app = await DaemonHost.StartAsync(options, ct, configureServices);
                 return new RunningDaemon(app, options, attempt);
             }
             catch (Exception ex) when (TestPorts.IsAddressInUse(ex))

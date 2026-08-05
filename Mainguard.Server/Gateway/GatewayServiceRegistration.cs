@@ -226,8 +226,9 @@ public static class GatewayServiceRegistration
             })));
 
         // The confinement descriptor the spawn path reads. Null base URL ⇒ the gateway is disabled and
-        // BuildSecrets keeps today's behaviour exactly (the raw key goes to the jail), which is what
-        // keeps a daemon started without --gateway-bind byte-identical to before this change.
+        // BuildSecrets keeps the pre-gateway behaviour exactly (the raw key goes to the jail). Since MG-4
+        // item 3 the gateway is ON by default, so this is normally populated; `--gateway-bind off` (or
+        // MAINGUARD_GATEWAY_BIND=off), or a host with no private address, still yields the old posture.
         services.AddSingleton(new GatewayConfinementOptions(
             BaseUrl: BuildGatewayBaseUrl(options),
             Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
@@ -331,9 +332,20 @@ public static class GatewayServiceRegistration
     /// matters is the daemon → provider leg, which the forwarder establishes.</para>
     /// </summary>
     internal static string? BuildGatewayBaseUrl(DaemonOptions? options) =>
+        BuildGatewayUpstream(options) is { } upstream ? "http://" + upstream : null;
+
+    /// <summary>
+    /// The gateway's <c>host:port</c> — the same address as <see cref="BuildGatewayBaseUrl"/> without the
+    /// scheme, which is the shape the egress proxy wants (a tinyproxy filter matches a destination host,
+    /// and an <c>upstream</c> directive names a <c>host:port</c>). Derived from the ONE place the bind is
+    /// configured so the address the jail is pointed at and the address the proxy is told to permit cannot
+    /// drift apart; a drift there would be invisible until a confined agent silently lost its egress.
+    /// Null when the gateway is disabled.
+    /// </summary>
+    public static string? BuildGatewayUpstream(DaemonOptions? options) =>
         options is null || string.IsNullOrWhiteSpace(options.GatewayBindAddress)
             ? null
-            : $"http://{options.GatewayBindAddress}:{options.GatewayPort}";
+            : $"{options.GatewayBindAddress}:{options.GatewayPort}";
 
     /// <summary>
     /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's

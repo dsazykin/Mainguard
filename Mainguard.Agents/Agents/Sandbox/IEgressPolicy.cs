@@ -66,6 +66,25 @@ public interface IEgressPolicy
         Task.FromResult(new AgentSegment(NetworkName, null));
 
     /// <summary>
+    /// MG-4 — can the egress proxy actually open a TCP connection to <paramref name="hostPort"/>?
+    ///
+    /// <para>This is the precondition for confining a BYOK agent, and it is checked rather than assumed
+    /// because getting it wrong is not a degradation, it is an outage. A confined CLI is pointed at the
+    /// daemon's model gateway and reaches it <b>through the proxy</b> (its own segment is
+    /// <c>Internal=true</c>, so it has no other route). If the daemon bound an address the proxy cannot
+    /// dial — a private address on an interface containers do not route to — every model call from that
+    /// jail fails, and it fails as a proxy error that is indistinguishable from a provider outage. The
+    /// caller's contract is therefore: <b>false ⇒ do not confine</b>, i.e. fall back to the behaviour
+    /// the agent had before the gateway existed, which works.</para>
+    ///
+    /// <para>The DEFAULT returns true, for the substrate-less test doubles of this seam: they never run
+    /// with a gateway configured, so the probe is never consulted on that path. The shipped
+    /// <see cref="EgressProxyConfigurator"/> performs a real connect from inside the proxy container.</para>
+    /// </summary>
+    /// <param name="hostPort">The gateway's <c>host:port</c>.</param>
+    Task<bool> CanProxyReachAsync(string hostPort, CancellationToken ct = default) => Task.FromResult(true);
+
+    /// <summary>
     /// MG-36 — best-effort teardown of one agent's segment once its jail is gone: detach the proxy and
     /// remove the network, so Docker's finite bridge-address pool is not consumed by dead agents. Never
     /// throws (a stop must not fail because a network lingered); a segment that still has a live

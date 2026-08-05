@@ -589,8 +589,12 @@
 
         <!-- Shell-level toasts (MainWindowViewModel.Toasts): window-wide, non-blocking,
              auto-dismissing — today the daemon auto-update outcome. Bottom-right, above content
-             but below the command-palette scrim. -->
-        <ItemsControl ItemsSource="{Binding Toasts}" ZIndex="500"
+             but below the command-palette scrim.
+             Grid.Row="1" is LOAD-BEARING: without it this lands in row 0 — the Auto-sized custom
+             title bar — where VerticalAlignment="Bottom" anchors to the bottom of the TITLE BAR
+             (i.e. the top of the window) and grows that row to fit. That was the top-right
+             regression; MainWindowShellRenderHarness.ShellToasts_* pin the geometry. -->
+        <ItemsControl Grid.Row="1" ItemsSource="{Binding Toasts}" ZIndex="500"
                       HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="20">
             <ItemsControl.ItemsPanel>
                 <ItemsPanelTemplate>

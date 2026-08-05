@@ -134,8 +134,13 @@ public static class DaemonHost
         // provisioner/worktree manager, and the P2-07 spawn path obtains the hardened sandbox engine +
         // default-deny egress policy, from it. WSL2 for now. (The A6 DaemonGitProxy is constructed
         // per-repo from its allowlisted prefixes when the sandbox spawn path wires it in.)
+        // MG-4: the substrate is told the gateway address the daemon actually bound, so the egress proxy
+        // PERMITS it. Without that entry a confined jail is pointed at an endpoint Mainguard's own
+        // default-deny filter refuses — the confinement would break the agent instead of metering it.
         builder.Services.AddSingleton<IAgentEnvironment>(sp =>
-            new Wsl2AgentEnvironment(auditLog: sp.GetRequiredService<IAuditLog>()));
+            new Wsl2AgentEnvironment(
+                auditLog: sp.GetRequiredService<IAuditLog>(),
+                gatewayEndpoint: Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
 
         // P2-47 #8: the real sandboxed-spawn chain behind AgentService.SpawnAgent (provision worktree →
         // ensure default-deny egress → start hardened jail). Kept out of the gRPC class (validation+dispatch
@@ -369,12 +374,26 @@ public static class DaemonHost
     /// <see cref="DaemonOptions.Port"/>. Never binds a wildcard / non-loopback
     /// address (invariant 2).
     /// </summary>
-    public static WebApplication Build(DaemonOptions options)
+    /// <param name="configureServices">
+    /// An optional last word on the service collection, applied AFTER the daemon has registered
+    /// everything (so a later <c>AddSingleton</c> wins) and BEFORE the container is built.
+    ///
+    /// <para>Null in every production path — this changes nothing for a daemon started by the installer,
+    /// the systemd unit, or the dev loop. It exists because the model gateway can only be exercised
+    /// end to end against a REAL Kestrel listener (<c>WebApplicationFactory</c> swaps in a
+    /// <c>TestServer</c>, so a jail has nothing to connect to), and the one thing such a test cannot use
+    /// verbatim is the forwarder's upstream leg: <see cref="Gateway.ModelProxyMiddleware"/> always dials
+    /// <c>https://&lt;bound upstream&gt;</c>, i.e. the live provider. Overriding the upstream transport is
+    /// what lets the test drive the whole real path — real jail, real proxy, real middleware, real
+    /// ledger — while stopping at the network boundary instead of billing a real key.</para>
+    /// </param>
+    public static WebApplication Build(DaemonOptions options, Action<IServiceCollection>? configureServices = null)
     {
         var builder = WebApplication.CreateBuilder();
 
         // Services first: the session mTLS material must exist before the listener that presents it.
         var certificates = ConfigureServices(builder, options);
+        configureServices?.Invoke(builder.Services);
 
         builder.WebHost.ConfigureKestrel(kestrel =>
         {
@@ -498,9 +517,13 @@ public static class DaemonHost
     /// Starts a real daemon host, mapping a bind failure (port already in use) to a
     /// typed <see cref="DaemonStartupException"/> naming the port.
     /// </summary>
-    public static async Task<WebApplication> StartAsync(DaemonOptions options, CancellationToken ct = default)
+    /// <param name="configureServices">See <see cref="Build(DaemonOptions, Action{IServiceCollection})"/> —
+    /// null on every production path.</param>
+    public static async Task<WebApplication> StartAsync(
+        DaemonOptions options, CancellationToken ct = default,
+        Action<IServiceCollection>? configureServices = null)
     {
-        var app = Build(options);
+        var app = Build(options, configureServices);
         try
         {
             await app.StartAsync(ct);

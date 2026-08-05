@@ -76,7 +76,26 @@ public sealed class InstalledAdapterCatalog
     {
     }
 
-    public InstalledAdapterCatalog(string registryDir) => _registryDir = registryDir;
+    public InstalledAdapterCatalog(string registryDir)
+    {
+        _registryDir = registryDir;
+        // The adapters ROOT is the registry's parent, because that is the layout the installer creates
+        // (`<root>/registry/<id>.json` beside `<root>/bin`). Derived rather than hardcoded so the root
+        // and the registry cannot disagree: the spawn path bind-mounts this root read-only into every
+        // jail, and it used to mount AdapterPaths.VmRoot unconditionally — so a catalog pointed anywhere
+        // else described CLIs that lived at one path while the jail was handed another. That is only
+        // ever a silent mismatch in production (the default puts both at VmRoot); it becomes a hard
+        // container-create failure the moment the two differ.
+        Root = Path.GetDirectoryName(registryDir.TrimEnd('/', '\\')) is { Length: > 0 } parent
+            ? parent
+            : registryDir;
+    }
+
+    /// <summary>
+    /// The adapters root this catalog's CLIs are installed under — the directory the spawn path
+    /// bind-mounts READ-ONLY into every jail at <see cref="AdapterPaths.SandboxMount"/>.
+    /// </summary>
+    public string Root { get; }
 
     /// <summary>All currently installed agent adapters (empty when none / dir absent).</summary>
     public IReadOnlyList<InstalledAdapterMarker> List()
