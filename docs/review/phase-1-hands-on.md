@@ -41,8 +41,8 @@ Two different shells appear below and they are not interchangeable:
 path, because that is what the app hashes and provisions:
 
 ```powershell
-mkdir $HOME\mg-testrepo
-cd $HOME\mg-testrepo
+mkdir .\mg-testrepo
+cd .\mg-testrepo
 git init
 "def add(a,b):`n    return a+b" | Set-Content calc.py
 "import calc`ndef test_add(): assert calc.add(2,2)==4" | Set-Content test_calc.py
@@ -65,18 +65,22 @@ per-agent repo     /home/mainguard/mainguard/agents/<repoHash>/<agentId>
 agent branches     refs/heads/agent/*
 ```
 
-**Find your repo's hash** (it is the SHA-256 of the normalized Windows path — do not compute it, read
-it off the daemon):
+**Find your repo's hash.** It is the SHA-256 of the normalized Windows path — don't compute it, and
+don't try to pick it out of a bare `ls` (you get a multi-column list of 64-char names with nothing to
+tell them apart). Ask each mirror which repo it is:
 
 ```powershell
-wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 200 | Select-String 'repo=' | Select-Object -Last 1
+wsl -d MainguardEnv -u root -- bash -c 'for g in /home/mainguard/mainguard/repos/*.git; do h=$(basename "$g" .git); printf "%s  %s\n" "$h" "$(git --git-dir="$g" config --get remote.origin.url)"; done'
 ```
 
-Or just list them newest-first:
+Output looks like:
 
-```powershell
-wsl -d MainguardEnv -u root -- ls -t /home/mainguard/mainguard/repos
 ```
+1deb19131adb…  /mnt/c/Users/yikes/Code/mg-testrepo
+f0fa0539692f…  /mnt/c/Users/yikes/Code/GitLoom
+```
+
+Pick the line matching your scratch repo.
 
 Set it once for the commands below:
 
