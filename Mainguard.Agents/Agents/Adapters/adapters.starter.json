@@ -72,9 +72,34 @@
     "or the override file itself signed by the app — neither is done here, so do not describe adapter",
     "installs as provenance-verified end to end; describe the UPDATE PATH as provenance-verified.",
     "",
-    "(If a future CLI genuinely cannot install script-free — e.g. it fetches a platform binary in a",
-    "postinstall — do NOT drop the flag for everyone. That CLI needs its payload vendored, or an",
-    "explicit per-adapter opt-out with its own review.)",
+    "platformBinary EXISTS BECAUSE THAT CASE ARRIVED. claude-code and opencode publish an npm package",
+    "that is only a LAUNCHER: the real ~300MB executable ships in a platform-specific subpackage, and a",
+    "postinstall hardlinks it over a placeholder in the launcher's bin/. Script-free, that postinstall",
+    "never runs, so the placeholder survives — and the placeholder is a stub that prints 'native binary",
+    "not installed' and EXITS 1. The health probe then fails on a perfectly good install. (Owner-reported",
+    "against the update path, but it was never update-specific: a fresh pinned install failed identically",
+    "from the day --ignore-scripts landed. It only surfaced on update because the update was the first",
+    "thing to re-run the install since; the pre-flag install marker had been reporting green ever since.)",
+    "",
+    "The flag was NOT dropped, and the payload was not vendored (300MB through the base64 staging path is",
+    "not a thing). Instead Mainguard performs the same FILE OPERATION itself, declared here and executed",
+    "by AdapterChannel: hardlink <sources[n]> over <target>, both relative to the adapters prefix, running",
+    "NOTHING the vendor shipped. The subpackage is already on disk — --ignore-scripts suppresses lifecycle",
+    "hooks, never dependency resolution, so npm fetched it as an exact-versioned optionalDependency during",
+    "the same install. sources is ORDERED and each candidate is validated by the real health probe, first",
+    "one that runs wins: that is the vendors' own algorithm (see opencode's postinstall.mjs) and it covers",
+    "the AVX2-vs-baseline and glibc-vs-musl variants without Mainguard reimplementing CPU detection that",
+    "would silently mis-select the day a vendor changed it. The paths carry no version, so an update to a",
+    "newer release needs no manifest edit.",
+    "",
+    "THIRD RESIDUAL GAP, and the one platformBinary makes concrete: for these two CLIs the sha256 pin and",
+    "the provenance rung cover the LAUNCHER tarball, while the bytes that actually EXECUTE come from the",
+    "platform subpackage — resolved live by npm, unpinned and unhashed, exactly like the rest of the",
+    "dependency closure described above. This is not a regression (that subpackage has always been what",
+    "ran; before the flag, the vendor's own postinstall placed it), but do not read 'sha256-pinned' as",
+    "covering the executable for claude-code or opencode. Closing it means pinning the subpackage's npm",
+    "integrity per platform and verifying it in-VM before the link — real work this format does not",
+    "express yet, and it needs the UPDATE path to resolve the new subpackage's signed integrity too.",
     "",
     "apiKeyEnvVar names the env var the CLI reads its model API key from; the spawn path injects the",
     "user's key under exactly that name (audit fix #13 — a hardcoded ANTHROPIC_API_KEY meant codex never",
@@ -141,6 +166,10 @@
       "sha256": "3a434c8bcb493e9ca87315d9aa6064835c5987e8fbc85c181bb76157dd5c45d8",
       "payloadUrl": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.218.tgz",
       "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "platformBinary": {
+        "sources": ["lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude"],
+        "target": "lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+      },
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/claude", "--version"],
         "expectedVersionSubstring": "2.1.218"
@@ -212,6 +241,13 @@
       "sha256": "6060f03c1c45afcd901a05fdd8eae60b7e82c7113ffa092792be30d6e8117eda",
       "payloadUrl": "https://registry.npmjs.org/opencode-ai/-/opencode-ai-1.18.4.tgz",
       "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+      "platformBinary": {
+        "sources": [
+          "lib/node_modules/opencode-ai/node_modules/opencode-linux-x64/bin/opencode",
+          "lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode"
+        ],
+        "target": "lib/node_modules/opencode-ai/bin/opencode.exe"
+      },
       "healthProbe": {
         "command": ["/home/mainguard/mainguard/adapters/bin/opencode", "--version"],
         "expectedVersionSubstring": "1.18.4"
