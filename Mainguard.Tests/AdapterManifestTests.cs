@@ -263,6 +263,63 @@ public class AdapterManifestTests
     }
 
     [Fact]
+    public void PlatformBinary_WithAnEscapingPath_IsRefused()
+    {
+        // These paths are joined onto the adapters prefix and handed to `ln`/`cp` inside the VM, so a
+        // '..' or an absolute path would write outside the prefix. Refused at parse, like credentialPaths.
+        const string json = """
+        { "adapters": [ { "id": "a", "displayName": "A", "version": "1.0.0",
+          "provenance": "none",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
+          "platformBinary": { "sources": ["../../etc/passwd"], "target": "lib/bin/a" } } ] }
+        """;
+
+        var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(json));
+        Assert.Equal(AdapterManifestError.BadPlatformBinary, ex.Error);
+    }
+
+    [Fact]
+    public void PlatformBinary_WithNoSources_IsRefused()
+    {
+        // An empty candidate list is a declaration that places nothing — it would leave the vendor's
+        // exit-1 stub in place while LOOKING like the case was handled.
+        const string json = """
+        { "adapters": [ { "id": "a", "displayName": "A", "version": "1.0.0",
+          "provenance": "none",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "installCmd": ["true"], "healthProbe": { "command": ["x"], "expectedVersionSubstring": "1" },
+          "platformBinary": { "sources": [], "target": "lib/bin/a" } } ] }
+        """;
+
+        var ex = Assert.Throws<AdapterManifestException>(() => AdapterManifest.Parse(json));
+        Assert.Equal(AdapterManifestError.BadPlatformBinary, ex.Error);
+    }
+
+    [Fact]
+    public void BundledStarterCatalog_LauncherOnlyPackages_DeclareTheirPlatformBinary()
+    {
+        // claude-code and opencode both ship an npm package that is ONLY a launcher: the real
+        // executable is a platform subpackage, placed by a postinstall that --ignore-scripts suppresses,
+        // and the placeholder left behind exits 1. Verified against the pinned tarballs — each contains a
+        // bin/<name>.exe shell stub whose entire body prints "not installed" and exits 1. Without a
+        // platformBinary declaration their health probe can never go green, so this is the guard that
+        // stops a version bump (or a merge) from silently dropping the field and re-breaking both CLIs.
+        var manifest = AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson());
+        foreach (var id in new[] { "claude-code", "opencode" })
+        {
+            var adapter = Assert.Single(manifest.Adapters, a => a.Id == id);
+            Assert.NotNull(adapter.PlatformBinary);
+            Assert.NotEmpty(adapter.PlatformBinary!.Sources);
+
+            // The placed file must be the very thing the launcher's own bin entry points at, or the
+            // probe would still reach the stub.
+            Assert.EndsWith(".exe", adapter.PlatformBinary.Target, System.StringComparison.Ordinal);
+            Assert.StartsWith("lib/node_modules/", adapter.PlatformBinary.Target, System.StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void BundledStarterCatalog_CredentialPaths_AllPassTheHomeRelativeGate()
     {
         // The shipped catalog must never regress the gate its own spawn/harvest paths trust.
