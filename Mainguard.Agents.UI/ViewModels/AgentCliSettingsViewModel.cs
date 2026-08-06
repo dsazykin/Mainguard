@@ -286,7 +286,12 @@ public partial class AgentCliSettingsViewModel : ViewModelBase, ISettingsPage
         catch (Exception ex)
         {
             row.IsFailed = true;
-            row.StatusMessage = $"{row.Id} could not be switched: {ex.Message} The previous pin was kept.";
+            // Reassurance first, cause last. The old order ("… could not be switched: {message} The
+            // previous pin was kept.") put the exception at the front, where a message ending in an
+            // exit code wrapped into "exited\n1. The previous pin was kept." — the "1." reading as a
+            // numbered-list item. Ending on the cause also means the part worth reading is not the part
+            // that gets truncated.
+            row.StatusMessage = $"{row.Id} could not be switched — the previous pin was kept. {ex.Message}";
         }
         finally
         {

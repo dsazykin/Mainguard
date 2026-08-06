@@ -480,6 +480,221 @@ public class AdapterChannelTests
         Assert.True(bundled.IsAuthoritativeLocal);
     }
 
+    // ---- launcher-only packages: placing the platform executable a script-free install leaves ----
+
+    private const string VmRoot = "/home/mainguard/mainguard/adapters";
+
+    private static string ManifestWithPlatformBinary(string version, string sha, params string[] sources) => $$"""
+    {
+      "adapters": [
+        {
+          "id": "claude-code",
+          "displayName": "Claude Code",
+          "version": "{{version}}",
+          "provenance": "npm-registry-signature",
+          "sha256": "{{sha}}",
+          "payloadUrl": "https://registry.npmjs.org/pkg/-/pkg-{{version}}.tgz",
+          "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
+          "platformBinary": {
+            "sources": {{System.Text.Json.JsonSerializer.Serialize(sources)}},
+            "target": "lib/node_modules/pkg/bin/claude.exe"
+          },
+          "healthProbe": { "command": ["/home/mainguard/mainguard/adapters/bin/claude", "--version"], "expectedVersionSubstring": "{{version}}" },
+          "launch": ["/opt/mainguard/adapters/bin/claude"]
+        }
+      ]
+    }
+    """;
+
+    /// <summary>
+    /// A VM that behaves the way the real one does for a launcher-only npm package, verified against
+    /// MainguardEnv: <c>npm install --ignore-scripts</c> lands the launcher AND the platform
+    /// subpackages (optional dependencies are resolved; only the lifecycle hooks are suppressed), but
+    /// the launcher's <c>bin/*.exe</c> is left as the vendor's stub — a shell script whose whole body
+    /// prints "native binary not installed" and exits 1. The probe follows <c>bin/claude</c> to
+    /// whatever that file currently is, so it only reports a version once something has been placed
+    /// over the stub.
+    /// </summary>
+    private sealed class LauncherPackageHost : IAdapterInstallHost
+    {
+        /// <summary>Verbatim from @anthropic-ai/claude-code 2.1.223's bin/claude.exe.</summary>
+        public const string StubStderr =
+            "Error: claude native binary not installed.\n\n"
+            + "Either postinstall did not run (--ignore-scripts, some pnpm configs)\n"
+            + "or the platform-native optional dependency was not downloaded\n(--omit=optional).";
+
+        private readonly string _version;
+
+        /// <summary>Candidate path (prefix-relative) → the version that candidate's binary reports.
+        /// A candidate ABSENT from this map is one npm did not install for this os/cpu.</summary>
+        private readonly Dictionary<string, string> _available;
+
+        public LauncherPackageHost(string version, Dictionary<string, string> available)
+        {
+            _version = version;
+            _available = available;
+        }
+
+        private const string Target = "lib/node_modules/pkg/bin/claude.exe";
+
+        /// <summary>What bin/claude currently resolves to: null before install, "stub" after a
+        /// script-free install, otherwise the prefix-relative candidate that was placed over it.</summary>
+        public string? Placed { get; private set; }
+
+        public readonly List<IReadOnlyList<string>> Commands = new();
+
+        public Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
+        {
+            Commands.Add(command);
+
+            if (command[0] == $"{VmRoot}/bin/claude")
+            {
+                if (Placed is null)
+                    return Task.FromResult(new AdapterCommandResult(127, "", "no such file"));
+                if (Placed == "stub")
+                    return Task.FromResult(new AdapterCommandResult(1, "", StubStderr));
+                return Task.FromResult(new AdapterCommandResult(0, $"{_available[Placed]} (Claude Code)", ""));
+            }
+
+            if (command[0] == "npm")
+            {
+                Placed = "stub"; // the placeholder the suppressed postinstall would have replaced
+                return Task.FromResult(new AdapterCommandResult(0, "", ""));
+            }
+
+            if (command[0] is "ln" or "cp")
+            {
+                var source = command[^2][(VmRoot.Length + 1)..];
+                var target = command[^1];
+                Assert.Equal($"{VmRoot}/{Target}", target);
+                if (!_available.ContainsKey(source))
+                {
+                    return Task.FromResult(new AdapterCommandResult(
+                        1, "", $"{command[0]}: cannot stat '{command[^2]}': No such file or directory"));
+                }
+
+                Placed = source;
+                return Task.FromResult(new AdapterCommandResult(0, "", ""));
+            }
+
+            if (command[0] == "chmod")
+                return Task.FromResult(new AdapterCommandResult(0, "", ""));
+
+            throw new InvalidOperationException($"unexpected command: {string.Join(' ', command)}");
+        }
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct)
+        {
+            Shims[path] = content;
+            return Task.CompletedTask;
+        }
+
+        public readonly Dictionary<string, string> Shims = new();
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+            => Task.FromResult($"{VmRoot}/stage/{fileName}");
+    }
+
+    [Fact]
+    public async Task Ensure_ShouldPlaceThePlatformBinary_WhenAScriptFreeInstallLeavesTheVendorStub()
+    {
+        // The owner-reported failure, reproduced in MainguardEnv before this fix: the install succeeds,
+        // the platform subpackage is on disk, and the probe still exits 1 because bin/claude resolves to
+        // the vendor's placeholder. Placing the subpackage's binary over it — the file operation the
+        // suppressed postinstall would have done — is what makes the probe green.
+        const string source = "lib/node_modules/pkg/node_modules/@anthropic-ai/claude-code-linux-x64/claude";
+        var manifest = ManifestWithPlatformBinary("2.1.223", ShaOf(PayloadVx), source);
+        var host = new LauncherPackageHost("2.1.223", new() { [source] = "2.1.223" });
+        var channel = new AdapterChannel(
+            new FakeSource { PayloadToServe = PayloadVx }, host, new FakeCache(manifest));
+
+        var result = await channel.EnsureAsync("claude-code");
+
+        Assert.Equal(AdapterEnsureResult.Installed, result);
+        Assert.Equal(source, host.Placed);
+
+        // Placed by hardlink, not copy: these binaries are ~300 MB and both paths sit under one prefix.
+        Assert.Contains(host.Commands, c => c.SequenceEqual(
+            new[] { "ln", "-f", $"{VmRoot}/{source}", $"{VmRoot}/lib/node_modules/pkg/bin/claude.exe" }));
+
+        // The marker means "runnable", so it must only exist because the probe really went green.
+        Assert.Contains(host.Shims, s => s.Key.EndsWith("registry/claude-code.json", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Ensure_ShouldTryPlatformBinaryCandidatesInOrder_AndKeepTheFirstThatRuns()
+    {
+        // Vendors publish several builds per platform (AVX2 vs baseline, glibc vs musl) and npm installs
+        // every variant matching os/cpu. Rather than reimplement each vendor's CPU detection, each
+        // candidate is placed and validated by the REAL probe. Here the first is not on disk at all.
+        const string missing = "lib/node_modules/pkg/node_modules/opencode-linux-x64/bin/opencode";
+        const string present = "lib/node_modules/pkg/node_modules/opencode-linux-x64-baseline/bin/opencode";
+        var manifest = ManifestWithPlatformBinary("2.1.223", ShaOf(PayloadVx), missing, present);
+        var host = new LauncherPackageHost("2.1.223", new() { [present] = "2.1.223" });
+        var channel = new AdapterChannel(
+            new FakeSource { PayloadToServe = PayloadVx }, host, new FakeCache(manifest));
+
+        var result = await channel.EnsureAsync("claude-code");
+
+        Assert.Equal(AdapterEnsureResult.Installed, result);
+        Assert.Equal(present, host.Placed);
+        Assert.Contains(host.Commands, c => c[0] == "ln" && c.Contains($"{VmRoot}/{missing}")); // it really tried
+    }
+
+    [Fact]
+    public async Task Ensure_ShouldFailAsAnInstall_WhenNoPlatformBinaryCandidateIsOnDisk()
+    {
+        // Nothing could be placed, so the CLI has no executable at all. That is an INSTALL failure, not
+        // a probe failure, and saying so is what tells a reader the subpackage never arrived rather
+        // than that the binary ran and misbehaved.
+        const string source = "lib/node_modules/pkg/node_modules/@anthropic-ai/claude-code-linux-x64/claude";
+        var manifest = ManifestWithPlatformBinary("2.1.223", ShaOf(PayloadVx), source);
+        var host = new LauncherPackageHost("2.1.223", new());
+        var channel = new AdapterChannel(
+            new FakeSource { PayloadToServe = PayloadVx }, host, new FakeCache(manifest));
+
+        var ex = await Assert.ThrowsAsync<AdapterChannelException>(() => channel.EnsureAsync("claude-code"));
+
+        Assert.Equal(AdapterChannelError.InstallFailed, ex.Error);
+        Assert.Contains(source, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("registry/", string.Join("|", host.Shims.Keys), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Ensure_ProbeFailure_ShouldCarryTheProbesOwnStderr_NotOnlyAnExitCode()
+    {
+        // "health probe exited 1" names a symptom and no cause; the stub's own words name the bug
+        // outright. The UI shows this string verbatim, so the cause has to be IN it.
+        var manifest = ManifestWithPlatformBinary("2.1.223", ShaOf(PayloadVx),
+            "lib/node_modules/pkg/node_modules/absent/claude");
+        var host = new StubOnlyHost();
+        var channel = new AdapterChannel(
+            new FakeSource { PayloadToServe = PayloadVx }, host, new FakeCache(manifest));
+
+        var ex = await Assert.ThrowsAsync<AdapterChannelException>(() => channel.EnsureAsync("claude-code"));
+
+        Assert.Equal(AdapterChannelError.ProbeFailed, ex.Error);
+        Assert.Contains("native binary not installed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("--ignore-scripts", ex.Message, StringComparison.Ordinal);
+        // Collapsed to one line: a wrapped "exited\n1." rendered the exit code as a list item.
+        Assert.DoesNotContain('\n', ex.Message);
+    }
+
+    /// <summary>A VM where the placement SUCCEEDS but the placed binary still refuses to run (a wrong
+    /// CPU variant, a truncated download) — so the probe, not the placement, is what reports the cause.</summary>
+    private sealed class StubOnlyHost : IAdapterInstallHost
+    {
+        public Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
+            => Task.FromResult(command[0] == $"{VmRoot}/bin/claude"
+                ? new AdapterCommandResult(1, "", LauncherPackageHost.StubStderr)
+                : new AdapterCommandResult(0, "", ""));
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+            => Task.FromResult($"{VmRoot}/stage/{fileName}");
+    }
+
     // ---- MG-9: the --ignore-scripts poison canary ----------------------------------------------
 
     [Fact]
@@ -557,10 +772,19 @@ public class AdapterChannelTests
                     : new AdapterCommandResult(1, "", "not installed"));
             }
 
-            if (!command.Contains("--ignore-scripts"))
-                PostinstallRan = true;
+            // Only the PACKAGE-MANAGER invocation can run lifecycle scripts. The install path also
+            // issues plain file commands (ln/cp/chmod, placing the platform executable a script-free
+            // install leaves unplaced), and counting those as installs would have made this canary
+            // fire on every adapter that declares a platformBinary — a false red that would most
+            // likely have been "fixed" by loosening the canary.
+            if (command.Count > 0 && command[0] is "npm" or "pnpm" or "yarn")
+            {
+                if (!command.Contains("--ignore-scripts"))
+                    PostinstallRan = true;
 
-            Installed = true;
+                Installed = true;
+            }
+
             return Task.FromResult(new AdapterCommandResult(0, "", ""));
         }
 
