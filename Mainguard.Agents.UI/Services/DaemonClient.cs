@@ -562,6 +562,22 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }
     }
 
+    /// <summary>
+    /// Streams live per-agent CPU/RAM sampled from the container engine, plus whether each agent's spend
+    /// can be measured at all. Whole-set snapshots, so a torn-down agent drops out rather than lingering.
+    /// Sampling is driven by this subscription — dropping it stops the daemon's engine calls.
+    /// </summary>
+    public async IAsyncEnumerable<AgentResourcesSnapshot> StreamAgentResourcesAsync(
+        [EnumeratorCancellation] CancellationToken ct)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        using var call = client.StreamAgentResources(new StreamAgentResourcesRequest(), AuthOnly(ct));
+        await foreach (var snapshot in call.ResponseStream.ReadAllAsync(ct).ConfigureAwait(false))
+        {
+            yield return snapshot;
+        }
+    }
+
     /// <summary>Reads the per-agent + per-day budget caps.</summary>
     public async Task<Budget> GetBudgetsAsync(CancellationToken ct, TimeSpan? deadline = null)
     {

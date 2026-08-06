@@ -93,6 +93,18 @@
     + files when `!Smoke`; a bootstrap `LoggerFactory` logs the Lifecycle/Migration startup milestones
     before the host is built, and the migration log delegate threads through
     `GatewayServiceRegistration`).
+- **`Runtime/AgentResourceProbe.cs`** — the per-tick join behind `StreamAgentResources`: the session
+  registry (who is alive, in which container) × the container engine (`IContainerResourceSampler`) ×
+  the gateway credential store (**is this agent's spend measurable at all**). `AgentResourceReport`
+  carries nullable CPU/RAM where null means NOT MEASURED, never zero. **The metering predicate lives
+  here and nowhere else**: an agent is metered exactly when `AgentGatewayCredentials.TokenFor(agentId)`
+  is non-null, i.e. the daemon actually issued it a gateway confinement token at spawn — deliberately
+  NOT "the user supplied an API key", since `SandboxAgentLauncher.TryConfineToGatewayAsync` also
+  requires the gateway to be bound, reachable from that jail's egress proxy, and the CLI to declare BOTH
+  `baseUrlEnvVar` and `modelHost` (only `claude-code`/`gemini-cli` do, so a BYOK `codex`/`qwen-code`/
+  `opencode` agent spends real money **unmetered**). Reading the daemon's own answer rather than
+  recomputing those four conditions is the point: two derivations would eventually disagree invisibly.
+  Results are cached for `DefaultCacheWindow` so N subscribers cannot multiply engine calls.
 - **`Runtime/AgentSessionStore.cs`** — the in-memory daemon agent registry + snapshot-then-deltas
   event fan-out (host state, not transport); the gRPC classes dispatch here. Appends `spawn`/`stop`
   audit events via `IAuditLog`; `MarkState(agentId, state, reason)` (P2-09) updates a session's state
@@ -279,7 +291,13 @@
   ids/versions/env-var NAMES only, no paths/secrets; **`GetDaemonInfo`** answers the tier-1 skew probe
   from the injected `Runtime/DaemonInfoProvider.cs` — the daemon's assembly informational version +
   the `MAINGUARDOS_VERSION` parsed from `/etc/mainguardos-release` (overridable path for tests;
-  absent/unreadable stamp → "" — the probe never throws)), **`TerminalGrpcService.cs`** (P2-03/PR3: a
+  absent/unreadable stamp → "" — the probe never throws); **`StreamAgentResources`** streams live
+  per-agent CPU/RAM + the `metered` flag from `Runtime/AgentResourceProbe.cs` on a
+  `ResourcePollInterval` (5s) loop — **sampling is driven by the subscription**, so with no client
+  attached the daemon makes no engine calls. Whole-set snapshots (a torn-down agent drops out rather
+  than keeping stale numbers), and the `cpu_percent`/`mem_bytes` fields are proto3 `optional` so
+  "unknown" is carried explicitly rather than defaulting to a 0 that reads as "idle"),
+  **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
   (managed) attach gets the banner + output but `PERMISSION_DENIED` on input; otherwise the per-attach
   `PtySession` factory path through `TerminalStreamer`, else the P2-02 echo. P2-18: an

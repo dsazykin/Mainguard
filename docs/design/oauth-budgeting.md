@@ -71,6 +71,35 @@ login rather than metering it.
 
 **This is recorded as an open problem. No direction is recommended here.**
 
+## What the UI does about it
+
+Since the Resource Monitor gained a real data source, the tab no longer shows cost controls where cost
+cannot be measured. The operative predicate is **"the daemon issued this agent a gateway confinement
+token at spawn"** (`AgentGatewayCredentials.TokenFor(agentId) is not null`), surfaced per agent over
+`AgentService.StreamAgentResources` as `metered`.
+
+That predicate is used rather than "the user supplied an API key" because BYOK is **not** sufficient, and
+the difference is exactly the residual scope documented at the top of this file:
+
+| situation | has key | confinable CLI | gateway on + reachable | metered |
+|---|---|---|---|---|
+| BYOK claude-code / gemini-cli, gateway on | yes | yes | yes | **yes** |
+| BYOK codex / qwen-code / opencode | yes | **no** | yes | no |
+| OAuth session (any CLI) | **no** | — | — | no |
+| any agent, `--gateway-bind off` | — | — | **no** | no |
+| gateway unreachable from the jail's proxy | yes | yes | **no** | no |
+
+`SandboxAgentLauncher.TryConfineToGatewayAsync` already collapses all of those conditions into a single
+decision, so the UI consumes that decision rather than re-deriving it. Two derivations of the same
+predicate would eventually disagree, and the disagreement would be silent — the same failure mode this
+document already records for the upstream binding.
+
+When nothing is metered, the per-day cap editor and its Save button are hidden (a cap on traffic nobody
+meters is a control with no effect) and replaced by a one-line statement, the `spend today $X` clause is
+dropped from the totals, and each row's spend cell reads `—`. **It deliberately never renders `$0.00`**,
+which is indistinguishable from "you have spent nothing" — the precise false reassurance this file exists
+to prevent. A BYOK user whose agent is genuinely confined still gets the full cost UI.
+
 ## Confinement is accounting, not blocking
 
 BYOK metering is a *soft* limit, and the softness is deliberate:
