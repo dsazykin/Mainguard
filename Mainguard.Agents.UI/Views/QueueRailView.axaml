@@ -51,8 +51,18 @@
                   <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
                   <TextBlock Classes="Mono" Text="{Binding VerifiedAgainst}" FontSize="11" Foreground="{DynamicResource TextMuted}"
                              IsVisible="{Binding VerifiedAgainst, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-                  <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3" HorizontalAlignment="Left"
-                          Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowReviewAccent}"/>
+                  <!-- The verification trigger. Secondary by role: the rail's ONE accent stays the
+                       Review CTA, and asking for a check is a supporting action, not the CTA. -->
+                  <TextBlock Text="{Binding VerifyMessage}" FontSize="11" Foreground="{DynamicResource TextMuted}"
+                             TextWrapping="Wrap"
+                             IsVisible="{Binding VerifyMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                  <StackPanel Orientation="Horizontal" Spacing="6">
+                    <Button Classes="Secondary" Content="{Binding VerifyButtonText}" FontSize="12" Padding="10,3"
+                            Command="{Binding VerifyCommand}" IsEnabled="{Binding CanVerify}"
+                            ToolTip.Tip="Run this repo's verification command in this agent's own jail."/>
+                    <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3"
+                            Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowReviewAccent}"/>
+                  </StackPanel>
                 </StackPanel>
               </Border>
             </DataTemplate>

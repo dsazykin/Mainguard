@@ -60,7 +60,11 @@
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
   coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
-  states, PNGs to `artifacts_headless/`; the **P2-10 suite** — `MergeQueueStateMachineTests`
+  states, PNGs to `artifacts_headless/`, plus `Capture_VerifyTrigger_OnQueueRail_AllFiveThemes`
+  (`queue_verify_trigger_<Theme>.png` — the Verify affordance on the merge-queue rail, asserting it is
+  offered on an unverified entry and WITHHELD while one is already `Verifying`) and
+  `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
+  row); the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
@@ -969,7 +973,20 @@
   daemon action projects live off each RPC — kill switch Engage/Resume → frozen state, a drafted plan
   → the pending-plan projection then Reject clears it, a real ledger spend → the telemetry projection
   + budgets round-trip, `SendMessage` → the coordinator transcript, and a registered `MergeQueue`
-  entry → the merge-queue projection incl. `MainSha`); `ReviewCockpitOverlayAckTests` (the **review
+  entry → the merge-queue projection incl. `MainSha`); **`VerificationTriggerTests` (the regression
+  suite for "nothing in the product could trigger a verification".** The `MergeQueue` machine, the
+  `RunVerification` RPC and `DaemonClient.RunVerificationAsync` all existed and were all tested — but
+  no production path reached any of them, so entries sat at `not verified yet` forever, and the
+  existing tests passed only because they called `MergeQueue.RunVerificationAsync` DIRECTLY, stepping
+  over the missing rung. So these tests never call that method: they press
+  `QueueEntryViewModel.VerifyCommand` — the control the rail is bound to — and assert the run happened
+  on the daemon, through the whole real chain (VM command → `IMergeQueueService` → shipped
+  `DaemonBackedOrchestrator` → shipped `DaemonClient` → in-proc `RunVerification` RPC → real
+  `MergeQueue`). Cases: the decisive Working→Verified with the daemon's runner provably invoked and
+  `not verified yet` cleared; verifying does NOT merge and an always-refusing `IMergeGate` still
+  refuses (the trigger weakens no gate); a `NoVerificationCommandException` surfaces as a quotable
+  `Can't verify — …` with the branch back on Working rather than a phantom Verified; and no active
+  repo refuses with a reason instead of throwing into the UI thread); `ReviewCockpitOverlayAckTests` (the **review
   cockpit overlay** against the same real in-proc daemon: an RT-D2-blocked branch surfaces its flagged
   item on the overlay, the overlay's own per-row acknowledge control is pressed, and the **daemon-side
   gate** then permits the merge it was refusing — asserted on `ChangedTestCommandGate` state and

@@ -512,8 +512,13 @@
     `IsFrozen`/`KillSwitchLabel`/`ToggleKillSwitchCommand`, re-raising the two derived readouts when the
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
-    Lane-E prototype rail projection over the mock `IMergeQueueService`: state words, `CanMerge` gate
-    line, the one Review accent on the front-most fresh Verified entry),
+    rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
+    actually hosts**: state words, `CanMerge` gate line, the one Review accent on the front-most fresh
+    Verified entry, and the per-row **`VerifyCommand`** — the human verification trigger. The command is
+    deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
+    (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
+    daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
+    `CanVerify` withholds the button while a run is in flight and on the terminal states),
     `MergeQueueViewModel`/`MergeQueueRowViewModel` (P2-10: the rail bound to the **real** `MergeQueue`
     state machine — subscribes to its `Changed` event, per-row state word + `main@sha` label +
     `CanMerge`-gated Merge button with the reason as tooltip + the loud stale-override behind a confirm;
@@ -762,6 +767,15 @@
     was simply absent, so pressing Merge recorded a merge (and the cached PRE-merge sha) that git had
     never performed. `SetActiveRepo(handle, localRepoPath, syncRemoteName)` carries the rest of the
     `ProvisionRepo` answer, because a handle alone can observe the queue but cannot merge.
+    `DaemonBackedOrchestrator.RunVerificationAsync` is the **verification trigger's production caller** —
+    the rung that did not exist, which is why `DaemonClient.RunVerificationAsync` was defined and never
+    invoked and every queue entry stayed at `not verified yet`. It resolves the active repo handle and
+    makes ONE RPC: no policy, no state machine, no local projection mutation. All of that belongs to the
+    daemon's `MergeQueue.RunVerificationAsync`, which runs the test command in the *agent's own jail* and
+    republishes the new state on the queue stream. A gRPC `FailedPrecondition` (no live jail / no
+    configured test command / missing toolchain) is returned as `VerificationOutcome(Ran: false)` with the
+    daemon's reason verbatim, kept distinct from a suite that genuinely failed (`Ran: true, Passed: false`);
+    the call carries a 30-minute deadline because a first run may build the toolchain image.
     `FlaggedChangeSource.cs` — `IFlaggedChangeSource` + `DaemonFlaggedChangeSource` +
     `FlaggedAckOutcome`: the seam a review surface reads its must-acknowledge items from (the daemon's
     `QueueEntry.FlaggedItems` projection) and routes per-item acknowledgments through (the daemon's

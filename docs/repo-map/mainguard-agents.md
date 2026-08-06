@@ -61,7 +61,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     per OPS §4.1, `WorkerMergeState` per P2-10,
     `AgentInfo`/`QueueEntry`/`VerificationRecord`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`),
     `IOrchestrationServices.cs` (the service interfaces the control-center ViewModels consume:
-    `IAgentService`, `IMergeQueueService`, `ICoordinatorService`, `IKillSwitchService`,
+    `IAgentService`, `IMergeQueueService` (+ `VerificationOutcome`; **`RunVerificationAsync` is the
+    UI-facing verification trigger** — the rung whose absence left the whole verification mechanism
+    without a production caller, so queue entries sat at `not verified yet` forever. It is a *trigger*
+    only: every decision stays in the daemon's `MergeQueue.RunVerificationAsync`, which an automatic
+    phase-2 caller drives directly for identical gates/jail execution/transitions),
+    `ICoordinatorService`, `IKillSwitchService`,
     `ITelemetryService` (**P2-47 #4** adds `GetSpendBudgetAsync`/`SetSpendBudgetAsync` over the Core
     `SpendBudget` DTO so the Resource Monitor displays + edits the per-day cap, round-tripping the whole
     cap record through the `SetBudgets` RPC), `IVibeService` — designed so a `DaemonClient` adapter can

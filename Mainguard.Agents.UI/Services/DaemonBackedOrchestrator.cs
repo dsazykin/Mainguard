@@ -818,6 +818,73 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
+    /// Asks the daemon to verify this agent's branch now — the missing rung that left the whole
+    /// verification mechanism without a production caller.
+    ///
+    /// <para><b>Everything that decides anything lives on the daemon.</b> This method resolves the active
+    /// repo handle and makes one RPC; it holds no policy, no state machine, and no retry. The daemon's
+    /// <c>MergeQueue.RunVerificationAsync</c> owns the Verifying transition, runs the test command in the
+    /// <i>agent's own jail</i> (host execution is a rejection trigger), writes the immutable record, and
+    /// lands the branch on <c>Verified</c> or back on <c>Working</c>. The queue stream then republishes
+    /// that state, so this method deliberately mutates no local projection.</para>
+    ///
+    /// <para>A refusal the run never started with — no live jail, no configured test command, a jail
+    /// missing the declared toolchain — arrives as gRPC <c>FailedPrecondition</c> and is returned as
+    /// <c>Ran: false</c> with the daemon's reason verbatim. A suite that genuinely failed is
+    /// <c>Ran: true, Passed: false</c>, which is a result and not an error.</para>
+    /// </summary>
+    public async Task<VerificationOutcome> RunVerificationAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: "Can't verify — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        try
+        {
+            // Verification builds a toolchain image on first use and then runs the repo's whole test
+            // command in the jail, so it is minutes-scale work — the per-call deadline has to allow for
+            // that. The default RPC deadline would abort a perfectly healthy first run.
+            var response = await _client
+                .RunVerificationAsync(repoHandle!, agentId, cts.Token, VerificationDeadline)
+                .ConfigureAwait(false);
+            return new VerificationOutcome(
+                Ran: true,
+                Passed: response.Passed,
+                Reason: response.Passed
+                    ? $"verified against main@{Short(response.MainSha)}"
+                    : $"tests failed — {response.ResolvedCommand}");
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.FailedPrecondition)
+        {
+            // The daemon's typed refusal: quotable, and specifically NOT a test failure.
+            return new VerificationOutcome(Ran: false, Passed: false, Reason: $"Can't verify — {ex.Status.Detail}");
+        }
+        catch (Grpc.Core.RpcException ex)
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: $"Can't verify — the daemon didn't answer ({ex.StatusCode}).");
+        }
+    }
+
+    /// <summary>A verification runs the repo's full test command in a jail, after possibly building its
+    /// toolchain image; it is the longest-running RPC the surface issues.</summary>
+    private static readonly TimeSpan VerificationDeadline = TimeSpan.FromMinutes(30);
+
+    private static string Short(string sha) =>
+        string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);
+
+    /// <summary>
     /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
     /// button: <c>BeginMerge</c> (the daemon takes the repo's one lease and enforces <c>CanMerge</c> under
     /// it) → <b>the real Windows-side <c>git merge --ff-only</c> on the user's own checkout</b> →
