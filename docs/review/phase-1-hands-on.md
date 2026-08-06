@@ -132,7 +132,12 @@ attempt is fast. That's the ticket, not a new bug.
 
 **Do:** in the coordinator terminal, ask for something small and verifiable:
 
-> "Add a `subtract(a,b)` function to calc.py with a test, then commit it to a branch."
+> "Add a `subtract(a,b)` function to calc.py with a test, then commit it."
+
+**Do not say "commit it to a branch".** The worktree already starts on the agent's own branch
+(`agent/<agentId>`), and that phrasing invites the agent to `checkout -b` a new one — which strands
+the work where the merge queue cannot see it. That is a real defect (being fixed separately), but
+don't trip it on purpose while testing the queue.
 
 **Expect:** it works in its own jail on its own branch. Nothing appears in your working tree.
 
@@ -148,7 +153,22 @@ wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/agents/$H
 wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$H.git for-each-ref refs/heads/agent/
 ```
 
-**Expect:** an agent directory, and an `agent/<something>` ref with a commit on it.
+**Expect:** an agent directory, and the `agent/<id>` ref **ahead of where it started**.
+
+A ref existing proves nothing — it is created at spawn and always points at *some* commit. What
+matters is that it **moved**. Read the agent id off the directory name, then:
+
+```powershell
+$A = "<the agent id from the ls above>"
+wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/agents/$H/$A.git log --oneline -3 refs/heads/agent/$A
+```
+
+You want the agent's commit at the top. If you see only your own initial commit, the work went
+somewhere else — check what branch the jail is actually on:
+
+```powershell
+wsl -d MainguardEnv -u root -- docker exec mainguard-$($H.Substring(0,12))-$A sh -c 'cd /workspace; git rev-parse --abbrev-ref HEAD; git log --oneline -3'
+```
 
 ---
 
