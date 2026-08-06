@@ -21,8 +21,10 @@ namespace Mainguard.Server.Tests.Agents;
 /// reading is knowable rather than merely non-null: <c>docker stats</c> reports percent-of-one-core, so
 /// one busy core must land near 100 and cannot exceed the machine's core count × 100.</para>
 ///
-/// <para>Uses a trivial <c>busybox</c> container carrying the real <c>mainguard.agent</c> label, so it
-/// needs the Docker daemon only and skips cleanly on a box without the CI-built agent images.</para>
+/// <para>Uses trivial <c>busybox</c> containers, so it needs the Docker daemon only and skips cleanly on
+/// a box without the CI-built agent images. They carry no <c>mainguard.agent</c> label on purpose: the
+/// sampler is handed explicit (agentId, containerId) targets, and labelling them would make them look
+/// like live jails to <c>DockerAgentLister</c> — the swarm reconciler's sole liveness truth.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
 [Collection(DockerSuiteCollection.Name)]
@@ -114,15 +116,19 @@ public class ResourceSamplingDockerTests
         Assert.False(string.IsNullOrWhiteSpace(ghost.UnavailableReason));
     }
 
+    /// <param name="agentId">Only the sampler's output key — the sampler is given explicit
+    /// (agentId, containerId) targets, so these containers deliberately carry NO <c>mainguard.agent</c>
+    /// label. Labelling them would make them look like real jails to <c>DockerAgentLister</c>, which the
+    /// swarm reconciler treats as its sole liveness truth.</param>
     private static async Task<string> RunAsync(
         IDockerClient docker, string name, string agentId, string script, CancellationToken ct)
     {
+        _ = agentId;
         var created = await docker.Containers.CreateContainerAsync(new CreateContainerParameters
         {
             Image = TrivialImage,
             Name = name,
             Cmd = new List<string> { "sh", "-c", script },
-            Labels = new Dictionary<string, string> { ["mainguard.agent"] = agentId },
         }, ct);
         await docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct);
         return created.ID;
