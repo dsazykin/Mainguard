@@ -1038,14 +1038,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Adapters/`** (P2-22 pinned adapter channel — the real mechanism to run version-pinned
     agent CLIs inside the VM, replacing P2-14's interim spawn shape; daemon-side, no UI).
     - `AdapterManifest.cs` (the `adapters.json` schema —
-      `AdapterManifest`/`AdapterSpec`/`ConfigShim`/`HealthProbe` records + `AdapterManifest.Parse` with
+      `AdapterManifest`/`AdapterSpec`/`ConfigShim`/`HealthProbe`/`PlatformBinaryLink` records +
+      `AdapterManifest.Parse` with
       **strict** validation (`JsonUnmappedMemberHandling.Disallow` → unknown fields rejected): typed
       `AdapterManifestException`/`AdapterManifestError` on malformed JSON, a missing health probe, a
-      non-64-hex `sha256`, a duplicate id, and — critically — an **unpinned version**
+      non-64-hex `sha256`, a duplicate id, a `platformBinary` with no candidate sources or an
+      absolute/`..`-escaping path (`BadPlatformBinary` — those paths are handed to `ln`/`cp` in the VM),
+      and — critically — an **unpinned version**
       (`latest`/`@latest`/a range → refused; `@latest` can't even parse)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
-      → run `installCmd` INSIDE the VM at the pinned version → write config shims → probe (exit 0 AND the
+      → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
+      executable** when the spec declares one → probe (exit 0 AND the
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
@@ -1059,6 +1063,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `payloadUrl`; ships so CLI selection works with **no hosted channel yet** — a hosted channel later
       serves the same schema and refreshes over it. `AgentCliCatalogTests` runs `AdapterManifest.Parse`
       over the shipped file so a bad pin edit fails CI, not a user's install).
+      **`platformBinary` (`AdapterChannel.ProbeAsync`/`PlacePlatformBinaryAsync`)** closes the
+      owner-reported "update available, but the health probe exits 1" failure. claude-code and opencode
+      ship an npm package that is only a LAUNCHER — the real ~300 MB executable is a platform
+      subpackage that a `postinstall` hardlinks over a placeholder in the launcher's `bin/`. Since
+      `--ignore-scripts` (MG-9) that postinstall never runs, so the placeholder survives, and the
+      placeholder is a stub that prints "native binary not installed" and **exits 1** — the probe then
+      fails on a perfectly good install, identically for a pinned install and an update (it only
+      *surfaced* on update because the update was the first thing to re-run the install since the flag
+      landed; the pre-flag install marker had read green throughout). The flag is NOT dropped and
+      nothing the vendor ships is executed: Mainguard performs the same file operation itself from the
+      reviewed manifest (`ln -f`, falling back to `cp -f`, then `chmod 0755`), against a subpackage npm
+      had already downloaded as an exact-versioned `optionalDependency` (`--ignore-scripts` suppresses
+      lifecycle hooks, never dependency resolution — no network here). `sources` is an ORDERED candidate
+      list and each is validated by the adapter's REAL health probe, first one that runs wins — the
+      vendors' own algorithm, covering the AVX2/baseline and glibc/musl variants without reimplementing
+      CPU detection. Paths carry no version, so a version bump needs no manifest edit. **The pin/provenance
+      still cover the LAUNCHER tarball only** for these two CLIs — the bytes that execute come from the
+      unpinned dependency closure the manifest already documents (third residual gap there).
     - `AdapterPaths` (the fixed layout: VM-side `/home/mainguard/mainguard/adapters` — one npm `--prefix`
       with `bin/`, `stage/`, `registry/` — bind-mounted **read-only** into every jail at
       `/opt/mainguard/adapters`, so a CLI installed AFTER provisioning reaches every new sandbox with no
