@@ -234,10 +234,11 @@
           <views:QueueRailView DataContext="{Binding Queue}"/>
         </Border>
         <!-- the queue ↔ telemetry seam. Same class of bug as the column above: telemetry was pinned at
-             Height="240" with no way to give the queue more room on a short window. The row stays Auto
-             so hiding telemetry (Conversation Deck) still collapses it to zero height rather than
-             leaving a 240px hole; the Border's MinHeight sets the resting size and the splitter takes
-             it from there. -->
+             Height="240" with no way to give the queue more room on a short window. The row starts Auto,
+             so the card's MinHeight sets the resting size and a hidden card collapses the row to zero;
+             the splitter then takes over. NOTE the row only STAYS Auto until the first drag — after that
+             the splitter has rewritten it to pixels, and the collapse-on-hide is maintained by
+             ControlCenterView.axaml.cs, not by this markup. -->
         <GridSplitter Grid.Row="1" Classes="PanelSeam" Height="6" Margin="0,4"
                       ResizeDirection="Rows" Cursor="SizeNorthSouth"
                       IsVisible="{Binding IsFlightDeck}"
