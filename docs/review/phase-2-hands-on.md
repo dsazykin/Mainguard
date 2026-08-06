@@ -20,8 +20,12 @@ $env:MAINGUARD_DATA_ROOT = "$env:TEMP\mg-test-p2"
 dotnet run --project Mainguard.Pro.App
 ```
 
-Use the same scratch repo as phase 1. Do the phase-1 steps 1–2 first (app starts, coordinator
-starts) — if those don't work, nothing below will, and it won't be phase 2's fault.
+Use the same scratch repo as phase 1, and read that guide's **"Where the agent's work actually
+lives"** section first — the VM paths and the `$H` repo-hash variable used below are defined there.
+Do phase-1 steps 1–2 (app starts, coordinator starts) before anything here; if those don't work,
+nothing below will, and it won't be phase 2's fault.
+
+**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
 
 **Where everything below happens:** left rail → **Coordinator**. Its tooltip reads *"Coordinator —
 plan approvals, chat, and the merge queue"*. The panel header says *"The Coordinator plans and
@@ -51,11 +55,19 @@ no worktree and no view of the code, so its plan would have been a guess.
 
 **Expect:** **no work happens.** No commits, no branch, no file changes.
 
-**Check:**
+**Check — and this has to be done in the VM, not your checkout.** Looking at your own working tree
+proves nothing here: the agent's work never lands there before a merge, so it would look identical
+whether the gate held or failed completely. That is the trap; look where the work would actually be:
 
-```bash
-cd ~/mg-testrepo && git branch -a && git log --all --oneline -5
+```powershell
+# the per-agent repo: does it exist, and does it have any agent branch with commits?
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/agents/$H
+wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$H.git for-each-ref refs/heads/agent/
 ```
+
+**Expect:** no new `agent/*` ref for this worker, and no commits in its per-agent repo. A jail may
+exist (the worker was spawned, and it read the repo to write its plan) — that is fine. What must
+*not* exist is committed work.
 
 **This is the load-bearing test of phase 2.** The design point is that a blocking *call* an agent
 can decline to make is a convention, not a boundary — so the daemon withholds the task entirely
@@ -124,7 +136,8 @@ Decide whether that's what you want. It's a deliberate wording, not an accident.
 **Expect:** everything from phase 1 still applies — verification in its own jail, then the merge
 queue, then **you** merge. Phase 2 added a gate; it didn't remove one.
 
-**Check `main` moved by sha**, same as phase 1 step 5.
+**Check `main` moved by sha**, same as phase 1 step 5 — `git fetch` first, then `git rev-parse
+main` in your checkout. That merge is the only moment the work crosses from the VM to your machine.
 
 **Also worth confirming:** an unapproved worker cannot merge **even if it somehow verified green** —
 the plan gate is ANDed into the merge queue alongside the changed-test-command gate and the
@@ -156,8 +169,5 @@ releases the task, that's a real defect.
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p2
-```
-```bash
-wsl -d MainguardEnv -u root -- docker ps -aq | xargs -r wsl -d MainguardEnv -u root -- docker rm -f
-cd ~/mg-testrepo && git checkout main && git branch | grep -v main | xargs -r git branch -D
+wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
 ```

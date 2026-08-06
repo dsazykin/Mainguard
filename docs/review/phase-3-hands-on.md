@@ -23,6 +23,9 @@ dotnet run --project Mainguard.Pro.App
 Run the phase-2 procedure first. Phase 3 shouldn't change any of it — if phase 2's flow breaks here,
 that's the finding.
 
+**Read phase 1's "Where the agent's work actually lives"** for the VM paths and the `$H` repo-hash
+variable used below. **Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
+
 ---
 
 ## 1. The coordinator has no repository
@@ -35,12 +38,21 @@ that's the finding.
 
 **Expect:** it **cannot**. Not "it declines politely" — there is no repo in its jail to read.
 
-**Check from outside:**
+**Check from outside.** Find the coordinator's container, then look for a worktree in it:
 
-```bash
+```powershell
 wsl -d MainguardEnv -u root -- docker ps --format '{{.Names}}'
-# find the coordinator's container, then:
-wsl -d MainguardEnv -u root -- docker exec <name> ls /workspace   # should not exist
+wsl -d MainguardEnv -u root -- docker exec <coordinator-container> ls /workspace
+```
+
+**Expect:** no `/workspace`. Compare against a **worker's** container, which should have one — that
+contrast is the proof. A coordinator with no repo and a worker with a repo is the shape phase 3
+creates; if both look the same, nothing changed.
+
+Also confirm the coordinator got no per-agent repo of its own:
+
+```powershell
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/agents/$H
 ```
 
 **Why this matters.** The contract said the coordinator "has no worktree, no git credentials and no
@@ -82,8 +94,8 @@ approval (`ApprovePlan`, `RejectPlan`) are denied **at the daemon**.
 
 **Confirm it's the daemon refusing, not the model being agreeable:**
 
-```bash
-wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 60 | grep -iE 'denied|permission|role'
+```powershell
+wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 60 | Select-String -Pattern 'denied|permission|role'
 ```
 
 **This distinction is the whole point.** A system prompt is not a security boundary — telling the
@@ -139,15 +151,13 @@ Phase 3 removes coordinator capability. It should remove nothing else.
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p3
-```
-```bash
-wsl -d MainguardEnv -u root -- docker ps -aq | xargs -r wsl -d MainguardEnv -u root -- docker rm -f
+wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
 ```
 
 **Restoring your daemon:** these builds deploy their daemon into `MainguardEnv` on launch, and
 `DaemonUpdater` **refuses downgrades**. To go back to plain `phase2`, check out `phase2`, `dotnet
 build`, launch, and confirm with:
 
-```bash
+```powershell
 wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 5
 ```

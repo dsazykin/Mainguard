@@ -27,14 +27,61 @@ $env:MAINGUARD_DATA_ROOT = "$env:TEMP\mg-test-p1"
 dotnet run --project Mainguard.Pro.App
 ```
 
-**Use a scratch repo**, not Mainguard itself — an agent will commit to it:
+### Shells — read this first
 
-```bash
-mkdir -p ~/mg-testrepo && cd ~/mg-testrepo && git init
-printf 'def add(a,b):\n    return a+b\n' > calc.py
-printf 'import calc\ndef test_add(): assert calc.add(2,2)==4\n' > test_calc.py
-printf 'python -m pytest -q\n' > .mainguard/verify   # mkdir -p .mainguard first
-git add -A && git commit -m "initial"
+Two different shells appear below and they are not interchangeable:
+
+- **PowerShell** blocks run on Windows. You are on **Windows PowerShell 5.1**, which has **no `&&`
+  operator** — put each command on its own line. (`;` chains but runs the next command even if the
+  previous one failed, so it is not a substitute when order matters.)
+- **WSL** blocks run inside a Linux distro. Anything inspecting the daemon or a jail is prefixed
+  `wsl -d MainguardEnv …` and can be run from PowerShell as written.
+
+**Use a scratch repo**, not Mainguard itself — an agent will commit to it. It must be a **Windows**
+path, because that is what the app hashes and provisions:
+
+```powershell
+mkdir $HOME\mg-testrepo
+cd $HOME\mg-testrepo
+git init
+"def add(a,b):`n    return a+b" | Set-Content calc.py
+"import calc`ndef test_add(): assert calc.add(2,2)==4" | Set-Content test_calc.py
+mkdir .mainguard
+"python -m pytest -q" | Set-Content .mainguard\verify
+git add -A
+git commit -m "initial"
+```
+
+### Where the agent's work actually lives — important
+
+**You will not see an agent's branch in your own checkout.** The agent works on a copy inside the
+MainguardOS VM and never touches your working tree. That is the product's central guarantee, and it
+means "nothing appeared locally" is *not* evidence of anything on its own.
+
+```
+your checkout      C:\Users\yikes\mg-testrepo          ← only changes when YOU merge
+bare mirror        /home/mainguard/mainguard/repos/<repoHash>.git
+per-agent repo     /home/mainguard/mainguard/agents/<repoHash>/<agentId>
+agent branches     refs/heads/agent/*
+```
+
+**Find your repo's hash** (it is the SHA-256 of the normalized Windows path — do not compute it, read
+it off the daemon):
+
+```powershell
+wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 200 | Select-String 'repo=' | Select-Object -Last 1
+```
+
+Or just list them newest-first:
+
+```powershell
+wsl -d MainguardEnv -u root -- ls -t /home/mainguard/mainguard/repos
+```
+
+Set it once for the commands below:
+
+```powershell
+$H = "<the 64-char hash>"
 ```
 
 > `dotnet build` also publishes the in-VM daemon; `DaemonUpdater` deploys it when the app launches.
@@ -85,12 +132,19 @@ attempt is fast. That's the ticket, not a new bug.
 
 **Expect:** it works in its own jail on its own branch. Nothing appears in your working tree.
 
-**Check the isolation is real** — the point of the whole product:
+**Check both halves.** Your checkout is untouched **and** the work really exists in the VM — the
+first alone proves nothing, since an agent that did nothing at all would also leave it clean:
 
-```bash
-cd ~/mg-testrepo && git status        # clean; the agent is NOT editing your checkout
-git branch -a                         # its branch exists
+```powershell
+cd $HOME\mg-testrepo
+git status                                    # clean — the agent is NOT editing your checkout
+
+# the work exists, over there:
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/agents/$H
+wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$H.git for-each-ref refs/heads/agent/
 ```
+
+**Expect:** an agent directory, and an `agent/<something>` ref with a commit on it.
 
 ---
 
@@ -102,9 +156,9 @@ git branch -a                         # its branch exists
 
 **Check:**
 
-```bash
-wsl -d MainguardEnv -u root -- docker ps          # a container exists while verifying
-wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 40 | grep -i verif
+```powershell
+wsl -d MainguardEnv -u root -- docker ps
+wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 40 | Select-String verif
 ```
 
 Host execution would be a rejection trigger. If you ever see the verify command run on Windows,
@@ -116,18 +170,22 @@ that's a serious finding.
 
 **Do:** go to the queue. The item should be there, verified. Note `main`'s sha first:
 
-```bash
-cd ~/mg-testrepo && git rev-parse main
+```powershell
+cd $HOME\mg-testrepo
+git rev-parse main
 ```
 
 Click **Merge**.
 
 **Expect:**
 
-```bash
+```powershell
+git fetch                 # your checkout learns about the merge
 git rev-parse main        # CHANGED
-git log --oneline -3      # the agent's commit is in your real checkout
+git log --oneline -3      # the agent's commit is now in YOUR checkout
 ```
+
+This is the **only** point in the whole flow where the agent's work reaches your machine.
 
 **This is the single most important check in phase 1.** For most of this project the Merge button
 took the lease, recorded success, fired the stale cascade, and **ran no git at all** — the branch
@@ -188,8 +246,9 @@ For each step: what you did, what you expected, what happened. Two things specif
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p1
+Remove-Item -Recurse -Force $HOME\mg-testrepo
+wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
 ```
-```bash
-wsl -d MainguardEnv -u root -- docker ps -aq | xargs -r wsl -d MainguardEnv -u root -- docker rm -f
-rm -rf ~/mg-testrepo
-```
+
+Leaving the VM's mirror and agent repos is harmless — they are keyed by repo hash and a deleted
+checkout simply never resolves again.
