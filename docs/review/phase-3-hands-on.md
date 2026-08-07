@@ -24,7 +24,11 @@ Run the phase-2 procedure first. Phase 3 shouldn't change any of it — if phase
 that's the finding.
 
 **Read phase 1's "Where the agent's work actually lives"** for the VM paths and the `$H` repo-hash
-variable used below. **Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
+variable used below. **Testing note:** read *"Running the test suite while an agent is up"* in the phase-1 guide before
+running any Docker-backed test — it covers the unfiltered-run trap, the two Docker daemons, and how a
+severed jail masquerades as a provider outage.
+
+**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
 
 ---
 
@@ -151,7 +155,7 @@ Phase 3 removes coordinator capability. It should remove nothing else.
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p3
-wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
+wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```
 
 **Restoring your daemon:** these builds deploy their daemon into `MainguardEnv` on launch, and
