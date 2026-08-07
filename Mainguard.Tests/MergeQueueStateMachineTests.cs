@@ -295,9 +295,95 @@ public class MergeQueueStateMachineTests
         queue = new MergeQueue("repo", "sha0", store, ver, run);
 
         Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a")); // resumed the interrupted state
-        await queue.ResumeAfterRestartAsync();
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => true);
 
         Assert.Equal(WorkerMergeState.Verified, queue.GetState("a")); // terminal state reached — not stuck
+        Assert.Equal(new[] { "a" }, report.ReRun);
+        Assert.Empty(report.Stranded);
+    }
+
+    /// <summary>
+    /// The other arm, and the reason the resume takes a jail probe at all. An entry whose sandbox died with
+    /// the daemon <b>cannot</b> verify — verification runs in the worker's own jail (§3.2) — so a resume
+    /// that "re-drove" it would announce Verifying → Verifying to every observer and then fail on the
+    /// no-jail refusal. It is returned to Working instead, with the reason recorded, and it does NOT run.
+    /// </summary>
+    [Fact]
+    public async Task Restart_WhenTheJailIsGone_ReturnsTheEntryToWorking_WithoutClaimingToVerifyInIt()
+    {
+        var store = new InMemoryMergeQueueStore();
+        store.Save(new Mainguard.Git.Models.MergeQueueRow
+        {
+            RepoHash = "repo",
+            AgentId = "a",
+            State = WorkerMergeState.Verifying.ToString(),
+            UpdatedUtc = DateTime.UtcNow,
+        });
+
+        var ran = 0;
+        var audit = new InMemoryAuditLog();
+        var queue = new MergeQueue(
+            "repo", "sha0", store, new InMemoryVerificationStore(),
+            (id, ct) =>
+            {
+                Interlocked.Increment(ref ran);
+                return Task.FromResult(new VerificationRecord(id, "sha0", true, "l", "c", "h", DateTimeOffset.UnixEpoch));
+            },
+            audit: audit);
+
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => false);
+
+        Assert.Equal(0, ran); // nothing was executed — there was nowhere to execute it
+        Assert.Equal(WorkerMergeState.Working, queue.GetState("a"));
+        Assert.Equal("Working", store.LoadAll("repo").Single(r => r.AgentId == "a").State);
+        Assert.Equal(new[] { "a" }, report.Stranded);
+        Assert.Empty(report.ReRun);
+
+        // Recorded as the daemon reconciling itself, not as a human clearing anything.
+        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.RestartResumeEvent);
+        Assert.Equal("stranded", audited.Fields["outcome"]);
+        Assert.Equal("a", audited.Fields["agent"]);
+        Assert.DoesNotContain(audit.Read(), e => e.Type == MergeQueue.StalledVerificationClearedEvent);
+    }
+
+    /// <summary>
+    /// A resume must not touch a verification that is genuinely running. The in-flight set is the only
+    /// thing that tells the two apart, and re-entering <c>RunVerificationAsync</c> for a live run would
+    /// throw "already in flight" out of a background task nobody awaits.
+    /// </summary>
+    [Fact]
+    public async Task Restart_SkipsAVerificationThatIsActuallyRunning()
+    {
+        var release = new TaskCompletionSource();
+        var starts = 0;
+        MergeQueue queue = null!;
+        queue = new MergeQueue(
+            "repo", "sha0", new InMemoryMergeQueueStore(), new InMemoryVerificationStore(),
+            async (id, ct) =>
+            {
+                Interlocked.Increment(ref starts);
+                await release.Task;
+                return new VerificationRecord(id, queue.CurrentMainSha, true, "l", "c", "h", DateTimeOffset.UnixEpoch);
+            });
+
+        var inFlight = queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+        Assert.True(queue.IsVerificationInFlight("a"));
+
+        // Both arms must leave it alone: it is neither re-run nor stranded.
+        var live = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => true);
+        var dead = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => false);
+
+        Assert.Empty(live.ReRun);
+        Assert.Empty(live.Stranded);
+        Assert.Empty(dead.ReRun);
+        Assert.Empty(dead.Stranded);
+        Assert.Equal(1, starts);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+
+        release.SetResult();
+        await inFlight;
+        Assert.Equal(WorkerMergeState.Verified, queue.GetState("a"));
     }
 
     // ---- NoAutoMergePathExists (API shape) ------------------------------
@@ -476,9 +562,15 @@ public class MergeQueueStateMachineTests
 
     /// <summary>
     /// The stalled-verification case. A daemon that restarts mid-run rehydrates <c>Verifying</c> with
-    /// nothing executing (the in-flight set is memory; the state is persisted) and nothing in production
-    /// calls <c>ResumeAfterRestartAsync</c> — so the entry reports "verifying" forever about a run that
-    /// does not exist. The clear says so, and returns it to Working.
+    /// nothing executing (the in-flight set is memory; the state is persisted) — so until something
+    /// re-drives it the entry reports "verifying" about a run that does not exist. The clear says so, and
+    /// returns it to Working.
+    ///
+    /// <para><c>MergeQueueProvisioner</c> now starts a <c>ResumeAfterRestartAsync</c> pass whenever it
+    /// rebuilds a repo's queue, so the daemon reaches this shape by itself. This stays the human's escape
+    /// hatch for what a resume cannot establish — a repo whose queue is never rebuilt, or a container
+    /// runtime the probe could not reach — and it is asserted here directly on the queue, with no resume in
+    /// the picture, so the two mechanisms cannot mask each other.</para>
     /// </summary>
     [Fact]
     public void ClearStalledVerification_UnsticksARowWithNoRunBehindIt()

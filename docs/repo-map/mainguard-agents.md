@@ -916,8 +916,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
       `GetState`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`; every legal transition enumerated,
       every illegal one throws typed `InvalidMergeStateTransitionException`; each transition persisted in
-      the same transaction (restart resumes, `ResumeAfterRestartAsync` re-runs an interrupted
-      `Verifying`); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
+      the same transaction (restart resumes; `ResumeAfterRestartAsync(hasLiveJail)` + its background
+      `BeginResumeAfterRestart`/`LastResume` pair re-drive an interrupted `Verifying` — see the
+      restart-resume note below); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
       `StaleVerified` and auto re-queues FIFO by original verification time; `CanMerge` false unless
       `Verified`/fresh AND every composable `IMergeGate` allows; the human merge (`ConfirmHumanMerge` →
       `Merged`) + `RequestReview`/`Reject`/`NotifyNewCommits` are **not** on `IMergeQueue`
@@ -946,7 +947,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       consults so a rehydrated-but-idle `Verifying` reads "verification stalled — no run in progress"
       instead of claiming an activity that is not happening, and what
       `SettleAfterVerificationLocked` guards with so a run finishing after a discard is dropped rather
-      than throwing out of an unawaited continuation. `VerificationRunner.cs` (runs the configured test command in the worker sandbox
+      than throwing out of an unawaited continuation. **Restart resume (the wiring, not just the
+      method):** `ResumeAfterRestartAsync` shipped complete and had **no production caller** — every
+      reference was its own definition, a comment observing the gap, or a test, one of which asserted the
+      absence — so a daemon killed mid-verification rehydrated `Verifying` with nothing behind it and the
+      entry reported "verifying" forever about a run that no longer existed; `TryClearStalledVerification`
+      was the human mitigation for it. It now takes a **`hasLiveJail` probe** and splits into two arms,
+      returning a `RestartResumeReport(ReRun, Stranded)`: jail alive → the verification is genuinely
+      re-executed in it (the real re-drive), jail gone → the entry cannot verify at all (§3.2 — host
+      execution is a rejection trigger) so it is moved straight to `Working` rather than flapping
+      `Verifying → Verifying →` failed-run `→ Working`. Runs actually in flight are skipped, so it is safe
+      on a live queue. Both arms append the `verification_restart_resume` audit event with an
+      `outcome` field (`rerun`/`stranded`) — deliberately NOT `stalled_verification_cleared`, whose `by`
+      field names a person. `BeginResumeAfterRestart` runs a pass on a background task and publishes it on
+      `LastResume` (the `LastCascade` posture: tests await it, production fires and forgets), because the
+      only production caller is inside a gRPC handler and a pass runs whole test suites.
+      `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
@@ -980,7 +996,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
       verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
       `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
-      agent→approved-plan binding exists yet.)
+      agent→approved-plan binding exists yet. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
+      now also calls `MergeQueue.BeginResumeAfterRestart`, passing `resolveContainerId` as the jail probe
+      — this is `ResumeAfterRestartAsync`'s production caller. It is here rather than in
+      `DaemonBootSequence` because a boot task would have nothing to iterate: the registry is empty at
+      boot by design and `ActiveRepoIndex` is memory-only, so a boot-sequence resume step would run
+      against zero queues forever — the same no-caller defect one level up. `EnsureQueue` is the moment a
+      repo's persisted queue state re-enters the process, and every path into it (`ProvisionRepo`, a
+      jailed spawn, the PR-intake target resolver) is an RPC handler, so the pass necessarily lands after
+      merge-reconcile and the swarm reconciler.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the

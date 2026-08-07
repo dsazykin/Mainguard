@@ -87,7 +87,23 @@
   `EnsureEntry` cannot resurrect, `ClearStalledVerification` unsticks a `Verifying` row with no run and
   is refused while one is live, `NotifyNewCommits` on a discarded entry is a no-op rather than the
   illegal `Discarded → Working` throw a terminal guard naming only `Merged`/`Rejected` produced, and
-  neither action appears on `IMergeQueue`),
+  neither action appears on `IMergeQueue`; plus the **two-armed restart resume** — jail alive re-runs and
+  reaches `Verified`, jail gone returns the entry to `Working` having executed nothing and audited
+  `verification_restart_resume outcome=stranded` rather than a human's `stalled_verification_cleared`,
+  and a genuinely in-flight run is skipped by both arms),
+  `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
+  older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
+  the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake
+  container runtime holds the exec open, and that object graph is then abandoned), bring a second
+  provisioner up over the SAME persisted rows, and make the single production call a repo coming up makes
+  — `MergeQueueProvisioner.EnsureQueue` — asserting where the entry lands with **no human RPC**: jail
+  alive → the command really re-executes in the jail, the immutable record is written against the queue's
+  main and the row persists `Verified`; jail gone → `Working`, nothing executed, nothing recorded, and
+  `Clear stalled run` then truthfully refuses with "not stuck verifying" while discard still works; an
+  ordinary restart with nothing interrupted moves nothing; and `EnsureQueue` returns while the resume's
+  verification is still running, since it is a gRPC handler. Real bare mirror, real agent branch, real
+  publish/drift/RT-D2/flagged-change path — only the container runtime is a fake, and its jail-liveness
+  answer is the input the whole change turns on),
   `VerificationRunnerTests` (daemon-observed exit is pass/fail,
   `ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit`, runs-in-sandbox-never-host, artifact
   provenance), `ForegroundMergeServiceTests` (real-git: journaled/undoable A5 ff-only merge,
@@ -1140,7 +1156,10 @@
   `IApproverIdentityResolver` value and reflection proves `DiscardEntryRequest` has no field to assert
   one with; a discard is refused while that entry holds the repo's merge lease, and on an already
   terminal entry; `ClearStalledVerification` unsticks a `Verifying` row the stream reports has no run
-  behind it (`verification_in_flight`, a fact only the daemon can supply); the coordinator role is
+  behind it (`verification_in_flight`, a fact only the daemon can supply) — that test used to pin
+  "`ResumeAfterRestartAsync` has no production caller" and now pins the boundary that survived it: the
+  queue there is hand-registered so no resume is in the picture, and the human's escape hatch has to work
+  on its own for every frozen row a resume cannot reach; the coordinator role is
   denied **both** RPCs at the interceptor with nothing mutated, and the in-jail `AgentIpcRequest` op
   set stays `{spawn, list}` so the agent surface cannot address them at all. The two decisive cases
   drive the shipped `QueueRailViewModel` through the shipped `DaemonBackedOrchestrator` into a real

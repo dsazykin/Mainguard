@@ -174,6 +174,21 @@ public sealed record QueueEntryDiscard(
     string By, DateTimeOffset At, string Reason, WorkerMergeState? FromState);
 
 /// <summary>
+/// What one <see cref="MergeQueue.ResumeAfterRestartAsync"/> pass did with the entries a daemon restart
+/// left frozen at <c>Verifying</c>. The two lists are the two honest answers, and they are separate
+/// because they are not the same fact about the branch.
+/// </summary>
+/// <param name="ReRun">Entries whose jail is still up, so the interrupted verification was re-executed in
+/// it. Each of these reached a real terminal (<c>Verified</c>, or <c>Working</c> on a failure) driven by a
+/// daemon-observed container exit — i.e. an actual re-drive.</param>
+/// <param name="Stranded">Entries whose jail is <b>gone</b>. These were returned to <c>Working</c> without
+/// pretending to verify anything: with no sandbox there is nothing to run the test command in (§3.2 — host
+/// execution is a rejection trigger), so "re-drive it" is not available and claiming otherwise would be the
+/// same lie in a different state. They need a jail before they can verify again.</param>
+public sealed record RestartResumeReport(
+    IReadOnlyList<string> ReRun, IReadOnlyList<string> Stranded);
+
+/// <summary>
 /// The concrete P2-10 merge queue: an exhaustive, persisted state machine over one repo's agent
 /// branches. Every legal transition is enumerated; every illegal transition throws
 /// <see cref="InvalidMergeStateTransitionException"/>. Each transition is persisted in the same
@@ -187,8 +202,9 @@ public sealed class MergeQueue : IMergeQueue
     //
     // Discarded is reachable from EVERY non-terminal state, and that breadth is the point: the entries this
     // exists for are stranded at Working (their agent was stopped and nothing ever removed the entry) or
-    // frozen at Verifying (the daemon restarted mid-run and nothing resumes it), and an action that only
-    // worked from AwaitingReview — where Rejected already lives — would not reach a single one of them.
+    // frozen at Verifying (the daemon restarted mid-run before ResumeAfterRestartAsync could re-drive it),
+    // and an action that only worked from AwaitingReview — where Rejected already lives — would not reach a
+    // single one of them.
     private static readonly IReadOnlyDictionary<WorkerMergeState, WorkerMergeState[]> Legal =
         new Dictionary<WorkerMergeState, WorkerMergeState[]>
         {
@@ -230,11 +246,28 @@ public sealed class MergeQueue : IMergeQueue
     /// <summary>Audit event appended when a human clears a <c>Verifying</c> state with no run behind it.</summary>
     public const string StalledVerificationClearedEvent = "stalled_verification_cleared";
 
+    /// <summary>
+    /// Audit event appended for every entry the restart resume acted on, carrying an <c>outcome</c> field of
+    /// <c>rerun</c> or <c>stranded</c>. Deliberately NOT
+    /// <see cref="StalledVerificationClearedEvent"/>: that event records a human deciding, and its
+    /// <c>by</c> field is a person. This one records the daemon reconciling itself after a restart, and
+    /// conflating the two would put an actor's name on something nobody did.
+    /// </summary>
+    public const string RestartResumeEvent = "verification_restart_resume";
+
     /// <summary>When true the kill switch has frozen the queue (P2-14): no merge, loudly.</summary>
     public bool IsFrozen { get; set; }
 
     /// <summary>The most recent stale-cascade re-queue work (tests await it; production ignores it).</summary>
     public Task LastCascade { get; private set; } = Task.CompletedTask;
+
+    /// <summary>
+    /// The most recent <see cref="BeginResumeAfterRestart"/> pass — same posture as
+    /// <see cref="LastCascade"/>: tests await it, production fires and forgets. A completed no-op pass
+    /// until something starts one, so a caller can always await it.
+    /// </summary>
+    public Task<RestartResumeReport> LastResume { get; private set; } =
+        Task.FromResult(new RestartResumeReport(Array.Empty<string>(), Array.Empty<string>()));
 
     /// <summary>Raised (off any lock) after any state change so the gRPC stream / UI can re-read.</summary>
     public event Action? Changed;
@@ -576,9 +609,14 @@ public sealed class MergeQueue : IMergeQueue
     /// <para>This is the fact that separates a branch being verified from a branch whose row merely SAYS
     /// <c>Verifying</c>. The two are indistinguishable from the state alone, and they come apart routinely:
     /// the state is persisted per transition while the in-flight set is in-memory, so a daemon that
-    /// restarts mid-run rehydrates <c>Verifying</c> with nothing behind it, and
-    /// <see cref="ResumeAfterRestartAsync"/> — which would have re-driven it — has no production caller.
-    /// The entry then reports "verifying" forever, to a human, about a run that does not exist.</para>
+    /// restarts mid-run rehydrates <c>Verifying</c> with nothing behind it. Left alone, the entry reports
+    /// "verifying" forever, to a human, about a run that does not exist.</para>
+    ///
+    /// <para><see cref="ResumeAfterRestartAsync"/> now closes that window — <see cref="MergeQueueProvisioner"/>
+    /// starts a pass the moment it rebuilds a repo's queue — so a restart-frozen row is transient rather
+    /// than permanent. This predicate stays exactly as load-bearing: it is what the resume itself measures
+    /// to skip live runs, what <c>CanMerge</c> words its refusal from, and what
+    /// <see cref="TryClearStalledVerification"/> refuses on.</para>
     /// </summary>
     public bool IsVerificationInFlight(string agentId)
     {
@@ -670,7 +708,16 @@ public sealed class MergeQueue : IMergeQueue
     /// <para>This means exactly one thing and refuses in every other case: if a verification really is
     /// executing (<see cref="IsVerificationInFlight"/>) the call is refused, because the honest answer is
     /// "wait", and because walking a live run's entry to <c>Working</c> would make its own completion an
-    /// illegal <c>Working → Verified</c> transition.</para>
+    /// illegal <c>Working → Verified</c> transition. That refusal now also covers a resume's own re-run:
+    /// <see cref="ResumeAfterRestartAsync"/> goes through <see cref="RunVerificationAsync"/>, so its runs
+    /// are in-flight like any other and a human clicking Clear during one is told to wait.</para>
+    ///
+    /// <para><b>Still the escape hatch, deliberately.</b> The restart resume handles the case it can
+    /// establish — a run interrupted by a restart — and nothing else. A queue whose repo never comes back up
+    /// (so its queue is never rebuilt and no resume ever runs), a probe that could not reach the container
+    /// runtime, an entry a future path freezes some other way: those still need a human to be able to say
+    /// "there is no run behind this". Removing this on the strength of the resume would trade a stuck entry
+    /// with a button for a stuck entry without one.</para>
     /// </summary>
     /// <returns>True when the entry moved back to <see cref="WorkerMergeState.Working"/>.</returns>
     public bool TryClearStalledVerification(string agentId, string clearedBy, out string refusal)
@@ -799,29 +846,156 @@ public sealed class MergeQueue : IMergeQueue
     // ---- Restart resume --------------------------------------------------
 
     /// <summary>
-    /// Resumes any interrupted <c>Verifying</c> run after a daemon restart (edge row 4 — never stuck).
-    /// Each interrupted run is re-executed; the terminal state is always reached.
+    /// Starts a <see cref="ResumeAfterRestartAsync"/> pass in the background and publishes it on
+    /// <see cref="LastResume"/>.
+    ///
+    /// <para><b>Background, not inline, and that is load-bearing.</b> The daemon's only caller
+    /// (<see cref="MergeQueueProvisioner.EnsureQueue"/>) runs inside a gRPC handler, and a resume does two
+    /// slow things per entry: it asks the container runtime whether the jail is up, and — when it is — it
+    /// runs the repo's whole test suite in that jail. Doing that inline would hang <c>ProvisionRepo</c> (and
+    /// every spawn) for the length of a test run, which is how a fix for a stuck queue becomes a stuck
+    /// daemon.</para>
     /// </summary>
-    public async Task ResumeAfterRestartAsync(CancellationToken ct = default)
+    /// <param name="hasLiveJail">agentId → does this entry still have a running sandbox. See
+    /// <see cref="ResumeAfterRestartAsync"/> for why the answer decides the arm.</param>
+    /// <param name="log">Optional milestone sink; one line per entry acted on.</param>
+    /// <param name="ct">Cancels the pass between entries.</param>
+    public Task<RestartResumeReport> BeginResumeAfterRestart(
+        Func<string, bool> hasLiveJail, Action<string>? log = null, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(hasLiveJail);
+        return LastResume = Task.Run(
+            () => ResumeAfterRestartAsync(hasLiveJail, log, ct), CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Re-drives every <c>Verifying</c> entry this queue hydrated with no run behind it — the shape a
+    /// daemon killed mid-verification leaves, because the state is persisted per transition while the
+    /// in-flight set (<see cref="IsVerificationInFlight"/>) is memory. Without this the entry reports
+    /// "verifying" forever, to a human, about a run that does not exist (edge row 4 — never stuck).
+    ///
+    /// <para><b>Two arms, because there are two different branches here and one answer cannot be honest
+    /// about both.</b></para>
+    /// <list type="bullet">
+    ///   <item><b>The jail is still up</b> — jails are persistent by design and survive the daemon, so this
+    ///   is the common case. The verification is genuinely re-executed in it and reaches a real terminal
+    ///   decided by the container-runtime exit. This is the actual re-drive.</item>
+    ///   <item><b>The jail is gone</b> — then this entry <i>cannot</i> verify: verification runs in the
+    ///   worker's own sandbox and host execution is a rejection trigger (§3.2). Calling
+    ///   <see cref="RunVerificationAsync"/> anyway would transition Verifying → Verifying, publish that to
+    ///   every observer, fail on the no-jail refusal and settle to <c>Working</c> — the same destination by
+    ///   way of a state flap and a "verification failed" shaped event for a verification that never ran. So
+    ///   the entry is moved straight to <c>Working</c> and the reason is recorded, which is what the row
+    ///   already meant and what a fresh jail can act on. Restoring a jail for it is the human's
+    ///   <c>Clear stalled run</c> escape hatch's neighbour, not this method's job.</item>
+    /// </list>
+    ///
+    /// <para>Entries with a run actually in flight are skipped, so this is safe on a live queue as well as a
+    /// freshly hydrated one — and it can never collide with <see cref="RunVerificationAsync"/>'s
+    /// already-in-flight guard.</para>
+    /// </summary>
+    /// <param name="hasLiveJail">agentId → does this entry still have a running sandbox. An exception from
+    /// the probe counts as "no jail": the daemon's own resolver already answers null for an unreachable
+    /// container runtime, and the safe reading of "we could not establish that a jail exists" is the one
+    /// that does not then claim to be verifying in it.</param>
+    /// <param name="log">Optional milestone sink; one line per entry acted on.</param>
+    /// <param name="ct">Cancels the pass between entries.</param>
+    public async Task<RestartResumeReport> ResumeAfterRestartAsync(
+        Func<string, bool> hasLiveJail, Action<string>? log = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(hasLiveJail);
+
         List<string> interrupted;
         lock (_gate)
         {
-            interrupted = _states.Where(kv => kv.Value == WorkerMergeState.Verifying).Select(kv => kv.Key).ToList();
+            interrupted = _states
+                .Where(kv => kv.Value == WorkerMergeState.Verifying && !_verifying.Contains(kv.Key))
+                .Select(kv => kv.Key)
+                .ToList();
         }
+
+        var reRun = new List<string>();
+        var stranded = new List<string>();
 
         foreach (var agentId in interrupted)
         {
+            ct.ThrowIfCancellationRequested();
+
+            if (!ProbeJail(hasLiveJail, agentId))
+            {
+                if (StrandInterrupted(agentId))
+                {
+                    stranded.Add(agentId);
+                    log?.Invoke(
+                        $"restart resume repo={_repoHash} agent={agentId} — the verification interrupted by "
+                        + "the restart cannot be re-run (its jail is gone); returned to Working");
+                }
+
+                continue;
+            }
+
+            reRun.Add(agentId);
+            log?.Invoke(
+                $"restart resume repo={_repoHash} agent={agentId} — re-running the verification the "
+                + "restart interrupted, in the agent's own jail");
+            Audit(agentId, "rerun");
+
             try
             {
                 await RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {
                 // RunVerificationAsync already surfaced the branch back to Working on failure.
             }
         }
+
+        return new RestartResumeReport(reRun, stranded);
     }
+
+    private static bool ProbeJail(Func<string, bool> hasLiveJail, string agentId)
+    {
+        try
+        {
+            return hasLiveJail(agentId);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    // Moves an interrupted entry off Verifying, re-reading the state under the lock: the probe ran outside
+    // it, and a human discard (or the intake's Cancel) landing in that window has decided already.
+    private bool StrandInterrupted(string agentId)
+    {
+        lock (_gate)
+        {
+            if (GetStateLocked(agentId) != WorkerMergeState.Verifying || _verifying.Contains(agentId))
+            {
+                return false;
+            }
+
+            SetStateLocked(agentId, WorkerMergeState.Working);
+        }
+
+        Audit(agentId, "stranded");
+        Changed?.Invoke();
+        return true;
+    }
+
+    private void Audit(string agentId, string outcome) =>
+        _audit.Append(new AuditEvent(RestartResumeEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["outcome"] = outcome,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
 
     // ---- Internals -------------------------------------------------------
 
