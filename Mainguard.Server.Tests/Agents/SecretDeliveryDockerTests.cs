@@ -59,7 +59,7 @@ public class SecretDeliveryDockerTests
             agentEnv: new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = nonce },
             ct: ct);
 
-        var credential = await ReadFileFactsAsync(fixture, handle.ContainerId, SecretPath, ct);
+        var credential = await ReadFileFactsAsync(fixture, handle.ContainerId, SecretPath, ct, needle: nonce);
 
         Assert.True(credential.Ran,
             $"the in-jail probe produced no {FactFrame} frame at all, so nothing about '{SecretPath}' was "
@@ -69,7 +69,11 @@ public class SecretDeliveryDockerTests
             + "silent-failure this test exists for. Raw output: " + credential.Raw);
 
         // The exact bytes THIS spawn sent — not a truncation, and not a file that was already there.
-        Assert.Contains(nonce, credential.Content, StringComparison.Ordinal);
+        // Decided by grep in the jail, so a secret whose bytes could collide with the frame's delimiters
+        // can never corrupt the fields around it (see FileFacts).
+        Assert.True(credential.HasNonce,
+            $"'{SecretPath}' exists but does not contain this run's nonce, so it is not the file this "
+            + "spawn delivered — a leftover, or a truncated write. Raw: " + credential.Raw);
         Assert.NotEqual("0", credential.Bytes);
         Assert.Equal("400", credential.Mode); // G-13: readable by its owner alone
         Assert.Equal("1000", credential.Uid); // and that owner is the agent uid
@@ -98,7 +102,7 @@ public class SecretDeliveryDockerTests
         // reach K — it does not even resolve, because the supervisor's directory denies the agent uid
         // before the file's own 0400 is ever consulted. The control now holds one level earlier than it
         // did when both secrets shared a traversable 0711 directory.
-        var oobFromAgent = await ReadFileFactsAsync(fixture, handle.ContainerId, OobKeyPath, ct);
+        var oobFromAgent = await ReadFileFactsAsync(fixture, handle.ContainerId, OobKeyPath, ct, needle: nonce);
         Assert.True(oobFromAgent.Ran,
             "the in-jail probe did not run as the agent, so 'the agent cannot reach K' is unmeasured. Raw: "
             + oobFromAgent.Raw);
@@ -186,25 +190,48 @@ public class SecretDeliveryDockerTests
 
     /// <summary>What the jail says about one path. <paramref name="Ran"/> distinguishes "the probe did
     /// not execute" from "the file is not there" — the two outcomes that look identical to a naive
-    /// substring assertion, and the reason every field below can be trusted.</summary>
+    /// substring assertion, and the reason every field below can be trusted.
+    ///
+    /// <para><b>There is no <c>Content</c> field, deliberately.</b> The frame used to carry the file's
+    /// bytes, and the OOB key is 32 bytes of <see cref="System.Security.Cryptography.RandomNumberGenerator"/>
+    /// output — so roughly one run in five contained a <c>|</c> or a <c>]</c>, the frame's own delimiters,
+    /// and the probe corrupted its own reading. A <c>]</c> terminated the frame early and
+    /// <see cref="Mode"/> parsed as empty; a <c>|</c> shifted every field one place and <see cref="Mode"/>
+    /// parsed as <c>"32"</c> — the byte count. Both were seen in CI, and both were read as a delivery
+    /// defect when delivery had been correct all along. A frame whose delimiters can occur in the payload
+    /// it carries is not a measurement. Every field here is now digits or a <c>Y</c>/<c>N</c>, and the
+    /// one question that needed the content — "does it hold the nonce?" — is answered <b>in the jail</b>
+    /// by <see cref="HasNonce"/>, so the bytes never enter the frame at all.</para></summary>
     private sealed record FileFacts(
-        bool Ran, bool Exists, string Content, string Bytes, string Mode, string Uid, string Gid, string Raw);
+        bool Ran, bool Exists, bool HasNonce, string Bytes, string Mode, string Uid, string Gid, string Raw);
+
+    /// <summary>A needle that matches nothing, for the probes that ask nothing about content. It must be
+    /// non-empty: <c>grep -qF ""</c> matches every file, which would make <see cref="FileFacts.HasNonce"/>
+    /// true everywhere and quietly vacuous.</summary>
+    private const string NoNeedle = "MG-NEEDLE-THAT-MATCHES-NOTHING";
 
     /// <param name="asUid">The uid to run the probe as. Null = the container's own user (the agent).</param>
+    /// <param name="needle">Asked of the file <i>inside</i> the jail, so the file's bytes never travel.</param>
     private static async Task<FileFacts> ReadFileFactsAsync(
-        SandboxFixture fixture, string containerId, string path, CancellationToken ct, int? asUid = null)
+        SandboxFixture fixture, string containerId, string path, CancellationToken ct,
+        int? asUid = null, string needle = NoNeedle)
     {
         // The frame opener is printed by the shell itself, unconditionally, BEFORE anything can fail —
         // so a missing frame proves the probe never ran rather than that the answer was "no".
+        //
+        // EVERY field is delimiter-free by construction: four numeric stat/wc results and one Y/N. The
+        // file's own bytes are NOT among them — see FileFacts for the ~22%-of-runs corruption that
+        // carrying them caused. "Does it contain the nonce?" is decided in the jail by grep and crosses
+        // the boundary as one character.
         var script =
-            "p=\"$1\"; printf '" + FactFrame + "'; "
+            "p=\"$1\"; n=\"$2\"; printf '" + FactFrame + "'; "
             + "if [ -e \"$p\" ]; then "
             + "  printf 'EXISTS|%s|%s|%s|%s|%s' "
-            + "    \"$(cat \"$p\" 2>/dev/null)\" "
             + "    \"$(wc -c < \"$p\" 2>/dev/null | tr -d ' ')\" "
             + "    \"$(stat -c %a \"$p\" 2>/dev/null)\" "
             + "    \"$(stat -c %u \"$p\" 2>/dev/null)\" "
-            + "    \"$(stat -c %g \"$p\" 2>/dev/null)\"; "
+            + "    \"$(stat -c %g \"$p\" 2>/dev/null)\" "
+            + "    \"$(if grep -qF -- \"$n\" \"$p\" 2>/dev/null; then echo Y; else echo N; fi)\"; "
             + "else printf 'ABSENT|||||'; fi; "
             + "printf ']'";
 
@@ -215,26 +242,26 @@ public class SecretDeliveryDockerTests
         // the agent reports the supervisor's key ABSENT, which is the isolation working rather than a
         // delivery failure. So "was it delivered?" is asked as the owner, and "can the agent get it?"
         // is asked separately, as the agent — see the caller.
-        var raw = await ProbeAsAsync(fixture, containerId, script, path, asUid, ct).ConfigureAwait(false);
+        var raw = await ProbeAsAsync(fixture, containerId, script, path, needle, asUid, ct).ConfigureAwait(false);
         var start = raw.IndexOf(FactFrame, StringComparison.Ordinal);
         if (start < 0)
-            return new FileFacts(false, false, "", "", "", "", "", raw);
+            return new FileFacts(false, false, false, "", "", "", "", raw);
 
         start += FactFrame.Length;
         var end = raw.IndexOf(']', start);
         if (end < 0)
-            return new FileFacts(false, false, "", "", "", "", "", raw);
+            return new FileFacts(false, false, false, "", "", "", "", raw);
 
         var parts = raw[start..end].Split('|');
         var exists = parts.Length > 0 && parts[0] == "EXISTS";
         return new FileFacts(
             Ran: true,
             Exists: exists,
-            Content: parts.Length > 1 ? parts[1] : "",
-            Bytes: parts.Length > 2 ? parts[2] : "",
-            Mode: parts.Length > 3 ? parts[3] : "",
-            Uid: parts.Length > 4 ? parts[4] : "",
-            Gid: parts.Length > 5 ? parts[5] : "",
+            Bytes: parts.Length > 1 ? parts[1] : "",
+            Mode: parts.Length > 2 ? parts[2] : "",
+            Uid: parts.Length > 3 ? parts[3] : "",
+            Gid: parts.Length > 4 ? parts[4] : "",
+            HasNonce: parts.Length > 5 && parts[5] == "Y",
             Raw: raw);
     }
 
@@ -242,12 +269,13 @@ public class SecretDeliveryDockerTests
     /// user (every jail exec is the agent), so the per-owner read goes through the Docker client the
     /// fixture already exposes rather than widening a production signature for a test.</summary>
     private static async Task<string> ProbeAsAsync(
-        SandboxFixture fixture, string containerId, string script, string path, int? asUid, CancellationToken ct)
+        SandboxFixture fixture, string containerId, string script, string path, string needle,
+        int? asUid, CancellationToken ct)
     {
         if (asUid is null)
         {
             var engineResult = await fixture.Engine.ExecAsync(
-                containerId, new[] { "sh", "-c", script, "sh", path }, ct).ConfigureAwait(false);
+                containerId, new[] { "sh", "-c", script, "sh", path, needle }, ct).ConfigureAwait(false);
             return engineResult.Stdout + engineResult.Stderr;
         }
 
@@ -256,7 +284,7 @@ public class SecretDeliveryDockerTests
             User = asUid.Value.ToString(System.Globalization.CultureInfo.InvariantCulture),
             AttachStdout = true,
             AttachStderr = true,
-            Cmd = new List<string> { "sh", "-c", script, "sh", path },
+            Cmd = new List<string> { "sh", "-c", script, "sh", path, needle },
         }, ct).ConfigureAwait(false);
 
         using var stream = await fixture.Docker.Exec
