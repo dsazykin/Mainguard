@@ -151,7 +151,7 @@ Phase 3 removes coordinator capability. It should remove nothing else.
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p3
-wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
+wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```
 
 **Restoring your daemon:** these builds deploy their daemon into `MainguardEnv` on launch, and
