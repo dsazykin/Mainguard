@@ -60,7 +60,18 @@
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
   coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
-  states, PNGs to `artifacts_headless/`; the **P2-10 suite** — `MergeQueueStateMachineTests`
+  states, PNGs to `artifacts_headless/`;
+  **`Headless/ControlCenterPanelSizingRenderHarness.cs`** — the Control Center's panel *sizing*, which
+  the harness above cannot see because `MockOrchestrator`'s fixtures are short friendly strings
+  ("Loom-3", "fix/auth-refresh") while `DaemonBackedOrchestrator` projects `Name = AgentId` (32 hex)
+  and `Branch = agent/<id>`. Rewrites the rail's entries to production id lengths, then asserts the
+  merge-queue seam is a real draggable/keyboard-resizable `GridSplitter`, that widening the window
+  widens the queue (bounded at 640px), that no queue text is arranged past the rail's right edge
+  (**geometric** overflow — `TextLayout.HasCollapsed` alone is vacuous here, a horizontal `StackPanel`
+  measures at infinite width and never trims), that the telemetry row resizes and still collapses when
+  Conversation Deck hides it, and that the seam's hover accent is a different colour from its rest
+  state in every theme. PNGs: `control_center_sizing_<narrow|default|wide>_<Theme>.png`,
+  `control_center_seam_hover_<Theme>.png`; the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
