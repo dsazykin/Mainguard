@@ -200,8 +200,17 @@ public sealed class AgentRefMediationTests
         var b2Before = AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a2").Trim();
 
         // a1 forges a ref named after a2 inside its OWN repository and commits onto it.
+        //
+        // `core.hooksPath=/dev/null` deliberately: the in-jail AgentBranchGuard hook would refuse this
+        // write, and that must NOT be what makes this test pass. The hook is ergonomics — an agent with a
+        // shell bypasses it exactly like this — whereas the property under test here is the daemon-side
+        // boundary, which has to hold against an agent that HAS forged the ref. Letting the guard rail
+        // stop the forgery would quietly turn this into a test of the guard rail and stop exercising the
+        // boundary at all.
         var forged = env.CommitInWorktree(wtA, "forged.txt", "not a2's work\n");
-        AgentTestGit.RunChecked(env.AgentRepoPath(hash, "a1"), "update-ref", "refs/heads/agent/a2", forged);
+        AgentTestGit.RunChecked(
+            env.AgentRepoPath(hash, "a1"), "-c", "core.hooksPath=/dev/null",
+            "update-ref", "refs/heads/agent/a2", forged);
 
         // Publishing a1 carries a1's branch and nothing else.
         Assert.Equal(AgentRefPublishOutcome.Published, env.Worktrees.Publish(hash, "a1").Outcome);

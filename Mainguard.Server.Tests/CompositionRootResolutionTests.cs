@@ -59,6 +59,28 @@ public sealed class CompositionRootResolutionTests
     }
 
     /// <summary>
+    /// The stranded-branch check is actually wired into the daemon's provisioner.
+    ///
+    /// <para>It is an optional constructor argument that defaults to null, and null means the old
+    /// behaviour precisely: an agent whose work sits on a branch other than <c>agent/&lt;id&gt;</c> gets
+    /// verified against an empty branch and nothing anywhere says so. Every other test of the detection
+    /// passes its own callback, so dropping the one line in <c>GatewayServiceRegistration</c> would leave
+    /// them all green and the product unfixed — which is the exact failure mode this file exists for.</para>
+    /// </summary>
+    [Fact]
+    public void MergeQueueProvisioner_IsWiredToCheckWhichBranchAnAgentIsActuallyOn()
+    {
+        using var host = new DaemonFixture();
+
+        var provisioner = host.Services.GetRequiredService<MergeQueueProvisioner>();
+
+        Assert.True(
+            provisioner.ChecksAgentBranchAlignment,
+            "the daemon's MergeQueueProvisioner must be constructed with checkAgentBranch, or work "
+            + "committed off agent/<id> is silently verified as an empty branch again");
+    }
+
+    /// <summary>
     /// P2-47 anti-idle proof: the external-PR intake dependency chain resolves and
     /// <see cref="PrIntakeHostedService"/> is registered as a hosted service, so the daemon's scheduler
     /// runs the poll loop instead of returning early. Each link (transport / store / worktrees / fetcher)

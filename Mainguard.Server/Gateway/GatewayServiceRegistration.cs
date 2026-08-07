@@ -117,7 +117,14 @@ public static class GatewayServiceRegistration
             // mirror; with the agent now committing into its OWN repository, this is what carries it
             // there — immediately before verification, so the verified bytes are current (design §7).
             publishAgentRef: (repoHash, agentId) =>
-                sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId)));
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId),
+            // ...and the other half of the same question. The publish above carries ONLY
+            // refs/heads/agent/<id>; this establishes whether the agent's worktree is actually on that
+            // branch, so that work committed elsewhere is refused with the measurement instead of
+            // verified as an empty branch. Passing it is what makes the check exist in the daemon at all —
+            // the parameter defaults to null, and a null here would be the silent behaviour again.
+            checkAgentBranch: (repoHash, agentId) =>
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.CheckAgentBranch(repoHash, agentId)));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
