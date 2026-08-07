@@ -519,6 +519,61 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
     }
 
+    [Fact]
+    public async Task AgentThatMovedItsWorkOffItsOwnBranch_IsRefusedWithTheMeasurement_NotVerifiedSilently()
+    {
+        // The defect, end to end, in the shape it was measured on the owner's machine: the worktree is
+        // created on agent/<id>, the agent switches to another branch and commits there, and readiness is
+        // then proposed.
+        //
+        // Asserting "the mirror's ref did not move" would prove nothing — that is true with or without the
+        // fix, and it is exactly what made this invisible. What has to be asserted is that proposing the
+        // work as ready now REPORTS the condition.
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, AgentId);
+        StrandWorkOffTheAgentBranch(worktree);
+
+        var provisioner = NewProvisioner(exitCode: 0, out var engine);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None));
+
+        // Names the branch found, the branch expected, and what to do — a cause, not just a symptom.
+        Assert.Contains("stranded-work", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains("agent/" + AgentId, refusal.Message, StringComparison.Ordinal);
+        Assert.Contains("merge queue", refusal.Message, StringComparison.Ordinal);
+        Assert.Contains("git branch -f", refusal.Message, StringComparison.Ordinal);
+
+        // Refused BEFORE anything ran in the jail: verifying an empty branch and reporting a pass is the
+        // outcome that would let stranded work look finished.
+        Assert.Empty(engine.Commands);
+
+        // The queue surfaces the branch back to Working rather than leaving it wedged in Verifying.
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
+    }
+
+    /// <summary>
+    /// The agent moves off its own branch and commits there.
+    ///
+    /// <para>Driven through LibGit2Sharp, which does not execute git hooks at all — so this reproduces a
+    /// jail with no in-jail guard rail, which is every jail that existed before this change (including the
+    /// one the defect was reported from) and any jail whose agent removed the hook. That is the right
+    /// substrate for a test of the daemon-side backstop: it must not be able to pass merely because the
+    /// guard rail happened to stop the agent first. The guard rail itself is exercised against a real
+    /// <c>git</c> CLI in <c>AgentBranchGuardTests</c>.</para>
+    /// </summary>
+    private static void StrandWorkOffTheAgentBranch(string worktree)
+    {
+        using (var repo = new Repository(worktree))
+        {
+            Commands.Checkout(repo, repo.CreateBranch("stranded-work"));
+        }
+
+        WriteAndCommit(worktree, "subtract.cs", "public static int Subtract(int a, int b) => a - b;\n",
+            "Add subtract function");
+    }
+
     // ---- harness ---------------------------------------------------------
 
     private MergeQueueProvisioner NewProvisioner(int exitCode, out FakeSandboxEngine engine)
@@ -562,7 +617,11 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
             // agent/<id> — the branch's rewritten test command would be invisible and the drift gate
             // would silently stop firing while every assertion below still looked plausible.
-            publishAgentRef: (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId));
+            publishAgentRef: (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId),
+            // ...and the production drift check alongside it. Wired for EVERY test in this class on
+            // purpose: the interesting risk is not that it fires when it should, it is that it fires when
+            // it should not. Every other test here commits on agent/<id> and must stay green.
+            checkAgentBranch: (repoHash, agentId) => new WorktreeManager(_vmRoot).CheckAgentBranch(repoHash, agentId));
     }
 
     /// <summary>Seeds a source repo carrying a main-side verification config, then provisions its mirror.</summary>

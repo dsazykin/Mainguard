@@ -114,6 +114,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       drops the cloned `origin`, sets `core.sharedRepository=group` + `gc.auto=0`, prunes other agents'
       `agent/*` refs, and group-shares the tree; plus `Remove`/`Exists`/`ListAgentIds`/`AnyAttached`, the
       last being the “is a borrower still attached?” question the prune policy turns on)).
+    - `AgentBranchGuard.cs` (**agent branch confinement** — the two non-boundary layers that keep an
+      agent's work where the merge queue can see it, after live phase-1 testing found an agent could
+      `git checkout -b …`, commit, and have the work become *invisible* with no warning, error or queue
+      entry. `AgentBranchGuard.InstallHook` writes a `reference-transaction` hook into the agent's own
+      repo refusing writes to any `refs/heads/` other than `agent/<id>` — **ERGONOMICS, NOT SECURITY**:
+      the agent can delete it or run `git -c core.hooksPath=/dev/null`, all measured, so it is a guard
+      rail and never a reason to relax the daemon-side rule in `AgentRefMediator`. Four measured
+      exemptions keep ordinary git working — decide only in `prepared`, scope to `refs/heads/` (so
+      stash/tag/fetch and the `ORIG_HEAD`/`AUTO_MERGE`/`REBASE_HEAD` pseudo-refs pass, and HEAD moves
+      stay legal or rebase would break), allow deletions, and allow no-op rewrites so `git pack-refs`/
+      `git gc` still work in a jail that is ALREADY stranded. The daemon needs no exemption: its git runs
+      `-c core.hooksPath=/dev/null` (MG-1). `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
+      backstop — measured `symbolic-ref`/`rev-parse`/`merge-base --is-ancestor`, never a guess, with
+      `Unknown` deliberately distinct from "aligned"; `Describe` is the operator report naming the actual
+      branch, the expected branch and a recovery that was actually computed. Auto-recovery is
+      **rejected** — see `docs/design/agent-branch-confinement.md` §4).
     - `AgentRefMediator.cs` (**MG-3 stage 2** — the ONE path by which anything an agent produced reaches
       the shared mirror, and the reason the design chose daemon-FETCH over push-to-daemon: with a push
       model the agent proposes `old new refname` triples the daemon must validate forever and correctly,
@@ -162,7 +178,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`WorktreeManager.AgentRefRefusedEvent`) alongside the warning, because "an agent tried to rewrite
       history the mirror already published" must leave a durable record and not just a log line, `Prune`,
       and `List` (the union over the per-agent repos, filtered to `agent/*`, via the pure
-      `WorktreePorcelainParser`); duplicate agent id → typed refusal before any mutation).
+      `WorktreePorcelainParser`); duplicate agent id → typed refusal before any mutation; spawn also
+      installs the `AgentBranchGuard` hook (last, after both `GroupShareRecursive` passes, so it keeps its
+      narrower non-group-writable mode) and `CheckAgentBranch` exposes the drift probe the verification
+      path consults).
     - `IAgentEnvironment.cs` (the substrate facade + `SyncRemote`/`SubstrateCapabilities` records: holds
       `Repos`/`Worktrees` and — **added by P2-07** — `Sandboxes` (`ISandboxEngine`) + `Egress`
       (`IEgressPolicy`), plus `ResolveSyncRemote(hash)`; the Health/Upgrade/Teardown lifecycle stays
