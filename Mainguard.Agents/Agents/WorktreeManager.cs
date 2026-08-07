@@ -362,7 +362,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             // No `-b`: check out the EXISTING branch. `-b` is what makes CreateAgentWorktree a creation,
             // and it is the one character between resuming the work and starting an empty branch under
             // the same name.
-            AgentGitCommand.Run(agentRepoPath, "worktree", "add", worktreePath, branch);
+            // BREAK 1 (throwaway branch, never to be merged): `-B` create-or-RESET the branch onto the
+            // default branch instead of checking out the existing one. This is precisely the failure the
+            // design rejected — a jail on a fresh empty branch under the entry's own name, reported as a
+            // successful resume, with the recovered commits silently absent.
+            AgentGitCommand.Run(
+                agentRepoPath, "worktree", "add", "-B", branch, worktreePath, DefaultBranch(agentRepoPath));
             FinishWorktreeLocked(repoHash, agentId, worktreePath, agentRepoPath);
         }
         catch

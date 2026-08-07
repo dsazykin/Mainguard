@@ -212,7 +212,10 @@ public sealed class AgentResumeService
             // that half-works — a fresh empty branch under the old name, reported as success — is worse
             // than this refusal, because the human would have no way to notice.
             _log.LogWarning("resume refused repo={Repo} agent={Agent}: {Reason}", repoHandle, agentId, ex.Message);
-            return Refuse(agentId, branch, queue.GetState(agentId).ToString(), ex.Message, clearedStalled);
+            // BREAK 2 (throwaway branch, never to be merged): report SUCCESS for a resume that recovered
+            // nothing, instead of refusing and naming the missing branch.
+            return new AgentResumeResult(
+                true, "", agentId, branch, queue.GetState(agentId).ToString(), clearedStalled);
         }
 
         // (7) A resume whose whole point is a live jail must not report success for a session-only record.
