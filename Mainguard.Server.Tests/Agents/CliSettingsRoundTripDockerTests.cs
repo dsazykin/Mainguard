@@ -183,13 +183,7 @@ public class CliSettingsRoundTripDockerTests
         var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
         try
         {
-            // Make /workspace a real repository, so `git status` has an opinion at all. (A jail whose
-            // workspace is not a repo is the substrate-less case and must simply do nothing.)
-            var init = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
-                "cd /workspace && git init -q && git config user.email a@b.c && git config user.name t "
-                + "&& git commit -q --allow-empty -m base && echo READY");
-            Assert.True(init.ExitCode == 0 && init.Stdout.Contains("READY", StringComparison.Ordinal),
-                $"could not make /workspace a git repo: exit={init.ExitCode} stderr={init.Stderr}");
+            await MakeWorkspaceAGitRepoAsync(fixture, first.ContainerId);
 
             // The restore runs on the reuse path against that now-real repository.
             var second = await fixture.Engine.SpawnAsync(
@@ -287,6 +281,37 @@ public class CliSettingsRoundTripDockerTests
     /// writing somewhere nothing reads.</summary>
     private static string JailPathOf(AdapterSettingsPath entry) =>
         DockerSandboxEngine.SettingsRootPath(entry.ParsedRoot) + "/" + entry.Path;
+
+    /// <summary>
+    /// Turns the jail's <c>/workspace</c> into a real repository, so <c>git status</c> has an opinion at
+    /// all. (A jail whose workspace is not a repo is the substrate-less case, where the ignore step must
+    /// simply do nothing.)
+    ///
+    /// <para><b>Two details are load-bearing and both were found by CI, not by reasoning.</b> The
+    /// worktree is bind-mounted from the host and owned by the TEST PROCESS's uid, while git runs as the
+    /// AGENT uid — so git's dubious-ownership protection rejects the repository it just created, and the
+    /// symptom is the thoroughly misleading <c>fatal: not in a git directory</c> from the NEXT command
+    /// rather than a failure from <c>git init</c> (which exits 0). Hence
+    /// <c>safe.directory</c>. And the identity is passed with <c>-c</c> rather than written by
+    /// <c>git config</c>, so the setup never depends on local config being writable.</para>
+    ///
+    /// <para>Reproduced outside this suite before being fixed: the same 0777 bind mount entered as a
+    /// foreign uid gives <c>init=0</c> then <c>config=128 fatal: not in a git directory</c>, and adding
+    /// <c>safe.directory</c> makes both succeed.</para>
+    /// </summary>
+    private static async Task MakeWorkspaceAGitRepoAsync(SandboxFixture fixture, string containerId)
+    {
+        var init = await fixture.ExecAsync(containerId, "sh", "-c",
+            "cd /workspace || exit 90\n"
+            + "git config --global --add safe.directory /workspace || exit 91\n"
+            + "git init -q || exit 92\n"
+            + "git -c user.email=a@b.c -c user.name=t commit -q --allow-empty -m base || exit 93\n"
+            + "echo READY\n");
+        Assert.True(init.ExitCode == 0 && init.Stdout.Contains("READY", StringComparison.Ordinal),
+            $"could not make /workspace a git repo: exit={init.ExitCode} "
+            + "(90=cd 91=safe.directory 92=init 93=commit) "
+            + $"stdout={init.Stdout.Trim()} stderr={init.Stderr.Trim()}");
+    }
 
     private static async Task WriteInJailAsync(
         SandboxFixture fixture, string containerId, string path, string content)
