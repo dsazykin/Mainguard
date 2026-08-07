@@ -60,11 +60,24 @@
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
   coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
-  states, PNGs to `artifacts_headless/`, plus `Capture_VerifyTrigger_OnQueueRail_AllFiveThemes`
+  states, PNGs to `artifacts_headless/`;
+  **`Headless/ControlCenterPanelSizingRenderHarness.cs`** — the Control Center's panel *sizing*, which
+  the harness above cannot see because `MockOrchestrator`'s fixtures are short friendly strings
+  ("Loom-3", "fix/auth-refresh") while `DaemonBackedOrchestrator` projects `Name = AgentId` (32 hex)
+  and `Branch = agent/<id>`. Rewrites the rail's entries to production id lengths, then asserts the
+  merge-queue seam is a real draggable/keyboard-resizable `GridSplitter`, that widening the window
+  widens the queue (bounded at 640px), that no queue text is arranged past the rail's right edge
+  (**geometric** overflow — `TextLayout.HasCollapsed` alone is vacuous here, a horizontal `StackPanel`
+  measures at infinite width and never trims), that the telemetry row resizes and still collapses when
+  Conversation Deck hides it, and that the seam's hover accent is a different colour from its rest
+  state in every theme. PNGs: `control_center_sizing_<narrow|default|wide>_<Theme>.png`,
+  `control_center_seam_hover_<Theme>.png`;
+  plus `Capture_VerifyTrigger_OnQueueRail_AllFiveThemes`
   (`queue_verify_trigger_<Theme>.png` — the Verify affordance on the merge-queue rail, asserting it is
   offered on an unverified entry and WITHHELD while one is already `Verifying`) and
   `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
-  row); the **P2-10 suite** — `MergeQueueStateMachineTests`
+  row);
+  the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
@@ -795,7 +808,13 @@
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares
   `dotnet-10`, the branch demands `rust-stable`, and the observable is which presence probe the daemon
   ran in the jail), the flag/block/reason/acknowledge quartet, comment-edits-are-not-drift,
-  both-files-drifted-names-both, and the typed `ToolchainProvisioningException` when the jail does not
+  both-files-drifted-names-both,
+  `AgentThatMovedItsWorkOffItsOwnBranch_IsRefusedWithTheMeasurement_NotVerifiedSilently` (the decisive
+  proof for the stranded-branch defect — the agent is moved off `agent/<id>` through LibGit2Sharp, which
+  never runs hooks, so the daemon-side backstop cannot pass merely because the in-jail guard rail stopped
+  the agent first; asserts the refusal names both branches and the recovery, that NOTHING was executed in
+  the jail, and that the queue returns to `Working`. Asserting "the mirror's ref did not move" would have
+  proven nothing — that is true with or without the fix), and the typed `ToolchainProvisioningException` when the jail does not
   actually carry what main declared (asserting the verify command was never launched — a provisioning
   failure is not a test result). **P2-11 flagged-change gate wiring** lives in the same class because
   the detector was never broken and the spine was, so only wiring-level tests over the real mirror can
@@ -936,7 +955,10 @@
   reflection over the registered engine's own delegates, that its target resolver really is
   `PrIntakeTargetResolver.Resolve` and not a hardwired `null`, and that its worker host really is the
   daemon's `ExternalPrWorkerHost`: a hardwired constant is invisible from the outside, since the
-  engine resolves and the hosted service starts either way), **`ExternalPrIntakeSpawnWiringTests`**
+  engine resolves and the hosted service starts either way), and that the daemon's
+  `MergeQueueProvisioner` really was constructed with `checkAgentBranch` — an optional argument whose
+  absence restores the silent stranded-branch behaviour exactly while every other test stays green),
+  **`ExternalPrIntakeSpawnWiringTests`**
   (the intake→spawn decisions at the tier that needs no Docker: the explicit-`pr-<n>`-id scheme and
   its duplicate-id refusal; `EnsureWorkerAsync` adopting a live session and a restart-orphaned jail;
   the MG-2 managed-worker cap refusing an intake spawn over the SAME population an ordinary managed
@@ -1083,6 +1105,17 @@
   last-writer-wins clobber, a blank repo handle never forms a shared bucket, and a miss returns null
   rather than substituting a stranger's credential), `RepoProvisionerTests.cs` (first-run hardened
   bare mirror, incremental fetch advancing the head, manual-delete re-clone, spaces/Unicode path),
+  `AgentBranchGuardTests.cs` (**the stranded-branch defect from live phase-1 testing**, over a REAL
+  mirror/agent repo/linked worktree, driving "the agent" through a plain `git` CLI via `AgentTestGit`
+  because the daemon's own helper pins `core.hooksPath=/dev/null` and would disable the very hook under
+  test — a test that could only ever pass. Detection: `checkout -b` + commit is caught, the report names
+  both branches and the computed fast-forward recovery; a detached HEAD is caught and not mistaken for a
+  branch named `HEAD`; the on-its-own-branch control stays clean; no worktree reports `Unknown` rather
+  than collapsing into "fine". Prevention: spawn installs the hook, `checkout -b` is refused with no
+  residue and work on `agent/<id>` still succeeds; a 5-case theory pins that stash/tag/pack-refs/gc/
+  detach are untouched; `TheHookSurvivesAnUpgradeOverAJailThatIsALREADYStranded` covers the population
+  this ships to, where `pack-refs` re-states a pre-existing loose foreign branch as a create; and
+  `TheHookDoesNotObstructTheDaemonsOwnGit` pins that spawn/teardown are unaffected),
   `AgentWorktreeManagerTests.cs` (add/remove/prune round-trip, duplicate-id + dirty-remove typed
   failures, **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names

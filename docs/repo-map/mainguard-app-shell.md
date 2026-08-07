@@ -271,7 +271,20 @@
       and the rail's worker rows carry a quiet role word (subagent via `AgentRowViewModel.RoleLabel`);
       layout preset = the Settings **General** page's Layout picker (formerly a File-menu → Layout
       submenu), Flight Deck default / Conversation Deck, persisted like Theme via
-      `UserPreferences.WorkspaceLayout`; The Loom retired), `QueueRailView` (the mock merge-queue rail),
+      `UserPreferences.WorkspaceLayout`; The Loom retired). **Panel sizing (2026-08-06):** the surface
+      grid was `ColumnDefinitions="Auto,*,8,300"` — a LITERAL 8px gap where a splitter belonged and a
+      hard-coded 300px queue — so a wider window only fed the terminal and the boundary had nothing to
+      grab. The queue column is proportional now (`3*` / `*`, `MinWidth` 320 / 280, `MaxWidth` 640) with
+      a real `GridSplitter` between them, and the telemetry card's fixed `Height="240"` became a second
+      (row) splitter. Both carry the local `GridSplitter.PanelSeam` style: `BorderHairline` at rest,
+      `AccentBrush` on pointer-over / pressed / focus, `Focusable` for arrow-key resizing. The row
+      splitter rewrites its `Auto` row to a pixel length on first drag, which would leave a hole when
+      Conversation Deck hides telemetry — `ControlCenterView.axaml.cs` parks that height on hide and
+      restores it on show (its only job). No width persistence: none of the shell's other splitters
+      persist either. `QueueRailView` (the mock merge-queue rail; its rows now put the state word in an
+      `Auto` column so a 32-hex agent id can no longer push it off the edge, trim the name with a
+      full-value tooltip, and **wrap** the branch / SHA identifiers — horizontal scrolling is explicitly
+      `Disabled` there because enabling it measures at infinite width and silently defeats that wrap),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line), `CoordinatorPanelView` (conversation + plan-approval card —
       **retained for a possible future surface but no longer rendered**; since 2026-07-22 the coordinator
@@ -280,8 +293,12 @@
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47
       #7)** built from the live `GetMergeDiff` RPC; **no rule logic in the axaml/code-behind** — invariant
-      1), `AgentDocumentView` (terminal tail + plan tree + health strip + flagged-gate review section +
-      composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table), `ResourceMonitorView` (the
+      1; its diff readout is the one pane on this surface that scrolls HORIZONTALLY — diff lines are
+      source, so wrapping them would break column alignment and the old clip simply hid the rest),
+      `AgentDocumentView` (terminal tail + plan tree + health strip + flagged-gate review section +
+      composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table; its trimmed Detail column
+      carries a full-value tooltip — a blocked host you cannot read is a blocked host you cannot act on),
+      `ResourceMonitorView` (the
       Resources **tab** — task-manager style: totals header + CPU history decomposing into one live row
       per agent (CPU/RAM/spend/state/task, stable order so an open context menu never gets yanked),
       right-click Pause/Resume + End task with a C-pattern confirmation; **P2-47 #4 adds the editable

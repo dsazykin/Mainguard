@@ -22,10 +22,18 @@
   <Grid RowDefinitions="Auto,*,Auto" Margin="10">
     <StackPanel Grid.Row="0" Spacing="4" Margin="0,0,0,10">
       <TextBlock Text="Merge queue" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-      <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" Foreground="{DynamicResource TextMuted}"/>
+      <!-- "main <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
+      <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" TextWrapping="Wrap"
+                 Foreground="{DynamicResource TextMuted}"/>
     </StackPanel>
 
-    <ScrollViewer Grid.Row="1">
+    <!-- Horizontal scrolling is DELIBERATELY off. The rail's two long strings are identifiers (a 32-hex
+         agent id and its agent/<id> branch) and they now wrap instead of overflowing, which is both
+         lossless and readable without a second scrollbar to read a name. Turning the horizontal bar on
+         would measure this content at infinite width and therefore SILENTLY DEFEAT that wrapping — it
+         would restore the clipping it was meant to cure. Genuinely unwrappable content (diff lines,
+         where wrapping destroys column alignment) scrolls sideways in ReviewCockpitView instead. -->
+    <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled">
       <StackPanel>
         <TextBlock Text="Nothing queued." FontSize="12" Foreground="{DynamicResource TextMuted}"
                    IsVisible="{Binding IsEmpty}"/>
@@ -35,21 +43,38 @@
               <Border Padding="8,8" Margin="0,0,0,5" CornerRadius="8"
                       BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
                 <StackPanel Spacing="3">
-                  <StackPanel Orientation="Horizontal" Spacing="6">
+                  <!-- Was a horizontal StackPanel, which gives the name unbounded width and lets it push
+                       the state word off the edge: a real 32-hex agent id rendered the row as
+                       "<id>  Work…". State words come FIRST in this design (§3, E4/N-3), so the state
+                       word gets an Auto column that is measured before the name's star column — it can
+                       no longer be the thing that gets clipped. -->
+                  <Grid ColumnDefinitions="Auto,*,Auto">
                     <!-- Reserved 10px badge slot (E3): the slot never reflows -->
-                    <Panel Width="10" Height="10" VerticalAlignment="Center">
+                    <Panel Grid.Column="0" Width="10" Height="10" Margin="0,0,6,0" VerticalAlignment="Center">
                       <PathIcon Classes="badge"
                                 Classes.neutral="{Binding IsNeutral}" Classes.mutedState="{Binding IsMutedState}"
                                 Classes.infoState="{Binding IsInfoState}" Classes.warningState="{Binding IsWarningState}"
                                 Classes.successState="{Binding IsSuccessState}" Classes.dangerState="{Binding IsDangerState}"
                                 Data="{Binding BadgeGeometryKey, Converter={x:Static ResourceKeyToGeometryConverter.Instance}}"/>
                     </Panel>
-                    <TextBlock Text="{Binding Name}" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock Text="{Binding StateWord}" FontSize="11" VerticalAlignment="Center" Foreground="{DynamicResource TextMuted}"/>
-                  </StackPanel>
-                  <TextBlock Classes="Mono" Text="{Binding Branch}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-                  <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-                  <TextBlock Classes="Mono" Text="{Binding VerifiedAgainst}" FontSize="11" Foreground="{DynamicResource TextMuted}"
+                    <!-- The name shares its line with the state word, so it trims rather than wraps (a
+                         wrapped 32-hex id would make every row three lines tall). Nothing is lost: the
+                         tooltip carries the full value, and the Branch line below prints the SAME id in
+                         full, wrapped. -->
+                    <TextBlock Grid.Column="1" Text="{Binding Name}" FontSize="13" FontWeight="SemiBold"
+                               TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Name}"
+                               VerticalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
+                    <TextBlock Grid.Column="2" Text="{Binding StateWord}" FontSize="11" Margin="6,0,0,0"
+                               VerticalAlignment="Center" Foreground="{DynamicResource TextMuted}"/>
+                  </Grid>
+                  <!-- Identifiers wrap instead of clipping: losing characters off the end of a branch name
+                       or a SHA is exactly the case where an ellipsis is useless, because the whole point
+                       of reading it is to match it against something else. -->
+                  <TextBlock Classes="Mono" Text="{Binding Branch}" FontSize="11" TextWrapping="Wrap"
+                             ToolTip.Tip="{Binding Branch}" Foreground="{DynamicResource TextMuted}"/>
+                  <TextBlock Text="{Binding Detail}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
+                  <TextBlock Classes="Mono" Text="{Binding VerifiedAgainst}" FontSize="11" TextWrapping="Wrap"
+                             Foreground="{DynamicResource TextMuted}"
                              IsVisible="{Binding VerifiedAgainst, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
                   <!-- The verification trigger. Secondary by role: the rail's ONE accent stays the
                        Review CTA, and asking for a check is a supporting action, not the CTA. -->

@@ -58,6 +58,7 @@ public sealed class MergeQueueProvisioner
     private readonly IAuditLog _audit;
     private readonly Action<string>? _log;
     private readonly Func<string, string, bool>? _publishAgentRef;
+    private readonly Func<string, string, AgentBranchAlignment>? _checkAgentBranch;
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
 
@@ -101,6 +102,18 @@ public sealed class MergeQueueProvisioner
     /// bytes that get verified definitely current rather than whatever the watcher last saw. Null (the
     /// pre-MG-3 tests) simply verifies whatever the mirror already holds.
     /// </param>
+    /// <param name="checkAgentBranch">
+    /// (repoHash, agentId) → which branch the agent's worktree is ACTUALLY on. Consulted immediately after
+    /// the publish above, because that publish is the point at which "the agent has produced nothing" and
+    /// "the agent produced work somewhere the mirror will never see" become indistinguishable: the mediator
+    /// carries only <c>refs/heads/agent/&lt;id&gt;</c>, so an agent that committed on another branch leaves
+    /// that ref untouched and every downstream consumer reads a ref that is present, readable and stale.
+    /// Drift is raised here rather than logged, because a verification that runs against the wrong bytes
+    /// and passes is worse than one that refuses with the reason.
+    ///
+    /// <para>Null (every pre-existing test) restores the old behaviour exactly: nothing is checked. The
+    /// daemon passes it.</para>
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -114,7 +127,8 @@ public sealed class MergeQueueProvisioner
         IAuditLog? audit = null,
         Action<string>? log = null,
         Func<string, string, bool>? publishAgentRef = null,
-        Func<string, TaskPlan?>? resolveApprovedPlan = null)
+        Func<string, TaskPlan?>? resolveApprovedPlan = null,
+        Func<string, string, AgentBranchAlignment>? checkAgentBranch = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -131,7 +145,19 @@ public sealed class MergeQueueProvisioner
         _log = log;
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
+        _checkAgentBranch = checkAgentBranch;
     }
+
+    /// <summary>
+    /// Whether this provisioner will actually establish which branch an agent is on before verifying it.
+    ///
+    /// <para>Exposed for one reason: the check is an optional constructor argument, so the daemon failing
+    /// to pass it would restore the silent behaviour exactly, with every other test in this repository
+    /// still green. That is the shape of defect this codebase keeps producing — a control that is
+    /// implemented, tested, and wired nowhere — so the composition root asserts on this rather than
+    /// trusting a line in a registration file.</para>
+    /// </summary>
+    public bool ChecksAgentBranchAlignment => _checkAgentBranch is not null;
 
     /// <summary>
     /// Ensures a live, registered queue for <paramref name="repoHandle"/> and returns it; null when the repo
@@ -276,6 +302,39 @@ public sealed class MergeQueueProvisioner
         // than whatever the ref watcher last happened to see. The daemon names the source ref and the
         // destination; the agent cannot name a ref at all.
         _publishAgentRef?.Invoke(repoHandle, agentId);
+
+        // ...and now say so if that publish carried nothing because the agent's work is not on the branch
+        // the daemon carries. The restriction to refs/heads/agent/<id> is deliberate and stays (see
+        // AgentRefMediator): what was wrong is that a branch outside it was ignored SILENTLY, which is
+        // byte-for-byte the same observation as an agent that has done nothing at all. Verification is the
+        // point the work is proposed as ready, so it is the point the difference has to be stated.
+        //
+        // This deliberately does NOT fast-forward agent/<id> onto whatever HEAD happens to be. See
+        // docs/design/agent-branch-confinement.md §4: the trust argument for auto-recovery is sound, but
+        // the daemon has no signal that the branch the agent is standing on is the branch it means to
+        // submit, and replacing a silent no-op with a silent yes-op keeps the property that made this
+        // defect invisible.
+        var alignment = _checkAgentBranch?.Invoke(repoHandle, agentId);
+        if (alignment is { Drifted: true })
+        {
+            var report = alignment.Describe(agentId);
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} verification REFUSED — {report}");
+            _audit.Append(new AuditEvent(AgentBranchGuard.DriftEvent, new Dictionary<string, string>
+            {
+                ["repo"] = repoHandle,
+                ["agent"] = agentId,
+                ["expected"] = alignment.ExpectedBranch,
+                ["actual"] = alignment.ActualBranch ?? "(detached HEAD)",
+                ["head"] = alignment.HeadSha ?? string.Empty,
+                ["agent_branch"] = alignment.AgentBranchSha ?? string.Empty,
+                ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            }));
+
+            // InvalidOperationException, like the no-jail refusal above: MergeQueueGrpcService maps it to
+            // FAILED_PRECONDITION carrying this text, so the operator reads the measurement rather than
+            // "Exception was thrown by handler".
+            throw new InvalidOperationException(report);
+        }
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);
