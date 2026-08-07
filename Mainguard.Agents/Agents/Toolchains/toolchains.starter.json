@@ -1,0 +1,98 @@
+{
+  "$comment": [
+    "The curated toolchain manifest. PRODUCT SOURCE, not user or repository input: a repository's",
+    ".mainguard/toolchain may name an `id` from this file and nothing else. It can never supply a URL,",
+    "a package list, a command or a version — that asymmetry is what keeps a repo-writable file from",
+    "becoming an install-time code-execution surface, and making the INSTALLED SET a human's choice",
+    "does not change it.",
+    "",
+    "Adding an entry: pin a version-addressed HTTPS tarball, paste the checksum UPSTREAM publishes",
+    "(never one computed from your own download — that is circular), and give it a probe that proves",
+    "the toolchain RUNS rather than that a file arrived. ToolchainManifestTests parses this file, so a",
+    "bad edit fails CI rather than a user's install."
+  ],
+
+  "toolchains": [
+    {
+      "id": "python-3",
+      "displayName": "Python 3",
+      "summary": "CPython 3.12 with pip — runs a repository's Python test suite and installs its dependencies from PyPI.",
+      "version": "3.12.13",
+
+      "$comment-payload": [
+        "python-build-standalone (astral-sh), the same distribution `uv` installs. Chosen over the",
+        "pinned nixpkgs for one measured reason: nixpkgs' python3 — which the agent base image already",
+        "bakes at /opt/toolchain/bin/python3 — ships WITHOUT pip, and `nix profile install` cannot",
+        "express `python3.withPackages (ps: [ps.pip])` as a flake attribute path. Verified in a real",
+        "container: `import pip` fails on the base image's interpreter and `apt` cannot fix it (the",
+        "rootfs is read-only). Without a package manager a Python repository can commit tests that can",
+        "never run, which is the defect this entry closes.",
+        "",
+        "These builds are also RELOCATABLE, which is what lets a toolchain be a read-only bind mount",
+        "instead of an image layer: sys.prefix is derived from the executable's own path at runtime.",
+        "Verified: extracted to an arbitrary directory and mounted read-only into the hardened jail, it",
+        "reports its own mount point as sys.prefix and pip resolves against it.",
+        "",
+        "sha256 is upstream's, from the release's SHA256SUMS asset. Refresh: bump the release tag and",
+        "the version, and paste the new line from that same SHA256SUMS file."
+      ],
+      "payloadUrl": "https://github.com/astral-sh/python-build-standalone/releases/download/20260623/cpython-3.12.13%2B20260623-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "sha256": "9fa869d69be54f6b8eeae64272fbd9bb0646e0e1a8da9d80e51ba5a3bee48930",
+      "stripComponents": 1,
+
+      "$comment-path": [
+        "The interpreter's own bin, then the per-agent user base's bin — that second entry is what puts",
+        "console scripts (`pytest`, `ruff`, `mypy`) on PATH after a project installs them, since the",
+        "toolchain itself is read-only and nothing can ever be installed into it."
+      ],
+      "pathEntries": [
+        "{toolchain}/bin",
+        "{cache}/python/userbase/bin"
+      ],
+
+      "$comment-environment": [
+        "PYTHONUSERBASE + PIP_USER send every `pip install` into the per-agent package cache: an ext4",
+        "tree outside /workspace (so `git add -A` cannot commit a dependency closure into the branch",
+        "under verification) and outside $HOME (a 256 MiB tmpfs that a real closure overruns). This is",
+        "the same treatment NUGET_PACKAGES already gets from PackageCachePolicy, and it is what makes a",
+        "read-only toolchain usable rather than merely safe.",
+        "",
+        "PIP_USER=1 is what lets a repository's verify command read `pip install -r requirements.txt`",
+        "with no Mainguard-specific flags. It is overridden by an explicit --target/--prefix and it is",
+        "refused inside a virtualenv, so a repository that builds its own venv must unset it; that is",
+        "documented in docs/design/python-toolchain.md rather than papered over.",
+        "",
+        "PYTHONDONTWRITEBYTECODE keeps __pycache__ out of the worktree — the tree under verification",
+        "must not gain untracked files that an agent's `git add -A` would then commit."
+      ],
+      "environment": {
+        "PYTHONUSERBASE": "{cache}/python/userbase",
+        "PIP_USER": "1",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      },
+
+      "$comment-probe": [
+        "Deliberately NOT `python3 --version`. Two reasons, both measured. First, the base image already",
+        "carries a python3 on PATH, so a bare version probe can pass while this toolchain is entirely",
+        "absent. Second, the defect being closed is a MISSING PIP, not a missing interpreter — a probe",
+        "that does not import pip would have reported the owner's broken environment as healthy. This",
+        "runs the toolchain's own interpreter by absolute path and imports pip in the same breath."
+      ],
+      "probe": {
+        "command": [
+          "{toolchain}/bin/python3",
+          "-c",
+          "import pip, sys; print(sys.version.split()[0] + ' pip ' + pip.__version__)"
+        ],
+        "expectedVersionSubstring": "3.12.13"
+      },
+
+      "installEgressHosts": [
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com"
+      ]
+    }
+  ]
+}

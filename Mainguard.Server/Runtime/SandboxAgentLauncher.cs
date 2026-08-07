@@ -168,6 +168,13 @@ public sealed class SandboxAgentLauncher
                 repoHandle, string.Join(",", toolchain.Ids), toolchain.ImageRef, toolchain.BaseDigest);
         }
 
+        // The runtime-mount half of the same declaration: toolchains a HUMAN installed into this
+        // environment, which reach the jail as a read-only bind mount rather than as an image layer.
+        // Checked HERE, before the container exists, for the same reason the layer is built here — and
+        // refused loudly for the reason stated above, which applies identically to a mount that is not
+        // there.
+        var mountedToolchainIds = await EnsureMountedToolchainsAsync(repoHandle, barePath, ct).ConfigureAwait(false);
+
         // agentKind → the CLI the user dynamically installed. Resolved BEFORE the worktree so an
         // unknown kind costs nothing; the jail still spawns without a launch command (the operator
         // gets a shell in a correct sandbox rather than a failed spawn), and the caller surfaces it.
@@ -253,7 +260,9 @@ public sealed class SandboxAgentLauncher
                 ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort),
                 // MG-43: the daemon-owned package cache for THIS agent, read-write at
                 // /var/cache/mainguard — on ext4, outside the worktree, outside the tmpfs $HOME.
-                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
+                PackageCachePath: packageCachePath,
+                ToolchainsRootPath: mountedToolchainIds.Count > 0 ? _environment.ToolchainsRootPath : null,
+                ToolchainIds: mountedToolchainIds), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
@@ -303,6 +312,84 @@ public sealed class SandboxAgentLauncher
 
         return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m), progress)
             .EnsureAsync(repoHandle, declaration, baseDigest, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The declared toolchains that are delivered as a read-only mount, checked to be actually installed
+    /// in this environment. Returns the ids the jail should carry; an empty list means the repo declared
+    /// none of them and no toolchain mount is attached.
+    ///
+    /// <para><b>Why this refuses instead of continuing.</b> The failure being prevented is the one the
+    /// owner hit: a repository declares Python, the jail starts without it, and the verify command dies
+    /// with <c>No module named pytest</c> — which reads like the agent wrote a broken test, not like the
+    /// environment is missing a toolchain. Verification is the gate that decides whether work may enter
+    /// the merge queue, so a jail that cannot run the repository's tests must fail as a PROVISIONING
+    /// problem, by name, with the action that fixes it. It must never produce a red verification.</para>
+    ///
+    /// <para>Note what is NOT here: an auto-install. A repository's declaration is not permission to
+    /// install software — it names a toolchain and a human decides whether this environment has it.
+    /// Installing on a repo's say-so would hand a repo-writable file the install-time execution the
+    /// closed catalog exists to deny it.</para>
+    /// </summary>
+    private async Task<IReadOnlyList<string>> EnsureMountedToolchainsAsync(
+        string repoHandle, string barePath, CancellationToken ct)
+    {
+        var declaration = RepoToolchainConfig.ReadMainBaseline(barePath, repoHandle);
+        if (declaration.IsEmpty)
+        {
+            return Array.Empty<string>();
+        }
+
+        var wanted = declaration.Ids
+            .Select(id => ToolchainCatalog.TryGet(id))
+            .Where(r => r is { Delivery: ToolchainDelivery.RuntimeMount })
+            .Select(r => r!.Id)
+            .ToList();
+
+        if (wanted.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var channel = _environment.Toolchains;
+        if (channel is null)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this substrate ('{_environment.SubstrateId}') cannot install toolchains, so the jail would "
+                + $"start without {string.Join(" and ", wanted)} — the tools this repository's verification "
+                + "command needs.");
+        }
+
+        var missing = new List<string>();
+        foreach (var id in wanted)
+        {
+            var entry = channel.Manifest.TryGet(id);
+            if (entry is null)
+            {
+                missing.Add(id);
+                continue;
+            }
+
+            var status = await channel.StatusAsync(entry, ct).ConfigureAwait(false);
+            if (!status.IsInstalled)
+            {
+                missing.Add($"{entry.DisplayName} ({entry.Id}) — {status.Detail}");
+            }
+        }
+
+        if (missing.Count > 0)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this repository declares {string.Join(", ", missing)}, which is not installed in this "
+                + "Mainguard environment. Install it in Settings → Toolchains and start the agent again. "
+                + "The jail was NOT started: a jail without the toolchain cannot run this repository's "
+                + "tests, and a verification that fails for that reason would look like failing code.");
+        }
+
+        _log.LogInformation(
+            "mounted toolchains ready: repo={Repo} ids={Ids} root={Root}",
+            repoHandle, string.Join(",", wanted), _environment.ToolchainsRootPath);
+        return wanted;
     }
 
     /// <summary>Best-effort teardown of a launched agent: remove the jail, then its MG-36 network
