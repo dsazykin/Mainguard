@@ -734,6 +734,14 @@
   chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in all five
   themes), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
+  `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
+  must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious
+  implementation returns 0 for), `DockerResourceSamplerProgressTests` (**the delivery race**, pinned
+  deterministically with a fake `IDockerClient` that reports through `IProgress` and returns immediately:
+  the first implementation used `Progress<T>`, which raises its callback ASYNCHRONOUSLY, so the awaited
+  call could finish while the value was still queued and the sampler reported "no reading returned" for a
+  container that answered — measured at 1721/2000 lost in isolation, and it passed locally against real
+  Docker while failing only on a loaded CI runner. Reinstating `Progress<T>` fails it 198/200),
   `Headless/ResourceMonitorStreamTests`, `Headless/ResourceMonitorHonestyTests` (**the two honesty
   properties of the Resources tab**: an unmeasured reading renders "—" while a measured zero still
   renders "0%" — the tab previously hard-coded 0 for everything, which is indistinguishable from an

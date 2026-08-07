@@ -626,7 +626,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (the seam the daemon join + the gRPC stream + the client projection are all driven through with
       KNOWN values end to end), `ContainerResourceSample` (**a null reading means NOT MEASURED, never
       zero** — the two are different facts and the UI renders them differently), `DockerResourceSampler`
-      (one-shot `stats?stream=false` per jail, parallel + bounded at `MaxConcurrentSamples`;
+      (one-shot `stats?stream=false` per jail, parallel + bounded at `MaxConcurrentSamples`, with the
+      reading taken through `SynchronousProgress<T>` — **never `Progress<T>`**, which raises its callback
+      asynchronously so the awaited call can complete while the value is still queued, losing a reading
+      the engine actually returned;
       **deliberately never `one-shot=true`**, which zeros `precpu_stats` so the CPU delta is uncomputable
       and a naive percentage reads a fabricated 0%), and `UnavailableContainerResourceSampler` (no engine
       ⇒ every agent explicitly unknown). `TryComputeCpuPercent`/`TryComputeMemoryBytes` are pure + unit

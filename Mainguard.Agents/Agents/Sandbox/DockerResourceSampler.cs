@@ -45,6 +45,25 @@ public interface IContainerResourceSampler
 }
 
 /// <summary>
+/// An <see cref="IProgress{T}"/> that runs its handler INLINE, on the thread that calls
+/// <see cref="Report"/>, instead of posting it elsewhere like <see cref="Progress{T}"/> does.
+///
+/// <para>Needed because Docker.DotNet delivers a one-shot stats reading through this callback and then
+/// returns: with <see cref="Progress{T}"/> the value is captured on a different thread at an unspecified
+/// later moment, so the awaiting code can observe "nothing arrived" for a call that succeeded. Inline
+/// delivery makes the reading visible by the time the await completes, by construction rather than by
+/// timing.</para>
+/// </summary>
+internal sealed class SynchronousProgress<T> : IProgress<T>
+{
+    private readonly Action<T> _handler;
+
+    public SynchronousProgress(Action<T> handler) => _handler = handler;
+
+    public void Report(T value) => _handler(value);
+}
+
+/// <summary>
 /// The sampler for a host with no reachable container engine: every agent is explicitly UNKNOWN. Used
 /// when the Docker client cannot even be constructed, so that case degrades to "not measured" like any
 /// other sampling failure instead of taking the daemon down — or, worse, reporting a fleet of zeros.
@@ -171,7 +190,13 @@ public sealed class DockerResourceSampler : IContainerResourceSampler
                 containerId,
                 // Stream = false, and deliberately NOT OneShot — see the class remarks.
                 new ContainerStatsParameters { Stream = false },
-                new Progress<ContainerStatsResponse>(r => Interlocked.CompareExchange(ref reading, r, null)),
+                // NOT Progress<T>: that type is specified to raise its callback ASYNCHRONOUSLY, posting
+                // to the captured SynchronizationContext or, when there is none, to the thread pool. The
+                // await below can therefore complete while the callback is still queued, leaving the
+                // reading null — reported as "no reading returned" for a container that answered
+                // perfectly. It is a race, so it wins on an idle laptop and loses on a loaded CI runner:
+                // exactly the shape of bug that reads as "works on my machine".
+                new SynchronousProgress<ContainerStatsResponse>(r => reading ??= r),
                 timeout.Token).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
