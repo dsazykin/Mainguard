@@ -48,6 +48,13 @@ Three projects in `Mainguard.slnx` (a `.slnx`, not `.sln`):
 - **No timing asserts in xUnit.** Perf-sensitive tests assert structure and *print* measurements (`[H1]`, `[H2]` tags); enforcement belongs to the future benchmark project (ADR-007, Hotspot Register [PERF-2]).
 - **UI changes get a render-harness pass** where one exists (`Mainguard.Tests/Headless/`) — they render the real view in all five themes and write PNGs to `artifacts_headless/`.
 - Run `dotnet test` before handing anything back; run the focused class while iterating.
+- **If an agent jail is running, use `dotnet test --filter "Category!=RequiresDocker"`.** A plain
+  `dotnet test` silently includes the Docker suite whenever the daemon pings and
+  `mainguard-agent-base:latest` exists, and `DockerSuiteFixture` sweeps `mainguard-*` containers and
+  networks on every construction *and* dispose. Note there are **two Docker daemons** — tests run
+  against Docker Desktop, real jails live in MainguardEnv's own engine — and both hold containers
+  named `mainguard-…`, so `docker ps` alone cannot tell you which you are looking at. Details in
+  `docs/review/phase-1-hands-on.md`.
 
 ## Commit & PR etiquette
 

@@ -70,8 +70,15 @@ don't try to pick it out of a bare `ls` (you get a multi-column list of 64-char 
 tell them apart). Ask each mirror which repo it is:
 
 ```powershell
-wsl -d MainguardEnv -u root -- bash -c 'for g in /home/mainguard/mainguard/repos/*.git; do h=$(basename "$g" .git); printf "%s  %s\n" "$h" "$(git --git-dir="$g" config --get remote.origin.url)"; done'
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/repos | ForEach-Object {
+    $u = wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$_ config --get remote.origin.url
+    "{0}  {1}" -f ($_ -replace '\.git$',''), $u
+}
 ```
+
+> PowerShell drives the loop deliberately. A bash loop inside `wsl -- bash -c '…'` gets mangled on the
+> way through — PowerShell eats the backslash in `\n`, and the nested quotes break the script. Every
+> command here avoids embedding shell syntax in a PowerShell string for that reason.
 
 Output looks like:
 
@@ -82,16 +89,73 @@ f0fa0539692f…  /mnt/c/Users/yikes/Code/GitLoom
 
 Pick the line matching your scratch repo.
 
-Set it once for the commands below:
+Set it once for the commands below — and **re-set it in every new PowerShell window**, because it
+does not persist:
 
 ```powershell
 $H = "<the 64-char hash>"
+```
+
+**Check it took.** PowerShell expands an undefined variable to *empty* rather than erroring, so an
+unset `$H` silently turns `…/repos/$H.git` into `…/repos/.git` and you get a confusing failure about
+the wrong path — or worse, a command that succeeds against the wrong target:
+
+```powershell
+if ($H -notmatch '^[0-9a-f]{64}$') { Write-Error 'Set $H to your repo hash first' }
 ```
 
 > `dotnet build` also publishes the in-VM daemon; `DaemonUpdater` deploys it when the app launches.
 > It **refuses downgrades**, so if you've run a phase-2/3 build, going back to `phase2` may leave the
 > newer daemon in place. `wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 5` shows what's
 > actually running.
+
+### Running the test suite while an agent is up — read this first
+
+Three things bite here, all learned the hard way.
+
+**1. An unfiltered solution run silently includes the Docker suite.** `dotnet test Mainguard.slnx`
+executes the `RequiresDocker` classes whenever the daemon pings *and* `mainguard-agent-base:latest`
+inspects — `DockerAvailability.Probe()` returns `Ready` on those two conditions alone, so
+`[RequiresDockerFact]` never sets `Skip`. Nothing announces it. If you only want the fast tests:
+
+```powershell
+dotnet test Mainguard.slnx --filter "Category!=RequiresDocker"
+```
+
+Prefer that whenever an agent is running — the Docker suite is slow, competes for the engine, and
+`DockerSuiteFixture` sweeps `mainguard-*` containers and networks on **every** construction *and*
+dispose, not once per run. A single pre-flight "nothing is running" check is worthless against that.
+
+**2. There are TWO Docker daemons, and they are indistinguishable by container name.**
+
+| | engine | what lives there |
+|---|---|---|
+| **Docker Desktop** | 29.4.3 | what `dotnet test` uses from Ubuntu — **test containers only** |
+| **MainguardEnv** | 20.10.24 | what `mainguardd` uses — **the real agent jails** |
+
+`mainguardd` runs *inside* MainguardEnv and talks to its own socket, so a real jail is never in
+Docker Desktop. But both hold containers named `mainguard-…`, so `docker ps` from Ubuntu shows the
+test engine while the jail you care about is somewhere else entirely.
+
+**Any diagnosis must say which engine it is looking at**, or it is guesswork. Four separate
+investigations concluded a live jail had been destroyed when the container in question was a test
+artifact in the other daemon:
+
+```powershell
+docker ps                                                  # Docker Desktop — tests
+wsl -d MainguardEnv -u root -- docker ps                   # MainguardEnv — real jails
+```
+
+**3. A severed jail looks like a provider outage.** If an agent suddenly cannot reach the model API
+or a package registry, check its network attachment before believing it is an agent bug:
+
+```powershell
+wsl -d MainguardEnv -u root -- docker inspect <container> --format "{{json .NetworkSettings.Networks}}"
+```
+
+`{}` means it has no network. Stop and re-spawn the agent — the daemon rebuilds the proxy and the
+segment on the next spawn (`EnsureReadyAsync` / `EnsureAgentSegmentAsync`). Do **not** hand-recreate
+them: the names and subnets are the daemon's to assign, and guessing makes it worse.
 
 ---
 
@@ -271,7 +335,7 @@ For each step: what you did, what you expected, what happened. Two things specif
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p1
 Remove-Item -Recurse -Force $HOME\mg-testrepo
-wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
+wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```
 
 Leaving the VM's mirror and agent repos is harmless — they are keyed by repo hash and a deleted
