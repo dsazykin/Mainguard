@@ -57,13 +57,18 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// <param name="cliCredentials">The CLI login-state files to RESTORE into the jail's tmpfs
     /// <c>$HOME</c> at spawn (the host-keychain half of the credentialPaths round-trip). Null keeps the
     /// jail's home empty, which is every other suite's expectation.</param>
+    /// <param name="cliSettings">The CLI settings files to RESTORE into the jail (the per-repo half of
+    /// the settingsPaths round-trip — the user's approved-command list). Null is what an UNTRUSTED jail
+    /// is spawned with, and it is every other suite's expectation.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
         string? packageCachePath = null, CancellationToken ct = default,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
         => SpawnFromImageAsync(
-            ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct, cliCredentials);
+            ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct,
+            cliCredentials, cliSettings);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -74,7 +79,8 @@ public sealed class SandboxFixture : IAsyncDisposable
         string imageRef, string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
         string? packageCachePath = null, CancellationToken ct = default,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
@@ -98,7 +104,8 @@ public sealed class SandboxFixture : IAsyncDisposable
                 Secrets: secrets,
                 AgentUid: agentUid,
                 SupervisorUid: supervisorUid,
-                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
+                PackageCachePath: packageCachePath,
+                CliSettingsFiles: cliSettings), ct).ConfigureAwait(false);
 
             _containerIds.Add(handle.ContainerId);
             return handle;

@@ -11,6 +11,23 @@ namespace Mainguard.Agents.Agents.Sandbox;
 /// and lives only in the tmpfs home; the durable copy is the host OS keychain.</summary>
 public sealed record SandboxCredentialFile(string HomeRelativePath, byte[] Content);
 
+/// <summary>
+/// One CLI SETTINGS file to restore into a jail at spawn — the permission allowlist above all (e.g.
+/// <c>.claude/settings.local.json</c> under <see cref="Adapters.AdapterSettingsRoot.Workspace"/>).
+///
+/// <para>Not a credential and deliberately not carried on <see cref="SandboxSecrets"/>: its durable
+/// home is an ordinary per-repository JSON file under the Mainguard data root, not the OS keychain.
+/// It still travels over exec <b>stdin</b> like every other file written into a jail, because
+/// <c>docker cp</c> writes UNDER the tmpfs <c>$HOME</c> and reports success while the container sees
+/// nothing.</para>
+///
+/// <para><paramref name="Root"/> selects the tree and <paramref name="RelativePath"/> MUST already
+/// have passed <see cref="Adapters.AdapterManifest.IsHomeRelativeFilePath"/> — the engine resolves it
+/// under the chosen root without further checks.</para>
+/// </summary>
+public sealed record SandboxSettingsFile(
+    Adapters.AdapterSettingsRoot Root, string RelativePath, byte[] Content);
+
 /// <summary>The secrets delivered to a sandbox on spawn — never through <c>Env</c>/argv/disk.</summary>
 /// <param name="AgentEnv">The P2-01 credential env-file entries, written to the agent-owned 0400 tmpfs.</param>
 /// <param name="OobKey">The OOB session HMAC key <c>K</c>, written to the supervisor-owned 0400 tmpfs.</param>
@@ -49,6 +66,10 @@ public sealed record SandboxSecrets(
 /// <see cref="DockerSandboxEngine"/> proves in the started container that the mount is really there and
 /// really writable before handing the jail back — see <see cref="PackageCachePolicy.WritabilityProbe"/>
 /// for why the daemon's own record of the request is not evidence about the container.</param>
+/// <param name="CliSettingsFiles">The CLI's saved settings (the adapter's declared
+/// <c>settingsPaths</c>) to restore into the jail's throwaway trees, write-if-absent exactly like the
+/// credential restore. Null/empty = none, which is what an UNTRUSTED jail always gets: an external
+/// pull request's code must never inherit the user's approved-command list.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -64,7 +85,8 @@ public sealed record SandboxSpawnRequest(
     string? NetworkName = null,
     string? ProxyUrl = null,
     string? AgentRepoPath = null,
-    string? PackageCachePath = null);
+    string? PackageCachePath = null,
+    IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

@@ -521,7 +521,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
       probe; defaults true — an engine/fake with no separate image store has nothing to preflight, the
       Docker impl really inspects)/**`ImageDigestAsync` (MG-27 — the immutable `sha256:` content digest a
-      mutable ref resolves to; defaults null)** + `SandboxSpawnRequest`/`SandboxSecrets`/`SandboxHandle`;
+      mutable ref resolves to; defaults null)** + `SandboxSpawnRequest`/`SandboxSecrets`/`SandboxHandle`
+      + **`SandboxSettingsFile(Root, RelativePath, Content)`** (the CLI-settings restore payload, carried
+      on `SandboxSpawnRequest.CliSettingsFiles` rather than on `SandboxSecrets` because settings are NOT
+      secrets — their durable home is a per-repo JSON file, not the OS keychain);
       **MG-36:** `SandboxSpawnRequest` also carries the optional per-agent `NetworkName`/`ProxyUrl`) and
       `IEgressPolicy.cs` (`Allowlist`/`NetworkName`/`ProxyUrl`/`EnsureReadyAsync`/`Evaluate` + the
       **MG-36** `EnsureAgentSegmentAsync`/`RemoveAgentSegmentAsync` →
@@ -585,7 +588,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       creates its own file in the tmpfs directory Docker mounted owned by it. `HasOwnedSecretDirsAsync`
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
-      resurrecting the same EPERM for every container that outlived the upgrade) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      resurrecting the same EPERM for every container that outlived the upgrade.
+      `RestoreCliCredentialsAsync`/**`RestoreCliSettingsAsync`** run on BOTH the create and the reuse
+      paths, write-if-absent as the AGENT uid over exec stdin — `docker cp` would write UNDER the tmpfs
+      `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
+      older copy clobbering a live jail's fresher tokens or approvals. **`SettingsRootPath(root)`** is the
+      ONE `AdapterSettingsRoot`→in-jail-directory mapping, shared with the harvest side so the two legs of
+      the round trip cannot drift apart. **`ExcludeRestoredSettingsFromGitAsync`** appends a restored
+      WORKSPACE settings path to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and
+      the keep-alive cycle's dirty-tree path is `git add -A && git commit`, so without this the feature
+      would commit the user's permission allowlist into their repository and merge it to main; the
+      exclude file lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is
+      touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -1104,7 +1118,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       non-64-hex `sha256`, a duplicate id, a `platformBinary` with no candidate sources or an
       absolute/`..`-escaping path (`BadPlatformBinary` — those paths are handed to `ln`/`cp` in the VM),
       and — critically — an **unpinned version**
-      (`latest`/`@latest`/a range → refused; `@latest` can't even parse)).
+      (`latest`/`@latest`/a range → refused; `@latest` can't even parse). Also validates
+      `settingsPaths`: an unknown `root`, an escaping path, a duplicate entry, or a path shared with
+      `credentialPaths` are all refused — the last because credentials go to the OS keychain and
+      settings to a plaintext per-repo file, so one path in both lists would divert a credential).
+    - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
+      `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
+      re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
+      per-agent worktree — both wiped every spawn, and the workspace one is where claude-code records
+      "don't ask again"), `AdapterSettingsPath.TryParseRoot`/`SpellRoot`/`IsWellFormed` (an unknown root
+      is refused, never defaulted — guessing would decide whether an allowlist lands in the throwaway
+      home or the user's checkout), and `AdapterSettingsPolicy.MaxFileBytes` (256 KiB ceiling on a
+      harvest: the jail's occupant can write these files). Scope is PER REPOSITORY —
+      see [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
       → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
@@ -1149,7 +1175,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       probe, so a marker means 'runnable' — read **fresh per call** (installs happen while the daemon
       runs; caching would make a new CLI unlaunchable until restart) to answer `TryGetLaunch(agentKind)` →
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
-      used to ignore).
+      used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
+      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI

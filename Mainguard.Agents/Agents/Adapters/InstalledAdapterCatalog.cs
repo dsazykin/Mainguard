@@ -38,7 +38,13 @@ public sealed record InstalledAdapterMarker(
     /// <see cref="AdapterSpec.ModelHost"/>), carried across the host/VM boundary so the spawn path can
     /// record the agent's gateway upstream binding. Null on markers written before this field existed —
     /// re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("modelHost")] string? ModelHost = null)
+    [property: JsonPropertyName("modelHost")] string? ModelHost = null,
+    /// <summary>The non-credential configuration files this CLI keeps (see
+    /// <see cref="AdapterSpec.SettingsPaths"/>) — the ONLY entries the daemon will restore into /
+    /// harvest from a jail's throwaway trees, so a permission grant survives the next spawn. Client-
+    /// supplied entries are filtered against this list exactly as credential paths are. Null on markers
+    /// written before this field existed — re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 

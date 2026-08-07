@@ -782,6 +782,20 @@
     in-app Stop ever wrote a `cli_login_*` entry — app close, a daemon/VM restart or a crash lost the
     login and the user re-authenticated inside the jail every session. Pinned by
     `CliLoginHarvestWiringTests` (the caller) and `CliLoginRoundTripDockerTests` (the round-trip).
+    `CliSettingsStore.cs` — the same round-trip for a CLI's **settings**, and deliberately a DIFFERENT
+    store: one plain JSON file per `(repo handle, adapter id)` under
+    `<data root>/cli-settings/`, not a keyring entry. Logins stay keychain-only because they are
+    credentials; settings are configuration the owner should be able to read, audit and delete, and the
+    scope is **per repository** because a permission allowlist is a standing grant of execution —
+    approving a command in one repo must not pre-approve it in another. `Load`/`Save` are total (a
+    corrupt or missing file ⇒ empty ⇒ the CLI asks again, never a failed spawn), `Save` merges rather
+    than replaces (a file one session did not rewrite must not erase a working allowlist), a blank scope
+    is never a wildcard, and scope segments that are not filename-safe are HASHED rather than sanitised
+    so two repos can never collapse onto one directory. `DaemonBackedOrchestrator` loads it on
+    `StartCoordinatorAsync` (`SpawnAgent.cli_settings`) and `PersistHarvestedSettings` files every
+    harvest under the outcome's OWN `RepoHandle` — the sweep walks every agent on the daemon, so filing
+    by "whichever repo is open" is exactly how one repo's allowlist would land under another's name.
+    See [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     `VmExitGuard.cs` — the pure full-exit-warning decision
     (`ShouldConfirm(stopVmOnExit, liveAgents)`) + dialog copy: a VM-stopping full exit under live agents
     confirms first; `App.RequestFullExitGuardedAsync` is the guarded path every user-facing exit takes

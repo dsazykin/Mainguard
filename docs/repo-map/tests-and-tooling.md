@@ -621,6 +621,32 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/AdapterSettingsPathTests.cs`** — the manifest half of the CLI-settings round trip:
+  the bundled `claude-code` adapter really declares BOTH `settingsPaths` roots (a field nothing declares
+  is a feature nobody gets, and a home-only declaration would persist a file the CLI never writes), every
+  bundled entry passes the shape gate, an unknown/miscased `root` is refused rather than defaulted, a
+  path that escapes its root is refused, and — the storage boundary — a path listed in BOTH
+  `credentialPaths` and `settingsPaths` is refused, because credentials go to the OS keychain and
+  settings to a plaintext per-repo file.
+- **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
+  `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
+  per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
+  harvest never clearing a good allowlist, a corrupt file meaning "no settings" rather than a crash, the
+  store being a readable file the owner can find and delete, and two non-filename-safe scopes still
+  getting different files (a naive sanitiser would merge two repos' allowlists). Temp root throughout.
+- **`Mainguard.Server.Tests/CliSettingsBoundaryTests.cs`** — the two **trust gates** on the CLI-settings
+  round trip (the owner-reported "every new agent makes me re-approve everything"), asserted through the
+  SHIPPED `AgentSpawnService` resolved from the daemon's own container. **IN:**
+  `AnUntrustedSpawn_InheritsNoGrants_EvenWhenTheRepositorysCacheIsWarm` warms the per-(repo, kind)
+  fallback cache with a real session first, then spawns the untrusted head the way
+  `ExternalPrWorkerHost` does — so the test fails unless the `withoutHostCredentials` gate itself
+  refuses, not merely because the caller passed nothing. An inherited allowlist is inherited execution.
+  **OUT:** `StoppingAnUnattendedWorker_PersistsNothing_EvenThoughTheFileIsRightThere` — the fake jail
+  HAS the settings file (the attended test above harvests it from the same engine), so an empty result
+  can only be `CliSettingsHarvestPolicy`. Plus the declared-path filter (a right-path/wrong-root entry
+  and an undeclared `.ssh/authorized_keys` are both dropped) and the 256 KiB harvest ceiling. Docker-free:
+  a fake substrate whose sandbox engine RECORDS every `SandboxSpawnRequest`, so what actually reaches a
+  jail is observable. The real-jail leg is `Agents/CliSettingsRoundTripDockerTests.cs`.
 - **`Mainguard.Server.Tests/MergeExecutionPathTests.cs`** — the GUI Merge button actually merges,
   end to end through the real composition (in-proc daemon + shipped `DaemonClient` + shipped
   `DaemonBackedOrchestrator` + a real git repo on disk). **Asserts repository state, never RPC
@@ -1303,7 +1329,24 @@
   the harvest exec running as the agent uid against a 0600 file, and the exec-stdin restore that
   `docker cp` cannot do (it writes UNDER the tmpfs and reports success) — are invisible to a fake
   engine. The CALLER that drives this in the shipped app is pinned separately by
-  `CliLoginHarvestWiringTests`), `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
+  `CliLoginHarvestWiringTests`),
+  **`Agents/CliSettingsRoundTripDockerTests.cs`** (`[RequiresDockerFact]` — the **CLI-settings round
+  trip**, i.e. "a command approved in one agent is still approved in the next". A per-run nonce is
+  written into jail #1 at BOTH declared roots — `/workspace/.probe/settings.local.json` (where
+  claude-code records "don't ask again") and `$HOME/.probe/settings.json` —
+  `SandboxAgentLauncher.HarvestCliSettingsAsync` reads them back, the REAL `CliSettingsStore` (temp
+  root, never the owner's) persists them per repo, jail #1 is removed (the tmpfs home AND the worktree
+  both go), and a FRESH jail spawned from the store is probed with a sentinel-framed `cat` — the
+  assertion is made **inside the second container**, because "a file was written host-side" is a
+  different claim. Two more legs: a jail given no settings really has none in-container (the untrusted
+  posture); the reuse path is write-if-absent (a live jail's fresher approvals are never clobbered by
+  the stored copy); and
+  `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` makes `/workspace` a REAL git
+  repository and asserts `git status --porcelain` is empty *while the restored file is present* — the
+  keep-alive cycle's dirty-tree path is `git add -A && git commit`, so an unignored restore would put
+  the user's permission allowlist into their own history. The gates that decide WHEN any of this runs
+  are `CliSettingsBoundaryTests`),
+  `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
   proceeds to the engine; a missing `mainguard-agent-base`/`mainguard-egress-proxy` answers
   `FailedPrecondition` naming exactly that image + the repair BEFORE any worktree/jail work — the
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
