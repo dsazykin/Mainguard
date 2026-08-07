@@ -379,8 +379,22 @@ public sealed class MergeQueue : IMergeQueue
                 throw new InvalidOperationException($"A verification for '{agentId}' is already in flight.");
             }
 
-            // Transition into Verifying (legal from Working / StaleVerified / Verifying-resume).
-            SetStateLocked(agentId, WorkerMergeState.Verifying);
+            try
+            {
+                // Transition into Verifying (legal from Working / StaleVerified / Verifying-resume).
+                SetStateLocked(agentId, WorkerMergeState.Verifying);
+            }
+            catch
+            {
+                // The entry went terminal (a human discard) between the caller deciding to verify and this
+                // lock, so the transition is illegal and this call is over. Undo the in-flight mark on the
+                // way out: leaving it would make IsVerificationInFlight answer TRUE forever for an entry
+                // with no run — which is the same "the row says an activity that is not happening" defect
+                // the restart resume exists to end, and nothing ever clears it because every exit path that
+                // removes an id from _verifying is downstream of this throw.
+                _verifying.Remove(agentId);
+                throw;
+            }
         }
 
         VerificationRecord record;
@@ -934,6 +948,17 @@ public sealed class MergeQueue : IMergeQueue
                 continue;
             }
 
+            // The probe blocks on the container runtime (up to ten seconds in the daemon), which is ample
+            // room for a human to discard the entry or the intake to cancel it. Re-read before committing
+            // to a run: without this the entry is reported as re-run and RunVerificationAsync throws an
+            // illegal-transition exception into the swallow below, so the report would name a run that
+            // never happened. Still a check-then-act — RunVerificationAsync takes the lock itself — which
+            // is why that method also undoes its in-flight mark when the transition is refused.
+            if (!StillInterrupted(agentId))
+            {
+                continue;
+            }
+
             reRun.Add(agentId);
             log?.Invoke(
                 $"restart resume repo={_repoHash} agent={agentId} — re-running the verification the "
@@ -966,6 +991,15 @@ public sealed class MergeQueue : IMergeQueue
         catch (Exception)
         {
             return false;
+        }
+    }
+
+    // Is this entry still the thing the pass measured — a Verifying row with no run behind it?
+    private bool StillInterrupted(string agentId)
+    {
+        lock (_gate)
+        {
+            return GetStateLocked(agentId) == WorkerMergeState.Verifying && !_verifying.Contains(agentId);
         }
     }
 

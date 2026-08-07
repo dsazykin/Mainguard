@@ -90,7 +90,9 @@
   neither action appears on `IMergeQueue`; plus the **two-armed restart resume** — jail alive re-runs and
   reaches `Verified`, jail gone returns the entry to `Working` having executed nothing and audited
   `verification_restart_resume outcome=stranded` rather than a human's `stalled_verification_cleared`,
-  and a genuinely in-flight run is skipped by both arms),
+  and a genuinely in-flight run is skipped by both arms; plus the discard-wins-the-race pair — a discard
+  landing inside the jail probe is not reported as re-run, and `RunVerificationAsync` on an entry that went
+  terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`),
   `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
   older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
   the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake

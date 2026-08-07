@@ -961,7 +961,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `outcome` field (`rerun`/`stranded`) — deliberately NOT `stalled_verification_cleared`, whose `by`
       field names a person. `BeginResumeAfterRestart` runs a pass on a background task and publishes it on
       `LastResume` (the `LastCascade` posture: tests await it, production fires and forgets), because the
-      only production caller is inside a gRPC handler and a pass runs whole test suites.
+      only production caller is inside a gRPC handler and a pass runs whole test suites. The pass re-reads
+      each entry's state after the (Docker-blocking) probe, so a discard landing in that window is not
+      reported as a run; and `RunVerificationAsync` now **undoes its `_verifying` mark when the
+      `→ Verifying` transition is refused** — it marked first and transitioned second, so an illegal
+      `Discarded → Verifying` left the id in the in-flight set permanently and `IsVerificationInFlight`
+      answered true forever for an entry with no run (this subsystem's own defect shape, since every path
+      that removes an id is downstream of that throw).
       `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2

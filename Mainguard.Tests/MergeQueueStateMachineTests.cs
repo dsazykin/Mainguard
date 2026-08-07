@@ -347,6 +347,76 @@ public class MergeQueueStateMachineTests
     }
 
     /// <summary>
+    /// The human wins a race with the resume. The jail probe blocks on the container runtime — ten seconds
+    /// in the daemon — which is ample room for a discard to land, and the resume runs on a background task
+    /// whose exceptions nobody sees.
+    ///
+    /// <para>Two things must hold, and neither did before the guard: the report must not name a run that
+    /// never happened, and <c>IsVerificationInFlight</c> must not be left answering TRUE forever. The
+    /// second is the nastier one — <c>RunVerificationAsync</c> adds to the in-flight set and THEN attempts
+    /// the transition, so an illegal <c>Discarded → Verifying</c> throws with the id already marked, and
+    /// every path that would remove it is downstream of the throw. That is this subsystem's own defect
+    /// shape (a row claiming an activity that is not happening) reintroduced by its fix.</para>
+    /// </summary>
+    [Fact]
+    public async Task Restart_WhenTheEntryIsDiscardedWhileTheJailProbeRuns_DoesNotRunIt_AndLeavesNoPhantomInFlight()
+    {
+        var store = new InMemoryMergeQueueStore();
+        store.Save(new Mainguard.Git.Models.MergeQueueRow
+        {
+            RepoHash = "repo",
+            AgentId = "a",
+            State = WorkerMergeState.Verifying.ToString(),
+            UpdatedUtc = DateTime.UtcNow,
+        });
+
+        var ran = 0;
+        MergeQueue queue = null!;
+        queue = new MergeQueue(
+            "repo", "sha0", store, new InMemoryVerificationStore(),
+            (id, ct) =>
+            {
+                Interlocked.Increment(ref ran);
+                return Task.FromResult(new VerificationRecord(id, "sha0", true, "l", "c", "h", DateTimeOffset.UnixEpoch));
+            });
+
+        // The probe is where the daemon blocks on Docker; the human's discard lands inside it.
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: id =>
+        {
+            Assert.True(queue.TryDiscard(id, "uid:1000", "its agent is gone", out var refusal), refusal);
+            return true; // ...and the jail really is up, so this is the arm that would have re-run it.
+        });
+
+        Assert.Equal(0, ran);
+        Assert.Empty(report.ReRun); // not reported as re-driven — nothing was
+        Assert.Empty(report.Stranded);
+
+        // The human's decision stands, and nothing claims to be verifying it.
+        Assert.Equal(WorkerMergeState.Discarded, queue.GetState("a"));
+        Assert.False(queue.IsVerificationInFlight("a"));
+    }
+
+    /// <summary>
+    /// The same leak, asserted directly on <see cref="MergeQueue.RunVerificationAsync"/>, because the guard
+    /// lives there and the resume is only one of its callers (the stale cascade's auto re-queue and the
+    /// Verify RPC reach it too).
+    /// </summary>
+    [Fact]
+    public async Task RunVerification_OnAnEntryThatWentTerminal_ThrowsWithoutLeavingItMarkedInFlight()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+        Assert.True(h.Queue.TryDiscard("a", "uid:1000", "", out var refusal), refusal);
+
+        await Assert.ThrowsAsync<InvalidMergeStateTransitionException>(
+            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
+
+        Assert.False(h.Queue.IsVerificationInFlight("a"));
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("a"));
+    }
+
+    /// <summary>
     /// A resume must not touch a verification that is genuinely running. The in-flight set is the only
     /// thing that tells the two apart, and re-entering <c>RunVerificationAsync</c> for a live run would
     /// throw "already in flight" out of a background task nobody awaits.
