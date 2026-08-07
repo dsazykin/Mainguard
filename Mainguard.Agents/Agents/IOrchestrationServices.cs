@@ -33,12 +33,36 @@ public interface IAgentService
     Task EndAgentAsync(string agentId);
 }
 
-/// <summary>The P2-10 queue, UI-facing shape (states + gate + human merge).</summary>
+/// <summary>
+/// What a verification attempt did, phrased for display. <paramref name="Ran"/> distinguishes the one
+/// thing the merge decision rests on: <i>the run never started</i> (no live jail, no configured test
+/// command, no active repo — <paramref name="Reason"/> says which) versus <i>the run happened and the
+/// branch's tests decided it</i>. A genuinely failing suite is <c>Ran: true, Passed: false</c> — a
+/// result, not an error — and must never be rendered as a provisioning problem.
+/// </summary>
+public sealed record VerificationOutcome(bool Ran, bool Passed, string Reason);
+
+/// <summary>The P2-10 queue, UI-facing shape (states + gate + verification trigger + human merge).</summary>
 public interface IMergeQueueService
 {
     string MainSha { get; }
     IReadOnlyList<QueueEntry> GetQueue();
     bool CanMerge(string agentId, out string reason);
+    /// <summary>
+    /// Asks the daemon to verify <paramref name="agentId"/>'s branch <b>now</b>, in that agent's own jail.
+    ///
+    /// <para><b>This is a trigger, not an implementation.</b> Every decision — the Verifying transition, the
+    /// jail execution, the immutable record, the Verified-or-back-to-Working outcome — belongs to
+    /// <c>MergeQueue.RunVerificationAsync</c> on the daemon, and this seam only asks for it. Callers must not
+    /// re-implement any part of that sequence beside it: an automatic caller (phase 2's "the worker says it
+    /// is ready") drives the same daemon method and therefore gets identical gates, identical jail
+    /// execution, and identical state transitions.</para>
+    ///
+    /// <para>Verifying does <b>not</b> merge and does not weaken any gate. A passing run only moves the
+    /// branch to <c>Verified</c>; <see cref="CanMerge"/> still has to agree before <see
+    /// cref="ConfirmMergeAsync"/> is reachable.</para>
+    /// </summary>
+    Task<VerificationOutcome> RunVerificationAsync(string agentId);
     /// <summary>
     /// The human foreground merge; fires the NotifyMainMoved stale cascade.
     /// <para>Returns <see cref="MergeOutcome"/> rather than a bare task because a merge that landed is not

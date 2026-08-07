@@ -5,6 +5,29 @@
              x:Class="Mainguard.Agents.UI.Views.ControlCenterView"
              x:DataType="vm:ControlCenterViewModel">
 
+  <UserControl.Styles>
+    <!-- The panel seams. Rest state is the same BorderHairline the other seven GridSplitters in the
+         shell draw; pointer-over / drag / keyboard-focus lift it to the accent so the boundary
+         ANNOUNCES that it can be dragged (the reported bug was not just "it doesn't resize" but
+         "there is no handle to grab"). Both ends are DynamicResource tokens that exist in all five
+         themes, so Daylight Loom — a LIGHT theme — gets the same visible seam as the dark ones
+         instead of a handle that vanishes into the panel. -->
+    <Style Selector="GridSplitter.PanelSeam">
+      <Setter Property="Background" Value="{DynamicResource BorderHairline}"/>
+      <!-- Focusable so the seam is reachable by Tab; GridSplitter drives KeyboardIncrement off arrow keys. -->
+      <Setter Property="Focusable" Value="True"/>
+    </Style>
+    <Style Selector="GridSplitter.PanelSeam:pointerover">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+    </Style>
+    <Style Selector="GridSplitter.PanelSeam:pressed">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+    </Style>
+    <Style Selector="GridSplitter.PanelSeam:focus">
+      <Setter Property="Background" Value="{DynamicResource AccentBrush}"/>
+    </Style>
+  </UserControl.Styles>
+
   <!-- The coordinator surface hosted inside MainWindow's content area (revised design,
        2026-07-11): the section rail picks WHAT is focused (coordinator vs an agent); the
        workspace layout preset picks HOW it is arranged — Flight Deck (queue rail right,
@@ -24,7 +47,18 @@
       </StackPanel>
     </Border>
 
-    <Grid Grid.Row="1" ColumnDefinitions="Auto,*,8,300">
+    <!-- Column 2 used to be a literal 8px gap and column 3 a hard-coded 300px, so EVERY extra pixel
+         of window width went to the center pane and the merge queue stayed 300px forever — the
+         reported "window extended, still can't see the text". Column 3 is proportional now (it grows
+         with the window, bounded so it never eats the terminal or shrinks to nothing) and column 2 is
+         a real GridSplitter, so the boundary can also be dragged. -->
+    <Grid Grid.Row="1">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="3*" MinWidth="320"/>
+        <ColumnDefinition Width="Auto"/>
+        <ColumnDefinition Width="*" MinWidth="280" MaxWidth="640"/>
+      </Grid.ColumnDefinitions>
 
       <!-- The coordinator is driven from its own inline terminal now (not a bespoke chat panel); the
            CoordinatorPanelView / ICoordinatorService plumbing is kept for a possible future surface but
@@ -182,13 +216,34 @@
         </Panel>
       </Border>
 
+      <!-- the terminal ↔ merge-queue seam -->
+      <GridSplitter Grid.Column="2" Classes="PanelSeam" Width="6" Margin="1,0"
+                    ResizeDirection="Columns" Cursor="SizeWestEast"
+                    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"/>
+
       <!-- right rail: the merge queue (+ telemetry beneath it on Flight Deck) -->
-      <Grid Grid.Column="3" RowDefinitions="*,Auto">
-        <Border Grid.Row="0" Background="{DynamicResource SurfacePanel}" CornerRadius="12"
+      <Grid Grid.Column="3">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="*" MinHeight="160"/>
+          <RowDefinition Height="Auto"/>
+          <!-- the telemetry row; resized by TelemetrySeam, collapsed by the code-behind when hidden -->
+          <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <Border Grid.Row="0" MinHeight="160" Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
           <views:QueueRailView DataContext="{Binding Queue}"/>
         </Border>
-        <Border Grid.Row="1" Height="240" Margin="0,8,0,0" IsVisible="{Binding IsFlightDeck}"
+        <!-- the queue ↔ telemetry seam. Same class of bug as the column above: telemetry was pinned at
+             Height="240" with no way to give the queue more room on a short window. The row starts Auto,
+             so the card's MinHeight sets the resting size and a hidden card collapses the row to zero;
+             the splitter then takes over. NOTE the row only STAYS Auto until the first drag — after that
+             the splitter has rewritten it to pixels, and the collapse-on-hide is maintained by
+             ControlCenterView.axaml.cs, not by this markup. -->
+        <GridSplitter Grid.Row="1" Classes="PanelSeam" Height="6" Margin="0,4"
+                      ResizeDirection="Rows" Cursor="SizeNorthSouth"
+                      IsVisible="{Binding IsFlightDeck}"
+                      HorizontalAlignment="Stretch" VerticalAlignment="Center"/>
+        <Border Grid.Row="2" x:Name="TelemetryCard" MinHeight="180" MaxHeight="560" IsVisible="{Binding IsFlightDeck}"
                 Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
           <views:TelemetryPanelView DataContext="{Binding Telemetry}"/>

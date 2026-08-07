@@ -60,7 +60,24 @@
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
   coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
-  states, PNGs to `artifacts_headless/`; the **P2-10 suite** — `MergeQueueStateMachineTests`
+  states, PNGs to `artifacts_headless/`;
+  **`Headless/ControlCenterPanelSizingRenderHarness.cs`** — the Control Center's panel *sizing*, which
+  the harness above cannot see because `MockOrchestrator`'s fixtures are short friendly strings
+  ("Loom-3", "fix/auth-refresh") while `DaemonBackedOrchestrator` projects `Name = AgentId` (32 hex)
+  and `Branch = agent/<id>`. Rewrites the rail's entries to production id lengths, then asserts the
+  merge-queue seam is a real draggable/keyboard-resizable `GridSplitter`, that widening the window
+  widens the queue (bounded at 640px), that no queue text is arranged past the rail's right edge
+  (**geometric** overflow — `TextLayout.HasCollapsed` alone is vacuous here, a horizontal `StackPanel`
+  measures at infinite width and never trims), that the telemetry row resizes and still collapses when
+  Conversation Deck hides it, and that the seam's hover accent is a different colour from its rest
+  state in every theme. PNGs: `control_center_sizing_<narrow|default|wide>_<Theme>.png`,
+  `control_center_seam_hover_<Theme>.png`;
+  plus `Capture_VerifyTrigger_OnQueueRail_AllFiveThemes`
+  (`queue_verify_trigger_<Theme>.png` — the Verify affordance on the merge-queue rail, asserting it is
+  offered on an unverified entry and WITHHELD while one is already `Verifying`) and
+  `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
+  row);
+  the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
@@ -723,7 +740,22 @@
   chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in all five
   themes), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
-  `Headless/ResourceMonitorStreamTests`, and the `Headless/ActivityBarRenderHarness` (the five-theme
+  `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
+  must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious
+  implementation returns 0 for), `DockerResourceSamplerProgressTests` (**the delivery race**, pinned
+  deterministically with a fake `IDockerClient` that reports through `IProgress` and returns immediately:
+  the first implementation used `Progress<T>`, which raises its callback ASYNCHRONOUSLY, so the awaited
+  call could finish while the value was still queued and the sampler reported "no reading returned" for a
+  container that answered — measured at 1721/2000 lost in isolation, and it passed locally against real
+  Docker while failing only on a loaded CI runner. Reinstating `Progress<T>` fails it 198/200),
+  `Headless/ResourceMonitorStreamTests`, `Headless/ResourceMonitorHonestyTests` (**the two honesty
+  properties of the Resources tab**: an unmeasured reading renders "—" while a measured zero still
+  renders "0%" — the tab previously hard-coded 0 for everything, which is indistinguishable from an
+  idle fleet — and the cost UI appears only where spend is actually metered, with the unmetered row
+  refusing to draw `$0.00` even on a mixed fleet), `Headless/ResourceMonitorRenderHarness` (the tab in
+  all five themes × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
+  `artifacts_headless/`; the VM truths are asserted beside each capture so a blank surface cannot pass
+  as green), and the `Headless/ActivityBarRenderHarness` (the five-theme
   rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`). **`Terminal/`** is
   the P2-04 VT conformance & replay harness: `ITerminalEngineHarness.cs` (the engine-agnostic "feed
   bytes → read grid" seam + `GridSnapshot`/`GridCell`/`CellColor`/`CellAttrs` with a deterministic
@@ -978,7 +1010,20 @@
   daemon action projects live off each RPC — kill switch Engage/Resume → frozen state, a drafted plan
   → the pending-plan projection then Reject clears it, a real ledger spend → the telemetry projection
   + budgets round-trip, `SendMessage` → the coordinator transcript, and a registered `MergeQueue`
-  entry → the merge-queue projection incl. `MainSha`); `ReviewCockpitOverlayAckTests` (the **review
+  entry → the merge-queue projection incl. `MainSha`); **`VerificationTriggerTests` (the regression
+  suite for "nothing in the product could trigger a verification".** The `MergeQueue` machine, the
+  `RunVerification` RPC and `DaemonClient.RunVerificationAsync` all existed and were all tested — but
+  no production path reached any of them, so entries sat at `not verified yet` forever, and the
+  existing tests passed only because they called `MergeQueue.RunVerificationAsync` DIRECTLY, stepping
+  over the missing rung. So these tests never call that method: they press
+  `QueueEntryViewModel.VerifyCommand` — the control the rail is bound to — and assert the run happened
+  on the daemon, through the whole real chain (VM command → `IMergeQueueService` → shipped
+  `DaemonBackedOrchestrator` → shipped `DaemonClient` → in-proc `RunVerification` RPC → real
+  `MergeQueue`). Cases: the decisive Working→Verified with the daemon's runner provably invoked and
+  `not verified yet` cleared; verifying does NOT merge and an always-refusing `IMergeGate` still
+  refuses (the trigger weakens no gate); a `NoVerificationCommandException` surfaces as a quotable
+  `Can't verify — …` with the branch back on Working rather than a phantom Verified; and no active
+  repo refuses with a reason instead of throwing into the UI thread); `ReviewCockpitOverlayAckTests` (the **review
   cockpit overlay** against the same real in-proc daemon: an RT-D2-blocked branch surfaces its flagged
   item on the overlay, the overlay's own per-row acknowledge control is pressed, and the **daemon-side
   gate** then permits the merge it was refusing — asserted on `ChangedTestCommandGate` state and
@@ -1067,7 +1112,19 @@
   real `mainguard.agent`/`mainguard.repo` labels (not the P2-07 agent-base image), points a
   `SwarmReconciler` at the **real `DockerAgentLister`**, then `docker rm -f`s it out of band and
   asserts the next reconcile prunes + marks it `Dead` (Docker-as-truth convergence the simulated tests
-  can't prove; cleans up in a finally). **`Agents/`** hosts the TI-P2-06 integration suite on
+  can't prove; cleans up in a finally). **`Agents/ResourceSamplingDockerTests.cs`**
+  (`[RequiresDockerDaemonFact]`) proves the Resource Monitor's data source against a REAL engine, which
+  is the claim the feature shipped without: a `busybox` spin loop pinning one core must read a real
+  non-zero CPU **bounded by `ProcessorCount × 100`** (a mis-scaled formula cannot pass by being huge),
+  a sleeping container alongside it must read far lower (so a constant-returning sampler fails), and a
+  missing container must come back **UNKNOWN rather than 0** — `0%` and "no data" have to stay
+  distinguishable. **`AgentResourceProjectionTests.cs`** carries the same claim across the whole wire
+  through the REAL composition root: a scripted `IContainerResourceSampler` (injected via
+  `DaemonFixture.ResourceSampler`) feeds 37.5% / 1 GiB in, and the shipped `DaemonClient` +
+  `DaemonBackedOrchestrator` must project those exact values out of `GetAgentUsage()` — asserted on the
+  VALUES, not the shape, because the old code passed every shape test while returning 0. It also pins
+  the metering predicate on a real daemon (an agent `AgentGatewayCredentials.Issue`d a token is
+  metered; one without is not, and carries no spend figure at all). **`Agents/`** hosts the TI-P2-06 integration suite on
   `DualRepoFixture`: `AgentTestGit.cs` (test-only git CLI helper + temp-VM-root/cleanup — not a
   production runner), `SessionKeyCacheScopeTests.cs` (MG-6 — the memory-only credential cache is
   scoped to **(repo, kind)**, never the bare agent kind: a model key / harvested CLI OAuth files /

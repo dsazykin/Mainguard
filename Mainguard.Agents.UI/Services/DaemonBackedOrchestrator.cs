@@ -89,6 +89,13 @@ public sealed class DaemonBackedOrchestrator :
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly Dictionary<string, (long Tokens, long UsdMicros)> _agentSpend = new(StringComparer.Ordinal);
+    /// <summary>Latest per-agent CPU/RAM tick from the daemon's sampler, keyed by agent id. Absence of an
+    /// entry — or a null field within one — is "not measured" and must stay distinguishable from zero.</summary>
+    private readonly Dictionary<string, (double? Cpu, double? RamBytes, bool Metered)> _agentResources =
+        new(StringComparer.Ordinal);
+    /// <summary>Whether a resource tick has EVER arrived. Before the first one there is nothing to report,
+    /// which is not the same as a fleet reading zero.</summary>
+    private bool _haveResourceTick;
     private string _mainSha = string.Empty;
     private long _totalUsdMicros;
     private long _totalTokens;
@@ -103,6 +110,7 @@ public sealed class DaemonBackedOrchestrator :
     private Task? _agentPump;
     private Task? _planPump;
     private Task? _spendPump;
+    private Task? _resourcePump;
     private Task? _conversationPump;
     private Task? _queuePump;
     private Task? _loginHarvestPump;
@@ -234,6 +242,7 @@ public sealed class DaemonBackedOrchestrator :
         _agentPump = Task.Run(() => AgentPumpAsync(_cts.Token));
         _planPump = Task.Run(() => PlanPumpAsync(_cts.Token));
         _spendPump = Task.Run(() => SpendPumpAsync(_cts.Token));
+        _resourcePump = Task.Run(() => ResourcePumpAsync(_cts.Token));
         _conversationPump = Task.Run(() => ConversationPumpAsync(_cts.Token));
         _loginHarvestPump = Task.Run(() => LoginHarvestPumpAsync(_cts.Token));
     }
@@ -339,6 +348,17 @@ public sealed class DaemonBackedOrchestrator :
             await foreach (var sample in _client.StreamSpendAsync(token).ConfigureAwait(false))
             {
                 ApplySpendSample(sample);
+            }
+        }, ct).ConfigureAwait(false);
+    }
+
+    private async Task ResourcePumpAsync(CancellationToken ct)
+    {
+        await ReconnectLoopAsync(async token =>
+        {
+            await foreach (var snapshot in _client.StreamAgentResourcesAsync(token).ConfigureAwait(false))
+            {
+                ApplyResourceSnapshot(snapshot);
             }
         }, ct).ConfigureAwait(false);
     }
@@ -617,15 +637,80 @@ public sealed class DaemonBackedOrchestrator :
                 _agentSpend[sample.AgentId] = (acc.Tokens + sample.TokensSpent, acc.UsdMicros + sample.UsdMicrosSpent);
             }
 
-            // No CPU/RAM in the gateway contract — spend is the live signal (0 for the host gauges is honest).
-            _samples.Add(new ResourceSample(DateTimeOffset.UtcNow, 0, 0, _totalUsdMicros / 1_000_000m));
-            if (_samples.Count > 120)
-            {
-                _samples.RemoveAt(0);
-            }
+            AppendSampleLocked();
         }
 
         Sampled?.Invoke();
+    }
+
+    /// <summary>
+    /// Replaces the per-agent CPU/RAM map from one daemon tick. Whole-set replacement (not merge) on
+    /// purpose: an agent that has gone away must lose its numbers rather than keep showing its last ones
+    /// forever, which would be a stale reading presented as a live one.
+    /// </summary>
+    private void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
+    {
+        lock (_gate)
+        {
+            _agentResources.Clear();
+            foreach (var row in snapshot.Agents)
+            {
+                if (string.IsNullOrEmpty(row.AgentId)) continue;
+                // HasCpuPercent/HasMemBytes are proto3 explicit presence: false means the daemon could
+                // not measure it. Reading row.CpuPercent unconditionally would silently yield 0.0 and
+                // recreate the exact bug this feature fixes.
+                _agentResources[row.AgentId] = (
+                    row.HasCpuPercent ? row.CpuPercent : null,
+                    row.HasMemBytes ? row.MemBytes : null,
+                    row.Metered);
+            }
+
+            _haveResourceTick = true;
+            AppendSampleLocked();
+        }
+
+        Sampled?.Invoke();
+    }
+
+    /// <summary>
+    /// Appends one combined history point. Totals are sums of the readings that EXIST: if nothing has been
+    /// measured yet, the total is null (unknown) rather than 0, so the monitor's header can say so.
+    /// Caller holds <c>_gate</c>.
+    /// </summary>
+    private void AppendSampleLocked()
+    {
+        double? cpu = null;
+        double? ramGb = null;
+        if (_haveResourceTick)
+        {
+            foreach (var (agentCpu, agentRam, _) in _agentResources.Values)
+            {
+                if (agentCpu is { } c) cpu = (cpu ?? 0) + c;
+                if (agentRam is { } r) ramGb = (ramGb ?? 0) + r / (1024.0 * 1024.0 * 1024.0);
+            }
+        }
+
+        // Spend is reported only when at least one live agent is actually metered. The ledger only ever
+        // counts gateway-transited traffic, so with nothing metered the running total is structurally 0 —
+        // and "$0.00" would read as "you have spent nothing" rather than "this is not being measured".
+        decimal? spend = AnyMeteredLocked() ? _totalUsdMicros / 1_000_000m : null;
+
+        _samples.Add(new ResourceSample(DateTimeOffset.UtcNow, cpu, ramGb, spend));
+        if (_samples.Count > 120)
+        {
+            _samples.RemoveAt(0);
+        }
+    }
+
+    /// <summary>True when any live agent's spend is measurable. Caller holds <c>_gate</c>.</summary>
+    private bool AnyMeteredLocked()
+    {
+        foreach (var (_, _, metered) in _agentResources.Values)
+        {
+            if (metered) return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -816,6 +901,73 @@ public sealed class DaemonBackedOrchestrator :
         reason = "not in the merge queue";
         return false;
     }
+
+    /// <summary>
+    /// Asks the daemon to verify this agent's branch now — the missing rung that left the whole
+    /// verification mechanism without a production caller.
+    ///
+    /// <para><b>Everything that decides anything lives on the daemon.</b> This method resolves the active
+    /// repo handle and makes one RPC; it holds no policy, no state machine, and no retry. The daemon's
+    /// <c>MergeQueue.RunVerificationAsync</c> owns the Verifying transition, runs the test command in the
+    /// <i>agent's own jail</i> (host execution is a rejection trigger), writes the immutable record, and
+    /// lands the branch on <c>Verified</c> or back on <c>Working</c>. The queue stream then republishes
+    /// that state, so this method deliberately mutates no local projection.</para>
+    ///
+    /// <para>A refusal the run never started with — no live jail, no configured test command, a jail
+    /// missing the declared toolchain — arrives as gRPC <c>FailedPrecondition</c> and is returned as
+    /// <c>Ran: false</c> with the daemon's reason verbatim. A suite that genuinely failed is
+    /// <c>Ran: true, Passed: false</c>, which is a result and not an error.</para>
+    /// </summary>
+    public async Task<VerificationOutcome> RunVerificationAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: "Can't verify — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        try
+        {
+            // Verification builds a toolchain image on first use and then runs the repo's whole test
+            // command in the jail, so it is minutes-scale work — the per-call deadline has to allow for
+            // that. The default RPC deadline would abort a perfectly healthy first run.
+            var response = await _client
+                .RunVerificationAsync(repoHandle!, agentId, cts.Token, VerificationDeadline)
+                .ConfigureAwait(false);
+            return new VerificationOutcome(
+                Ran: true,
+                Passed: response.Passed,
+                Reason: response.Passed
+                    ? $"verified against main@{Short(response.MainSha)}"
+                    : $"tests failed — {response.ResolvedCommand}");
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.FailedPrecondition)
+        {
+            // The daemon's typed refusal: quotable, and specifically NOT a test failure.
+            return new VerificationOutcome(Ran: false, Passed: false, Reason: $"Can't verify — {ex.Status.Detail}");
+        }
+        catch (Grpc.Core.RpcException ex)
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: $"Can't verify — the daemon didn't answer ({ex.StatusCode}).");
+        }
+    }
+
+    /// <summary>A verification runs the repo's full test command in a jail, after possibly building its
+    /// toolchain image; it is the longest-running RPC the surface issues.</summary>
+    private static readonly TimeSpan VerificationDeadline = TimeSpan.FromMinutes(30);
+
+    private static string Short(string sha) =>
+        string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);
 
     /// <summary>
     /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
@@ -1263,7 +1415,10 @@ public sealed class DaemonBackedOrchestrator :
         {
             lock (_gate)
             {
-                return _samples.Count > 0 ? _samples[^1] : new ResourceSample(DateTimeOffset.UtcNow, 0, 0, 0m);
+                // Nothing sampled yet: every reading is unknown. It is NOT a fleet sitting at zero.
+                return _samples.Count > 0
+                    ? _samples[^1]
+                    : new ResourceSample(DateTimeOffset.UtcNow, null, null, null);
             }
         }
     }
@@ -1281,9 +1436,19 @@ public sealed class DaemonBackedOrchestrator :
                 .Select(a =>
                 {
                     _agentSpend.TryGetValue(a.AgentId, out var spend);
+                    var haveReading = _agentResources.TryGetValue(a.AgentId, out var res);
+
+                    // Spend is a number only where it is actually measured. An unmetered agent reports
+                    // null, so the row can say "not tracked" instead of drawing a reassuring $0.00.
+                    decimal? spendUsd = haveReading && res.Metered ? spend.UsdMicros / 1_000_000m : null;
+
                     return new AgentResourceUsage(
                         a.AgentId, a.Name, a.State.ToString(), a.State == AgentLifecycleState.Paused,
-                        CpuPercent: 0, RamGb: 0, SpendUsd: spend.UsdMicros / 1_000_000m, Task: a.Detail);
+                        CpuPercent: haveReading ? res.Cpu : null,
+                        RamGb: haveReading && res.RamBytes is { } bytes ? bytes / (1024.0 * 1024.0 * 1024.0) : null,
+                        SpendUsd: spendUsd,
+                        Task: a.Detail,
+                        IsMetered: haveReading && res.Metered);
                 })
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToArray();
@@ -1349,7 +1514,7 @@ public sealed class DaemonBackedOrchestrator :
         try
         {
             Task.WaitAll(
-                new[] { _agentPump, _planPump, _spendPump, _conversationPump, _queuePump, _loginHarvestPump }
+                new[] { _agentPump, _planPump, _spendPump, _resourcePump, _conversationPump, _queuePump, _loginHarvestPump }
                     .Where(t => t is not null).Select(t => t!).ToArray(),
                 TimeSpan.FromSeconds(2));
         }

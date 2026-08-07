@@ -35,6 +35,12 @@ user request
    -> HUMAN reviews and merges                          <- human gate #2
 ```
 
+> **This flow is the phase-2/3 model.** In phase 1 the coordinator *is* the working agent, so there is
+> no worker to propose readiness on its behalf and `request_verification` has nothing to fire — phase 1
+> triggers verification by a human action on the merge-queue entry instead. Who triggers a verification
+> in which phase, and the one method an automatic caller must reuse, is recorded in
+> [`verification-trigger.md`](verification-trigger.md).
+
 **Plan authorship belongs to the worker, not the coordinator.** The coordinator has no worktree, no
 git credentials, and no view of repository contents; a plan it authored would describe work it could
 not inspect. The worker has the context, so the plan describes what will actually be done rather than

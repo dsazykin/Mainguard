@@ -507,6 +507,49 @@ public sealed class MockOrchestrator :
         return true;
     }
 
+    /// <summary>
+    /// The scripted stand-in for the daemon's verification trigger. The shipped app runs
+    /// <see cref="Mainguard.Agents.UI"/>'s daemon-backed adapter, whose implementation is one RPC into
+    /// <c>MergeQueue.RunVerificationAsync</c>; this exists so the design harness and the render harnesses
+    /// drive the same seam. It refuses for the same reasons the daemon does (frozen queue, an entry that
+    /// is already terminal) rather than pretending every request can run.
+    /// </summary>
+    public Task<VerificationOutcome> RunVerificationAsync(string agentId)
+    {
+        var raised = new List<AgentEvent>();
+        VerificationOutcome outcome;
+        lock (_gate)
+        {
+            if (_frozen)
+            {
+                return Task.FromResult(new VerificationOutcome(
+                    Ran: false, Passed: false, Reason: "Can't verify — the queue is frozen; resume first."));
+            }
+
+            var a = Find(agentId);
+            if (a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected)
+            {
+                return Task.FromResult(new VerificationOutcome(
+                    Ran: false, Passed: false,
+                    Reason: $"Can't verify — this branch is already {a.Merge.ToString().ToLowerInvariant()}."));
+            }
+
+            var now = DateTimeOffset.Now;
+            SetMerge(a, WorkerMergeState.Verifying, raised);
+            SetMerge(a, WorkerMergeState.Verified, raised);
+            a.Life = AgentLifecycleState.AwaitingReview;
+            a.Verification = new VerificationRecord(a.Id, _mainSha, true, a.TestsTotal, a.TestsTotal, now);
+            a.Detail = "verified against " + _mainSha;
+            _transcript.Add(new ChatLine(
+                ChatLineKind.SystemLine, $"{a.Name} verified against {_mainSha} (requested)", now));
+            outcome = new VerificationOutcome(Ran: true, Passed: true, Reason: "verified against main@" + _mainSha);
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.FromResult(outcome);
+    }
+
     public Task<MergeOutcome> ConfirmMergeAsync(string agentId)
     {
         var raised = new List<AgentEvent>();
@@ -677,9 +720,14 @@ public sealed class MockOrchestrator :
     {
         lock (_gate)
             return _agents.Where(a => a.Life != AgentLifecycleState.TornDown)
+                // IsMetered: true — the scripted fleet models a BYOK deployment (it also carries a
+                // scripted $50/day cap), so the design harnesses keep exercising the full cost UI.
+                // Stated explicitly rather than left to default false, which would silently switch
+                // every design capture to the "spend isn't tracked" surface.
                 .Select(a => new AgentResourceUsage(
                     a.Id, a.Name, a.Life.ToString(), a.Life == AgentLifecycleState.Paused,
-                    Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail))
+                    Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail,
+                    IsMetered: true))
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToList();
     }
