@@ -1341,11 +1341,16 @@
   different claim. Two more legs: a jail given no settings really has none in-container (the untrusted
   posture); the reuse path is write-if-absent (a live jail's fresher approvals are never clobbered by
   the stored copy); and
-  `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` makes `/workspace` a REAL git
-  repository and asserts `git status --porcelain` is empty *while the restored file is present* — the
-  keep-alive cycle's dirty-tree path is `git add -A && git commit`, so an unignored restore would put
-  the user's permission allowlist into their own history. The gates that decide WHEN any of this runs
-  are `CliSettingsBoundaryTests`),
+  `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` +
+  `TheFirstSessionsOwnSettingsFile_IsIgnoredEvenThoughNothingWasRestored` make `/workspace` a REAL git
+  repository and assert `git status --porcelain` is empty *while the file is present* — agents run
+  `git add -A`, so an unignored settings file would put the user's permission allowlist into their own
+  history, and the second test covers the case the ignore list cannot be derived from a restore
+  payload at all (a first session, which creates the file itself). These use
+  `SandboxFixture.NewJailWritableTempWorktree()`: a default-mode temp worktree measures the RUNNER's
+  uid mapping rather than the feature, which is exactly how the first CI run failed with
+  `mkdir: cannot create directory '/workspace/.probe': Permission denied` after passing locally. The
+  gates that decide WHEN any of this runs are `CliSettingsBoundaryTests`),
   `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
   proceeds to the engine; a missing `mainguard-agent-base`/`mainguard-egress-proxy` answers
   `FailedPrecondition` naming exactly that image + the repair BEFORE any worktree/jail work — the

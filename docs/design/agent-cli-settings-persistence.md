@@ -171,8 +171,14 @@ second system:
    touched, the user's own `.gitignore` is not edited, and no state outlives the agent. (MG-43 moved
    the package cache out of the worktree for the same reason; this file cannot move, because it is
    where the CLI reads it from.)
-   `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` makes `/workspace` a real
-   repository and asserts `git status --porcelain` is empty *while the file is present*.
+
+   The ignore list is driven by the adapter's **declaration**, not by the restore payload, and that
+   distinction is the whole point: on a first-ever session there is nothing to restore — the CLI
+   creates the file itself the moment the user approves something. Deriving the list from the restore
+   would have protected every session except the one that creates the file.
+   `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` and
+   `TheFirstSessionsOwnSettingsFile_IsIgnoredEvenThoughNothingWasRestored` make `/workspace` a real
+   repository and assert `git status --porcelain` is empty *while the file is present*.
 5. **Persist.** The response carries the session's `repo_handle`, and the client files the result
    under **that** repository — not "whichever repo is open". The harvest sweep walks every agent on
    the daemon, so filing by the open repo is precisely how one repository's allowlist would end up

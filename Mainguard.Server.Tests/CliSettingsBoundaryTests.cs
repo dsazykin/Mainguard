@@ -192,6 +192,45 @@ public sealed class CliSettingsBoundaryTests
         Assert.Null(kept);
     }
 
+    // ---- keeping the allowlist out of the user's git history ------------------------------------
+
+    [Fact]
+    public async Task AJailIsToldToIgnoreTheWorkspaceSettingsPath_EvenWhenThereIsNothingToRestore()
+    {
+        using var rig = SettingsRig.Create();
+
+        // The FIRST-ever session in a repository: no stored approvals, so nothing is restored. The CLI
+        // will create `.probe/settings.local.json` in /workspace itself the moment the user approves
+        // something — and /workspace is the tree the agent commits with `git add -A`. If the ignore
+        // list were derived from the restore payload, this session — the one that creates the file —
+        // would be the only one unprotected, and the user's permission allowlist would land in their
+        // own repository.
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None);
+
+        Assert.Null(rig.Engine.LastSpawn!.CliSettingsFiles);
+        Assert.Equal(new[] { Declared.Path }, rig.Engine.LastSpawn!.WorkspaceIgnorePaths);
+    }
+
+    [Fact]
+    public void OnlyWorkspaceRootedDeclarations_BecomeIgnoreEntries()
+    {
+        var marker = new InstalledAdapterMarker(
+            AgentKind, "1.0.0", new[] { "/bin/true" },
+            SettingsPaths: new[]
+            {
+                Declared,
+                // $HOME is a tmpfs outside any repository — ignoring it would be meaningless noise in
+                // the exclude file, and a sign the root was not being read.
+                new AdapterSettingsPath("home", ".probe/settings.json"),
+                // A malformed declaration must not reach a path that is written into a git config file.
+                new AdapterSettingsPath("workspace", "../escape.json"),
+            });
+
+        Assert.Equal(
+            new[] { Declared.Path }, SandboxAgentLauncher.DeclaredWorkspaceSettingsPaths(marker));
+    }
+
     [Fact]
     public void AnAdapterThatDeclaresNoSettings_RestoresNothing()
     {

@@ -594,12 +594,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
       older copy clobbering a live jail's fresher tokens or approvals. **`SettingsRootPath(root)`** is the
       ONE `AdapterSettingsRoot`→in-jail-directory mapping, shared with the harvest side so the two legs of
-      the round trip cannot drift apart. **`ExcludeRestoredSettingsFromGitAsync`** appends a restored
-      WORKSPACE settings path to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and
-      the keep-alive cycle's dirty-tree path is `git add -A && git commit`, so without this the feature
-      would commit the user's permission allowlist into their repository and merge it to main; the
-      exclude file lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is
-      touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the round trip cannot drift apart. **`ApplyWorkspaceSettingsIgnoreAsync`** appends the WORKSPACE
+      settings paths to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and agents run
+      `git add -A`, so without this the feature would commit the user's permission allowlist into their
+      repository and merge it to main. Driven by `SandboxSpawnRequest.WorkspaceIgnorePaths` (the
+      adapter's DECLARATION) unioned with anything restored, because the session that most needs the
+      ignore is the FIRST one — nothing to restore, and the CLI creates the file itself. The exclude file
+      lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is touched and no
+      state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared

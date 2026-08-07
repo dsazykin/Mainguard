@@ -69,7 +69,11 @@ public class CliSettingsRoundTripDockerTests
         using var store = new TempSettingsStore();
 
         // ---- jail #1: the user approves a command in the terminal ---------------------------------
-        var first = await fixture.SpawnAsync(agentId: "settings-roundtrip-1", ct: ct);
+        // jailWritableWorktree: the jail writes into /workspace on both legs (the simulated approval
+        // here, the restore's own `mkdir -p` below), and a default-mode temp worktree measures the
+        // RUNNER's uid mapping rather than this feature — see NewJailWritableTempWorktree.
+        var first = await fixture.SpawnAsync(
+            agentId: "settings-roundtrip-1", ct: ct, jailWritableWorktree: true);
         await WriteInJailAsync(fixture, first.ContainerId, JailPathOf(WorkspaceEntry), grant);
         await WriteInJailAsync(fixture, first.ContainerId, JailPathOf(HomeEntry), userPref);
 
@@ -92,7 +96,7 @@ public class CliSettingsRoundTripDockerTests
 
         var second = await fixture.SpawnAsync(
             agentId: "settings-roundtrip-2", ct: ct,
-            cliSettings: SandboxSettings(restored));
+            cliSettings: SandboxSettings(restored), jailWritableWorktree: true);
 
         // Read from INSIDE the container. Framed rather than substring-matched: a probe that failed to
         // run prints no frame at all, which would otherwise be indistinguishable from a mismatch.
@@ -130,7 +134,7 @@ public class CliSettingsRoundTripDockerTests
         // user's latest approvals.
         await fixture.EnsureEgressReadyAsync(ct);
         var repoHash = "sbxreuse" + Guid.NewGuid().ToString("N")[..8];
-        var worktree = fixture.NewTempVmRoot();
+        var worktree = fixture.NewJailWritableTempWorktree();
 
         var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
         try
@@ -174,7 +178,7 @@ public class CliSettingsRoundTripDockerTests
         // into the user's branch and merged to main — Mainguard silently writing to their history.
         await fixture.EnsureEgressReadyAsync(ct);
         var repoHash = "sbxignore" + Guid.NewGuid().ToString("N")[..8];
-        var worktree = fixture.NewTempVmRoot();
+        var worktree = fixture.NewJailWritableTempWorktree();
 
         var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
         try
@@ -201,6 +205,54 @@ public class CliSettingsRoundTripDockerTests
             // The file really is there — otherwise a clean `git status` would prove nothing at all.
             Assert.NotEqual(
                 string.Empty, await ReadInJailAsync(fixture, first.ContainerId, JailPathOf(WorkspaceEntry)));
+
+            var status = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
+                "cd /workspace && printf 'BEGIN['; git status --porcelain; printf ']END'");
+            Assert.Equal(0, status.ExitCode);
+            Assert.Equal("BEGIN[]END", status.Stdout.Trim());
+        }
+        finally
+        {
+            try { await fixture.Engine.RemoveAsync(first.ContainerId, CancellationToken.None); }
+            catch { /* never fail a test from cleanup */ }
+        }
+    }
+
+    [RequiresDockerFact]
+    public async Task TheFirstSessionsOwnSettingsFile_IsIgnoredEvenThoughNothingWasRestored()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
+        var ct = cts.Token;
+        await using var fixture = new SandboxFixture();
+
+        // The session that matters most: a repository with no stored approvals, so the restore payload
+        // is EMPTY and the CLI creates the settings file itself when the user first approves something.
+        // An ignore list derived from the restore payload would leave exactly this session unprotected.
+        await fixture.EnsureEgressReadyAsync(ct);
+        var repoHash = "sbxfirst" + Guid.NewGuid().ToString("N")[..8];
+        var worktree = fixture.NewJailWritableTempWorktree();
+
+        var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
+        try
+        {
+            var init = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
+                "cd /workspace && git init -q && git config user.email a@b.c && git config user.name t "
+                + "&& git commit -q --allow-empty -m base && echo READY");
+            Assert.True(init.ExitCode == 0 && init.Stdout.Contains("READY", StringComparison.Ordinal),
+                $"could not make /workspace a git repo: exit={init.ExitCode} stderr={init.Stderr}");
+
+            // Re-enter the engine with the DECLARED path but no restore payload — the first-session shape.
+            var second = await fixture.Engine.SpawnAsync(
+                Request(repoHash, worktree, fixture, null) with
+                {
+                    WorkspaceIgnorePaths = new[] { WorkspaceEntry.Path },
+                },
+                ct);
+            Assert.True(second.Reused, "the second spawn must have reused the first jail");
+
+            // Now the CLI writes its own approval, exactly as it does in-terminal.
+            await WriteInJailAsync(fixture, first.ContainerId, JailPathOf(WorkspaceEntry),
+                "{\"permissions\":{\"allow\":[\"Bash(ls:*)\"]}}");
 
             var status = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
                 "cd /workspace && printf 'BEGIN['; git status --porcelain; printf ']END'");

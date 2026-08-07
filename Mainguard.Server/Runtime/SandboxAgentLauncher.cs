@@ -259,7 +259,13 @@ public sealed class SandboxAgentLauncher
                 // adapter declares, exactly as the credential files are, because the client names the
                 // paths on the wire. An untrusted spawn never reaches here with any (the caller passes
                 // none), so this filter is the second gate, not the only one.
-                CliSettingsFiles: FilterCliSettings(cliSettings, adapter)), ct).ConfigureAwait(false);
+                CliSettingsFiles: FilterCliSettings(cliSettings, adapter),
+                // The DECLARED workspace settings paths, sent whether or not anything is being restored
+                // into them: /workspace is the tree the agent commits, and on a first-ever session the
+                // CLI creates its own settings file there the moment the user approves something. That
+                // file must never reach the user's history, and that session has no restore payload to
+                // infer the path from.
+                WorkspaceIgnorePaths: DeclaredWorkspaceSettingsPaths(adapter)), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
@@ -515,6 +521,21 @@ public sealed class SandboxAgentLauncher
             .ToArray();
         return kept.Length > 0 ? kept : null;
     }
+
+    /// <summary>
+    /// The WORKSPACE-rooted settings paths this adapter declares — the files the jail must keep out of
+    /// the agent's commits. Derived from the marker rather than from whatever is being restored,
+    /// because the session that most needs the ignore is the FIRST one, which restores nothing and
+    /// whose CLI writes the file itself. Empty when the adapter declares no workspace settings.
+    /// </summary>
+    internal static IReadOnlyList<string> DeclaredWorkspaceSettingsPaths(InstalledAdapterMarker? adapter) =>
+        adapter?.SettingsPaths is not { Count: > 0 } declared
+            ? Array.Empty<string>()
+            : declared
+                .Where(d => d is not null && d.IsWellFormed() && d.ParsedRoot == AdapterSettingsRoot.Workspace)
+                .Select(d => d.Path)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
 
     /// <summary>
     /// Harvests the CLI's SETTINGS files (the installed adapter's declared <c>settingsPaths</c>) out of

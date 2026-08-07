@@ -70,6 +70,13 @@ public sealed record SandboxSecrets(
 /// <c>settingsPaths</c>) to restore into the jail's throwaway trees, write-if-absent exactly like the
 /// credential restore. Null/empty = none, which is what an UNTRUSTED jail always gets: an external
 /// pull request's code must never inherit the user's approved-command list.</param>
+/// <param name="WorkspaceIgnorePaths">The workspace-rooted settings paths this agent's CLI is
+/// DECLARED to use, whether or not anything is being restored into them. They are added to the agent
+/// repository's local <c>info/exclude</c>, because <c>/workspace</c> is the tree the agent commits and
+/// the CLI writes its approvals there itself — so on a first-ever session, with nothing to restore,
+/// the agent's own <c>git add -A</c> would otherwise commit the user's permission allowlist into their
+/// repository. Separate from <see cref="CliSettingsFiles"/> precisely because that case has no
+/// restore payload to derive it from.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -86,7 +93,8 @@ public sealed record SandboxSpawnRequest(
     string? ProxyUrl = null,
     string? AgentRepoPath = null,
     string? PackageCachePath = null,
-    IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null);
+    IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null,
+    IReadOnlyList<string>? WorkspaceIgnorePaths = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);
