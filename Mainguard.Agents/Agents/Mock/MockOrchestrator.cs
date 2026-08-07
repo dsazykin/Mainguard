@@ -677,9 +677,14 @@ public sealed class MockOrchestrator :
     {
         lock (_gate)
             return _agents.Where(a => a.Life != AgentLifecycleState.TornDown)
+                // IsMetered: true — the scripted fleet models a BYOK deployment (it also carries a
+                // scripted $50/day cap), so the design harnesses keep exercising the full cost UI.
+                // Stated explicitly rather than left to default false, which would silently switch
+                // every design capture to the "spend isn't tracked" surface.
                 .Select(a => new AgentResourceUsage(
                     a.Id, a.Name, a.Life.ToString(), a.Life == AgentLifecycleState.Paused,
-                    Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail))
+                    Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail,
+                    IsMetered: true))
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToList();
     }

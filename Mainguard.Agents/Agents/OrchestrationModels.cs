@@ -99,14 +99,30 @@ public sealed record AgentEvent(long Seq, string Type, string AgentId, string Pa
 /// <summary>P2-44: one sandbox telemetry fact (egress denial, secret access attempt, …).</summary>
 public sealed record SandboxEvent(DateTimeOffset At, string AgentId, string Kind, string Detail, string Process);
 
-/// <summary>P2-13 activity-bar resource sample (VM CPU/RAM + gateway token spend).</summary>
-public sealed record ResourceSample(DateTimeOffset At, double CpuPercent, double RamGb, decimal SpendTodayUsd);
+/// <summary>
+/// P2-13 activity-bar resource sample (VM CPU/RAM + gateway token spend).
+///
+/// <para><b>Every reading is nullable, and null means NOT MEASURED — never zero.</b> These were plain
+/// doubles, and the daemon-backed client filled them with literal <c>0</c> because nothing sampled the
+/// containers; the monitor therefore displayed a confident "CPU 0% · RAM 0.0 GB" for a fleet of busy
+/// agents. Making absence representable is what stops that from being expressible again: a formatter
+/// cannot render an unknown as 0 if the unknown never becomes a 0.</para>
+/// </summary>
+/// <param name="SpendTodayUsd">Null when spend is not measurable — see <see cref="AgentResourceUsage.IsMetered"/>.</param>
+public sealed record ResourceSample(DateTimeOffset At, double? CpuPercent, double? RamGb, decimal? SpendTodayUsd);
 
 /// <summary>One agent's live resource row for the task-manager-style monitor (revised 2026-07-11):
-/// per-agent CPU/RAM/spend plus the state word and current task, so totals decompose.</summary>
+/// per-agent CPU/RAM/spend plus the state word and current task, so totals decompose.
+/// Null CPU/RAM/spend mean not measured, never zero (see <see cref="ResourceSample"/>).</summary>
+/// <param name="IsMetered">Whether this agent's model spend is measurable at all: true exactly when the
+/// daemon issued it a gateway confinement token at spawn, so its traffic transits the metering proxy.
+/// False for OAuth sessions (they authenticate past the proxy with a credential Mainguard never issued),
+/// for BYOK CLIs that declare no base-URL/model-host pair (codex, qwen-code, opencode), and when the
+/// gateway is off. When false the UI must show no spend figure rather than <c>$0.00</c>, which would read
+/// as "you have spent nothing". See <c>docs/design/oauth-budgeting.md</c>.</param>
 public sealed record AgentResourceUsage(
     string AgentId, string Name, string StateWord, bool IsPaused,
-    double CpuPercent, double RamGb, decimal SpendUsd, string Task);
+    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false);
 
 /// <summary>P2-13/P2-08 spend caps, UI-facing shape (Core DTO — no proto/UI coupling). The per-agent
 /// and per-day caps the gateway <c>BudgetLedger</c> enforces daemon-side, surfaced so the Resource

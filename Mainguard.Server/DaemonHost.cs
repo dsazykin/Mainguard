@@ -170,6 +170,33 @@ public static class DaemonHost
         // server-side, so a coordinator agent cannot fan out unlimited workers via mainguard-agent spawn.
         builder.Services.AddSingleton(new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits());
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
+
+        // The Resource Monitor's data source. The tab shipped rendering per-agent CPU/RAM over a sampler
+        // that was never written — the client hard-coded both to 0 — so every agent read a convincing 0%.
+        // The Docker client is built here and shared rather than per call: this one is consulted on a poll
+        // loop, and a fresh client per tick would churn connections to the daemon socket for no reason.
+        builder.Services.AddSingleton<Docker.DotNet.IDockerClient>(
+            _ => new Docker.DotNet.DockerClientConfiguration().CreateClient());
+        builder.Services.AddSingleton<Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler>(sp =>
+        {
+            try
+            {
+                return new Mainguard.Agents.Agents.Sandbox.DockerResourceSampler(
+                    sp.GetRequiredService<Docker.DotNet.IDockerClient>());
+            }
+            catch (Exception ex)
+            {
+                // No engine to talk to. Report every agent as explicitly unknown rather than failing the
+                // RPC — and emphatically rather than reporting zeros, which would look like a working
+                // monitor observing an idle fleet.
+                return new Mainguard.Agents.Agents.Sandbox.UnavailableContainerResourceSampler(
+                    ex.GetType().Name);
+            }
+        });
+        builder.Services.AddSingleton(sp => new Runtime.AgentResourceProbe(
+            sp.GetRequiredService<Runtime.AgentSessionStore>(),
+            sp.GetRequiredService<Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler>(),
+            sp.GetService<Gateway.AgentGatewayCredentials>()));
         // Which repositories this daemon has provisioned, and where the user's copy of each one is. The
         // repo hash is one-way, so without this the daemon could not name the repo a handle refers to —
         // which is exactly why the external-PR intake's target resolver was hardwired to null.

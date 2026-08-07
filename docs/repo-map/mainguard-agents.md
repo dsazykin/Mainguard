@@ -620,6 +620,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (Unblock/Keep); **Unblock** adds the host over the new `EgressService` (`EgressGrpcService`, backed
       by `IEgressPolicy` — adds to the live `EgressAllowlist` + re-renders the running proxy) and retries
       the coordinator.
+    - `DockerResourceSampler.cs` (**the Resource Monitor's data source, which did not exist**: the tab
+      shipped rendering per-agent CPU/RAM over a sampler nobody wrote, so the client hard-coded
+      `CpuPercent: 0, RamGb: 0` and every agent read a convincing 0% forever. `IContainerResourceSampler`
+      (the seam the daemon join + the gRPC stream + the client projection are all driven through with
+      KNOWN values end to end), `ContainerResourceSample` (**a null reading means NOT MEASURED, never
+      zero** — the two are different facts and the UI renders them differently), `DockerResourceSampler`
+      (one-shot `stats?stream=false` per jail, parallel + bounded at `MaxConcurrentSamples`, with the
+      reading taken through `SynchronousProgress<T>` — **never `Progress<T>`**, which raises its callback
+      asynchronously so the awaited call can complete while the value is still queued, losing a reading
+      the engine actually returned;
+      **deliberately never `one-shot=true`**, which zeros `precpu_stats` so the CPU delta is uncomputable
+      and a naive percentage reads a fabricated 0%), and `UnavailableContainerResourceSampler` (no engine
+      ⇒ every agent explicitly unknown). `TryComputeCpuPercent`/`TryComputeMemoryBytes` are pure + unit
+      tested; both cgroup generations are handled because the generation follows the HOST KERNEL, not the
+      engine. **Verified on BOTH Docker 20.10.24** (the EOL engine in today's `MainguardEnv`, max API
+      v1.41) **and 29.4.3** (CI/Docker Desktop) — Docker.DotNet 3.125.15 delivers exactly one message and
+      completes on both, so the `AttachStdin` hang that forced `ExecStdinTransport.cs` onto a raw socket
+      does not affect this endpoint)
     - `DockerAgentLister.cs` (P2-08: lists `mainguard.agent`-labelled containers → `AgentContainerState`
       for the swarm reconciler — Docker as the sole liveness truth). Seccomp/proxy images live under
       `images/` (built in CI, never at runtime). **MG-42 — per-repo verification toolchain** (the curated
