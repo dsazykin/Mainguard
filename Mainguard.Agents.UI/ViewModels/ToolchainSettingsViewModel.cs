@@ -34,10 +34,15 @@ public partial class ToolchainSettingsViewModel : ViewModelBase, ISettingsPage
     private CancellationTokenSource? _cts;
 
     /// <summary>Live constructor: the real channel over the VM install host.</summary>
-    public ToolchainSettingsViewModel(ToolchainChannel channel)
+    /// <param name="channel">The curated toolchain channel.</param>
+    /// <param name="declaration">The optional "declare a toolchain in this repository" flow rendered as
+    /// a second section on this page (see <see cref="Declaration"/>). Null in every call site that has
+    /// no repository context — the section is then simply absent rather than present and inert.</param>
+    public ToolchainSettingsViewModel(ToolchainChannel channel, ToolchainDeclarationViewModel? declaration = null)
     {
         WatchRows();
         _channel = channel ?? throw new ArgumentNullException(nameof(channel));
+        Declaration = declaration;
     }
 
     /// <summary>Design/render constructor: fixed representative rows, no service behind them.</summary>
@@ -52,6 +57,21 @@ public partial class ToolchainSettingsViewModel : ViewModelBase, ISettingsPage
     }
 
     public ObservableCollection<ToolchainRowViewModel> Toolchains { get; } = new();
+
+    /// <summary>
+    /// The second section of this page: the four-step, one-button-per-step flow for declaring a
+    /// toolchain in the open repository (<see cref="ToolchainDeclarationViewModel"/>). It lives here
+    /// rather than behind its own navigation entry because the two halves answer the same question from
+    /// opposite ends — "is this toolchain on my machine" and "does this repository ask for it" — and
+    /// splitting them across pages is how a user ends up with one without the other.
+    ///
+    /// <para>Null on the design/harness constructor and on any call site with no repository context, in
+    /// which case the section is not rendered at all.</para>
+    /// </summary>
+    public ToolchainDeclarationViewModel? Declaration { get; }
+
+    /// <summary>Whether to render the declaration section.</summary>
+    public bool HasDeclaration => Declaration is not null;
 
     // ---- per-row command enablement --------------------------------------------------------------
     //
@@ -312,6 +332,12 @@ public partial class ToolchainSettingsViewModel : ViewModelBase, ISettingsPage
     {
         if (RefreshCommand.CanExecute(null))
             RefreshCommand.Execute(null);
+
+        // The declaration flow measures the repository the same way: on open, and after every step it
+        // performs. A section that showed a remembered state would be the exact defect the flow's own
+        // re-evaluation exists to prevent.
+        if (Declaration is not null)
+            _ = Declaration.RefreshAsync();
     }
 
     public void OnDeactivated()

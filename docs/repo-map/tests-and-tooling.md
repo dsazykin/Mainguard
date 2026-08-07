@@ -13,6 +13,16 @@
     "checksum"), one CLI failing doesn't stop the others, skip finishes with zero CLIs, an
     already-installed CLI isn't re-offered, Cancel leaves no row spinning, and a catalog-read failure
     still lets the user through.
+  - **`Mainguard.Tests/ToolchainDeclarationFlowTests.cs`** — the four-button declaration flow, driven
+    against a REAL temporary git repository (never a mock of git): `master` is treated as the default
+    branch **dynamically**, so hardcoding `main` fails here — the owner's repo is `master`; Write file
+    writes the working tree and stages NOTHING, asserted against the repository's own index rather than
+    the view model (`repo.Index[path]` is null, the entry is `NewInWorkdir`) because a VM flag can agree
+    with itself while the index disagrees; Stage & commit produces exactly ONE commit touching exactly
+    that path and does NOT push; a dirty tree and a non-default branch are REFUSED with a reason and
+    **nothing is stashed and nothing is checked out**; every disabled button exposes a non-empty reason;
+    and `Refresh` RE-MEASURES, so a file deleted behind the app's back is seen. The last two caught the
+    first implementation staging inside step 1 — one violation, two red tests.
   - **`Mainguard.Tests/ToolchainSettingsUiTests.cs`** — the Settings **Toolchains** page (the human
     half of the user-managed toolchain channel) driven over a fake `IAdapterInstallHost` with the REAL
     `ToolchainChannel`, so the shipped fetch → sha256-verify → unpack → run-it policy executes minus

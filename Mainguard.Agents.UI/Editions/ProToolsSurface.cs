@@ -38,7 +38,17 @@ public sealed class ProToolsSurface : IProToolsSurface
     {
         var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
         var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
-        return new ToolchainSettingsViewModel(new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host));
+        var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host);
+
+        // Second section: the four-step declaration flow, over the repository the shell currently has
+        // open. That path comes from the ONE place the shell records it (UserPreferences, written by
+        // MainWindowViewModel on every open) rather than a new seam through IProToolsSurface. Empty when
+        // no repo is open — which the flow reports as every step's stated reason, not as a dead page.
+        var repoPath = ProComposition.Settings?.Current.LastOpenedRepoPath;
+        var declaration = new ToolchainDeclarationViewModel(
+            repoPath, new Mainguard.Git.Services.GitService(), channel);
+
+        return new ToolchainSettingsViewModel(channel, declaration);
     }
 
     // Daemon logs (in-depth per-subsystem logging): the read-only "recent daemon logs" surface over
