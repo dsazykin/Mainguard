@@ -183,9 +183,20 @@ public sealed class QueueEntryLifecycleTests
 
     /// <summary>
     /// A row that says <c>Verifying</c> with nothing running behind it — the shape a daemon restart
-    /// leaves, since queue state is persisted per transition while the in-flight set is memory and
-    /// <c>ResumeAfterRestartAsync</c> has no production caller. The stream says so (the daemon is the only
-    /// side that can), the gate reason says so, and the clear puts the entry back to Working.
+    /// leaves, since queue state is persisted per transition while the in-flight set is memory. The stream
+    /// says so (the daemon is the only side that can), the gate reason says so, and the clear puts the
+    /// entry back to Working.
+    ///
+    /// <para><b>This test used to be the pin on a defect and is now the pin on a boundary.</b> It read
+    /// "<c>ResumeAfterRestartAsync</c> has no production caller", which was true and was the reason this
+    /// clear had to exist: the only way out of a restart-frozen row was a human pressing a button.
+    /// <c>MergeQueueProvisioner.EnsureQueue</c> now starts a resume pass whenever it rebuilds a repo's
+    /// queue, so the daemon un-freezes those rows itself
+    /// (<see cref="MergeQueueRestartResumeTests"/> drives the restart end to end). What this still pins is
+    /// that the human's escape hatch survived being made less necessary — a resume only ever runs for a
+    /// repo whose queue is rebuilt, by a probe that can reach the container runtime, and every other frozen
+    /// row is still this RPC's to clear. The queue here is hand-registered precisely so no resume is in the
+    /// picture: the clear has to work on its own.</para>
     /// </summary>
     [Fact]
     public async Task ClearStalledVerification_UnsticksAnEntryFrozenMidVerify_AndTheStreamSaysNoRunIsLive()

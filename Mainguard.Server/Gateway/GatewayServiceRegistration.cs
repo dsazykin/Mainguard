@@ -466,11 +466,17 @@ public static class GatewayServiceRegistration
     /// container rather than recreating it) and the merge queue rehydrates its state from SQLite in its
     /// constructor. So after a daemon restart the queue resumed knowing about every branch, every jail was
     /// still running, and the session store was empty: every verification on the box refused with "no live
-    /// sandbox", <c>ResumeAfterRestartAsync</c> drove each interrupted run straight back to Working, and
-    /// the stale cascade's auto re-verify failed for every branch. The queue came back up permanently
-    /// unable to verify anything until each agent was spawned again — with no error naming the actual
-    /// cause. That fallback matches on BOTH labels, so it disambiguates two repos' <c>pr-7</c> the same way
-    /// the session key does.</para>
+    /// sandbox" and the stale cascade's auto re-verify failed for every branch. The queue came back up
+    /// permanently unable to verify anything until each agent was spawned again — with no error naming the
+    /// actual cause. That fallback matches on BOTH labels, so it disambiguates two repos' <c>pr-7</c> the
+    /// same way the session key does.</para>
+    ///
+    /// <para>This method is now also the restart resume's jail probe:
+    /// <see cref="MergeQueueProvisioner"/> hands it to <c>MergeQueue.BeginResumeAfterRestart</c>, which
+    /// re-runs an interrupted verification when it answers and returns the entry to <c>Working</c> when it
+    /// does not. That makes the Docker fallback above load-bearing twice over — without it every survivor
+    /// would look jail-less on the one pass whose whole job is telling those two cases apart, and the
+    /// resume would report every branch on the box as stranded.</para>
     /// </summary>
     internal static string? ResolveVerificationJail(AgentSessionStore sessions, string repoHash, string agentId)
     {
