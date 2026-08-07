@@ -84,7 +84,7 @@
                   <!-- The row's actions. The rail's ONE accent stays the Review CTA, so nothing else here
                        is Accent: Verify is Secondary (asking for a check is a supporting action) and the
                        destructive one reads destructive by hue (Button.DangerQuiet) rather than by mass.
-                       A WrapPanel rather than a horizontal StackPanel because there are now up to four
+                       A WrapPanel rather than a horizontal StackPanel because there are now up to five
                        controls on a rail that is user-resizable down to a narrow column — a StackPanel
                        would push the last one off the edge, which is the clipping #306 just fixed above.
                        Every row that can be acted on has a control: the defect this answers was an entry
@@ -95,6 +95,12 @@
                     <Button Classes="Secondary" Content="{Binding VerifyButtonText}" FontSize="12" Padding="10,3"
                             Margin="0,2,6,0" Command="{Binding VerifyCommand}" IsEnabled="{Binding CanVerify}"
                             ToolTip.Tip="Run this repo's verification command in this agent's own jail."/>
+                    <!-- Only for a STRANDED row — one the daemon says has no jail. It is Secondary, not
+                         Accent: the rail's one accent stays the Review CTA, and a recovery action that
+                         out-shouted the merge CTA would move the surface's emphasis onto cleanup. -->
+                    <Button Classes="Secondary" Content="{Binding ResumeButtonText}" FontSize="12" Padding="10,3"
+                            Margin="0,2,6,0" Command="{Binding ResumeCommand}" IsVisible="{Binding CanResume}"
+                            ToolTip.Tip="This entry's agent has no sandbox, so it cannot be verified. Resume starts a new one on this same entry's agent/&lt;id&gt; branch, with its commits intact."/>
                     <!-- Only for a row the DAEMON says has no run behind its Verifying state. -->
                     <Button Classes="Secondary" Content="Clear stalled run" FontSize="12" Padding="10,3" Margin="0,2,6,0"
                             Command="{Binding ClearStalledVerificationCommand}"

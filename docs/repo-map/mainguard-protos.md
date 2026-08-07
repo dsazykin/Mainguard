@@ -4,7 +4,14 @@
 - **`protos/mainguard/v1/`** — the `mainguard.v1` proto surface (package name binding; opaque
   handles only, no OS paths — G-14).
   - `common.proto` (`Handle`/`Empty`), `agent.proto` (`AgentService`:
-    `SpawnAgent`/`StopAgent`/`ListAgents`/`StreamAgentEvents` + the PR3 **`ListInstalledAdapters`** —
+    `SpawnAgent`/`StopAgent`/`ListAgents`/`StreamAgentEvents`; **`ResumeAgent`** gives a STRANDED
+    merge-queue entry a live jail again — a spawn onto the agent id that entry ALREADY has, with the
+    worktree standing on its existing `agent/<id>`. A separate RPC rather than an `agent_id` field on
+    `SpawnAgentRequest` for two enforcement reasons: `RoleInterceptor` denies by METHOD (a field inside a
+    shared message cannot be put on the coordinator's denied list), and `ResumeAgentRequest` carries no
+    `role`, so a resume structurally cannot mint a coordinator. Like `DiscardEntryRequest` it carries no
+    actor either. A refusal is `resumed=false` + a verbatim reason on a successful RPC, never a status
+    code, so "no exception" is not evidence a jail exists; + the PR3 **`ListInstalledAdapters`** —
     the installed agent CLIs as `InstalledAdapterInfo{id,version,api_key_env_var}`, env-var NAMES only,
     never values; plus **`GetDaemonInfo`** — the tier-1 skew probe returning `daemon_version` (the
     Mainguard.Server assembly informational version) + `payload_version` (the `/etc/mainguardos-release`
@@ -42,7 +49,13 @@
     takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
     untouched) and, like `ApprovePlanRequest`, carries **no actor field** — the discarding identity is
     daemon-derived, because an attribution the client fills in is one any token-holder can forge; both
-    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.verification_in_flight`**
+    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.has_live_sandbox`**
+    (`optional`) says whether the entry still HAS a jail — the fact that decides whether it is workable at
+    all, since verification runs only in the worker's own sandbox — so the rail can offer Resume on a
+    stranded row and withhold Verify instead of leaving an enabled button whose only behaviour is an
+    error. `optional` for the same reason `AgentResourceReading.cpu_percent` is: a proto3 `false` meaning
+    "this daemon does not report liveness" is indistinguishable from "this entry's jail is gone", which
+    would render every entry of an older daemon as stranded. **`QueueEntry.verification_in_flight`**
     says whether a run is really executing, which the state alone cannot: state is persisted per
     transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
     with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the

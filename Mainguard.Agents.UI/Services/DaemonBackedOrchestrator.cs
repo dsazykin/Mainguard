@@ -583,7 +583,12 @@ public sealed class DaemonBackedOrchestrator :
                     // Carried from the daemon rather than inferred from the state: a client that guessed
                     // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
                     // for — the ones a restart left frozen mid-verification.
-                    VerificationInFlight: entry.VerificationInFlight));
+                    VerificationInFlight: entry.VerificationInFlight,
+                    // Three-valued on purpose. `HasHasLiveSandbox` is protobuf's field-presence test: a
+                    // daemon that predates the field leaves it unset, and mapping that to `false` would
+                    // render every one of its entries as stranded and offer to spawn jails for agents that
+                    // are running. Unset means unknown, and unknown changes nothing.
+                    HasLiveSandbox: entry.HasHasLiveSandbox ? entry.HasLiveSandbox : null));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -1228,6 +1233,74 @@ public sealed class DaemonBackedOrchestrator :
         {
             throw new InvalidOperationException($"Can't clear this verification — {response.Reason}.");
         }
+    }
+
+    /// <summary>
+    /// Resumes a stranded entry: asks the daemon to spawn a jail onto the id the entry ALREADY has, with
+    /// the worktree standing on its existing <c>agent/&lt;id&gt;</c> branch.
+    ///
+    /// <para><b>This adapter asserts nothing.</b> It supplies the repo handle, the CLI the human picked and
+    /// that CLI's credentials, and the daemon answers. Whether the entry exists, whether its branch
+    /// survives, whether the id already has a session, whether a merge is open — none of those questions
+    /// are asked here, because the answers live in the daemon's own state and a client that guessed at them
+    /// would be building the control in the UI layer again.</para>
+    ///
+    /// <para><b>A refusal is thrown, never swallowed</b>, for the same reason a discard's is: the daemon
+    /// answers a refused resume with <c>resumed=false</c> and a reason on an otherwise successful RPC, so
+    /// "no exception" is not evidence a jail exists. <see cref="MergeActionRunner"/> turns the throw into a
+    /// warning toast carrying the daemon's words.</para>
+    /// </summary>
+    public async Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't resume — no repository is active for agents yet.");
+        }
+
+        if (string.IsNullOrWhiteSpace(agentKind))
+        {
+            // Not a security check (the daemon rejects a blank kind too) — it is the difference between
+            // naming what the human has to choose and reporting gRPC's INVALID_ARGUMENT at them.
+            throw new InvalidOperationException(
+                "Can't resume — pick which agent CLI should take over this branch first.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+
+        // The resumed jail needs the same credentials a fresh spawn of this CLI would get: its BYOK key
+        // under the adapter's DECLARED env-var name, and the saved login state from the host OS keychain
+        // (the jail's $HOME is tmpfs, so without it the human signs in again). The adapter is looked up
+        // rather than assumed — a CLI that declares no key variable authenticates interactively and no key
+        // may travel for it.
+        var installed = await ListInstalledClisAsync(cts.Token).ConfigureAwait(false);
+        var cli = installed.FirstOrDefault(c => string.Equals(c.Id, agentKind, StringComparison.Ordinal));
+        var provider = ApiKeyProviderMap.ProviderForEnvVar(cli?.ApiKeyEnvVar ?? string.Empty);
+        var key = provider is null ? null : _keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider));
+        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(agentKind)));
+
+        var response = await _client.ResumeAgentAsync(
+            repoHandle!, agentId, agentKind, key ?? string.Empty, cts.Token,
+            deadline: SpawnDeadline,
+            extraEnv: CollectCustomEnvKeys(),
+            cliCredentials: savedLogin.Count > 0 ? savedLogin : null).ConfigureAwait(false);
+
+        if (!response.Resumed)
+        {
+            throw new InvalidOperationException($"Can't resume — {response.Reason}.");
+        }
+
+        var state = Enum.TryParse<WorkerMergeState>(response.State, ignoreCase: true, out var s)
+            ? s : WorkerMergeState.Working;
+        Changed?.Invoke();
+        return new QueueEntryResumeOutcome(
+            response.AgentId, response.Branch, state, response.ClearedStalledVerification);
     }
 
     /// <summary>

@@ -479,7 +479,13 @@ public sealed class MockOrchestrator :
                     // make the rail label every one of them "Stalled", badge it as a warning and offer
                     // "Clear stalled run" on a row visibly executing tests: the exact false claim about
                     // an entry's activity that the in-flight flag exists to prevent, merely inverted.
-                    VerificationInFlight: a.Merge == WorkerMergeState.Verifying))
+                    VerificationInFlight: a.Merge == WorkerMergeState.Verifying,
+                    // A Dead agent's jail is gone; every other lifecycle state in the mock is one where a
+                    // sandbox exists (TornDown agents are filtered out of the queue above). Answered rather
+                    // than left null so the demo surface exercises the stranded shape at all — and answered
+                    // from the agent's OWN lifecycle rather than hardcoded, so a mock agent that dies while
+                    // the demo runs stops claiming a sandbox it does not have.
+                    HasLiveSandbox: a.Life != AgentLifecycleState.Dead))
                 .ToList();
 
         static int RailOrder(WorkerMergeState s) => s switch
@@ -640,6 +646,47 @@ public sealed class MockOrchestrator :
         foreach (var e in raised) EventReceived?.Invoke(e);
         Changed?.Invoke();
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Mock resume — the same shape the daemon enforces: the entry is ADOPTED (same id, same branch, same
+    /// row), an entry that already has a sandbox is refused, a terminal entry is refused, and a
+    /// <c>Verifying</c> row with no run behind it is walked back to <c>Working</c> so it can be verified
+    /// again. The mock has no jails, so "gets a sandbox" is the agent returning to a live lifecycle state.
+    /// </summary>
+    public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind)
+    {
+        var raised = new List<AgentEvent>();
+        QueueEntryResumeOutcome outcome;
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded)
+            {
+                throw new InvalidOperationException(
+                    $"Can't resume — this entry is already {a.Merge} — a terminal entry has nothing left to resume.");
+            }
+
+            if (a.Life != AgentLifecycleState.Dead)
+            {
+                throw new InvalidOperationException(
+                    "Can't resume — this entry already has a live agent — stop it before resuming.");
+            }
+
+            var clearedStalled = a.Merge == WorkerMergeState.Verifying;
+            if (clearedStalled)
+            {
+                SetMerge(a, WorkerMergeState.Working, raised);
+            }
+
+            a.Life = AgentLifecycleState.Working;
+            a.Detail = "resumed on " + a.Branch;
+            outcome = new QueueEntryResumeOutcome(agentId, a.Branch, a.Merge, clearedStalled);
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.FromResult(outcome);
     }
 
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)

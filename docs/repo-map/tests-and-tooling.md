@@ -108,7 +108,13 @@
   genuinely running (its tick loop advances them while `Detail` counts "tests 12/58"), so a projection
   that let `VerificationInFlight` default to false made the rail label every one of them "Stalled",
   badge it as a warning and offer "Clear stalled run" on a row visibly executing tests — asserted
-  against the real mock, not a stub. PNGs: `queue_lifecycle_<Theme>.png`,
+  against the real mock, not a stub. It also covers the **resume** affordance: only the row the daemon
+  says has NO sandbox offers Resume — a live one, including the stalled-verifying row whose jail is fine,
+  offers none, because a resume there would spend a minute building a jail for the daemon to refuse — and
+  that same row's Verify is WITHHELD rather than left enabled to produce "has no live sandbox". Resume is
+  not `Accent` (the rail's one accent stays Review), acts on the first press (it destroys nothing), and
+  reaches the seam with the row's OWN id plus the selected CLI, which are the two facts the daemon keys
+  the adoption on. PNGs: `queue_lifecycle_<Theme>.png`,
   `queue_lifecycle_confirm_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix
@@ -643,6 +649,22 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Agents/QueueEntryResumeDockerTests.cs`** (`RequiresDocker`) — the decisive
+  end-to-end for resume, against a real jail. A real agent spawned by the shipped chain commits in its
+  real worktree; the container is then removed through the engine and the daemon's session record
+  dropped, which is the state a VM stop or a crash leaves (deliberately NOT `StopAgent`, whose clean
+  teardown also deletes the branch). The entry is then exactly the dead end from the field report:
+  present, `Working`, `has_live_sandbox=false`, and a `RunVerification` that refuses with "no live
+  sandbox". The resume then has to produce a **different, real container** for the same `(repo, agent)`,
+  a worktree standing on `agent/<id>` at the commit the dead jail made, a passing verification run by
+  real `docker exec` of the command read out of `.mainguard/verify`, `CanMerge` true **on the daemon's
+  own gate**, and a `queue_entry_resumed` audit event naming the actor and the from-state. The second
+  case is the honest refusal: after a clean `StopAgent` the branch is gone, so the resume must refuse and
+  build nothing rather than start a jail on a fresh empty branch under the old name.
+  `Agents/FixtureRepo.cs` — the tiny **Node** project both Docker merge-queue suites verify (shared
+  rather than copied: the verify command and marker are what the assertions compare against, so two
+  copies would drift and the stale one would assert provenance against a command the repo no longer
+  declares).
 - **`Mainguard.Server.Tests/Agents/MergeQueueEndToEndDockerTests.cs`** (`RequiresDocker`) — **the
   merge queue driven as ONE loop instead of as a pile of parts.** Every other merge-queue test
   substitutes something load-bearing (a `runVerification` lambda that returns `Passed:true`, a
@@ -1044,7 +1066,11 @@
   `QueueEntryViewModel.VerifyCommand` — the control the rail is bound to — and assert the run happened
   on the daemon, through the whole real chain (VM command → `IMergeQueueService` → shipped
   `DaemonBackedOrchestrator` → shipped `DaemonClient` → in-proc `RunVerification` RPC → real
-  `MergeQueue`). Cases: the decisive Working→Verified with the daemon's runner provably invoked and
+  `MergeQueue`). Its fixtures now give the entry a live jail in the daemon's `AgentSessionStore`
+  (`GiveTheEntryALiveJail`), because the queue stream carries `has_live_sandbox` and the rail WITHHOLDS
+  Verify on an entry the daemon says has none — a seeded entry with no session is, in production, a
+  stranded one, and pressing Verify on it can only produce "has no live sandbox". Cases: the decisive
+  Working→Verified with the daemon's runner provably invoked and
   `not verified yet` cleared; verifying does NOT merge and an always-refusing `IMergeGate` still
   refuses (the trigger weakens no gate); a `NoVerificationCommandException` surfaces as a quotable
   `Can't verify — …` with the branch back on Working rather than a phantom Verified; and no active
@@ -1145,7 +1171,24 @@
   set stays `{spawn, list}` so the agent surface cannot address them at all. The two decisive cases
   drive the shipped `QueueRailViewModel` through the shipped `DaemonBackedOrchestrator` into a real
   in-proc daemon: a discard that lands must move the daemon's queue, and a discard the daemon REFUSES
-  must keep the row and report the reason as a warning. **`Agents/SwarmReconcilerDockerTests.cs`**
+  must keep the row and report the reason as a warning.
+  **`QueueEntryResumeTests.cs`** — the authorization half of resuming a stranded entry, all of which is
+  decided BEFORE any jail is built. Adoption attaches a jail to an agent id someone else owns, so it is
+  strictly more power than the merge RPCs contract §4 already denies: the coordinator is denied
+  `ResumeAgent` at the **role** layer (asserted as such, not merely as `PermissionDenied`, which a
+  never-authenticated token also produces) with no session created, and reflection pins the in-jail op set
+  at `{spawn, list}` with no agent id on the shim request at all. Everything is keyed on
+  `(RepoHash, AgentId)` — another repository's `pr-7` is neither adopted nor disturbed — and each refusal
+  has its own sentence: discarded, terminal, already-has-a-live-agent, merge-lease-held, and
+  verification-genuinely-in-flight (whose wording deliberately differs from the stalled-clear's, because
+  an in-flight run implies `Verifying` and an assertion on shared wording passed with the guard deleted).
+  A refused resume leaves no session, no state change and no audit event. The stale-`Verifying` case is
+  built the way a restart builds it — a queue constructed over a store that already holds the row — and
+  proves the claim is retracted, the immutable verification record is NOT discarded, no "verified" state
+  is resurrected, and a refusal that follows the retraction SAYS so. The rail case drives the shipped
+  `QueueRailViewModel` through the shipped `DaemonBackedOrchestrator` into a real in-proc daemon: the
+  daemon's `has_live_sandbox=false` is what makes the button appear, and its refusal reaches the human
+  verbatim as a warning. **`Agents/SwarmReconcilerDockerTests.cs`**
   (TI-P2-08 test 7, RequiresDocker via the new Docker-presence-only `[RequiresDockerDaemonFact]`):
   `Reconciler_OutOfBandDockerRm_ShouldConvergeOnBoot` stands up a trivial `busybox` container with the
   real `mainguard.agent`/`mainguard.repo` labels (not the P2-07 agent-base image), points a
@@ -1183,7 +1226,12 @@
   this ships to, where `pack-refs` re-states a pre-existing loose foreign branch as a create; and
   `TheHookDoesNotObstructTheDaemonsOwnGit` pins that spawn/teardown are unaffected),
   `AgentWorktreeManagerTests.cs` (add/remove/prune round-trip, duplicate-id + dirty-remove typed
-  failures, **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
+  failures, the **resume/adoption** set — `AdoptAgentWorktree` starts a new worktree on the EXISTING
+  `agent/<id>` with the dead jail's commits and file contents intact (a `worktree add -b` would fail every
+  line of it), refuses typed with `AgentBranchMissingException` and creates nothing when the branch is
+  gone, and carries across commits the mirror never saw before deleting the repository that holds them;
+  plus the decisive contrast between `RemoveAgentWorktreeKeepingBranch` and `RemoveAgentWorktree`, one of
+  which leaves the branch adoptable and the other of which does not — **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names
   the mirror's object store and the agent repo owns literally zero objects of its own),
   `AgentPush_LandsInItsOwnRepo_AndOnlyTheDaemonPublishesToTheMirror` (an agent push moves its own ref

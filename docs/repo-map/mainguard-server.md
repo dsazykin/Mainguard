@@ -64,7 +64,11 @@
   `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
   (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
   blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
-  branch into the state a re-verification starts from) and the human-only
+  branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
+  strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
+  writable jail to another agent's branch and have the daemon verify what it put there — and because
+  this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
+  `SpawnAgentRequest`) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
   or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
@@ -188,7 +192,21 @@
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
     `External` and route an upstream PR's merge into a local fast-forward), and `withoutHostCredentials`
     (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*` nor any
-    harvested CLI login, and seeds neither).
+    harvested CLI login, and seeds neither). A fourth, `adoptExistingBranch`, is the RESUME flag: it
+    routes the launcher to `AdoptAgentWorktree` (start on this id's EXISTING `agent/<id>`) instead of
+    `CreateAgentWorktree`, and switches the post-failure cleanup to the branch-preserving one. It asks no
+    authorization question — that is `AgentResumeService`'s job, and a spawn that could name any id
+    without it would let one agent adopt another's branch.
+  - **`Runtime/AgentResumeService.cs`** — the human-only resume for a STRANDED merge-queue entry (jail
+    gone, branch intact), behind `AgentService.ResumeAgent`. Holds ALL of the authorization, keyed on
+    `(RepoHash, AgentId)`: the entry must exist in THIS repo's live queue and be non-terminal, the id must
+    have no live session, the repo must hold no merge lease naming it, and no verification may be in
+    flight. Retracts a stale `Verifying` claim through the queue's own `TryClearStalledVerification` (one
+    implementation of that transition, not two), reads the entry's ORIGIN off the queue so `EnsureEntry`
+    cannot silently re-badge an intake'd PR as `Local`, refuses a resume that produced no sandbox (rolling
+    the session back), and appends the `queue_entry_resumed` audit event. Every refusal is an ordinary
+    result carrying its sentence — never an exception — and a refusal that follows a retraction says so.
+    See `docs/design/resume-stranded-queue-entry.md`.
   - **`Runtime/CoordinatorIpcServer.cs`** (PR3) — the coordinator→daemon spawn channel: one Unix-domain
     socket per coordinator served from a daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un
     limit) that also carries the executable `mainguard-agent` shim; the dir is created BEFORE the jail
@@ -288,9 +306,13 @@
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops
   so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source).
 - **`Services/AgentGrpcService.cs`** (**PR3:** validation+mapping only — `SpawnAgent`/`StopAgent`
-  dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes, incl. the v1
+  dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes via the shared
+  `MapLaunchFailure`, incl. the v1
   spawn preflight's `SandboxImageMissingException` → actionable `FailedPrecondition` naming the
-  missing jail image + repair; `role` rides the request/`AgentInfo`/snapshot), and the new
+  missing jail image + repair; `role` rides the request/`AgentInfo`/snapshot); **`ResumeAgent`**
+  dispatches to `AgentResumeService` and derives the actor from the connection (there is no actor field
+  on the request), answering a refusal as an ordinary response with `resumed=false` + a verbatim reason
+  rather than a status code — so a caller must not read "no exception" as "it resumed"; and the new
   **`ListInstalledAdapters`** RPC surfaces the `InstalledAdapterCatalog` markers —
   ids/versions/env-var NAMES only, no paths/secrets; **`GetDaemonInfo`** answers the tier-1 skew probe
   from the injected `Runtime/DaemonInfoProvider.cs` — the daemon's assembly informational version +
@@ -319,7 +341,11 @@
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
   list can badge external-PR entries, plus `verification_in_flight` (via
   `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run
-  leaves a persisted `Verifying` row with nothing executing; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  leaves a persisted `Verifying` row with nothing executing — plus `has_live_sandbox` (`optional`, from
+  the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
+  which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
+  enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
+  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the

@@ -170,6 +170,10 @@ public static class DaemonHost
         // server-side, so a coordinator agent cannot fan out unlimited workers via mainguard-agent spawn.
         builder.Services.AddSingleton(new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits());
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
+        // The human-only resume path for a stranded merge-queue entry (AgentService.ResumeAgent). It
+        // depends on the merge-queue registry registered by GatewayServiceRegistration below — DI resolves
+        // at first use, so the ordering here is presentational, not a dependency.
+        builder.Services.AddSingleton<Runtime.AgentResumeService>();
 
         // The Resource Monitor's data source. The tab shipped rendering per-agent CPU/RAM over a sampler
         // that was never written — the client hard-coded both to 0 — so every agent read a convincing 0%.

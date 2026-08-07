@@ -102,6 +102,13 @@ public sealed class AgentSpawnService
     /// login files so a coordinator-spawned worker inherits the login the user just performed; an
     /// untrusted head must inherit <b>nothing</b>, and must not seed that cache either.
     /// </param>
+    /// <param name="adoptExistingBranch">
+    /// <b>Resume.</b> Start this jail on the <c>agent/&lt;id&gt;</c> branch <paramref name="agentId"/>
+    /// already has, instead of creating one. Only <see cref="AgentResumeService"/> passes it, and only
+    /// after establishing daemon-side that <c>(repo, agentId)</c> names a live, non-terminal merge-queue
+    /// entry with no session of its own — the authorization question this flag does NOT ask, because a
+    /// spawn that could name any id would let one agent adopt another agent's branch.
+    /// </param>
     public async Task<string> SpawnAsync(
         string repoHandle, string agentKind, string? modelApiKey, string role, CancellationToken ct,
         IReadOnlyDictionary<string, string>? extraEnv = null,
@@ -109,7 +116,8 @@ public sealed class AgentSpawnService
         string? parentAgentId = null,
         string? agentId = null,
         Mainguard.Agents.Agents.MergeEntryOrigin queueOrigin = Mainguard.Agents.Agents.MergeEntryOrigin.Local,
-        bool withoutHostCredentials = false)
+        bool withoutHostCredentials = false,
+        bool adoptExistingBranch = false)
     {
         // Custom env entries travel to the same 0400 tmpfs env-file as the model key; a malformed
         // name would corrupt it for every entry, so reject the whole spawn up front (typed →
@@ -212,7 +220,8 @@ public sealed class AgentSpawnService
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
                 extraEnv: launchEnv,
                 cliCredentials: launchCredentials,
-                progress: new InlineProgress(m => _store.MarkState(key, session.State, m))).ConfigureAwait(false);
+                progress: new InlineProgress(m => _store.MarkState(key, session.State, m)),
+                adoptExistingBranch: adoptExistingBranch).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {

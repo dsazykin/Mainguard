@@ -80,6 +80,18 @@ message QueueEntry {
   // on the wire a client cannot distinguish a branch being verified from one stuck pretending to be, and
   // therefore cannot offer the human the one action that unsticks it.
   bool verification_in_flight = 8;
+  // Whether this entry's agent still HAS a jail in this repo — the fact that decides whether the entry
+  // is workable at all. Verification runs in the worker's own sandbox and never on the host, so an entry
+  // whose jail is gone cannot be verified, cannot become Verified, and therefore cannot merge; its
+  // Verify button is an error message waiting to happen and its only honest actions are Resume and
+  // Discard. Only the daemon holds the session table, so a client cannot derive this.
+  //
+  // `optional` ON PURPOSE, exactly like AgentResourceReading.cpu_percent: proto3 scalars default to
+  // false, and a false that means "this daemon does not report liveness" is indistinguishable from one
+  // that means "this entry's jail is gone" — which would make every entry served by an older daemon
+  // render as stranded. Explicit presence lets "unknown" be a value on the wire, and unknown leaves the
+  // surface exactly as it was.
+  optional bool has_live_sandbox = 9;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the

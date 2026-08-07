@@ -72,12 +72,21 @@ public sealed class SandboxAgentLauncher
     /// when the repo is not provisioned (session-only path). On a failure <i>after</i> the worktree exists,
     /// the half-made worktree is cleaned up so no residue survives, then the failure propagates.
     /// </summary>
+    /// <param name="adoptExistingBranch">
+    /// <b>Resume.</b> When true the worktree is ADOPTED onto this id's existing <c>agent/&lt;id&gt;</c>
+    /// branch rather than created on a new one, so a jail started for a stranded queue entry begins on the
+    /// commits the dead jail left behind. Two things change with it, both of them load-bearing: an absent
+    /// branch is a typed refusal instead of a fresh branch off main, and the post-failure cleanup preserves
+    /// the branch instead of deleting it — a rollback that ran the ordinary teardown would destroy the one
+    /// copy of the work the resume exists to recover.
+    /// </param>
     public async Task<SandboxLaunchResult?> TryLaunchAsync(
         string repoHandle, string agentId, string agentKind, string? modelApiKey,
         string? ipcDirPath = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? extraEnv = null,
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
-        IProgress<string>? progress = null)
+        IProgress<string>? progress = null,
+        bool adoptExistingBranch = false)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -174,7 +183,12 @@ public sealed class SandboxAgentLauncher
         var adapter = _adapters.TryGet(agentKind);
         var launchCommand = adapter?.Launch;
 
-        var worktreePath = _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
+        // Resume adopts this id's existing agent/<id>; an ordinary spawn creates a new one. The two are
+        // deliberately different methods rather than one with a flag deep inside: creating refuses when
+        // the branch exists, adopting refuses when it does not, and each refusal is the other's success.
+        var worktreePath = adoptExistingBranch
+            ? _environment.Worktrees.AdoptAgentWorktree(repoHandle, agentId)
+            : _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
         // MG-3: the per-agent repository the worktree is linked off — the ONE git dir this jail may
         // write. Resolved AFTER creation so an implementation that has no per-agent repo (the test
         // doubles' default) simply reports none and the jail carries no such mount.
@@ -269,8 +283,23 @@ public sealed class SandboxAgentLauncher
         catch (Exception ex)
         {
             // Leave no residue: remove the worktree we just created before surfacing the failure.
-            _log.LogError(ex, "jail start failed after worktree — cleaning up worktree: repo={Repo}", repoHandle);
-            TryRemoveWorktree(repoHandle, agentId);
+            //
+            // On the RESUME path the cleanup must keep agent/<id>. The ordinary teardown ends in
+            // `branch -D`, which here would delete the only surviving copy of the commits this launch was
+            // invoked to recover — turning a failed resume into data loss. The branch-preserving clear can
+            // leave the worktree behind if it cannot remove it; the next resume clears that residue, and
+            // residue is a strictly better failure than deleted work.
+            _log.LogError(ex, "jail start failed after worktree — cleaning up worktree: repo={Repo} adopt={Adopt}",
+                repoHandle, adoptExistingBranch);
+            if (adoptExistingBranch)
+            {
+                TryRemoveWorktreeKeepingBranch(repoHandle, agentId);
+            }
+            else
+            {
+                TryRemoveWorktree(repoHandle, agentId);
+            }
+
             throw;
         }
     }
@@ -337,6 +366,15 @@ public sealed class SandboxAgentLauncher
     {
         try { _environment.Worktrees.RemoveAgentWorktree(repoHash, agentId, force: true); }
         catch { /* best effort */ }
+    }
+
+    /// <summary>The resume path's rollback: clear the worktree, keep <c>agent/&lt;id&gt;</c>. A manager
+    /// that cannot do that throws rather than falling back — and this swallows the throw, so the outcome
+    /// is residue, never a deleted branch.</summary>
+    private void TryRemoveWorktreeKeepingBranch(string repoHash, string agentId)
+    {
+        try { _environment.Worktrees.RemoveAgentWorktreeKeepingBranch(repoHash, agentId); }
+        catch { /* best effort — and deliberately NOT falling back to the branch-deleting removal */ }
     }
 
     /// <summary>
