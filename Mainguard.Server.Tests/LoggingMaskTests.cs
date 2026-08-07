@@ -49,6 +49,64 @@ public sealed class LoggingMaskTests : IClassFixture<DaemonFixture>
         Assert.Contains(logs, line => line.Contains("model_api_key=***", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The same guarantee for <c>ResumeAgent</c>, asserted by <b>rendering</b> rather than by registry
+    /// membership.
+    ///
+    /// <para>The registry test below is a spelling check: it proves a <c>// SECRET</c> field has an entry.
+    /// It cannot prove the entry is the right one, and it says nothing at all about
+    /// <c>extra_env</c>/<c>cli_credentials</c>, whose field lines deliberately carry no marker because
+    /// their secrecy lives on the nested messages. Resume carries the identical credential payload to a
+    /// spawn, so the thing worth asserting is that all three really come out masked — which is what this
+    /// does, on the interceptor's own output.</para>
+    /// </summary>
+    [Fact]
+    public async Task ResumeAgent_MasksEveryCredentialItCarries_TheSameWayASpawnDoes()
+    {
+        const string key = "RESUME-SECRET-KEY-DEADBEEF-DO-NOT-LOG";
+        const string envValue = "RESUME-SECRET-ENV-DEADBEEF-DO-NOT-LOG";
+        const string login = "RESUME-SECRET-LOGIN-DEADBEEF-DO-NOT-LOG";
+
+        var client = new AgentService.AgentServiceClient(_daemon.CreateChannel());
+        var request = new ResumeAgentRequest
+        {
+            RepoHandle = "repo-handle-opaque",
+            AgentId = "stranded-agent",
+            AgentKind = "claude-code",
+            ModelApiKey = key,
+        };
+        request.ExtraEnv.Add(new EnvEntry { Name = "LLM_TOKEN", Value = envValue });
+        request.CliCredentials.Add(new CliCredentialFile
+        {
+            Path = ".claude/.credentials.json",
+            Content = Google.Protobuf.ByteString.CopyFromUtf8(login),
+        });
+
+        // The RPC is expected to refuse (no queue for that handle) — the logging happens either way, and
+        // a refused call is exactly the path where a request body gets rendered into a warning.
+        try
+        {
+            await client.ResumeAgentAsync(request, _daemon.AuthHeaders());
+        }
+        catch (RpcException)
+        {
+            // The refusal is not what this test is about.
+        }
+
+        var logs = _daemon.CapturedLogs;
+        Assert.NotEmpty(logs);
+        foreach (var secret in new[] { key, envValue, login, "RESUME-SECRET" })
+        {
+            Assert.DoesNotContain(logs, line => line.Contains(secret, StringComparison.Ordinal));
+        }
+
+        // …and the request WAS logged, with the key masked — otherwise "no secret in the logs" would pass
+        // for a request that was never rendered at all.
+        Assert.Contains(logs, line =>
+            line.Contains("ResumeAgent", StringComparison.Ordinal)
+            && line.Contains("model_api_key=***", StringComparison.Ordinal));
+    }
+
     // A non-RpcException that escapes a handler used to reach the client as a bare UNKNOWN with nothing
     // recorded daemon-side (the #201 class of invisibility). The interceptor now catches it, logs an
     // Error under the Rpc category naming the method + exception type, and rethrows — and the fault line

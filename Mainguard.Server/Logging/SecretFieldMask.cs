@@ -22,6 +22,10 @@ public static class SecretFieldMask
     {
         // agent.proto — SpawnAgentRequest.model_api_key
         ("mainguard.v1.SpawnAgentRequest", 4),
+        // agent.proto — ResumeAgentRequest.model_api_key. A resume carries the same credentials a
+        // spawn does, so it must mask the same things; its extra_env/cli_credentials are covered by
+        // the two nested-message registrations below, exactly as SpawnAgentRequest's are.
+        ("mainguard.v1.ResumeAgentRequest", 4),
         // agent.proto — EnvEntry.value (SpawnAgentRequest.extra_env: custom llm_env_* keys)
         ("mainguard.v1.EnvEntry", 2),
         // agent.proto — CliCredentialFile.content (CLI login state: SpawnAgentRequest.cli_credentials

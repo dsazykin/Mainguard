@@ -189,7 +189,17 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         // per entry.FlaggedItems row and acknowledges it over the daemon RPC; with an empty list there is
         // nothing to render and nothing to click, so a daemon-blocked branch would be permanently
         // unmergeable from the shipped UI. This projection is the cockpit's only source for it.
-        await loop.WaitForQueueProjectionAsync(agent.Id);
+        // Waited for by the FLAGGED ITEM, not merely by the entry's presence. `WaitForQueueProjectionAsync`
+        // returns on the first snapshot carrying the agent — which can be the one the spawn's EnsureEntry
+        // pushed, before the verification armed the gate. Asserting on FlaggedItems straight after it read
+        // whichever snapshot happened to have landed, so the test was racing the stream it was measuring
+        // (observed as an empty FlaggedItems on CI while the daemon's own gate, asserted above, was
+        // correctly blocking). The acknowledged-state assertion further down already waits this way.
+        Assert.True(
+            await WaitUntilAsync(() =>
+                loop.Adapter.GetQueue().FirstOrDefault(q => q.AgentId == agent.Id)?.FlaggedItems.Count > 0,
+                ProjectionWait),
+            "the flagged item never reached the client projection — the review surface would have nothing to acknowledge");
         var entry = Assert.Single(loop.Adapter.GetQueue(), q => q.AgentId == agent.Id);
         var flagged = Assert.Single(entry.FlaggedItems);
         Assert.Equal(Mainguard.Server.Services.MergeQueueGrpcService.ChangedTestCommandItemId, flagged.Id);

@@ -98,8 +98,13 @@ message ResumeAgentRequest {
   // as it is at spawn time — asked rather than guessed.
   string agent_kind = 3;
   string model_api_key = 4; // SECRET
-  repeated EnvEntry extra_env = 5;         // SECRET values (see SpawnAgentRequest.extra_env)
-  repeated CliCredentialFile cli_credentials = 6; // SECRET (see SpawnAgentRequest.cli_credentials)
+  // The user's CUSTOM env-var keys and the CLI's saved login state — identical payloads to
+  // SpawnAgentRequest.extra_env / .cli_credentials, and redacted by the same registrations
+  // (EnvEntry.value, CliCredentialFile.content), so a resume masks exactly what a spawn masks.
+  // Values are SECRET; the field lines deliberately carry no trailing `// SECRET` marker, for the
+  // same reason SpawnAgentRequest's do not — the secrecy lives on the nested message's own field.
+  repeated EnvEntry extra_env = 5;
+  repeated CliCredentialFile cli_credentials = 6;
   // No `role`, and no actor — see the RPC comment.
 }
 
