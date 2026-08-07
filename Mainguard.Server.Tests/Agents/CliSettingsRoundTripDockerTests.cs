@@ -229,11 +229,7 @@ public class CliSettingsRoundTripDockerTests
         var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
         try
         {
-            var init = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
-                "cd /workspace && git init -q && git config user.email a@b.c && git config user.name t "
-                + "&& git commit -q --allow-empty -m base && echo READY");
-            Assert.True(init.ExitCode == 0 && init.Stdout.Contains("READY", StringComparison.Ordinal),
-                $"could not make /workspace a git repo: exit={init.ExitCode} stderr={init.Stderr}");
+            await MakeWorkspaceAGitRepoAsync(fixture, first.ContainerId);
 
             // Re-enter the engine with the DECLARED path but no restore payload — the first-session shape.
             var second = await fixture.Engine.SpawnAsync(
