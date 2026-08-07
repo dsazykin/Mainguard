@@ -44,7 +44,19 @@ public sealed class ToolchainChannelException : Exception
 /// — never merely because a marker file exists. See <see cref="ToolchainChannel.ListAsync"/>.</param>
 /// <param name="Detail">What the probe reported, or why it did not run. Always something a human can act
 /// on.</param>
-public sealed record ToolchainStatus(ToolchainEntry Entry, bool IsInstalled, string Detail);
+/// <param name="CouldNotCheck">
+/// True when the check itself could not be performed — the environment could not be reached at all, so
+/// nothing was learned about this toolchain either way.
+///
+/// <para><b>Why this is not folded into <paramref name="IsInstalled"/>.</b> "We ran the check and the
+/// toolchain is absent" and "we could not run the check" are different facts with different remedies,
+/// and collapsing them produces a confidently wrong diagnosis: telling someone whose WSL is not running
+/// to "install it in Settings → Toolchains" sends them to a button that will also fail, for a reason
+/// nothing on screen mentions. A raw exception at least did not claim to know. Swapping it for a
+/// misleading sentence would not be an improvement, so the third state is carried explicitly.</para>
+/// </param>
+public sealed record ToolchainStatus(
+    ToolchainEntry Entry, bool IsInstalled, string Detail, bool CouldNotCheck = false);
 
 /// <summary>
 /// The user-managed toolchain channel: installs a curated, pinned, checksum-verified language toolchain
@@ -124,7 +136,18 @@ public sealed class ToolchainChannel
     public async Task<ToolchainStatus> StatusAsync(ToolchainEntry entry, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(entry);
-        var probe = await ProbeAsync(entry, ct).ConfigureAwait(false);
+        var outcome = await ProbeAsync(entry, ct).ConfigureAwait(false);
+        var probe = outcome.Result;
+
+        if (outcome.HostFailure is { } hostFailure)
+        {
+            // NOT "Not installed" — nothing was learned about the toolchain. See ToolchainStatus.
+            return new ToolchainStatus(
+                entry,
+                IsInstalled: false,
+                Detail: $"Could not check — this Mainguard environment could not be reached ({hostFailure})",
+                CouldNotCheck: true);
+        }
 
         if (!probe.Succeeded)
         {
@@ -232,7 +255,7 @@ public sealed class ToolchainChannel
         }
 
         progress?.Report("Checking that it runs…");
-        var probe = await ProbeAsync(entry, ct).ConfigureAwait(false);
+        var probe = (await ProbeAsync(entry, ct).ConfigureAwait(false)).Result;
         if (!probe.Succeeded)
         {
             throw new ToolchainChannelException(ToolchainChannelError.ProbeFailed,
@@ -281,10 +304,50 @@ public sealed class ToolchainChannel
         _log?.Invoke($"toolchain removed: {entry.Id}");
     }
 
-    private Task<AdapterCommandResult> ProbeAsync(ToolchainEntry entry, CancellationToken ct) =>
-        RunAsync(
-            entry.ProbeCommand(ToolchainPaths.VmInstallDir(entry.Id, _root), Sandbox.PackageCachePolicy.SandboxMount),
-            ct);
+    /// <summary>What a probe attempt produced, including the case where it never ran.</summary>
+    /// <param name="Result">The command result (synthetic when <paramref name="HostFailure"/> is set).</param>
+    /// <param name="HostFailure">Why the probe could not be STARTED, or null when it ran.</param>
+    private sealed record ProbeOutcome(AdapterCommandResult Result, string? HostFailure);
+
+    /// <summary>
+    /// Runs the entry's probe. <b>A probe that cannot be STARTED is reported, never thrown</b> — and is
+    /// reported as its own outcome rather than as a failed probe.
+    ///
+    /// <para>Found by running the end-to-end test for the first time. The probe names the interpreter by
+    /// absolute path, so before an install that path does not exist; a host that launches processes
+    /// directly then throws <see cref="System.ComponentModel.Win32Exception"/> ("No such file or
+    /// directory") straight out of <see cref="StatusAsync"/>. The production host happens to hide this —
+    /// it shells into the VM, so a missing binary comes back as a non-zero exit from <c>wsl</c> — but
+    /// relying on that is relying on an accident of one implementation, and it is the SAME code path
+    /// that must report a stopped distro or a missing <c>wsl.exe</c>.</para>
+    ///
+    /// <para>What it costs in production is not hypothetical: <see cref="StatusAsync"/> is what
+    /// <c>SandboxAgentLauncher.EnsureMountedToolchainsAsync</c> calls before every spawn, and the entire
+    /// purpose of that path is to turn "toolchain missing" into a typed, human-readable refusal.</para>
+    /// </summary>
+    private async Task<ProbeOutcome> ProbeAsync(ToolchainEntry entry, CancellationToken ct)
+    {
+        var argv = entry.ProbeCommand(
+            ToolchainPaths.VmInstallDir(entry.Id, _root), Sandbox.PackageCachePolicy.SandboxMount);
+
+        try
+        {
+            return new ProbeOutcome(await RunAsync(argv, ct).ConfigureAwait(false), null);
+        }
+        catch (OperationCanceledException)
+        {
+            // A caller-requested cancellation is not a host failure and must propagate untouched.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // 127 is the shell's "command not found", so the synthetic result reads correctly anywhere
+            // it is surfaced; the REASON is what callers use to avoid claiming the toolchain is absent.
+            return new ProbeOutcome(
+                new AdapterCommandResult(127, string.Empty, ex.Message),
+                $"{ex.GetType().Name}: {ex.Message}");
+        }
+    }
 
     private Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct) =>
         _host.RunAsync(command, ct);

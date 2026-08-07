@@ -195,6 +195,61 @@ public class ToolchainChannelTests
         Assert.Contains("tool-x", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task AHostThatCannotEvenRunTheProbe_ReportsNotInstalled_RatherThanThrowing()
+    {
+        // Found by running the end-to-end test for the first time, where this threw a raw
+        // Win32Exception out of StatusAsync. The probe names the interpreter by ABSOLUTE PATH, so
+        // before an install that path does not exist — and "is it installed?" is exactly the question
+        // asked at that moment.
+        //
+        // Why it matters beyond a test: StatusAsync is what
+        // SandboxAgentLauncher.EnsureMountedToolchainsAsync calls before EVERY spawn, and that path
+        // exists to turn a missing toolchain into a typed, readable refusal. A raw platform exception
+        // out of a spawn is the one thing it must never produce.
+        var manifest = ToolchainManifest.Parse(ValidManifestJson());
+        var channel = new ToolchainChannel(new ThrowingHost(), manifest);
+
+        var status = await channel.StatusAsync(manifest.Entries[0]);
+
+        Assert.False(status.IsInstalled);
+        Assert.False(string.IsNullOrWhiteSpace(status.Detail));
+    }
+
+    [Fact]
+    public async Task AnUnreachableEnvironment_IsReportedAsUNKNOWN_NotAsNotInstalled()
+    {
+        // The distinction that keeps the fix from being a downgrade. Swapping a raw exception for the
+        // confident sentence "Not installed — install it in Settings → Toolchains" would send someone
+        // whose WSL is down to a button that fails the same way, for a reason nothing on screen names.
+        // "We could not look" is not "it is not there".
+        var manifest = ToolchainManifest.Parse(ValidManifestJson());
+        var channel = new ToolchainChannel(new ThrowingHost(), manifest);
+
+        var status = await channel.StatusAsync(manifest.Entries[0]);
+
+        Assert.True(status.CouldNotCheck);
+        Assert.Contains("could not", status.Detail, StringComparison.OrdinalIgnoreCase);
+        // It must NOT claim the toolchain is absent.
+        Assert.DoesNotContain("Not installed", status.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AProbeThatRunsAndFails_IsStillPlainNotInstalled()
+    {
+        // The converse, so the new flag cannot swallow the ordinary case: a host that WORKS and a probe
+        // that simply exits non-zero is a genuine "not installed", and must stay actionable.
+        var manifest = ToolchainManifest.Parse(ValidManifestJson());
+        var host = new ScriptedHost { PreInstalled = false };
+        var channel = new ToolchainChannel(host, manifest);
+
+        var status = await channel.StatusAsync(manifest.Entries[0]);
+
+        Assert.False(status.IsInstalled);
+        Assert.False(status.CouldNotCheck);
+        Assert.Equal("Not installed", status.Detail);
+    }
+
     // ---- The catalog + the spawn path ------------------------------------------------------------
 
     [Fact]
@@ -387,6 +442,20 @@ public class ToolchainChannelTests
             Commands.FindIndex(c => string.Equals(c[0], exe, StringComparison.Ordinal));
 
         public string Describe() => string.Join(" | ", Commands.Select(c => string.Join(' ', c)));
+    }
+
+    /// <summary>A host that cannot launch anything — the shape a real host takes when the binary under
+    /// test is not on disk, or when WSL is not running at all.</summary>
+    private sealed class ThrowingHost : IAdapterInstallHost
+    {
+        public Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct) =>
+            throw new System.ComponentModel.Win32Exception(
+                $"An error occurred trying to start process '{command[0]}'. No such file or directory");
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
+            throw new InvalidOperationException("never staged");
     }
 
     /// <summary>An image builder that fails the test if it is ever asked to build.</summary>

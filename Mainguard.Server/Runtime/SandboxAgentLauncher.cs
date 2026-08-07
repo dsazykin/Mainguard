@@ -302,6 +302,21 @@ public sealed class SandboxAgentLauncher
             return null;
         }
 
+        // Only an IMAGE-LAYER toolchain needs a builder. A declaration of nothing but runtime-mount
+        // toolchains (`python-3`) builds no layer at all, so demanding an image builder for it would
+        // refuse a perfectly satisfiable repository — and refuse it with the WRONG REASON, which is
+        // worse: "this substrate cannot build toolchain layers" sends the reader after an image-build
+        // capability that was never required. Found by the spawn test below, which drives a Python-only
+        // repository through a substrate that has no builder.
+        var needsLayer = declaration.Ids
+            .Select(ToolchainCatalog.TryGet)
+            .Any(r => r is { Delivery: ToolchainDelivery.ImageLayer });
+
+        if (!needsLayer)
+        {
+            return null;
+        }
+
         var builder = _environment.ToolchainImages;
         if (builder is null)
         {
@@ -361,6 +376,7 @@ public sealed class SandboxAgentLauncher
         }
 
         var missing = new List<string>();
+        var unknown = new List<string>();
         foreach (var id in wanted)
         {
             var entry = channel.Manifest.TryGet(id);
@@ -371,10 +387,27 @@ public sealed class SandboxAgentLauncher
             }
 
             var status = await channel.StatusAsync(entry, ct).ConfigureAwait(false);
-            if (!status.IsInstalled)
+            if (status.CouldNotCheck)
+            {
+                unknown.Add($"{entry.DisplayName} ({entry.Id}) — {status.Detail}");
+            }
+            else if (!status.IsInstalled)
             {
                 missing.Add($"{entry.DisplayName} ({entry.Id}) — {status.Detail}");
             }
+        }
+
+        // Reported FIRST, and as its own failure. "We could not look" is not "it is not there": sending
+        // someone whose environment is unreachable to Settings → Toolchains points them at a button that
+        // will fail the same way, for a reason nothing on screen mentions. A wrong-but-confident
+        // diagnosis is worse than the raw error it replaced.
+        if (unknown.Count > 0)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this repository declares {string.Join(", ", unknown)}. Mainguard could not reach its "
+                + "environment to check, so whether the toolchain is installed is UNKNOWN — this is not a "
+                + "report that it is missing. Check that MainguardEnv is running, then start the agent "
+                + "again. The jail was NOT started.");
         }
 
         if (missing.Count > 0)

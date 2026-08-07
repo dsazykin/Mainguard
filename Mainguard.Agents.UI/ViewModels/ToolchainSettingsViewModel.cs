@@ -140,6 +140,21 @@ public partial class ToolchainSettingsViewModel : ViewModelBase, ISettingsPage
         try
         {
             var statuses = await _channel.ListAsync(CancellationToken.None).ConfigureAwait(true);
+
+            // The channel no longer throws when the environment cannot be reached — it answers
+            // "could not check" per toolchain, so the SPAWN path can tell that apart from "not
+            // installed" instead of dying on a raw platform exception. This page must not lose the
+            // distinction in the other direction: if NOTHING could be checked, the environment is
+            // down, and a list of rows each mumbling "Could not check" is a worse answer than one
+            // banner saying so. A page that reports per-item uncertainty when the whole substrate is
+            // unreachable buries the only fact that matters.
+            if (statuses.Count > 0 && statuses.All(s => s.CouldNotCheck))
+            {
+                LoadError = $"{statuses[0].Detail}. Start the Mainguard environment, then Refresh.";
+                Toolchains.Clear();
+                return;
+            }
+
             Toolchains.Clear();
             foreach (var status in statuses)
                 Toolchains.Add(new ToolchainRowViewModel(status));
