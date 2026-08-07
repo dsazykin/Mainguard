@@ -579,7 +579,11 @@ public sealed class DaemonBackedOrchestrator :
 
                 _queue.Add(new QueueEntry(
                     entry.AgentId, entry.AgentId, $"agent/{entry.AgentId}", state,
-                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged));
+                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged,
+                    // Carried from the daemon rather than inferred from the state: a client that guessed
+                    // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
+                    // for — the ones a restart left frozen mid-verification.
+                    VerificationInFlight: entry.VerificationInFlight));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -1152,6 +1156,79 @@ public sealed class DaemonBackedOrchestrator :
     /// through. One path, one RPC; only the reporting differs.</para></summary>
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
         => AcknowledgeFlaggedChangeReportedAsync(agentId, itemId, CancellationToken.None);
+
+    /// <summary>
+    /// The human drops a queue entry. Every part of what makes this mean anything — the terminal
+    /// transition, the persisted record, the audit event, the refusal while a merge is in flight — is
+    /// daemon-side; this method only carries the request and reports the daemon's answer.
+    ///
+    /// <para><b>A refusal is thrown, never swallowed.</b> The daemon answers a refused discard with
+    /// <c>discarded=false</c> and a reason (already terminal, unknown entry, merge in progress), which is
+    /// a successful RPC — so a caller that only checked for exceptions would report a removal that did
+    /// not happen, and the entry would reappear on the next queue snapshot with nothing said. That is the
+    /// same "nothing visibly happened" failure <see cref="MergeActionRunner"/> exists to prevent.</para>
+    /// </summary>
+    public async Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't discard — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .DiscardEntryAsync(repoHandle!, agentId, reason ?? string.Empty, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Discarded)
+        {
+            throw new InvalidOperationException($"Can't discard — {response.Reason}.");
+        }
+
+        DateTimeOffset? at = DateTimeOffset.TryParse(
+            response.DiscardedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
+
+        return new QueueEntryDiscardOutcome(agentId, response.DiscardedBy ?? "", at);
+    }
+
+    /// <summary>
+    /// Clears a <c>Verifying</c> entry with no run behind it. Refusals — chiefly "a verification is
+    /// running for this entry right now" — are thrown for the same reason as above: they are the answer
+    /// the human asked for, and a silently-ignored one is indistinguishable from a button that does
+    /// nothing.
+    /// </summary>
+    public async Task ClearStalledVerificationAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't clear this verification — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .ClearStalledVerificationAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Cleared)
+        {
+            throw new InvalidOperationException($"Can't clear this verification — {response.Reason}.");
+        }
+    }
 
     /// <summary>
     /// Whether an acknowledgment made right now could actually reach the daemon's gate. There is exactly

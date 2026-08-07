@@ -36,4 +36,28 @@ public class MergeQueueRow
     /// dispatch routes correctly after a daemon restart. Defaults to <c>Local</c>.
     /// </summary>
     public string Origin { get; set; } = "Local";
+
+    /// <summary>
+    /// Who dropped this entry from the queue, for a row whose <see cref="State"/> is <c>Discarded</c>;
+    /// null for every other row. Daemon-derived at the RPC (the same
+    /// <c>IApproverIdentityResolver</c> a plan approval uses) — the discard request carries no identity
+    /// field, so a client cannot assert one.
+    ///
+    /// <para>Read the honest limits of this value on <c>IApproverIdentityResolver</c>: over loopback TCP
+    /// the daemon has no peer credential, so this attributes the discard to the HOST SESSION the daemon
+    /// runs as and cannot tell two local callers apart. It is a record of <i>where</i> the discard came
+    /// from, not proof of which human pressed the button.</para>
+    /// </summary>
+    public string? DiscardedBy { get; set; }
+
+    /// <summary>When the entry was discarded (UTC); null unless <see cref="State"/> is <c>Discarded</c>.</summary>
+    public DateTime? DiscardedAtUtc { get; set; }
+
+    /// <summary>
+    /// The human's stated reason for the discard, verbatim; empty when they gave none. Kept on the row
+    /// rather than only in the audit log because the row is what survives in the daemon DB and what the
+    /// queue rehydrates from — an audit sink that is in-memory today (see <c>DaemonHost</c>) would
+    /// otherwise lose the whole record on the next daemon restart.
+    /// </summary>
+    public string? DiscardReason { get; set; }
 }

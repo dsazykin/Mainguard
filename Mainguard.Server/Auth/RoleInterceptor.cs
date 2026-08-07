@@ -41,6 +41,15 @@ public sealed class RoleInterceptor : Interceptor
         // merge power by another name — a coordinator that could ack its own branch's flagged items would
         // hold the merge gate it is denied at BeginMerge/ConfirmMerge.
         "/mainguard.v1.MergeQueueService/AcknowledgeFlaggedChange",
+        // Discarding an entry is merge power's mirror image and belongs to the human for the same reason.
+        // An agent that could discard its own queue entry could delete the record of a branch that was
+        // flagged, refused, or simply never verified — erasing the evidence instead of clearing the gate.
+        // It is also the queue's only human-driven terminal besides the merge itself.
+        "/mainguard.v1.MergeQueueService/DiscardEntry",
+        // Same boundary: clearing a stalled verification puts a branch back to Working, which is the state
+        // a re-verification starts from. A coordinator that could reset its own branch's verification state
+        // would be steering the merge conversation it is denied every other leg of.
+        "/mainguard.v1.MergeQueueService/ClearStalledVerification",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
         // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per

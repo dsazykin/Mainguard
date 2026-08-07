@@ -17,8 +17,20 @@ public enum AgentLifecycleState
     Merged, Rejected, Dead, TornDown,
 }
 
-/// <summary>Branch merge-eligibility lifecycle — the P2-10 enum verbatim (OPS §4.2).</summary>
-public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected }
+/// <summary>
+/// Branch merge-eligibility lifecycle — the P2-10 enum (OPS §4.2), plus the human's
+/// <see cref="Discarded"/> terminal.
+///
+/// <para><b><see cref="Discarded"/> is deliberately its own member rather than a reuse of
+/// <see cref="Rejected"/>.</b> <c>Rejected</c> means a human read this branch's diff in review and turned
+/// the work down — it is only reachable from <c>AwaitingReview</c> and it is a statement about the code.
+/// <c>Discarded</c> is a statement about the ENTRY: the human dropped it from the queue (its agent is gone,
+/// the work was superseded, it was never going anywhere). Persisting one as the other would make the
+/// queue's own record say something that did not happen, which is the failure this queue exists to
+/// prevent. Neither is <see cref="Merged"/>, and nothing in this enum lets a discard be mistaken for
+/// one.</para>
+/// </summary>
+public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded }
 
 /// <summary>
 /// Where a merge-queue entry came from (P2-12). <see cref="Local"/> is a locally-spawned agent whose
@@ -63,6 +75,11 @@ public sealed record VerificationRecord(string AgentId, string MainSha, bool Pas
 /// <summary>P2-11: one must-acknowledge flagged item; acks bind to the diff hash daemon-side.</summary>
 public sealed record FlaggedItem(string Id, string Path, string Category, string Fact, bool Acknowledged);
 
+/// <param name="VerificationInFlight">Whether a verification run is really executing for this entry, as
+/// opposed to the entry merely being in <see cref="WorkerMergeState.Verifying"/>. Only the daemon can
+/// answer this (its in-flight set is memory; the state is persisted), and the two disagree after any
+/// restart mid-run. Defaults to false so a projection that cannot answer never claims a run is
+/// happening — the direction that matters, since claiming one is what makes an entry look busy forever.</param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -70,7 +87,8 @@ public sealed record QueueEntry(
     WorkerMergeState State,
     string Detail,
     VerificationRecord? Verification,
-    IReadOnlyList<FlaggedItem> FlaggedItems);
+    IReadOnlyList<FlaggedItem> FlaggedItems,
+    bool VerificationInFlight = false);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(

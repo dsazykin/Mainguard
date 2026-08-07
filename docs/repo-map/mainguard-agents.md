@@ -929,7 +929,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`EnsureEntry(agentId, origin)` enters a new PR at `Working` + stamps origin, `GetOrigin`, `Cancel`
       — the closed-PR path that forgets an entry rather than reaching a terminal state — and
       `IMergeQueueStore.Delete`; origin is persisted + hydrated so the merge dispatch routes correctly
-      after a restart). `VerificationRunner.cs` (runs the configured test command in the worker sandbox
+      after a restart). **Human entry lifecycle** (also NOT on `IMergeQueue`, for the same reason the
+      merge is not — an agent-reachable discard is a way to erase the evidence blocking its own branch):
+      `TryDiscard(agentId, by, reason)` walks any non-terminal entry to the new terminal
+      `WorkerMergeState.Discarded` — distinct from `Rejected` (a verdict on the CODE, reachable only
+      from `AwaitingReview`) and from `Merged` — persisting a `QueueEntryDiscard` (`GetDiscard`) on the
+      entry's own row in the same `Save` and appending the `queue_entry_discarded` audit event; it
+      refuses an untracked id (`SetStateLocked` would otherwise invent the entry, since every unknown
+      agent defaults to `Working`) and any terminal one. A discarded entry leaves **`Agents`** — the
+      stream snapshot's source — while staying in `_states`, which is what makes the discard a decision
+      rather than a deletion: nothing resurrects the id (`EnsureEntry` only creates what `_states` lacks),
+      `GetState` still answers `Discarded`, and the row + audit record survive. `DiscardedAgents` exposes
+      the other side. `TryClearStalledVerification` returns a `Verifying` entry with no run behind it to
+      `Working`, refusing while `IsVerificationInFlight` is true (that would make the live run's own
+      completion an illegal `Working → Verified`); `IsVerificationInFlight` is also what `CanMerge` now
+      consults so a rehydrated-but-idle `Verifying` reads "verification stalled — no run in progress"
+      instead of claiming an activity that is not happening, and what
+      `SettleAfterVerificationLocked` guards with so a run finishing after a discard is dropped rather
+      than throwing out of an unawaited continuation. `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
@@ -996,7 +1013,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       via `IPrWorkerHost.EnsureWorkerAsync` — which creates the worktree as part of the ordinary spawn
       chain** → fetch head via `IPrHeadFetcher` → `MergeQueue.EnsureEntry(..., External)` at `Working`),
       invalidates+re-queues on a moved head (`NotifyNewCommits`), and cancels+prunes a PR closed upstream
-      (`Queue.Cancel` + `IPrWorkerHost.ReleaseWorkerAsync` + untrack). **A refused or failed worker
+      (`Queue.Cancel` + `IPrWorkerHost.ReleaseWorkerAsync` + untrack). **A DISCARDED entry short-circuits
+      the whole of `MaterializeAsync`, before `EnsureWorkerAsync`** — materializing is re-asked on every
+      poll, so without it the intake would keep re-provisioning the jail and its MG-36 network segment
+      (the bridge pool is ~32 deep) for a pull request the human explicitly dropped, and would hold the
+      worker until the PR closed upstream. The worker is released instead, so a discard means the same
+      thing for an intake'd PR as for a local agent. **A refused or failed worker
       materializes NOTHING** — no worktree, no entry, and no seen-head, so the PR is retried on a later
       poll rather than entering a queue it could never leave (an entry with no jail can never be verified,
       since verification runs in the worker's own jail; an unbounded external queue that spawned
