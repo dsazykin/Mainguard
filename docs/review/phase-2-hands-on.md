@@ -169,5 +169,5 @@ releases the task, that's a real defect.
 
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p2
-wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
+wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```

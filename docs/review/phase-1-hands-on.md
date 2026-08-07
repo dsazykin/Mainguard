@@ -70,8 +70,15 @@ don't try to pick it out of a bare `ls` (you get a multi-column list of 64-char 
 tell them apart). Ask each mirror which repo it is:
 
 ```powershell
-wsl -d MainguardEnv -u root -- bash -c 'for g in /home/mainguard/mainguard/repos/*.git; do h=$(basename "$g" .git); printf "%s  %s\n" "$h" "$(git --git-dir="$g" config --get remote.origin.url)"; done'
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/repos | ForEach-Object {
+    $u = wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$_ config --get remote.origin.url
+    "{0}  {1}" -f ($_ -replace '\.git$',''), $u
+}
 ```
+
+> PowerShell drives the loop deliberately. A bash loop inside `wsl -- bash -c '…'` gets mangled on the
+> way through — PowerShell eats the backslash in `\n`, and the nested quotes break the script. Every
+> command here avoids embedding shell syntax in a PowerShell string for that reason.
 
 Output looks like:
 
@@ -82,10 +89,19 @@ f0fa0539692f…  /mnt/c/Users/yikes/Code/GitLoom
 
 Pick the line matching your scratch repo.
 
-Set it once for the commands below:
+Set it once for the commands below — and **re-set it in every new PowerShell window**, because it
+does not persist:
 
 ```powershell
 $H = "<the 64-char hash>"
+```
+
+**Check it took.** PowerShell expands an undefined variable to *empty* rather than erroring, so an
+unset `$H` silently turns `…/repos/$H.git` into `…/repos/.git` and you get a confusing failure about
+the wrong path — or worse, a command that succeeds against the wrong target:
+
+```powershell
+if ($H -notmatch '^[0-9a-f]{64}$') { Write-Error 'Set $H to your repo hash first' }
 ```
 
 > `dotnet build` also publishes the in-VM daemon; `DaemonUpdater` deploys it when the app launches.
@@ -271,7 +287,7 @@ For each step: what you did, what you expected, what happened. Two things specif
 ```powershell
 Remove-Item -Recurse -Force $env:TEMP\mg-test-p1
 Remove-Item -Recurse -Force $HOME\mg-testrepo
-wsl -d MainguardEnv -u root -- bash -c 'docker ps -aq | xargs -r docker rm -f'
+wsl -d MainguardEnv -u root -- docker ps -aq | ForEach-Object { wsl -d MainguardEnv -u root -- docker rm -f $_ }
 ```
 
 Leaving the VM's mirror and agent repos is harmless — they are keyed by repo hash and a deleted
