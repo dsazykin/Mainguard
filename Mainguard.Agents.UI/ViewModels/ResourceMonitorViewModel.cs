@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Threading.Tasks;
@@ -39,6 +40,37 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
     [ObservableProperty] private string _perDayUsdCap = "";
     [ObservableProperty] private string _perDayTokenCap = "";
     [ObservableProperty] private string _budgetStatus = "";
+
+    /// <summary>
+    /// Whether the cost UI (the per-day cap editor, its Save button, and the <c>spend today $X</c> clause)
+    /// means anything right now — true when at least one live agent's spend is actually measurable.
+    ///
+    /// <para><b>The predicate is metering, not a mode name.</b> "Coordinator mode vs BYOK mode" is the
+    /// symptom; the mechanism is that spend is recorded by routing model traffic through Mainguard's
+    /// gateway, which requires an API key the daemon can swap for a scoped token. An OAuth-authenticated
+    /// agent authenticates <i>past</i> that proxy with a session Mainguard never issued, so its spend is
+    /// structurally unmeasurable (<c>docs/design/oauth-budgeting.md</c> records this as an open problem).
+    /// BYOK alone is also not sufficient: only <c>claude-code</c> and <c>gemini-cli</c> declare the
+    /// <c>baseUrlEnvVar</c>/<c>modelHost</c> pair confinement needs, so a BYOK <c>codex</c>, <c>qwen-code</c>
+    /// or <c>opencode</c> agent spends real money unmetered — and the gateway can be switched off entirely.
+    /// The daemon already collapses all of those conditions into one fact when it decides whether to issue
+    /// a confinement token, so that fact is what travels here rather than a second derivation that could
+    /// disagree with the first.</para>
+    ///
+    /// <para>When false, the cap editor is replaced by a one-line statement rather than silently removed:
+    /// an absent control teaches nothing, and the failure this fixes is a UI that quietly implied a
+    /// guarantee it did not provide. What must NOT happen is rendering <c>$0.00</c>, which is
+    /// indistinguishable from "you have spent nothing".</para>
+    /// </summary>
+    [ObservableProperty] private bool _isCostVisible;
+
+    /// <summary>
+    /// Whether to show the "spend isn't tracked" statement. Deliberately NOT just <c>!IsCostVisible</c>:
+    /// with no agents running there are no sessions to make a claim about, and asserting that spend is
+    /// not tracked for them would be an unearned statement about nothing — the same species of error as
+    /// the <c>$0.00</c> this change removes. Empty means empty; the totals line already says "0 agents".
+    /// </summary>
+    [ObservableProperty] private bool _isCostNoticeVisible;
 
     public ResourceMonitorViewModel(IAgentService agents, ITelemetryService telemetry)
     {
@@ -130,8 +162,22 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
             row.Update(u);
         }
 
+        // Cost UI is shown only where cost is actually measured. The predicate is per-agent metering, not
+        // a UI mode name: spend is recorded by routing model traffic through the gateway, which needs an
+        // API key to swap for a scoped token. See IsCostVisible.
+        IsCostVisible = usage.Any(u => u.IsMetered);
+        IsCostNoticeVisible = usage.Count > 0 && !IsCostVisible;
+
         var total = _telemetry.Current;
-        TotalsText = FormattableString.Invariant($"CPU {total.CpuPercent:0}%   ·   RAM {total.RamGb:0.0} GB   ·   spend today ${total.SpendTodayUsd:0.00}   ·   {Rows.Count} agents");
+        var cpuPart = total.CpuPercent is { } c ? FormattableString.Invariant($"CPU {c:0}%") : $"CPU {AgentUsageRowViewModel.Unknown}";
+        var ramPart = total.RamGb is { } r ? FormattableString.Invariant($"RAM {r:0.0} GB") : $"RAM {AgentUsageRowViewModel.Unknown}";
+        var parts = new List<string> { cpuPart, ramPart };
+        // The spend clause is omitted entirely when nothing is metered — printing "spend today $0.00"
+        // there is the false-reassurance shape: indistinguishable from "you have spent nothing".
+        if (total.SpendTodayUsd is { } spend)
+            parts.Add(FormattableString.Invariant($"spend today ${spend:0.00}"));
+        parts.Add(FormattableString.Invariant($"{Rows.Count} agents"));
+        TotalsText = string.Join("   ·   ", parts);
 
         var history = _telemetry.History;
         var points = new Points();
@@ -139,7 +185,10 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
         for (int i = 0; i < n; i++)
         {
             var s = history[history.Count - n + i];
-            points.Add(new Point(i * (240.0 / Math.Max(1, n - 1)), 20 - s.CpuPercent / 100.0 * 20));
+            // An unmeasured point is skipped rather than plotted at the baseline: a gap in the line is
+            // honest about missing data, whereas drawing it at 0 invents an idle period.
+            if (s.CpuPercent is not { } cpu) continue;
+            points.Add(new Point(i * (240.0 / Math.Max(1, n - 1)), 20 - cpu / 100.0 * 20));
         }
         CpuPoints = points;
     }
@@ -196,9 +245,17 @@ public partial class AgentUsageRowViewModel : ViewModelBase
     [ObservableProperty] private string _cpuText = "";
     [ObservableProperty] private string _ramText = "";
     [ObservableProperty] private string _spendText = "";
+    /// <summary>Whether this agent's spend is measurable; drives whether the row shows a figure at all.</summary>
+    [ObservableProperty] private bool _isMetered;
+    /// <summary>Why there is no spend figure. Null for a metered agent (nothing to explain).</summary>
+    [ObservableProperty] private string? _spendTooltip;
     [ObservableProperty] private string _task = "";
     [ObservableProperty] private bool _isPaused;
     [ObservableProperty] private string _pauseMenuLabel = "Pause";
+
+    /// <summary>The one rendering of "not measured". Shared so a row and the totals line cannot drift
+    /// into two different vocabularies for the same fact.</summary>
+    public const string Unknown = "—";
 
     public AgentUsageRowViewModel(string agentId, ResourceMonitorViewModel owner)
     {
@@ -210,9 +267,16 @@ public partial class AgentUsageRowViewModel : ViewModelBase
     {
         Name = usage.Name;
         StateWord = usage.StateWord;
-        CpuText = FormattableString.Invariant($"{usage.CpuPercent:0}%");
-        RamText = FormattableString.Invariant($"{usage.RamGb:0.0} GB");
-        SpendText = FormattableString.Invariant($"${usage.SpendUsd:0.00}");
+        // Unknown renders as an em dash, never as 0 — "0%" is a measurement, "—" is the absence of one.
+        CpuText = usage.CpuPercent is { } cpu ? FormattableString.Invariant($"{cpu:0}%") : Unknown;
+        RamText = usage.RamGb is { } ram ? FormattableString.Invariant($"{ram:0.0} GB") : Unknown;
+        IsMetered = usage.IsMetered;
+        SpendText = usage.SpendUsd is { } spend ? FormattableString.Invariant($"${spend:0.00}") : Unknown;
+        SpendTooltip = usage.IsMetered
+            ? null
+            : "Spend isn't tracked for this session — metering needs an API key routed through Mainguard's "
+              + "model gateway. An OAuth login authenticates directly with the provider, so Mainguard "
+              + "never sees the cost.";
         Task = usage.Task;
         IsPaused = usage.IsPaused;
         PauseMenuLabel = usage.IsPaused ? "Resume" : "Pause";

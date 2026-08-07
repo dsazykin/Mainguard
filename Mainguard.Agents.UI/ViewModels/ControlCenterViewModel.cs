@@ -840,10 +840,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         for (int i = 0; i < n; i++)
         {
             var s = history[history.Count - n + i];
-            points.Add(new Point(i * (60.0 / Math.Max(1, n - 1)), 16 - s.CpuPercent / 100.0 * 16));
+            // Skip unmeasured points rather than plotting them at the baseline: a gap says "no data",
+            // a zero would invent an idle period the fleet never had.
+            if (s.CpuPercent is not { } cpu) continue;
+            points.Add(new Point(i * (60.0 / Math.Max(1, n - 1)), 16 - cpu / 100.0 * 16));
         }
         CpuPoints = points;
-        SpendText = FormattableString.Invariant($"${_telemetry.Current.SpendTodayUsd:0.00}");
+        // No metered agent ⇒ no spend figure. "$0.00" would read as "you have spent nothing".
+        SpendText = _telemetry.Current.SpendTodayUsd is { } spend
+            ? FormattableString.Invariant($"${spend:0.00}")
+            : AgentUsageRowViewModel.Unknown;
     }
 
     // ---- selection / navigation ----

@@ -740,7 +740,22 @@
   chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in all five
   themes), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
-  `Headless/ResourceMonitorStreamTests`, and the `Headless/ActivityBarRenderHarness` (the five-theme
+  `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
+  must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious
+  implementation returns 0 for), `DockerResourceSamplerProgressTests` (**the delivery race**, pinned
+  deterministically with a fake `IDockerClient` that reports through `IProgress` and returns immediately:
+  the first implementation used `Progress<T>`, which raises its callback ASYNCHRONOUSLY, so the awaited
+  call could finish while the value was still queued and the sampler reported "no reading returned" for a
+  container that answered — measured at 1721/2000 lost in isolation, and it passed locally against real
+  Docker while failing only on a loaded CI runner. Reinstating `Progress<T>` fails it 198/200),
+  `Headless/ResourceMonitorStreamTests`, `Headless/ResourceMonitorHonestyTests` (**the two honesty
+  properties of the Resources tab**: an unmeasured reading renders "—" while a measured zero still
+  renders "0%" — the tab previously hard-coded 0 for everything, which is indistinguishable from an
+  idle fleet — and the cost UI appears only where spend is actually metered, with the unmetered row
+  refusing to draw `$0.00` even on a mixed fleet), `Headless/ResourceMonitorRenderHarness` (the tab in
+  all five themes × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
+  `artifacts_headless/`; the VM truths are asserted beside each capture so a blank surface cannot pass
+  as green), and the `Headless/ActivityBarRenderHarness` (the five-theme
   rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`). **`Terminal/`** is
   the P2-04 VT conformance & replay harness: `ITerminalEngineHarness.cs` (the engine-agnostic "feed
   bytes → read grid" seam + `GridSnapshot`/`GridCell`/`CellColor`/`CellAttrs` with a deterministic
@@ -1097,7 +1112,19 @@
   real `mainguard.agent`/`mainguard.repo` labels (not the P2-07 agent-base image), points a
   `SwarmReconciler` at the **real `DockerAgentLister`**, then `docker rm -f`s it out of band and
   asserts the next reconcile prunes + marks it `Dead` (Docker-as-truth convergence the simulated tests
-  can't prove; cleans up in a finally). **`Agents/`** hosts the TI-P2-06 integration suite on
+  can't prove; cleans up in a finally). **`Agents/ResourceSamplingDockerTests.cs`**
+  (`[RequiresDockerDaemonFact]`) proves the Resource Monitor's data source against a REAL engine, which
+  is the claim the feature shipped without: a `busybox` spin loop pinning one core must read a real
+  non-zero CPU **bounded by `ProcessorCount × 100`** (a mis-scaled formula cannot pass by being huge),
+  a sleeping container alongside it must read far lower (so a constant-returning sampler fails), and a
+  missing container must come back **UNKNOWN rather than 0** — `0%` and "no data" have to stay
+  distinguishable. **`AgentResourceProjectionTests.cs`** carries the same claim across the whole wire
+  through the REAL composition root: a scripted `IContainerResourceSampler` (injected via
+  `DaemonFixture.ResourceSampler`) feeds 37.5% / 1 GiB in, and the shipped `DaemonClient` +
+  `DaemonBackedOrchestrator` must project those exact values out of `GetAgentUsage()` — asserted on the
+  VALUES, not the shape, because the old code passed every shape test while returning 0. It also pins
+  the metering predicate on a real daemon (an agent `AgentGatewayCredentials.Issue`d a token is
+  metered; one without is not, and carries no spend figure at all). **`Agents/`** hosts the TI-P2-06 integration suite on
   `DualRepoFixture`: `AgentTestGit.cs` (test-only git CLI helper + temp-VM-root/cleanup — not a
   production runner), `SessionKeyCacheScopeTests.cs` (MG-6 — the memory-only credential cache is
   scoped to **(repo, kind)**, never the bare agent kind: a model key / harvested CLI OAuth files /
