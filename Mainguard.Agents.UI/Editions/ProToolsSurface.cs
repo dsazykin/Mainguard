@@ -31,6 +31,16 @@ public sealed class ProToolsSurface : IProToolsSurface
         return new AgentCliSettingsViewModel(installer, updater);
     }
 
+    // Toolchains: the curated language-toolchain channel, over the SAME in-VM install host the agent-CLI
+    // channel uses (one way to run a command in the VM, not two). A toolchain installed here lands in the
+    // daemon-owned toolchains root and is bind-mounted READ-ONLY into every new jail — no image rebuild.
+    public object CreateToolchainsPage()
+    {
+        var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
+        var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
+        return new ToolchainSettingsViewModel(new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host));
+    }
+
     // Daemon logs (in-depth per-subsystem logging): the read-only "recent daemon logs" surface over
     // Core's DaemonLogReader (journalctl / tail over the same WSL seam the OOBE health card uses). A
     // fresh reader every time this page is (re)activated — the page wrapper disposes the previous one.

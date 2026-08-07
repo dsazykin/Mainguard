@@ -94,7 +94,9 @@ public sealed record SandboxSpawnRequest(
     string? AgentRepoPath = null,
     string? PackageCachePath = null,
     IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null,
-    IReadOnlyList<string>? WorkspaceIgnorePaths = null);
+    IReadOnlyList<string>? WorkspaceIgnorePaths = null,
+    string? ToolchainsRootPath = null,
+    IReadOnlyList<string>? ToolchainIds = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

@@ -6,6 +6,35 @@ using System.Linq;
 namespace Mainguard.Agents.Agents.Sandbox;
 
 /// <summary>
+/// How a toolchain reaches a jail. Both kinds are equally curated and equally closed to repository
+/// input; they differ only in what the artefact needs in order to exist.
+/// </summary>
+public enum ToolchainDelivery
+{
+    /// <summary>
+    /// Built into a per-repo image layer on the spawn path by <see cref="ToolchainProvisioner"/>.
+    ///
+    /// <para>Required whenever the toolchain needs something a bind mount cannot carry: system packages
+    /// from apt (<c>dotnet-10</c> aborts at startup without <c>libicu72</c>, and every headless Avalonia
+    /// test dies without <c>libfontconfig1</c>) or the image's baked nix store (the nix-sourced recipes).
+    /// Nothing about that is a user choice — it is a property of the artefact — so these are built on
+    /// demand when a repository declares them, exactly as before.</para>
+    /// </summary>
+    ImageLayer,
+
+    /// <summary>
+    /// Installed into the VM by <see cref="Toolchains.ToolchainChannel"/> when a HUMAN asks for it, and
+    /// bind-mounted READ-ONLY into every jail thereafter.
+    ///
+    /// <para>Available to any toolchain that ships as a self-contained relocatable tarball — no root, no
+    /// system packages, no build. That is a real and common shape (CPython via python-build-standalone,
+    /// the official Node and Go tarballs), and it is the shape that lets the user manage the set: an
+    /// install is a directory, a removal is a <c>rm -rf</c>, and neither needs an image rebuild (G-16).</para>
+    /// </summary>
+    RuntimeMount,
+}
+
+/// <summary>
 /// One curated, product-owned toolchain recipe. A repository's <c>.mainguard/toolchain</c> can name
 /// <see cref="Id"/>; it can never supply any other field. That asymmetry is the entire security design
 /// of the feature — see <see cref="ToolchainCatalog"/>.
@@ -30,7 +59,8 @@ public sealed record ToolchainRecipe(
     ImmutableArray<string> PathEntries,
     ImmutableArray<KeyValuePair<string, string>> Environment,
     ImmutableArray<string> Probe,
-    ImmutableArray<string> BuildEgressHosts);
+    ImmutableArray<string> BuildEgressHosts,
+    ToolchainDelivery Delivery = ToolchainDelivery.ImageLayer);
 
 /// <summary>
 /// The <b>closed</b> set of toolchains a repository may ask for.
@@ -59,7 +89,8 @@ public static class ToolchainCatalog
     /// The nixpkgs revision the nix-sourced recipes resolve against. It is deliberately the SAME
     /// revision <c>images/mainguard-agent-base/Dockerfile</c> bakes its curated toolchain from
     /// (<c>ARG NIXPKGS_REV</c>), so the per-repo layer and the base image draw from one pinned
-    /// universe rather than two that can drift apart. <c>ToolchainCatalogGuardTests</c> reads the
+    /// universe rather than two that can drift apart.
+    /// <c>ToolchainDeclarationTests.CatalogNixpkgsRevision_MatchesTheAgentBaseImage</c> reads the
     /// Dockerfile and fails if these two ever disagree.
     /// </summary>
     public const string NixpkgsRev = "50ab793786d9de88ee30ec4e4c24fb4236fc2674";
@@ -154,20 +185,62 @@ public static class ToolchainCatalog
         Probe: ImmutableArray.Create("dotnet", "--version"),
         BuildEgressHosts: ImmutableArray.Create("builds.dotnet.microsoft.com", "deb.debian.org"));
 
-    /// <summary>Every catalogued toolchain, keyed by id.</summary>
+    /// <summary>The recipes that are built into a per-repo image layer on the spawn path.</summary>
+    private static readonly ToolchainRecipe[] ImageLayerRecipes =
+    {
+        Dotnet10,
+        Nix("rust-stable", "Rust (rustc + cargo) from the pinned nixpkgs",
+            new[] { "rustc", "cargo" }, new[] { "cargo", "--version" }),
+        Nix("jdk-21", "Temurin-class JDK 21 + Maven from the pinned nixpkgs",
+            new[] { "jdk21", "maven" }, new[] { "java", "-version" }),
+        Nix("ruby-3", "Ruby 3 + bundler from the pinned nixpkgs",
+            new[] { "ruby_3_3", "bundler" }, new[] { "ruby", "--version" }),
+        Nix("php-8", "PHP 8 + composer from the pinned nixpkgs",
+            new[] { "php", "phpPackages.composer" }, new[] { "php", "--version" }),
+    };
+
+    /// <summary>
+    /// A curated manifest entry, viewed as a catalog recipe so that ONE table answers "may a repository
+    /// declare this id?" regardless of how the toolchain is delivered.
+    ///
+    /// <para>It carries no <see cref="ToolchainRecipe.InstallSteps"/> and no
+    /// <see cref="ToolchainRecipe.BuildEgressHosts"/>, and that is the point rather than an omission:
+    /// nothing is built, so there is no build to reach the network. The install happened earlier, in the
+    /// VM, because a human asked for it.</para>
+    ///
+    /// <para>The paths and environment are resolved against the jail's read-only MOUNT
+    /// (<see cref="Toolchains.ToolchainPaths.SandboxMount"/>), which is where a container will find it.</para>
+    /// </summary>
+    private static ToolchainRecipe FromManifest(Toolchains.ToolchainEntry entry)
+    {
+        var root = Toolchains.ToolchainPaths.SandboxInstallDir(entry.Id);
+        return new ToolchainRecipe(
+            Id: entry.Id,
+            Summary: entry.Summary,
+            InstallSteps: ImmutableArray<string>.Empty,
+            PathEntries: entry.ResolvedPathEntries(root, PackageCachePolicy.SandboxMount).ToImmutableArray(),
+            Environment: entry.Environment
+                .Select(kv => new KeyValuePair<string, string>(
+                    kv.Key, Toolchains.ToolchainEntry.Expand(kv.Value, root, PackageCachePolicy.SandboxMount)))
+                .ToImmutableArray(),
+            Probe: entry.ProbeCommand(root, PackageCachePolicy.SandboxMount).ToImmutableArray(),
+            BuildEgressHosts: ImmutableArray<string>.Empty,
+            Delivery: ToolchainDelivery.RuntimeMount);
+    }
+
+    /// <summary>
+    /// Every catalogued toolchain, keyed by id — image-layer recipes and user-installable manifest
+    /// entries in ONE table.
+    ///
+    /// <para>Unifying them here is what keeps the closed-catalog property intact while the INSTALLED SET
+    /// becomes a user choice: <see cref="ToolchainDeclarationResolver"/> still resolves a repository's
+    /// declaration against this one dictionary, so an id that is not curated is still a typed refusal,
+    /// never a passthrough and never a silent skip.</para>
+    /// </summary>
     public static readonly ImmutableDictionary<string, ToolchainRecipe> All =
-        new[]
-        {
-            Dotnet10,
-            Nix("rust-stable", "Rust (rustc + cargo) from the pinned nixpkgs",
-                new[] { "rustc", "cargo" }, new[] { "cargo", "--version" }),
-            Nix("jdk-21", "Temurin-class JDK 21 + Maven from the pinned nixpkgs",
-                new[] { "jdk21", "maven" }, new[] { "java", "-version" }),
-            Nix("ruby-3", "Ruby 3 + bundler from the pinned nixpkgs",
-                new[] { "ruby_3_3", "bundler" }, new[] { "ruby", "--version" }),
-            Nix("php-8", "PHP 8 + composer from the pinned nixpkgs",
-                new[] { "php", "phpPackages.composer" }, new[] { "php", "--version" }),
-        }.ToImmutableDictionary(r => r.Id, StringComparer.Ordinal);
+        ImageLayerRecipes
+            .Concat(Toolchains.ToolchainManifest.Shipped.Entries.Select(FromManifest))
+            .ToImmutableDictionary(r => r.Id, StringComparer.Ordinal);
 
     /// <summary>The catalogued ids, sorted — what an unknown-id failure lists for the human.</summary>
     public static IReadOnlyList<string> KnownIds { get; } =

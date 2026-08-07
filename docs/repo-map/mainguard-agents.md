@@ -669,7 +669,28 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       bakes, which `ToolchainDeclarationTests` reads out of the Dockerfile so the two cannot drift. A repo
       names an **id**; it never supplies a URL, a checksum, a revision or a command — that asymmetry is
       the whole security design, because a declaration file that described an *installation* would be an
-      install-time arbitrary-code-execution surface in a file an agent can write).
+      install-time arbitrary-code-execution surface in a file an agent can write. `ToolchainDelivery`
+      splits the catalog into `ImageLayer` recipes — built on the spawn path, required whenever the
+      toolchain needs apt packages (`dotnet-10` aborts without `libicu72`) or the baked nix store — and
+      `RuntimeMount` entries, which come from the user-managed manifest below. `All` unions both, so ONE
+      table still answers "may a repository declare this id?").
+    - **`Agents/Toolchains/`** — the **user-managed** half of the same feature (the base image's
+      nixpkgs `python3` has no pip and the rootfs is read-only, so a Python repo could commit tests that
+      could never run; see [`docs/design/python-toolchain.md`](../design/python-toolchain.md)):
+      - `toolchains.starter.json` (the curated manifest, embedded — pinned version, upstream-published
+        sha256, HTTPS payload, PATH/env, and the probe. Adding Node or Go is an edit to THIS FILE only).
+      - `ToolchainManifest.cs` (`ToolchainEntry`/`ToolchainProbe` + a validating parser that refuses a
+        non-HTTPS payload, a short hash, a path-shaped id or an empty probe — so a bad edit fails CI
+        rather than a user's install. `{toolchain}`/`{cache}` tokens expand against the VM path when an
+        install is probed and the in-jail mount path when a container is built).
+      - `ToolchainChannel.cs` (install/remove/list into the VM over the SAME `IAdapterInstallHost` seam
+        the agent-CLI channel uses. Fetches and checksums **in the VM** — a ~350 MB payload is not
+        base64-over-stdin — refuses to unpack on a mismatch, and writes the install marker LAST, only
+        after a probe that RUNS the toolchain at the pinned version. `ListAsync` re-probes rather than
+        reading markers: PR #305's marker reported healthy for eleven days).
+      - `ToolchainPaths.cs` (`/home/mainguard/mainguard/toolchains` → `/opt/mainguard/toolchains`,
+        bind-mounted **read-only** so one shared tree cannot be rewritten by a jail to change what
+        another agent's verification runs).
     - `ToolchainDeclaration.cs` (`.mainguard/toolchain` — one catalogued id per line, `#` comments;
       `ToolchainDeclarationResolver` mirrors `VerificationCommandResolver` input-for-input — branch vs
       main vs a human-owned out-of-branch pin — and arms the same RT-D2 `ChangedTestCommandGate` under its
