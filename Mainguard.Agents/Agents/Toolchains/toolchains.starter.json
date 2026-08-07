@@ -65,6 +65,21 @@
         "PYTHONDONTWRITEBYTECODE keeps __pycache__ out of the worktree — the tree under verification",
         "must not gain untracked files that an agent's `git add -A` would then commit."
       ],
+
+      "$comment-verify-command": [
+        "The verify command a Python repo must write is:",
+        "",
+        "    sh -c \"pip install -q -r requirements.txt && python -m pytest -q\"",
+        "",
+        "The sh -c wrapper is REQUIRED. .mainguard/verify is tokenised argv-style with NO shell, so a",
+        "bare `a && b` arrives as argv [a, &&, b] and the first program takes `&&` as its own argument.",
+        "Measured in a real jail: the bare form dies with pip's `no such option: -m` at exit 2, which",
+        "reads as a failing test suite rather than as a malformed command. The tokeniser does honour",
+        "quotes and strips them, so the wrapped form is exactly three tokens and works.",
+        "",
+        "Every ecosystem this manifest enables needs a separate dependency-install step, so this applies",
+        "to Node and Go too when they are added. .NET never needed one, which is why nobody hit it."
+      ],
       "environment": {
         "PYTHONUSERBASE": "{cache}/python/userbase",
         "PIP_USER": "1",

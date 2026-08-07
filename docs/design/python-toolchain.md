@@ -114,14 +114,43 @@ then have an ambiguous `python -m pytest` — ours or theirs — and a verificat
 disagrees with the developer's machine about which test runner ran is the same class of defect the
 `dotnet-10` recipe already refuses when it declines `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1`.
 
-The cost is one line in the repository's verify command, which is the ecosystem-normal shape:
+The cost is one line in the repository's verify command:
 
 ```
-pip install -q -r requirements.txt && python -m pytest -q
+sh -c "pip install -q -r requirements.txt && python -m pytest -q"
 ```
 
 `pip` exists, PyPI is allowlisted, and the cache is real — so that line is cheap on every run after the
 first. This is what the owner's scratch repo needs to change to.
+
+### The `sh -c "…"` wrapper is required, not decoration
+
+This is the single easiest thing to get wrong, and it was wrong in this document until it was measured.
+
+`.mainguard/verify` is **tokenised argv-style with no shell** — `VerificationCommandResolver.Tokenize`
+splits on whitespace (honouring quotes) and `ISandboxEngine.ExecAsync` hands the result straight to
+`docker exec`. So there is no shell to interpret `&&`, and it arrives as a **literal argument to the
+first program**. Measured in a real jail, running both forms as bare argv exactly as production does:
+
+| `.mainguard/verify` | resulting argv | result |
+| --- | --- | --- |
+| `pip install -q -r requirements.txt && python -m pytest -q` | `[pip, install, -q, -r, requirements.txt, &&, python, -m, pytest, -q]` | **`no such option: -m`, exit 2** |
+| `sh -c "pip install -q -r requirements.txt && python -m pytest -q"` | `[sh, -c, pip install -q -r requirements.txt && python -m pytest -q]` | **`1 passed`, exit 0** |
+
+pip swallows `&&`, `python` and `-m` as its own arguments. The tokeniser *does* honour quotes and does
+not keep the quote characters, so the second form collapses to exactly three tokens and the shell that
+runs the `&&` is one the repository asked for explicitly.
+
+Nobody hit this before because **this repository's own verify is a single command**
+(`dotnet test Mainguard.slnx --configuration Release`), and .NET is the one ecosystem that needs no
+separate dependency-install step. Every ecosystem this change enables needs one.
+
+**A known sharp edge, recorded rather than fixed here.** The failure is not legible: a repository that
+writes the natural `&&` form gets `no such option: -m` and exit 2, which says nothing about tokenisation,
+and the merge queue records it as **failing tests** rather than as a malformed command. That is the house
+pattern — a truthful-looking result that means something else. Distinguishing "your verify command was
+mis-tokenised" from "your tests failed" is worth doing; it is not done here because changing the
+verification execution path is high blast radius and belongs in its own change.
 
 ### 3. Egress — verified, not assumed
 
@@ -135,10 +164,11 @@ What was measured, and what was not:
   `--security-opt no-new-privileges`, uid 1000, tmpfs `$HOME`, toolchain mounted read-only),
   `pip install -r requirements.txt` reached PyPI and succeeded, and `python -m pytest -q` then ran. This
   run used the default bridge, **not** the tinyproxy segment.
-- **Not measured on this machine:** pip through the live `mainguard-egress-proxy`. Standing up a proxy
-  segment by hand was abandoned after a `DockerSuiteFixture` sweep severed the owner's live jail from its
-  network mid-session (see "What went wrong" below). `PythonToolchainDockerTests` routes through the real
-  proxy segment and measures this in CI.
+- **Not measured yet:** pip through the live `mainguard-egress-proxy`. The allowlist entries being
+  present is not the same fact as PyPI being reachable through tinyproxy from inside a jail, and only the
+  second one matters to a real repository. `PythonToolchainDockerTests` routes through the real proxy
+  segment; it is gated behind `MAINGUARD_VERIFY_E2E=1` and has not been run, so treat this as **open**
+  rather than as covered.
 
 The toolchain **payload** host (`github.com` / the release-asset CDN) stays off the jail allowlist: it is
 reached by the daemon on the VM's own network at install time, which is where
