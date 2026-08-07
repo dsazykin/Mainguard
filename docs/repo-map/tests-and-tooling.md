@@ -13,6 +13,22 @@
     "checksum"), one CLI failing doesn't stop the others, skip finishes with zero CLIs, an
     already-installed CLI isn't re-offered, Cancel leaves no row spinning, and a catalog-read failure
     still lets the user through.
+  - **`Mainguard.Tests/ToolchainSettingsUiTests.cs`** — the Settings **Toolchains** page (the human
+    half of the user-managed toolchain channel) driven over a fake `IAdapterInstallHost` with the REAL
+    `ToolchainChannel`, so the shipped fetch → sha256-verify → unpack → run-it policy executes minus
+    the VM: the list's installed state comes from the PROBE, a toolchain that runs at the WRONG version
+    is reported as NOT installed (with both versions named), install flips the row and writes the
+    registry marker LAST, an install refusal names its cause ("checksum") and leaves the row
+    retryable + the command enabled, Remove flips the row back and RE-PROBES (a failed remove
+    re-attaches its cause to the rebuilt row), and a catalog-read failure explains itself instead of
+    throwing. Also the ViewModel-level `Row…ShouldRepublish…` twins of
+    `AgentCliUiTests.Settings_Row*`: Install/Remove live on the parent but read ROW state, so the
+    parent must bridge row `PropertyChanged` → `NotifyCanExecuteChanged()` or the buttons render
+    visible and permanently dead.
+  - **`Mainguard.Tests/Headless/ToolchainSettingsRenderHarness.cs`** — the Toolchains page in all five
+    themes × list/installing/failure/loading/load-error →
+    `artifacts_headless/toolchain_settings_<Theme>_<state>.png` (the `list` state deliberately includes
+    the "a different version is present" row and a long-name truncation row).
   - **`Mainguard.Tests/AddReposToOsViewModelTests.cs`** — the post-setup Add-Repos-to-Mainguard-OS
     window over the same fake seams as `OobeRepoOnboardingTests`: honest empty scan, per-row failure
     isolation with a live retry, the named daemon-unreachable cause (never a crash), quiet idempotent
@@ -829,7 +845,15 @@
   (the scripted-coordinator
   two-tasks→two-plans→approvals→parallel-workers→verify→sequential-merge-with-stale-reverify story
   asserted through the audit trail; the real-container leg is `MergeQueueDockerTests`). **MG-42
-  per-repo toolchain (Core):** `ToolchainDeclarationTests` (the `.mainguard/toolchain` format + the
+  user-managed toolchains (Agents):** `ToolchainChannelTests` (the shipped manifest parses and curates
+  `python-3`; a manifest that weakens the pin — plaintext URL, short hash, path-shaped id, empty expected
+  version — is refused at parse; the install verifies the checksum BEFORE unpacking and refuses to unpack
+  on a mismatch; a toolchain that lands but does not run, or runs at the wrong version, is a failed
+  install with NO marker; installed state comes from the PROBE, not the marker file; a repo declaring only
+  a mounted toolchain builds no image layer; a jail gets the toolchain read-only with its bin FIRST on
+  PATH and `PYTHONUSERBASE` in the package cache; and `BaseImagePath` is guarded against the agent base
+  image's own `ENV PATH`).
+- **The per-repo toolchain (Core):** `ToolchainDeclarationTests` (the `.mainguard/toolchain` format + the
   closed-catalog refusals — a line that is not a bare id (`dotnet-10 && curl … | sh`, a URL,
   `../../etc/passwd`, `$(id)`) is rejected at parse time and an uncatalogued id is a typed
   `UnknownToolchainException`, never a silent skip; the resolution rules mirrored from
@@ -1353,7 +1377,15 @@
   Engine 29 it does not. The guards for that live in the no-Docker leg
   (`ContainerSpecBuilderTests.Build_EachSecretLivesInATmpfsOwnedByItsOwnUid_SoNoChownIsEverNeeded`,
   `SandboxSecretWriteTimeoutTests.SecretWrite_RunsAsTheSecretsOwner_AndNeverChowns`), which is the only
-  leg that is engine-independent. `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
+  leg that is engine-independent. `Agents/PythonToolchainDockerTests.cs` (the **user-managed** Python
+  toolchain end to end: the premise measured rather than assumed — the base image's own `python3` runs
+  but CANNOT `import pip`, which is why a bare version probe would report a broken environment as
+  healthy — then, gated behind `MAINGUARD_VERIFY_E2E=1`, a full install through the SHIPPED
+  `ToolchainChannel`, the in-jail probe answering at the pinned version, `command -v python3` proving the
+  declared toolchain WINS the PATH race against the base image's, and the repo's own
+  `.mainguard/verify` running **GREEN when its pytest test passes and RED when it fails** — same jail,
+  same toolchain, same command, only the test changed, because a verifier that cannot go red is not a
+  verifier). `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
   the per-repo toolchain layer built by the SHIPPED `ToolchainProvisioner` against a real runtime and
   then run in a real hardened jail: the premise asserted rather than assumed (`command -v dotnet`
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),

@@ -100,6 +100,12 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
         // deliberately not through the jail's default-deny segment, and touching no allowlist.
         ToolchainImages = new DockerToolchainImageBuilder(docker);
+
+        // The user-managed toolchain channel installs INTO the VM over the same hardened WSL runner the
+        // agent-CLI channel uses — one way to run a command in MainguardEnv, not two. Constructing it
+        // needs no live VM (the runner shells out lazily), so this is safe in construction and tests.
+        Toolchains = new Toolchains.ToolchainChannel(
+            new WslAdapterInstallHost(new Bootstrap.WslRunner()));
     }
 
     public string SubstrateId => "wsl2";
@@ -117,6 +123,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public IEgressPolicy Egress { get; }
 
     public IToolchainImageBuilder? ToolchainImages { get; }
+
+    public Toolchains.ToolchainChannel? Toolchains { get; }
 
     public PackageCacheManager? PackageCaches { get; }
 

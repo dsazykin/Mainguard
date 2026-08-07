@@ -76,6 +76,13 @@
     <EmbeddedResource Include="Agents\Adapters\adapters.starter.json">
       <LogicalName>Mainguard.Agents.Agents.Adapters.adapters.starter.json</LogicalName>
     </EmbeddedResource>
+    <!-- The curated toolchain manifest: the pinned + checksum-verified language toolchains a HUMAN may
+         install into MainguardEnv. Embedded for the same reason the adapter channel is — the set must be
+         product source a repository can only select from by id, never something a repo-writable file can
+         describe. Adding Node or Go is an edit to this ONE file. -->
+    <EmbeddedResource Include="Agents\Toolchains\toolchains.starter.json">
+      <LogicalName>Mainguard.Agents.Agents.Toolchains.toolchains.starter.json</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
 
 </Project>
