@@ -251,11 +251,27 @@ public class PythonToolchainDockerTests
                 psi.ArgumentList.Add(command[i]);
             }
 
-            using var process = Process.Start(psi)!;
-            var stdout = await process.StandardOutput.ReadToEndAsync(ct);
-            var stderr = await process.StandardError.ReadToEndAsync(ct);
-            await process.WaitForExitAsync(ct);
-            return new AdapterCommandResult(process.ExitCode, stdout, stderr);
+            Process process;
+            try
+            {
+                process = Process.Start(psi)!;
+            }
+            catch (System.ComponentModel.Win32Exception ex)
+            {
+                // The production host shells into the VM, so a missing binary comes back as a non-zero
+                // exit rather than a throw. Launching directly, it throws. Matching the real host's
+                // SHAPE here is the point: a fake that fails differently from production exercises a
+                // codepath nobody runs. 127 is the shell's "command not found".
+                return new AdapterCommandResult(127, string.Empty, ex.Message);
+            }
+
+            using (process)
+            {
+                var stdout = await process.StandardOutput.ReadToEndAsync(ct);
+                var stderr = await process.StandardError.ReadToEndAsync(ct);
+                await process.WaitForExitAsync(ct);
+                return new AdapterCommandResult(process.ExitCode, stdout, stderr);
+            }
         }
 
         public async Task WriteFileAsync(string path, string content, CancellationToken ct)
