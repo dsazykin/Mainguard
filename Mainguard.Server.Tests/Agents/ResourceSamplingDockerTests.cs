@@ -65,8 +65,12 @@ public class ResourceSamplingDockerTests
             var busy = Assert.Single(samples, s => s.AgentId == agentId);
             var idle = Assert.Single(samples, s => s.AgentId == agentId + "-idle");
 
-            // 1. Measured at all — not the "unavailable" degrade path.
-            Assert.Null(busy.UnavailableReason);
+            // 1. Measured at all — not the "unavailable" degrade path. The reason is put IN the message:
+            // a bare Assert.Null here reports "value is not null", which says nothing about which of
+            // timeout / container-gone / missing-counter actually happened on a machine you cannot see.
+            Assert.True(busy.UnavailableReason is null,
+                $"the busy container was not measured: reason='{busy.UnavailableReason}' " +
+                $"cpu={Show(busy.CpuPercent)} ram={Show(busy.RamBytes)}");
             Assert.NotNull(busy.CpuPercent);
             Assert.NotNull(busy.RamBytes);
 
@@ -83,7 +87,8 @@ public class ResourceSamplingDockerTests
             Assert.True(busy.RamBytes > 0, $"expected real resident bytes, got {busy.RamBytes}");
 
             // 5. The sampler DISCRIMINATES: the sleeping container must not read like the spinning one.
-            Assert.NotNull(idle.CpuPercent);
+            Assert.True(idle.CpuPercent is not null,
+                $"the idle container was not measured: reason='{idle.UnavailableReason}'");
             Assert.True(idle.CpuPercent < busy.CpuPercent / 2,
                 $"idle ({idle.CpuPercent}) should be far below busy ({busy.CpuPercent})");
         }
@@ -120,6 +125,9 @@ public class ResourceSamplingDockerTests
     /// (agentId, containerId) targets, so these containers deliberately carry NO <c>mainguard.agent</c>
     /// label. Labelling them would make them look like real jails to <c>DockerAgentLister</c>, which the
     /// swarm reconciler treats as its sole liveness truth.</param>
+    private static string Show(double? value) =>
+        value?.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) ?? "UNKNOWN";
+
     private static async Task<string> RunAsync(
         IDockerClient docker, string name, string agentId, string script, CancellationToken ct)
     {

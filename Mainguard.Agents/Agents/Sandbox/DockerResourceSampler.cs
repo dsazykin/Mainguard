@@ -102,11 +102,17 @@ public sealed class UnavailableContainerResourceSampler : IContainerResourceSamp
 public sealed class DockerResourceSampler : IContainerResourceSampler
 {
     /// <summary>
-    /// How long one tick may spend before its readings are abandoned. Generous against the ~1s the engine
-    /// inherently takes (it must collect two readings to produce a delta) plus a loaded host, but finite:
-    /// a wedged endpoint must cost one skipped tick, never a stuck sampler.
+    /// How long one tick may spend before its readings are abandoned. Finite on purpose: a wedged
+    /// endpoint must cost one skipped tick, never a stuck sampler.
+    ///
+    /// <para>Matched to <see cref="DockerSandboxEngine.ControlPlaneTimeout"/> rather than tuned
+    /// independently. The engine's own floor here is ~1s (it must collect two readings to produce a
+    /// delta), so the interesting question is how much QUEUEING behind other work to tolerate before
+    /// calling a sample lost — and a daemon serving a whole Docker test suite, or a laptop mid-build,
+    /// can hold a control-plane call well past a few seconds. Being impatient here does not fail safe:
+    /// it converts "busy" into "unknown", which is a worse answer than waiting.</para>
     /// </summary>
-    public static readonly TimeSpan DefaultSampleTimeout = TimeSpan.FromSeconds(10);
+    public static readonly TimeSpan DefaultSampleTimeout = DockerSandboxEngine.ControlPlaneTimeout;
 
     /// <summary>
     /// Ceiling on jails sampled concurrently. The calls are sampled in parallel because each one blocks
