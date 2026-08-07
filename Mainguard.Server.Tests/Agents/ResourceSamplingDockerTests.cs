@@ -62,8 +62,8 @@ public class ResourceSamplingDockerTests
             var samples = await sampler.SampleAsync(
                 new[] { (agentId, busyId!), (agentId + "-idle", idleId!) }, ct);
 
-            var busy = Assert.Single(samples.Where(s => s.AgentId == agentId));
-            var idle = Assert.Single(samples.Where(s => s.AgentId == agentId + "-idle"));
+            var busy = Assert.Single(samples, s => s.AgentId == agentId);
+            var idle = Assert.Single(samples, s => s.AgentId == agentId + "-idle");
 
             // 1. Measured at all — not the "unavailable" degrade path.
             Assert.Null(busy.UnavailableReason);
