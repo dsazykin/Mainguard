@@ -31,6 +31,23 @@ service MergeQueueService {
   // evaluates is a gate a human can actually clear. Item-by-item by construction — there is no
   // "acknowledge all" RPC, exactly as there is no "acknowledge all" method on AcknowledgmentStore.
   rpc AcknowledgeFlaggedChange(AcknowledgeFlaggedChangeRequest) returns (AcknowledgeFlaggedChangeResponse);
+  // The human drops an entry from the queue: a TERMINAL `Discarded` transition, recorded with a
+  // daemon-derived actor, a timestamp and the human's reason. It is the way out for an entry whose agent
+  // is gone — a stopped agent leaves its queue entry behind forever, and until this RPC existed there was
+  // no operation of any kind that could act on one.
+  //
+  // It is not a merge and cannot become one: no lease is taken or confirmed, no stale cascade fires, no
+  // T-19 journal entry is written, and the persisted state is `Discarded`, a distinct WorkerMergeState
+  // from `Merged` (NoAutoMergePathExists is unaffected — this RPC can only reach a terminal that is not
+  // Merged). Denied to the coordinator role at the interceptor, alongside the merge RPCs: an
+  // agent-invokable discard is a way for a branch to erase the evidence blocking it.
+  rpc DiscardEntry(DiscardEntryRequest) returns (DiscardEntryResponse);
+  // Clears a `Verifying` state that has no run behind it, returning the entry to `Working` so it can be
+  // verified again. The daemon persists state per transition but tracks in-flight runs in memory, so a
+  // restart mid-verification rehydrates `Verifying` with nothing executing — and ResumeAfterRestartAsync
+  // has no production caller, so the entry reports "verifying" to a human forever. Refused outright while
+  // a run really is executing: the honest answer there is "wait".
+  rpc ClearStalledVerification(ClearStalledVerificationRequest) returns (ClearStalledVerificationResponse);
 }
 
 message StreamQueueRequest {
@@ -57,6 +74,12 @@ message QueueEntry {
   // not a gate, it is a permanently unmergeable branch: the daemon can evaluate it and no human can
   // clear it. Empty for an entry with nothing flagged.
   repeated FlaggedItem flagged_items = 7;
+  // Whether a verification run is ACTUALLY executing for this entry right now, as opposed to the row
+  // merely saying `Verifying`. The two come apart on every daemon restart (state is persisted per
+  // transition; the in-flight set is in-memory), and only the daemon can tell them apart — so without it
+  // on the wire a client cannot distinguish a branch being verified from one stuck pretending to be, and
+  // therefore cannot offer the human the one action that unsticks it.
+  bool verification_in_flight = 8;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the
@@ -146,6 +169,40 @@ message AcknowledgeFlaggedChangeResponse {
   bool acknowledged = 1;   // false when the id named no live, unacknowledged item
   bool can_merge = 2;      // the gate re-read after the ack (so the caller needn't round-trip again)
   string reason = 3;       // rendered verbatim when can_merge is false (§3.4 vocabulary)
+}
+
+message DiscardEntryRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+  // The human's reason, recorded verbatim on the entry's row and in the audit event. May be empty — a
+  // discard with no stated reason is still a recorded discard, and demanding prose would only produce
+  // ".".
+  string reason = 3;
+  // There is deliberately NO actor field. The discarding identity is derived daemon-side from the
+  // connection (IApproverIdentityResolver, the same resolver a plan approval uses) because an
+  // attributable record a client can populate is an attribution anyone holding the token can forge.
+}
+
+message DiscardEntryResponse {
+  bool discarded = 1;
+  // Rendered verbatim when discarded is false (already terminal, unknown entry, a merge in progress).
+  string reason = 2;
+  // The record that was written, echoed back so the surface can say what it did rather than assume.
+  string discarded_by = 3;
+  string discarded_at = 4; // ISO-8601 (round-trip "O"); empty when nothing was discarded
+}
+
+message ClearStalledVerificationRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+}
+
+message ClearStalledVerificationResponse {
+  bool cleared = 1;
+  // Verbatim when cleared is false — including the case that matters most, "a verification is running
+  // for this entry right now", which is a refusal and not a failure.
+  string reason = 2;
+  string state = 3; // the resulting WorkerMergeState name
 }
 
 message GetMergeDiffRequest {

@@ -490,6 +490,33 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }, CallOptions(ct, deadline));
     }
 
+    /// <summary>
+    /// The human drops a queue entry (terminal <c>Discarded</c>, recorded daemon-side with an actor and a
+    /// timestamp). The request carries no identity field on purpose — the daemon derives the actor from
+    /// the connection, so there is nothing here for a client to assert.
+    /// </summary>
+    public async Task<DiscardEntryResponse> DiscardEntryAsync(
+        string repoHandle, string agentId, string reason, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.DiscardEntryAsync(new DiscardEntryRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            Reason = reason ?? string.Empty,
+        }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Clears a <c>Verifying</c> entry with no run behind it, returning it to <c>Working</c>.</summary>
+    public async Task<ClearStalledVerificationResponse> ClearStalledVerificationAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.ClearStalledVerificationAsync(
+            new ClearStalledVerificationRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
     /// <summary>P2-47 #7: the agent-branch-vs-main diff for the review cockpit, parsed into <see cref="FilePatch"/>
     /// via the pure T-06 <c>PatchParser</c> on the client. Returns the resolved branch + main + patch list.</summary>
     public async Task<(string Branch, string MainBranch, IReadOnlyList<Mainguard.Git.Models.FilePatch> Files)> GetMergeDiffAsync(

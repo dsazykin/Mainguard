@@ -37,7 +37,16 @@
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate), `orchestrator.proto` (P2-14: `PlanApprovalService`
+    unmergeable branch rather than a gate; **`DiscardEntry`/`ClearStalledVerification`** are the human
+    entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
+    takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
+    untouched) and, like `ApprovePlanRequest`, carries **no actor field** — the discarding identity is
+    daemon-derived, because an attribution the client fills in is one any token-holder can forge; both
+    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.verification_in_flight`**
+    says whether a run is really executing, which the state alone cannot: state is persisted per
+    transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
+    with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
+    entries that need unsticking), `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`

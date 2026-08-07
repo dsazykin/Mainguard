@@ -284,9 +284,17 @@
       persist either. `QueueRailView` (the mock merge-queue rail; its rows now put the state word in an
       `Auto` column so a 32-hex agent id can no longer push it off the edge, trim the name with a
       full-value tooltip, and **wrap** the branch / SHA identifiers — horizontal scrolling is explicitly
-      `Disabled` there because enabling it measures at infinite width and silently defeats that wrap),
+      `Disabled` there because enabling it measures at infinite width and silently defeats that wrap.
+      It also carries the entry-**lifecycle** actions, which is the rail the shipped Control Center
+      actually hosts: a `Button.DangerQuiet` **Discard** on every non-terminal row — the reported defect
+      was an entry left by a stopped agent with no control on it at all, so this is per-row rather than
+      on the front one — behind a two-step confirm whose question states that the entry will not be
+      merged and the branch is left alone, plus a `Button.Secondary` "Clear stalled run" shown only when
+      the daemon reports no run behind a `Verifying` state. The rail's ONE accent stays the Review CTA:
+      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
-      Merge/Override, gate reason line), `CoordinatorPanelView` (conversation + plan-approval card —
+      Merge/Override, gate reason line; **harness-only** — constructed solely by
+      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (conversation + plan-approval card —
       **retained for a possible future surface but no longer rendered**; since 2026-07-22 the coordinator
       is driven from its inline terminal, not this bespoke GUI), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
@@ -535,7 +543,15 @@
     deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
     (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
     daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
-    `CanVerify` withholds the button while a run is in flight and on the terminal states),
+    `CanVerify` withholds the button while a run is in flight and on the terminal states. Beside it, the
+    **entry-lifecycle** commands `BeginDiscard`/`CancelDiscard`/`ConfirmDiscard` (two-step) +
+    `ClearStalledVerification`, each an equally thin drive of a daemon RPC through `MergeActionRunner`.
+    The class can neither remove a row nor invent an outcome — a local "remove from list" would clear
+    the rail until the next `StreamQueue` snapshot silently refilled it. `IsVerificationStalled` comes
+    from the daemon's `QueueEntry.VerificationInFlight`, never inferred from `Verifying`, which is wrong
+    for exactly the frozen entries the action exists for; `CanDiscard` hides the action on terminal
+    entries (the daemon refuses them anyway). The `IMergeQueueService` argument is **required** for both
+    reasons at once: an optional seam lets a caller build a row whose buttons silently do nothing),
     `MergeQueueViewModel`/`MergeQueueRowViewModel` (P2-10: the rail bound to the **real** `MergeQueue`
     state machine — subscribes to its `Changed` event, per-row state word + `main@sha` label +
     `CanMerge`-gated Merge button with the reason as tooltip + the loud stale-override behind a confirm;
@@ -776,7 +792,14 @@
     (both the review cockpit and the agent document invoke the merge fire-and-forget, so every refusal
     used to vanish into an unobserved task and the button read as "nothing happened"): awaits
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
-    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller.
+    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
+    now the one place for the entry-lifecycle actions too (`DiscardAsync`,
+    `ClearStalledVerificationAsync`), which need the same contract for a sharper reason: the daemon
+    answers a REFUSED discard with an ordinary successful RPC carrying `discarded=false`, so "no
+    exception" is not evidence anything was removed. `DaemonBackedOrchestrator.DiscardEntryAsync` turns
+    that into a throw and this turns the throw into a warning; the success line says *dropped from the
+    merge queue* and that the branch and its commits are untouched, because a queue entry vanishing is
+    otherwise ambiguous with one that merged.
     `DaemonBackedOrchestrator.ConfirmMergeAsync` is the RT-D1 conversation itself (P2-10 §3.7):
     `BeginMerge` (the daemon's lease + `CanMerge` under it) → **the real Windows-side
     `git merge --ff-only` on the user's own checkout, via `IJournaledMergeExecutor`** → `ConfirmMerge`

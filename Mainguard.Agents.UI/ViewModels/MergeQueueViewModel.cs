@@ -178,6 +178,8 @@ public partial class MergeQueueRowViewModel : ViewModelBase
             WorkerMergeState.StaleVerified => ("AgentStaleIcon", false, false, false, true, false, false),
             WorkerMergeState.Merged => ("CheckmarkIcon", false, false, false, false, true, false),
             WorkerMergeState.Rejected => ("DismissIcon", false, false, false, false, false, true),
+            // Finished and NOT merged: muted, and pointedly not the success green Merged wears.
+            WorkerMergeState.Discarded => ("DismissIcon", false, true, false, false, false, false),
             _ => ("AgentWorkingIcon", false, true, false, false, false, false),
         };
     }

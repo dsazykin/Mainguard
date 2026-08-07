@@ -60,7 +60,11 @@
 - **`Auth/RoleInterceptor.cs`** (P2-14) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
-  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`) and the human-only
+  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
+  `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
+  (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
+  blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
+  branch into the state a re-verification starts from) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
   or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
@@ -313,7 +317,9 @@
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
   stream) / **`MergeQueueGrpcService.cs`** (P2-10: `StreamQueue` re-pushes on the queue's `Changed`
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
-  list can badge external-PR entries; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  list can badge external-PR entries, plus `verification_in_flight` (via
+  `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run
+  leaves a persisted `Verifying` row with nothing executing; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the
@@ -322,7 +328,14 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY) — validation/dispatch only (no business logic —
+  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` refuses while this
+  repo's outstanding merge lease names the entry — a terminal transition inside the
+  `BeginMerge`→`ConfirmMerge` window would make `ConfirmMerge` refuse to record a merge that really
+  landed — derives the actor from `IApproverIdentityResolver` (never the request; there is no such
+  field), and answers a refusal as `discarded=false` + reason rather than a fault. It is deliberately
+  **not** kill-switch-gated: freezing the queue stops merges, and is no reason to forbid tidying an
+  entry that cannot merge either way. `ClearStalledVerification` returns a stalled `Verifying` entry to
+  `Working`, refusing while a run is genuinely in flight) — validation/dispatch only (no business logic —
   rejection trigger). **P2-14:**
   - `MergeQueueGrpcService.BeginMerge`/`ConfirmMerge` and `AgentGrpcService.SpawnAgent` now consult the
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);

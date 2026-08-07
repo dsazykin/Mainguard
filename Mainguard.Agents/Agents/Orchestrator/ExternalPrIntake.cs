@@ -273,6 +273,37 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         var agentId = AgentIdFor(pr.Number);
         var seen = _store.GetSeenHead(source.Key, pr.Number);
 
+        // A human dropped this entry from the queue. Materializing is re-asked on EVERY poll, so without
+        // this the intake would go on re-provisioning the jail and its MG-36 network segment (the bridge
+        // pool is ~32 deep) for a pull request the operator explicitly discarded — and would keep the
+        // worker alive indefinitely, since the release path below only fires when the PR CLOSES upstream.
+        // Releasing here instead makes the discard mean the same thing for an intake'd PR that it means
+        // for a local agent: the entry is off the queue and nothing is being kept warm for it.
+        //
+        // Checked before EnsureWorkerAsync, because that call is the provisioning this must prevent.
+        //
+        // The release happens ONCE, gated on the PR still being tracked: this runs on every poll for as
+        // long as the PR stays open upstream, and tearing the same worker down again on each one would
+        // trade a leak for a stream of pointless teardowns. Untracking is what makes it once — it also
+        // takes the PR out of the closed-upstream sweep, which would otherwise release it a second time
+        // whenever it finally closes.
+        if (target.Queue.GetState(agentId) == WorkerMergeState.Discarded)
+        {
+            if (seen is not null)
+            {
+                await _workers.ReleaseWorkerAsync(target.RepoHash, agentId, ct).ConfigureAwait(false);
+                _store.Untrack(source.Key, pr.Number);
+                _audit.Append(new AuditEvent("external_pr_discarded", new Dictionary<string, string>
+                {
+                    ["source"] = source.Key,
+                    ["pr"] = pr.Number.ToString(),
+                    ["agent"] = agentId,
+                }));
+            }
+
+            return;
+        }
+
         // THE JAIL FIRST. This is the whole point: an external entry with no sandbox can never be
         // verified, because verification runs in the worker's own jail and never on the host. The host
         // creates the worktree as part of the ordinary spawn chain, so there is no separate

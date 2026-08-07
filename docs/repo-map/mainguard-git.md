@@ -40,9 +40,15 @@ The all-editions base. Git logic goes here.
   duplicate subscribe is idempotent; `PrIntakeHeads` — the last-seen head SHA per
   `(source, PR number)`, the "seen PR heads" store + tracked-PR set) — with the
   `HasTosAcknowledgment(provider)` query helper, case-insensitive, that P2-15 chains. `MergeQueueRow`
-  carries a P2-12 `Origin` column (`Local`/`External`). Migrations live in `Migrations/` (P2-10 adds
+  carries a P2-12 `Origin` column (`Local`/`External`) and the discard record —
+  `DiscardedBy`/`DiscardedAtUtc`/`DiscardReason`, all null except on a `Discarded` row. The record
+  lives on the row rather than only in the audit log because the daemon's `IAuditLog` is in-memory
+  today, so the row is what actually survives a restart; `DiscardedBy` is daemon-derived at the RPC
+  (there is no actor field on the wire) and attributes the host session, not a distinguishable human —
+  see `IApproverIdentityResolver`. Migrations live in `Migrations/` (P2-10 adds
   `AddMergeQueue`; P2-12 adds `AddPrIntake` — the two intake tables + the `Origin` column; P2-13 adds
-  `AddGatewayPerDayBudget` — the two per-day budget columns).
+  `AddGatewayPerDayBudget` — the two per-day budget columns; `AddMergeQueueDiscardRecord` adds the
+  three discard columns).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +

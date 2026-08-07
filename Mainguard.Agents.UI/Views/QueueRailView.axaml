@@ -76,17 +76,47 @@
                   <TextBlock Classes="Mono" Text="{Binding VerifiedAgainst}" FontSize="11" TextWrapping="Wrap"
                              Foreground="{DynamicResource TextMuted}"
                              IsVisible="{Binding VerifiedAgainst, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-                  <!-- The verification trigger. Secondary by role: the rail's ONE accent stays the
-                       Review CTA, and asking for a check is a supporting action, not the CTA. -->
+                  <!-- The verification trigger's message line (#307), above the action row. -->
                   <TextBlock Text="{Binding VerifyMessage}" FontSize="11" Foreground="{DynamicResource TextMuted}"
                              TextWrapping="Wrap"
                              IsVisible="{Binding VerifyMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-                  <StackPanel Orientation="Horizontal" Spacing="6">
-                    <Button Classes="Secondary" Content="{Binding VerifyButtonText}" FontSize="12" Padding="10,3"
-                            Command="{Binding VerifyCommand}" IsEnabled="{Binding CanVerify}"
-                            ToolTip.Tip="Run this repo's verification command in this agent's own jail."/>
-                    <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3"
+
+                  <!-- The row's actions. The rail's ONE accent stays the Review CTA, so nothing else here
+                       is Accent: Verify is Secondary (asking for a check is a supporting action) and the
+                       destructive one reads destructive by hue (Button.DangerQuiet) rather than by mass.
+                       A WrapPanel rather than a horizontal StackPanel because there are now up to four
+                       controls on a rail that is user-resizable down to a narrow column — a StackPanel
+                       would push the last one off the edge, which is the clipping #306 just fixed above.
+                       Every row that can be acted on has a control: the defect this answers was an entry
+                       left with NONE, so Discard is on every non-terminal row rather than the front one. -->
+                  <WrapPanel Orientation="Horizontal" IsVisible="{Binding !IsConfirmingDiscard}">
+                    <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3" Margin="0,2,6,0"
                             Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowReviewAccent}"/>
+                    <Button Classes="Secondary" Content="{Binding VerifyButtonText}" FontSize="12" Padding="10,3"
+                            Margin="0,2,6,0" Command="{Binding VerifyCommand}" IsEnabled="{Binding CanVerify}"
+                            ToolTip.Tip="Run this repo's verification command in this agent's own jail."/>
+                    <!-- Only for a row the DAEMON says has no run behind its Verifying state. -->
+                    <Button Classes="Secondary" Content="Clear stalled run" FontSize="12" Padding="10,3" Margin="0,2,6,0"
+                            Command="{Binding ClearStalledVerificationCommand}"
+                            IsVisible="{Binding IsVerificationStalled}"
+                            ToolTip.Tip="This entry says Verifying but the daemon is not running anything for it. Clearing puts it back to Working so it can be verified again."/>
+                    <Button Classes="DangerQuiet" Content="Discard" FontSize="12" Padding="10,3" Margin="0,2,0,0"
+                            Command="{Binding BeginDiscardCommand}" IsVisible="{Binding CanDiscard}"
+                            ToolTip.Tip="Drop this entry from the merge queue. The branch and its commits are untouched."/>
+                  </WrapPanel>
+
+                  <!-- The two-step guard. A discard is terminal and daemon-recorded, so the row asks
+                       first and says exactly what it will and will not do — "not merged" is stated
+                       because a queue entry vanishing is otherwise ambiguous with one that merged. -->
+                  <StackPanel Spacing="4" IsVisible="{Binding IsConfirmingDiscard}">
+                    <TextBlock Text="Drop this entry from the queue? It will not be merged, and the branch is left alone."
+                               FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                    <WrapPanel Orientation="Horizontal">
+                      <Button Classes="Danger" Content="Yes, discard" FontSize="12" Padding="10,3" Margin="0,2,6,0"
+                              Command="{Binding ConfirmDiscardCommand}"/>
+                      <Button Classes="Secondary" Content="Keep" FontSize="12" Padding="10,3" Margin="0,2,0,0"
+                              Command="{Binding CancelDiscardCommand}"/>
+                    </WrapPanel>
                   </StackPanel>
                 </StackPanel>
               </Border>

@@ -80,7 +80,14 @@
   the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
-  `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
+  `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`, and the
+  **entry-lifecycle** block — discard from `Working` is terminal/not-`Merged`/persisted with actor +
+  reason, an untracked id cannot be discarded into existence, a discard mid-verification beats the run
+  that finishes after it, a discarded entry leaves the live queue but survives a restart as a record
+  `EnsureEntry` cannot resurrect, `ClearStalledVerification` unsticks a `Verifying` row with no run and
+  is refused while one is live, `NotifyNewCommits` on a discarded entry is a no-op rather than the
+  illegal `Discarded → Working` throw a terminal guard naming only `Merged`/`Rejected` produced, and
+  neither action appears on `IMergeQueue`),
   `VerificationRunnerTests` (daemon-observed exit is pass/fail,
   `ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit`, runs-in-sandbox-never-host, artifact
   provenance), `ForegroundMergeServiceTests` (real-git: journaled/undoable A5 ff-only merge,
@@ -88,7 +95,21 @@
   EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
   never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
-  real-`MergeQueue` rail in all five themes → `merge_queue_<Theme>.png`); the **P2-11 review-cockpit
+  real-`MergeQueue` rail in all five themes → `merge_queue_<Theme>.png`; note this renders
+  `MergeQueueView`, which is **harness-only** — the shipped Control Center hosts `QueueRailView`),
+  **`Headless/QueueEntryLifecycleRenderHarness.cs`** — the rail's entry-lifecycle actions at production
+  id lengths: every non-terminal row has a Discard that is both visible **and enabled** (a
+  visibility-only assertion misses the disabled case), "Clear stalled run" appears only on the row the
+  daemon reports has no run behind its `Verifying` state and not on the one that really is verifying,
+  the rail still carries exactly ONE `Button.Accent` (the Review CTA) with the destructive action
+  wearing `Button.DangerQuiet` resolved from `DangerBrush`, and the discard asks first — arming it
+  calls nothing, and the question states that the entry will not be merged and the branch is left
+  alone. It also holds the INVERTED form of the same defect: `MockOrchestrator`'s `Verifying` rows are
+  genuinely running (its tick loop advances them while `Detail` counts "tests 12/58"), so a projection
+  that let `VerificationInFlight` default to false made the rail label every one of them "Stalled",
+  badge it as a warning and offer "Clear stalled run" on a row visibly executing tests — asserted
+  against the real mock, not a stub. PNGs: `queue_lifecycle_<Theme>.png`,
+  `queue_lifecycle_confirm_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix
   present/partial/absent/malformed→nullable, Agent-Trace ours + external-vendor parse + range-join,
@@ -789,7 +810,11 @@
   rate-limit backoff-no-crash-loop, zero-upstream-writes, the configurable author-filter `[Theory]`,
   and the spawn seam: the intake asks for a `pr-<n>` jail before anything else, a **gate refusal
   materializes NOTHING** and is retried on a later poll, a spawn failure likewise, repeat polls never
-  spawn a second jail, and a non-rate-limit transport fault no longer escapes the poll) and
+  spawn a second jail, a non-rate-limit transport fault no longer escapes the poll, and a **human
+  discard releases the worker ONCE and stops the PR being re-materialized** — materializing is re-asked
+  on every poll and consulted no queue state, so a dropped-but-still-open PR kept its jail re-provisioned
+  and held until it closed upstream, while its moved-head leg threw `Discarded → Working` out of the
+  swallowed per-PR catch and therefore re-threw forever without ever recording the head) and
   `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
   API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
@@ -1106,7 +1131,21 @@
   the lock and an end-to-end assertion would pass either way), `ApproverIdentityDaemonDerivedTests`
   (SA-1/F2 — reflection proves `ApprovePlanRequest` has no identity field, and a
   `ConfigureTestServices`-overridden `IApproverIdentityResolver` proves the recorded/echoed approver
-  is the connection's value regardless of the request). **`Agents/SwarmReconcilerDockerTests.cs`**
+  is the connection's value regardless of the request),
+  **`QueueEntryLifecycleTests.cs`** — the queue's human entry-lifecycle actions, asserted DAEMON-side
+  because the tempting fix (a ViewModel that drops the row from its own collection) clears a rail the
+  next `StreamQueue` snapshot silently refills. `DiscardEntry` moves the daemon's state machine to a
+  terminal that is **not** `Merged`, writes the record, appends its own audit event and removes the
+  entry from the stream the rail renders from; the actor is the daemon-derived
+  `IApproverIdentityResolver` value and reflection proves `DiscardEntryRequest` has no field to assert
+  one with; a discard is refused while that entry holds the repo's merge lease, and on an already
+  terminal entry; `ClearStalledVerification` unsticks a `Verifying` row the stream reports has no run
+  behind it (`verification_in_flight`, a fact only the daemon can supply); the coordinator role is
+  denied **both** RPCs at the interceptor with nothing mutated, and the in-jail `AgentIpcRequest` op
+  set stays `{spawn, list}` so the agent surface cannot address them at all. The two decisive cases
+  drive the shipped `QueueRailViewModel` through the shipped `DaemonBackedOrchestrator` into a real
+  in-proc daemon: a discard that lands must move the daemon's queue, and a discard the daemon REFUSES
+  must keep the row and report the reason as a warning. **`Agents/SwarmReconcilerDockerTests.cs`**
   (TI-P2-08 test 7, RequiresDocker via the new Docker-presence-only `[RequiresDockerDaemonFact]`):
   `Reconciler_OutOfBandDockerRm_ShouldConvergeOnBoot` stands up a trivial `busybox` container with the
   real `mainguard.agent`/`mainguard.repo` labels (not the P2-07 agent-base image), points a

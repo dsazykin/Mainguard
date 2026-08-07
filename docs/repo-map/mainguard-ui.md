@@ -59,7 +59,12 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   - `App.axaml` merges it into `Application.Resources` (for Views' `{StaticResource …}` /
     `{DynamicResource …}` icon lookups).
 - **`Styles/DesignSystem.axaml`** — the component-class `<Styles>`
-  (`Button.Primary/.Accent/.Success/.Danger/.Secondary/.IconButton/.Pill/.Segment/.WindowButton`,
+  (`Button.Primary/.Accent/.Success/.Danger/.DangerQuiet/.Secondary/.IconButton/.Pill/.Segment/.WindowButton`
+  — `.DangerQuiet` is the UNFILLED destructive: `Button.Secondary`'s shape with `DangerBrush` text and
+  hairline, for a destructive action that sits BESIDE a view's single accent CTA rather than being it
+  (the merge-queue rail's per-row Discard, where the one accent is reserved for the Review CTA);
+  `.Danger` stays the filled form, for the moment a destructive action IS the primary action — the
+  confirmation step. Adds no tokens; both resolve `DangerBrush`/`DangerHover`, which every theme has —
   `Border.Card/.RefChip*/.SegmentTrack`, `ComboBox`, flyout/menu surfaces, `CheckBox`,
   `PathIcon.Chevron/.spinning`, typography, button hover fades).
   - `App.axaml` `StyleInclude`s it LAST (after `FluentTheme` + AvaloniaEdit + Dock) so these overrides

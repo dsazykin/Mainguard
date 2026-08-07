@@ -472,7 +472,14 @@ public sealed class MockOrchestrator :
         lock (_gate)
             return _agents.Where(a => a.InQueue && a.Life != AgentLifecycleState.TornDown)
                 .OrderBy(a => RailOrder(a.Merge))
-                .Select(a => new QueueEntry(a.Id, a.Name, a.Branch, a.Merge, a.Detail, a.Verification, a.Flagged.ToList()))
+                .Select(a => new QueueEntry(
+                    a.Id, a.Name, a.Branch, a.Merge, a.Detail, a.Verification, a.Flagged.ToList(),
+                    // The mock's Verifying rows are genuinely RUNNING — the tick loop advances them and
+                    // their Detail counts "tests 12/41" as it goes. Letting this default to false would
+                    // make the rail label every one of them "Stalled", badge it as a warning and offer
+                    // "Clear stalled run" on a row visibly executing tests: the exact false claim about
+                    // an entry's activity that the in-flight flag exists to prevent, merely inverted.
+                    VerificationInFlight: a.Merge == WorkerMergeState.Verifying))
                 .ToList();
 
         static int RailOrder(WorkerMergeState s) => s switch
@@ -527,7 +534,10 @@ public sealed class MockOrchestrator :
             }
 
             var a = Find(agentId);
-            if (a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected)
+            // Every terminal, Discarded included. Listing them was what let a discarded mock entry be
+            // walked Discarded → Verifying → Verified, contradicting the terminal contract this mock
+            // exists to stand in for.
+            if (a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded)
             {
                 return Task.FromResult(new VerificationOutcome(
                     Ran: false, Passed: false,
@@ -576,6 +586,60 @@ public sealed class MockOrchestrator :
         foreach (var e in raised) EventReceived?.Invoke(e);
         Changed?.Invoke();
         return Task.FromResult(outcome);
+    }
+
+    /// <summary>
+    /// Mock discard — the same shape the daemon enforces: terminal <c>Discarded</c> (never
+    /// <c>Merged</c>), the entry leaves the live queue, and a terminal entry refuses.
+    /// </summary>
+    public Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason)
+    {
+        var raised = new List<AgentEvent>();
+        QueueEntryDiscardOutcome outcome;
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded)
+            {
+                throw new InvalidOperationException(
+                    $"Can't discard — this entry is already {a.Merge} — a terminal entry cannot be discarded.");
+            }
+
+            SetMerge(a, WorkerMergeState.Discarded, raised);
+            a.InQueue = false;
+            a.Detail = string.IsNullOrWhiteSpace(reason) ? "discarded" : "discarded — " + reason;
+            // "mock:" so nothing can mistake the mock's attribution for a daemon-derived identity.
+            outcome = new QueueEntryDiscardOutcome(agentId, "mock:local", DateTimeOffset.Now);
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.FromResult(outcome);
+    }
+
+    /// <summary>
+    /// Mock clear-stalled-verification. The mock has no real runs, so every <c>Verifying</c> entry here is
+    /// by definition stalled; anything else refuses with the daemon's wording.
+    /// </summary>
+    public Task ClearStalledVerificationAsync(string agentId)
+    {
+        var raised = new List<AgentEvent>();
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Merge != WorkerMergeState.Verifying)
+            {
+                throw new InvalidOperationException(
+                    $"Can't clear this verification — this entry is {a.Merge}, not stuck verifying — there is nothing to clear.");
+            }
+
+            SetMerge(a, WorkerMergeState.Working, raised);
+            a.Detail = "verification cleared";
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.CompletedTask;
     }
 
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
