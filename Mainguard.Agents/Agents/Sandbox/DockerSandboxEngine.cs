@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Docker.DotNet;
 using Docker.DotNet.Models;
+using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
 
@@ -184,6 +185,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // state. Write-if-absent, so a still-running jail's fresher tokens are never
                 // clobbered by the host keychain's older copy.
                 await RestoreCliCredentialsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                // Same reason, same write-if-absent rule: a relaunched jail's home came back empty, so
+                // the user's approved-command list has to be put back or every command is re-prompted.
+                await RestoreCliSettingsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                await ApplyWorkspaceSettingsIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
                 // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
                 // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
                 // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
@@ -219,6 +224,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
                 request.Secrets.OobKey, credentials.SupervisorUid, ct).ConfigureAwait(false);
             await RestoreCliCredentialsAsync(created.ID, request, ct).ConfigureAwait(false);
+            // The CLI's saved settings — the approved-command list the user built in an earlier jail.
+            // Ordered after the credential restore purely so a failure in the security-bearing write is
+            // never masked by one in the convenience write; both share the same failure handling below.
+            await RestoreCliSettingsAsync(created.ID, request, ct).ConfigureAwait(false);
+            // Driven by the adapter's DECLARATION, so it also covers the first-ever session — the one
+            // with nothing to restore, where the CLI creates the file itself the moment the user
+            // approves something. That is the session the ignore matters most in.
+            await ApplyWorkspaceSettingsIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -532,6 +545,132 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             await WriteSecretOverExecStdinAsync(path, exec, "CLI credential restore", ct).ConfigureAwait(false);
         }
     }
+
+    /// <summary>
+    /// Restores the CLI's saved SETTINGS — the user's approved-command list above all — into the jail's
+    /// throwaway trees, so a fresh agent does not re-prompt for everything that was already approved.
+    ///
+    /// <para>Mechanically identical to the credential restore and for the same three reasons: the write
+    /// runs as the AGENT uid (the CLI has to be able to rewrite the file when the user approves
+    /// something new), it goes over exec <b>stdin</b> rather than <c>docker cp</c> (which writes
+    /// underneath the tmpfs <c>$HOME</c> and reports success while the container sees nothing), and it
+    /// is <b>write-if-absent</b> — a live jail's own copy is always fresher than the host's.</para>
+    ///
+    /// <para>The only difference is the ROOT: an entry may be relative to <c>$HOME</c> or to
+    /// <c>/workspace</c>, because a CLI's user-level and project-level settings live in different trees
+    /// and it is the PROJECT one that holds "don't ask again" grants. Both are wiped every spawn, which
+    /// is why either needs restoring at all. Paths were validated relative upstream
+    /// (<see cref="AdapterManifest.IsHomeRelativeFilePath"/>), so neither root can be escaped.</para>
+    /// </summary>
+    private async Task RestoreCliSettingsAsync(string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        if (request.CliSettingsFiles is not { Count: > 0 } files)
+            return;
+
+        foreach (var file in files)
+        {
+            if (file.Content is not { Length: > 0 })
+                continue;
+
+            var path = SettingsRootPath(file.Root) + "/" + file.RelativePath;
+            var length = file.Content.Length.ToString(CultureInfo.InvariantCulture);
+            var exec = new ExecStdinRequest(
+                containerId,
+                request.AgentUid.ToString(CultureInfo.InvariantCulture),
+                // path is argv-safe; the content is piped via stdin only — the same shape as every
+                // other in-jail write, so there is one script to reason about rather than two.
+                new[]
+                {
+                    "sh", "-c",
+                    "umask 0077\n"
+                    + "if [ -e \"$1\" ]; then head -c \"$2\" > /dev/null; exit 0; fi\n"
+                    + "mkdir -p \"$(dirname \"$1\")\" || exit 74\n"
+                    + "head -c \"$2\" > \"$1.partial\" || exit 74\n"
+                    + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$2\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
+                    + "mv \"$1.partial\" \"$1\"\n",
+                    "sh", path, length,
+                },
+                file.Content);
+
+            await WriteSecretOverExecStdinAsync(path, exec, "CLI settings restore", ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Keeps the CLI's WORKSPACE settings file out of the agent's commits.
+    ///
+    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so that
+    /// file is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c>
+    /// (their own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the
+    /// user's permission allowlist would start committing it into their repository and merging it to
+    /// main: a convenience feature quietly writing to the user's history. The MG-43 package cache was
+    /// moved out of the worktree for exactly this reason; this file cannot move, because it is where
+    /// the CLI reads it from.</para>
+    ///
+    /// <para><b>Why it is driven by the DECLARATION and not by the restore.</b> On a first-ever session
+    /// there is nothing to restore — the CLI creates the file itself the moment the user approves
+    /// something. Deriving the ignore list from the restore payload alone would therefore protect every
+    /// session except the one that creates the file, which is the one that matters. So the union of the
+    /// adapter's declared workspace paths and anything actually restored is used, and this runs on every
+    /// spawn.</para>
+    ///
+    /// <para>The entry goes in <c>$GIT_DIR/info/exclude</c> — the repository's LOCAL ignore file, which
+    /// lives in the per-agent repo the daemon deletes at teardown. Nothing tracked is touched, the
+    /// user's own <c>.gitignore</c> is not edited, and no state outlives the agent.</para>
+    ///
+    /// <para>Best effort by construction: a worktree that is not a git repository at all (every
+    /// substrate-less test jail) resolves no git dir and this exits 0 having done nothing. A failure
+    /// here must never fail a spawn — the settings are already in place, which is the user-visible
+    /// half.</para>
+    /// </summary>
+    private async Task ApplyWorkspaceSettingsIgnoreAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        var workspacePaths = (request.WorkspaceIgnorePaths ?? Array.Empty<string>())
+            .Concat((request.CliSettingsFiles ?? Array.Empty<SandboxSettingsFile>())
+                .Where(f => f.Root == AdapterSettingsRoot.Workspace && f.Content is { Length: > 0 })
+                .Select(f => f.RelativePath))
+            .Where(AdapterManifest.IsHomeRelativeFilePath)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (workspacePaths.Length == 0)
+        {
+            return;
+        }
+
+        var command = new List<string>
+        {
+            "sh", "-c",
+            "cd " + ContainerSpecBuilder.WorkspaceTarget + " 2>/dev/null || exit 0\n"
+            + "excl=$(git rev-parse --git-path info/exclude 2>/dev/null) || exit 0\n"
+            + "[ -n \"$excl\" ] || exit 0\n"
+            + "mkdir -p \"$(dirname \"$excl\")\" 2>/dev/null || exit 0\n"
+            + "for p in \"$@\"; do\n"
+            + "  grep -qxF \"/$p\" \"$excl\" 2>/dev/null || printf '/%s\\n' \"$p\" >> \"$excl\" || exit 0\n"
+            + "done\n",
+            "sh",
+        };
+        command.AddRange(workspacePaths); // positional — never interpolated into script text
+
+        try
+        {
+            await ExecAsync(containerId, command, ct).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The settings are already restored; failing the spawn over the ignore entry would trade a
+            // working feature for a cosmetic one.
+        }
+    }
+
+    /// <summary>The absolute in-jail directory a settings root names. The ONE mapping — the harvest side
+    /// (<c>SandboxAgentLauncher</c>) resolves through this same method, so the two legs of the round trip
+    /// cannot drift onto different directories.</summary>
+    public static string SettingsRootPath(AdapterSettingsRoot root) => root switch
+    {
+        AdapterSettingsRoot.Workspace => ContainerSpecBuilder.WorkspaceTarget,
+        _ => ContainerSpecBuilder.AgentHome,
+    };
 
     /// <summary>
     /// Writes secret bytes to <paramref name="path"/> inside the container as a mode-0400 file owned by

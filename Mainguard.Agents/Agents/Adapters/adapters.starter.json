@@ -155,7 +155,41 @@
     "tmpfs wiped every relaunch, so Mainguard restores these at spawn from the HOST OS keychain and",
     "harvests them back on stop — log in once, stay logged in. Files only, never directories (a",
     "directory would drag session history/caches into the keychain). Keep the list to what the",
-    "vendor's CLI actually reads for auth; verify against the pinned version when bumping."
+    "vendor's CLI actually reads for auth; verify against the pinned version when bumping.",
+    "",
+    "settingsPaths is the NON-credential twin of credentialPaths, and it is a separate field because the",
+    "two get different storage on purpose. A credential goes to the host OS keychain and nowhere else.",
+    "Settings — the permission allowlist above all — go to an ordinary JSON file under the Mainguard data",
+    "root, PER REPOSITORY: %LocalAppData%\\Mainguard\\cli-settings\\<repo>\\<adapter>.json, which the owner",
+    "can read, edit and delete. AdapterManifest.Parse REFUSES a path that appears in both lists, so a",
+    "credential can never be diverted into the plaintext store by a manifest edit.",
+    "",
+    "Each entry names a ROOT because a CLI writes its settings into two different throwaway trees, and",
+    "BOTH die every spawn:",
+    "  home       $HOME (/home/agent) — the 256 MiB tmpfs. USER-level config.",
+    "  workspace  /workspace — this agent's git worktree, created per spawn and deleted at teardown.",
+    "             PROJECT-level config, and the one that actually matters: claude-code writes the grants",
+    "             a user creates with 'yes, and don't ask again' to .claude/settings.local.json in the",
+    "             project directory, not to the home file. A home-only design would have persisted a file",
+    "             the CLI never writes and lost every approval the user made.",
+    "",
+    "SCOPE IS PER REPO AND THAT IS A SECURITY DECISION, not an implementation detail. A permission",
+    "allowlist is a standing grant of execution: approving a command while working on repo A must not",
+    "silently pre-approve it in repo B, where the same command name can mean something entirely",
+    "different. Settings that are genuinely global (a theme, a model choice) therefore get re-set once",
+    "per repository, which is the cost of not being able to tell them apart inside an opaque vendor blob.",
+    "",
+    "UNTRUSTED JAILS INHERIT NOTHING. The external-PR intake spawns its worker withoutHostCredentials,",
+    "and that flag now gates settings exactly as it gates cached logins: a jail running a pull request's",
+    "code starts with an EMPTY allowlist. Inheriting one would hand somebody else's branch pre-approved",
+    "execution, which would be a real regression introduced by a convenience fix. Harvest is narrower",
+    "still — it runs only for a HUMAN-ATTENDED session (a Managed worker's terminal is daemon-locked",
+    "read-only per P2-14, so nobody could have approved anything in it). See",
+    "docs/design/agent-cli-settings-persistence.md.",
+    "",
+    "gemini-cli and qwen-code list .gemini/settings.json and .qwen/settings.json under credentialPaths",
+    "rather than here. That predates this field and is deliberately left alone: moving them would migrate",
+    "live data out of the keychain, and it is a keychain-to-file move, not a bug. Re-open it separately."
   ],
   "adapters": [
     {
@@ -179,7 +213,11 @@
       "baseUrlEnvVar": "ANTHROPIC_BASE_URL",
       "modelHost": "api.anthropic.com",
       "egressHosts": ["platform.claude.com", "statsig.anthropic.com"],
-      "credentialPaths": [".claude/.credentials.json", ".claude.json"]
+      "credentialPaths": [".claude/.credentials.json", ".claude.json"],
+      "settingsPaths": [
+        { "root": "workspace", "path": ".claude/settings.local.json" },
+        { "root": "home", "path": ".claude/settings.json" }
+      ]
     },
     {
       "id": "codex",

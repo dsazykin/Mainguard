@@ -112,6 +112,9 @@ public sealed class DaemonBackedOrchestrator :
     private Task? _spendPump;
     private Task? _resourcePump;
     private Task? _conversationPump;
+    /// <summary>Where a repository's saved CLI settings live between agents. Per repo by construction —
+    /// approving a command here must not pre-approve it somewhere else.</summary>
+    private readonly CliSettingsStore _cliSettings;
     private Task? _queuePump;
     private Task? _loginHarvestPump;
     private CancellationTokenSource? _queuePumpCts;
@@ -140,14 +143,20 @@ public sealed class DaemonBackedOrchestrator :
     /// into the keychain (defaults to <see cref="DefaultLoginHarvestInterval"/>). Injectable so the
     /// round-trip test can drive a sweep in seconds instead of minutes; it changes the CADENCE only,
     /// never whether the sweep happens.</param>
+    /// <param name="cliSettings">The PER-REPO store for a CLI's saved settings — the approved-command
+    /// list. Deliberately not the keychain: settings are configuration the owner should be able to read
+    /// and delete, while logins stay keychain-only. Injectable so tests write to a temp directory
+    /// instead of the user's real store.</param>
     public DaemonBackedOrchestrator(
         DaemonClient client, bool ownsClient = true, Func<string, string?>? keystoreLookup = null,
         Func<string, IReadOnlyList<string>>? keystoreList = null,
         Action<string, string>? keystoreSave = null,
         Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null,
         Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null,
-        TimeSpan? loginHarvestInterval = null)
+        TimeSpan? loginHarvestInterval = null,
+        CliSettingsStore? cliSettings = null)
     {
+        _cliSettings = cliSettings ?? new CliSettingsStore();
         _client = client ?? throw new ArgumentNullException(nameof(client));
         _loginHarvestInterval = loginHarvestInterval is { } interval && interval > TimeSpan.Zero
             ? interval
@@ -857,6 +866,8 @@ public sealed class DaemonBackedOrchestrator :
     /// next spawn of this kind restores them so the CLI boots signed in.</summary>
     private void PersistHarvestedLogin(AgentStopOutcome outcome)
     {
+        PersistHarvestedSettings(outcome);
+
         if (outcome.CliCredentials.Count == 0 || string.IsNullOrWhiteSpace(outcome.AgentKind))
         {
             return;
@@ -867,6 +878,31 @@ public sealed class DaemonBackedOrchestrator :
         {
             _keystoreSave(keystoreKey, vault);
         }
+    }
+
+    /// <summary>
+    /// Folds the settings a harvest returned into <b>that agent's own repository's</b> store, so the
+    /// commands the user approved in this session are already approved in the next agent.
+    ///
+    /// <para>The repo comes from the outcome, never from whichever repository happens to be open: the
+    /// harvest sweep walks every agent on the daemon, so filing by the open repo would put one
+    /// repository's approved-command list under another's name — the precise cross-repo leak the
+    /// per-repo scope exists to prevent. A harvest with no repo handle is dropped rather than filed
+    /// under a blank scope.</para>
+    ///
+    /// <para>The daemon already refused to harvest anything from an unattended or untrusted session,
+    /// so an empty list here is the normal, correct outcome for those and simply writes nothing.</para>
+    /// </summary>
+    private void PersistHarvestedSettings(AgentStopOutcome outcome)
+    {
+        if (outcome.CliSettings.Count == 0
+            || string.IsNullOrWhiteSpace(outcome.AgentKind)
+            || string.IsNullOrWhiteSpace(outcome.RepoHandle))
+        {
+            return;
+        }
+
+        _cliSettings.Save(outcome.RepoHandle, outcome.AgentKind, outcome.CliSettings);
     }
 
     // No per-agent pause/prompt/plan-tree RPCs exist on the daemon contract yet — these steer nothing.
@@ -1414,11 +1450,16 @@ public sealed class DaemonBackedOrchestrator :
         // login performed in an earlier session survives into this one instead of prompting again.
         var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(cli.Id)));
 
+        // THIS repository's saved settings — the commands the user already approved here. Loaded by
+        // repo handle, so an approval made in another repository is not in this list at all.
+        var savedSettings = _cliSettings.Load(repoHandle!, cli.Id);
+
         var agentId = await _client.SpawnAgentAsync(
             repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
             ct, deadline: SpawnDeadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
             extraEnv: CollectCustomEnvKeys(),
-            cliCredentials: savedLogin.Count > 0 ? savedLogin : null).ConfigureAwait(false);
+            cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
+            cliSettings: savedSettings.Count > 0 ? savedSettings : null).ConfigureAwait(false);
 
         lock (_gate)
         {

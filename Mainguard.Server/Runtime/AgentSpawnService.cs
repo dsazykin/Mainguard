@@ -16,9 +16,41 @@ namespace Mainguard.Server.Runtime;
 /// <summary>The outcome of a stop: whether a session was actually removed, its adapter kind, and
 /// the CLI login-state files harvested from the jail before teardown (empty when none) — the
 /// client's cue to update the host OS keychain, the only durable credential store.</summary>
+/// <param name="RepoHandle">The repository the session belonged to — the same opaque handle the client
+/// supplied on spawn. Returned because settings are stored PER REPO and the client's harvest sweep
+/// walks every agent on the daemon: without it the client could only file them under whichever repo
+/// happened to be open, which is how one repository's approved-command list ends up in another's.</param>
 public sealed record AgentStopResult(
     bool Stopped, string AgentKind,
-    IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile> CliCredentials);
+    IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile> CliCredentials,
+    IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile> CliSettings,
+    string RepoHandle = "");
+
+/// <summary>
+/// May the settings a jail holds — the CLI's approved-command list — flow back OUT to the host store
+/// that seeds every later agent in this repository?
+///
+/// <para>This is the escalation direction and it is deliberately narrower than the restore direction.
+/// The settings file is agent-writable by construction (the CLI must be able to record a new
+/// approval), so Mainguard cannot tell "the human answered yes" from "the agent wrote the file". What
+/// it CAN tell is whether a human was in a position to answer at all:</para>
+/// <list type="bullet">
+///   <item>a <see cref="AgentRoles.Managed"/> worker's terminal is daemon-locked read-only (P2-14), so
+///   nobody typed an approval into it — anything found there was written by the agent, and the
+///   external-PR intake's untrusted worker is Managed by construction;</item>
+///   <item>every other session (manual, coordinator) is a terminal the user drives, which is exactly
+///   where the owner's approvals are made and therefore the only place worth harvesting.</item>
+/// </list>
+/// <para>Restore stays wider on purpose: a Managed worker SHOULD inherit the repo's approvals so it
+/// does not stall on prompts nobody can answer. Grants flow in from a human-managed source and never
+/// back out of an unattended one.</para>
+/// </summary>
+public static class CliSettingsHarvestPolicy
+{
+    /// <summary>True when a session of this role is human-attended, so its settings may be persisted.</summary>
+    public static bool MayHarvest(string? role) =>
+        !string.Equals(role, AgentRoles.Managed, StringComparison.Ordinal);
+}
 
 /// <summary>A spawn the daemon refuses on policy (kill switch engaged, no repo, …) — not a fault.</summary>
 public sealed class AgentSpawnRefusedException : Exception
@@ -96,11 +128,19 @@ public sealed class AgentSpawnService
     /// API instead of fast-forwarding the mirrored branch behind the pull request's back — and
     /// <c>EnsureEntry</c> overwrites the origin on every call, so a Local stamp here would silently undo
     /// the intake's.</param>
+    /// <param name="cliSettings">The CLI's saved settings for THIS repository — the approved-command
+    /// list the user built in earlier agents — restored into the jail so they are not re-prompted for
+    /// everything they already allowed. Per-repo by construction: the client keys its store on the repo
+    /// handle, and the daemon-side fallback cache is scoped the same way.</param>
     /// <param name="withoutHostCredentials">
     /// TRUST BOUNDARY. Set for a jail running code from outside the user's own machine (an external pull
     /// request head). A normal spawn falls back to the per-(repo, kind) memory cache for extra env and CLI
     /// login files so a coordinator-spawned worker inherits the login the user just performed; an
     /// untrusted head must inherit <b>nothing</b>, and must not seed that cache either.
+    /// <para>It gates the SETTINGS the same way, and there the reasoning is stronger than for a login:
+    /// a permission allowlist is a standing grant of execution, so a jail holding a pull request's code
+    /// must start with an EMPTY one. Inheriting the user's approvals would hand somebody else's branch
+    /// pre-approved execution — a real security regression introduced by a convenience fix.</para>
     /// </param>
     public async Task<string> SpawnAsync(
         string repoHandle, string agentKind, string? modelApiKey, string role, CancellationToken ct,
@@ -109,7 +149,8 @@ public sealed class AgentSpawnService
         string? parentAgentId = null,
         string? agentId = null,
         Mainguard.Agents.Agents.MergeEntryOrigin queueOrigin = Mainguard.Agents.Agents.MergeEntryOrigin.Local,
-        bool withoutHostCredentials = false)
+        bool withoutHostCredentials = false,
+        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? cliSettings = null)
     {
         // Custom env entries travel to the same 0400 tmpfs env-file as the model key; a malformed
         // name would corrupt it for every entry, so reject the whole spawn up front (typed →
@@ -149,6 +190,7 @@ public sealed class AgentSpawnService
             _keys.Remember(repoHandle, agentKind, modelApiKey);
             _keys.RememberExtraEnv(repoHandle, extraEnv);
             _keys.RememberCliCredentials(repoHandle, agentKind, cliCredentials);
+            _keys.RememberCliSettings(repoHandle, agentKind, cliSettings);
         }
 
         // Record the session first (its id names the worktree + container), then run the real
@@ -202,6 +244,14 @@ public sealed class AgentSpawnService
             var launchCredentials = withoutHostCredentials
                 ? null
                 : cliCredentials ?? _keys.TryGetCliCredentials(repoHandle, agentKind);
+            // THE UNTRUSTED-AGENT BOUNDARY, applied to the permission allowlist. An external pull
+            // request's jail gets NO inherited grants — not the caller's, not the repo's cached ones —
+            // so it starts asking about every command exactly as a first-ever agent would. Deleting
+            // this ternary is the whole regression: the jail would boot pre-approved to run whatever
+            // the user had ever allowed in this repository, on code an outside author chose.
+            var launchSettings = withoutHostCredentials
+                ? null
+                : cliSettings ?? _keys.TryGetCliSettings(repoHandle, agentKind);
             // Launch progress → a state delta on THIS session, so the several minutes a first-run
             // toolchain image build takes read as progress in the client instead of as a hang. The
             // session stays in "Starting"; only the reason moves, which is exactly the update
@@ -212,7 +262,8 @@ public sealed class AgentSpawnService
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
                 extraEnv: launchEnv,
                 cliCredentials: launchCredentials,
-                progress: new InlineProgress(m => _store.MarkState(key, session.State, m))).ConfigureAwait(false);
+                progress: new InlineProgress(m => _store.MarkState(key, session.State, m)),
+                cliSettings: launchSettings).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -305,11 +356,18 @@ public sealed class AgentSpawnService
         {
             return new AgentStopResult(
                 false, session?.Kind ?? string.Empty,
-                Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>());
+                Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>(),
+                Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>(),
+                session?.RepoHash ?? string.Empty);
         }
 
         var credentials = await _launcher.HarvestCliCredentialsAsync(
             containerId, session.Kind, ct).ConfigureAwait(false);
+        var settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
+        if (settings.Count > 0)
+        {
+            _keys.RememberCliSettings(session.RepoHash ?? string.Empty, session.Kind, settings);
+        }
 
         // Same in-memory cache StopAsync refreshes, so a worker spawned by a coordinator later in this
         // daemon session (no client in the loop) boots with the login the user just performed (MG-6
@@ -321,8 +379,33 @@ public sealed class AgentSpawnService
         }
 
         _spawnLog.LogInformation(
-            "harvest: agent={Agent} credentialFiles={Files} (agent left running)", agentId, credentials.Count);
-        return new AgentStopResult(false, session.Kind, credentials);
+            "harvest: agent={Agent} credentialFiles={Files} settingsFiles={Settings} (agent left running)",
+            agentId, credentials.Count, settings.Count);
+        return new AgentStopResult(
+            false, session.Kind, credentials, settings, session.RepoHash ?? string.Empty);
+    }
+
+    /// <summary>
+    /// Harvests a session's CLI settings — or refuses to, and says why. The gate is
+    /// <see cref="CliSettingsHarvestPolicy"/>: only a human-attended session's approvals may flow back
+    /// out to the store that seeds every later agent in the repository. A Managed worker (the
+    /// external-PR intake's untrusted jail included) has a daemon-locked read-only terminal, so nothing
+    /// in its settings file was approved by a person — persisting it would let an agent write its own
+    /// future permissions.
+    /// </summary>
+    private async Task<IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>>
+        HarvestSettingsIfAttendedAsync(AgentSession session, string containerId, CancellationToken ct)
+    {
+        if (!CliSettingsHarvestPolicy.MayHarvest(session.Role))
+        {
+            _spawnLog.LogInformation(
+                "cli settings harvest skipped: agent={Agent} role={Role} — an unattended jail's "
+                + "approved-command list is agent-authored and never flows back to the host store.",
+                session.Id, session.Role);
+            return Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
+        }
+
+        return await _launcher.HarvestCliSettingsAsync(containerId, session.Kind, ct).ConfigureAwait(false);
     }
 
     /// <summary>Stops one agent: session record, CLI PTY, IPC endpoint, input lock, jail + worktree.
@@ -367,10 +450,20 @@ public sealed class AgentSpawnService
 
         IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile> credentials =
             Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>();
+        IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile> settings =
+            Array.Empty<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
         if (stopped && session?.ContainerId is { Length: > 0 } containerId)
         {
             credentials = await _launcher.HarvestCliCredentialsAsync(
                 containerId, session.Kind, ct).ConfigureAwait(false);
+            // The approvals the user gave in this jail, on their way to the per-repo host store — but
+            // only from a session a human could actually approve in (see the policy type).
+            settings = await HarvestSettingsIfAttendedAsync(session, containerId, ct).ConfigureAwait(false);
+            if (settings.Count > 0)
+            {
+                _keys.RememberCliSettings(session.RepoHash ?? string.Empty, session.Kind, settings);
+            }
+
             // Keep the memory-only per (repo, kind) cache current too, so a worker of this kind spawned
             // later in THIS daemon session against THE SAME REPO (coordinator IPC — no client in the
             // loop) boots with the login the user just performed in the stopped jail. A session with no
@@ -380,8 +473,10 @@ public sealed class AgentSpawnService
         }
 
         _spawnLog.LogInformation(
-            "stop: agent={Agent} stopped={Stopped} credentialFiles={Files}", agentId, stopped, credentials.Count);
-        return new AgentStopResult(stopped, session?.Kind ?? string.Empty, credentials);
+            "stop: agent={Agent} stopped={Stopped} credentialFiles={Files} settingsFiles={Settings}",
+            agentId, stopped, credentials.Count, settings.Count);
+        return new AgentStopResult(
+            stopped, session?.Kind ?? string.Empty, credentials, settings, session?.RepoHash ?? string.Empty);
     }
 
     /// <summary>

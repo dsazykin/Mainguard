@@ -77,7 +77,8 @@ public sealed class SandboxAgentLauncher
         string? ipcDirPath = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? extraEnv = null,
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
-        IProgress<string>? progress = null)
+        IProgress<string>? progress = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -261,6 +262,17 @@ public sealed class SandboxAgentLauncher
                 // MG-43: the daemon-owned package cache for THIS agent, read-write at
                 // /var/cache/mainguard — on ext4, outside the worktree, outside the tmpfs $HOME.
                 PackageCachePath: packageCachePath,
+                // The user's saved CLI settings — the approved-command list. Filtered to what THIS
+                // adapter declares, exactly as the credential files are, because the client names the
+                // paths on the wire. An untrusted spawn never reaches here with any (the caller passes
+                // none), so this filter is the second gate, not the only one.
+                CliSettingsFiles: FilterCliSettings(cliSettings, adapter),
+                // The DECLARED workspace settings paths, sent whether or not anything is being restored
+                // into them: /workspace is the tree the agent commits, and on a first-ever session the
+                // CLI creates its own settings file there the moment the user approves something. That
+                // file must never reach the user's history, and that session has no restore payload to
+                // infer the path from.
+                WorkspaceIgnorePaths: DeclaredWorkspaceSettingsPaths(adapter),
                 ToolchainsRootPath: mountedToolchainIds.Count > 0 ? _environment.ToolchainsRootPath : null,
                 ToolchainIds: mountedToolchainIds), ct).ConfigureAwait(false);
 
@@ -568,6 +580,128 @@ public sealed class SandboxAgentLauncher
             .Where(f => f.Content is { Length: > 0 } && allowed.Contains(f.HomeRelativePath))
             .ToArray();
         return kept.Length > 0 ? kept : null;
+    }
+
+    /// <summary>
+    /// The ONLY settings files that reach the jail: client-supplied entries whose (root, path) pair
+    /// exactly matches one the installed adapter DECLARES (its marker's <c>settingsPaths</c>) and
+    /// passes the relative-path shape gate. Same reasoning as
+    /// <see cref="FilterCliCredentials"/> — the client names paths on the wire — but the stakes are
+    /// different in kind: these files carry a PERMISSION ALLOWLIST, so an unfiltered path would let a
+    /// compromised client plant a pre-approved-command file anywhere in the agent's home or checkout.
+    /// No marker / no declared settings paths ⇒ nothing is restored.
+    /// </summary>
+    internal static IReadOnlyList<SandboxSettingsFile>? FilterCliSettings(
+        IReadOnlyList<SandboxSettingsFile>? supplied, InstalledAdapterMarker? adapter)
+    {
+        if (supplied is not { Count: > 0 } || adapter?.SettingsPaths is not { Count: > 0 } declared)
+        {
+            return null;
+        }
+
+        var allowed = new HashSet<(AdapterSettingsRoot Root, string Path)>(
+            declared.Where(d => d is not null && d.IsWellFormed()).Select(d => (d.ParsedRoot, d.Path)));
+        var kept = supplied
+            .Where(f => f.Content is { Length: > 0 }
+                        && f.Content.Length <= AdapterSettingsPolicy.MaxFileBytes
+                        && allowed.Contains((f.Root, f.RelativePath)))
+            .ToArray();
+        return kept.Length > 0 ? kept : null;
+    }
+
+    /// <summary>
+    /// The WORKSPACE-rooted settings paths this adapter declares — the files the jail must keep out of
+    /// the agent's commits. Derived from the marker rather than from whatever is being restored,
+    /// because the session that most needs the ignore is the FIRST one, which restores nothing and
+    /// whose CLI writes the file itself. Empty when the adapter declares no workspace settings.
+    /// </summary>
+    internal static IReadOnlyList<string> DeclaredWorkspaceSettingsPaths(InstalledAdapterMarker? adapter) =>
+        adapter?.SettingsPaths is not { Count: > 0 } declared
+            ? Array.Empty<string>()
+            : declared
+                .Where(d => d is not null && d.IsWellFormed() && d.ParsedRoot == AdapterSettingsRoot.Workspace)
+                .Select(d => d.Path)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+
+    /// <summary>
+    /// Harvests the CLI's SETTINGS files (the installed adapter's declared <c>settingsPaths</c>) out of
+    /// the jail, so the approvals a user gave in this session survive into the next agent.
+    ///
+    /// <para><b>This is the direction that can escalate, and the caller — not this method — decides
+    /// whether it may run.</b> The files are agent-writable by construction (the CLI has to be able to
+    /// record a new approval), so what comes back is "whatever is in the file", not "what a human
+    /// approved". <see cref="AgentSpawnService"/> therefore calls this only for a human-attended,
+    /// trusted session; see the design note for the full argument.</para>
+    ///
+    /// <para>Mechanically the twin of <see cref="HarvestCliCredentialsAsync"/>: base64 over the exec
+    /// pipe, a missing file skipped, any exec failure yielding an empty result — harvesting must never
+    /// block a stop. Files over <see cref="AdapterSettingsPolicy.MaxFileBytes"/> are refused rather
+    /// than truncated: a settings file is kilobytes, and the ceiling bounds what a jail's occupant can
+    /// push into a host-side store that later jails read.</para>
+    /// </summary>
+    public async Task<IReadOnlyList<SandboxSettingsFile>> HarvestCliSettingsAsync(
+        string containerId, string agentKind, CancellationToken ct = default)
+    {
+        var declared = _adapters.TryGet(agentKind)?.SettingsPaths;
+        if (declared is not { Count: > 0 })
+        {
+            return Array.Empty<SandboxSettingsFile>();
+        }
+
+        var harvested = new List<SandboxSettingsFile>();
+        foreach (var entry in declared)
+        {
+            if (entry is null || !entry.IsWellFormed())
+            {
+                continue;
+            }
+
+            var root = entry.ParsedRoot;
+            try
+            {
+                // Runs as the container's default user — the agent uid. Path is positional ("$1"),
+                // never interpolated into script text. The size check happens in the shell so an
+                // oversized file is never read into the daemon's memory at all.
+                var result = await _environment.Sandboxes.ExecAsync(containerId, new[]
+                {
+                    "sh", "-c",
+                    "[ -f \"$1\" ] || exit 1\n"
+                    + "[ \"$(wc -c < \"$1\" | tr -d ' ')\" -le \"$2\" ] || exit 2\n"
+                    + "base64 \"$1\"\n",
+                    "sh",
+                    DockerSandboxEngine.SettingsRootPath(root) + "/" + entry.Path,
+                    AdapterSettingsPolicy.MaxFileBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                }, ct).ConfigureAwait(false);
+
+                if (result.ExitCode == 2)
+                {
+                    _log.LogWarning(
+                        "cli settings harvest refused (over {Max} bytes): kind={Kind} root={Root} path={Path}",
+                        AdapterSettingsPolicy.MaxFileBytes, agentKind, AdapterSettingsPath.SpellRoot(root), entry.Path);
+                    continue;
+                }
+
+                if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Stdout))
+                {
+                    continue; // no settings written yet — nothing to persist
+                }
+
+                var content = Convert.FromBase64String(
+                    string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
+                if (content.Length is > 0 and <= AdapterSettingsPolicy.MaxFileBytes)
+                {
+                    harvested.Add(new SandboxSettingsFile(root, entry.Path, content));
+                }
+            }
+            catch (Exception ex)
+            {
+                // A dead container / malformed pipe output loses this file's harvest, never the stop.
+                _log.LogWarning(ex, "cli settings harvest failed: kind={Kind} path={Path}", agentKind, entry.Path);
+            }
+        }
+
+        return harvested;
     }
 
     /// <summary>
