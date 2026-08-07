@@ -57,13 +57,19 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// <param name="cliCredentials">The CLI login-state files to RESTORE into the jail's tmpfs
     /// <c>$HOME</c> at spawn (the host-keychain half of the credentialPaths round-trip). Null keeps the
     /// jail's home empty, which is every other suite's expectation.</param>
+    /// <param name="cliSettings">The CLI settings files to RESTORE into the jail (the per-repo half of
+    /// the settingsPaths round-trip — the user's approved-command list). Null is what an UNTRUSTED jail
+    /// is spawned with, and it is every other suite's expectation.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
         string? packageCachePath = null, CancellationToken ct = default,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
+        bool jailWritableWorktree = false)
         => SpawnFromImageAsync(
-            ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct, cliCredentials);
+            ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct,
+            cliCredentials, cliSettings, jailWritableWorktree);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -74,14 +80,16 @@ public sealed class SandboxFixture : IAsyncDisposable
         string imageRef, string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
         string? packageCachePath = null, CancellationToken ct = default,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
+        bool jailWritableWorktree = false)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
         // found` failure was pure test-ordering, not a product bug.
         await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
 
-        var worktree = NewTempWorktree();
+        var worktree = jailWritableWorktree ? NewJailWritableTempWorktree() : NewTempWorktree();
         var secrets = new SandboxSecrets(
             agentEnv ?? new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
             OobKey: oobKey ?? RandomKey(),
@@ -98,7 +106,8 @@ public sealed class SandboxFixture : IAsyncDisposable
                 Secrets: secrets,
                 AgentUid: agentUid,
                 SupervisorUid: supervisorUid,
-                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
+                PackageCachePath: packageCachePath,
+                CliSettingsFiles: cliSettings), ct).ConfigureAwait(false);
 
             _containerIds.Add(handle.ContainerId);
             return handle;
@@ -341,6 +350,34 @@ public sealed class SandboxFixture : IAsyncDisposable
         if (!OperatingSystem.IsWindows())
         {
             File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserExecute);
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// A temp worktree the JAIL can actually write to, whatever uid the runner maps it to.
+    ///
+    /// <para><b>Why 0777, and why that is honest — the same argument as <see cref="NewTempCache"/>.</b>
+    /// In production the jail reaches its worktree through the MG-17 group whose gid IS the remapped
+    /// agent gid, provisioned at VM boot by <c>UsernsRemapPolicy.MountOwnershipScript</c> — a VM-level
+    /// fact no test process can reproduce. A directory left at the default 0755 owned by the test
+    /// process therefore measures the RUNNER's uid mapping instead of the feature: on this box the jail
+    /// is uid 1000 and can write everything, on a userns-remapped CI runner it is host uid 101000 and
+    /// can write nothing. That is precisely the green/red split that made these settings tests pass
+    /// locally and fail in CI with <c>mkdir: cannot create directory '/workspace/.probe': Permission
+    /// denied</c>. 0777 takes the uid mapping out of the question so the test measures what it claims
+    /// to.</para>
+    ///
+    /// <para>Opt-in rather than the default for <see cref="NewTempWorktree"/>: suites that assert on
+    /// worktree PERMISSIONS must keep the ordinary mode.</para>
+    /// </summary>
+    public string NewJailWritableTempWorktree()
+    {
+        var path = NewTempWorktree();
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, (UnixFileMode)0b111_111_111);
         }
 
         return path;

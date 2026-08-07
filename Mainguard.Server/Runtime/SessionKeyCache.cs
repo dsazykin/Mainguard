@@ -26,6 +26,8 @@ public sealed class SessionKeyCache
         new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<ScopedKey, System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>>
         _cliCredentials = new();
+    private readonly ConcurrentDictionary<ScopedKey, System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>>
+        _cliSettings = new();
 
     /// <summary>Records the key supplied for <paramref name="agentKind"/> in <paramref name="repoHandle"/>
     /// (empty repo/kind/value are ignored).</summary>
@@ -74,6 +76,32 @@ public sealed class SessionKeyCache
     public System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? TryGetCliCredentials(
         string repoHandle, string agentKind) =>
         TryScope(repoHandle, agentKind, out var scope) && _cliCredentials.TryGetValue(scope, out var files) ? files : null;
+
+    /// <summary>
+    /// Records the CLI SETTINGS files — the user's approved-command list — for this repo + kind, so a
+    /// coordinator-initiated worker (no client in the loop) inherits the approvals instead of
+    /// re-prompting for every command the user already allowed.
+    ///
+    /// <para>The (repo, kind) scope is the same one the credentials use and it carries the same weight
+    /// here for a different reason: a permission allowlist is a standing grant of execution, so one
+    /// repo's approvals must never reach another repo's jail. A blank repo handle forms no scope and
+    /// the write is simply dropped — never collapsed into a shared bucket.</para>
+    /// </summary>
+    public void RememberCliSettings(
+        string repoHandle,
+        string agentKind,
+        System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? files)
+    {
+        if (TryScope(repoHandle, agentKind, out var scope) && files is { Count: > 0 })
+        {
+            _cliSettings[scope] = files;
+        }
+    }
+
+    /// <summary>The CLI settings files last supplied for this repo + kind, or null.</summary>
+    public System.Collections.Generic.IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? TryGetCliSettings(
+        string repoHandle, string agentKind) =>
+        TryScope(repoHandle, agentKind, out var scope) && _cliSettings.TryGetValue(scope, out var files) ? files : null;
 
     // A blank repo handle or kind can never form a scope — that would collapse distinct repos into one
     // shared bucket, which is exactly the MG-6 defect. Such calls are dropped (write) / miss (read).

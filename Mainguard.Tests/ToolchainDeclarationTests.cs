@@ -150,11 +150,47 @@ public class ToolchainDeclarationTests
     public void EveryRecipe_CarriesAProbe()
     {
         // A recipe with no probe is a recipe whose absence from the jail cannot be detected, which is
-        // exactly the silent failure the whole feature is meant to avoid.
+        // exactly the silent failure the whole feature is meant to avoid. This holds for BOTH delivery
+        // kinds — how a toolchain arrives changes nothing about needing to prove it arrived.
         foreach (var recipe in ToolchainCatalog.All.Values)
         {
             Assert.NotEmpty(recipe.Probe);
+        }
+    }
+
+    [Fact]
+    public void EveryImageLayerRecipe_CarriesInstallSteps()
+    {
+        // An image-layer recipe with no install steps would render a Dockerfile that changes nothing —
+        // a layer that builds, caches and is spawned from while delivering no toolchain at all.
+        foreach (var recipe in ToolchainCatalog.All.Values
+                     .Where(r => r.Delivery == ToolchainDelivery.ImageLayer))
+        {
             Assert.NotEmpty(recipe.InstallSteps);
+        }
+    }
+
+    [Fact]
+    public void EveryRuntimeMountRecipe_BuildsNothing()
+    {
+        // The converse, and it is the load-bearing half of the new delivery kind: a runtime-mount
+        // toolchain is installed into the VM by a human, so there is no build. A recipe that carried
+        // install steps would silently reintroduce the multi-minute spawn-path build the mount exists to
+        // avoid, and a recipe that named build egress hosts would be claiming a network reach it never
+        // makes.
+        var runtime = ToolchainCatalog.All.Values
+            .Where(r => r.Delivery == ToolchainDelivery.RuntimeMount)
+            .ToList();
+
+        Assert.NotEmpty(runtime); // the catalog must actually carry one, or this asserts nothing
+
+        foreach (var recipe in runtime)
+        {
+            Assert.Empty(recipe.InstallSteps);
+            Assert.Empty(recipe.BuildEgressHosts);
+            // It must still say where it lands, or the jail gets a mount it cannot find.
+            Assert.NotEmpty(recipe.PathEntries);
+            Assert.All(recipe.PathEntries, p => Assert.StartsWith("/", p, StringComparison.Ordinal));
         }
     }
 

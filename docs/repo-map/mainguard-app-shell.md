@@ -78,6 +78,12 @@
     `UserControl` — it used to be its own window opened from the repo actions menu, now it is the
     Settings **Agent CLIs** page, and `AgentCliSettingsViewModel` implements `ISettingsPage` so
     `OnActivated` kicks the catalog refresh, replacing the old window's `OnDataContextChanged` hook),
+    `ToolchainSettingsView` (**Toolchains** — the same row shape over the user-managed *language*
+    toolchain channel: per-toolchain pinned-version chip, the summary, an installed/not-installed line
+    that carries what the PROBE reported (so "a different version is present — expected 3.12.13, the
+    probe reported: go1.22.6" reads as words rather than a bare "no"), per-row Install/Remove, an
+    inline actionable failure cause, Cancel + Refresh; a `UserControl` page whose
+    `ToolchainSettingsViewModel` implements `ISettingsPage`),
     `StartupWindow`/`StartupWindowViewModel` (owner design 2026-07-17 — the control-center BLOCKING
     startup loading screen driving Core's `AppStartupSequence`: a `BootstrapStageViewModel` glyph
     checklist + one changing status line, and the CONSENTED tier-2 OS upgrade offer hosted INLINE —
@@ -104,7 +110,8 @@
     `MainWindowViewModel.RailSections`/`ActivateSection`.
     `SettingsViewModel.ActivatePage(pageId, focusHost)` builds and activates one of ~10 pages —
     **General**, **Keyboard Shortcuts**, **Accounts**, **SSH Keys**, **Git Profiles**, **AI
-    Providers**\[Pro], **Agent CLIs**\[Pro], **Mainguard OS**\[Pro], **Daemon Logs**\[Pro], **About** —
+    Providers**\[Pro], **Agent CLIs**\[Pro], **Toolchains**\[Pro], **Mainguard OS**\[Pro], **Daemon
+    Logs**\[Pro], **About** —
     lazily and caches each row's Content; any page whose ViewModel is also `IDisposable` (currently only
     Daemon Logs) has its row's cache discarded on leaving so the next visit rebuilds fresh instead of
     reusing a disposed instance. The old small 440×560 single-screen dialog (pinned-top-menu-icon
@@ -381,8 +388,8 @@
   Settings window: owns `Pages` (`ObservableCollection<SettingsPageRowViewModel>`) +
   `ActivePageContent` (`object?`) + `ActivatePage(pageId, focusHost)`, mirroring
   `MainWindowViewModel.RailSections`/`ActivateSection`; builds all ~10 pages (General / Keyboard
-  Shortcuts / Accounts / SSH Keys / Git Profiles / AI Providers\[Pro] / Agent CLIs\[Pro] / Mainguard
-  OS\[Pro] / Daemon Logs\[Pro] / About)), `SettingsPageRowViewModel` (a
+  Shortcuts / Accounts / SSH Keys / Git Profiles / AI Providers\[Pro] / Agent CLIs\[Pro] /
+  Toolchains\[Pro] / Mainguard OS\[Pro] / Daemon Logs\[Pro] / About)), `SettingsPageRowViewModel` (a
   `RailSectionViewModel`-shrunk-down analog for one Settings-sidebar row:
   id/label/icon/`IsActive`/`ActivateCommand` + a lazily-built, cached Content — the cache is dropped
   by `SettingsViewModel` whenever the page's ViewModel is also `IDisposable`, so a disposed
@@ -607,7 +614,20 @@
     whose `CanExecute` reads ROW state, so the VM watches `Clis` + each row's `PropertyChanged` and
     re-publishes `NotifyCanExecuteChanged()` — `[NotifyCanExecuteChangedFor]` on `IsBusy` alone left
     the buttons visible-but-dead (`Headless/RowCommandEnablementTests`); add a row property to
-    `RowCommandInputs` whenever a new row-reading `CanExecute` lands), `VmUpgradeOfferViewModel` (the tier-2 upgrade
+    `RowCommandInputs` whenever a new row-reading `CanExecute` lands),
+    `ToolchainRowViewModel`/`ToolchainSettingsViewModel` (Settings **Toolchains** — the human half of
+    the user-managed toolchain channel (`Mainguard.Agents.Agents.Toolchains.ToolchainChannel`): a
+    repository may name a toolchain `id` and nothing else, and whether that id is actually on this
+    machine is decided here. `RefreshAsync` re-reads the curated manifest and RE-PROBES each toolchain
+    inside the VM (a toolchain that runs at the WRONG version is reported as not installed, with the
+    mismatch spelled out on the row), `InstallAsync(row)` installs ONE at its pinned, checksum-verified
+    version and `RemoveAsync(row)` removes it — both serialized (`IsBusy`) and failure-isolated to the
+    row, which carries the typed `ToolchainChannelException` message as its actionable cause; Remove
+    asks for no confirmation but ALWAYS re-probes afterwards (re-attaching a failure's cause to the
+    rebuilt row) so the list can never misreport a half-removal. Same row→command
+    `CanExecuteChanged` bridge as the Agent CLIs page (`_watched` + `RowCommandInputs` =
+    `CanInstall`/`CanRemove`), and the same two-constructor (live channel / design rows) shape),
+    `VmUpgradeOfferViewModel` (the tier-2 upgrade
     offer/progress VM: starts in the consent state (`IsOffering`), `UpgradeCommand` runs the injected
     `IVmUpgradeOrchestrator` off the UI thread and advances the `VmUpgradePlan`-seeded
     `BootstrapStageViewModel` checklist from the orchestrator's `IProgress<string>` lines (a line
@@ -782,6 +802,20 @@
     in-app Stop ever wrote a `cli_login_*` entry — app close, a daemon/VM restart or a crash lost the
     login and the user re-authenticated inside the jail every session. Pinned by
     `CliLoginHarvestWiringTests` (the caller) and `CliLoginRoundTripDockerTests` (the round-trip).
+    `CliSettingsStore.cs` — the same round-trip for a CLI's **settings**, and deliberately a DIFFERENT
+    store: one plain JSON file per `(repo handle, adapter id)` under
+    `<data root>/cli-settings/`, not a keyring entry. Logins stay keychain-only because they are
+    credentials; settings are configuration the owner should be able to read, audit and delete, and the
+    scope is **per repository** because a permission allowlist is a standing grant of execution —
+    approving a command in one repo must not pre-approve it in another. `Load`/`Save` are total (a
+    corrupt or missing file ⇒ empty ⇒ the CLI asks again, never a failed spawn), `Save` merges rather
+    than replaces (a file one session did not rewrite must not erase a working allowlist), a blank scope
+    is never a wildcard, and scope segments that are not filename-safe are HASHED rather than sanitised
+    so two repos can never collapse onto one directory. `DaemonBackedOrchestrator` loads it on
+    `StartCoordinatorAsync` (`SpawnAgent.cli_settings`) and `PersistHarvestedSettings` files every
+    harvest under the outcome's OWN `RepoHandle` — the sweep walks every agent on the daemon, so filing
+    by "whichever repo is open" is exactly how one repo's allowlist would land under another's name.
+    See [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
     `VmExitGuard.cs` — the pure full-exit-warning decision
     (`ShouldConfirm(stopVmOnExit, liveAgents)`) + dialog copy: a VM-stopping full exit under live agents
     confirms first; `App.RequestFullExitGuardedAsync` is the guarded path every user-facing exit takes
@@ -877,9 +911,9 @@
   `Mainguard.App.Shell`. Holds every Pro-only `Views/` + `ViewModels/` (Control Center / Coordinator /
   Resources / agent rail / telemetry / queue rail / merge queue / review cockpit / agent workspace +
   document / terminal / OOBE wizard / bootstrap / vibe mode / startup + shutdown windows / CLI-OAuth
-  ToS + VM-upgrade offer), the four Pro-only Settings pages (`AgentCliSettingsView`,
-  `ApiKeySettingsView`, `DaemonLogsView` — all three `UserControl`s implementing `Mainguard.UI`'s
-  `ISettingsPage`, embedded by the shell's `SettingsViewModel` — and
+  ToS + VM-upgrade offer), the five Pro-only Settings pages (`AgentCliSettingsView`,
+  `ApiKeySettingsView`, `DaemonLogsView`, `ToolchainSettingsView` — all four `UserControl`s
+  implementing `Mainguard.UI`'s `ISettingsPage`, embedded by the shell's `SettingsViewModel` — and
   `MainguardOsPageView`/`MainguardOsPageViewModel`, the settings-page host of the old
   `AddReposToOsView`/`AddReposToOsViewModel` add-more-repos engine that also folds in the standalone
   "Rebuild sandbox images" Tools action as `RebuildSandboxImagesCommand`), the Pro-only terminal

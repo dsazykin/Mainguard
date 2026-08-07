@@ -29,6 +29,13 @@
     <Using Include="Xunit" />
   </ItemGroup>
 
+  <!-- The runner config only takes effect if it sits NEXT TO the test assembly; without this copy the
+       RequiresDocker fixture's engine announcement is silently dropped at the default `dotnet test`
+       verbosity. DockerSuiteDiagnosticsTests asserts the copy actually happened. -->
+  <ItemGroup>
+    <None Update="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\Mainguard.Git\Mainguard.Git.csproj" />
     <ProjectReference Include="..\Mainguard.Agents\Mainguard.Agents.csproj" />
