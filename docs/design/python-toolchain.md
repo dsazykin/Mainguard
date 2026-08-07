@@ -271,12 +271,25 @@ working in:
 This change does not make either worse — a `RuntimeMount` toolchain builds nothing, so a Python
 repository never enters the build path at all.
 
-## What went wrong while building this
+## A diagnostic trap worth writing down
 
-`PythonToolchainDockerTests` carries `[Collection(DockerSuiteCollection.Name)]`, as every
-`RequiresDocker` class must. `DockerSuiteFixture.SweepAsync` then force-removed the shared egress proxy
-and **deleted every mainguard network**, evicting endpoints first — while the owner had a live agent jail
-running. Measured afterwards: the container was still up with `NetworkSettings.Networks == {}`.
+While building this I ran one `RequiresDocker` test, saw `DockerSuiteFixture.SweepAsync` delete every
+`mainguard-*` network, then found a running `mainguard-…` container with
+`NetworkSettings.Networks == {}` — and reported that a live agent jail had been severed. **That was
+wrong**, and three other agents reached the same wrong conclusion independently.
 
-The sweep is correct for CI and hostile on a workstation. Worth a follow-up: scope it to test-owned names,
-or refuse to run when a non-test mainguard jail is up.
+There are **two Docker daemons** on this machine:
+
+| daemon | reached by | holds |
+| --- | --- | --- |
+| Docker Desktop | `docker ps` from the Ubuntu distro; `dotnet test` | test artifacts |
+| MainguardEnv (20.10.24) | `wsl -d MainguardEnv -u root -- docker ps` | the **real** jails |
+
+`mainguardd` runs *inside* MainguardEnv and talks to that distro's own socket, so a production jail is
+**never** in Docker Desktop. The container I inspected was a test artifact, and the networks the sweep
+deleted were created by the tests themselves. Verified afterwards against the right daemon: the real jail
+was up and attached (`10.203.4.3`) on its own `mainguard-agent-…` segment, with the egress proxy and all
+segments intact, throughout.
+
+**Both engines hold containers named `mainguard-…`, so a `docker ps` that does not name its daemon is not
+evidence.** Any claim about a jail's health has to say which daemon it came from.
