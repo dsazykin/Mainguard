@@ -9,6 +9,8 @@ using Docker.DotNet;
 using Docker.DotNet.Models;
 using Mainguard.Agents.Agents.Sandbox;
 using Xunit;
+using Xunit.Abstractions;
+using Xunit.Sdk;
 
 namespace Mainguard.Server.Tests.Fixtures;
 
@@ -170,48 +172,87 @@ internal sealed class DockerSuiteLock : IDisposable
 /// networks and the <c>mainguard-agent-</c> segments — and is exactly the operation the per-test
 /// teardown already performs, moved earlier. It is best-effort throughout: a cleanup that throws would
 /// replace a real failure with a useless one.</para>
+///
+/// <para><b>Which engine it sweeps, and why that sentence is load-bearing.</b> The sweep is destructive by
+/// design and the resources it destroys carry production's literal names, so the only thing separating
+/// "correct test cleanup" from "the owner's jails just lost their networks" is WHICH dockerd it ran
+/// against. On a Windows workstation those are two different daemons that look identical from a
+/// <c>docker ps</c> line (see <see cref="DockerEngineIdentity"/>), and on 2026-08-07 a swept TEST jail —
+/// up, <c>Networks</c> empty — was read by three separate readers as the owner's destroyed jail. So this
+/// fixture now (a) refuses outright to sweep when it can prove it is on the app's own engine
+/// (<see cref="DockerSuiteSweepGuard"/>), (b) names the engine on every line it emits, and (c) writes what
+/// it removed to <see cref="DockerSuiteJournal"/>, which is the only place that question can be answered
+/// after the run has exited.</para>
 /// </summary>
 public sealed class DockerSuiteFixture : IDisposable
 {
     private readonly DockerSuiteLock _lock;
+    private readonly IMessageSink? _sink;
+    private readonly DockerSuiteJournal _journal = new();
 
-    public DockerSuiteFixture()
+    /// <summary>
+    /// xunit injects the diagnostic <see cref="IMessageSink"/> into a collection fixture that asks for it.
+    ///
+    /// <para>This must stay the type's ONLY public constructor: xunit v2 rejects a collection fixture with
+    /// more than one ("may only define a single public constructor") and fails every test in the
+    /// collection — measured, not assumed, because that failure would only ever show up in CI.</para>
+    /// </summary>
+    public DockerSuiteFixture(IMessageSink? sink)
     {
+        _sink = sink;
         var lockPath = DockerSuiteLock.DefaultPath;
 
         // A run that queues behind another one is otherwise indistinguishable from a hung run, and "the
         // suite hangs at the first Docker test" is exactly the kind of unexplained symptom this change
-        // exists to stop costing people an investigation. So it is announced — on BOTH streams, though
-        // be warned that `dotnet test` swallows the test host's stdout AND stderr (measured: neither
-        // line reaches the console under the VSTest runner). The reliable live answer to "is it waiting
-        // or wedged?" is therefore who holds the lock file named here: `fuser <path>` on Linux names the
-        // holding process, and the queued run's own wall time exceeding its reported test Duration is
-        // the same fact after the fact.
-        Announce($"[docker-suite] waiting for exclusive use of the Docker daemon ({lockPath})…");
+        // exists to stop costing people an investigation. So it is announced.
+        //
+        // Channels, measured on this box (.NET 10, xunit 2.9.3, xunit.runner.visualstudio 3.1.4):
+        //   * Console.Out/Console.Error from a fixture reach `dotnet test --verbosity normal` — and
+        //     NOTHING at the default (minimal) verbosity, which is what a developer types.
+        //   * An IMessageSink DiagnosticMessage reaches BOTH, provided xunit.runner.json sets
+        //     "diagnosticMessages": true (measured both ways: flipping it to false removes the line).
+        // Hence both are written: the sink is what makes a plain `dotnet test` say out loud that the
+        // Docker suite is live and which engine it is about to modify.
+        Announce($"waiting for exclusive use of the Docker daemon ({lockPath})…");
         _lock = DockerSuiteLock.Acquire(lockPath);
         Announce(
-            $"[docker-suite] acquired after {_lock.Waited.TotalSeconds:F1}s — this run now owns the "
-            + "shared egress proxy and the mainguard networks.");
+            $"acquired after {_lock.Waited.TotalSeconds:F1}s — this run now owns the shared egress proxy "
+            + $"and the mainguard networks. Journal: {_journal.Path}");
 
-        SweepAsync().GetAwaiter().GetResult();
+        try
+        {
+            SweepAsync("entry").GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // A refusal must not also leave the daemon lock held for the rest of the process.
+            _lock.Dispose();
+            throw;
+        }
     }
 
-    private static void Announce(string line)
+    private void Announce(string line)
     {
-        Console.Out.WriteLine(line);
+        var text = "[docker-suite] " + line;
+        Console.Out.WriteLine(text);
         Console.Out.Flush();
-        Console.Error.WriteLine(line);
+        Console.Error.WriteLine(text);
         Console.Error.Flush();
+        try { _sink?.OnMessage(new DiagnosticMessage(text)); }
+        catch { /* a diagnostic must never fail the run */ }
     }
 
     /// <summary>How long this run queued behind another one (0 on an idle daemon).</summary>
     public TimeSpan WaitedForDaemon => _lock.Waited;
 
+    /// <summary>Where this run recorded what it removed.</summary>
+    public string JournalPath => _journal.Path;
+
     public void Dispose()
     {
         try
         {
-            SweepAsync().GetAwaiter().GetResult();
+            SweepAsync("exit").GetAwaiter().GetResult();
         }
         finally
         {
@@ -223,8 +264,12 @@ public sealed class DockerSuiteFixture : IDisposable
     /// Removes the shared proxy, the two topology networks and every per-agent segment, if a daemon is
     /// reachable at all. No daemon means every test in the collection is skipping anyway, so there is
     /// nothing to sweep and nothing to report.
+    ///
+    /// <para>Throws only for a refusal (<see cref="DockerSuiteSweepGuard"/>) — the one failure that must
+    /// stop the run rather than be swallowed, because continuing would do the damage the refusal exists
+    /// to prevent. Everything else stays best-effort.</para>
     /// </summary>
-    private static async Task SweepAsync()
+    private async Task SweepAsync(string phase)
     {
         IDockerClient docker;
         try
@@ -250,50 +295,91 @@ public sealed class DockerSuiteFixture : IDisposable
         try
         {
             using var ct = new CancellationTokenSource(TimeSpan.FromMinutes(2));
-            try
+            var engine = await DockerEngineIdentity.ResolveAsync(docker, ct.Token).ConfigureAwait(false);
+
+            if (DockerSuiteSweepGuard.RefusalFor(MainguardOsHost.IsInside(), engine) is { } refusal)
             {
-                await docker.Containers.RemoveContainerAsync(
-                    EgressProxyConfigurator.ProxyContainerName,
-                    new ContainerRemoveParameters { Force = true }, ct.Token).ConfigureAwait(false);
+                Announce(refusal);
+                _journal.Record($"{phase} sweep REFUSED — {engine.Describe()} is Mainguard OS's own engine.");
+                throw new DockerSuiteRefusedException(refusal);
             }
-            catch { /* already gone — the state we wanted */ }
 
-            var networks = await docker.Networks
-                .ListNetworksAsync(new NetworksListParameters(), ct.Token).ConfigureAwait(false);
-            foreach (var net in networks)
-            {
-                if (net.Name is null || !IsMainguardNetwork(net.Name))
-                {
-                    continue;
-                }
+            Announce(
+                $"{phase} sweep on {engine.Describe()} — this removes "
+                + $"'{EgressProxyConfigurator.ProxyContainerName}' and every mainguard network ON THAT ENGINE.");
 
-                try
-                {
-                    // Docker refuses to delete a network that still holds an endpoint, so a jail a
-                    // crashed run left behind would silently pin the segment (and its bridge-pool slot)
-                    // in place. Evict first, then delete.
-                    var inspect = await docker.Networks.InspectNetworkAsync(net.ID, ct.Token).ConfigureAwait(false);
-                    foreach (var endpoint in inspect.Containers ?? new Dictionary<string, EndpointResource>())
-                    {
-                        try
-                        {
-                            await docker.Networks.DisconnectNetworkAsync(net.ID,
-                                new NetworkDisconnectParameters { Container = endpoint.Key, Force = true },
-                                ct.Token).ConfigureAwait(false);
-                        }
-                        catch { /* best effort — the delete below reports the real problem */ }
-                    }
-
-                    await docker.Networks.DeleteNetworkAsync(net.ID, ct.Token).ConfigureAwait(false);
-                }
-                catch { /* best effort */ }
-            }
+            var outcome = await SweepEngineAsync(docker, ct.Token).ConfigureAwait(false);
+            var report = $"{phase} sweep {outcome.Describe(engine)}";
+            Announce(report);
+            _journal.Record(report);
         }
-        catch { /* never fail a run from a sweep */ }
+        catch (DockerSuiteRefusedException)
+        {
+            // The one failure that must NOT be swallowed. Its own type, so that an unrelated
+            // InvalidOperationException out of Docker.DotNet stays best-effort as it always was —
+            // widening the rethrow would turn a flaky daemon call into a red security suite.
+            throw;
+        }
+        catch
+        {
+            /* never fail a run from a sweep */
+        }
         finally
         {
             docker.Dispose();
         }
+    }
+
+    /// <summary>The removal itself, reporting exactly what it took out so the caller can say so.</summary>
+    private static async Task<SweepOutcome> SweepEngineAsync(IDockerClient docker, CancellationToken ct)
+    {
+        var proxyRemoved = false;
+        try
+        {
+            await docker.Containers.RemoveContainerAsync(
+                EgressProxyConfigurator.ProxyContainerName,
+                new ContainerRemoveParameters { Force = true }, ct).ConfigureAwait(false);
+            proxyRemoved = true;
+        }
+        catch { /* already gone — the state we wanted */ }
+
+        var swept = new List<SweptNetwork>();
+        var networks = await docker.Networks
+            .ListNetworksAsync(new NetworksListParameters(), ct).ConfigureAwait(false);
+        foreach (var net in networks)
+        {
+            if (net.Name is null || !IsMainguardNetwork(net.Name))
+            {
+                continue;
+            }
+
+            var evicted = new List<string>();
+            try
+            {
+                // Docker refuses to delete a network that still holds an endpoint, so a jail a
+                // crashed run left behind would silently pin the segment (and its bridge-pool slot)
+                // in place. Evict first, then delete.
+                var inspect = await docker.Networks.InspectNetworkAsync(net.ID, ct).ConfigureAwait(false);
+                foreach (var endpoint in inspect.Containers ?? new Dictionary<string, EndpointResource>())
+                {
+                    try
+                    {
+                        await docker.Networks.DisconnectNetworkAsync(net.ID,
+                            new NetworkDisconnectParameters { Container = endpoint.Key, Force = true },
+                            ct).ConfigureAwait(false);
+                        // The NAME, not the id: this list is what answers "what detached my container?".
+                        evicted.Add(string.IsNullOrEmpty(endpoint.Value?.Name) ? endpoint.Key : endpoint.Value.Name);
+                    }
+                    catch { /* best effort — the delete below reports the real problem */ }
+                }
+
+                await docker.Networks.DeleteNetworkAsync(net.ID, ct).ConfigureAwait(false);
+                swept.Add(new SweptNetwork(net.Name, net.ID ?? string.Empty, evicted));
+            }
+            catch { /* best effort */ }
+        }
+
+        return new SweepOutcome(EgressProxyConfigurator.ProxyContainerName, proxyRemoved, swept);
     }
 
     /// <summary>

@@ -989,6 +989,20 @@
   REAL python3 `mainguard-agent` shim round-trip — are `LinuxOnly`, authoritative in the Linux CI
   leg),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
   sequence), `FixtureAcceptanceTests` (the TI-P2-00 fixture smokes),
+  **`DockerSuiteDiagnosticsTests` (the RequiresDocker sweep's diagnosis contract, all daemon-free: the
+  refusal names the engine, the evidence (`/etc/mainguardos-release`), what it would have destroyed by
+  name and what to do instead — and does NOT fire off Mainguard OS, since a guard that always fired
+  would take CI's whole security leg down; the marker probe is asserted against a real temp file in
+  both directions; the sweep report names every removed network and every evicted container, and says
+  "nothing to remove" in words when it removed nothing; the journal appends, stamps and never throws;
+  and `xunit.runner.json` still sets `diagnosticMessages` AND is still copied next to the test
+  assembly, because the failure mode of that channel is silence)**,
+  `xunit.runner.json` (**`diagnosticMessages: true`** — measured on .NET 10 / xunit 2.9.3 /
+  xunit.runner.visualstudio 3.1.4: a fixture's `Console` output reaches only
+  `dotnet test --verbosity normal`, while an `IMessageSink` diagnostic reaches the DEFAULT verbosity
+  too and vanishes when the flag is false. It is what makes a plain solution-wide `dotnet test` say
+  out loud that the Docker suite is live and which engine it is about to sweep — the surprise that
+  cost an investigation on 2026-08-07),
   **`CompositionRootResolutionTests` (P2-47 integration proof #1 — every mapped gRPC service's ctor
   graph resolves via `ActivatorUtilities`, the gateway+governance singletons resolve, and the P2-12
   external-PR intake chain resolves so `PrIntakeHostedService` no longer idles — including, by
@@ -1253,7 +1267,25 @@
   run's spawn with an address-pool error. `FixtureAcceptanceTests` asserts the lock really excludes
   and really releases, that the sweep predicate matches mainguard's networks and no neighbour's, and —
   by reflection, with a floor on the count so an empty match cannot pass — that every RequiresDocker
-  class is actually in the collection)**, `Fixtures/RequiresLibvtermFact.cs` (`[RequiresLibvtermFact]`
+  class is actually in the collection. The fixture now also takes xunit's `IMessageSink` — its ONLY
+  public constructor, since xunit v2 rejects a collection fixture with two — and announces/journals
+  through `Fixtures/DockerSuiteEngine.cs` before doing anything destructive)**,
+  **`Fixtures/DockerSuiteEngine.cs` (`DockerEngineIdentity` + `MainguardOsHost` +
+  `DockerSuiteSweepGuard` + `SweepOutcome`/`SweptNetwork` + `DockerSuiteJournal` — WHICH dockerd the
+  sweep is about to strip, said out loud. On a Windows workstation there are two engines and mainguard
+  names its containers identically on both: the app's is a dockerd INSIDE the `MainguardEnv` distro
+  (where `mainguardd` runs as a systemd unit, so its bare `new DockerClientConfiguration()` resolves
+  there), the suite's is whatever engine the shell running `dotnet test` sees. A swept TEST jail — up,
+  `Networks` empty — is therefore byte-identical in `docker ps` to a destroyed production one, which is
+  how three readers in a row concluded on 2026-08-07 that the owner's live jail had been severed while
+  it sat untouched and attached on the other engine. So: the guard REFUSES the sweep when the run can
+  prove it is on the app's own engine (the payload's `/etc/mainguardos-release` marker — the only
+  client-side signal that is honest; a `DOCKER_HOST` pointed into the VM is undetectable, so the
+  endpoint is named instead of guessed at), every destructive line names the engine, and the journal
+  (`$TMPDIR/mainguard-docker-suite.log`, `MAINGUARD_DOCKER_SUITE_JOURNAL`) records the engine, the
+  proxy removal and every deleted network WITH the container endpoints evicted from it — the only
+  place on the box that can answer "what detached my container from its networks?" after the run has
+  exited)**, `Fixtures/RequiresLibvtermFact.cs` (`[RequiresLibvtermFact]`
   — **visibly skips** the P2-18 grid legs when native libvterm is not loadable, replacing the old
   `if (!Available) return;` early return that reported a green **"Passed"** while asserting nothing;
   the sibling `LibvtermPresenceTests` is this project's merge gate — under
