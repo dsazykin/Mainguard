@@ -25,6 +25,10 @@ lives"** section first — the VM paths and the `$H` repo-hash variable used bel
 Do phase-1 steps 1–2 (app starts, coordinator starts) before anything here; if those don't work,
 nothing below will, and it won't be phase 2's fault.
 
+**Testing note:** read *"Running the test suite while an agent is up"* in the phase-1 guide before
+running any Docker-backed test — it covers the unfiltered-run trap, the two Docker daemons, and how a
+severed jail masquerades as a provider outage.
+
 **Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
 
 **Where everything below happens:** left rail → **Coordinator**. Its tooltip reads *"Coordinator —
