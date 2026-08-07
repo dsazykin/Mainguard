@@ -6,6 +6,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Agents.Agents.Toolchains;
 using Xunit;
@@ -323,6 +324,51 @@ public class ToolchainChannelTests
         var last = matches[^1].Groups[1].Value.Trim();
 
         Assert.Equal(ContainerSpecBuilder.BaseImagePath, last);
+    }
+
+    // ---- The verify command a Python repo must write ---------------------------------------------
+
+    /// <summary>
+    /// The recipe this feature tells people to use must actually survive the shell-free tokeniser.
+    ///
+    /// <para>This test exists because the obvious recipe — <c>pip install -r requirements.txt &amp;&amp;
+    /// python -m pytest -q</c> — is <b>broken</b>, and was recommended in this repository's own docs
+    /// until it was measured. Verification splits <c>.mainguard/verify</c> on whitespace and hands the
+    /// argv straight to <c>docker exec</c>; there is no shell, so <c>&amp;&amp;</c> is passed to pip as a
+    /// positional argument. Measured in a real jail: <c>no such option: -m</c>, exit 2.</para>
+    ///
+    /// <para>Nobody noticed for a simple reason: this repository's own verify is a single command
+    /// (<c>dotnet test …</c>), and .NET is the one ecosystem that needs no separate install step. Every
+    /// ecosystem this change enables needs one.</para>
+    /// </summary>
+    [Fact]
+    public void TheDocumentedPythonVerifyCommand_TokenisesToAShellInvocation_NotAMangledPipCall()
+    {
+        const string recommended = "sh -c \"pip install -q -r requirements.txt && python -m pytest -q\"";
+
+        var argv = VerificationCommandResolver.Resolve(recommended, recommended).Command;
+
+        // Exactly three tokens: the quoted script must survive as ONE argument, quotes stripped.
+        Assert.Equal(
+            new[] { "sh", "-c", "pip install -q -r requirements.txt && python -m pytest -q" },
+            argv);
+    }
+
+    [Fact]
+    public void ABareAmpersandVerifyCommand_DoesNotSurviveTokenisation()
+    {
+        // The converse, pinned so the limitation is documented by a test rather than by a comment
+        // somebody has to find. `&&` becomes an ARGUMENT TO PIP, which is why it fails at runtime with a
+        // pip usage error rather than anything that mentions a shell.
+        const string broken = "pip install -q -r requirements.txt && python -m pytest -q";
+
+        var argv = VerificationCommandResolver.Resolve(broken, broken).Command;
+
+        Assert.Contains("&&", argv);
+        Assert.Equal("pip", argv[0]);
+        // Everything after `&&` is handed to pip too — this is the whole defect in one assertion.
+        Assert.Contains("python", argv);
+        Assert.Contains("-m", argv);
     }
 
     // ---- Fixtures --------------------------------------------------------------------------------

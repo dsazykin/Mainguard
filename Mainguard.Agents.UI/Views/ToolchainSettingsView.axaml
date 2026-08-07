@@ -1,6 +1,7 @@
 <UserControl xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+        xmlns:views="using:Mainguard.Agents.UI.Views"
         x:Class="Mainguard.Agents.UI.Views.ToolchainSettingsView"
         x:DataType="vm:ToolchainSettingsViewModel">
     <Border Padding="0" MaxWidth="620">
@@ -124,6 +125,12 @@
                     <TextBlock Text="This Mainguard release curates no language toolchains — check for a Mainguard update."
                                Foreground="{DynamicResource TextMuted}" FontSize="12" Margin="4,8"
                                IsVisible="{Binding ShowEmpty}"/>
+
+                    <!-- Second section of the same page: declaring a toolchain in the OPEN repository.
+                         The list above answers "is it on this machine"; this answers "does this repo ask
+                         for it". Absent (not inert) when there is no repository context to give it. -->
+                    <views:ToolchainDeclarationView DataContext="{Binding Declaration}"
+                                                    IsVisible="{Binding $parent[UserControl].((vm:ToolchainSettingsViewModel)DataContext).HasDeclaration}"/>
                 </StackPanel>
             </ScrollViewer>
 

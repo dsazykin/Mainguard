@@ -17,7 +17,7 @@ Pro-only View/VM (Control Center, Coordinator, Resources monitor, agent rail, te
 merge queue, review cockpit, agent workspace/document, terminal + `TerminalControl`/`VtScreen`, OOBE
 wizard, bootstrap, egress/PR-intake settings, vibe mode, startup/shutdown windows, CLI-OAuth ToS,
 VM-upgrade offer), the five Pro Settings pages (`AgentCliSettingsView`, `ApiKeySettingsView`,
-`DaemonLogsView`, `ToolchainSettingsView` (the user-managed language-toolchain channel's install/
+`DaemonLogsView`, `ToolchainSettingsView` + `ToolchainDeclarationView` (the user-managed language-toolchain channel's install/
 remove surface, `ToolchainSettingsViewModel`/`ToolchainRowViewModel`),
 `MainguardOsPageView`/`MainguardOsPageViewModel` — the latter replacing the old
 standalone `AddReposToOsView` window and absorbing the former Tools "Rebuild sandbox images" action

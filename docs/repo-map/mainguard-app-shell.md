@@ -627,6 +627,21 @@
     rebuilt row) so the list can never misreport a half-removal. Same row→command
     `CanExecuteChanged` bridge as the Agent CLIs page (`_watched` + `RowCommandInputs` =
     `CanInstall`/`CanRemove`), and the same two-constructor (live channel / design rows) shape),
+    `ToolchainDeclarationViewModel` (Settings **Toolchains** → the per-repository half: declaring
+    `.mainguard/toolchain` as **four discrete buttons the user presses one at a time** — Write file →
+    Stage & commit → Push → Install. **No step ever does another's work**: writing touches the working
+    tree and stages nothing, committing stages that ONE path and never pushes. That is not a style
+    preference — an action that quietly does more than its label says is the failure this shape exists
+    to prevent, and the first implementation staged inside step 1 *while its own status message said
+    nothing had been staged* (`WriteFile_ShouldWriteTheWorkingTreeOnly_AndStageNothing`). Each command
+    is enabled **iff** its `…DisabledReason` is empty (`CanWriteFile`/`CanCommit`/`CanPush`/`CanInstall`),
+    so a button cannot be disabled without a stated reason — the #302 pattern, made structurally
+    impossible rather than remembered. Never stashes, never checks out, never pushes as a side effect:
+    a dirty tree or a non-default branch is REFUSED with the reason, naming both branches. The default
+    branch is resolved dynamically via `RepoToolchainConfig.DefaultBranch` (`symbolic-ref`, `main`
+    fallback) — neither name is hardcoded anywhere, because the owner's repo is `master`. `RefreshAsync`
+    re-MEASURES the repository through one `IGitService.ExecuteWithRepo` after every step, so a change
+    made outside the app is visible on the next pass and no precondition is ever inferred),
     `VmUpgradeOfferViewModel` (the tier-2 upgrade
     offer/progress VM: starts in the consent state (`IsOffering`), `UpgradeCommand` runs the injected
     `IVmUpgradeOrchestrator` off the UI thread and advances the `VmUpgradePlan`-seeded
@@ -912,7 +927,7 @@
   Resources / agent rail / telemetry / queue rail / merge queue / review cockpit / agent workspace +
   document / terminal / OOBE wizard / bootstrap / vibe mode / startup + shutdown windows / CLI-OAuth
   ToS + VM-upgrade offer), the five Pro-only Settings pages (`AgentCliSettingsView`,
-  `ApiKeySettingsView`, `DaemonLogsView`, `ToolchainSettingsView` — all four `UserControl`s
+  `ApiKeySettingsView`, `DaemonLogsView`, `ToolchainSettingsView`, `ToolchainDeclarationView` — all `UserControl`s
   implementing `Mainguard.UI`'s `ISettingsPage`, embedded by the shell's `SettingsViewModel` — and
   `MainguardOsPageView`/`MainguardOsPageViewModel`, the settings-page host of the old
   `AddReposToOsView`/`AddReposToOsViewModel` add-more-repos engine that also folds in the standalone

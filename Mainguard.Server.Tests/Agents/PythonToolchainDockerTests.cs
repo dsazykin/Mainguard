@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Agents.Agents.Toolchains;
 using Mainguard.Server.Tests.Fixtures;
@@ -131,6 +132,33 @@ public class PythonToolchainDockerTests
         _out.WriteLine($"command -v python3 => {which.Stdout.Trim()}");
         Assert.StartsWith(ToolchainPaths.SandboxInstallDir("python-3"), which.Stdout.Trim(), StringComparison.Ordinal);
 
+        // ---- 3b. Egress: PyPI reachable THROUGH the proxy, and the proxy really constraining --------
+        // "pip install worked" on its own does not prove the allowlist is doing anything — it is equally
+        // consistent with the jail having open internet, in which case the whole default-deny story is
+        // decoration. So both directions are measured against the SAME jail: an allowlisted registry must
+        // answer, and a host that is not on the allowlist must not.
+        var pypi = await fx.Engine.ExecAsync(containerId, new[]
+        {
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "25",
+            "https://pypi.org/simple/pytest/",
+        }, ct);
+        _out.WriteLine($"pypi via proxy => exit {pypi.ExitCode}, http {pypi.Stdout.Trim()}");
+
+        var blocked = await fx.Engine.ExecAsync(containerId, new[]
+        {
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "25",
+            "https://example.com/",
+        }, ct);
+        _out.WriteLine($"non-allowlisted host => exit {blocked.ExitCode}, http {blocked.Stdout.Trim()}");
+
+        Assert.Equal(0, pypi.ExitCode);
+        Assert.Equal("200", pypi.Stdout.Trim());
+        Assert.True(
+            blocked.ExitCode != 0 || blocked.Stdout.Trim() is not "200",
+            "a host that is NOT on the egress allowlist answered 200 from inside the jail — the jail has "
+            + "a route that bypasses the default-deny proxy, which would make the pip result above "
+            + $"meaningless (got exit {blocked.ExitCode}, http '{blocked.Stdout.Trim()}')");
+
         // ---- 4. GREEN ------------------------------------------------------------------------------
         var verifyCommand = File.ReadAllText(Path.Combine(worktree, ".mainguard", "verify")).Trim();
         _out.WriteLine($"verify command : {verifyCommand}");
@@ -168,12 +196,28 @@ public class PythonToolchainDockerTests
 
     // ---- harness ---------------------------------------------------------------------------------
 
+    /// <summary>
+    /// Runs the repository's verify command <b>the way production runs it</b>: resolved through the
+    /// shipped <see cref="VerificationCommandResolver"/> and exec'd as bare argv.
+    ///
+    /// <para><b>This method used to build its own shell</b> — <c>["sh", "-c", "cd /workspace &amp;&amp; " +
+    /// verifyCommand]</c> — and that made the whole test a lie. Production tokenises the command with a
+    /// shell-free whitespace splitter and hands the argv straight to <c>docker exec</c>; a test that
+    /// wraps it in <c>sh -c</c> first hands the repository a shell it will never actually have. Measured:
+    /// a verify of <c>pip install -r requirements.txt &amp;&amp; python -m pytest -q</c> passes under the old
+    /// harness and fails in production with <c>no such option: -m</c>, because pip swallows <c>&amp;&amp;</c>,
+    /// <c>python</c> and <c>-m</c> as its own arguments. The instrument would have been green while every
+    /// real Python repository was broken.</para>
+    ///
+    /// <para>The working directory comes from the container spec (<c>WORKDIR /workspace</c>), not from a
+    /// <c>cd</c> the test prepends — for the same reason.</para>
+    /// </summary>
     private static Task<SandboxExecResult> RunVerifyAsync(
-        SandboxFixture fx, string containerId, string verifyCommand, CancellationToken ct) =>
-        // `sh -c`, never `sh -lc`: a login shell sources /etc/profile, which on Debian resets PATH and
-        // would drop the toolchain mount — the command would then fail at exit 127 for a reason that has
-        // nothing to do with the repository.
-        fx.Engine.ExecAsync(containerId, new[] { "sh", "-c", "cd /workspace && " + verifyCommand }, ct);
+        SandboxFixture fx, string containerId, string verifyCommand, CancellationToken ct)
+    {
+        var resolved = VerificationCommandResolver.Resolve(verifyCommand, verifyCommand);
+        return fx.Engine.ExecAsync(containerId, resolved.Command, ct);
+    }
 
     private async Task<string> CreateJailAsync(
         SandboxFixture fx, string toolchainRoot, string worktree, string cacheDir, CancellationToken ct)
@@ -216,9 +260,16 @@ public class PythonToolchainDockerTests
 
         // The install step is the repository's, exactly as `dotnet restore` is for a .NET repo: the
         // toolchain supplies the interpreter and pip, the repository supplies its own dependencies.
+        //
+        // The `sh -c "…"` wrapper is NOT decoration and NOT a test convenience — it is the only form
+        // that works. Verification tokenises this file with a shell-free whitespace splitter, so a bare
+        // `a && b` arrives as argv `[a, &&, b]` and the first program swallows `&&` as its own argument
+        // (measured: `no such option: -m`, exit 2). The tokeniser DOES honour quotes and drops the quote
+        // characters, so this collapses to exactly three tokens — `sh`, `-c`, and the whole script — and
+        // the shell that runs the `&&` is one the repository asked for explicitly.
         File.WriteAllText(
             Path.Combine(worktree, ".mainguard", "verify"),
-            "pip install -q -r requirements.txt && python -m pytest -q\n");
+            "sh -c \"pip install -q -r requirements.txt && python -m pytest -q\"\n");
 
         File.WriteAllText(
             Path.Combine(worktree, "tests", "test_math.py"),
