@@ -159,8 +159,10 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// <c>docker network ls</c>, and so the name is stable across restarts — a per-spawn random name
     /// would leak a network per relaunch.
     /// </summary>
+    // MUTATION M11 (DO NOT MERGE): the agent id is dropped from the segment name, so every agent in a
+    // repo lands on ONE flat segment — the exact pre-MG-36 topology east-west isolation replaced.
     public static string AgentSegmentName(string repoHash, string agentId) =>
-        AgentSegmentPrefix + ContainerSpecBuilder.ContainerName(repoHash, agentId)["mainguard-".Length..];
+        AgentSegmentPrefix + ContainerSpecBuilder.ContainerName(repoHash, "flat")["mainguard-".Length..];
 
     /// <summary>
     /// Something outside this call disturbed the proxy while we were adopting it. Raised where WE
@@ -427,7 +429,9 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// </summary>
     private async Task AttachSegmentAsync(string proxyId, string segmentName, CancellationToken ct)
     {
-        var segmentId = await EnsureNetworkAsync(segmentName, isInternal: true, ct).ConfigureAwait(false);
+        // MUTATION M9 (DO NOT MERGE): agent segments are created NON-internal, i.e. every jail gets a
+        // NAT'd route straight off the bridge to the internet.
+        var segmentId = await EnsureNetworkAsync(segmentName, isInternal: false, ct).ConfigureAwait(false);
 
         var inspect = await _docker.Containers.InspectContainerAsync(proxyId, ct).ConfigureAwait(false);
         if (ProxyAddressOf(inspect, segmentName) is not null)
