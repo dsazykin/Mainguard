@@ -181,14 +181,17 @@ Start the coordinator.
 
 **Expect:** a terminal draws, with your chosen CLI running in it.
 
-**First run is slow and this is the weak point.** It builds a ~2.9 GB toolchain image. You should
-see a progress line naming the build. **Do not press Stop** — that kills the build and the next
-attempt starts over.
+**First run is slow, and that is now expected rather than fragile.** It builds a ~2.9 GB toolchain
+image. You should see a progress line naming the build, and it should keep updating — a running
+build reports in every 20 seconds with how long it has been going, so a line that stops changing for
+minutes is the signal that something is actually wrong. **Do not press Stop** — that kills the build
+and the next attempt starts over.
 
-**Known issue (#53):** `SpawnDeadline` is 5 minutes and this build often takes longer, so a cold
-first run can still time out even though it's working. If it does, wait for the build to finish
-(`wsl -d MainguardEnv -u root -- docker images | grep toolchain`) and start again — the second
-attempt is fast. That's the ticket, not a new bug.
+There is no fixed time limit on this any more. The client gives up only if the daemon says *nothing*
+for five minutes, so a slow link or a cold cache no longer cuts off a healthy build — and a spawn
+that really is wedged still fails, with a message quoting the last thing the daemon reported. If a
+second agent asks for the same toolchain while it is building, it waits for that build and says so
+instead of starting a second copy of it.
 
 ---
 
