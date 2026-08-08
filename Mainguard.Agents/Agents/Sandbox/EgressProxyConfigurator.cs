@@ -318,7 +318,10 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // Inside the retry: a concurrent teardown removes the networks too, and re-reading them is part
         // of starting over. A drifted network (EgressNetworkDriftException) is a policy failure, not a
         // disturbance, and deliberately propagates on the first attempt.
-        await EnsureNetworkAsync(AgentNetworkName, isInternal: true, ct).ConfigureAwait(false);
+        // MUTATION M13 (DO NOT MERGE): the shared agent network — the one the RequiresDocker egress
+        // matrix's jails actually sit on — is created NON-internal, i.e. every jail on it gets a NAT'd
+        // route straight to the internet. Only the iptables backstop is left to stop direct egress.
+        await EnsureNetworkAsync(AgentNetworkName, isInternal: false, ct).ConfigureAwait(false);
         var egressId = await EnsureNetworkAsync(EgressNetworkName, isInternal: false, ct).ConfigureAwait(false);
 
         // MG-27: resolve the proxy's ref to its immutable content digest ONCE, and both compare and
