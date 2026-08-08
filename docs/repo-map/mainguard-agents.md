@@ -66,6 +66,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     without a production caller, so queue entries sat at `not verified yet` forever. It is a *trigger*
     only: every decision stays in the daemon's `MergeQueue.RunVerificationAsync`, which an automatic
     phase-2 caller drives directly for identical gates/jail execution/transitions),
+    (+ `ResumeEntryAsync`/`QueueEntryResumeOutcome` — the human's way out for a STRANDED entry: the daemon
+    spawns a jail onto that entry's existing agent id and branch, so it can be verified and merged instead
+    of only discarded. Adoption, not re-creation — same id, same branch, same row; see
+    `docs/design/resume-stranded-queue-entry.md`. `QueueEntry.HasLiveSandbox` is the three-valued fact it
+    keys off: `false` = the daemon says this entry has no jail, `null` = the projection could not say, and
+    only `false` offers Resume or withholds Verify),
     `ICoordinatorService`, `IKillSwitchService`,
     `ITelemetryService` (**P2-47 #4** adds `GetSpendBudgetAsync`/`SetSpendBudgetAsync` over the Core
     `SpendBudget` DTO so the Resource Monitor displays + edits the per-day cap, round-tripping the whole
@@ -178,7 +184,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `PublishAgentBranch` (the daemon-side carry of `refs/heads/agent/<id>` from the agent's repo into
       the mirror — the daemon names BOTH refs, so the agent never proposes a ref update at all);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force` +
-      `branch -D` + delete the whole per-agent repo + the `MirrorMaintenance` idle hook, no residue); a
+      `branch -D` + delete the whole per-agent repo + the `MirrorMaintenance` idle hook, no residue);
+      **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a
+      jail spawned for a stranded queue entry starts on that entry's existing branch with its commits
+      intact: rescue-publish the dead jail's own repo into the mirror first (a crash can leave commits the
+      mirror never saw), then require `refs/heads/agent/<id>` or throw `AgentBranchMissingException` —
+      never a silent fresh branch off main — then clear the residue and re-clone; `CreateAgentWorktree`
+      and this one are each other's mirror image, one refusing when the branch exists and the other when
+      it does not) and **`RemoveAgentWorktreeKeepingBranch`** (the resume's rollback: the same clear
+      WITHOUT the `branch -D`, because on that path the branch is the only surviving copy of the work —
+      its interface default THROWS rather than falling back to the branch-deleting removal, and the
+      launcher swallows the throw so the worst outcome is residue, never lost commits); `FinishWorktree`
+      is the shared tail (quarantine remote, pnpm hook, `GroupShareRecursive`, branch guard, publish) so
+      a create and an adoption cannot drift into differently-configured worktrees; a
       REFUSED publish also raises the G-17 `agent_ref_refused` audit event
       (`WorktreeManager.AgentRefRefusedEvent`) alongside the warning, because "an agent tried to rewrite
       history the mirror already published" must leave a durable record and not just a log line, `Prune`,

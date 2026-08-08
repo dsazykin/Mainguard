@@ -9,6 +9,22 @@ option csharp_namespace = "Mainguard.Protos.V1";
 // designed snapshot-then-deltas so a reconnecting client converges trivially.
 service AgentService {
   rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
+  // Give a STRANDED merge-queue entry a live jail again: spawn onto the agent id that entry already
+  // has, with the new worktree standing on its existing `agent/<id>` branch and its commits intact, so
+  // the entry can be verified and merged instead of only discarded. A stopped/crashed agent leaves its
+  // queue entry behind and verification runs only in the worker's own jail, so before this the only
+  // offered action on such an entry was to throw the work away.
+  //
+  // This is a SEPARATE RPC rather than an agent_id field on SpawnAgentRequest, and separate for two
+  // reasons that are both enforcement:
+  //   * `RoleInterceptor` denies by METHOD. A whole method can be put on the coordinator denial list;
+  //     a field inside a shared message cannot, and adoption is strictly more dangerous than the merge
+  //     power §4 already denies — an agent that could adopt an arbitrary id could hijack another
+  //     agent's entry, write its branch, and have the daemon verify the result.
+  //   * There is deliberately no `role` field. A resume can therefore never mint a coordinator or a
+  //     managed session; it always produces a plain one, by construction rather than by validation.
+  // As with DiscardEntry there is also no actor field: the resuming identity is derived daemon-side.
+  rpc ResumeAgent(ResumeAgentRequest) returns (ResumeAgentResponse);
   rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
   // Harvest a LIVE agent's CLI login-state WITHOUT stopping it. The jail's $HOME is tmpfs and the
   // durable store is the host OS keychain, but harvest previously ran only inside StopAgent — so a
@@ -86,6 +102,45 @@ message EnvEntry {
 
 message SpawnAgentResponse {
   string agent_id = 1;
+}
+
+message ResumeAgentRequest {
+  string repo_handle = 1;   // opaque handle, never a daemon filesystem path (G-14)
+  // The EXISTING entry to adopt. Scoped to repo_handle and validated against that repo's live merge
+  // queue: agent ids are unique per repo and NOT globally (the external-PR intake names entries
+  // `pr-<n>`, so two subscribed repositories both hold a `pr-7`), so the daemon keys every check on
+  // the (repo, agent) pair. An id naming no entry in this repo's queue is refused.
+  string agent_id = 2;
+  // Which CLI to run in the resumed jail. The queue entry does not record the kind that produced the
+  // branch (MergeQueueRow holds no such column), so this is the human's choice at resume time exactly
+  // as it is at spawn time — asked rather than guessed.
+  string agent_kind = 3;
+  string model_api_key = 4; // SECRET
+  // The user's CUSTOM env-var keys and the CLI's saved login state — identical payloads to
+  // SpawnAgentRequest.extra_env / .cli_credentials, and redacted by the same registrations
+  // (EnvEntry.value, CliCredentialFile.content), so a resume masks exactly what a spawn masks.
+  // Values are SECRET; the field lines deliberately carry no trailing `// SECRET` marker, for the
+  // same reason SpawnAgentRequest's do not — the secrecy lives on the nested message's own field.
+  repeated EnvEntry extra_env = 5;
+  repeated CliCredentialFile cli_credentials = 6;
+  // No `role`, and no actor — see the RPC comment.
+}
+
+message ResumeAgentResponse {
+  // False for every refusal, which is an ordinary successful RPC and NOT an error: "the branch is
+  // gone", "this entry already has a live agent", "a merge is in progress" are states of the world the
+  // human has to read. A caller must therefore never treat "no exception" as evidence that anything
+  // was resumed.
+  bool resumed = 1;
+  string reason = 2;   // rendered verbatim when resumed is false
+  string agent_id = 3; // the SAME id that was adopted — never a newly minted one
+  string branch = 4;   // agent/<id>, the branch the resumed jail's worktree stands on
+  string state = 5;    // the entry's WorkerMergeState after the resume
+  // True when the entry was sitting at `Verifying` with no run behind it and the resume walked it back
+  // to `Working`. Surfaced rather than hidden: the entry's state changed as a side effect of an action
+  // asked for a different reason, and a stale "verifying" claim must not be left standing for a jail
+  // that no longer existed.
+  bool cleared_stalled_verification = 6;
 }
 
 message StopAgentRequest {

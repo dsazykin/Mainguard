@@ -203,6 +203,51 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.AgentId;
     }
 
+    /// <summary>
+    /// Resumes a stranded merge-queue entry: a jail spawned onto the id that entry ALREADY has, with the
+    /// worktree standing on its existing <c>agent/&lt;id&gt;</c> branch.
+    ///
+    /// <para>A refusal comes back as an ordinary response with <c>Resumed == false</c> and a reason, not as
+    /// an exception — so a caller must never read "no throw" as "it resumed". The request carries no actor
+    /// and no role: the identity is daemon-derived, and a resume structurally cannot mint a coordinator.</para>
+    /// </summary>
+    public async Task<ResumeAgentResponse> ResumeAgentAsync(
+        string repoHandle, string agentId, string agentKind, string modelApiKey,
+        CancellationToken ct, TimeSpan? deadline = null,
+        IReadOnlyDictionary<string, string>? extraEnv = null,
+        IReadOnlyList<CliLoginFile>? cliCredentials = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        var request = new ResumeAgentRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            AgentKind = agentKind ?? string.Empty,
+            ModelApiKey = modelApiKey ?? string.Empty,
+        };
+        if (extraEnv is not null)
+        {
+            foreach (var (name, value) in extraEnv)
+            {
+                request.ExtraEnv.Add(new EnvEntry { Name = name, Value = value });
+            }
+        }
+
+        if (cliCredentials is not null)
+        {
+            foreach (var file in cliCredentials)
+            {
+                request.CliCredentials.Add(new CliCredentialFile
+                {
+                    Path = file.Path,
+                    Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+                });
+            }
+        }
+
+        return await client.ResumeAgentAsync(request, CallOptions(ct, deadline));
+    }
+
     /// <summary>The tier-1 skew probe (authenticated, deadlined): the daemon's own version + the
     /// MainguardOS payload version. A pre-<c>GetDaemonInfo</c> daemon throws <c>Unimplemented</c> —
     /// that IS the skew signal; the caller maps it (see <c>DaemonAutoRefresh</c>), not this method.</summary>

@@ -69,6 +69,7 @@ public sealed class VerificationTriggerTests
         // A queued entry that has never been verified — exactly the owner's situation.
         queue.EnsureEntry(AgentId, MergeEntryOrigin.Local);
         Assert.Equal(WorkerMergeState.Working, queue.GetState(AgentId));
+        GiveTheEntryALiveJail(daemon);
 
         var registry = (MergeQueueRegistry)daemon.Services.GetRequiredService<IMergeQueueRegistry>();
         registry.Register(RepoHandle, new MergeQueueContext(
@@ -165,6 +166,7 @@ public sealed class VerificationTriggerTests
                 "this repository configures no verification command"));
 
         queue.EnsureEntry(AgentId, MergeEntryOrigin.Local);
+        GiveTheEntryALiveJail(daemon);
         var registry = (MergeQueueRegistry)daemon.Services.GetRequiredService<IMergeQueueRegistry>();
         registry.Register(RepoHandle, new MergeQueueContext(
             queue, daemon.Services.GetRequiredService<IMergeLeaseStore>()));
@@ -236,6 +238,23 @@ public sealed class VerificationTriggerTests
             reason = "a gate says no";
             return false;
         }
+    }
+
+    /// <summary>
+    /// Gives the entry a live jail in the daemon's session store.
+    ///
+    /// <para>Required since the queue stream started carrying <c>has_live_sandbox</c>: verification runs in
+    /// the worker's own sandbox and never on the host, so the rail now WITHHOLDS Verify on an entry the
+    /// daemon says has no jail rather than leaving an enabled button whose only possible outcome is
+    /// "Agent 'x' has no live sandbox". A fixture that seeded a queue entry with no session was therefore
+    /// asserting the trigger on a row that, in production, is stranded — the state the resume action
+    /// exists for. Giving it a jail is what makes these tests about the trigger again.</para>
+    /// </summary>
+    private static void GiveTheEntryALiveJail(DaemonFixture daemon)
+    {
+        var sessions = daemon.Services.GetRequiredService<Mainguard.Server.Runtime.AgentSessionStore>();
+        var session = sessions.Spawn("worker", role: "", parentAgentId: null, agentId: AgentId, repoHash: RepoHandle);
+        sessions.AttachSandbox(session.Key, "container-" + AgentId);
     }
 
     private static async Task<bool> WaitUntilAsync(Func<bool> predicate)

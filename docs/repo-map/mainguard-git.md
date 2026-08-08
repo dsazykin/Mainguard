@@ -376,7 +376,12 @@ The all-editions base. Git logic goes here.
   exit code + stderr; `RepoProvisioningException` — P2-06 daemon-side git failure
   (clone/fetch/config/worktree/remote) from `AgentGitCommand`, carries the already-redacted stderr;
   `AgentWorktreeConflictException` — P2-06 typed refusal thrown before any mutation: duplicate
-  `agent/<id>` branch/path, or a non-forced dirty removal; `SandboxSpecException` — P2-07
+  `agent/<id>` branch/path, or a non-forced dirty removal; `AgentBranchMissingException` — its exact
+  mirror image, for the RESUME path: `AdoptAgentWorktree` was asked to start a jail on an existing
+  `agent/<id>` and the mirror has no such branch, so there is nothing to resume. A refusal and never a
+  fallback: creating the branch instead would report success for an operation that recovered no commits
+  at all. Carries `(RepoHash, AgentId, Branch)` — the pair, because an id is unique per repo, not
+  globally; `SandboxSpecException` — P2-07
   hardened-spec violation raised at construction (Windows/UNC mount source, a dropped G2 control, or a
   secret in `Env`); `GitProxyRefusedException` — P2-07 A6 daemon-git-proxy refusal (non-fetch service
   or non-allowlisted prefix); `DeclaredDependencyDeniedException` — P2-07 F5 out-of-scope module

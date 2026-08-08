@@ -89,7 +89,43 @@ public interface IMergeQueueService
     /// Refused (as an exception carrying the daemon's reason) when a verification really is executing.
     /// </summary>
     Task ClearStalledVerificationAsync(string agentId);
+
+    /// <summary>
+    /// <b>Resume a stranded entry</b>: give it a live jail again, standing on its own
+    /// <c>agent/&lt;id&gt;</c> branch with its commits intact, so it can be verified and merged instead of
+    /// only discarded.
+    ///
+    /// <para>The entry is <b>adopted, not replaced</b> — same agent id, same branch, same row, same
+    /// origin, same verification history. Nothing here creates a queue entry; the daemon refuses outright
+    /// for an id its queue does not already hold.</para>
+    ///
+    /// <para>Every decision is the daemon's (does this repo's queue hold the entry, is a verification
+    /// really running, is a merge lease open, does the branch still exist, does the id already have a
+    /// session), and adoption is denied to the coordinator role at the interceptor — an agent that could
+    /// adopt an arbitrary id could hijack another agent's entry.</para>
+    /// </summary>
+    /// <param name="agentId">The stranded entry to resume.</param>
+    /// <param name="agentKind">Which CLI to run in the resumed jail. The queue entry does not record the
+    /// kind that produced the branch, so this is the human's choice — asked, not guessed.</param>
+    /// <exception cref="InvalidOperationException">The daemon refused; the message is its reason, already
+    /// phrased for display, and nothing was changed.</exception>
+    Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind);
 }
+
+/// <summary>
+/// What a resume actually did. Returned rather than a bare task for the same reason
+/// <see cref="QueueEntryDiscardOutcome"/> is: the surface has to state what happened instead of narrating
+/// an outcome it assumed — and one of these facts is a state change the human did not directly ask for.
+/// </summary>
+/// <param name="AgentId">The entry that was resumed — the SAME id, never a newly minted one.</param>
+/// <param name="Branch">The branch the resumed jail's worktree stands on.</param>
+/// <param name="State">The entry's merge state after the resume.</param>
+/// <param name="ClearedStalledVerification">True when the entry had been sitting at <c>Verifying</c> with
+/// no run behind it and the resume walked it back to <c>Working</c>. Surfaced rather than hidden: a stale
+/// "verifying" claim for a jail that no longer existed must not be left standing, and the human is told
+/// that their resume retracted it.</param>
+public sealed record QueueEntryResumeOutcome(
+    string AgentId, string Branch, WorkerMergeState State, bool ClearedStalledVerification);
 
 /// <summary>
 /// What a discard recorded. Returned rather than a bare task for the same reason

@@ -239,7 +239,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         _telemetry = services.Telemetry;
         _owner = services.Owner;
 
-        Queue = new QueueRailViewModel(_queue, OpenReview);
+        // The rail's Resume needs a CLI to run in the jail it asks for, and this surface is where the
+        // human picks one. Passed as a callback rather than a value so it reads the CURRENT selection at
+        // press time — a value captured here would be whatever was selected when the repo was opened, and
+        // an empty one (no CLI installed yet) is answered by the daemon rather than guessed at.
+        Queue = new QueueRailViewModel(_queue, OpenReview, resumeAgentKind: () => SelectedCli?.Id);
         Coordinator = new CoordinatorPanelViewModel(_coordinator);
         Telemetry = new TelemetryPanelViewModel(_telemetry);
         // Vibe is headed for its own app (decision 2026-07-11); the VM stays alive here so

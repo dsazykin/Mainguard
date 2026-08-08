@@ -552,7 +552,14 @@
     daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
     `CanVerify` withholds the button while a run is in flight and on the terminal states. Beside it, the
     **entry-lifecycle** commands `BeginDiscard`/`CancelDiscard`/`ConfirmDiscard` (two-step) +
-    `ClearStalledVerification`, each an equally thin drive of a daemon RPC through `MergeActionRunner`.
+    `ClearStalledVerification` + **`Resume`** (the way out for a STRANDED entry: the daemon spawns a jail
+    onto this same entry's agent id and branch — `CanResume` is true only when the daemon POSITIVELY
+    reports no sandbox (`QueueEntry.HasLiveSandbox == false`; the three-valued `null` offers nothing), and
+    the same fact now withholds `CanVerify` instead of leaving an enabled button whose only behaviour is
+    "has no live sandbox". Not two-step, unlike Discard: it adds a sandbox and destroys nothing. The CLI
+    to run comes from the injected `resumeAgentKind` callback, read at press time, because the picker
+    lives on `ControlCenterViewModel`), each an equally thin drive of a daemon RPC through
+    `MergeActionRunner`.
     The class can neither remove a row nor invent an outcome — a local "remove from list" would clear
     the rail until the next `StreamQueue` snapshot silently refilled it. `IsVerificationStalled` comes
     from the daemon's `QueueEntry.VerificationInFlight`, never inferred from `Verifying`, which is wrong
@@ -843,12 +850,17 @@
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
     (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
     now the one place for the entry-lifecycle actions too (`DiscardAsync`,
-    `ClearStalledVerificationAsync`), which need the same contract for a sharper reason: the daemon
-    answers a REFUSED discard with an ordinary successful RPC carrying `discarded=false`, so "no
+    `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
+    daemon answers a REFUSED discard (or resume) with an ordinary successful RPC carrying
+    `discarded=false` / `resumed=false`, so "no
     exception" is not evidence anything was removed. `DaemonBackedOrchestrator.DiscardEntryAsync` turns
     that into a throw and this turns the throw into a warning; the success line says *dropped from the
     merge queue* and that the branch and its commits are untouched, because a queue entry vanishing is
-    otherwise ambiguous with one that merged.
+    otherwise ambiguous with one that merged. `ResumeConfirmation` says the entry keeps its id and its
+    commits and states a cleared stalled verification in the same breath — a state change the human did
+    not directly ask for must not be silent. `DaemonBackedOrchestrator.ResumeEntryAsync` resolves the
+    picked CLI's BYOK key + saved login exactly as `StartCoordinatorAsync` does and asserts nothing else:
+    every question a resume has to answer is the daemon's.
     `DaemonBackedOrchestrator.ConfirmMergeAsync` is the RT-D1 conversation itself (P2-10 §3.7):
     `BeginMerge` (the daemon's lease + `CanMerge` under it) → **the real Windows-side
     `git merge --ff-only` on the user's own checkout, via `IJournaledMergeExecutor`** → `ConfirmMerge`
