@@ -395,8 +395,10 @@ public static class ContainerSpecBuilder
             SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
 
             // G2 control 4: drop ALL capabilities and add back a minimal set with no SYS_PTRACE.
-            CapDrop = new List<string> { "ALL" },
-            CapAdd = MinimalCaps.ToList(),
+            // MUTATION M4 (DO NOT MERGE): the capability drop is removed entirely and CAP_SYS_PTRACE is
+            // handed to the jail — the exact posture G2 control 4 exists to forbid.
+            CapDrop = new List<string>(),
+            CapAdd = MinimalCaps.Concat(new[] { "SYS_PTRACE" }).ToList(),
 
             // MG-17: inherit the daemon's userns-remap. Docker's per-container knob has no value meaning
             // "definitely remap" — "" is "whatever dockerd does" and "host" is an explicit OPT-OUT — so
@@ -814,13 +816,8 @@ public static class ContainerSpecBuilder
         if (!securityOpt.Contains("no-new-privileges"))
             throw new SandboxSpecException("G-15: no-new-privileges is missing from SecurityOpt.");
 
-        // Control 4: no CAP_SYS_PTRACE in the effective set (= what CapAdd restores after dropping ALL).
-        var capAdd = create.HostConfig.CapAdd ?? new List<string>();
-        if (capAdd.Any(c => c.Contains("SYS_PTRACE", StringComparison.OrdinalIgnoreCase)))
-            throw new SandboxSpecException("G2 control 4: CAP_SYS_PTRACE must not be in the agent capability set.");
-        var capDrop = create.HostConfig.CapDrop ?? new List<string>();
-        if (!capDrop.Any(c => string.Equals(c, "ALL", StringComparison.OrdinalIgnoreCase)))
-            throw new SandboxSpecException("G2 control 4: capabilities must be dropped (CapDrop ALL) before any are added back.");
+        // MUTATION M4 (DO NOT MERGE): the builder's own G2 control-4 guards are disabled so the spec
+        // reaches Docker and the RUNTIME behaviour is the thing under test.
 
         // Control 1: the supervisor-uid ownership of the K/credential tmpfs is expressed in the spec.
         if (creds.SupervisorUid == creds.AgentUid)

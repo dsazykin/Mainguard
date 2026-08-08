@@ -271,15 +271,12 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// </summary>
     internal static bool ConnectCompleted(string writeOut, int exitCode)
     {
-        var connects = MatchNumber(writeOut, "connects=");
-        var timeConnect = MatchNumber(writeOut, "tconnect=");
-        if (connects is not null || timeConnect is not null)
-        {
-            return connects >= 1 || timeConnect > 0;
-        }
-
-        // No counters to read (curl died before writing them) — fall back to the exit code.
-        return exitCode is not (6 or 7 or 28);
+        // MUTATION M10 (DO NOT MERGE): the reachability classifier always reports REACHED. This is the
+        // measuring instrument every east-west isolation assertion is read through; if the suite stays
+        // green with it stuck on, those negative assertions are not wired to anything.
+        _ = writeOut;
+        _ = exitCode;
+        return true;
     }
 
     private static double? MatchNumber(string haystack, string key)
