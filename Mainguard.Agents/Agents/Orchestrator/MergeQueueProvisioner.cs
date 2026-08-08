@@ -26,6 +26,33 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// constructor, so a queue rebuilt here after a daemon restart resumes the repo's real state rather than
 /// starting empty — which is exactly why the queue must be rebuilt from the SAME persisted stores the
 /// previous daemon instance wrote to, not from fresh in-memory ones.</para>
+///
+/// <para><b>...and rehydrating the state is only half of it, which is the second missing call this type now
+/// carries.</b> A queue that comes back holding a <c>Verifying</c> row holds a row about a run that died
+/// with the previous process: the state is persisted per transition, the in-flight set is memory, so the
+/// entry reports "verifying" forever about something that does not exist.
+/// <see cref="MergeQueue.ResumeAfterRestartAsync"/> is the answer to that and had no production caller
+/// either; <see cref="EnsureQueue"/> starts it here, on the created branch, the moment the queue exists.</para>
+///
+/// <para><b>Why here and not in <c>DaemonBootSequence</c>.</b> That is the obvious home and it is the wrong
+/// one — a boot task would have nothing to iterate. The <see cref="MergeQueueRegistry"/> is empty at boot by
+/// design, <c>ActiveRepoIndex</c> is memory-only and equally empty, and the RT-D1 merge-reconcile slot next
+/// door says so out loud ("repos map in as their swarms come up; none at boot"). A resume step wired into
+/// the ordered boot sequence would run against zero queues on every start and pass its own tests
+/// forever — the same "complete mechanism, no production caller" shape, moved up one level. The moment a
+/// repo's persisted queue state re-enters the process is <see cref="EnsureQueue"/>, so that is the moment
+/// the resume can act; it is reached from <c>ProvisionRepo</c>, from a jailed spawn, and from the PR-intake
+/// target resolver.</para>
+///
+/// <para><b>Order relative to the rest of boot.</b> Every one of those entry points is an RPC handler, so a
+/// resume necessarily runs after the boot sequence's merge-reconcile step — which matters, because that
+/// step can synthesize a missing <c>ConfirmMerge</c> and move main, and re-verifying against a main that is
+/// about to move produces evidence the stale cascade immediately invalidates. It also lands after the swarm
+/// reconciler, which is what settles Docker as the truth for jail liveness and prunes the worktrees of
+/// agents whose containers are gone — the exact question <c>hasLiveJail</c> asks. Neither ordering is
+/// enforced by a lock, and neither needs to be: the probe reads the container runtime directly at the
+/// instant it runs, so a resume that somehow overtook the reconciler would still get the true answer, and
+/// a main that moves underneath a re-run is the ordinary stale cascade rather than a corruption.</para>
 /// </summary>
 public sealed class MergeQueueProvisioner
 {
@@ -213,6 +240,13 @@ public sealed class MergeQueueProvisioner
         if (created)
         {
             _log?.Invoke($"merge queue registered repo={repoHandle} main={mainSha} branch={mainBranch}");
+
+            // ...and THIS is the restart resume's production trigger. See the class remarks for why it is
+            // here and not in DaemonBootSequence. Started only on the created branch: a repeat EnsureQueue
+            // is the same live queue, whose Verifying rows are real runs this process started.
+            context.Queue.BeginResumeAfterRestart(
+                hasLiveJail: agentId => !string.IsNullOrEmpty(_resolveContainerId(repoHandle, agentId)),
+                log: _log);
         }
 
         return context;

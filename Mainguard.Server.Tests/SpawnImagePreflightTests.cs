@@ -296,9 +296,79 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
         return response.AgentId;
     }
 
+    /// <summary>
+    /// The question this fix has to answer, not assume: what does a SPAWN tell the user when the
+    /// environment cannot be reached at all?
+    ///
+    /// <para>"Not installed — install it in Settings → Toolchains" would be a confidently wrong
+    /// diagnosis: the install button fails the same way, for a reason nothing on screen mentions.
+    /// Swapping a raw exception for a misleading sentence is not an improvement, so the two cases are
+    /// distinguished all the way out to the RPC the UI receives.</para>
+    /// </summary>
+    [Fact]
+    public async Task Spawn_WhenTheEnvironmentCannotBeReached_SaysUNKNOWN_NotNotInstalled()
+    {
+        var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(new UnreachableHost());
+        using var rig = Rig(missingImage: null, mainToolchain: "python-3", toolchainChannel: channel);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => SpawnAsync(rig));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("UNKNOWN", ex.Status.Detail, StringComparison.Ordinal);
+        // The remedy must be the true one — check the environment, not "go press install".
+        Assert.Contains("MainguardEnv is running", ex.Status.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("Install it in Settings", ex.Status.Detail, StringComparison.Ordinal);
+        Assert.Equal(0, rig.Environment.Engine.SpawnCalls);
+    }
+
+    /// <summary>The converse: a reachable environment that genuinely lacks the toolchain must still get
+    /// the actionable install instruction, or the distinction above has simply broken the common case.</summary>
+    [Fact]
+    public async Task Spawn_WhenTheToolchainIsGenuinelyAbsent_SaysInstallItInSettings()
+    {
+        var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(new AbsentToolchainHost());
+        using var rig = Rig(missingImage: null, mainToolchain: "python-3", toolchainChannel: channel);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => SpawnAsync(rig));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("Install it in Settings", ex.Status.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("UNKNOWN", ex.Status.Detail, StringComparison.Ordinal);
+        Assert.Equal(0, rig.Environment.Engine.SpawnCalls);
+    }
+
+    /// <summary>A host that cannot be started at all — WSL down, distro stopped, wsl.exe absent.</summary>
+    private sealed class UnreachableHost : Mainguard.Agents.Agents.Adapters.IAdapterInstallHost
+    {
+        public Task<Mainguard.Agents.Agents.Adapters.AdapterCommandResult> RunAsync(
+            IReadOnlyList<string> command, CancellationToken ct) =>
+            throw new System.ComponentModel.Win32Exception(
+                "An error occurred trying to start process 'wsl.exe'. No such file or directory");
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
+            throw new InvalidOperationException("never staged");
+    }
+
+    /// <summary>A host that WORKS and reports the toolchain simply is not there.</summary>
+    private sealed class AbsentToolchainHost : Mainguard.Agents.Agents.Adapters.IAdapterInstallHost
+    {
+        public Task<Mainguard.Agents.Agents.Adapters.AdapterCommandResult> RunAsync(
+            IReadOnlyList<string> command, CancellationToken ct) =>
+            Task.FromResult(new Mainguard.Agents.Agents.Adapters.AdapterCommandResult(
+                127, string.Empty, "no such file or directory"));
+
+        public Task WriteFileAsync(string path, string content, CancellationToken ct) => Task.CompletedTask;
+
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
+            throw new InvalidOperationException("never staged");
+    }
+
     private PreflightRig Rig(
         string? missingImage, string? staleImage = null,
-        IToolchainImageBuilder? toolchains = null, string? mainToolchain = null, bool digestlessEngine = false)
+        IToolchainImageBuilder? toolchains = null, string? mainToolchain = null, bool digestlessEngine = false,
+        Mainguard.Agents.Agents.Toolchains.ToolchainChannel? toolchainChannel = null)
     {
         var tempRoot = Path.Combine(Path.GetTempPath(), "gl-preflight-" + Guid.NewGuid().ToString("N")[..8]);
         var barePath = Path.Combine(tempRoot, "repos", RepoHandle);
@@ -313,7 +383,8 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
             SeedBareRepoWithToolchain(tempRoot, barePath, mainToolchain);
         }
 
-        var environment = new PreflightEnvironment(tempRoot, missingImage, staleImage, toolchains, digestlessEngine);
+        var environment = new PreflightEnvironment(
+            tempRoot, missingImage, staleImage, toolchains, digestlessEngine, toolchainChannel);
         var host = _daemon.WithWebHostBuilder(builder => builder.ConfigureTestServices(services =>
             services.AddSingleton<IAgentEnvironment>(environment)));
         return new PreflightRig(tempRoot, host, environment);
@@ -386,13 +457,18 @@ public sealed class SpawnImagePreflightTests : IClassFixture<DaemonFixture>
     {
         public PreflightEnvironment(
             string root, string? missingImage, string? staleImage = null, IToolchainImageBuilder? toolchains = null,
-            bool digestlessEngine = false)
+            bool digestlessEngine = false,
+            Mainguard.Agents.Agents.Toolchains.ToolchainChannel? toolchainChannel = null)
         {
             Engine = new ImageAwareEngine(missingImage, staleImage, digestlessEngine);
             Repos = new StubProvisioner(root);
             Worktrees = new StubWorktrees(root);
             ToolchainImages = toolchains;
+            Toolchains = toolchainChannel;
         }
+
+        /// <summary>The user-managed toolchain channel; null models a substrate that has none.</summary>
+        public Mainguard.Agents.Agents.Toolchains.ToolchainChannel? Toolchains { get; }
 
         /// <summary>MG-42 — null models a substrate with no image-build capability, which is the
         /// DEFAULT for every hand-rolled IAgentEnvironment double in the tree.</summary>

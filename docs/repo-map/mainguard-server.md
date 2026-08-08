@@ -159,7 +159,14 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`).
+    (`AgentStopResult`). It owns the same two halves for the **CLI SETTINGS round-trip**:
+    `FilterCliSettings` admits only (root, path) pairs the marker's `settingsPaths` declares and caps
+    each file at `AdapterSettingsPolicy.MaxFileBytes` — the stakes are higher than for a login, because
+    these files carry a permission allowlist and an unfiltered path would let a compromised client plant
+    pre-approved commands anywhere in the home or the checkout — and `HarvestCliSettingsAsync` reads
+    them back out (size-checked in the shell, so an oversized file never enters daemon memory),
+    resolving each root through `DockerSandboxEngine.SettingsRootPath` so restore and harvest cannot
+    address different directories.
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
@@ -191,8 +198,18 @@
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
     `External` and route an upstream PR's merge into a local fast-forward), and `withoutHostCredentials`
-    (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*` nor any
-    harvested CLI login, and seeds neither). A fourth, `adoptExistingBranch`, is the RESUME flag: it
+    (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*`, nor any
+    harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
+    stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
+    a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
+    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
+    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
+    read-only, so anything in its settings file was written by the agent, not approved by a person.
+    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
+    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    the client files them under the right repository rather than whichever one is open. See
+    [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
+    A further flag, `adoptExistingBranch`, is the RESUME flag: it
     routes the launcher to `AdoptAgentWorktree` (start on this id's EXISTING `agent/<id>`) instead of
     `CreateAgentWorktree`, and switches the post-failure cleanup to the branch-preserving one. It asks no
     authorization question — that is `AgentResumeService`'s job, and a spawn that could name any id
@@ -216,8 +233,10 @@
   - **`Runtime/SessionKeyCache.cs`** (PR3) — memory-only per-kind model-key cache (the daemon has no
     keystore; keys only arrive on `SpawnAgent`), so a coordinator-initiated worker of the same kind
     reuses the client-supplied key; also caches the per-kind CLI login-state files a client spawn
-    restored (and a stop harvested), so an IPC-spawned worker boots signed in too; never persisted,
-    never logged.
+    restored (and a stop harvested), so an IPC-spawned worker boots signed in too; and the per-(repo,
+    kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
+    the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
+    and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim: `Evaluate(activeManagedWorkers, maxActiveWorkers, admission)`
   returns a refusal reason or `null`. The cap is checked **before** admission, so a coordinator cannot

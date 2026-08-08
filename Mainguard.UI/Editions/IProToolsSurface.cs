@@ -6,8 +6,9 @@ namespace Mainguard.UI.Editions;
 /// <summary>
 /// The Settings-page surface the SHARED shell (<c>SettingsViewModel</c>) talks to instead of naming the
 /// Pro agent-platform types directly (step 1c) — so Settings carries ZERO reference to
-/// <c>Mainguard.Agents.Agents.*</c> or any Pro-only View. It exposes EXACTLY the five agent-platform pages
-/// as opaque <c>object</c> content (concretely Pro ViewModels, resolved to their View by
+/// <c>Mainguard.Agents.Agents.*</c> or any Pro-only View. It exposes EXACTLY the agent-platform pages
+/// (AI Providers, Agent CLIs, Toolchains, Mainguard OS, Daemon Logs) plus the one rebuild action, as
+/// opaque <c>object</c> content (concretely Pro ViewModels, resolved to their View by
 /// <c>ViewLocator</c> — the same <c>object?</c>-through-ViewLocator pattern as
 /// <see cref="IAgentPlatformSurface.AgentRailContent"/>/<c>CreateResourceMonitor</c>), so no Pro-only
 /// concrete type crosses the seam. <c>ProToolsSurface</c> satisfies it under the Pro edition; the Client
@@ -26,6 +27,11 @@ public interface IProToolsSurface
 
     /// <summary>Settings → Agent CLIs: the agent-CLI install/manage page content.</summary>
     object CreateAgentClisPage();
+
+    /// <summary>Settings → Toolchains: the curated language-toolchain install/remove page content —
+    /// the human half of the user-managed toolchain channel (a repository may name a toolchain id;
+    /// only a person can put that toolchain on this machine).</summary>
+    object CreateToolchainsPage();
 
     /// <summary>Settings → Daemon Logs: the read-only recent-daemon-logs page content.</summary>
     object CreateDaemonLogsPage();

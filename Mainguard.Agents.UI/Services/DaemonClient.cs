@@ -19,9 +19,28 @@ namespace Mainguard.Agents.UI.Services;
 /// received on stop to persist the latest login into the host OS keychain.</summary>
 public sealed record CliLoginFile(string Path, byte[] Content);
 
+/// <summary>
+/// One CLI SETTINGS file crossing the host↔daemon boundary: sent on spawn to restore THIS
+/// repository's saved settings (the approved-command list above all) into the jail, received on stop
+/// or harvest to fold the session's approvals back into the per-repo store.
+///
+/// <para><see cref="Root"/> is the declared spelling — <c>"home"</c> or <c>"workspace"</c> — because a
+/// CLI keeps user-level and project-level configuration in two different trees and both are wiped
+/// every spawn. It stays a string on this side so the client never has to know the jail's directory
+/// layout (G-14); the daemon resolves it, and refuses a spelling it does not know.</para>
+/// </summary>
+public sealed record CliSettingsFileEntry(string Root, string Path, byte[] Content);
+
 /// <summary>A stop's result: whether a session was removed, its adapter kind, and the login-state
 /// files harvested from the jail before its tmpfs $HOME evaporated (empty when none).</summary>
-public sealed record AgentStopOutcome(bool Stopped, string AgentKind, IReadOnlyList<CliLoginFile> CliCredentials);
+/// <param name="CliSettings">The CLI settings harvested alongside the login — empty when the session
+/// was unattended, when the adapter declares none, or when nothing has been approved yet. Persisted
+/// PER REPOSITORY by the caller: never into the keychain, and never across repos.</param>
+/// <param name="RepoHandle">Which repository the session belonged to. The harvest sweep walks every
+/// agent on the daemon, so this — not "whichever repo is open" — is what files the settings correctly.</param>
+public sealed record AgentStopOutcome(
+    bool Stopped, string AgentKind, IReadOnlyList<CliLoginFile> CliCredentials,
+    IReadOnlyList<CliSettingsFileEntry> CliSettings, string RepoHandle = "");
 
 /// <summary>
 /// The App's sole daemon touch-point (G-18): a gRPC client over loopback. Owns channel
@@ -135,7 +154,8 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         string repoHandle, string taskPrompt, string agentKind, string modelApiKey,
         CancellationToken ct, TimeSpan? deadline = null, string role = "",
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<CliLoginFile>? cliCredentials = null)
+        IReadOnlyList<CliLoginFile>? cliCredentials = null,
+        IReadOnlyList<CliSettingsFileEntry>? cliSettings = null)
     {
         var client = new AgentService.AgentServiceClient(Channel());
         var request = new SpawnAgentRequest
@@ -160,6 +180,19 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             {
                 request.CliCredentials.Add(new CliCredentialFile
                 {
+                    Path = file.Path,
+                    Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+                });
+            }
+        }
+
+        if (cliSettings is not null)
+        {
+            foreach (var file in cliSettings)
+            {
+                request.CliSettings.Add(new Mainguard.Protos.V1.CliSettingsFile
+                {
+                    Root = file.Root,
                     Path = file.Path,
                     Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
                 });
@@ -261,7 +294,9 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         var credentials = response.CliCredentials
             .Select(f => new CliLoginFile(f.Path, f.Content.ToByteArray()))
             .ToArray();
-        return new AgentStopOutcome(response.Stopped, response.AgentKind, credentials);
+        return new AgentStopOutcome(
+            response.Stopped, response.AgentKind, credentials, SettingsOf(response.CliSettings),
+            response.RepoHandle);
     }
 
     /// <summary>
@@ -280,9 +315,16 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         var credentials = response.CliCredentials
             .Select(f => new CliLoginFile(f.Path, f.Content.ToByteArray()))
             .ToArray();
-        // Stopped:false — the agent is still running; only the credential payload matters here.
-        return new AgentStopOutcome(false, response.AgentKind, credentials);
+        // Stopped:false — the agent is still running; only the harvested payload matters here.
+        return new AgentStopOutcome(
+            false, response.AgentKind, credentials, SettingsOf(response.CliSettings), response.RepoHandle);
     }
+
+    /// <summary>The wire settings entries as the client's own record. One place, so the stop leg and
+    /// the live-harvest leg cannot diverge in how they read the same message.</summary>
+    private static IReadOnlyList<CliSettingsFileEntry> SettingsOf(
+        IEnumerable<Mainguard.Protos.V1.CliSettingsFile> files) =>
+        files.Select(f => new CliSettingsFileEntry(f.Root, f.Path, f.Content.ToByteArray())).ToArray();
 
     /// <summary>Reads the daemon-owned egress allowlist (P2-07).</summary>
     public async Task<IReadOnlyList<AllowlistEntry>> ListAllowlistAsync(CancellationToken ct, TimeSpan? deadline = null)

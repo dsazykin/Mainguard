@@ -118,6 +118,15 @@ public sealed record AdapterSpec(
     /// launch from demanding a fresh sign-in. Files only, relative, no <c>..</c>; null = this CLI
     /// has no persistable login state (API-key-only).</summary>
     [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null,
+    /// <summary>The files where THIS CLI keeps its NON-credential configuration — above all the
+    /// permission allowlist a user builds by approving commands. Both trees a CLI can write them to
+    /// are wiped every spawn (the tmpfs <c>$HOME</c> and the per-agent worktree), so without this the
+    /// user re-approves every command in every new agent. Restored into every trusted jail and
+    /// harvested back per REPOSITORY (never globally): an approval given while working on repo A must
+    /// not silently pre-approve the same command in repo B. Must not overlap
+    /// <see cref="CredentialPaths"/> — settings go to an ordinary per-repo file, credentials only ever
+    /// to the host OS keychain. Null = this CLI has no persistable settings.</summary>
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null,
     /// <summary>The environment variable this CLI reads its API BASE URL from (e.g.
     /// <c>ANTHROPIC_BASE_URL</c> for claude-code, <c>OPENAI_BASE_URL</c> for codex). MG-4: pointing the
     /// CLI at the daemon's model gateway is what lets the jail hold only a Mainguard session token while
@@ -272,6 +281,41 @@ public sealed record AdapterManifest(
                     if (!IsHomeRelativeFilePath(path))
                         throw new AdapterManifestException(AdapterManifestError.Malformed,
                             $"Adapter '{a.Id}' credentialPaths entry '{path}' must be a $HOME-relative file path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                }
+            }
+
+            if (a.SettingsPaths is not null)
+            {
+                // The credential list, as the SHAPE GATE already accepted it — the comparison below has
+                // to be against paths that are really restorable, not against raw manifest text.
+                var credentialPaths = new HashSet<string>(
+                    (a.CredentialPaths ?? Array.Empty<string>()).Where(IsHomeRelativeFilePath),
+                    StringComparer.Ordinal);
+                var seenSettings = new HashSet<(string Root, string Path)>();
+                foreach (var entry in a.SettingsPaths)
+                {
+                    if (entry is null || !AdapterSettingsPath.TryParseRoot(entry.Root, out _))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' settingsPaths entry has root '{entry?.Root}' — declare one of "
+                            + $"{string.Join(", ", AdapterSettingsPath.RootSpellings.Select(r => $"'{r}'"))}. "
+                            + "Refusing rather than defaulting: a guessed root would decide whether Mainguard "
+                            + "writes into the jail's throwaway home or into the user's real checkout.");
+                    if (!IsHomeRelativeFilePath(entry.Path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' settingsPaths entry '{entry.Path}' must be a plain relative file "
+                            + "path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                    if (!seenSettings.Add((entry.Root, entry.Path)))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' declares settingsPaths entry '{entry.Root}:{entry.Path}' twice.");
+                    // The boundary this field exists beside, enforced rather than described: a settings
+                    // path is persisted to an ORDINARY per-repo JSON file, a credential path only ever to
+                    // the host OS keychain. One path in both lists would quietly route a credential into
+                    // the plaintext store, which is precisely the standing rule this must not break.
+                    if (entry.ParsedRoot == AdapterSettingsRoot.Home && credentialPaths.Contains(entry.Path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' lists '{entry.Path}' in BOTH credentialPaths and settingsPaths. "
+                            + "Credentials are persisted only to the host OS keychain; settings go to an "
+                            + "ordinary per-repo file. A path cannot be both without leaking the credential.");
                 }
             }
 

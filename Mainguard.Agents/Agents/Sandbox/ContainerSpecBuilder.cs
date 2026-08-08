@@ -185,7 +185,9 @@ public sealed record ContainerSpecRequest(
     string? BareRepoPath = null,
     string? DnsServerAddress = null,
     string? AgentRepoPath = null,
-    string? PackageCachePath = null);
+    string? PackageCachePath = null,
+    string? ToolchainsRootPath = null,
+    IReadOnlyList<string>? ToolchainIds = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -293,6 +295,23 @@ public static class ContainerSpecBuilder
             });
         }
 
+        if (!string.IsNullOrEmpty(request.ToolchainsRootPath))
+        {
+            RejectNonExt4Source(request.ToolchainsRootPath);
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = request.ToolchainsRootPath,
+                Target = Toolchains.ToolchainPaths.SandboxMount,
+                // READ-ONLY, and this is the property that lets one toolchain tree be SHARED by every
+                // jail on the machine. A writable share would let agent A replace the interpreter that
+                // agent B's verification runs under — the merge gate decided by another tenant, which is
+                // the same reasoning that makes package caches per-agent instead. Toolchains may be
+                // shared precisely because nothing in a jail can write them.
+                ReadOnly = true,
+            });
+        }
+
         if (!string.IsNullOrEmpty(request.IpcDirPath))
         {
             RejectNonExt4Source(request.IpcDirPath);
@@ -365,6 +384,8 @@ public static class ContainerSpecBuilder
         {
             env.AddRange(PackageCachePolicy.EnvironmentList());
         }
+
+        env.AddRange(BuildToolchainEnv(request));
 
         var dns = ResolveDnsPinning(request);
 
@@ -575,6 +596,65 @@ public static class ContainerSpecBuilder
         var shortHash = repoHash.Length > 12 ? repoHash[..12] : repoHash;
         var safeAgent = new string(agentId.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '-').ToArray());
         return $"mainguard-{shortHash}-{safeAgent}";
+    }
+
+    /// <summary>
+    /// The <c>PATH</c> the agent base image bakes, verbatim from its final <c>ENV PATH=</c> line.
+    ///
+    /// <para><b>Why this is duplicated here.</b> A runtime-mount toolchain has to go on <c>PATH</c>
+    /// AHEAD of the base image's curated tools — a repository that declares Python must get the pinned
+    /// interpreter, not the incidental <c>/opt/toolchain/bin/python3</c> that has no pip. Docker's
+    /// <c>Env</c> does no shell expansion, so there is no <c>$PATH</c> to prepend to: the value handed to
+    /// <c>CreateContainerAsync</c> must be complete. That makes this constant a copy, and a copy that
+    /// drifts is a jail whose PATH silently loses the adapters mount or the nix profile — so
+    /// <c>ContainerSpecBuilderTests.BaseImagePath_MatchesTheAgentBaseImage</c> reads the Dockerfile and
+    /// fails if the two ever disagree, the same guard the catalog's nixpkgs revision already carries.</para>
+    /// </summary>
+    public const string BaseImagePath =
+        "/opt/mainguard/adapters/bin:/opt/toolchain/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin";
+
+    /// <summary>
+    /// The environment a jail needs in order to USE the toolchains its repository declared: their bin
+    /// directories at the front of <c>PATH</c>, plus whatever each one needs to find itself.
+    ///
+    /// <para>Only <see cref="ToolchainDelivery.RuntimeMount"/> toolchains appear here. An image-layer
+    /// toolchain baked its own <c>ENV PATH</c> and <c>ENV</c> lines into the layer at build time
+    /// (<see cref="ToolchainProvisioner.RenderDockerfile"/>), and setting them again here would override
+    /// the image's own with a value computed from a different source.</para>
+    ///
+    /// <para>An id that is declared but whose toolchain is not installed contributes nothing and is NOT
+    /// an error here — this builder is pure and cannot see the VM's filesystem. The check that the
+    /// toolchain is actually present belongs where it can be observed, and it is made there: by the
+    /// spawn path before the jail is created, and again by the verification path inside the live jail.</para>
+    /// </summary>
+    internal static List<string> BuildToolchainEnv(ContainerSpecRequest request)
+    {
+        var env = new List<string>();
+        if (request.ToolchainIds is not { Count: > 0 } || string.IsNullOrEmpty(request.ToolchainsRootPath))
+        {
+            return env;
+        }
+
+        var recipes = request.ToolchainIds
+            .Select(ToolchainCatalog.TryGet)
+            .Where(r => r is { Delivery: ToolchainDelivery.RuntimeMount })
+            .Select(r => r!)
+            .ToList();
+
+        if (recipes.Count == 0)
+        {
+            return env;
+        }
+
+        var pathEntries = recipes.SelectMany(r => r.PathEntries).ToList();
+        env.Add("PATH=" + string.Join(':', pathEntries) + ":" + BaseImagePath);
+
+        foreach (var (name, value) in recipes.SelectMany(r => r.Environment))
+        {
+            env.Add($"{name}={value}");
+        }
+
+        return env;
     }
 
     private static List<string> BuildProxyEnv(string proxyUrl)

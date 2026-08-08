@@ -31,6 +31,12 @@ public static class SecretFieldMask
         // agent.proto — CliCredentialFile.content (CLI login state: SpawnAgentRequest.cli_credentials
         // in, StopAgentResponse.cli_credentials out)
         ("mainguard.v1.CliCredentialFile", 2),
+        // agent.proto — CliSettingsFile.content. NOT a `// SECRET` field: a CLI's settings are
+        // configuration, and their durable home is a plain per-repo JSON file rather than the OS
+        // keychain. Masked anyway because the daemon has no business spraying a repository's
+        // approved-command list through its log on every spawn, stop and harvest sweep — the registry
+        // is one-directional (every SECRET field must be here; not everything here must be SECRET).
+        ("mainguard.v1.CliSettingsFile", 3),
         // reposync.proto — ProvisionRepoRequest.credential_token
         ("mainguard.v1.ProvisionRepoRequest", 2),
     };

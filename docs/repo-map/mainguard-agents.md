@@ -539,7 +539,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `docker pause`/`unpause`)/`StopAsync`/`RemoveAsync`/`ImageExistsAsync` (the v1 spawn-preflight image
       probe; defaults true — an engine/fake with no separate image store has nothing to preflight, the
       Docker impl really inspects)/**`ImageDigestAsync` (MG-27 — the immutable `sha256:` content digest a
-      mutable ref resolves to; defaults null)** + `SandboxSpawnRequest`/`SandboxSecrets`/`SandboxHandle`;
+      mutable ref resolves to; defaults null)** + `SandboxSpawnRequest`/`SandboxSecrets`/`SandboxHandle`
+      + **`SandboxSettingsFile(Root, RelativePath, Content)`** (the CLI-settings restore payload, carried
+      on `SandboxSpawnRequest.CliSettingsFiles` rather than on `SandboxSecrets` because settings are NOT
+      secrets — their durable home is a per-repo JSON file, not the OS keychain);
       **MG-36:** `SandboxSpawnRequest` also carries the optional per-agent `NetworkName`/`ProxyUrl`) and
       `IEgressPolicy.cs` (`Allowlist`/`NetworkName`/`ProxyUrl`/`EnsureReadyAsync`/`Evaluate` + the
       **MG-36** `EnsureAgentSegmentAsync`/`RemoveAgentSegmentAsync` →
@@ -603,7 +606,20 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       creates its own file in the tmpfs directory Docker mounted owned by it. `HasOwnedSecretDirsAsync`
       adds `staleSecretLayout` to the reuse staleness list, because tmpfs entries are fixed at create and
       reusing a pre-upgrade jail would exec a non-root owner into a directory that does not exist —
-      resurrecting the same EPERM for every container that outlived the upgrade) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      resurrecting the same EPERM for every container that outlived the upgrade.
+      `RestoreCliCredentialsAsync`/**`RestoreCliSettingsAsync`** run on BOTH the create and the reuse
+      paths, write-if-absent as the AGENT uid over exec stdin — `docker cp` would write UNDER the tmpfs
+      `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
+      older copy clobbering a live jail's fresher tokens or approvals. **`SettingsRootPath(root)`** is the
+      ONE `AdapterSettingsRoot`→in-jail-directory mapping, shared with the harvest side so the two legs of
+      the round trip cannot drift apart. **`ApplyWorkspaceSettingsIgnoreAsync`** appends the WORKSPACE
+      settings paths to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and agents run
+      `git add -A`, so without this the feature would commit the user's permission allowlist into their
+      repository and merge it to main. Driven by `SandboxSpawnRequest.WorkspaceIgnorePaths` (the
+      adapter's DECLARATION) unioned with anything restored, because the session that most needs the
+      ignore is the FIRST one — nothing to restore, and the CLI creates the file itself. The exclude file
+      lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is touched and no
+      state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -671,7 +687,28 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       bakes, which `ToolchainDeclarationTests` reads out of the Dockerfile so the two cannot drift. A repo
       names an **id**; it never supplies a URL, a checksum, a revision or a command — that asymmetry is
       the whole security design, because a declaration file that described an *installation* would be an
-      install-time arbitrary-code-execution surface in a file an agent can write).
+      install-time arbitrary-code-execution surface in a file an agent can write. `ToolchainDelivery`
+      splits the catalog into `ImageLayer` recipes — built on the spawn path, required whenever the
+      toolchain needs apt packages (`dotnet-10` aborts without `libicu72`) or the baked nix store — and
+      `RuntimeMount` entries, which come from the user-managed manifest below. `All` unions both, so ONE
+      table still answers "may a repository declare this id?").
+    - **`Agents/Toolchains/`** — the **user-managed** half of the same feature (the base image's
+      nixpkgs `python3` has no pip and the rootfs is read-only, so a Python repo could commit tests that
+      could never run; see [`docs/design/python-toolchain.md`](../design/python-toolchain.md)):
+      - `toolchains.starter.json` (the curated manifest, embedded — pinned version, upstream-published
+        sha256, HTTPS payload, PATH/env, and the probe. Adding Node or Go is an edit to THIS FILE only).
+      - `ToolchainManifest.cs` (`ToolchainEntry`/`ToolchainProbe` + a validating parser that refuses a
+        non-HTTPS payload, a short hash, a path-shaped id or an empty probe — so a bad edit fails CI
+        rather than a user's install. `{toolchain}`/`{cache}` tokens expand against the VM path when an
+        install is probed and the in-jail mount path when a container is built).
+      - `ToolchainChannel.cs` (install/remove/list into the VM over the SAME `IAdapterInstallHost` seam
+        the agent-CLI channel uses. Fetches and checksums **in the VM** — a ~350 MB payload is not
+        base64-over-stdin — refuses to unpack on a mismatch, and writes the install marker LAST, only
+        after a probe that RUNS the toolchain at the pinned version. `ListAsync` re-probes rather than
+        reading markers: PR #305's marker reported healthy for eleven days).
+      - `ToolchainPaths.cs` (`/home/mainguard/mainguard/toolchains` → `/opt/mainguard/toolchains`,
+        bind-mounted **read-only** so one shared tree cannot be rewritten by a jail to change what
+        another agent's verification runs).
     - `ToolchainDeclaration.cs` (`.mainguard/toolchain` — one catalogued id per line, `#` comments;
       `ToolchainDeclarationResolver` mirrors `VerificationCommandResolver` input-for-input — branch vs
       main vs a human-owned out-of-branch pin — and arms the same RT-D2 `ChangedTestCommandGate` under its
@@ -934,8 +971,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
       `GetState`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`; every legal transition enumerated,
       every illegal one throws typed `InvalidMergeStateTransitionException`; each transition persisted in
-      the same transaction (restart resumes, `ResumeAfterRestartAsync` re-runs an interrupted
-      `Verifying`); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
+      the same transaction (restart resumes; `ResumeAfterRestartAsync(hasLiveJail)` + its background
+      `BeginResumeAfterRestart`/`LastResume` pair re-drive an interrupted `Verifying` — see the
+      restart-resume note below); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
       `StaleVerified` and auto re-queues FIFO by original verification time; `CanMerge` false unless
       `Verified`/fresh AND every composable `IMergeGate` allows; the human merge (`ConfirmHumanMerge` →
       `Merged`) + `RequestReview`/`Reject`/`NotifyNewCommits` are **not** on `IMergeQueue`
@@ -964,7 +1002,28 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       consults so a rehydrated-but-idle `Verifying` reads "verification stalled — no run in progress"
       instead of claiming an activity that is not happening, and what
       `SettleAfterVerificationLocked` guards with so a run finishing after a discard is dropped rather
-      than throwing out of an unawaited continuation. `VerificationRunner.cs` (runs the configured test command in the worker sandbox
+      than throwing out of an unawaited continuation. **Restart resume (the wiring, not just the
+      method):** `ResumeAfterRestartAsync` shipped complete and had **no production caller** — every
+      reference was its own definition, a comment observing the gap, or a test, one of which asserted the
+      absence — so a daemon killed mid-verification rehydrated `Verifying` with nothing behind it and the
+      entry reported "verifying" forever about a run that no longer existed; `TryClearStalledVerification`
+      was the human mitigation for it. It now takes a **`hasLiveJail` probe** and splits into two arms,
+      returning a `RestartResumeReport(ReRun, Stranded)`: jail alive → the verification is genuinely
+      re-executed in it (the real re-drive), jail gone → the entry cannot verify at all (§3.2 — host
+      execution is a rejection trigger) so it is moved straight to `Working` rather than flapping
+      `Verifying → Verifying →` failed-run `→ Working`. Runs actually in flight are skipped, so it is safe
+      on a live queue. Both arms append the `verification_restart_resume` audit event with an
+      `outcome` field (`rerun`/`stranded`) — deliberately NOT `stalled_verification_cleared`, whose `by`
+      field names a person. `BeginResumeAfterRestart` runs a pass on a background task and publishes it on
+      `LastResume` (the `LastCascade` posture: tests await it, production fires and forgets), because the
+      only production caller is inside a gRPC handler and a pass runs whole test suites. The pass re-reads
+      each entry's state after the (Docker-blocking) probe, so a discard landing in that window is not
+      reported as a run; and `RunVerificationAsync` now **undoes its `_verifying` mark when the
+      `→ Verifying` transition is refused** — it marked first and transitioned second, so an illegal
+      `Discarded → Verifying` left the id in the in-flight set permanently and `IsVerificationInFlight`
+      answered true forever for an entry with no run (this subsystem's own defect shape, since every path
+      that removes an id is downstream of that throw).
+      `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
@@ -998,7 +1057,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
       verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
       `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
-      agent→approved-plan binding exists yet.)
+      agent→approved-plan binding exists yet. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
+      now also calls `MergeQueue.BeginResumeAfterRestart`, passing `resolveContainerId` as the jail probe
+      — this is `ResumeAfterRestartAsync`'s production caller. It is here rather than in
+      `DaemonBootSequence` because a boot task would have nothing to iterate: the registry is empty at
+      boot by design and `ActiveRepoIndex` is memory-only, so a boot-sequence resume step would run
+      against zero queues forever — the same no-caller defect one level up. `EnsureQueue` is the moment a
+      repo's persisted queue state re-enters the process, and every path into it (`ProvisionRepo`, a
+      jailed spawn, the PR-intake target resolver) is an RPC handler, so the pass necessarily lands after
+      merge-reconcile and the swarm reconciler.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
@@ -1122,7 +1189,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       non-64-hex `sha256`, a duplicate id, a `platformBinary` with no candidate sources or an
       absolute/`..`-escaping path (`BadPlatformBinary` — those paths are handed to `ln`/`cp` in the VM),
       and — critically — an **unpinned version**
-      (`latest`/`@latest`/a range → refused; `@latest` can't even parse)).
+      (`latest`/`@latest`/a range → refused; `@latest` can't even parse). Also validates
+      `settingsPaths`: an unknown `root`, an escaping path, a duplicate entry, or a path shared with
+      `credentialPaths` are all refused — the last because credentials go to the OS keychain and
+      settings to a plaintext per-repo file, so one path in both lists would divert a credential).
+    - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
+      `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
+      re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
+      per-agent worktree — both wiped every spawn, and the workspace one is where claude-code records
+      "don't ask again"), `AdapterSettingsPath.TryParseRoot`/`SpellRoot`/`IsWellFormed` (an unknown root
+      is refused, never defaulted — guessing would decide whether an allowlist lands in the throwaway
+      home or the user's checkout), and `AdapterSettingsPolicy.MaxFileBytes` (256 KiB ceiling on a
+      harvest: the jail's occupant can write these files). Scope is PER REPOSITORY —
+      see [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md)).
     - `AdapterChannel.cs` (`AdapterChannel.EnsureAsync(id)` — idempotent: green probe at the pinned
       version → no-op; else fetch payload → verify SHA-256 against the pin (typed `HashMismatch` refusal)
       → run `installCmd` INSIDE the VM at the pinned version → write config shims → **place the platform
@@ -1167,7 +1246,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       probe, so a marker means 'runnable' — read **fresh per call** (installs happen while the daemon
       runs; caching would make a new CLI unlaunchable until restart) to answer `TryGetLaunch(agentKind)` →
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
-      used to ignore).
+      used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
+      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI

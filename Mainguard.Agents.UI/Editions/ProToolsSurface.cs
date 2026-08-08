@@ -31,6 +31,26 @@ public sealed class ProToolsSurface : IProToolsSurface
         return new AgentCliSettingsViewModel(installer, updater);
     }
 
+    // Toolchains: the curated language-toolchain channel, over the SAME in-VM install host the agent-CLI
+    // channel uses (one way to run a command in the VM, not two). A toolchain installed here lands in the
+    // daemon-owned toolchains root and is bind-mounted READ-ONLY into every new jail — no image rebuild.
+    public object CreateToolchainsPage()
+    {
+        var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
+        var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
+        var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host);
+
+        // Second section: the four-step declaration flow, over the repository the shell currently has
+        // open. That path comes from the ONE place the shell records it (UserPreferences, written by
+        // MainWindowViewModel on every open) rather than a new seam through IProToolsSurface. Empty when
+        // no repo is open — which the flow reports as every step's stated reason, not as a dead page.
+        var repoPath = ProComposition.Settings?.Current.LastOpenedRepoPath;
+        var declaration = new ToolchainDeclarationViewModel(
+            repoPath, new Mainguard.Git.Services.GitService(), channel);
+
+        return new ToolchainSettingsViewModel(channel, declaration);
+    }
+
     // Daemon logs (in-depth per-subsystem logging): the read-only "recent daemon logs" surface over
     // Core's DaemonLogReader (journalctl / tail over the same WSL seam the OOBE health card uses). A
     // fresh reader every time this page is (re)activated — the page wrapper disposes the previous one.

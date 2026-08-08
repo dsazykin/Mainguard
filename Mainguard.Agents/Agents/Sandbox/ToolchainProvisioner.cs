@@ -173,9 +173,22 @@ public sealed class ToolchainProvisioner
                 + "a per-repo toolchain layer is only built on a digest-pinned base.");
         }
 
+        // Every declared id is resolved — an uncatalogued one is a typed refusal here, before anything
+        // is built — but only the IMAGE-LAYER ones produce a layer. A runtime-mount toolchain
+        // (ToolchainDelivery.RuntimeMount) is already installed in the VM because a human installed it,
+        // and reaches the jail as a read-only bind mount; there is nothing to build for it, and building
+        // an empty layer would be a gigabyte of cache and a multi-minute wait for no filesystem change.
         var recipes = declaration.Ids
             .Select(id => ToolchainCatalog.TryGet(id) ?? throw new UnknownToolchainException(repoHandle, id, ToolchainCatalog.KnownIds))
+            .Where(r => r.Delivery == ToolchainDelivery.ImageLayer)
             .ToImmutableArray();
+
+        if (recipes.IsEmpty)
+        {
+            // Declared, resolved, and nothing needs a layer. The caller stays on the base digest, and
+            // the toolchains still reach the jail — through the mount, not the image.
+            return null;
+        }
 
         var tag = ImageTagFor(baseDigest!, declaration, recipes);
         var expectedLabels = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -269,6 +282,10 @@ public sealed class ToolchainProvisioner
         declaration.Ids
             .Select(id => ToolchainCatalog.TryGet(id)
                 ?? throw new UnknownToolchainException(string.Empty, id, ToolchainCatalog.KnownIds))
+            // Same filter as EnsureAsync: the tag names what the LAYER contains, and a runtime-mount
+            // toolchain contributes no layer content. Filtering in both places keeps the tag a faithful
+            // content address rather than a hash over things the image does not hold.
+            .Where(r => r.Delivery == ToolchainDelivery.ImageLayer)
             .ToImmutableArray();
 
     /// <summary>

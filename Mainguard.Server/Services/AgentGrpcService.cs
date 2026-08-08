@@ -75,9 +75,28 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
                     file.Path, file.Content.ToByteArray()));
             }
 
+            // An entry whose root the daemon does not recognise is DROPPED, never defaulted to a tree:
+            // guessing would decide whether a permission allowlist lands in the jail's throwaway home
+            // or in the user's real checkout. The launcher then filters what survives against the
+            // adapter's own declaration, so this is the outer of two gates.
+            System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? cliSettings = null;
+            foreach (var file in request.CliSettings)
+            {
+                if (!Mainguard.Agents.Agents.Adapters.AdapterSettingsPath.TryParseRoot(file.Root, out var root))
+                {
+                    _log.LogWarning("SpawnAgent: dropping cli_settings entry with unknown root '{Root}'", file.Root);
+                    continue;
+                }
+
+                cliSettings ??= new System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
+                cliSettings.Add(new Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile(
+                    root, file.Path, file.Content.ToByteArray()));
+            }
+
             var agentId = await _spawns.SpawnAsync(
                 request.RepoHandle, request.AgentKind, request.ModelApiKey, request.Role,
-                context.CancellationToken, extraEnv, cliCredentials).ConfigureAwait(false);
+                context.CancellationToken, extraEnv, cliCredentials,
+                cliSettings: cliSettings).ConfigureAwait(false);
             return new SpawnAgentResponse { AgentId = agentId };
         }
         catch (RpcException)
@@ -238,7 +257,12 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         }
 
         var result = await _spawns.StopAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
-        var response = new StopAgentResponse { Stopped = result.Stopped, AgentKind = result.AgentKind };
+        var response = new StopAgentResponse
+        {
+            Stopped = result.Stopped,
+            AgentKind = result.AgentKind,
+            RepoHandle = result.RepoHandle,
+        };
         foreach (var file in result.CliCredentials)
         {
             response.CliCredentials.Add(new CliCredentialFile
@@ -248,8 +272,24 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
             });
         }
 
+        foreach (var file in result.CliSettings)
+        {
+            response.CliSettings.Add(ToWire(file));
+        }
+
         return response;
     }
+
+    /// <summary>One harvested settings file on the wire. The root travels as its declared spelling —
+    /// the client stores per (repo, root, path), so an ordinal mismatch here would split one file's
+    /// history into two entries.</summary>
+    private static CliSettingsFile ToWire(Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile file) =>
+        new()
+        {
+            Root = Mainguard.Agents.Agents.Adapters.AdapterSettingsPath.SpellRoot(file.Root),
+            Path = file.RelativePath,
+            Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+        };
 
     /// <summary>
     /// Harvests a live agent's CLI login-state WITHOUT stopping it, so the client can keep the host
@@ -267,7 +307,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         var result = await _spawns.HarvestCredentialsAsync(request.AgentId, context.CancellationToken)
             .ConfigureAwait(false);
 
-        var response = new HarvestAgentCredentialsResponse { AgentKind = result.AgentKind };
+        var response = new HarvestAgentCredentialsResponse
+        {
+            AgentKind = result.AgentKind,
+            RepoHandle = result.RepoHandle,
+        };
         foreach (var file in result.CliCredentials)
         {
             response.CliCredentials.Add(new CliCredentialFile
@@ -275,6 +319,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
                 Path = file.HomeRelativePath,
                 Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
             });
+        }
+
+        foreach (var file in result.CliSettings)
+        {
+            response.CliSettings.Add(ToWire(file));
         }
 
         return response;
