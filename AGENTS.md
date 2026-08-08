@@ -321,6 +321,14 @@ This is not a tidiness rule. `.wslconfig` caps the VM at 10 GB; a single `dotnet
 
 **Related: do not run `dotnet test Mainguard.slnx` (the whole solution) locally while other heavy work is in flight.** Use a targeted `--filter`; CI runs the full suite. And never run the `RequiresDocker` suite on a workstation with live agent jails — see the testing restrictions in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
+### Check `packages.lock.json` before every commit — a WSL build rewrites them
+
+**Building this repo under WSL silently adds a `net10.0/linux-x64` target to three committed lockfiles** (`Mainguard.Agents`, `Mainguard.Git`, `Mainguard.Protos`). No `PackageReference` changed; the restore simply resolved for a RID the committed files were never generated with. Verified: the committed lockfiles contain **zero** `linux-x64` entries, so every WSL build produces this diff.
+
+CI restores with `--locked-mode`, so this either fails somebody's build or gets committed and quietly widens the supply-chain pin — dressed as an intentional dependency change, in a file nobody re-reads.
+
+**So: `git status` before staging, and revert any `packages.lock.json` you did not mean to change.** `git checkout -- '**/packages.lock.json'` is the escape hatch. A lockfile edit is legitimate *only* alongside a deliberate `PackageReference` change, per the restore rule in [`CLAUDE.md`](CLAUDE.md) — and then it should be regenerated with a plain `dotnet restore Mainguard.slnx` and committed with the `.csproj` edit.
+
 ### Two long-lived branches: `main` vs `phase2` (added 2026-07-07)
 
 - **`main` — the core Git client** (Master Implementation Document v1, T-01…T-33), now in
