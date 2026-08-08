@@ -28,7 +28,13 @@ variable used below. **Testing note:** read *"Running the test suite while an ag
 running any Docker-backed test — it covers the unfiltered-run trap, the two Docker daemons, and how a
 severed jail masquerades as a provider outage.
 
-**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
+**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line. `.mainguard/verify`
+has no shell either (it is argv), so chained verify commands need `sh -c "…"`.
+
+**Toolchain:** same as phase 2 — Python 3 installed in **Settings → Toolchains**, done once, lives in
+the VM. Note what it should look like here: the toolchain mount is a **worker** concern. The
+coordinator has no worktree and runs nothing, so a coordinator that somehow needs a toolchain would
+itself be a finding.
 
 ---
 
