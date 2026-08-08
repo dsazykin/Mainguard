@@ -97,7 +97,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken)
                 .ConfigureAwait(false);
         }
+        // MalformedVerificationCommandException is already an InvalidOperationException and so is
+        // caught below; it is named explicitly because the whole point of the type is that it must
+        // NEVER become a RunVerificationResponse with Passed=false. A refusal here says "the command
+        // could not be run and why"; a response would say "your tests failed" about a command that
+        // never started.
         catch (Exception ex) when (ex is NoVerificationCommandException
+            or MalformedVerificationCommandException
             or Mainguard.Git.Exceptions.ToolchainProvisioningException
             or InvalidOperationException)
         {
