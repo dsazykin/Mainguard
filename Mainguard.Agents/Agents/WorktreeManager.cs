@@ -362,6 +362,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             // No `-b`: check out the EXISTING branch. `-b` is what makes CreateAgentWorktree a creation,
             // and it is the one character between resuming the work and starting an empty branch under
             // the same name.
+            // MUTATION M12 (DO NOT MERGE): the adopted branch is silently reset to main before
+            // checkout. The jail still stands on agent/<id> — it just no longer carries the dead
+            // jail's commits. This is the precise shape of "resume looked like it worked".
+            AgentGitCommand.Run(agentRepoPath, "branch", "-f", branch, "main");
             AgentGitCommand.Run(agentRepoPath, "worktree", "add", worktreePath, branch);
             FinishWorktreeLocked(repoHash, agentId, worktreePath, agentRepoPath);
         }
