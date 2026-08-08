@@ -792,6 +792,15 @@
     (AwaitingReview/Conflict), suppressed when the app is foregrounded on that agent; first observation
     baselines silently; `IAgentNotifier` seam with the `WindowNotificationManager`-backed default + a
     fake for tests).
+  - `SpawnProgressWatchdog.cs` (the spawn RPC's deadline, measured from the daemon's **last sign of
+    life** rather than from the start of the call. `SpawnAgent` carried a flat 5-minute gRPC deadline; a
+    first run builds the repo's ~2.9 GB toolchain image inside that call, so the client hung up on a
+    working launch — and destructively, since the cancelled server call makes the daemon tear the session
+    and worktree down. A bigger constant only moves the cliff, so the budget bounds SILENCE: each
+    launch-progress delta re-arms it, and a build that keeps reporting runs as long as it needs.
+    `DaemonBackedOrchestrator` still passes a 60-minute hard cap as the gRPC deadline, so a daemon that
+    chatters without progressing is bounded too — the false timeout was traded for a bounded one, never
+    for an infinite wait. A user's Stop stays an `OperationCanceledException`, never a timeout.)
   - `DaemonBackedOrchestrator.cs` (**P2-47**: the real, DaemonClient-backed implementation of every
     control-center seam —
     `IAgentService`/`IMergeQueueService`/`ICoordinatorService`/`IKillSwitchService`/`ITelemetryService`/`IVibeService`

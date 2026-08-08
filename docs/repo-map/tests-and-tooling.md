@@ -942,7 +942,24 @@
   (the user-facing progress line: reported BEFORE the build rather than after — asserted by snapshotting
   the builder's call count at report time, not by statement order — the ready line after, nothing at all
   on a cache hit, and a null sink changing nothing; this is the daemon end of the channel that turns a
-  multi-minute first-run image build into visible progress instead of a hang) plus, in
+  multi-minute first-run image build into visible progress instead of a hang),
+  `ToolchainBuildDeduplicationTests` (one build per image ACROSS SPAWNS — asserted through **two separate
+  provisioner objects**, which is the shape production has and the shape the old per-instance
+  `SemaphoreSlim` could not serialise; a test reusing one provisioner passes against the broken code,
+  which is how the false claim survived. Covers the injected gate AND the production default, that
+  different images do not block each other, that a waiter says it is waiting, that a cancelled first
+  spawn leaves the gate usable, and that the gate leaks no entry),
+  `ToolchainBuildHeartbeatTests` (a SILENT build still reports every interval — the property that keeps
+  the beat honest for `dotnet-10`'s silent tarball step — the line quotes the engine's newest output when
+  there is any, nothing is reported after disposal, and a long build keeps the spawn's progress sink
+  talking with DISTINCT lines, since the daemon's session store drops an identical repeat),
+  `SpawnProgressWatchdogTests` + `SpawnWatchdogWiringTests` (the client end: a spawn that keeps reporting
+  survives ten half-budgets of simulated time, one that goes silent is CANCELLED and quotes what it last
+  heard, one that never spoke fails without inventing a last line, a user's Stop stays a cancel — and the
+  wiring half drives the real `ApplyAgentEvent` with real `AgentEvent`s so the daemon→watchdog join
+  cannot silently go inert, including that a running agent's chatter does NOT vouch for a wedged spawn.
+  Both files avoid `Assert.ThrowsAsync<TimeoutException>(() => task.WaitAsync(budget))`, which goes GREEN
+  for a watchdog that cancels nothing — the helper asserts the task ENDED first) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
   claim per test on purpose, since xUnit stops at the first failing assertion and a five-assertion
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares

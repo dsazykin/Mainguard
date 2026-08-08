@@ -62,12 +62,35 @@ public sealed class DaemonBackedOrchestrator :
     /// makes the keychain warm enough that losing this one costs at most the last interval.</summary>
     private static readonly TimeSpan ShutdownHarvestBudget = TimeSpan.FromSeconds(5);
 
-    /// <summary>SpawnAgent runs the daemon's whole provision chain (worktree + hardened container +
-    /// CLI bind under a PTY) — on a cold start that is well past the client's 10 s RPC default, whose
-    /// expiry cancelled the server-side spawn mid-provision and tore it down (the "never starts on
-    /// the first try" field bug). Stop still aborts the wait through the cancellation token, and the
-    /// surface's connect watchdog keeps the long wait honest.</summary>
-    private static readonly TimeSpan SpawnDeadline = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// How long the daemon may say NOTHING about a spawn in flight before the client gives up on it.
+    ///
+    /// <para>This replaces a flat 5-minute gRPC deadline on <c>SpawnAgent</c>, which was measuring the
+    /// wrong thing. SpawnAgent runs the whole provision chain — including, on a first run for a
+    /// repository, the toolchain image build, which for <c>dotnet-10</c> is ~2.9 GB and routinely takes
+    /// longer than five minutes on a fresh machine. The deadline then cancelled the server call, the
+    /// daemon tore the half-made spawn down as a failure, and the next attempt started the same build
+    /// over: a healthy launch reported as a hang, on every fresh environment.</para>
+    ///
+    /// <para>A bigger constant would only move the cliff. Since PR #319/#320 the daemon reports launch
+    /// progress as state deltas on the spawning session, and this client already reads that stream —
+    /// so the budget bounds SILENCE instead of duration (<see cref="SpawnProgressWatchdog"/>). A build
+    /// that keeps reporting runs as long as it needs; a spawn that goes quiet is still reported, with
+    /// what it last said.</para>
+    /// </summary>
+    /// <remarks>Settable so a test can drive the whole event→watchdog wiring in milliseconds instead of
+    /// minutes — the same shape as <c>ControlCenterViewModel.CoordinatorConnectTimeout</c>. It changes the
+    /// budget only, never what is measured.</remarks>
+    internal static TimeSpan SpawnSilenceBudget { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// The outer bound on a spawn, carried as the gRPC deadline, so removing the false timeout does not
+    /// create an unbounded wait. It is deliberately far past any healthy launch (a cold toolchain build
+    /// plus a container start), because it exists to stop a pathological case — a daemon that keeps
+    /// emitting lines while getting nowhere would never trip the silence budget — and not to police a
+    /// slow one.
+    /// </summary>
+    private static readonly TimeSpan SpawnHardCap = TimeSpan.FromMinutes(60);
 
     private readonly DaemonClient _client;
     private readonly bool _ownsClient;
@@ -96,6 +119,10 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>Whether a resource tick has EVER arrived. Before the first one there is nothing to report,
     /// which is not the same as a fleet reading zero.</summary>
     private bool _haveResourceTick;
+    /// <summary>The spawns currently in flight, each watching for the daemon going silent. A list rather
+    /// than a single slot because a coordinator start and a queue-entry resume can overlap, and a launch
+    /// that is making progress must not be cancelled by another one's quiet.</summary>
+    private readonly List<SpawnProgressWatchdog> _spawnWatchdogs = new();
     private string _mainSha = string.Empty;
     private long _totalUsdMicros;
     private long _totalTokens;
@@ -477,7 +504,9 @@ public sealed class DaemonBackedOrchestrator :
 
     // ---- projection appliers --------------------------------------------
 
-    private void ApplyAgentEvent(Proto.AgentEvent e)
+    /// <remarks>Internal rather than private so a test can drive the daemon→watchdog wiring with real
+    /// <c>AgentEvent</c> messages; the live agent-event pump is the only production caller.</remarks>
+    internal void ApplyAgentEvent(Proto.AgentEvent e)
     {
         switch (e.EventCase)
         {
@@ -534,6 +563,16 @@ public sealed class DaemonBackedOrchestrator :
                     _ = ResyncAgentsAsync();
                 }
 
+                // A still-provisioning session that reports a reason is the daemon telling us what a
+                // spawn is DOING (the toolchain build's progress lines). That is the evidence the spawn
+                // watchdogs measure, so it is fed to them here — the only place it arrives. Restricted to
+                // the provisioning state on purpose: a running agent's chatter must not vouch for a
+                // different spawn that is wedged.
+                if (newState == AgentLifecycleState.Provisioning && reason.Length > 0)
+                {
+                    NoteSpawnProgress(reason);
+                }
+
                 // Egress block-notification fallback (Fix 2): a CLI that DIED with a "couldn't reach HOST"
                 // reason was almost certainly refused by the default-deny proxy — surface it so the operator
                 // can unblock the host and retry, instead of a silent exit-1.
@@ -553,6 +592,65 @@ public sealed class DaemonBackedOrchestrator :
         EventReceived?.Invoke(new AgentEvent(
             Interlocked.Increment(ref _seq), e.EventCase.ToString(), e.AgentId, string.Empty, DateTimeOffset.UtcNow));
         Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Feeds one launch-progress line to every spawn currently in flight. Called from the agent-event
+    /// pump thread.
+    ///
+    /// <para>Fanned out rather than routed by agent id, and that is deliberate: the client does not learn
+    /// the id until <c>SpawnAgent</c> RETURNS, which is precisely the moment the wait it is trying to
+    /// survive has already ended. Over-crediting is bounded — only provisioning-state deltas reach here,
+    /// so the only thing that can extend a spawn's budget is another spawn genuinely provisioning — and
+    /// the hard cap bounds it regardless.</para>
+    /// </summary>
+    private void NoteSpawnProgress(string line)
+    {
+        SpawnProgressWatchdog[] watching;
+        lock (_gate)
+        {
+            if (_spawnWatchdogs.Count == 0)
+            {
+                return;
+            }
+
+            watching = _spawnWatchdogs.ToArray();
+        }
+
+        foreach (var watchdog in watching)
+        {
+            watchdog.NoteProgress(line);
+        }
+    }
+
+    /// <summary>
+    /// Runs one spawn RPC under the silence budget: registers a watchdog for the duration, gives the call
+    /// the hard cap as its gRPC deadline, and unregisters at the end.
+    ///
+    /// <para>Both spawn routes go through here — starting a coordinator and resuming a stranded queue
+    /// entry — because both run the identical daemon provision chain, toolchain build included, and the
+    /// resume path inherited exactly the same five-minute cliff.</para>
+    /// </summary>
+    internal async Task<T> SpawnUnderWatchdogAsync<T>(
+        Func<CancellationToken, TimeSpan, Task<T>> call, CancellationToken ct)
+    {
+        var watchdog = new SpawnProgressWatchdog(SpawnSilenceBudget);
+        lock (_gate)
+        {
+            _spawnWatchdogs.Add(watchdog);
+        }
+
+        try
+        {
+            return await watchdog.RunAsync(token => call(token, SpawnHardCap), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _spawnWatchdogs.Remove(watchdog);
+            }
+        }
     }
 
     private void ApplyQueueUpdate(Proto.QueueUpdate update)
@@ -1321,11 +1419,15 @@ public sealed class DaemonBackedOrchestrator :
         var key = provider is null ? null : _keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider));
         var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(agentKind)));
 
-        var response = await _client.ResumeAgentAsync(
-            repoHandle!, agentId, agentKind, key ?? string.Empty, cts.Token,
-            deadline: SpawnDeadline,
-            extraEnv: CollectCustomEnvKeys(),
-            cliCredentials: savedLogin.Count > 0 ? savedLogin : null).ConfigureAwait(false);
+        // Same provision chain as a fresh spawn (toolchain build included), so the same silence-bounded
+        // wait rather than a flat deadline that a cold first build outruns.
+        var response = await SpawnUnderWatchdogAsync(
+            (token, deadline) => _client.ResumeAgentAsync(
+                repoHandle!, agentId, agentKind, key ?? string.Empty, token,
+                deadline: deadline,
+                extraEnv: CollectCustomEnvKeys(),
+                cliCredentials: savedLogin.Count > 0 ? savedLogin : null),
+            cts.Token).ConfigureAwait(false);
 
         if (!response.Resumed)
         {
@@ -1527,12 +1629,16 @@ public sealed class DaemonBackedOrchestrator :
         // repo handle, so an approval made in another repository is not in this list at all.
         var savedSettings = _cliSettings.Load(repoHandle!, cli.Id);
 
-        var agentId = await _client.SpawnAgentAsync(
-            repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
-            ct, deadline: SpawnDeadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
-            extraEnv: CollectCustomEnvKeys(),
-            cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
-            cliSettings: savedSettings.Count > 0 ? savedSettings : null).ConfigureAwait(false);
+        // The wait is bounded by SILENCE, not by duration: a first start for this repository builds its
+        // toolchain image inside this call and legitimately outruns any fixed budget.
+        var agentId = await SpawnUnderWatchdogAsync(
+            (token, deadline) => _client.SpawnAgentAsync(
+                repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
+                token, deadline: deadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
+                extraEnv: CollectCustomEnvKeys(),
+                cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
+                cliSettings: savedSettings.Count > 0 ? savedSettings : null),
+            ct).ConfigureAwait(false);
 
         lock (_gate)
         {

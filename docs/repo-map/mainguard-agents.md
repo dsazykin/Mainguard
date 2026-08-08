@@ -720,10 +720,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `git show <mainBranch>:.mainguard/toolchain` against the daemon-side bare mirror, which no jail can
       write).
     - `ToolchainProvisioner.cs` (takes an optional `IProgress<string>` alongside its daemon-log sink and
-      reports `BuildingMessage(declaration)` **before** the build and `BuiltMessage` after, only on a real
+      reports `BuildingMessage(declaration)` **before** the build, `StillBuildingMessage(…)` every 20 s
+      **during** it (`ToolchainBuildHeartbeat.cs`), `WaitingForBuildMessage(…)` while queued behind another
+      spawn's identical build, and `BuiltMessage` after — only on a real
       build and never on a cache hit — this is the one launch step that runs for MINUTES, and without a
       user-facing line for it the coordinator surface had nothing to show and fell through to "the
-      coordinator isn't responding … use Stop to cancel and try again", which killed the build; builds the
+      coordinator isn't responding … use Stop to cancel and try again", which killed the build. **The
+      build gate is `ToolchainBuildGate.Shared`, NOT a field on this object**: the launcher builds a new
+      provisioner per spawn, so the old per-instance `SemaphoreSlim` serialised nothing across spawns and
+      two agents really could run two identical multi-GB builds — the comment claimed otherwise and was
+      wrong about the only case that mattered. Builds the
       layer
       `FROM <the bare digest the spawn preflight just resolved>`, so **MG-27's pin is inherited rather
       than bypassed**, and hands the launcher the layer's OWN content digest. **The FROM is a BARE digest
@@ -746,6 +752,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       share one layer and a comment edit rebuilds nothing, while a layer built on an older base is a
       different artefact by construction; a cache hit re-checks the provenance labels because a local tag
       is a name, not evidence).
+    - `ToolchainBuildGate.cs` (the **process-wide** "one build per toolchain image, across every spawn"
+      gate, keyed by the content-addressed image TAG — the same inputs (base digest × declaration ×
+      rendered Dockerfile) that decide whether two builds would produce the same layer, so two repos
+      declaring `dotnet-10` share one build and a changed declaration never queues behind a build that
+      cannot satisfy it. It **serialises rather than joins** (unlike
+      `SandboxImageProvisioningTracker`, which hands the second caller the first's task): joined callers
+      share a fate, so one user's Stop would cancel another spawn's build, and the second caller would
+      inherit the first's cancellation token and progress sink. The waiter reports every 20 s, because a
+      silent wait is indistinguishable from a hang to every watchdog upstream. Ref-counted, so a daemon
+      running for weeks keeps no dead semaphore per declaration.)
+    - `ToolchainBuildHeartbeat.cs` (keeps a running build AUDIBLE: one line per interval for as long as
+      the build call is outstanding, carrying elapsed time and the engine's last output. Deliberately
+      **not** gated on engine output — `dotnet-10`'s slowest step is a silent `curl -fsSL … | tar`, so a
+      beat that required engine chatter would go quiet during the healthiest, longest part of the build,
+      which is the original bug in a new costume. Disposal is awaited, so no line can arrive after the
+      build it describes ended.)
     - `DockerToolchainImageBuilder.cs` (the Docker implementation: a **one-file** in-memory tar build
       context — the generated Dockerfile has no `COPY`/`ADD` and the context has nothing to copy, so the
       layer's only inputs are the pinned base plus the recipes' checksum-verified fetches; it reads the
