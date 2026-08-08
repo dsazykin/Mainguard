@@ -77,6 +77,21 @@ public sealed class NoVerificationCommandException : InvalidOperationException
     public NoVerificationCommandException(string message) : base(message) { }
 }
 
+/// <summary>
+/// Thrown when a verification command's shell operators survived tokenisation — i.e. the repository
+/// wrote a command that needs a shell, on a path that has none.
+///
+/// <para>Deliberately an <see cref="InvalidOperationException"/> so it lands with the other
+/// <b>refusals</b> at the RPC boundary (<c>FailedPrecondition</c>) rather than anywhere near a
+/// <see cref="VerificationRecord"/>. That placement is the fix: the failure being prevented is not
+/// "the command is wrong", it is "the command is wrong AND the queue reported it as the repository's
+/// tests failing".</para>
+/// </summary>
+public sealed class MalformedVerificationCommandException : InvalidOperationException
+{
+    public MalformedVerificationCommandException(string message) : base(message) { }
+}
+
 /// <summary>The persistence seam for merge-queue state (daemon SQLite; in-memory in tests).</summary>
 public interface IMergeQueueStore
 {
