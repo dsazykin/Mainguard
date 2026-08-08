@@ -148,8 +148,13 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
         }
     }
 
-    public async Task BuildAsync(
+    public Task BuildAsync(
         string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels, CancellationToken ct = default)
+        => BuildAsync(imageRef, dockerfile, labels, engineOutput: null, ct);
+
+    public async Task BuildAsync(
+        string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels,
+        IProgress<string>? engineOutput, CancellationToken ct = default)
     {
         await using var context = BuildContext(dockerfile);
 
@@ -181,12 +186,16 @@ public sealed class DockerToolchainImageBuilder : IToolchainImageBuilder
             if (!string.IsNullOrEmpty(message.Stream))
             {
                 Append(output, message.Stream!);
+                // Forwarded LIVE, unlike `output`, which is only ever read on a failure. Upstream this
+                // is what lets a running build say so while it runs instead of after it ends.
+                engineOutput?.Report(message.Stream!);
             }
 
             if (!string.IsNullOrEmpty(message.Status))
             {
                 var id = string.IsNullOrEmpty(message.ID) ? string.Empty : message.ID + ": ";
                 Append(output, $"[status] {id}{message.Status}\n");
+                engineOutput?.Report($"{id}{message.Status}");
             }
         });
 
