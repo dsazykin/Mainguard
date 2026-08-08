@@ -117,7 +117,10 @@
       <!-- Diff readout: the shipped diff tints over the ranked hunks (composed, not recomputed). -->
       <Border Grid.Column="1" Margin="4,0,0,0" CornerRadius="8" Background="{DynamicResource SurfaceDeep}"
               BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
-        <ScrollViewer>
+        <!-- The one place on this surface that genuinely needs to scroll sideways: diff lines are source
+             code, so wrapping them would break the column alignment that makes a diff readable. Without
+             this, a long line was simply clipped at the pane edge with no way to reach the rest. -->
+        <ScrollViewer HorizontalScrollBarVisibility="Auto">
           <ItemsControl ItemsSource="{Binding Files}" Margin="4">
             <ItemsControl.ItemTemplate>
               <DataTemplate x:DataType="vm:ReviewFileRowViewModel">

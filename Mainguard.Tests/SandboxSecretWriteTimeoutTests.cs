@@ -192,6 +192,62 @@ public class SandboxSecretWriteTimeoutTests
         Assert.DoesNotContain("cat > \"$1\"", shell, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The secret write execs AS THE SECRET'S OWNER and never chowns.
+    ///
+    /// <para>It used to exec as uid 0 and chown the file to its owner — "root, so chown to the supervisor
+    /// uid is permitted". That premise was false for this container's whole life. A jail carries a
+    /// non-root <c>User</c> AND <c>no-new-privileges</c>, and on Docker 20.10.24 — the engine
+    /// <c>MainguardEnv</c> ships — an exec in such a container is given an EMPTY permitted/effective
+    /// capability set even when it asks for uid 0. Measured on the owner's VM: <c>uid=0</c>,
+    /// <c>CapPrm: 0000000000000000</c> against a bounding set of <c>fb</c>, and
+    /// <c>chown: changing ownership of '/run/secrets/agent.env.partial': Operation not permitted</c>.
+    /// The spawn then destroyed the container and the coordinator could not start at all.</para>
+    ///
+    /// <para>This is the engine-independent guard on the write half (<c>ContainerSpecBuilderTests</c>
+    /// owns the mount half). It matters that it lives here rather than in the RequiresDocker leg: the
+    /// end-to-end secret-delivery test asserts exactly the right outcome and still could not have caught
+    /// this, because it only ever runs against a modern engine (Engine 29.4.3 in CI and on Docker
+    /// Desktop), where the very same exec DOES get <c>CapPrm: fb</c> and the old chown succeeded.</para>
+    /// </summary>
+    [Fact]
+    public async Task SecretWrite_RunsAsTheSecretsOwner_AndNeverChowns()
+    {
+        const int SupervisorUid = 1001;
+        var stdin = new FakeStdinTransport { Hang = false };
+        await EngineOver(new FakeDockerClient(), stdin).WriteSecretFileAsync(
+            ContainerId, SecretPath, Secret, SupervisorUid, CancellationToken.None);
+
+        var sent = Assert.Single(stdin.Ran);
+
+        // The exec identity IS the fix: the owner creates its own file in a tmpfs directory Docker
+        // mounted owned by that uid, so the file is correctly owned the moment it exists.
+        Assert.Equal(SupervisorUid.ToString(), sent.User);
+        Assert.NotEqual("0", sent.User);
+
+        // …and nothing on the path asks for a privilege the exec provably does not have.
+        var shell = string.Join(" ", sent.Command);
+        Assert.DoesNotContain("chown", shell, StringComparison.Ordinal);
+
+        // Owner-chmod needs no capability and is still the G-13 control, so it must remain.
+        Assert.Contains("chmod 0400 \"$1.partial\"", shell, StringComparison.Ordinal);
+    }
+
+    /// <summary>The owner argument is honoured rather than ignored: a second secret with a different
+    /// owner must exec as that different uid. Asserting one uid alone would pass against an
+    /// implementation that hard-coded the agent's.</summary>
+    [Fact]
+    public async Task SecretWrite_ExecsAsWhicheverOwnerItIsGiven()
+    {
+        var stdin = new FakeStdinTransport { Hang = false };
+        var engine = EngineOver(new FakeDockerClient(), stdin);
+
+        await engine.WriteSecretFileAsync(ContainerId, SecretPath, Secret, 1000, CancellationToken.None);
+        await engine.WriteSecretFileAsync(ContainerId, "/run/secrets/supervisor/oob.key", Secret, 1001, CancellationToken.None);
+
+        Assert.Equal(new[] { "1000", "1001" }, stdin.Ran.Select(r => r.User).ToArray());
+    }
+
     [Fact]
     public async Task SecretWrite_WhenTheInJailShellFails_ThrowsInsteadOfReportingSuccess()
     {

@@ -120,6 +120,24 @@
         <Setter Property="Background" Value="{DynamicResource DangerHover}"/>
     </Style>
 
+    <!-- Quiet destructive: a destructive action that must NOT compete with the view's one accent CTA.
+         Same shape as Button.Secondary (unfilled, hairline) but its text and border carry the danger
+         token, so it reads as destructive by hue rather than by mass. Button.Danger is the filled form,
+         for the moment a destructive action IS the primary action of its surface (a confirmation step);
+         this is the form for a destructive action sitting beside one — e.g. the merge-queue rail, where
+         the single accent is deliberately reserved for the Review CTA and a filled red Discard on every
+         row would out-shout it. Uses existing tokens only; adds none. -->
+    <Style Selector="Button.DangerQuiet">
+        <Setter Property="Background" Value="{DynamicResource SurfaceHoverGhost}"/>
+        <Setter Property="Foreground" Value="{DynamicResource DangerBrush}"/>
+        <Setter Property="BorderThickness" Value="1"/>
+        <Setter Property="BorderBrush" Value="{DynamicResource BorderHairline}"/>
+        <Setter Property="CornerRadius" Value="6"/>
+    </Style>
+    <Style Selector="Button.DangerQuiet:pointerover /template/ ContentPresenter">
+        <Setter Property="Background" Value="{DynamicResource SurfaceHover}"/>
+    </Style>
+
     <!-- Secondary / cancel: transparent, muted, hairline border -->
     <Style Selector="Button.Secondary">
         <Setter Property="Background" Value="{DynamicResource SurfaceHoverGhost}"/>

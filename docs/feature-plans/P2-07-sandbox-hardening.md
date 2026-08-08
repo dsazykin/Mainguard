@@ -124,7 +124,9 @@ HostConfig:
   Memory        = limits.MemoryBytes; PidsLimit = limits.Pids
   ReadonlyRootfs= true where the base image tolerates it (rw /tmp, /home/agent via tmpfs/volumes)
   Mounts        = [{ Source: <ext4 worktree>, Target: /workspace, Type: bind }]   // ext4 ONLY
-  Tmpfs         = { "/dev/shm": "", "/run/secrets": "size=1m,mode=0700" }
+  Tmpfs         = { "/dev/shm": "", "/run/secrets": "size=1m,mode=0711",
+                    "/run/secrets/agent":      "size=1m,mode=0700,uid=<agent>,gid=<agent>",
+                    "/run/secrets/supervisor": "size=1m,mode=0700,uid=<sup>,gid=<sup>" }
   NetworkMode   = <internal agent network>
 Env             = HTTP_PROXY/HTTPS_PROXY/NO_PROXY → proxy; never secrets (G-13)
 ```
@@ -138,12 +140,22 @@ typed builder error, not a warning.
 
 ### 3.2 Credentials tmpfs (+ G2 key custody)
 
-Spawn writes `BuildEnvFileContent` output into the container's `/run/secrets/agent.env` via
+Spawn writes `BuildEnvFileContent` output into the container's `/run/secrets/agent/agent.env` via
 Docker exec/attach copy after start (content never on persistent disk, never in `Env`, never
 argv), `chmod 0400`, owner = agent uid. Adapter launch sources it. **Per-agent** tmpfs: no
 `~/.claude` or global auth-dir mounts, ever (invariant).
 
-**The OOB session HMAC key `K` lives on a *separate* tmpfs file** (`/run/secrets/oob.key`),
+**Each secret is created BY ITS OWNER, never chowned to it.** The two secrets live in per-owner `0700`
+tmpfs directories that Docker mounts (daemon-side, as real root) already owned by the right uid, under a
+root-owned `0711` `/run/secrets`. The earlier flat layout needed a uid-0 exec to `chown` each file after
+writing it, and that could never work: a jail carries a non-root `User` **and** `no-new-privileges`, and
+on Docker 20.10.24 — the engine `MainguardEnv` ships — such a container's exec gets an EMPTY
+permitted/effective capability set even when it asks for uid 0 (measured: `uid=0`,
+`CapPrm: 0000000000000000` against bounding `fb`), so every write failed
+`chown: … Operation not permitted` and no coordinator could start. Owner-creation needs no capability
+at all and is correct with or without a daemon-level userns remap.
+
+**The OOB session HMAC key `K` lives on a *separate* tmpfs file** (`/run/secrets/supervisor/oob.key`),
 mode **0400, owned by the dedicated supervisor uid ≠ the agent-CLI uid** (OPS decision C / G2
 control 1). The agent uid must be unable to obtain `K` by **any** path — file read (closed by
 control 1) or supervisor memory scrape (closed by controls 3+4, hardened by control 2 — §3.6).
@@ -262,7 +274,7 @@ hard dependency (rejection trigger). Keep the interface engine-agnostic (no Dock
 | **A6:** `git push`/`receive-pack` through the proxy | refused (no code path) + audited |
 | **A6:** fetch of a non-allowlisted host+org prefix through the proxy | refused, transparency-logged |
 | **F5:** `go get`/npm fetch of a non-declared VCS dependency | scoped-out (declared-dep proxy) **or** transparency line + P2-44 anomaly — never silent |
-| **G2:** agent uid reads `/run/secrets/oob.key` | denied (0400 + supervisor uid) |
+| **G2:** agent uid reads `/run/secrets/supervisor/oob.key` | denied — and now denied one level earlier: the agent uid cannot open, list or write the supervisor's `0700` directory at all, so it never reaches the file's own `0400` |
 | **G2:** agent uid `ptrace`/`process_vm_readv` against the supervisor process | denied (seccomp denylist + no `CAP_SYS_PTRACE`; yama backstop) — zero key bytes obtained |
 
 ---

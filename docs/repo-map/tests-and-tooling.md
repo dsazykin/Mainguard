@@ -13,6 +13,32 @@
     "checksum"), one CLI failing doesn't stop the others, skip finishes with zero CLIs, an
     already-installed CLI isn't re-offered, Cancel leaves no row spinning, and a catalog-read failure
     still lets the user through.
+  - **`Mainguard.Tests/ToolchainDeclarationFlowTests.cs`** — the four-button declaration flow, driven
+    against a REAL temporary git repository (never a mock of git): `master` is treated as the default
+    branch **dynamically**, so hardcoding `main` fails here — the owner's repo is `master`; Write file
+    writes the working tree and stages NOTHING, asserted against the repository's own index rather than
+    the view model (`repo.Index[path]` is null, the entry is `NewInWorkdir`) because a VM flag can agree
+    with itself while the index disagrees; Stage & commit produces exactly ONE commit touching exactly
+    that path and does NOT push; a dirty tree and a non-default branch are REFUSED with a reason and
+    **nothing is stashed and nothing is checked out**; every disabled button exposes a non-empty reason;
+    and `Refresh` RE-MEASURES, so a file deleted behind the app's back is seen. The last two caught the
+    first implementation staging inside step 1 — one violation, two red tests.
+  - **`Mainguard.Tests/ToolchainSettingsUiTests.cs`** — the Settings **Toolchains** page (the human
+    half of the user-managed toolchain channel) driven over a fake `IAdapterInstallHost` with the REAL
+    `ToolchainChannel`, so the shipped fetch → sha256-verify → unpack → run-it policy executes minus
+    the VM: the list's installed state comes from the PROBE, a toolchain that runs at the WRONG version
+    is reported as NOT installed (with both versions named), install flips the row and writes the
+    registry marker LAST, an install refusal names its cause ("checksum") and leaves the row
+    retryable + the command enabled, Remove flips the row back and RE-PROBES (a failed remove
+    re-attaches its cause to the rebuilt row), and a catalog-read failure explains itself instead of
+    throwing. Also the ViewModel-level `Row…ShouldRepublish…` twins of
+    `AgentCliUiTests.Settings_Row*`: Install/Remove live on the parent but read ROW state, so the
+    parent must bridge row `PropertyChanged` → `NotifyCanExecuteChanged()` or the buttons render
+    visible and permanently dead.
+  - **`Mainguard.Tests/Headless/ToolchainSettingsRenderHarness.cs`** — the Toolchains page in all five
+    themes × list/installing/failure/loading/load-error →
+    `artifacts_headless/toolchain_settings_<Theme>_<state>.png` (the `list` state deliberately includes
+    the "a different version is present" row and a long-name truncation row).
   - **`Mainguard.Tests/AddReposToOsViewModelTests.cs`** — the post-setup Add-Repos-to-Mainguard-OS
     window over the same fake seams as `OobeRepoOnboardingTests`: honest empty scan, per-row failure
     isolation with a live retry, the named daemon-unreachable cause (never a crash), quiet idempotent
@@ -22,6 +48,23 @@
     themes × list/installing/failure/loading/load-error →
     `artifacts_headless/agent_cli_settings_<Theme>_<state>.png` (`OobeWizardRenderHarness` gained the
     picker's `clis_pick`/`clis_installing`/`clis_results` states).
+  - **`Mainguard.Tests/Headless/RowCommandEnablementTests.cs`** — the "visible but permanently
+    disabled button" regression (owner: *"the update cli button isn't clickable"*). Renders the real
+    `AgentCliSettingsView`, flips a row's `UpdateAvailableVersion` / `PreviousVersion` / `IsInstalled`,
+    and asserts the rendered `Button.IsEffectivelyEnabled` — deliberately NOT visibility, which is the
+    half that always worked. Pins the whole class: the per-row Install/Update/Revert commands live on
+    `AgentCliSettingsViewModel` but their `CanExecute` reads ROW state, so the parent must bridge row
+    `PropertyChanged` → `…Command.NotifyCanExecuteChanged()` (`[NotifyCanExecuteChangedFor]` on the
+    parent's `IsBusy` covers only half of it). The ViewModel-level twins that pin the notification
+    itself live in `AgentCliUiTests.Settings_Row*`.
+  - **`Mainguard.Tests/Headless/MainWindowShellRenderHarness.cs`** — the real `MainWindow` shell:
+    top-nav/toolbar + opening overlay (`mainwindow_shell.png`), the Settings window's pinned-menu
+    picker (`settings_window.png`), and BOTH toast hosts pinned to the **bottom-right** corner with
+    measured geometry (not eyeballed) plus five-theme PNGs — the dashboard stack
+    (`toasts_stacked_<Theme>.png`) and the shell-level stack
+    (`shell_toasts_bottom_right_<Theme>.png`), the latter also covering upward stacking order. The
+    position tests exist because the shell host lost its `Grid.Row="1"` and rendered top-right out of
+    the title-bar row; they fail with the measured y-offset rather than a bare boolean.
   - `StartupShutdownRenderHarness` (owner design 2026-07-17) renders `StartupWindow` + `ShutdownWindow`
     in all five themes across the key states (`loading_early`, `upgrade_consent`, `upgrade_running`,
     `degraded`, and the shutdown `stopping_vm`/`releasing`), plus the `MainWindow` degraded banner —
@@ -52,10 +95,52 @@
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
   coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
-  states, PNGs to `artifacts_headless/`; the **P2-10 suite** — `MergeQueueStateMachineTests`
+  states, PNGs to `artifacts_headless/`;
+  **`Headless/ControlCenterPanelSizingRenderHarness.cs`** — the Control Center's panel *sizing*, which
+  the harness above cannot see because `MockOrchestrator`'s fixtures are short friendly strings
+  ("Loom-3", "fix/auth-refresh") while `DaemonBackedOrchestrator` projects `Name = AgentId` (32 hex)
+  and `Branch = agent/<id>`. Rewrites the rail's entries to production id lengths, then asserts the
+  merge-queue seam is a real draggable/keyboard-resizable `GridSplitter`, that widening the window
+  widens the queue (bounded at 640px), that no queue text is arranged past the rail's right edge
+  (**geometric** overflow — `TextLayout.HasCollapsed` alone is vacuous here, a horizontal `StackPanel`
+  measures at infinite width and never trims), that the telemetry row resizes and still collapses when
+  Conversation Deck hides it, and that the seam's hover accent is a different colour from its rest
+  state in every theme. PNGs: `control_center_sizing_<narrow|default|wide>_<Theme>.png`,
+  `control_center_seam_hover_<Theme>.png`;
+  plus `Capture_VerifyTrigger_OnQueueRail_AllFiveThemes`
+  (`queue_verify_trigger_<Theme>.png` — the Verify affordance on the merge-queue rail, asserting it is
+  offered on an unverified entry and WITHHELD while one is already `Verifying`) and
+  `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
+  row);
+  the **P2-10 suite** — `MergeQueueStateMachineTests`
   (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
-  `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`),
+  `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`, and the
+  **entry-lifecycle** block — discard from `Working` is terminal/not-`Merged`/persisted with actor +
+  reason, an untracked id cannot be discarded into existence, a discard mid-verification beats the run
+  that finishes after it, a discarded entry leaves the live queue but survives a restart as a record
+  `EnsureEntry` cannot resurrect, `ClearStalledVerification` unsticks a `Verifying` row with no run and
+  is refused while one is live, `NotifyNewCommits` on a discarded entry is a no-op rather than the
+  illegal `Discarded → Working` throw a terminal guard naming only `Merged`/`Rejected` produced, and
+  neither action appears on `IMergeQueue`; plus the **two-armed restart resume** — jail alive re-runs and
+  reaches `Verified`, jail gone returns the entry to `Working` having executed nothing and audited
+  `verification_restart_resume outcome=stranded` rather than a human's `stalled_verification_cleared`,
+  and a genuinely in-flight run is skipped by both arms; plus the discard-wins-the-race pair — a discard
+  landing inside the jail probe is not reported as re-run, and `RunVerificationAsync` on an entry that went
+  terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`),
+  `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
+  older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
+  the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake
+  container runtime holds the exec open, and that object graph is then abandoned), bring a second
+  provisioner up over the SAME persisted rows, and make the single production call a repo coming up makes
+  — `MergeQueueProvisioner.EnsureQueue` — asserting where the entry lands with **no human RPC**: jail
+  alive → the command really re-executes in the jail, the immutable record is written against the queue's
+  main and the row persists `Verified`; jail gone → `Working`, nothing executed, nothing recorded, and
+  `Clear stalled run` then truthfully refuses with "not stuck verifying" while discard still works; an
+  ordinary restart with nothing interrupted moves nothing; and `EnsureQueue` returns while the resume's
+  verification is still running, since it is a gRPC handler. Real bare mirror, real agent branch, real
+  publish/drift/RT-D2/flagged-change path — only the container runtime is a fake, and its jail-liveness
+  answer is the input the whole change turns on),
   `VerificationRunnerTests` (daemon-observed exit is pass/fail,
   `ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit`, runs-in-sandbox-never-host, artifact
   provenance), `ForegroundMergeServiceTests` (real-git: journaled/undoable A5 ff-only merge,
@@ -63,7 +148,21 @@
   EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
   never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
-  real-`MergeQueue` rail in all five themes → `merge_queue_<Theme>.png`); the **P2-11 review-cockpit
+  real-`MergeQueue` rail in all five themes → `merge_queue_<Theme>.png`; note this renders
+  `MergeQueueView`, which is **harness-only** — the shipped Control Center hosts `QueueRailView`),
+  **`Headless/QueueEntryLifecycleRenderHarness.cs`** — the rail's entry-lifecycle actions at production
+  id lengths: every non-terminal row has a Discard that is both visible **and enabled** (a
+  visibility-only assertion misses the disabled case), "Clear stalled run" appears only on the row the
+  daemon reports has no run behind its `Verifying` state and not on the one that really is verifying,
+  the rail still carries exactly ONE `Button.Accent` (the Review CTA) with the destructive action
+  wearing `Button.DangerQuiet` resolved from `DangerBrush`, and the discard asks first — arming it
+  calls nothing, and the question states that the entry will not be merged and the branch is left
+  alone. It also holds the INVERTED form of the same defect: `MockOrchestrator`'s `Verifying` rows are
+  genuinely running (its tick loop advances them while `Detail` counts "tests 12/58"), so a projection
+  that let `VerificationInFlight` default to false made the rail label every one of them "Stalled",
+  badge it as a warning and offer "Clear stalled run" on a row visibly executing tests — asserted
+  against the real mock, not a stub. PNGs: `queue_lifecycle_<Theme>.png`,
+  `queue_lifecycle_confirm_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix
   present/partial/absent/malformed→nullable, Agent-Trace ours + external-vendor parse + range-join,
@@ -455,7 +554,15 @@
     quieter is toast-silent), `SandboxImageProvisionerTests` (v1 sandbox-image provisioning over a fake
     `IWslRunner`: probe parsing, exact distro-scoped `/mnt`-translated build argv + G-12 proof,
     serialized builds, per-image failure isolation, missing-sources skips, the auto-provision
-    outcome/toast policy), `VmUpgradeOrchestratorTests` (the tier-2 in-place VM upgrade:
+    outcome/toast policy), `SandboxImageProvisioningTrackerTests` (the 2026-08-05 auto-provisioning fix:
+    the tracker's in-flight state, a second request JOINING the run already going instead of starting a
+    rival `docker build` of the same tag, a faulted run not wedging the gate — plus
+    `SandboxImageMissingMessageTests`, which pins the spawn-preflight banner to only what was actually
+    checked: no manual `docker build` fallback (the old one named an in-distro path that does not exist
+    AND omitted `--label mainguard.image.version`, so an image built by it was re-rejected as stale
+    immediately), no "restart Mainguard" advice (restarting CANCELS the in-flight build — the reason the
+    images stayed stale through every attempt), and no promise of an "installed" notice a stale image
+    never emits), `VmUpgradeOrchestratorTests` (the tier-2 in-place VM upgrade:
     `VmUpgradePolicy` older/equal/newer/garbage — installed-newer is NEVER offered a downgrade — the
     `MainguardOsReleaseStamp` parser, the new staging-scoped/tar-transport builders' exact argv,
     `VmUpgradeCheck` (daemon answer → in-distro `/etc/mainguardos-release` fallback → unknown = no
@@ -501,7 +608,15 @@
     every ACCEPT destination-constrained, and still terminates in DROP), `SandboxImageDigestTests`
     (**MG-27, pure** — see the jail-image note above), `EgressAllowlistTests` (defaults carry **no
     git-host entry**, add/remove round-trips + `allowlist_changed` audit events, a git-host entry
-    flagged `DefeatsA6`, JSON persistence round-trip), `DeclaredDependencyResolverTests` (F5:
+    flagged `DefeatsA6`, JSON persistence round-trip), `GatewayReachabilityPolicyTests` (**MG-4, pure:
+    the rendered egress policy that lets a CONFINED jail reach the model gateway, and the two things it
+    must not disturb. The gateway's own host must appear in the tinyproxy filter as a bare host (a
+    `host:port` pattern can never match, the same silent-no-op class as a wrong base-URL variable);
+    enabling confinement must add NO `upstream` directive, because an `upstream` is keyed on the
+    destination host on the one proxy every agent shares and would drag OAuth traffic through the gateway
+    to be 401'd — the highest-value assertion in the file; the provider hosts stay allowlisted; the
+    no-gateway default renders byte-identical policy; and the gateway entry does not trip the A6
+    warning**), `DeclaredDependencyResolverTests` (F5:
     `go.mod`/`package.json`/`package-lock.json` → the exact module set, subpath allow, out-of-scope
     typed denial), `DaemonGitProxyTests` (A6: allowlisted fetch succeeds + transparency line,
     non-allowlisted refused + audited, `git-receive-pack` push refused structurally + audited, and a
@@ -553,6 +668,45 @@
   - **`BoundGridSessionTests.cs`** — the same through the REAL `BoundTerminalSession` pump: atomic
     snapshot+deltas mirror a scripted CLI, OSC 52 clipboard frames (queries never), raw subscribers +
     `TailText` intact alongside the engine, resize → PTY+vterm+snapshot, `GetScrollback`.
+- **`Mainguard.Server.Tests/CliLoginHarvestWiringTests.cs`** — the **caller** of the CLI-login
+  harvest, which is what was missing: `DaemonBackedOrchestrator.PersistLiveAgentLoginsAsync` had no
+  callers anywhere in the repo, so only an explicit in-app Stop ever wrote a `cli_login_*` keychain
+  entry and every other teardown (app close, daemon/VM restart, crash) lost the login. Both new legs
+  are asserted through the SHIPPED orchestrator against the real in-proc daemon and the real
+  `HarvestAgentCredentials` RPC, and **neither test calls `PersistLiveAgentLoginsAsync` itself** — that
+  would recreate the exact blind spot. `StartedOrchestrator_SweepsALiveAgentsLogin_IntoTheHostKeychain`
+  drives the periodic pump (200 ms interval) and asserts the harvested bytes land in the injected
+  keychain; `Dispose_HarvestsOneLastTime_SoClosingTheAppKeepsTheLogin` sets a 30-minute interval so the
+  vault can only be written by the shutdown sweep. The rig is Docker-free: a fake substrate whose
+  sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
+  login bytes, and only for the path the temp install marker declares. The real-jail leg is
+  `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/AdapterSettingsPathTests.cs`** — the manifest half of the CLI-settings round trip:
+  the bundled `claude-code` adapter really declares BOTH `settingsPaths` roots (a field nothing declares
+  is a feature nobody gets, and a home-only declaration would persist a file the CLI never writes), every
+  bundled entry passes the shape gate, an unknown/miscased `root` is refused rather than defaulted, a
+  path that escapes its root is refused, and — the storage boundary — a path listed in BOTH
+  `credentialPaths` and `settingsPaths` is refused, because credentials go to the OS keychain and
+  settings to a plaintext per-repo file.
+- **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
+  `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
+  per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
+  harvest never clearing a good allowlist, a corrupt file meaning "no settings" rather than a crash, the
+  store being a readable file the owner can find and delete, and two non-filename-safe scopes still
+  getting different files (a naive sanitiser would merge two repos' allowlists). Temp root throughout.
+- **`Mainguard.Server.Tests/CliSettingsBoundaryTests.cs`** — the two **trust gates** on the CLI-settings
+  round trip (the owner-reported "every new agent makes me re-approve everything"), asserted through the
+  SHIPPED `AgentSpawnService` resolved from the daemon's own container. **IN:**
+  `AnUntrustedSpawn_InheritsNoGrants_EvenWhenTheRepositorysCacheIsWarm` warms the per-(repo, kind)
+  fallback cache with a real session first, then spawns the untrusted head the way
+  `ExternalPrWorkerHost` does — so the test fails unless the `withoutHostCredentials` gate itself
+  refuses, not merely because the caller passed nothing. An inherited allowlist is inherited execution.
+  **OUT:** `StoppingAnUnattendedWorker_PersistsNothing_EvenThoughTheFileIsRightThere` — the fake jail
+  HAS the settings file (the attended test above harvests it from the same engine), so an empty result
+  can only be `CliSettingsHarvestPolicy`. Plus the declared-path filter (a right-path/wrong-root entry
+  and an undeclared `.ssh/authorized_keys` are both dropped) and the 256 KiB harvest ceiling. Docker-free:
+  a fake substrate whose sandbox engine RECORDS every `SandboxSpawnRequest`, so what actually reaches a
+  jail is observable. The real-jail leg is `Agents/CliSettingsRoundTripDockerTests.cs`.
 - **`Mainguard.Server.Tests/MergeExecutionPathTests.cs`** — the GUI Merge button actually merges,
   end to end through the real composition (in-proc daemon + shipped `DaemonClient` + shipped
   `DaemonBackedOrchestrator` + a real git repo on disk). **Asserts repository state, never RPC
@@ -693,7 +847,22 @@
   chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in all five
   themes), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
-  `Headless/ResourceMonitorStreamTests`, and the `Headless/ActivityBarRenderHarness` (the five-theme
+  `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
+  must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious
+  implementation returns 0 for), `DockerResourceSamplerProgressTests` (**the delivery race**, pinned
+  deterministically with a fake `IDockerClient` that reports through `IProgress` and returns immediately:
+  the first implementation used `Progress<T>`, which raises its callback ASYNCHRONOUSLY, so the awaited
+  call could finish while the value was still queued and the sampler reported "no reading returned" for a
+  container that answered — measured at 1721/2000 lost in isolation, and it passed locally against real
+  Docker while failing only on a loaded CI runner. Reinstating `Progress<T>` fails it 198/200),
+  `Headless/ResourceMonitorStreamTests`, `Headless/ResourceMonitorHonestyTests` (**the two honesty
+  properties of the Resources tab**: an unmeasured reading renders "—" while a measured zero still
+  renders "0%" — the tab previously hard-coded 0 for everything, which is indistinguishable from an
+  idle fleet — and the cost UI appears only where spend is actually metered, with the unmetered row
+  refusing to draw `$0.00` even on a mixed fleet), `Headless/ResourceMonitorRenderHarness` (the tab in
+  all five themes × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
+  `artifacts_headless/`; the VM truths are asserted beside each capture so a blank surface cannot pass
+  as green), and the `Headless/ActivityBarRenderHarness` (the five-theme
   rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`). **`Terminal/`** is
   the P2-04 VT conformance & replay harness: `ITerminalEngineHarness.cs` (the engine-agnostic "feed
   bytes → read grid" seam + `GridSnapshot`/`GridCell`/`CellColor`/`CellAttrs` with a deterministic
@@ -727,7 +896,11 @@
   rate-limit backoff-no-crash-loop, zero-upstream-writes, the configurable author-filter `[Theory]`,
   and the spawn seam: the intake asks for a `pr-<n>` jail before anything else, a **gate refusal
   materializes NOTHING** and is retried on a later poll, a spawn failure likewise, repeat polls never
-  spawn a second jail, and a non-rate-limit transport fault no longer escapes the poll) and
+  spawn a second jail, a non-rate-limit transport fault no longer escapes the poll, and a **human
+  discard releases the worker ONCE and stops the PR being re-materialized** — materializing is re-asked
+  on every poll and consulted no queue state, so a dropped-but-still-open PR kept its jail re-provisioned
+  and held until it closed upstream, while its moved-head leg threw `Discarded → Working` out of the
+  swallowed per-PR catch and therefore re-threw forever without ever recording the head) and
   `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
   API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
@@ -776,7 +949,15 @@
   **only then** → verify → the stale cascade → sequential human merges, all asserted through the
   audit trail; plus the saturated-cap case, where the third spawn is refused and the refusal names the
   waiting plans. The real-container leg is `MergeQueueDockerTests`). **MG-42
-  per-repo toolchain (Core):** `ToolchainDeclarationTests` (the `.mainguard/toolchain` format + the
+  user-managed toolchains (Agents):** `ToolchainChannelTests` (the shipped manifest parses and curates
+  `python-3`; a manifest that weakens the pin — plaintext URL, short hash, path-shaped id, empty expected
+  version — is refused at parse; the install verifies the checksum BEFORE unpacking and refuses to unpack
+  on a mismatch; a toolchain that lands but does not run, or runs at the wrong version, is a failed
+  install with NO marker; installed state comes from the PROBE, not the marker file; a repo declaring only
+  a mounted toolchain builds no image layer; a jail gets the toolchain read-only with its bin FIRST on
+  PATH and `PYTHONUSERBASE` in the package cache; and `BaseImagePath` is guarded against the agent base
+  image's own `ENV PATH`).
+- **The per-repo toolchain (Core):** `ToolchainDeclarationTests` (the `.mainguard/toolchain` format + the
   closed-catalog refusals — a line that is not a bare id (`dotnet-10 && curl … | sh`, a URL,
   `../../etc/passwd`, `$(id)`) is rejected at parse time and an uncatalogued id is a typed
   `UnknownToolchainException`, never a silent skip; the resolution rules mirrored from
@@ -785,13 +966,23 @@
   whole repo's queue) and specifically does not normalise into equality with main; the generated
   Dockerfile's digest-pinned `FROM`, its absent `COPY`/`ADD`, and its return to `USER agent`; the
   content-addressed tag's sensitivity to base digest and declaration but not to comments; and the
-  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths) plus, in
+  provisioner's cache-hit/poisoned-tag/failed-build/lying-build paths), `ToolchainProvisionerProgressTests`
+  (the user-facing progress line: reported BEFORE the build rather than after — asserted by snapshotting
+  the builder's call count at report time, not by statement order — the ready line after, nothing at all
+  on a cache hit, and a null sink changing nothing; this is the daemon end of the channel that turns a
+  multi-minute first-run image build into visible progress instead of a hang) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
   claim per test on purpose, since xUnit stops at the first failing assertion and a five-assertion
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares
   `dotnet-10`, the branch demands `rust-stable`, and the observable is which presence probe the daemon
   ran in the jail), the flag/block/reason/acknowledge quartet, comment-edits-are-not-drift,
-  both-files-drifted-names-both, and the typed `ToolchainProvisioningException` when the jail does not
+  both-files-drifted-names-both,
+  `AgentThatMovedItsWorkOffItsOwnBranch_IsRefusedWithTheMeasurement_NotVerifiedSilently` (the decisive
+  proof for the stranded-branch defect — the agent is moved off `agent/<id>` through LibGit2Sharp, which
+  never runs hooks, so the daemon-side backstop cannot pass merely because the in-jail guard rail stopped
+  the agent first; asserts the refusal names both branches and the recovery, that NOTHING was executed in
+  the jail, and that the queue returns to `Working`. Asserting "the mirror's ref did not move" would have
+  proven nothing — that is true with or without the fix), and the typed `ToolchainProvisioningException` when the jail does not
   actually carry what main declared (asserting the verify command was never launched — a provisioning
   failure is not a test result). **P2-11 flagged-change gate wiring** lives in the same class because
   the detector was never broken and the spine was, so only wiring-level tests over the real mirror can
@@ -955,13 +1146,30 @@
   on the recorded `SandboxSpawnRequest`, because a correct spec builder nobody passes the flag to is the
   MG-12 shape. Over its own two-repo `RoleLockRig`),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
   sequence), `FixtureAcceptanceTests` (the TI-P2-00 fixture smokes),
+  **`DockerSuiteDiagnosticsTests` (the RequiresDocker sweep's diagnosis contract, all daemon-free: the
+  refusal names the engine, the evidence (`/etc/mainguardos-release`), what it would have destroyed by
+  name and what to do instead — and does NOT fire off Mainguard OS, since a guard that always fired
+  would take CI's whole security leg down; the marker probe is asserted against a real temp file in
+  both directions; the sweep report names every removed network and every evicted container, and says
+  "nothing to remove" in words when it removed nothing; the journal appends, stamps and never throws;
+  and `xunit.runner.json` still sets `diagnosticMessages` AND is still copied next to the test
+  assembly, because the failure mode of that channel is silence)**,
+  `xunit.runner.json` (**`diagnosticMessages: true`** — measured on .NET 10 / xunit 2.9.3 /
+  xunit.runner.visualstudio 3.1.4: a fixture's `Console` output reaches only
+  `dotnet test --verbosity normal`, while an `IMessageSink` diagnostic reaches the DEFAULT verbosity
+  too and vanishes when the flag is false. It is what makes a plain solution-wide `dotnet test` say
+  out loud that the Docker suite is live and which engine it is about to sweep — the surprise that
+  cost an investigation on 2026-08-07),
   **`CompositionRootResolutionTests` (P2-47 integration proof #1 — every mapped gRPC service's ctor
   graph resolves via `ActivatorUtilities`, the gateway+governance singletons resolve, and the P2-12
   external-PR intake chain resolves so `PrIntakeHostedService` no longer idles — including, by
   reflection over the registered engine's own delegates, that its target resolver really is
   `PrIntakeTargetResolver.Resolve` and not a hardwired `null`, and that its worker host really is the
   daemon's `ExternalPrWorkerHost`: a hardwired constant is invisible from the outside, since the
-  engine resolves and the hosted service starts either way), **`ExternalPrIntakeSpawnWiringTests`**
+  engine resolves and the hosted service starts either way), and that the daemon's
+  `MergeQueueProvisioner` really was constructed with `checkAgentBranch` — an optional argument whose
+  absence restores the silent stranded-branch behaviour exactly while every other test stays green),
+  **`ExternalPrIntakeSpawnWiringTests`**
   (the intake→spawn decisions at the tier that needs no Docker: the explicit-`pr-<n>`-id scheme and
   its duplicate-id refusal; `EnsureWorkerAsync` adopting a live session and a restart-orphaned jail;
   the MG-2 managed-worker cap refusing an intake spawn over the SAME population an ordinary managed
@@ -998,7 +1206,20 @@
   daemon action projects live off each RPC — kill switch Engage/Resume → frozen state, a drafted plan
   → the pending-plan projection then Reject clears it, a real ledger spend → the telemetry projection
   + budgets round-trip, `SendMessage` → the coordinator transcript, and a registered `MergeQueue`
-  entry → the merge-queue projection incl. `MainSha`); `ReviewCockpitOverlayAckTests` (the **review
+  entry → the merge-queue projection incl. `MainSha`); **`VerificationTriggerTests` (the regression
+  suite for "nothing in the product could trigger a verification".** The `MergeQueue` machine, the
+  `RunVerification` RPC and `DaemonClient.RunVerificationAsync` all existed and were all tested — but
+  no production path reached any of them, so entries sat at `not verified yet` forever, and the
+  existing tests passed only because they called `MergeQueue.RunVerificationAsync` DIRECTLY, stepping
+  over the missing rung. So these tests never call that method: they press
+  `QueueEntryViewModel.VerifyCommand` — the control the rail is bound to — and assert the run happened
+  on the daemon, through the whole real chain (VM command → `IMergeQueueService` → shipped
+  `DaemonBackedOrchestrator` → shipped `DaemonClient` → in-proc `RunVerification` RPC → real
+  `MergeQueue`). Cases: the decisive Working→Verified with the daemon's runner provably invoked and
+  `not verified yet` cleared; verifying does NOT merge and an always-refusing `IMergeGate` still
+  refuses (the trigger weakens no gate); a `NoVerificationCommandException` surfaces as a quotable
+  `Can't verify — …` with the branch back on Working rather than a phantom Verified; and no active
+  repo refuses with a reason instead of throwing into the UI thread); `ReviewCockpitOverlayAckTests` (the **review
   cockpit overlay** against the same real in-proc daemon: an RT-D2-blocked branch surfaces its flagged
   item on the overlay, the overlay's own per-row acknowledge control is pressed, and the **daemon-side
   gate** then permits the merge it was refusing — asserted on `ChangedTestCommandGate` state and
@@ -1025,6 +1246,39 @@
   authenticated token instead of the spoofable `x-mainguard-agent` header, injects the daemon-held key
   at the network hop so the agent's own credential never survives it, refuses an unauthenticated
   caller with 401, and filters credential/Mainguard/hop-by-hop headers both directions),
+  `GatewayUpstreamBindingTests` (**the per-agent upstream binding — every request built the way a
+  confined jail actually sends it, i.e. `Host` = the GATEWAY rather than the provider. The custody
+  tests above all use `Host = api.anthropic.com`, a shape production cannot produce once a CLI is
+  pointed at the gateway, which is why they passed while the real path fell through unfronted and
+  charged nothing. Covers: routing to the agent's bound upstream, `BudgetLedger` actually charged,
+  an over-budget agent refused 402 with nothing forwarded, an OAuth agent passing through untouched
+  and NOT 401'd (the regression that would hurt most), and an unknown token on the legacy model-host
+  shape still refused so the pass-through is not an auth bypass**),
+  `GatewayPipelineWiringTests` (**that the gateway is SERVING, not merely bound — the bind tests pass
+  in a world where the port answers 404 to everything, which is exactly what the daemon did before
+  the middleware was wired. Issues a real HTTP request over the real Kestrel listener, because
+  ASP.NET activates middleware lazily and a constructor whose arguments cannot be resolved from DI
+  would start the daemon happily and only fail on an agent's first call. Also pins that the branch
+  does NOT leak onto the mutually-authenticated gRPC control port**),
+  `Agents/GatewayConfinementDockerTests.cs` (**MG-4 end to end against REAL containers
+  (`[RequiresDockerFact]`) — the layer the in-process gateway tests structurally cannot reach. The model
+  request is issued FROM INSIDE a real hardened jail, sourced from the same
+  `CredTmpfsSpec.DefaultCredentialPath` the CLI sources (spelled through the constant — a stale copy of
+  the path would make `. <path>` yield an empty environment SILENTLY) and routed through the container's
+  own `HTTP_PROXY`, so nothing about its shape is
+  constructed by the test. That is what exposed the defect the change fixes: a confined request reaches
+  tinyproxy naming the GATEWAY as its destination, and the default-deny filter had no entry for the
+  daemon's own address, so Mainguard's own proxy answered 403 — switching the gateway on would have
+  BROKEN every BYOK agent rather than metering it. Five legs: the traffic transits the gateway and the
+  ledger is charged 41 tokens; the provider key is absent from the container spec, the credential tmpfs
+  AND the agent's effective environment — the tmpfs sweep runs as BOTH owner uids, because each secret
+  now lives in its owner's own `0700` directory and a sweep as the agent alone would silently stop
+  covering the supervisor's; a second call over a 1-token cap is refused 402 with nothing
+  reaching the provider; an OAuth agent is unconfined with its login restored and its provider host still
+  carried by the proxy (paired with a not-allowlisted negative control so an offline runner cannot pass
+  it for the wrong reason); and an unreachable gateway SKIPS confinement so the agent keeps its raw key
+  and its working direct route — the precondition that makes gateway-on-by-default safe. Only the
+  provider itself is faked, via the `DaemonHost` `configureServices` seam**),
   `DailyBudgetCapBootTests` (MG-21 — the persisted PER-DAY caps survive a restart: boot built
   `BudgetCaps(..., 0, 0)`, and 0 means UNLIMITED, so a daily budget silently stopped being enforced
   after every daemon restart while `GetBudgets` still reported it; resolves the ledger from a freshly
@@ -1051,13 +1305,42 @@
   the lock and an end-to-end assertion would pass either way), `ApproverIdentityDaemonDerivedTests`
   (SA-1/F2 — reflection proves `ApprovePlanRequest` has no identity field, and a
   `ConfigureTestServices`-overridden `IApproverIdentityResolver` proves the recorded/echoed approver
-  is the connection's value regardless of the request). **`Agents/SwarmReconcilerDockerTests.cs`**
+  is the connection's value regardless of the request),
+  **`QueueEntryLifecycleTests.cs`** — the queue's human entry-lifecycle actions, asserted DAEMON-side
+  because the tempting fix (a ViewModel that drops the row from its own collection) clears a rail the
+  next `StreamQueue` snapshot silently refills. `DiscardEntry` moves the daemon's state machine to a
+  terminal that is **not** `Merged`, writes the record, appends its own audit event and removes the
+  entry from the stream the rail renders from; the actor is the daemon-derived
+  `IApproverIdentityResolver` value and reflection proves `DiscardEntryRequest` has no field to assert
+  one with; a discard is refused while that entry holds the repo's merge lease, and on an already
+  terminal entry; `ClearStalledVerification` unsticks a `Verifying` row the stream reports has no run
+  behind it (`verification_in_flight`, a fact only the daemon can supply) — that test used to pin
+  "`ResumeAfterRestartAsync` has no production caller" and now pins the boundary that survived it: the
+  queue there is hand-registered so no resume is in the picture, and the human's escape hatch has to work
+  on its own for every frozen row a resume cannot reach; the coordinator role is
+  denied **both** RPCs at the interceptor with nothing mutated, and the in-jail `AgentIpcRequest` op
+  set stays `{spawn, list}` so the agent surface cannot address them at all. The two decisive cases
+  drive the shipped `QueueRailViewModel` through the shipped `DaemonBackedOrchestrator` into a real
+  in-proc daemon: a discard that lands must move the daemon's queue, and a discard the daemon REFUSES
+  must keep the row and report the reason as a warning. **`Agents/SwarmReconcilerDockerTests.cs`**
   (TI-P2-08 test 7, RequiresDocker via the new Docker-presence-only `[RequiresDockerDaemonFact]`):
   `Reconciler_OutOfBandDockerRm_ShouldConvergeOnBoot` stands up a trivial `busybox` container with the
   real `mainguard.agent`/`mainguard.repo` labels (not the P2-07 agent-base image), points a
   `SwarmReconciler` at the **real `DockerAgentLister`**, then `docker rm -f`s it out of band and
   asserts the next reconcile prunes + marks it `Dead` (Docker-as-truth convergence the simulated tests
-  can't prove; cleans up in a finally). **`Agents/`** hosts the TI-P2-06 integration suite on
+  can't prove; cleans up in a finally). **`Agents/ResourceSamplingDockerTests.cs`**
+  (`[RequiresDockerDaemonFact]`) proves the Resource Monitor's data source against a REAL engine, which
+  is the claim the feature shipped without: a `busybox` spin loop pinning one core must read a real
+  non-zero CPU **bounded by `ProcessorCount × 100`** (a mis-scaled formula cannot pass by being huge),
+  a sleeping container alongside it must read far lower (so a constant-returning sampler fails), and a
+  missing container must come back **UNKNOWN rather than 0** — `0%` and "no data" have to stay
+  distinguishable. **`AgentResourceProjectionTests.cs`** carries the same claim across the whole wire
+  through the REAL composition root: a scripted `IContainerResourceSampler` (injected via
+  `DaemonFixture.ResourceSampler`) feeds 37.5% / 1 GiB in, and the shipped `DaemonClient` +
+  `DaemonBackedOrchestrator` must project those exact values out of `GetAgentUsage()` — asserted on the
+  VALUES, not the shape, because the old code passed every shape test while returning 0. It also pins
+  the metering predicate on a real daemon (an agent `AgentGatewayCredentials.Issue`d a token is
+  metered; one without is not, and carries no spend figure at all). **`Agents/`** hosts the TI-P2-06 integration suite on
   `DualRepoFixture`: `AgentTestGit.cs` (test-only git CLI helper + temp-VM-root/cleanup — not a
   production runner), `SessionKeyCacheScopeTests.cs` (MG-6 — the memory-only credential cache is
   scoped to **(repo, kind)**, never the bare agent kind: a model key / harvested CLI OAuth files /
@@ -1065,6 +1348,17 @@
   last-writer-wins clobber, a blank repo handle never forms a shared bucket, and a miss returns null
   rather than substituting a stranger's credential), `RepoProvisionerTests.cs` (first-run hardened
   bare mirror, incremental fetch advancing the head, manual-delete re-clone, spaces/Unicode path),
+  `AgentBranchGuardTests.cs` (**the stranded-branch defect from live phase-1 testing**, over a REAL
+  mirror/agent repo/linked worktree, driving "the agent" through a plain `git` CLI via `AgentTestGit`
+  because the daemon's own helper pins `core.hooksPath=/dev/null` and would disable the very hook under
+  test — a test that could only ever pass. Detection: `checkout -b` + commit is caught, the report names
+  both branches and the computed fast-forward recovery; a detached HEAD is caught and not mistaken for a
+  branch named `HEAD`; the on-its-own-branch control stays clean; no worktree reports `Unknown` rather
+  than collapsing into "fine". Prevention: spawn installs the hook, `checkout -b` is refused with no
+  residue and work on `agent/<id>` still succeeds; a 5-case theory pins that stash/tag/pack-refs/gc/
+  detach are untouched; `TheHookSurvivesAnUpgradeOverAJailThatIsALREADYStranded` covers the population
+  this ships to, where `pack-refs` re-states a pre-existing loose foreign branch as a create; and
+  `TheHookDoesNotObstructTheDaemonsOwnGit` pins that spawn/teardown are unaffected),
   `AgentWorktreeManagerTests.cs` (add/remove/prune round-trip, duplicate-id + dirty-remove typed
   failures, **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names
@@ -1136,7 +1430,25 @@
   run's spawn with an address-pool error. `FixtureAcceptanceTests` asserts the lock really excludes
   and really releases, that the sweep predicate matches mainguard's networks and no neighbour's, and —
   by reflection, with a floor on the count so an empty match cannot pass — that every RequiresDocker
-  class is actually in the collection)**, `Fixtures/RequiresLibvtermFact.cs` (`[RequiresLibvtermFact]`
+  class is actually in the collection. The fixture now also takes xunit's `IMessageSink` — its ONLY
+  public constructor, since xunit v2 rejects a collection fixture with two — and announces/journals
+  through `Fixtures/DockerSuiteEngine.cs` before doing anything destructive)**,
+  **`Fixtures/DockerSuiteEngine.cs` (`DockerEngineIdentity` + `MainguardOsHost` +
+  `DockerSuiteSweepGuard` + `SweepOutcome`/`SweptNetwork` + `DockerSuiteJournal` — WHICH dockerd the
+  sweep is about to strip, said out loud. On a Windows workstation there are two engines and mainguard
+  names its containers identically on both: the app's is a dockerd INSIDE the `MainguardEnv` distro
+  (where `mainguardd` runs as a systemd unit, so its bare `new DockerClientConfiguration()` resolves
+  there), the suite's is whatever engine the shell running `dotnet test` sees. A swept TEST jail — up,
+  `Networks` empty — is therefore byte-identical in `docker ps` to a destroyed production one, which is
+  how three readers in a row concluded on 2026-08-07 that the owner's live jail had been severed while
+  it sat untouched and attached on the other engine. So: the guard REFUSES the sweep when the run can
+  prove it is on the app's own engine (the payload's `/etc/mainguardos-release` marker — the only
+  client-side signal that is honest; a `DOCKER_HOST` pointed into the VM is undetectable, so the
+  endpoint is named instead of guessed at), every destructive line names the engine, and the journal
+  (`$TMPDIR/mainguard-docker-suite.log`, `MAINGUARD_DOCKER_SUITE_JOURNAL`) records the engine, the
+  proxy removal and every deleted network WITH the container endpoints evicted from it — the only
+  place on the box that can answer "what detached my container from its networks?" after the run has
+  exited)**, `Fixtures/RequiresLibvtermFact.cs` (`[RequiresLibvtermFact]`
   — **visibly skips** the P2-18 grid legs when native libvterm is not loadable, replacing the old
   `if (!Available) return;` early return that reported a green **"Passed"** while asserting nothing;
   the sibling `LibvtermPresenceTests` is this project's merge gate — under
@@ -1177,13 +1489,64 @@
   a stale or coincidentally-0400 file cannot satisfy it. A third test pins the *reason* the archive
   API is unusable by asserting Docker really does refuse `ExtractArchiveToContainerAsync` into the
   read-only-rootfs jail — if that ever starts passing, the transport can be revisited),
+  **`Agents/CliLoginRoundTripDockerTests.cs`** (`[RequiresDockerFact]` — the **CLI-login round-trip**
+  end to end against real jails: a per-run nonce is written into jail #1's tmpfs `$HOME` at the one
+  path a temp install marker DECLARES, `SandboxAgentLauncher.HarvestCliCredentialsAsync` reads it back
+  out, `CliLoginVault.MergeAndSerialize` produces the exact string the OS keychain would hold, jail #1
+  is removed (the tmpfs dies with it), and a FRESH jail spawned with those restored files is probed
+  with a sentinel-framed `cat`. Docker rather than a fake because all three hops — the tmpfs overlay,
+  the harvest exec running as the agent uid against a 0600 file, and the exec-stdin restore that
+  `docker cp` cannot do (it writes UNDER the tmpfs and reports success) — are invisible to a fake
+  engine. The CALLER that drives this in the shipped app is pinned separately by
+  `CliLoginHarvestWiringTests`),
+  **`Agents/CliSettingsRoundTripDockerTests.cs`** (`[RequiresDockerFact]` — the **CLI-settings round
+  trip**, i.e. "a command approved in one agent is still approved in the next". A per-run nonce is
+  written into jail #1 at BOTH declared roots — `/workspace/.probe/settings.local.json` (where
+  claude-code records "don't ask again") and `$HOME/.probe/settings.json` —
+  `SandboxAgentLauncher.HarvestCliSettingsAsync` reads them back, the REAL `CliSettingsStore` (temp
+  root, never the owner's) persists them per repo, jail #1 is removed (the tmpfs home AND the worktree
+  both go), and a FRESH jail spawned from the store is probed with a sentinel-framed `cat` — the
+  assertion is made **inside the second container**, because "a file was written host-side" is a
+  different claim. Two more legs: a jail given no settings really has none in-container (the untrusted
+  posture); the reuse path is write-if-absent (a live jail's fresher approvals are never clobbered by
+  the stored copy); and
+  `ARestoredWorkspaceSettingsFile_IsNeverCommittedIntoTheUsersRepository` +
+  `TheFirstSessionsOwnSettingsFile_IsIgnoredEvenThoughNothingWasRestored` make `/workspace` a REAL git
+  repository and assert `git status --porcelain` is empty *while the file is present* — agents run
+  `git add -A`, so an unignored settings file would put the user's permission allowlist into their own
+  history, and the second test covers the case the ignore list cannot be derived from a restore
+  payload at all (a first session, which creates the file itself). These use
+  `SandboxFixture.NewJailWritableTempWorktree()`: a default-mode temp worktree measures the RUNNER's
+  uid mapping rather than the feature, which is exactly how the first CI run failed with
+  `mkdir: cannot create directory '/workspace/.probe': Permission denied` after passing locally. The
+  gates that decide WHEN any of this runs are `CliSettingsBoundaryTests`),
   `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
   proceeds to the engine; a missing `mainguard-agent-base`/`mainguard-egress-proxy` answers
   `FailedPrecondition` naming exactly that image + the repair BEFORE any worktree/jail work — the
   egress image's absence was previously not actionable), `Agents/SandboxHardeningDockerTests.cs`
   (docker-inspect shows no Windows mounts + live userns/limits, persistent-jail start-not-recreate,
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
-  supervisor-owned `/run/secrets/oob.key`), `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
+  supervisor-owned `/run/secrets/supervisor/oob.key` — probed as EACH SECRET'S OWNER, since the agent
+  cannot see into the supervisor's `0700` directory at all and asking it would conflate "not delivered"
+  with "properly hidden"; plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
+  container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
+  and no network is recreated by the checks that already existed, and that first version stayed green
+  with the new check disabled). **These RequiresDocker legs only ever run against
+  a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
+  EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
+  plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on
+  Engine 29 it does not. The guards for that live in the no-Docker leg
+  (`ContainerSpecBuilderTests.Build_EachSecretLivesInATmpfsOwnedByItsOwnUid_SoNoChownIsEverNeeded`,
+  `SandboxSecretWriteTimeoutTests.SecretWrite_RunsAsTheSecretsOwner_AndNeverChowns`), which is the only
+  leg that is engine-independent. `Agents/PythonToolchainDockerTests.cs` (the **user-managed** Python
+  toolchain end to end: the premise measured rather than assumed — the base image's own `python3` runs
+  but CANNOT `import pip`, which is why a bare version probe would report a broken environment as
+  healthy — then, gated behind `MAINGUARD_VERIFY_E2E=1`, a full install through the SHIPPED
+  `ToolchainChannel`, the in-jail probe answering at the pinned version, `command -v python3` proving the
+  declared toolchain WINS the PATH race against the base image's, and the repo's own
+  `.mainguard/verify` running **GREEN when its pytest test passes and RED when it fails** — same jail,
+  same toolchain, same command, only the test changed, because a verifier that cannot go red is not a
+  verifier). `Agents/ToolchainProvisioningDockerTests.cs` (**MG-42** —
   the per-repo toolchain layer built by the SHIPPED `ToolchainProvisioner` against a real runtime and
   then run in a real hardened jail: the premise asserted rather than assumed (`command -v dotnet`
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),

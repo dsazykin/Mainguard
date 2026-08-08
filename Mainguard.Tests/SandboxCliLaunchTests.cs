@@ -36,7 +36,9 @@ public class SandboxCliLaunchTests
     {
         // The wrapper is fixed text: credentials come from the agent-owned tmpfs (never argv/env —
         // G-13), the IPC mount joins PATH only when present, and "$@" hands off without rewriting.
-        Assert.Contains("/run/secrets/agent.env", SandboxCliLaunch.WrapperScript, StringComparison.Ordinal);
+        // Spelled through the constant on purpose: the wrapper's guard is `[ -r … ]`, so a wrapper that
+        // sources a path the spec no longer mounts fails SILENTLY and the agent runs with no credentials.
+        Assert.Contains(CredTmpfsSpec.DefaultCredentialPath, SandboxCliLaunch.WrapperScript, StringComparison.Ordinal);
         Assert.Contains(AgentIpcPaths.SandboxMount, SandboxCliLaunch.WrapperScript, StringComparison.Ordinal);
         Assert.EndsWith("exec \"$@\"", SandboxCliLaunch.WrapperScript, StringComparison.Ordinal);
 

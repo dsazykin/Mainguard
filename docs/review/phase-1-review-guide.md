@@ -104,6 +104,13 @@ dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj \
 dotnet run --project Mainguard.Pro.App    # the Pro head (not the shell library)
 ```
 
+**Before you run anything Docker-backed, see "Running the test suite while an agent is up" in
+`phase-1-hands-on.md`.** Three things there will otherwise cost you an afternoon: an unfiltered
+`dotnet test Mainguard.slnx` silently includes this suite; there are two Docker daemons whose
+containers share the `mainguard-` prefix (tests run against Docker Desktop, real jails live in
+MainguardEnv); and `DockerSuiteFixture` sweeps `mainguard-*` resources on every construction and
+dispose, so a pre-flight check proves nothing.
+
 `RequiresDocker` (~79 tests) needs Docker. **Concurrent runs are now safe** (#278): every
 `RequiresDocker` class joins a collection whose fixture takes a host-global, cross-process lock for
 the window its Docker tests run, so a second run queues rather than colliding. The resources

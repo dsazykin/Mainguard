@@ -33,7 +33,18 @@ public sealed record InstalledAdapterMarker(
     /// <see cref="AdapterSpec.BaseUrlEnvVar"/>), carried across the host/VM boundary so the spawn path
     /// can point the CLI at the daemon's model gateway (MG-4). Null on markers written before this
     /// field existed — re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null)
+    [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null,
+    /// <summary>The provider host this CLI's model traffic goes to (see
+    /// <see cref="AdapterSpec.ModelHost"/>), carried across the host/VM boundary so the spawn path can
+    /// record the agent's gateway upstream binding. Null on markers written before this field existed —
+    /// re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("modelHost")] string? ModelHost = null,
+    /// <summary>The non-credential configuration files this CLI keeps (see
+    /// <see cref="AdapterSpec.SettingsPaths"/>) — the ONLY entries the daemon will restore into /
+    /// harvest from a jail's throwaway trees, so a permission grant survives the next spawn. Client-
+    /// supplied entries are filtered against this list exactly as credential paths are. Null on markers
+    /// written before this field existed — re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
@@ -71,7 +82,26 @@ public sealed class InstalledAdapterCatalog
     {
     }
 
-    public InstalledAdapterCatalog(string registryDir) => _registryDir = registryDir;
+    public InstalledAdapterCatalog(string registryDir)
+    {
+        _registryDir = registryDir;
+        // The adapters ROOT is the registry's parent, because that is the layout the installer creates
+        // (`<root>/registry/<id>.json` beside `<root>/bin`). Derived rather than hardcoded so the root
+        // and the registry cannot disagree: the spawn path bind-mounts this root read-only into every
+        // jail, and it used to mount AdapterPaths.VmRoot unconditionally — so a catalog pointed anywhere
+        // else described CLIs that lived at one path while the jail was handed another. That is only
+        // ever a silent mismatch in production (the default puts both at VmRoot); it becomes a hard
+        // container-create failure the moment the two differ.
+        Root = Path.GetDirectoryName(registryDir.TrimEnd('/', '\\')) is { Length: > 0 } parent
+            ? parent
+            : registryDir;
+    }
+
+    /// <summary>
+    /// The adapters root this catalog's CLIs are installed under — the directory the spawn path
+    /// bind-mounts READ-ONLY into every jail at <see cref="AdapterPaths.SandboxMount"/>.
+    /// </summary>
+    public string Root { get; }
 
     /// <summary>All currently installed agent adapters (empty when none / dir absent).</summary>
     public IReadOnlyList<InstalledAdapterMarker> List()

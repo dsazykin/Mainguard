@@ -1,0 +1,14 @@
+{
+  "$schema": "https://xunit.net/schema/current/xunit.runner.schema.json",
+
+  "why-diagnosticMessages": [
+    "It is what lets the RequiresDocker fixture say out loud, at the DEFAULT `dotnet test` verbosity,",
+    "which Docker engine it is about to strip of the mainguard proxy and networks.",
+    "Measured (xunit 2.9.3 + xunit.runner.visualstudio 3.1.4, .NET 10): a fixture's Console output",
+    "reaches only --verbosity normal, while an IMessageSink DiagnosticMessage reaches both — and",
+    "disappears entirely when this flag is false. DockerSuiteDiagnosticsTests asserts the flag is still",
+    "true and still copied next to the test assembly, because the failure mode here is silence."
+  ],
+
+  "diagnosticMessages": true
+}

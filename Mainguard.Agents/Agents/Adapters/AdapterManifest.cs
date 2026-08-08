@@ -20,6 +20,10 @@ public enum AdapterManifestError
     /// <summary>Two adapters share an id.</summary>
     DuplicateId,
 
+    /// <summary>The <c>platformBinary</c> block is malformed — no candidate sources, an empty target, or
+    /// a path that is not a plain relative path under the adapters prefix.</summary>
+    BadPlatformBinary,
+
     /// <summary>The <c>provenance</c> rung is absent or names a level this build does not know (MG-9).
     /// Its own code because "the maintainer forgot to say what origin assurance this CLI carries" is a
     /// different failure from a malformed field — and it must be a REFUSAL, not a default, or an
@@ -42,6 +46,33 @@ public sealed class AdapterManifestException : Exception
 public sealed record ConfigShim(
     [property: JsonPropertyName("path")] string Path,
     [property: JsonPropertyName("content")] string Content);
+
+/// <summary>
+/// How a script-free install finishes placing a CLI whose npm package is only a LAUNCHER: the real
+/// executable ships in a platform-specific subpackage, and the vendor's <c>postinstall</c> is what
+/// normally hardlinks it over the placeholder at <see cref="Target"/>. Because every adapter installs
+/// with <c>--ignore-scripts</c> (that postinstall is arbitrary upstream code running inside MainguardEnv
+/// before any probe or sandbox applies), that step never runs and the placeholder — a stub that prints
+/// "native binary not installed" and exits 1 — is what the health probe ends up executing.
+///
+/// <para>This block is Mainguard performing the same FILE OPERATION itself, from a reviewed manifest,
+/// without executing anything the vendor shipped. <see cref="Sources"/> is an ordered candidate list
+/// (a CPU-feature or libc variant per entry, exactly as the vendors' own postinstalls enumerate them);
+/// each is placed in turn and validated by the adapter's real health probe, so which build is correct
+/// for this machine is answered EMPIRICALLY rather than guessed from a hardcoded CPU check.</para>
+///
+/// <para>Every path is relative to <see cref="AdapterPaths.VmRoot"/> — the npm <c>--prefix</c> the
+/// installCmd already writes into. Nothing here reaches the network: the subpackage was resolved and
+/// downloaded by the very same <c>npm install</c>, as one of the package's exact-versioned
+/// <c>optionalDependencies</c> (<c>--ignore-scripts</c> suppresses lifecycle hooks, never dependency
+/// resolution). What this therefore does NOT establish is stated in <c>adapters.starter.json</c>: the
+/// sha256 pin covers the launcher tarball, and the executable placed here comes from the unpinned
+/// dependency resolution the manifest already documents as a residual gap.</para>
+/// </summary>
+[JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
+public sealed record PlatformBinaryLink(
+    [property: JsonPropertyName("sources")] IReadOnlyList<string> Sources,
+    [property: JsonPropertyName("target")] string Target);
 
 /// <summary>The command that proves the pinned CLI is installed and at the right version.</summary>
 [JsonUnmappedMemberHandling(JsonUnmappedMemberHandling.Disallow)]
@@ -87,6 +118,15 @@ public sealed record AdapterSpec(
     /// launch from demanding a fresh sign-in. Files only, relative, no <c>..</c>; null = this CLI
     /// has no persistable login state (API-key-only).</summary>
     [property: JsonPropertyName("credentialPaths")] IReadOnlyList<string>? CredentialPaths = null,
+    /// <summary>The files where THIS CLI keeps its NON-credential configuration — above all the
+    /// permission allowlist a user builds by approving commands. Both trees a CLI can write them to
+    /// are wiped every spawn (the tmpfs <c>$HOME</c> and the per-agent worktree), so without this the
+    /// user re-approves every command in every new agent. Restored into every trusted jail and
+    /// harvested back per REPOSITORY (never globally): an approval given while working on repo A must
+    /// not silently pre-approve the same command in repo B. Must not overlap
+    /// <see cref="CredentialPaths"/> — settings go to an ordinary per-repo file, credentials only ever
+    /// to the host OS keychain. Null = this CLI has no persistable settings.</summary>
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null,
     /// <summary>The environment variable this CLI reads its API BASE URL from (e.g.
     /// <c>ANTHROPIC_BASE_URL</c> for claude-code, <c>OPENAI_BASE_URL</c> for codex). MG-4: pointing the
     /// CLI at the daemon's model gateway is what lets the jail hold only a Mainguard session token while
@@ -94,13 +134,26 @@ public sealed record AdapterSpec(
     /// cannot be redirected, so it must talk to the provider directly and BYOK confinement does not
     /// apply to it.</summary>
     [property: JsonPropertyName("baseUrlEnvVar")] string? BaseUrlEnvVar = null,
+    /// <summary>The provider host THIS CLI's model traffic goes to (e.g. <c>api.anthropic.com</c> for
+    /// claude-code). Paired with <see cref="BaseUrlEnvVar"/>: the base-URL variable says the CLI *can* be
+    /// redirected to the gateway, and this says where the gateway must then forward its traffic. Recorded
+    /// as the agent's per-agent upstream binding at spawn, because once the CLI is pointed at the gateway
+    /// the inbound request's Host header names the GATEWAY and can no longer identify the provider. Null =
+    /// no upstream binding, so this CLI is never gateway-confined.</summary>
+    [property: JsonPropertyName("modelHost")] string? ModelHost = null,
     /// <summary>MG-9: how much ORIGIN assurance this CLI's tarball is required to carry —
     /// <c>"npm-build-provenance"</c>, <c>"npm-registry-signature"</c>, or <c>"none"</c>. Mandatory on
     /// every npm-sourced adapter: <see cref="AdapterManifest.Parse"/> refuses a spec that omits it, so
     /// nobody can add a CLI without stating what can actually be verified about it. The declared rung is
     /// enforced fail-closed by <see cref="NpmProvenancePolicy"/>; the string is the wire form of
     /// <see cref="AdapterProvenanceLevel"/>.</summary>
-    [property: JsonPropertyName("provenance")] string? Provenance = null)
+    [property: JsonPropertyName("provenance")] string? Provenance = null,
+    /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
+    /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
+    /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
+    /// package is self-contained (its <c>bin</c> entry is the real entry point) and nothing extra is
+    /// needed. See <see cref="PlatformBinaryLink"/>.</summary>
+    [property: JsonPropertyName("platformBinary")] PlatformBinaryLink? PlatformBinary = null)
 {
     /// <summary>The parsed <see cref="Provenance"/> rung. Only ever reached after
     /// <see cref="AdapterManifest.Parse"/> validated it, so an unrecognised value here is a bug, not a
@@ -190,6 +243,28 @@ public sealed record AdapterManifest(
                     $"Adapter '{a.Id}' provenance '{a.Provenance}' is not a level this build knows "
                     + $"({string.Join(", ", ProvenanceNames.Keys.Select(k => $"'{k}'"))}). Refusing rather "
                     + "than guessing: an unknown rung must never resolve to a weaker check.");
+            if (a.PlatformBinary is { } platform)
+            {
+                // Every path is joined onto AdapterPaths.VmRoot and handed straight to `ln`/`cp` in the
+                // VM, so the same relative-path rule the credentialPaths gate enforces applies here: no
+                // absolute path, no '..' escape, no backslash or control character. A manifest is
+                // reviewed, but this is the one field that names files an install WRITES, so it is
+                // validated rather than trusted.
+                if (platform.Sources is null || platform.Sources.Count == 0)
+                    throw new AdapterManifestException(AdapterManifestError.BadPlatformBinary,
+                        $"Adapter '{a.Id}' platformBinary lists no 'sources' — there would be nothing to place.");
+                foreach (var source in platform.Sources)
+                {
+                    if (!IsHomeRelativeFilePath(source))
+                        throw new AdapterManifestException(AdapterManifestError.BadPlatformBinary,
+                            $"Adapter '{a.Id}' platformBinary source '{source}' must be a plain relative path under the adapters prefix.");
+                }
+
+                if (!IsHomeRelativeFilePath(platform.Target))
+                    throw new AdapterManifestException(AdapterManifestError.BadPlatformBinary,
+                        $"Adapter '{a.Id}' platformBinary target '{platform.Target}' must be a plain relative path under the adapters prefix.");
+            }
+
             if (a.Launch is not null && (a.Launch.Count == 0 || a.Launch.Any(string.IsNullOrWhiteSpace)))
                 throw new AdapterManifestException(AdapterManifestError.MissingField,
                     $"Adapter '{a.Id}' has an empty 'launch' command.");
@@ -206,6 +281,41 @@ public sealed record AdapterManifest(
                     if (!IsHomeRelativeFilePath(path))
                         throw new AdapterManifestException(AdapterManifestError.Malformed,
                             $"Adapter '{a.Id}' credentialPaths entry '{path}' must be a $HOME-relative file path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                }
+            }
+
+            if (a.SettingsPaths is not null)
+            {
+                // The credential list, as the SHAPE GATE already accepted it — the comparison below has
+                // to be against paths that are really restorable, not against raw manifest text.
+                var credentialPaths = new HashSet<string>(
+                    (a.CredentialPaths ?? Array.Empty<string>()).Where(IsHomeRelativeFilePath),
+                    StringComparer.Ordinal);
+                var seenSettings = new HashSet<(string Root, string Path)>();
+                foreach (var entry in a.SettingsPaths)
+                {
+                    if (entry is null || !AdapterSettingsPath.TryParseRoot(entry.Root, out _))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' settingsPaths entry has root '{entry?.Root}' — declare one of "
+                            + $"{string.Join(", ", AdapterSettingsPath.RootSpellings.Select(r => $"'{r}'"))}. "
+                            + "Refusing rather than defaulting: a guessed root would decide whether Mainguard "
+                            + "writes into the jail's throwaway home or into the user's real checkout.");
+                    if (!IsHomeRelativeFilePath(entry.Path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' settingsPaths entry '{entry.Path}' must be a plain relative file "
+                            + "path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                    if (!seenSettings.Add((entry.Root, entry.Path)))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' declares settingsPaths entry '{entry.Root}:{entry.Path}' twice.");
+                    // The boundary this field exists beside, enforced rather than described: a settings
+                    // path is persisted to an ORDINARY per-repo JSON file, a credential path only ever to
+                    // the host OS keychain. One path in both lists would quietly route a credential into
+                    // the plaintext store, which is precisely the standing rule this must not break.
+                    if (entry.ParsedRoot == AdapterSettingsRoot.Home && credentialPaths.Contains(entry.Path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' lists '{entry.Path}' in BOTH credentialPaths and settingsPaths. "
+                            + "Credentials are persisted only to the host OS keychain; settings go to an "
+                            + "ordinary per-repo file. A path cannot be both without leaking the credential.");
                 }
             }
 

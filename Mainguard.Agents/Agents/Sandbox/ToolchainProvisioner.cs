@@ -107,14 +107,45 @@ public sealed class ToolchainProvisioner
     /// <summary>Label: the newline-joined toolchain ids in the layer.</summary>
     public const string SpecLabel = "mainguard.toolchain.spec";
 
+    /// <summary>
+    /// The human-readable line reported through <see cref="ToolchainProvisioner"/>'s progress sink when
+    /// a layer actually has to be BUILT (never on a cache hit — a cache hit is not slow and saying
+    /// "building" for it would train people to ignore the message).
+    ///
+    /// <para>It exists because this build is the one part of a coordinator start that takes minutes: a
+    /// <c>dotnet-10</c> layer pulls ~2.9 GB, and it runs INSIDE the spawn call with nothing on the wire
+    /// to say so. The UI showed a blank pane and then, after 45 s, "the coordinator isn't responding —
+    /// use Stop to cancel and try again" — advice that killed the very build about to unblock it. This
+    /// string is what turns that wait into progress, so it is written for the person waiting, not for a
+    /// log grep (the log line next to it keeps the machine-readable ids/tag).</para>
+    /// </summary>
+    public static string BuildingMessage(ToolchainDeclaration declaration)
+    {
+        ArgumentNullException.ThrowIfNull(declaration);
+        var ids = declaration.Normalized.Replace('\n', ',');
+        return $"Building this repository's toolchain image ({ids}). The first start downloads a few GB "
+             + "and takes several minutes — leave Mainguard running.";
+    }
+
+    /// <summary>The progress line reported once the layer is in hand and the jail can be created.</summary>
+    public const string BuiltMessage = "Toolchain image ready — starting the sandbox.";
+
     private readonly IToolchainImageBuilder _builder;
     private readonly Action<string>? _log;
+    private readonly IProgress<string>? _progress;
     private readonly SemaphoreSlim _buildGate = new(1, 1);
 
-    public ToolchainProvisioner(IToolchainImageBuilder builder, Action<string>? log = null)
+    /// <param name="log">The daemon log sink (machine-readable lines: repo, tag, ids).</param>
+    /// <param name="progress">The USER-FACING sink. Separate from <paramref name="log"/> on purpose:
+    /// the daemon log wants the tag and the base digest, and the person staring at a blank pane wants
+    /// to know that a multi-minute download is running and must not be interrupted. Optional, so every
+    /// existing caller and every test double is unaffected.</param>
+    public ToolchainProvisioner(
+        IToolchainImageBuilder builder, Action<string>? log = null, IProgress<string>? progress = null)
     {
         _builder = builder ?? throw new ArgumentNullException(nameof(builder));
         _log = log;
+        _progress = progress;
     }
 
     /// <summary>
@@ -142,9 +173,22 @@ public sealed class ToolchainProvisioner
                 + "a per-repo toolchain layer is only built on a digest-pinned base.");
         }
 
+        // Every declared id is resolved — an uncatalogued one is a typed refusal here, before anything
+        // is built — but only the IMAGE-LAYER ones produce a layer. A runtime-mount toolchain
+        // (ToolchainDelivery.RuntimeMount) is already installed in the VM because a human installed it,
+        // and reaches the jail as a read-only bind mount; there is nothing to build for it, and building
+        // an empty layer would be a gigabyte of cache and a multi-minute wait for no filesystem change.
         var recipes = declaration.Ids
             .Select(id => ToolchainCatalog.TryGet(id) ?? throw new UnknownToolchainException(repoHandle, id, ToolchainCatalog.KnownIds))
+            .Where(r => r.Delivery == ToolchainDelivery.ImageLayer)
             .ToImmutableArray();
+
+        if (recipes.IsEmpty)
+        {
+            // Declared, resolved, and nothing needs a layer. The caller stays on the base digest, and
+            // the toolchains still reach the jail — through the mount, not the image.
+            return null;
+        }
 
         var tag = ImageTagFor(baseDigest!, declaration, recipes);
         var expectedLabels = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -163,6 +207,8 @@ public sealed class ToolchainProvisioner
             {
                 var dockerfile = RenderDockerfile(baseDigest!, recipes);
                 _log?.Invoke($"toolchain build begin: repo={repoHandle} image={tag} ids={declaration.Normalized.Replace('\n', ',')}");
+                // Reported BEFORE the build, not after: the whole point is to be visible during it.
+                _progress?.Report(BuildingMessage(declaration));
                 try
                 {
                     await _builder.BuildAsync(tag, dockerfile, expectedLabels, ct).ConfigureAwait(false);
@@ -188,6 +234,7 @@ public sealed class ToolchainProvisioner
                           + await SafeDescribeAsync(baseDigest!, ct).ConfigureAwait(false));
 
                 _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
+                _progress?.Report(BuiltMessage);
             }
 
             // The pin, PROVEN rather than requested. Everything above only decides which base we ASKED
@@ -235,6 +282,10 @@ public sealed class ToolchainProvisioner
         declaration.Ids
             .Select(id => ToolchainCatalog.TryGet(id)
                 ?? throw new UnknownToolchainException(string.Empty, id, ToolchainCatalog.KnownIds))
+            // Same filter as EnsureAsync: the tag names what the LAYER contains, and a runtime-mount
+            // toolchain contributes no layer content. Filtering in both places keeps the tag a faithful
+            // content address rather than a hash over things the image does not hold.
+            .Where(r => r.Delivery == ToolchainDelivery.ImageLayer)
             .ToImmutableArray();
 
     /// <summary>

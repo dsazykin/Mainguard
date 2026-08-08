@@ -4,8 +4,10 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Avalonia.Headless.XUnit;
+using Avalonia.Threading;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Mock;
+using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Agents.UI.Services;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.App.Shell.Services;
@@ -156,6 +158,133 @@ public class CoordinatorCliStartTests
             await startTask;
             Assert.False(vm.IsCoordinatorConnecting);
             Assert.False(vm.CoordinatorConnectTimedOut);
+        }
+        finally
+        {
+            ControlCenterViewModel.CoordinatorConnectTimeout = previous;
+        }
+    }
+
+    /// <summary>
+    /// A launch-progress line from the daemon is shown as progress AND suppresses the stall banner.
+    ///
+    /// <para>This is the second half of the coordinator-start failure the owner hit. The first start for
+    /// a repository builds its toolchain image — ~2.9 GB, minutes, inside the spawn call — and the 45 s
+    /// connect budget expired long before it finished, so a healthy launch was reported as "the
+    /// coordinator isn't responding … use Stop to cancel and try again". Following that advice killed
+    /// the build, and the next attempt started it over: the same shape as the sandbox-image loop closed
+    /// in PR #300, where the offered recovery guaranteed the failure repeated.</para>
+    ///
+    /// <para>The budget here is shortened to 50 ms and then deliberately OVERSHOT, so a build that is
+    /// merely slower than the budget cannot pass this by accident — it passes only because the progress
+    /// line rearmed the watchdog on the working budget.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public async Task DaemonProgressLine_ReadsAsProgress_AndTheStallBannerStaysDown()
+    {
+        var previous = ControlCenterViewModel.CoordinatorConnectTimeout;
+        ControlCenterViewModel.CoordinatorConnectTimeout = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            var host = new FakeCliHost { BlockStartUntilCancelled = true };
+            using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+            await vm.LoadInstalledClisAsync();
+
+            var startTask = vm.StartCoordinatorCommand.ExecuteAsync(null);
+            Assert.True(vm.IsCoordinatorConnecting);
+            Assert.False(vm.HasCoordinatorStartDetail); // nothing said yet — the generic explainer shows
+
+            var building = ToolchainProvisioner.BuildingMessage(ToolchainDeclarationResolver.Parse("dotnet-10"));
+            host.AnnounceCoordinatorProgress(building);
+            await WaitUntilAsync(() => vm.HasCoordinatorStartDetail, TimeSpan.FromSeconds(2));
+
+            Assert.Equal(building, vm.CoordinatorStartDetail);
+            Assert.Contains("dotnet-10", vm.CoordinatorStartDetail, StringComparison.Ordinal);
+
+            // Well past the 50 ms silence budget. The banner must NOT appear: the daemon told us what it
+            // is doing, so silence is not the diagnosis and Stop must not be advertised as the remedy.
+            await Task.Delay(TimeSpan.FromMilliseconds(400));
+            Dispatcher.UIThread.RunJobs();
+            Assert.False(vm.CoordinatorConnectTimedOut);
+            Assert.True(vm.IsCoordinatorConnecting); // still loading, just honestly
+
+            vm.StopCoordinatorCommand.Execute(null);
+            await vm.StopPrompt!.ConfirmCommand.ExecuteAsync(null);
+            await startTask;
+
+            // The progress line belongs to the launch, not to the surface: it clears with connecting, so
+            // a later start never opens showing the previous one's stale message.
+            Assert.False(vm.HasCoordinatorStartDetail);
+        }
+        finally
+        {
+            ControlCenterViewModel.CoordinatorConnectTimeout = previous;
+        }
+    }
+
+    /// <summary>
+    /// The other half of the same property, and what keeps the test above from being vacuous: with the
+    /// daemon saying NOTHING over the identical budget, the stall banner still fires. Suppression is
+    /// evidence-driven, not a blanket disabling of the watchdog — a launch that really is wedged must
+    /// still be reported.
+    /// </summary>
+    [AvaloniaFact]
+    public async Task WithNoProgressLine_TheStallBannerStillFires()
+    {
+        var previous = ControlCenterViewModel.CoordinatorConnectTimeout;
+        ControlCenterViewModel.CoordinatorConnectTimeout = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            var host = new FakeCliHost { BlockStartUntilCancelled = true };
+            using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+            await vm.LoadInstalledClisAsync();
+
+            var startTask = vm.StartCoordinatorCommand.ExecuteAsync(null);
+            await WaitUntilAsync(() => vm.CoordinatorConnectTimedOut, TimeSpan.FromSeconds(2));
+
+            Assert.True(vm.CoordinatorConnectTimedOut);
+            Assert.False(vm.HasCoordinatorStartDetail);
+
+            vm.StopCoordinatorCommand.Execute(null);
+            await vm.StopPrompt!.ConfirmCommand.ExecuteAsync(null);
+            await startTask;
+        }
+        finally
+        {
+            ControlCenterViewModel.CoordinatorConnectTimeout = previous;
+        }
+    }
+
+    /// <summary>A progress line that arrives AFTER the banner already fired takes it back down: a slow
+    /// first report must not leave the destructive-advice panel on screen for the rest of the build.</summary>
+    [AvaloniaFact]
+    public async Task AProgressLineArrivingLate_TakesTheStallBannerBackDown()
+    {
+        var previous = ControlCenterViewModel.CoordinatorConnectTimeout;
+        ControlCenterViewModel.CoordinatorConnectTimeout = TimeSpan.FromMilliseconds(50);
+        try
+        {
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            var host = new FakeCliHost { BlockStartUntilCancelled = true };
+            using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+            await vm.LoadInstalledClisAsync();
+
+            var startTask = vm.StartCoordinatorCommand.ExecuteAsync(null);
+            await WaitUntilAsync(() => vm.CoordinatorConnectTimedOut, TimeSpan.FromSeconds(2));
+            Assert.True(vm.CoordinatorConnectTimedOut);
+
+            host.AnnounceCoordinatorProgress(
+                ToolchainProvisioner.BuildingMessage(ToolchainDeclarationResolver.Parse("dotnet-10")));
+            await WaitUntilAsync(() => !vm.CoordinatorConnectTimedOut, TimeSpan.FromSeconds(2));
+
+            Assert.False(vm.CoordinatorConnectTimedOut);
+            Assert.True(vm.HasCoordinatorStartDetail);
+
+            vm.StopCoordinatorCommand.Execute(null);
+            await vm.StopPrompt!.ConfirmCommand.ExecuteAsync(null);
+            await startTask;
         }
         finally
         {
@@ -499,10 +628,22 @@ public class CoordinatorCliStartTests
 
         public IReadOnlyList<AgentInfo> ListAgents() => Agents.ToArray();
 
-        public event Action<AgentEvent>? EventReceived
+        public event Action<AgentEvent>? EventReceived;
+
+        /// <summary>
+        /// Models what the daemon does WHILE a spawn is still in flight: the session record exists from
+        /// the moment it is created (<c>AgentSessionStore.Spawn</c> broadcasts before the launch runs),
+        /// and a launch-progress line then arrives as a state delta whose <c>reason</c> moves while the
+        /// state word stays <c>Starting</c>. That delta lands in <c>AgentInfo.Detail</c>.
+        /// </summary>
+        public void AnnounceCoordinatorProgress(string detail)
         {
-            add { }
-            remove { }
+            var id = CoordinatorAgentId ?? "coord-inflight";
+            CoordinatorAgentId = id;
+            Agents.RemoveAll(a => a.AgentId == id);
+            Agents.Add(new AgentInfo(id, "claude-code", $"agent/{id}",
+                AgentLifecycleState.Provisioning, detail, DateTimeOffset.UtcNow, AgentRoles.Coordinator));
+            EventReceived?.Invoke(new AgentEvent(1, "State", id, detail, DateTimeOffset.UtcNow));
         }
 
         /// <summary>Models the daemon tearing the session down: the agent leaves the list, so the VM's

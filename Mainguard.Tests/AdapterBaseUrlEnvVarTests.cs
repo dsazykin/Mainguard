@@ -7,7 +7,7 @@ namespace Mainguard.Tests;
 /// MG-4 stage 2 — the adapter declares which env var its CLI reads its API <b>base URL</b> from.
 ///
 /// <para>This is the seam that makes BYOK confinement possible at all. The provider key is written
-/// verbatim into the agent-readable <c>/run/secrets/agent.env</c> today; to stop that, the CLI has to
+/// verbatim into the agent-readable <c>/run/secrets/agent/agent.env</c> today; to stop that, the CLI has to
 /// be pointed at the daemon's model gateway so the jail can hold a Mainguard session token while the
 /// real key stays daemon-side and is injected at the network hop. A CLI can only be redirected if we
 /// know the variable it honours (<c>ANTHROPIC_BASE_URL</c>, <c>OPENAI_BASE_URL</c>, …), and that fact
@@ -83,12 +83,82 @@ public sealed class AdapterBaseUrlEnvVarTests
             ApiKeyEnvVar: "ANTHROPIC_API_KEY",
             EgressHosts: null,
             CredentialPaths: null,
-            BaseUrlEnvVar: "ANTHROPIC_BASE_URL");
+            BaseUrlEnvVar: "ANTHROPIC_BASE_URL",
+            ModelHost: "api.anthropic.com");
 
         var round = InstalledAdapterMarker.TryDeserialize(InstalledAdapterMarker.Serialize(marker));
 
         Assert.NotNull(round);
         Assert.Equal("ANTHROPIC_BASE_URL", round!.BaseUrlEnvVar);
+        // The launcher needs BOTH across this hop — a marker that carried only half the pair would make
+        // TryConfineToGateway refuse, silently, on a CLI the manifest says is confinable.
+        Assert.Equal("api.anthropic.com", round.ModelHost);
+    }
+
+    // ---- the BUNDLED channel's actual declarations (MG-4 item 1) ----------------------------------
+    //
+    // The two tests below are about the shipped data, not the parser. PR #298 built the whole
+    // confinement mechanism and then left every bundled adapter with baseUrlEnvVar/modelHost ABSENT, so
+    // TryConfineToGateway refused every spawn and a BYOK jail kept receiving the raw provider key. A
+    // mechanism nothing declares is indistinguishable from no mechanism, and nothing failed to say so.
+
+    /// <summary>
+    /// The confinement pair is all-or-nothing. Declaring a base-URL variable without a model host (or
+    /// vice versa) reads as "confinable" to a human and is refused by the launcher, which is the exact
+    /// looks-applied-but-isn't shape this repo keeps producing. An adapter with no <c>apiKeyEnvVar</c>
+    /// is never BYOK, so declaring the pair on it would be decoration.
+    /// </summary>
+    [Fact]
+    public void BundledStarterCatalog_ConfinementPair_IsAllOrNothing_AndOnlyOnBYOKAdapters()
+    {
+        foreach (var adapter in AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters)
+        {
+            var hasBaseUrl = !string.IsNullOrWhiteSpace(adapter.BaseUrlEnvVar);
+            var hasModelHost = !string.IsNullOrWhiteSpace(adapter.ModelHost);
+
+            Assert.True(
+                hasBaseUrl == hasModelHost,
+                $"'{adapter.Id}' declares baseUrlEnvVar={adapter.BaseUrlEnvVar ?? "<null>"} but "
+                + $"modelHost={adapter.ModelHost ?? "<null>"}. SandboxAgentLauncher.TryConfineToGateway "
+                + "requires BOTH, so half a pair is a confinement that can never engage.");
+
+            if (hasBaseUrl)
+            {
+                Assert.False(
+                    string.IsNullOrWhiteSpace(adapter.ApiKeyEnvVar),
+                    $"'{adapter.Id}' declares a confinement pair but no apiKeyEnvVar, so no BYOK key is "
+                    + "ever injected for it and the pair can never be used.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pins the vendor facts measured against the pinned tarballs on 2026-08-05 (see the
+    /// <c>_comment</c> block in <c>adapters.starter.json</c> for how each was established).
+    ///
+    /// <para>This is a CHANGE DETECTOR, not a restatement of the JSON: it fails when someone adds a
+    /// plausible-looking variable to codex/qwen/opencode without redoing the measurement, and it fails
+    /// when claude-code's or gemini's pair is dropped or renamed. A wrong name here is worse than none
+    /// — the CLI would keep calling the provider directly while Mainguard believed it was fronted.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("claude-code", "ANTHROPIC_BASE_URL", "api.anthropic.com")]
+    [InlineData("gemini-cli", "GOOGLE_GEMINI_BASE_URL", "generativelanguage.googleapis.com")]
+    // No base-URL ENVIRONMENT VARIABLE exists in these CLIs' shipped binaries/bundles. codex takes its
+    // endpoint from config.toml only; qwen needs OPENAI_MODEL alongside and is OAuth-first with no
+    // apiKeyEnvVar; opencode is multi-provider with per-provider base URLs in its own config.
+    [InlineData("codex", null, null)]
+    [InlineData("qwen-code", null, null)]
+    [InlineData("opencode", null, null)]
+    public void BundledStarterCatalog_DeclaresTheMeasuredConfinementFacts(
+        string id, string? baseUrlEnvVar, string? modelHost)
+    {
+        var adapter = Assert.Single(
+            AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson()).Adapters,
+            a => a.Id == id);
+
+        Assert.Equal(baseUrlEnvVar, adapter.BaseUrlEnvVar);
+        Assert.Equal(modelHost, adapter.ModelHost);
     }
 
     // Markers written before this field existed must still load (the field backfills on re-install).

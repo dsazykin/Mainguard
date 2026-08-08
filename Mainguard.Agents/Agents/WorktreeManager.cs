@@ -61,6 +61,19 @@ public interface IAgentWorktreeManager
 
     /// <summary>MG-3 — stop watching (teardown). Default no-op.</summary>
     void UnwatchAgentRef(string repoHash, string agentId) { }
+
+    /// <summary>
+    /// Establishes which branch this agent's worktree is actually committing on, so that work committed
+    /// somewhere other than <c>agent/&lt;id&gt;</c> is REPORTED rather than silently ignored.
+    ///
+    /// <para>The default is <see cref="AgentBranchAlignmentState.Unknown"/>, not "aligned": the test
+    /// doubles that take this default have no worktree to read, and an implementation that cannot measure
+    /// alignment must never be able to assert it. A caller that treats Unknown as a pass is choosing to;
+    /// it cannot do so by accident.</para>
+    /// </summary>
+    AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
+        => new(AgentBranchAlignmentState.Unknown, AgentRepoLayout.BranchPrefix + agentId,
+            Detail: "this worktree manager has no worktree to inspect");
 }
 
 /// <summary>
@@ -271,6 +284,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             // …and again over the agent repo, whose `worktrees/<id>` metadata `worktree add` just created.
             GroupShareRecursive(agentRepoPath);
 
+            // The in-jail guard rail (layer 2), installed AFTER both GroupShareRecursive passes so the
+            // hook keeps its own narrower mode instead of being widened back to group-writable. It is
+            // ergonomics, not a boundary — see AgentBranchGuard — and it is best effort: a spawn must
+            // never fail because a guard rail could not be written.
+            AgentBranchGuard.InstallHook(agentRepoPath, agentId, _warningSink);
+
             // Seed the merge queue's input contract: refs/heads/agent/<id> exists in the MIRROR from the
             // moment the agent does, pointing at the base commit. Everything downstream (the queue, the
             // diff bridge, the host repo's sync fetch) reads it there and is unaffected by where the
@@ -289,6 +308,11 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
     /// <inheritdoc />
     public string AgentRepoPathFor(string repoHash, string agentId) => _agentRepos.PathFor(repoHash, agentId);
+
+    /// <inheritdoc />
+    public AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
+        => AgentBranchGuard.Probe(
+            WorktreePathFor(repoHash, agentId), _agentRepos.PathFor(repoHash, agentId), agentId);
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;

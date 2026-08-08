@@ -14,6 +14,10 @@ public static class ShutdownStatus
     /// <summary>Only when StopVmOnExit is on: terminating MainguardEnv (scoped, G-12).</summary>
     public const string StoppingVm = "Stopping Mainguard OS…";
 
+    /// <summary>Shown INSTEAD of <see cref="StoppingVm"/> when a sandbox-image build is still running:
+    /// the distro is deliberately left up so the build is not killed mid-layer.</summary>
+    public const string LeavingVmForImageBuild = "Finishing the sandbox image update in the background…";
+
     /// <summary>Terminal line before the process actually exits.</summary>
     public const string Done = "Mainguard is closing.";
 }
@@ -36,6 +40,16 @@ public interface IAppShutdownEnvironment
     /// <summary>Terminates MainguardEnv (scoped — never the VM-wide shutdown verb). Called only when
     /// <see cref="StopVmOnExit"/> is true; idempotent.</summary>
     Task StopVmAsync(CancellationToken ct);
+
+    /// <summary>
+    /// True while a sandbox-image provisioning build is running inside MainguardEnv
+    /// (<see cref="SandboxImageProvisioningTracker.IsProvisioning"/>). When it is, the
+    /// <see cref="StopVmOnExit"/> terminate is SKIPPED: <c>wsl --terminate</c> kills the in-flight
+    /// <c>docker build</c>, and because the expensive agent-base step is a single layer, the kill
+    /// discards the whole build — which is precisely how the images stayed stale across every restart
+    /// in the 2026-08-05 field failure.
+    /// </summary>
+    bool SandboxProvisioningInFlight { get; }
 
     /// <summary>oobe.log breadcrumb sink.</summary>
     void Log(string message);
@@ -85,15 +99,28 @@ public sealed class AppShutdownSequence
 
         if (_env.StopVmOnExit)
         {
-            status?.Report(ShutdownStatus.StoppingVm);
-            _env.Log("shutdown: stopping MainguardEnv (StopVmOnExit)");
-            try
+            // A provisioning build in flight outranks the StopVmOnExit convenience: terminating the
+            // distro under it destroys minutes of work and leaves the images stale, so the NEXT launch
+            // refuses to start the coordinator too. Leaving MainguardEnv up costs the user some idle
+            // RAM until WSL's own idle timer reaps it; killing the build costs them the feature.
+            if (_env.SandboxProvisioningInFlight)
             {
-                await _env.StopVmAsync(ct).ConfigureAwait(false);
+                status?.Report(ShutdownStatus.LeavingVmForImageBuild);
+                _env.Log("shutdown: a sandbox image build is still running — leaving MainguardEnv up "
+                    + "(StopVmOnExit skipped) so the build is not killed mid-layer");
             }
-            catch (Exception ex)
+            else
             {
-                _env.Log($"shutdown: stopping MainguardEnv failed (non-fatal): {ex.Message}");
+                status?.Report(ShutdownStatus.StoppingVm);
+                _env.Log("shutdown: stopping MainguardEnv (StopVmOnExit)");
+                try
+                {
+                    await _env.StopVmAsync(ct).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _env.Log($"shutdown: stopping MainguardEnv failed (non-fatal): {ex.Message}");
+                }
             }
         }
 

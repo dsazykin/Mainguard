@@ -7,17 +7,27 @@ using Xunit;
 namespace Mainguard.Server.Tests;
 
 /// <summary>
-/// Login persistence across a daemon restart.
+/// The <c>HarvestAgentCredentials</c> RPC's <b>transport contract</b>: argument validation, the
+/// unknown-agent answer, authentication, and the property that harvesting does not stop the agent.
 ///
-/// <para><b>The bug.</b> The CLI's login-state files live in the jail's tmpfs <c>$HOME</c>, and the
-/// durable store is the host OS keychain. The round-trip existed — <c>StopAgent</c> harvests, the
-/// client persists, the next <c>SpawnAgent</c> restores — but harvest was called from exactly ONE
-/// place: <c>AgentSpawnService.StopAsync</c>. Daemon shutdown only logs. So a daemon stop, VM
-/// shutdown, app close without stopping agents, or any crash never harvested at all: the tmpfs home
-/// died with the container and the user had to sign in again on every single launch.</para>
+/// <para><b>Scope, stated because it was previously overstated.</b> These are edge/liveness cases and
+/// nothing more. Every agent they spawn uses <c>unprovisioned-handle</c>, so it has no jail and no
+/// credential to return — the harvest legitimately answers empty in all of them, and each would keep
+/// passing if the harvest returned empty for a REAL jail too. This class therefore says nothing about
+/// whether login state actually makes the round-trip; reading it as round-trip coverage is what let
+/// the missing harvest caller go unnoticed. The two claims that matter are pinned elsewhere, at seams
+/// where they can fail:</para>
+/// <list type="bullet">
+///   <item><c>CliLoginHarvestWiringTests</c> — the shipped client actually CALLS the harvest (the
+///   periodic sweep and the shutdown one), asserting the bytes reach the keychain;</item>
+///   <item><c>CliLoginRoundTripDockerTests</c> — login written in a real jail survives that jail's
+///   teardown and reappears in a fresh one.</item>
+/// </list>
 ///
-/// <para><c>HarvestAgentCredentials</c> lets the client pull the current login while the agent keeps
-/// running, so the keychain can be kept warm instead of updated only at teardown.</para>
+/// <para><c>HarvestAgentCredentials</c> exists so the client can pull the current login while the
+/// agent keeps running: harvest used to happen ONLY inside <c>AgentSpawnService.StopAsync</c>, so a
+/// daemon stop, VM shutdown, app close, or crash never harvested at all — the tmpfs home died with the
+/// container and the user signed in again on every launch.</para>
 /// </summary>
 public sealed class HarvestCredentialsRpcTests : IClassFixture<DaemonFixture>
 {

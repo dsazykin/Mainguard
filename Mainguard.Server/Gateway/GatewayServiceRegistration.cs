@@ -28,7 +28,8 @@ namespace Mainguard.Server.Gateway;
 /// </summary>
 public static class GatewayServiceRegistration
 {
-    public static void Register(WebApplicationBuilder builder, string dbPath, Action<string>? log = null)
+    public static void Register(
+        WebApplicationBuilder builder, string dbPath, Action<string>? log = null, DaemonOptions? options = null)
     {
         var services = builder.Services;
 
@@ -120,7 +121,14 @@ public static class GatewayServiceRegistration
             // Phase 2 backstop: a worker whose own plan was never approved cannot merge, whatever it
             // verified. ANDed into every repo's queue alongside the RT-D2 changed-test-command gate and the
             // P2-11 flagged-change gate — the three are independent, and all three must say yes.
-            planGate: sp.GetRequiredService<WorkerPlanGate>()));
+            planGate: sp.GetRequiredService<WorkerPlanGate>(),
+            // ...and the other half of the same question. The publish above carries ONLY
+            // refs/heads/agent/<id>; this establishes whether the agent's worktree is actually on that
+            // branch, so that work committed elsewhere is refused with the measurement instead of
+            // verified as an empty branch. Passing it is what makes the check exist in the daemon at all —
+            // the parameter defaults to null, and a null here would be the silent behaviour again.
+            checkAgentBranch: (repoHash, agentId) =>
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.CheckAgentBranch(repoHash, agentId)));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
@@ -204,6 +212,37 @@ public static class GatewayServiceRegistration
         // is best-effort (like the gateway stores above): the DB-backed subscription/seen-head store when
         // the daemon DB opened, in-memory otherwise, so the daemon always starts.
         RegisterPrIntake(services, dbFactory);
+
+        // ---- the model-proxy data path (MG-4 / P2-08 invariant #1) -------------------------------
+        // These three types existed but were constructed ONLY in tests, so the gateway had no
+        // production data path at all: no credential custody, no forwarder, and therefore no ledger
+        // write on any real request. AiGateway.Acquire/Settle — the only writer to BudgetLedger — was
+        // reachable exclusively from test code. Registering them here is what makes a BYOK agent's
+        // spend actually charge, and an over-budget agent actually refuse.
+        //
+        // Registered unconditionally (not gated on the gateway being enabled) so the spawn path can ask
+        // for credentials and get a coherent "no confinement configured" answer, rather than the DI
+        // container throwing at spawn time on a daemon with the gateway off.
+        services.AddSingleton<AgentGatewayCredentials>();
+        services.AddSingleton<IAgentPortMap, NullAgentPortMap>();
+        services.AddSingleton(sp => new GatewayForwarder(
+            sp.GetRequiredService<AiGateway>(),
+            // One pooled handler for every upstream call — the provider connection is TLS to the real
+            // model host, established here, daemon-side, which is the whole point of the hop: the jail
+            // never holds a credential that works against it.
+            new HttpMessageInvoker(new SocketsHttpHandler
+            {
+                AutomaticDecompression = System.Net.DecompressionMethods.None,
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            })));
+
+        // The confinement descriptor the spawn path reads. Null base URL ⇒ the gateway is disabled and
+        // BuildSecrets keeps the pre-gateway behaviour exactly (the raw key goes to the jail). Since MG-4
+        // item 3 the gateway is ON by default, so this is normally populated; `--gateway-bind off` (or
+        // MAINGUARD_GATEWAY_BIND=off), or a host with no private address, still yields the old posture.
+        services.AddSingleton(new GatewayConfinementOptions(
+            BaseUrl: BuildGatewayBaseUrl(options),
+            Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
 
         services.AddHostedService<GatewayHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
@@ -291,6 +330,33 @@ public static class GatewayServiceRegistration
             return intake;
         });
     }
+
+    /// <summary>
+    /// The base URL a confined jail's CLI is pointed at, or null when the gateway is disabled.
+    ///
+    /// <para>The address is the daemon's own gateway bind address — MEASURED to be reachable from a jail
+    /// only via that jail's egress proxy, never directly (a container on an <c>Internal=true</c> network
+    /// can reach its own bridge's host-side address and nothing else; see
+    /// <c>docs/design/oauth-budgeting.md</c> for the measurements). Plain <c>http</c> is deliberate: the
+    /// hop is jail → its own segment proxy → daemon, entirely inside the VM's private networking, and
+    /// the credential it carries is a Mainguard session token rather than a provider key. The TLS that
+    /// matters is the daemon → provider leg, which the forwarder establishes.</para>
+    /// </summary>
+    internal static string? BuildGatewayBaseUrl(DaemonOptions? options) =>
+        BuildGatewayUpstream(options) is { } upstream ? "http://" + upstream : null;
+
+    /// <summary>
+    /// The gateway's <c>host:port</c> — the same address as <see cref="BuildGatewayBaseUrl"/> without the
+    /// scheme, which is the shape the egress proxy wants (a tinyproxy filter matches a destination host,
+    /// and an <c>upstream</c> directive names a <c>host:port</c>). Derived from the ONE place the bind is
+    /// configured so the address the jail is pointed at and the address the proxy is told to permit cannot
+    /// drift apart; a drift there would be invisible until a confined agent silently lost its egress.
+    /// Null when the gateway is disabled.
+    /// </summary>
+    public static string? BuildGatewayUpstream(DaemonOptions? options) =>
+        options is null || string.IsNullOrWhiteSpace(options.GatewayBindAddress)
+            ? null
+            : $"{options.GatewayBindAddress}:{options.GatewayPort}";
 
     /// <summary>
     /// Where the P2-10 verification log artifacts land: beside the daemon DB, so the in-proc test tier's
@@ -404,11 +470,17 @@ public static class GatewayServiceRegistration
     /// container rather than recreating it) and the merge queue rehydrates its state from SQLite in its
     /// constructor. So after a daemon restart the queue resumed knowing about every branch, every jail was
     /// still running, and the session store was empty: every verification on the box refused with "no live
-    /// sandbox", <c>ResumeAfterRestartAsync</c> drove each interrupted run straight back to Working, and
-    /// the stale cascade's auto re-verify failed for every branch. The queue came back up permanently
-    /// unable to verify anything until each agent was spawned again — with no error naming the actual
-    /// cause. That fallback matches on BOTH labels, so it disambiguates two repos' <c>pr-7</c> the same way
-    /// the session key does.</para>
+    /// sandbox" and the stale cascade's auto re-verify failed for every branch. The queue came back up
+    /// permanently unable to verify anything until each agent was spawned again — with no error naming the
+    /// actual cause. That fallback matches on BOTH labels, so it disambiguates two repos' <c>pr-7</c> the
+    /// same way the session key does.</para>
+    ///
+    /// <para>This method is now also the restart resume's jail probe:
+    /// <see cref="MergeQueueProvisioner"/> hands it to <c>MergeQueue.BeginResumeAfterRestart</c>, which
+    /// re-runs an interrupted verification when it answers and returns the entry to <c>Working</c> when it
+    /// does not. That makes the Docker fallback above load-bearing twice over — without it every survivor
+    /// would look jail-less on the one pass whose whole job is telling those two cases apart, and the
+    /// resume would report every branch on the box as stranded.</para>
     /// </summary>
     internal static string? ResolveVerificationJail(AgentSessionStore sessions, string repoHash, string agentId)
     {

@@ -25,6 +25,11 @@ service AgentService {
   // payload version stamped in /etc/mainguardos-release. A daemon that predates this RPC
   // answers Unimplemented — which the client treats as the skew signal itself.
   rpc GetDaemonInfo(GetDaemonInfoRequest) returns (GetDaemonInfoResponse);
+  // Live per-agent CPU/RAM sampled from the container engine, plus whether each agent's spend
+  // is measurable at all. The Resource Monitor was built over this data and it did not exist:
+  // the client hard-coded CPU/RAM to 0, so the tab showed a convincing zero for every agent
+  // forever. Sampling is driven by the subscription — no subscriber, no engine calls.
+  rpc StreamAgentResources(StreamAgentResourcesRequest) returns (stream AgentResourcesSnapshot);
 }
 
 message SpawnAgentRequest {
@@ -45,6 +50,24 @@ message SpawnAgentRequest {
   // writes paths the installed adapter DECLARES (credentialPaths) and only where no fresher
   // in-jail copy exists. Contents are SECRET; nothing persists agent-side (the home is tmpfs).
   repeated CliCredentialFile cli_credentials = 7;
+  // The CLI's saved SETTINGS FOR THIS REPOSITORY — above all the permission allowlist the user built
+  // by approving commands in earlier agents — restored into the jail's throwaway trees so a new agent
+  // does not re-prompt for everything already allowed. NOT secrets and NOT keychain-backed: the
+  // durable copy is an ordinary per-repo JSON file under the Mainguard data root that the owner can
+  // read and delete. Scope is per repository on purpose (an approval in repo A must not pre-approve
+  // the same command in repo B), and an UNTRUSTED spawn (external pull request) sends none at all.
+  repeated CliSettingsFile cli_settings = 8;
+}
+
+// One CLI settings file. Unlike CliCredentialFile this carries a ROOT, because a CLI keeps its
+// user-level and project-level configuration in two different trees and BOTH are wiped every spawn:
+//   "home"       -> the jail's tmpfs $HOME
+//   "workspace"  -> the per-agent git worktree, where claude-code records "don't ask again" grants
+// The daemon accepts an entry only when the installed adapter declares that exact (root, path).
+message CliSettingsFile {
+  string root = 1;    // "home" | "workspace" — an unknown value is refused, never defaulted
+  string path = 2;    // root-relative, validated against the adapter's declared settingsPaths
+  bytes content = 3;
 }
 
 // One CLI login-state file, addressed relative to the jail's $HOME (e.g.
@@ -77,6 +100,17 @@ message StopAgentResponse {
   repeated CliCredentialFile cli_credentials = 2;
   // The stopped session's adapter kind, so the client knows which keychain entry to update.
   string agent_kind = 3;
+  // The CLI's settings harvested from the jail (the adapter's declared settingsPaths), for the
+  // client to fold into its PER-REPO settings file. EMPTY for an unattended session — a Managed
+  // worker's terminal is daemon-locked read-only, so nothing in its allowlist was approved by a
+  // person, and letting it flow back would be an agent writing its own future permissions.
+  repeated CliSettingsFile cli_settings = 4;
+  // The repo handle this session belongs to — the SAME opaque handle the client supplied on spawn
+  // (never a daemon path, G-14). Settings are stored per repository, and the client's harvest sweep
+  // walks every agent on the daemon, not just the open repo's: without this the client would have to
+  // assume "whatever repo is open right now", which is exactly how one repo's approved-command list
+  // would end up filed under another. Empty when the session has no repo.
+  string repo_handle = 5;
 }
 
 message HarvestAgentCredentialsRequest {
@@ -90,6 +124,13 @@ message HarvestAgentCredentialsResponse {
   repeated CliCredentialFile cli_credentials = 1;
   // The adapter kind, so the client knows which keychain entry to update.
   string agent_kind = 2;
+  // The CLI's CURRENT settings (the adapter's declared settingsPaths), so the periodic sweep keeps
+  // the per-repo store warm and a crash does not cost the approvals made this session. Empty for an
+  // unattended session, for the same reason as StopAgentResponse.cli_settings.
+  repeated CliSettingsFile cli_settings = 3;
+  // The repo handle this session belongs to (see StopAgentResponse.repo_handle) — what makes the
+  // client's per-repo filing exact instead of a guess at the currently open repository.
+  string repo_handle = 4;
 }
 
 message ListAgentsRequest {}
@@ -161,4 +202,36 @@ message StateChange {
 
 message LogLine {
   string line = 1;
+}
+
+message StreamAgentResourcesRequest {}
+
+// One sampling tick, as a WHOLE-SET snapshot rather than per-agent deltas: an agent that
+// stopped reporting must be expressible, and a delta feed can only ever add. The client
+// replaces its map with each snapshot, so a torn-down agent's stale numbers cannot linger.
+message AgentResourcesSnapshot {
+  repeated AgentResourceReading agents = 1;
+}
+
+// One agent's sampled usage.
+//
+// cpu_percent and mem_bytes are `optional` ON PURPOSE. proto3 scalars default to 0, and a 0
+// that means "we could not measure it" is indistinguishable from a 0 that means "this agent is
+// idle" — which is precisely the false-reassurance bug this RPC exists to fix. Explicit field
+// presence makes "unknown" a value the wire format can carry, so the client never has to guess.
+message AgentResourceReading {
+  string agent_id = 1;
+  // Percent of ONE core (the `docker stats` convention): a container pinning two cores reads 200.
+  optional double cpu_percent = 2;
+  // Resident bytes, page-cache excluded the way `docker stats` does it.
+  optional double mem_bytes = 3;
+  // Whether this agent's model spend is MEASURABLE — i.e. the daemon issued it a gateway
+  // confinement token at spawn, so its traffic transits the metering proxy. False for an OAuth
+  // agent (it authenticates past the proxy with a session Mainguard never issued), for a BYOK
+  // CLI that declares no base-URL/model-host pair (codex, qwen-code, opencode), and for a daemon
+  // running with the gateway off. When false the client must not render a spend figure at all —
+  // "$0.00" would read as "you have spent nothing". See docs/design/oauth-budgeting.md.
+  bool metered = 4;
+  // Why a reading is absent, for the daemon log and diagnostics. Never rendered as a number.
+  string unavailable_reason = 5;
 }

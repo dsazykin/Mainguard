@@ -49,6 +49,19 @@ public sealed class DaemonBackedOrchestrator :
 
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
 
+    /// <summary>
+    /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
+    /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
+    /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
+    /// and the window it bounds is how much of a fresh interactive login a hard crash can lose.
+    /// </summary>
+    private static readonly TimeSpan DefaultLoginHarvestInterval = TimeSpan.FromMinutes(1);
+
+    /// <summary>How long <see cref="Dispose"/> will wait for the FINAL harvest before giving up. App
+    /// close must stay responsive, so this is a budget, not a guarantee — the periodic sweep is what
+    /// makes the keychain warm enough that losing this one costs at most the last interval.</summary>
+    private static readonly TimeSpan ShutdownHarvestBudget = TimeSpan.FromSeconds(5);
+
     /// <summary>SpawnAgent runs the daemon's whole provision chain (worktree + hardened container +
     /// CLI bind under a PTY) — on a cold start that is well past the client's 10 s RPC default, whose
     /// expiry cancelled the server-side spawn mid-provision and tore it down (the "never starts on
@@ -64,6 +77,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Func<Mainguard.Git.Services.IOperationJournal> _journalFactory;
     private readonly Lazy<Mainguard.Agents.Services.IHostPullRequestGateway> _hostPullRequests;
     private readonly CancellationTokenSource _cts = new();
+    private readonly TimeSpan _loginHarvestInterval;
     private readonly object _gate = new();
 
     // ---- projections (all guarded by _gate) ----
@@ -77,6 +91,13 @@ public sealed class DaemonBackedOrchestrator :
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly Dictionary<string, (long Tokens, long UsdMicros)> _agentSpend = new(StringComparer.Ordinal);
+    /// <summary>Latest per-agent CPU/RAM tick from the daemon's sampler, keyed by agent id. Absence of an
+    /// entry — or a null field within one — is "not measured" and must stay distinguishable from zero.</summary>
+    private readonly Dictionary<string, (double? Cpu, double? RamBytes, bool Metered)> _agentResources =
+        new(StringComparer.Ordinal);
+    /// <summary>Whether a resource tick has EVER arrived. Before the first one there is nothing to report,
+    /// which is not the same as a fleet reading zero.</summary>
+    private bool _haveResourceTick;
     private string _mainSha = string.Empty;
     private long _totalUsdMicros;
     private long _totalTokens;
@@ -91,8 +112,13 @@ public sealed class DaemonBackedOrchestrator :
     private Task? _agentPump;
     private Task? _planPump;
     private Task? _spendPump;
+    private Task? _resourcePump;
     private Task? _conversationPump;
+    /// <summary>Where a repository's saved CLI settings live between agents. Per repo by construction —
+    /// approving a command here must not pre-approve it somewhere else.</summary>
+    private readonly CliSettingsStore _cliSettings;
     private Task? _queuePump;
+    private Task? _loginHarvestPump;
     private CancellationTokenSource? _queuePumpCts;
     private long _seq;
 
@@ -115,14 +141,28 @@ public sealed class DaemonBackedOrchestrator :
     /// runs here, exactly like the local leg's <c>git merge</c>. Injectable so tests drive a fake host and
     /// never the live GitHub API.</para>
     /// </param>
+    /// <param name="loginHarvestInterval">How often the background login-harvest pump sweeps live agents
+    /// into the keychain (defaults to <see cref="DefaultLoginHarvestInterval"/>). Injectable so the
+    /// round-trip test can drive a sweep in seconds instead of minutes; it changes the CADENCE only,
+    /// never whether the sweep happens.</param>
+    /// <param name="cliSettings">The PER-REPO store for a CLI's saved settings — the approved-command
+    /// list. Deliberately not the keychain: settings are configuration the owner should be able to read
+    /// and delete, while logins stay keychain-only. Injectable so tests write to a temp directory
+    /// instead of the user's real store.</param>
     public DaemonBackedOrchestrator(
         DaemonClient client, bool ownsClient = true, Func<string, string?>? keystoreLookup = null,
         Func<string, IReadOnlyList<string>>? keystoreList = null,
         Action<string, string>? keystoreSave = null,
         Func<Mainguard.Git.Services.IOperationJournal>? journalFactory = null,
-        Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null)
+        Func<Mainguard.Agents.Services.IHostPullRequestGateway>? hostPullRequests = null,
+        TimeSpan? loginHarvestInterval = null,
+        CliSettingsStore? cliSettings = null)
     {
+        _cliSettings = cliSettings ?? new CliSettingsStore();
         _client = client ?? throw new ArgumentNullException(nameof(client));
+        _loginHarvestInterval = loginHarvestInterval is { } interval && interval > TimeSpan.Zero
+            ? interval
+            : DefaultLoginHarvestInterval;
         _ownsClient = ownsClient;
         _keystoreLookup = keystoreLookup ?? DefaultKeystoreLookup;
         _keystoreList = keystoreList ?? DefaultKeystoreList;
@@ -213,7 +253,9 @@ public sealed class DaemonBackedOrchestrator :
         _agentPump = Task.Run(() => AgentPumpAsync(_cts.Token));
         _planPump = Task.Run(() => PlanPumpAsync(_cts.Token));
         _spendPump = Task.Run(() => SpendPumpAsync(_cts.Token));
+        _resourcePump = Task.Run(() => ResourcePumpAsync(_cts.Token));
         _conversationPump = Task.Run(() => ConversationPumpAsync(_cts.Token));
+        _loginHarvestPump = Task.Run(() => LoginHarvestPumpAsync(_cts.Token));
     }
 
     /// <summary>P2-47 #5: a live terminal gateway over the daemon's <c>TerminalService.Attach</c> bidi stream,
@@ -321,6 +363,17 @@ public sealed class DaemonBackedOrchestrator :
         }, ct).ConfigureAwait(false);
     }
 
+    private async Task ResourcePumpAsync(CancellationToken ct)
+    {
+        await ReconnectLoopAsync(async token =>
+        {
+            await foreach (var snapshot in _client.StreamAgentResourcesAsync(token).ConfigureAwait(false))
+            {
+                ApplyResourceSnapshot(snapshot);
+            }
+        }, ct).ConfigureAwait(false);
+    }
+
     private async Task ConversationPumpAsync(CancellationToken ct)
     {
         await ReconnectLoopAsync(async token =>
@@ -330,6 +383,51 @@ public sealed class DaemonBackedOrchestrator :
                 ApplyConversationUpdate(update);
             }
         }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The login-harvest pump — the production caller of <see cref="PersistLiveAgentLoginsAsync"/>.
+    ///
+    /// <para><b>Why this exists.</b> The round-trip's durable half is the host OS keychain, and the only
+    /// thing that ever wrote to it was <see cref="EndAgentAsync"/>: the client persisted whatever the
+    /// <c>StopAgent</c> RPC handed back. <see cref="PersistLiveAgentLoginsAsync"/> — the sweep that keeps
+    /// the keychain warm while agents RUN — had no callers anywhere in the repository, so every path that
+    /// is not an explicit in-app Stop lost the login outright: app close, a daemon restart, a VM stop, a
+    /// crash, or simply leaving the agent running. The user then had to sign in again inside the jail on
+    /// every single session, which is the exact symptom the credentialPaths round-trip was built to
+    /// remove. Restore was wired; harvest was not.</para>
+    ///
+    /// <para>Best-effort and silent by construction: a down daemon, an agent with no jail, and a CLI that
+    /// has not been signed into yet all yield nothing, and an empty harvest never clobbers a good
+    /// keychain entry (<see cref="PersistHarvestedLogin"/> ignores it). Nothing here stores a credential
+    /// agent-side — the bytes go from the jail's tmpfs straight into the host keychain.</para>
+    /// </summary>
+    private async Task LoginHarvestPumpAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(_loginHarvestInterval, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            try
+            {
+                await PersistLiveAgentLoginsAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception)
+            {
+                // A failed sweep must never end the pump — the next one retries.
+            }
+        }
     }
 
     private async Task QueuePumpAsync(string repoHandle, CancellationToken ct)
@@ -492,7 +590,11 @@ public sealed class DaemonBackedOrchestrator :
 
                 _queue.Add(new QueueEntry(
                     entry.AgentId, entry.AgentId, $"agent/{entry.AgentId}", state,
-                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged));
+                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged,
+                    // Carried from the daemon rather than inferred from the state: a client that guessed
+                    // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
+                    // for — the ones a restart left frozen mid-verification.
+                    VerificationInFlight: entry.VerificationInFlight));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -569,15 +671,80 @@ public sealed class DaemonBackedOrchestrator :
                 _agentSpend[sample.AgentId] = (acc.Tokens + sample.TokensSpent, acc.UsdMicros + sample.UsdMicrosSpent);
             }
 
-            // No CPU/RAM in the gateway contract — spend is the live signal (0 for the host gauges is honest).
-            _samples.Add(new ResourceSample(DateTimeOffset.UtcNow, 0, 0, _totalUsdMicros / 1_000_000m));
-            if (_samples.Count > 120)
-            {
-                _samples.RemoveAt(0);
-            }
+            AppendSampleLocked();
         }
 
         Sampled?.Invoke();
+    }
+
+    /// <summary>
+    /// Replaces the per-agent CPU/RAM map from one daemon tick. Whole-set replacement (not merge) on
+    /// purpose: an agent that has gone away must lose its numbers rather than keep showing its last ones
+    /// forever, which would be a stale reading presented as a live one.
+    /// </summary>
+    private void ApplyResourceSnapshot(Proto.AgentResourcesSnapshot snapshot)
+    {
+        lock (_gate)
+        {
+            _agentResources.Clear();
+            foreach (var row in snapshot.Agents)
+            {
+                if (string.IsNullOrEmpty(row.AgentId)) continue;
+                // HasCpuPercent/HasMemBytes are proto3 explicit presence: false means the daemon could
+                // not measure it. Reading row.CpuPercent unconditionally would silently yield 0.0 and
+                // recreate the exact bug this feature fixes.
+                _agentResources[row.AgentId] = (
+                    row.HasCpuPercent ? row.CpuPercent : null,
+                    row.HasMemBytes ? row.MemBytes : null,
+                    row.Metered);
+            }
+
+            _haveResourceTick = true;
+            AppendSampleLocked();
+        }
+
+        Sampled?.Invoke();
+    }
+
+    /// <summary>
+    /// Appends one combined history point. Totals are sums of the readings that EXIST: if nothing has been
+    /// measured yet, the total is null (unknown) rather than 0, so the monitor's header can say so.
+    /// Caller holds <c>_gate</c>.
+    /// </summary>
+    private void AppendSampleLocked()
+    {
+        double? cpu = null;
+        double? ramGb = null;
+        if (_haveResourceTick)
+        {
+            foreach (var (agentCpu, agentRam, _) in _agentResources.Values)
+            {
+                if (agentCpu is { } c) cpu = (cpu ?? 0) + c;
+                if (agentRam is { } r) ramGb = (ramGb ?? 0) + r / (1024.0 * 1024.0 * 1024.0);
+            }
+        }
+
+        // Spend is reported only when at least one live agent is actually metered. The ledger only ever
+        // counts gateway-transited traffic, so with nothing metered the running total is structurally 0 —
+        // and "$0.00" would read as "you have spent nothing" rather than "this is not being measured".
+        decimal? spend = AnyMeteredLocked() ? _totalUsdMicros / 1_000_000m : null;
+
+        _samples.Add(new ResourceSample(DateTimeOffset.UtcNow, cpu, ramGb, spend));
+        if (_samples.Count > 120)
+        {
+            _samples.RemoveAt(0);
+        }
+    }
+
+    /// <summary>True when any live agent's spend is measurable. Caller holds <c>_gate</c>.</summary>
+    private bool AnyMeteredLocked()
+    {
+        foreach (var (_, _, metered) in _agentResources.Values)
+        {
+            if (metered) return true;
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -674,9 +841,13 @@ public sealed class DaemonBackedOrchestrator :
 
     /// <summary>
     /// Pulls the CURRENT login state of every live agent into the host OS keychain, without stopping
-    /// anything. Call this periodically while agents run and on app shutdown: harvest otherwise only
-    /// happens on an explicit StopAgent, so a daemon shutdown / VM stop / crash lost the login
-    /// entirely and the user had to sign in again on every launch.
+    /// anything. Harvest otherwise only happens on an explicit StopAgent, so a daemon shutdown / VM
+    /// stop / crash lost the login entirely and the user had to sign in again on every launch.
+    ///
+    /// <para>Driven from exactly two places, and both are load-bearing: <see cref="LoginHarvestPumpAsync"/>
+    /// (periodically, while agents run) and <see cref="Dispose"/> (once more at app close). This method
+    /// existed with NO callers at all, which made the whole round-trip inert outside an in-app Stop —
+    /// so a change that removes either caller is removing the fix, not tidying it.</para>
     ///
     /// <para>Best-effort by design — a daemon that is down or an agent that has not signed in yet
     /// simply yields nothing, and an empty harvest never clobbers a good keychain entry
@@ -716,6 +887,8 @@ public sealed class DaemonBackedOrchestrator :
     /// next spawn of this kind restores them so the CLI boots signed in.</summary>
     private void PersistHarvestedLogin(AgentStopOutcome outcome)
     {
+        PersistHarvestedSettings(outcome);
+
         if (outcome.CliCredentials.Count == 0 || string.IsNullOrWhiteSpace(outcome.AgentKind))
         {
             return;
@@ -726,6 +899,31 @@ public sealed class DaemonBackedOrchestrator :
         {
             _keystoreSave(keystoreKey, vault);
         }
+    }
+
+    /// <summary>
+    /// Folds the settings a harvest returned into <b>that agent's own repository's</b> store, so the
+    /// commands the user approved in this session are already approved in the next agent.
+    ///
+    /// <para>The repo comes from the outcome, never from whichever repository happens to be open: the
+    /// harvest sweep walks every agent on the daemon, so filing by the open repo would put one
+    /// repository's approved-command list under another's name — the precise cross-repo leak the
+    /// per-repo scope exists to prevent. A harvest with no repo handle is dropped rather than filed
+    /// under a blank scope.</para>
+    ///
+    /// <para>The daemon already refused to harvest anything from an unattended or untrusted session,
+    /// so an empty list here is the normal, correct outcome for those and simply writes nothing.</para>
+    /// </summary>
+    private void PersistHarvestedSettings(AgentStopOutcome outcome)
+    {
+        if (outcome.CliSettings.Count == 0
+            || string.IsNullOrWhiteSpace(outcome.AgentKind)
+            || string.IsNullOrWhiteSpace(outcome.RepoHandle))
+        {
+            return;
+        }
+
+        _cliSettings.Save(outcome.RepoHandle, outcome.AgentKind, outcome.CliSettings);
     }
 
     // No per-agent pause/prompt/plan-tree RPCs exist on the daemon contract yet — these steer nothing.
@@ -764,6 +962,73 @@ public sealed class DaemonBackedOrchestrator :
         reason = "not in the merge queue";
         return false;
     }
+
+    /// <summary>
+    /// Asks the daemon to verify this agent's branch now — the missing rung that left the whole
+    /// verification mechanism without a production caller.
+    ///
+    /// <para><b>Everything that decides anything lives on the daemon.</b> This method resolves the active
+    /// repo handle and makes one RPC; it holds no policy, no state machine, and no retry. The daemon's
+    /// <c>MergeQueue.RunVerificationAsync</c> owns the Verifying transition, runs the test command in the
+    /// <i>agent's own jail</i> (host execution is a rejection trigger), writes the immutable record, and
+    /// lands the branch on <c>Verified</c> or back on <c>Working</c>. The queue stream then republishes
+    /// that state, so this method deliberately mutates no local projection.</para>
+    ///
+    /// <para>A refusal the run never started with — no live jail, no configured test command, a jail
+    /// missing the declared toolchain — arrives as gRPC <c>FailedPrecondition</c> and is returned as
+    /// <c>Ran: false</c> with the daemon's reason verbatim. A suite that genuinely failed is
+    /// <c>Ran: true, Passed: false</c>, which is a result and not an error.</para>
+    /// </summary>
+    public async Task<VerificationOutcome> RunVerificationAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: "Can't verify — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        try
+        {
+            // Verification builds a toolchain image on first use and then runs the repo's whole test
+            // command in the jail, so it is minutes-scale work — the per-call deadline has to allow for
+            // that. The default RPC deadline would abort a perfectly healthy first run.
+            var response = await _client
+                .RunVerificationAsync(repoHandle!, agentId, cts.Token, VerificationDeadline)
+                .ConfigureAwait(false);
+            return new VerificationOutcome(
+                Ran: true,
+                Passed: response.Passed,
+                Reason: response.Passed
+                    ? $"verified against main@{Short(response.MainSha)}"
+                    : $"tests failed — {response.ResolvedCommand}");
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.FailedPrecondition)
+        {
+            // The daemon's typed refusal: quotable, and specifically NOT a test failure.
+            return new VerificationOutcome(Ran: false, Passed: false, Reason: $"Can't verify — {ex.Status.Detail}");
+        }
+        catch (Grpc.Core.RpcException ex)
+        {
+            return new VerificationOutcome(
+                Ran: false, Passed: false,
+                Reason: $"Can't verify — the daemon didn't answer ({ex.StatusCode}).");
+        }
+    }
+
+    /// <summary>A verification runs the repo's full test command in a jail, after possibly building its
+    /// toolchain image; it is the longest-running RPC the surface issues.</summary>
+    private static readonly TimeSpan VerificationDeadline = TimeSpan.FromMinutes(30);
+
+    private static string Short(string sha) =>
+        string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);
 
     /// <summary>
     /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
@@ -948,6 +1213,79 @@ public sealed class DaemonBackedOrchestrator :
     /// through. One path, one RPC; only the reporting differs.</para></summary>
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
         => AcknowledgeFlaggedChangeReportedAsync(agentId, itemId, CancellationToken.None);
+
+    /// <summary>
+    /// The human drops a queue entry. Every part of what makes this mean anything — the terminal
+    /// transition, the persisted record, the audit event, the refusal while a merge is in flight — is
+    /// daemon-side; this method only carries the request and reports the daemon's answer.
+    ///
+    /// <para><b>A refusal is thrown, never swallowed.</b> The daemon answers a refused discard with
+    /// <c>discarded=false</c> and a reason (already terminal, unknown entry, merge in progress), which is
+    /// a successful RPC — so a caller that only checked for exceptions would report a removal that did
+    /// not happen, and the entry would reappear on the next queue snapshot with nothing said. That is the
+    /// same "nothing visibly happened" failure <see cref="MergeActionRunner"/> exists to prevent.</para>
+    /// </summary>
+    public async Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't discard — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .DiscardEntryAsync(repoHandle!, agentId, reason ?? string.Empty, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Discarded)
+        {
+            throw new InvalidOperationException($"Can't discard — {response.Reason}.");
+        }
+
+        DateTimeOffset? at = DateTimeOffset.TryParse(
+            response.DiscardedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
+
+        return new QueueEntryDiscardOutcome(agentId, response.DiscardedBy ?? "", at);
+    }
+
+    /// <summary>
+    /// Clears a <c>Verifying</c> entry with no run behind it. Refusals — chiefly "a verification is
+    /// running for this entry right now" — are thrown for the same reason as above: they are the answer
+    /// the human asked for, and a silently-ignored one is indistinguishable from a button that does
+    /// nothing.
+    /// </summary>
+    public async Task ClearStalledVerificationAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't clear this verification — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .ClearStalledVerificationAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Cleared)
+        {
+            throw new InvalidOperationException($"Can't clear this verification — {response.Reason}.");
+        }
+    }
 
     /// <summary>
     /// Whether an acknowledgment made right now could actually reach the daemon's gate. There is exactly
@@ -1162,11 +1500,16 @@ public sealed class DaemonBackedOrchestrator :
         // login performed in an earlier session survives into this one instead of prompting again.
         var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(cli.Id)));
 
+        // THIS repository's saved settings — the commands the user already approved here. Loaded by
+        // repo handle, so an approval made in another repository is not in this list at all.
+        var savedSettings = _cliSettings.Load(repoHandle!, cli.Id);
+
         var agentId = await _client.SpawnAgentAsync(
             repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
             ct, deadline: SpawnDeadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
             extraEnv: CollectCustomEnvKeys(),
-            cliCredentials: savedLogin.Count > 0 ? savedLogin : null).ConfigureAwait(false);
+            cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
+            cliSettings: savedSettings.Count > 0 ? savedSettings : null).ConfigureAwait(false);
 
         lock (_gate)
         {
@@ -1240,7 +1583,10 @@ public sealed class DaemonBackedOrchestrator :
         {
             lock (_gate)
             {
-                return _samples.Count > 0 ? _samples[^1] : new ResourceSample(DateTimeOffset.UtcNow, 0, 0, 0m);
+                // Nothing sampled yet: every reading is unknown. It is NOT a fleet sitting at zero.
+                return _samples.Count > 0
+                    ? _samples[^1]
+                    : new ResourceSample(DateTimeOffset.UtcNow, null, null, null);
             }
         }
     }
@@ -1258,9 +1604,19 @@ public sealed class DaemonBackedOrchestrator :
                 .Select(a =>
                 {
                     _agentSpend.TryGetValue(a.AgentId, out var spend);
+                    var haveReading = _agentResources.TryGetValue(a.AgentId, out var res);
+
+                    // Spend is a number only where it is actually measured. An unmetered agent reports
+                    // null, so the row can say "not tracked" instead of drawing a reassuring $0.00.
+                    decimal? spendUsd = haveReading && res.Metered ? spend.UsdMicros / 1_000_000m : null;
+
                     return new AgentResourceUsage(
                         a.AgentId, a.Name, a.State.ToString(), a.State == AgentLifecycleState.Paused,
-                        CpuPercent: 0, RamGb: 0, SpendUsd: spend.UsdMicros / 1_000_000m, Task: a.Detail);
+                        CpuPercent: haveReading ? res.Cpu : null,
+                        RamGb: haveReading && res.RamBytes is { } bytes ? bytes / (1024.0 * 1024.0 * 1024.0) : null,
+                        SpendUsd: spendUsd,
+                        Task: a.Detail,
+                        IsMetered: haveReading && res.Metered);
                 })
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToArray();
@@ -1306,12 +1662,27 @@ public sealed class DaemonBackedOrchestrator :
 
     public void Dispose()
     {
+        // The LAST harvest, BEFORE anything is cancelled — this is the app-close leg of the login
+        // round-trip. Closing Mainguard with agents still running used to lose every login performed in
+        // this session (the jail's $HOME is tmpfs and dies with the VM/containers), so the sweep runs
+        // once more here on its OWN token: _cts is cancelled immediately below, and a harvest bound to
+        // it would be cancelled before it could issue a single RPC. Bounded by ShutdownHarvestBudget and
+        // run off the calling thread, so a wedged daemon delays the exit by seconds rather than hanging
+        // the UI thread on a sync-over-async wait.
+        try
+        {
+            using var shutdownHarvest = new CancellationTokenSource(ShutdownHarvestBudget);
+            Task.Run(() => PersistLiveAgentLoginsAsync(shutdownHarvest.Token), shutdownHarvest.Token)
+                .Wait(ShutdownHarvestBudget);
+        }
+        catch { /* a failed final harvest costs at most the last sweep interval — never the exit */ }
+
         _cts.Cancel();
         try { _queuePumpCts?.Cancel(); } catch { /* ignore */ }
         try
         {
             Task.WaitAll(
-                new[] { _agentPump, _planPump, _spendPump, _conversationPump, _queuePump }
+                new[] { _agentPump, _planPump, _spendPump, _resourcePump, _conversationPump, _queuePump, _loginHarvestPump }
                     .Where(t => t is not null).Select(t => t!).ToArray(),
                 TimeSpan.FromSeconds(2));
         }

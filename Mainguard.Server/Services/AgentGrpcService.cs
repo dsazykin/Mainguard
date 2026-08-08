@@ -17,20 +17,35 @@ namespace Mainguard.Server.Services;
 /// </summary>
 public sealed class AgentGrpcService : AgentService.AgentServiceBase
 {
+    /// <summary>
+    /// How often a subscribed client is sent a fresh CPU/RAM tick.
+    ///
+    /// <para>Chosen against the floor the engine itself imposes: a one-shot stats call inherently takes
+    /// ~1s, because the daemon must collect two readings to produce a CPU delta. Polling at 1-2s would
+    /// therefore leave the sampler running essentially continuously for a readout nobody watches that
+    /// closely. At 5s the engine is collecting roughly a fifth of the time, and a task-manager-style
+    /// readout still updates faster than a human re-reads it. The calls are also driven BY THE
+    /// SUBSCRIPTION — with the Resources tab closed and no client attached, the daemon makes no stats
+    /// calls at all.</para>
+    /// </summary>
+    public static readonly System.TimeSpan ResourcePollInterval = System.TimeSpan.FromSeconds(5);
+
     private readonly AgentSessionStore _store;
     private readonly AgentSpawnService _spawns;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly DaemonInfoProvider _info;
+    private readonly AgentResourceProbe _resources;
     private readonly ILogger _log;
 
     public AgentGrpcService(
         AgentSessionStore store, AgentSpawnService spawns, InstalledAdapterCatalog adapters,
-        DaemonInfoProvider info, ILoggerFactory loggerFactory)
+        DaemonInfoProvider info, AgentResourceProbe resources, ILoggerFactory loggerFactory)
     {
         _store = store;
         _spawns = spawns;
         _adapters = adapters;
         _info = info;
+        _resources = resources;
         _log = (loggerFactory ?? throw new System.ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.Spawn);
     }
@@ -54,9 +69,28 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
                     file.Path, file.Content.ToByteArray()));
             }
 
+            // An entry whose root the daemon does not recognise is DROPPED, never defaulted to a tree:
+            // guessing would decide whether a permission allowlist lands in the jail's throwaway home
+            // or in the user's real checkout. The launcher then filters what survives against the
+            // adapter's own declaration, so this is the outer of two gates.
+            System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? cliSettings = null;
+            foreach (var file in request.CliSettings)
+            {
+                if (!Mainguard.Agents.Agents.Adapters.AdapterSettingsPath.TryParseRoot(file.Root, out var root))
+                {
+                    _log.LogWarning("SpawnAgent: dropping cli_settings entry with unknown root '{Root}'", file.Root);
+                    continue;
+                }
+
+                cliSettings ??= new System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>();
+                cliSettings.Add(new Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile(
+                    root, file.Path, file.Content.ToByteArray()));
+            }
+
             var agentId = await _spawns.SpawnAsync(
                 request.RepoHandle, request.AgentKind, request.ModelApiKey, request.Role,
-                context.CancellationToken, extraEnv, cliCredentials).ConfigureAwait(false);
+                context.CancellationToken, extraEnv, cliCredentials,
+                cliSettings: cliSettings).ConfigureAwait(false);
             return new SpawnAgentResponse { AgentId = agentId };
         }
         catch (System.ArgumentException ex)
@@ -133,7 +167,12 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         }
 
         var result = await _spawns.StopAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
-        var response = new StopAgentResponse { Stopped = result.Stopped, AgentKind = result.AgentKind };
+        var response = new StopAgentResponse
+        {
+            Stopped = result.Stopped,
+            AgentKind = result.AgentKind,
+            RepoHandle = result.RepoHandle,
+        };
         foreach (var file in result.CliCredentials)
         {
             response.CliCredentials.Add(new CliCredentialFile
@@ -143,8 +182,24 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
             });
         }
 
+        foreach (var file in result.CliSettings)
+        {
+            response.CliSettings.Add(ToWire(file));
+        }
+
         return response;
     }
+
+    /// <summary>One harvested settings file on the wire. The root travels as its declared spelling —
+    /// the client stores per (repo, root, path), so an ordinal mismatch here would split one file's
+    /// history into two entries.</summary>
+    private static CliSettingsFile ToWire(Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile file) =>
+        new()
+        {
+            Root = Mainguard.Agents.Agents.Adapters.AdapterSettingsPath.SpellRoot(file.Root),
+            Path = file.RelativePath,
+            Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+        };
 
     /// <summary>
     /// Harvests a live agent's CLI login-state WITHOUT stopping it, so the client can keep the host
@@ -162,7 +217,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         var result = await _spawns.HarvestCredentialsAsync(request.AgentId, context.CancellationToken)
             .ConfigureAwait(false);
 
-        var response = new HarvestAgentCredentialsResponse { AgentKind = result.AgentKind };
+        var response = new HarvestAgentCredentialsResponse
+        {
+            AgentKind = result.AgentKind,
+            RepoHandle = result.RepoHandle,
+        };
         foreach (var file in result.CliCredentials)
         {
             response.CliCredentials.Add(new CliCredentialFile
@@ -170,6 +229,11 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
                 Path = file.HomeRelativePath,
                 Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
             });
+        }
+
+        foreach (var file in result.CliSettings)
+        {
+            response.CliSettings.Add(ToWire(file));
         }
 
         return response;
@@ -243,6 +307,44 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         finally
         {
             unsubscribe();
+        }
+    }
+
+    public override async Task StreamAgentResources(
+        StreamAgentResourcesRequest request,
+        IServerStreamWriter<AgentResourcesSnapshot> responseStream,
+        ServerCallContext context)
+    {
+        try
+        {
+            // Emit immediately, then on the interval: a client that has just opened the Resources tab
+            // must not stare at an empty table for a whole poll period.
+            while (!context.CancellationToken.IsCancellationRequested)
+            {
+                var readings = await _resources.ReadAsync(context.CancellationToken).ConfigureAwait(false);
+                var snapshot = new AgentResourcesSnapshot();
+                foreach (var reading in readings)
+                {
+                    var row = new AgentResourceReading
+                    {
+                        AgentId = reading.AgentId,
+                        Metered = reading.IsMetered,
+                        UnavailableReason = reading.UnavailableReason ?? string.Empty,
+                    };
+                    // Assigned ONLY when measured. Leaving the optional field unset is what carries
+                    // "unknown" across the wire; writing 0 here would recreate the bug this RPC fixes.
+                    if (reading.CpuPercent is { } cpu) row.CpuPercent = cpu;
+                    if (reading.RamBytes is { } ram) row.MemBytes = ram;
+                    snapshot.Agents.Add(row);
+                }
+
+                await responseStream.WriteAsync(snapshot).ConfigureAwait(false);
+                await Task.Delay(ResourcePollInterval, context.CancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (System.OperationCanceledException)
+        {
+            // Client detached — normal stream teardown, and the sampling stops with it.
         }
     }
 

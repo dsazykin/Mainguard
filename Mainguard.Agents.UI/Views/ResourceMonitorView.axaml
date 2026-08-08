@@ -21,8 +21,11 @@
           <Polyline Points="{Binding CpuPoints}" Stroke="{DynamicResource TextMuted}" StrokeThickness="1"
                     Height="20" Width="240" HorizontalAlignment="Left"/>
 
-          <!-- P2-13 editable per-day budget cap (round-trips through SetBudgets). Blank = no cap. -->
-          <Border Background="{DynamicResource SurfaceDeep}" CornerRadius="8" Padding="10,8" Margin="0,4,0,0">
+          <!-- P2-13 editable per-day budget cap (round-trips through SetBudgets). Blank = no cap.
+               Shown ONLY while at least one live agent's spend is measurable (IsCostVisible): a cap on
+               traffic nobody is metering is a control with no effect. -->
+          <Border Background="{DynamicResource SurfaceDeep}" CornerRadius="8" Padding="10,8" Margin="0,4,0,0"
+                  IsVisible="{Binding IsCostVisible}">
             <StackPanel Spacing="6">
               <TextBlock Text="Per-day spend cap" FontSize="11" FontWeight="SemiBold" Foreground="{DynamicResource TextMuted}"/>
               <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
@@ -35,6 +38,20 @@
               </StackPanel>
             </StackPanel>
           </Border>
+
+          <!-- The unmeterable case. A STATEMENT rather than an empty space: the control disappearing
+               teaches nothing, and rendering "$0.00" here would be read as "you have spent nothing"
+               — the precise false reassurance this replaces. Bound to IsCostNoticeVisible, not to
+               !IsCostVisible, so an EMPTY tab makes no claim about sessions that do not exist. -->
+          <Border Background="{DynamicResource SurfaceDeep}" CornerRadius="8" Padding="10,8" Margin="0,4,0,0"
+                  IsVisible="{Binding IsCostNoticeVisible}">
+            <StackPanel Spacing="4">
+              <TextBlock Text="Spend isn't tracked for these sessions" FontSize="11" FontWeight="SemiBold"
+                         Foreground="{DynamicResource TextMuted}"/>
+              <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="{DynamicResource TextMuted}"
+                         Text="Cost is measured by routing model traffic through Mainguard's gateway, which needs an API key. Agents signed in interactively talk to the provider directly, so there is no figure to show — not a figure of zero."/>
+            </StackPanel>
+          </Border>
         </StackPanel>
       </Border>
 
@@ -44,6 +61,8 @@
         <TextBlock Grid.Column="1" Text="State" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}"/>
         <TextBlock Grid.Column="2" Text="CPU" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" HorizontalAlignment="Right"/>
         <TextBlock Grid.Column="3" Text="RAM" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" HorizontalAlignment="Right"/>
+        <!-- The Spend column survives even when nothing is metered: the per-row "—" is the honest
+             answer, and removing the column would hide that the question was asked. -->
         <TextBlock Grid.Column="4" Text="Spend" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" HorizontalAlignment="Right"/>
         <TextBlock Grid.Column="5" Text="Task" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" Margin="12,0,0,0"/>
       </Grid>
@@ -79,7 +98,16 @@
                     <TextBlock Grid.Column="1" Text="{Binding StateWord}" FontSize="11" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="2" Classes="Mono" Text="{Binding CpuText}" FontSize="12" Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="3" Classes="Mono" Text="{Binding RamText}" FontSize="12" Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
-                    <TextBlock Grid.Column="4" Classes="Mono" Text="{Binding SpendText}" FontSize="12" Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                    <!-- An unmetered row shows "—" (never $0.00) and carries the reason on hover. The
+                         glyph itself is the signal; the muted colour is only a SECOND cue on top of it,
+                         so the state is never encoded by colour alone. -->
+                    <TextBlock Grid.Column="4" Classes="Mono" Text="{Binding SpendText}" FontSize="12"
+                               Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right"
+                               VerticalAlignment="Center" IsVisible="{Binding IsMetered}"/>
+                    <TextBlock Grid.Column="4" Classes="Mono" Text="{Binding SpendText}" FontSize="12"
+                               Foreground="{DynamicResource TextMuted}" HorizontalAlignment="Right"
+                               VerticalAlignment="Center" IsVisible="{Binding !IsMetered}"
+                               ToolTip.Tip="{Binding SpendTooltip}"/>
                     <TextBlock Grid.Column="5" Text="{Binding Task}" FontSize="11" Foreground="{DynamicResource TextMuted}" Margin="12,0,0,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                   </Grid>
                 </Border>

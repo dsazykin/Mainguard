@@ -7,8 +7,9 @@ using Mainguard.Agents.UI.Editions;
 namespace Mainguard.Agents.UI.Services;
 
 /// <summary>
-/// The one place the human "Merge to Main" action is driven from a surface, so that every outcome — the
-/// merge, and each of the ways it can refuse — becomes one visible sentence.
+/// The one place a human merge-queue action — "Merge to Main", and the entry-lifecycle actions beside it
+/// — is driven from a surface, so that every outcome, and each of the ways it can refuse, becomes one
+/// visible sentence.
 ///
 /// <para><b>Why this exists.</b> Both merge surfaces invoked the merge as fire-and-forget
 /// (<c>_ = _queue.ConfirmMergeAsync(id)</c>, and an un-awaited command body), which means every refusal
@@ -57,6 +58,71 @@ public static class MergeActionRunner
             // unreachable — all of them arrive here as a reason, and all of them leave the queue unchanged.
             sink(ex.Message, true);
         }
+    }
+
+    /// <summary>
+    /// Drives one human discard to a reported conclusion. Same contract as <see cref="RunAsync"/>: never
+    /// throws, and the daemon's refusal is the sentence the human reads.
+    ///
+    /// <para>The daemon answers a refused discard with an ordinary successful RPC carrying
+    /// <c>discarded=false</c>, so "no exception" is not evidence anything was removed — the adapter turns
+    /// that into a throw and this turns the throw into a warning. Without both halves a refused discard
+    /// would look exactly like a successful one until the next queue snapshot put the entry back.</para>
+    /// </summary>
+    public static async Task DiscardAsync(
+        IMergeQueueService queue, string agentId, string reason, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            var outcome = await queue.DiscardEntryAsync(agentId, reason ?? string.Empty).ConfigureAwait(false);
+            sink(DiscardConfirmation(outcome), false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down — not an outcome to report.
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
+    /// <summary>Drives one "clear the stalled verification" to a reported conclusion. Never throws.</summary>
+    public static async Task ClearStalledVerificationAsync(
+        IMergeQueueService queue, string agentId, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            await queue.ClearStalledVerificationAsync(agentId).ConfigureAwait(false);
+            sink($"Cleared the stalled verification on agent/{agentId} — it can be verified again.", false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
+    /// <summary>
+    /// The one visible sentence a discard produces. It says <b>dropped from the merge queue</b> and
+    /// nothing more — the branch and its commits are untouched, and a sentence like "removed the work"
+    /// would describe something that did not happen. The attributed actor is included because that is what
+    /// was recorded.
+    /// </summary>
+    internal static string DiscardConfirmation(QueueEntryDiscardOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+        var by = string.IsNullOrWhiteSpace(outcome.DiscardedBy) ? "" : $" (recorded as {outcome.DiscardedBy})";
+        return $"Dropped agent/{outcome.AgentId} from the merge queue{by}. "
+            + "The branch and its commits are untouched.";
     }
 
     /// <summary>

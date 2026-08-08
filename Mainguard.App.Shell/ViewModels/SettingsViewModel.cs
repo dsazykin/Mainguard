@@ -83,6 +83,8 @@ public partial class SettingsViewModel : ViewModelBase
                 proTools.CreateAiProvidersPage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("AgentClis", "Agent CLIs", "TerminalIcon",
                 proTools.CreateAgentClisPage, ActivateRow));
+            Pages.Add(new SettingsPageRowViewModel("Toolchains", "Toolchains", "TerminalIcon",
+                proTools.CreateToolchainsPage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("MainguardOs", "Mainguard OS", "FolderIcon",
                 () => proTools.CreateMainguardOsPage(OwnerWindow!) ?? new object(), ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("DaemonLogs", "Daemon Logs", "TerminalIcon",

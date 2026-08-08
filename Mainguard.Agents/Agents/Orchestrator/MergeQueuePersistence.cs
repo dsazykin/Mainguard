@@ -42,6 +42,9 @@ public sealed class DbMergeQueueStore : IMergeQueueStore
                     UpdatedUtc = row.UpdatedUtc,
                     VerifiedAtUtc = row.VerifiedAtUtc,
                     Origin = row.Origin,
+                    DiscardedBy = row.DiscardedBy,
+                    DiscardedAtUtc = row.DiscardedAtUtc,
+                    DiscardReason = row.DiscardReason,
                 });
             }
             else
@@ -51,6 +54,11 @@ public sealed class DbMergeQueueStore : IMergeQueueStore
                 existing.UpdatedUtc = row.UpdatedUtc;
                 existing.VerifiedAtUtc = row.VerifiedAtUtc;
                 existing.Origin = row.Origin;
+                // Copied on every save, not only on the discard transition, so the record and the state it
+                // belongs to can never drift apart in the row.
+                existing.DiscardedBy = row.DiscardedBy;
+                existing.DiscardedAtUtc = row.DiscardedAtUtc;
+                existing.DiscardReason = row.DiscardReason;
             }
 
             // The transition and its persistence commit as one SQLite transaction.

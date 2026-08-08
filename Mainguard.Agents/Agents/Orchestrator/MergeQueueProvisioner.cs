@@ -26,6 +26,33 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// constructor, so a queue rebuilt here after a daemon restart resumes the repo's real state rather than
 /// starting empty — which is exactly why the queue must be rebuilt from the SAME persisted stores the
 /// previous daemon instance wrote to, not from fresh in-memory ones.</para>
+///
+/// <para><b>...and rehydrating the state is only half of it, which is the second missing call this type now
+/// carries.</b> A queue that comes back holding a <c>Verifying</c> row holds a row about a run that died
+/// with the previous process: the state is persisted per transition, the in-flight set is memory, so the
+/// entry reports "verifying" forever about something that does not exist.
+/// <see cref="MergeQueue.ResumeAfterRestartAsync"/> is the answer to that and had no production caller
+/// either; <see cref="EnsureQueue"/> starts it here, on the created branch, the moment the queue exists.</para>
+///
+/// <para><b>Why here and not in <c>DaemonBootSequence</c>.</b> That is the obvious home and it is the wrong
+/// one — a boot task would have nothing to iterate. The <see cref="MergeQueueRegistry"/> is empty at boot by
+/// design, <c>ActiveRepoIndex</c> is memory-only and equally empty, and the RT-D1 merge-reconcile slot next
+/// door says so out loud ("repos map in as their swarms come up; none at boot"). A resume step wired into
+/// the ordered boot sequence would run against zero queues on every start and pass its own tests
+/// forever — the same "complete mechanism, no production caller" shape, moved up one level. The moment a
+/// repo's persisted queue state re-enters the process is <see cref="EnsureQueue"/>, so that is the moment
+/// the resume can act; it is reached from <c>ProvisionRepo</c>, from a jailed spawn, and from the PR-intake
+/// target resolver.</para>
+///
+/// <para><b>Order relative to the rest of boot.</b> Every one of those entry points is an RPC handler, so a
+/// resume necessarily runs after the boot sequence's merge-reconcile step — which matters, because that
+/// step can synthesize a missing <c>ConfirmMerge</c> and move main, and re-verifying against a main that is
+/// about to move produces evidence the stale cascade immediately invalidates. It also lands after the swarm
+/// reconciler, which is what settles Docker as the truth for jail liveness and prunes the worktrees of
+/// agents whose containers are gone — the exact question <c>hasLiveJail</c> asks. Neither ordering is
+/// enforced by a lock, and neither needs to be: the probe reads the container runtime directly at the
+/// instant it runs, so a resume that somehow overtook the reconciler would still get the true answer, and
+/// a main that moves underneath a re-run is the ordinary stale cascade rather than a corruption.</para>
 /// </summary>
 public sealed class MergeQueueProvisioner
 {
@@ -58,6 +85,7 @@ public sealed class MergeQueueProvisioner
     private readonly IAuditLog _audit;
     private readonly Action<string>? _log;
     private readonly Func<string, string, bool>? _publishAgentRef;
+    private readonly Func<string, string, AgentBranchAlignment>? _checkAgentBranch;
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
 
@@ -109,6 +137,18 @@ public sealed class MergeQueueProvisioner
     /// bytes that get verified definitely current rather than whatever the watcher last saw. Null (the
     /// pre-MG-3 tests) simply verifies whatever the mirror already holds.
     /// </param>
+    /// <param name="checkAgentBranch">
+    /// (repoHash, agentId) → which branch the agent's worktree is ACTUALLY on. Consulted immediately after
+    /// the publish above, because that publish is the point at which "the agent has produced nothing" and
+    /// "the agent produced work somewhere the mirror will never see" become indistinguishable: the mediator
+    /// carries only <c>refs/heads/agent/&lt;id&gt;</c>, so an agent that committed on another branch leaves
+    /// that ref untouched and every downstream consumer reads a ref that is present, readable and stale.
+    /// Drift is raised here rather than logged, because a verification that runs against the wrong bytes
+    /// and passes is worse than one that refuses with the reason.
+    ///
+    /// <para>Null (every pre-existing test) restores the old behaviour exactly: nothing is checked. The
+    /// daemon passes it.</para>
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -123,7 +163,8 @@ public sealed class MergeQueueProvisioner
         Action<string>? log = null,
         Func<string, string, bool>? publishAgentRef = null,
         Func<string, TaskPlan?>? resolveApprovedPlan = null,
-        IMergeGate? planGate = null)
+        IMergeGate? planGate = null,
+        Func<string, string, AgentBranchAlignment>? checkAgentBranch = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -141,7 +182,19 @@ public sealed class MergeQueueProvisioner
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
         _planGate = planGate;
+        _checkAgentBranch = checkAgentBranch;
     }
+
+    /// <summary>
+    /// Whether this provisioner will actually establish which branch an agent is on before verifying it.
+    ///
+    /// <para>Exposed for one reason: the check is an optional constructor argument, so the daemon failing
+    /// to pass it would restore the silent behaviour exactly, with every other test in this repository
+    /// still green. That is the shape of defect this codebase keeps producing — a control that is
+    /// implemented, tested, and wired nowhere — so the composition root asserts on this rather than
+    /// trusting a line in a registration file.</para>
+    /// </summary>
+    public bool ChecksAgentBranchAlignment => _checkAgentBranch is not null;
 
     /// <summary>
     /// Ensures a live, registered queue for <paramref name="repoHandle"/> and returns it; null when the repo
@@ -197,6 +250,13 @@ public sealed class MergeQueueProvisioner
         if (created)
         {
             _log?.Invoke($"merge queue registered repo={repoHandle} main={mainSha} branch={mainBranch}");
+
+            // ...and THIS is the restart resume's production trigger. See the class remarks for why it is
+            // here and not in DaemonBootSequence. Started only on the created branch: a repeat EnsureQueue
+            // is the same live queue, whose Verifying rows are real runs this process started.
+            context.Queue.BeginResumeAfterRestart(
+                hasLiveJail: agentId => !string.IsNullOrEmpty(_resolveContainerId(repoHandle, agentId)),
+                log: _log);
         }
 
         return context;
@@ -293,6 +353,39 @@ public sealed class MergeQueueProvisioner
         // than whatever the ref watcher last happened to see. The daemon names the source ref and the
         // destination; the agent cannot name a ref at all.
         _publishAgentRef?.Invoke(repoHandle, agentId);
+
+        // ...and now say so if that publish carried nothing because the agent's work is not on the branch
+        // the daemon carries. The restriction to refs/heads/agent/<id> is deliberate and stays (see
+        // AgentRefMediator): what was wrong is that a branch outside it was ignored SILENTLY, which is
+        // byte-for-byte the same observation as an agent that has done nothing at all. Verification is the
+        // point the work is proposed as ready, so it is the point the difference has to be stated.
+        //
+        // This deliberately does NOT fast-forward agent/<id> onto whatever HEAD happens to be. See
+        // docs/design/agent-branch-confinement.md §4: the trust argument for auto-recovery is sound, but
+        // the daemon has no signal that the branch the agent is standing on is the branch it means to
+        // submit, and replacing a silent no-op with a silent yes-op keeps the property that made this
+        // defect invisible.
+        var alignment = _checkAgentBranch?.Invoke(repoHandle, agentId);
+        if (alignment is { Drifted: true })
+        {
+            var report = alignment.Describe(agentId);
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} verification REFUSED — {report}");
+            _audit.Append(new AuditEvent(AgentBranchGuard.DriftEvent, new Dictionary<string, string>
+            {
+                ["repo"] = repoHandle,
+                ["agent"] = agentId,
+                ["expected"] = alignment.ExpectedBranch,
+                ["actual"] = alignment.ActualBranch ?? "(detached HEAD)",
+                ["head"] = alignment.HeadSha ?? string.Empty,
+                ["agent_branch"] = alignment.AgentBranchSha ?? string.Empty,
+                ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            }));
+
+            // InvalidOperationException, like the no-jail refusal above: MergeQueueGrpcService maps it to
+            // FAILED_PRECONDITION carrying this text, so the operator reads the measurement rather than
+            // "Exception was thrown by handler".
+            throw new InvalidOperationException(report);
+        }
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);

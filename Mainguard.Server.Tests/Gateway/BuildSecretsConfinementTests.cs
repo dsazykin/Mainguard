@@ -8,7 +8,7 @@ namespace Mainguard.Server.Tests.Gateway;
 /// MG-4 — the flip that keeps the real provider key out of the jail.
 ///
 /// <para><c>BuildSecrets</c> wrote the raw BYOK key verbatim into <c>agentEnv</c>, which lands in
-/// <c>/run/secrets/agent.env</c> — agent-uid-owned mode <c>0400</c>, i.e. readable by the agent. With
+/// <c>/run/secrets/agent/agent.env</c> — agent-uid-owned mode <c>0400</c>, i.e. readable by the agent. With
 /// a gateway available and a CLI that declares a base-URL variable, the jail instead receives an
 /// opaque <c>mg_sess_</c> token and is pointed at the gateway; the gateway swaps in the real key
 /// daemon-side at the network hop.</para>
