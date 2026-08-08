@@ -29,7 +29,15 @@ nothing below will, and it won't be phase 2's fault.
 running any Docker-backed test — it covers the unfiltered-run trap, the two Docker daemons, and how a
 severed jail masquerades as a provider outage.
 
-**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line.
+**Shell note:** Windows PowerShell 5.1 has **no `&&`** — one command per line. Separately, and for a
+different reason, `.mainguard/verify` has no shell either: it is argv, so a chained command needs the
+`sh -c "…"` wrapper phase 1's setup uses.
+
+**Toolchain:** the scratch repo declares `.mainguard/toolchain` = `python-3`. Confirm **Settings →
+Toolchains** shows Python 3 installed before starting anything — a worker whose toolchain is missing
+refuses to spawn, and that refusal will look like a phase-2 gate misfiring when it isn't one. The
+install lives in the VM at `/home/mainguard/mainguard/toolchains`, so it survives changing
+`$env:MAINGUARD_DATA_ROOT` and you only do it once across all three phases.
 
 **Where everything below happens:** left rail → **Coordinator**. Its tooltip reads *"Coordinator —
 plan approvals, chat, and the merge queue"*. The panel header says *"The Coordinator plans and

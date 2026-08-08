@@ -300,7 +300,26 @@ Skim sibling views for the same element and match them. If you catch yourself ty
 
 - **No direct pushes to `main`.** `main` is protected. Every change lands via a Pull Request.
 - **One branch per feature/fix.** Branch off the latest `main` (e.g. `feat/agent-executor`, `fix/index-lock`), open a PR, get it reviewed, and merge only when complete and green.
-- **Agents must not commit or push.** An AI agent makes the code changes and then **generates a detailed proposed commit message** for the human to review and commit themselves. The message should follow the `type: summary` convention with a body explaining *what changed and why* (not just what). The human owner is responsible for staging, committing, and opening the PR.
+- **Agents commit and push to their OWN branch; agents never merge.** An agent may stage, commit, push its feature branch and open a PR. What an agent must never do is **merge**, force-push, or push directly to `main` or `phase2`. Merging is the human's decision and the review it implies is the point. (This bullet previously read "agents must not commit or push", which was unworkable: it made durable incremental work impossible and was routinely ignored. The real invariant was always *no unreviewed merge*, so that is what it now says.)
+- **Commit messages** follow the `type: summary` convention with a body explaining *what changed and why*, not just what.
+
+### Commit early, commit often — work that is not pushed does not exist
+
+**Commit at every meaningful sub-step, and push each one. Not just the finished product.** A reasonable rhythm is a commit when: the plumbing compiles even with logic stubbed; a design decision is made and wired; each test or small group of tests goes green; docs and `docs/repo-map/` are updated. Push the branch on the **first** commit, and after each one after that.
+
+**Why this is mandatory rather than advice.** An entire afternoon of two agents' work was lost in one incident: hours of correct, tested changes existed only as uncommitted files, and the machine died. Nothing was recoverable — no commits, no dangling objects, no stash. A local commit dies with the machine; a **pushed** commit cannot. The cost of an extra commit is nothing; the cost of not having one is everything since the last one.
+
+`wip:` subjects are fine and expected for intermediate commits — a branch with eight honest `wip:` commits is strictly better than a branch with nothing on it. Squash before merge if you want clean history; squashing is cheap and recovering deleted work is not.
+
+**Intermediate commits carry no `Co-Authored-By: Claude` / `Claude-Session:` trailers.** Those belong on the final commit only — the one representing the merged change. Intermediate commits are scaffolding and should carry a plain subject.
+
+### Never build in `/tmp` — it is a RAM disk
+
+**On WSL (and most Linux setups) `/tmp` is a `tmpfs`, which is memory, not disk.** Put worktrees and anything that gets compiled on a real filesystem — `~/mg-work/<task>/` is on `/dev/sdd ext4` here, with hundreds of GB free. Verify with `findmnt -no SOURCE,FSTYPE --target <path>` if unsure.
+
+This is not a tidiness rule. `.wslconfig` caps the VM at 10 GB; a single `dotnet build Mainguard.slnx` writes ~1.7 GB of `bin`/`obj`. Several worktrees built in `/tmp` consumed ~5 GB of RAM before a compiler ran, and the VM was then killed by concurrent test runs — three times, destroying the uncommitted work described above. A `No space left on device` from `/tmp` is a **memory** warning, not a disk one.
+
+**Related: do not run `dotnet test Mainguard.slnx` (the whole solution) locally while other heavy work is in flight.** Use a targeted `--filter`; CI runs the full suite. And never run the `RequiresDocker` suite on a workstation with live agent jails — see the testing restrictions in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Two long-lived branches: `main` vs `phase2` (added 2026-07-07)
 

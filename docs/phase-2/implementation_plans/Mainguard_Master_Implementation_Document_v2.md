@@ -1776,6 +1776,30 @@ With user-chosen latest, integrity rests on the npm registry's integrity metadat
 
 **Design decisions (binding) — [`FeatureDesigns.md`](../../design/FeatureDesigns.md) §5.** The polish pack designed as experiences; the T-22 analytics redesign mandates (M-D1/M-D2 secondary encodings + gates G-D1…G-D4, with the computed CVD validator record): [`ProductAndUX.md`](../../design/ProductAndUX.md) Part 4 and `docs/design/assets/AnalyticsRedesign.html`.
 
+## P2-50 — Backlog: additive capabilities, not yet scheduled
+
+**Status: BACKLOG, and strictly additive.** Everything here is a capability the product does not have
+and is not broken without — recorded so it is a decision rather than something we forgot. **Defects do
+not belong in this section**, however small: a known-wrong behaviour parked in a backlog list reads as
+"planned" to the next person who finds it, which is how a real bug acquires the appearance of a
+roadmap item. Those go to the issue tracker and get fixed.
+
+### P2-50a — Node and Go runtime-mount toolchains
+
+`ToolchainCatalog` ships `python-3` as the first `RuntimeMount` toolchain (P2-46 / PR #314). Node and
+Go are self-contained relocatable tarballs with upstream-published checksums, so they are the *same*
+delivery kind with a different payload.
+
+**Cost:** an edit to `toolchains.starter.json` — a pinned version-addressed HTTPS tarball, upstream's
+own published checksum (never one computed from our download, which is circular), and a probe that
+proves the toolchain RUNS rather than that a file arrived. **No C# change, no new delivery kind.**
+`ToolchainManifestTests` parses that file, so a bad edit fails CI rather than a user's install.
+
+**Why deferred rather than done:** doing Python properly and proving it end-to-end beats half-doing
+three. The evidence that the mechanism generalises is the manifest itself.
+
+---
+
 # 6. WAVE 3 — THE VIBE PRODUCT (K-2…K-5, fully specified)
 
 > Sequencing stays locked: the engine (P2-26) ships with the desktop platform; the Vibe *product*
