@@ -103,7 +103,9 @@ public sealed record CredTmpfsSpec(
 
     /// <summary>The mode every per-owner secret directory is mounted with: the owner may traverse,
     /// list and create; nobody else has any access at all.</summary>
-    public const string OwnedDirMode = "0700";
+    // MUTATION M1 (DO NOT MERGE): 0700 -> 0755. The supervisor's secret directory becomes
+    // traversable/listable by the agent uid, removing the per-owner directory control.
+    public const string OwnedDirMode = "0755";
 
     /// <summary>The directory a secret path lives in — the thing that has to be owned by the writer.
     /// Hand-rolled rather than <c>Path.GetDirectoryName</c>, which yields backslashes when the daemon
@@ -392,7 +394,8 @@ public static class ContainerSpecBuilder
         var hostConfig = new HostConfig
         {
             // G-15: no privilege escalation, plus the default-deny G2 seccomp profile. NEVER seccomp=unconfined.
-            SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
+            // MUTATION M3 (DO NOT MERGE): no-new-privileges removed from SecurityOpt.
+            SecurityOpt = new List<string> { SeccompProfile.SecurityOptValue },
 
             // G2 control 4: drop ALL capabilities and add back a minimal set with no SYS_PTRACE.
             CapDrop = new List<string> { "ALL" },
@@ -427,7 +430,8 @@ public static class ContainerSpecBuilder
             DNS = dns,
 
             // Read-only rootfs; writable surfaces are tmpfs only.
-            ReadonlyRootfs = true,
+            // MUTATION M2 (DO NOT MERGE): read-only rootfs removed.
+            ReadonlyRootfs = false,
 
             // The ext4 worktree at /workspace, plus (when the VM has dynamically installed agent CLIs)
             // the shared adapters root mounted READ-ONLY. The read-only adapters mount is what makes
@@ -811,8 +815,9 @@ public static class ContainerSpecBuilder
             if (!seccomp.Contains(syscall, StringComparison.Ordinal))
                 throw new SandboxSpecException($"G2 control 3: the seccomp profile does not deny '{syscall}'.");
 
-        if (!securityOpt.Contains("no-new-privileges"))
-            throw new SandboxSpecException("G-15: no-new-privileges is missing from SecurityOpt.");
+        // MUTATION M3 (DO NOT MERGE): the builder's own guard for no-new-privileges is disabled so the
+        // spec reaches Docker and the RUNTIME assertion is the thing under test.
+        _ = securityOpt;
 
         // Control 4: no CAP_SYS_PTRACE in the effective set (= what CapAdd restores after dropping ALL).
         var capAdd = create.HostConfig.CapAdd ?? new List<string>();

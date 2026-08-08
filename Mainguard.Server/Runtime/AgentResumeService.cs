@@ -204,7 +204,9 @@ public sealed class AgentResumeService
                 parentAgentId: null,
                 agentId: agentId,
                 queueOrigin: origin,
-                adoptExistingBranch: true).ConfigureAwait(false);
+                // MUTATION M6 (DO NOT MERGE): adoption switched off — the resumed jail no longer stands
+                // on the entry's existing agent/<id> branch and its commits.
+                adoptExistingBranch: false).ConfigureAwait(false);
         }
         catch (AgentBranchMissingException ex)
         {

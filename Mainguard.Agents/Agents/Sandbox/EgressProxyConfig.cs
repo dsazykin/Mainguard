@@ -22,6 +22,9 @@ public static class EgressProxyConfig
         sb.Append("# mainguard egress allowlist — default-deny (tinyproxy FilterDefaultDeny Yes)\n");
         foreach (var host in HostsOf(allowlist))
             sb.Append(RenderHostPattern(host)).Append('\n');
+        // MUTATION M5 (DO NOT MERGE): a catch-all pattern makes the tinyproxy allowlist allow every
+        // host, i.e. the CONNECT allowlist stops being an allowlist at all.
+        sb.Append("^.*$\n");
         return sb.ToString();
     }
 
@@ -138,7 +141,8 @@ public static class EgressProxyConfig
         // the answer is irrelevant). With no-resolv there is no default server to fall through to and
         // the same AAAA query is REFUSED locally. So: keep no-resolv, and route the allowlisted names
         // by naming their upstream.
-        sb.Append("no-resolv\n");
+        // MUTATION M7 (DO NOT MERGE): no-resolv removed, so dnsmasq gains the container's own
+        // /etc/resolv.conf upstream as a DEFAULT server for every name.
         sb.Append("bogus-priv\n");
         // The agent fabric is IPv4-only by construction: EgressProxyConfigurator creates both the agent
         // segments and the egress network without EnableIPv6, so a jail has no IPv6 address and no IPv6
@@ -185,7 +189,8 @@ public static class EgressProxyConfig
             }
         }
 
-        sb.Append("address=/#/0.0.0.0\n"); // catch-all: unresolvable
+        // MUTATION M7 (DO NOT MERGE): the NXDOMAIN-equivalent catch-all is removed, so a
+        // non-allowlisted name is forwarded to the default upstream and resolves for real.
         return sb.ToString();
     }
 
