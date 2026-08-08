@@ -38,9 +38,12 @@ public readonly record struct AgentSessionKey(string RepoHash, string AgentId);
 /// operator-initiated spawn. Daemon-side only (never serialized). This is what lets the in-jail
 /// <c>mainguard-agent list</c> be scoped to the caller's own workers instead of every session on the
 /// daemon.</param>
+/// <param name="Detail">The last human-readable reason broadcast for this session. Held ONLY so
+/// <see cref="AgentSessionStore.MarkState(AgentSessionKey,string,string?)"/> can tell a repeated
+/// reason from a new one — see its remarks for why a reason-only change has to reach the client.</param>
 public sealed record AgentSession(
     string Id, string Kind, string State, string? ContainerId = null, string? RepoHash = null,
-    string Role = "", string? ParentAgentId = null)
+    string Role = "", string? ParentAgentId = null, string? Detail = null)
 {
     /// <summary>This session's identity in the store: (repo, agent id). Never just the id.</summary>
     public AgentSessionKey Key => new(RepoHash ?? string.Empty, Id);
@@ -142,6 +145,15 @@ public sealed class AgentSessionStore
     /// the P2-09 real <c>IAgentSupervisor</c> drives so a 429/budget/yield pause becomes a visible state.
     /// A no-op for an unknown session.
     /// </summary>
+    /// <remarks>
+    /// <para>Broadcasts when the state word <b>or the reason</b> changed. The reason used to be ignored
+    /// for the change test, which silently swallowed every update that reported progress WITHIN a state
+    /// — and that is the only shape a long step has. A coordinator sits in <c>Starting</c> for the
+    /// several minutes its toolchain image builds, so each of those progress lines was dropped here and
+    /// the client, having heard nothing, could only conclude the daemon had stopped responding.</para>
+    /// <para>A repeated identical reason is still not broadcast, so a caller reporting the same line in
+    /// a loop cannot flood the stream.</para>
+    /// </remarks>
     public void MarkState(AgentSessionKey key, string state, string? reason)
     {
         bool changed;
@@ -152,8 +164,14 @@ public sealed class AgentSessionStore
                 return;
             }
 
-            changed = !string.Equals(session.State, state, StringComparison.Ordinal);
-            _sessions[key] = session with { State = state };
+            changed = !string.Equals(session.State, state, StringComparison.Ordinal)
+                      || (!string.IsNullOrEmpty(reason)
+                          && !string.Equals(session.Detail, reason, StringComparison.Ordinal));
+            _sessions[key] = session with
+            {
+                State = state,
+                Detail = string.IsNullOrEmpty(reason) ? session.Detail : reason,
+            };
         }
 
         if (changed)

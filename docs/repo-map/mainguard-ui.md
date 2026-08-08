@@ -16,10 +16,12 @@ a strictly one-way boundary the shell references for the Pro-default manifest). 
 Pro-only View/VM (Control Center, Coordinator, Resources monitor, agent rail, telemetry, queue rail,
 merge queue, review cockpit, agent workspace/document, terminal + `TerminalControl`/`VtScreen`, OOBE
 wizard, bootstrap, egress/PR-intake settings, vibe mode, startup/shutdown windows, CLI-OAuth ToS,
-VM-upgrade offer), the four Pro Settings pages (`AgentCliSettingsView`, `ApiKeySettingsView`,
-`DaemonLogsView`, `MainguardOsPageView`/`MainguardOsPageViewModel` — the latter replacing the old
+VM-upgrade offer), the five Pro Settings pages (`AgentCliSettingsView`, `ApiKeySettingsView`,
+`DaemonLogsView`, `ToolchainSettingsView` + `ToolchainDeclarationView` (the user-managed language-toolchain channel's install/
+remove surface, `ToolchainSettingsViewModel`/`ToolchainRowViewModel`),
+`MainguardOsPageView`/`MainguardOsPageViewModel` — the latter replacing the old
 standalone `AddReposToOsView` window and absorbing the former Tools "Rebuild sandbox images" action
-as `RebuildSandboxImagesCommand`; the other three's root changed from `Window`/`ChromedWindow` to
+as `RebuildSandboxImagesCommand`; the others' root changed from `Window`/`ChromedWindow` to
 `UserControl` so they embed in the Settings window, and their ViewModels now implement the shared
 `Mainguard.UI.ViewModels.ISettingsPage` — `OnActivated`/`OnDeactivated` — so `SettingsViewModel` can
 lazily build, activate, and (for `DaemonLogsViewModel`, which is also `IDisposable`)
@@ -59,7 +61,12 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   - `App.axaml` merges it into `Application.Resources` (for Views' `{StaticResource …}` /
     `{DynamicResource …}` icon lookups).
 - **`Styles/DesignSystem.axaml`** — the component-class `<Styles>`
-  (`Button.Primary/.Accent/.Success/.Danger/.Secondary/.IconButton/.Pill/.Segment/.WindowButton`,
+  (`Button.Primary/.Accent/.Success/.Danger/.DangerQuiet/.Secondary/.IconButton/.Pill/.Segment/.WindowButton`
+  — `.DangerQuiet` is the UNFILLED destructive: `Button.Secondary`'s shape with `DangerBrush` text and
+  hairline, for a destructive action that sits BESIDE a view's single accent CTA rather than being it
+  (the merge-queue rail's per-row Discard, where the one accent is reserved for the Review CTA);
+  `.Danger` stays the filled form, for the moment a destructive action IS the primary action — the
+  confirmation step. Adds no tokens; both resolve `DangerBrush`/`DangerHover`, which every theme has —
   `Border.Card/.RefChip*/.SegmentTrack`, `ComboBox`, flyout/menu surfaces, `CheckBox`,
   `PathIcon.Chevron/.spinning`, typography, button hover fades).
   - `App.axaml` `StyleInclude`s it LAST (after `FluentTheme` + AvaloniaEdit + Dock) so these overrides
@@ -94,8 +101,9 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   here** — `Editions/IEditionManifest` (+
   `RailSectionDescriptor`/`SettingsPageDescriptor`/`EditionFirstRun`/`RailAdornmentKind`),
   `Editions/IAgentPlatformSurface`, `Editions/IProToolsSurface` (reshaped for the Settings-window
-  rework: its five methods used to each be `Task ManageXAsync(Window owner)` — open a dialog; four of
-  them now — `CreateAiProvidersPage`, `CreateAgentClisPage`, `CreateDaemonLogsPage`,
+  rework: its methods used to each be `Task ManageXAsync(Window owner)` — open a dialog; the page
+  factories now — `CreateAiProvidersPage`, `CreateAgentClisPage`, `CreateToolchainsPage` (the
+  user-managed language-toolchain page, added with the toolchain channel), `CreateDaemonLogsPage`,
   `CreateMainguardOsPage(Window owner)` — just construct and return the page's content ViewModel as
   opaque `object`, the same `object?`-through-`ViewLocator` pattern
   `IAgentPlatformSurface.AgentRailContent`/`CreateResourceMonitor` already used, since

@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Docker.DotNet;
 using Docker.DotNet.Models;
+using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Security;
 
@@ -115,6 +116,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         // MG-36 a different address per segment).
         var dnsServer = await ResolveDnsServerAsync(networkName, ct).ConfigureAwait(false);
 
+        // Built before the reuse check, not just before the create: the reuse check has to know
+        // which per-owner secret directories THIS spawn expects (see staleSecretLayout below).
+        var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
+
         var existing = await FindByNameAsync(name, ct).ConfigureAwait(false);
         if (existing is not null)
         {
@@ -149,10 +154,23 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             var missingCacheMount = !string.IsNullOrEmpty(request.PackageCachePath)
                 && (existing.Mounts is null
                     || existing.Mounts.All(m => m.Destination != PackageCachePolicy.SandboxMount));
+            // A jail created before the secrets moved into per-owner directories carries the old flat
+            // /run/secrets tmpfs, and tmpfs entries — like mounts — are fixed at create. Reusing one
+            // would leave the write path execing as a non-root owner into a directory that does not
+            // exist and is not writable by it: the very EPERM the per-owner layout removes, resurrected
+            // for every container that outlived the upgrade. Caught here rather than at the write,
+            // because recreating is the only way to change the tmpfs set.
+            //
+            // Measured, not theorised: the RequiresDocker secret-delivery test failed on exactly this —
+            // a jail left behind by a pre-change run was reused, and the supervisor's key had nowhere to
+            // land — then passed once the stale container was gone.
+            var staleSecretLayout =
+                !await HasOwnedSecretDirsAsync(existing.ID, credentials, ct).ConfigureAwait(false);
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
-            if (!SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
+            if (staleSecretLayout
+                || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
                 || missingCacheMount)
             {
@@ -167,6 +185,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // state. Write-if-absent, so a still-running jail's fresher tokens are never
                 // clobbered by the host keychain's older copy.
                 await RestoreCliCredentialsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                // Same reason, same write-if-absent rule: a relaunched jail's home came back empty, so
+                // the user's approved-command list has to be put back or every command is re-prompted.
+                await RestoreCliSettingsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                await ApplyWorkspaceSettingsIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
                 // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
                 // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
                 // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
@@ -176,12 +198,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
         }
 
-        var credentials = CredTmpfsSpec.Create(request.AgentUid, request.SupervisorUid);
         var spec = new ContainerSpecRequest(
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
             request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
-            request.PackageCachePath);
+            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
@@ -203,6 +224,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
                 request.Secrets.OobKey, credentials.SupervisorUid, ct).ConfigureAwait(false);
             await RestoreCliCredentialsAsync(created.ID, request, ct).ConfigureAwait(false);
+            // The CLI's saved settings — the approved-command list the user built in an earlier jail.
+            // Ordered after the credential restore purely so a failure in the security-bearing write is
+            // never masked by one in the convenience write; both share the same failure handling below.
+            await RestoreCliSettingsAsync(created.ID, request, ct).ConfigureAwait(false);
+            // Driven by the adapter's DECLARATION, so it also covers the first-ever session — the one
+            // with nothing to restore, where the CLI creates the file itself the moment the user
+            // approves something. That is the session the ignore matters most in.
+            await ApplyWorkspaceSettingsIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -354,6 +383,40 @@ public sealed class DockerSandboxEngine : ISandboxEngine
         }
     }
 
+    /// <summary>
+    /// True when an existing jail already carries a per-owner tmpfs for BOTH secrets — i.e. it was
+    /// created by a build that knows secrets are written by their owners rather than chowned into place.
+    ///
+    /// <para>Read from <c>HostConfig.Tmpfs</c> rather than by looking inside the container: the question
+    /// is what the container was CREATED with (tmpfs entries are fixed at create, like mounts), and an
+    /// in-jail <c>stat</c> would need an exec — on the very container whose usability is in doubt.</para>
+    ///
+    /// <para>A container that vanished under us counts as satisfying this, so the caller's own recreate
+    /// path — not this probe — decides what to do about it. Same convention as the sibling probes.</para>
+    /// </summary>
+    private async Task<bool> HasOwnedSecretDirsAsync(string containerId, CredTmpfsSpec credentials, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await _docker.Containers.InspectContainerAsync(containerId, ct).ConfigureAwait(false);
+            var tmpfs = inspect.HostConfig?.Tmpfs;
+            if (tmpfs is null)
+            {
+                return false;
+            }
+
+            // The directory of each ACTUAL secret path, exactly as AssertSecretDirsOwned derives it —
+            // so "was this container built for the layout this spawn uses?" is one question, not two
+            // that can drift.
+            return tmpfs.ContainsKey(CredTmpfsSpec.DirectoryOf(credentials.CredentialPath))
+                && tmpfs.ContainsKey(CredTmpfsSpec.DirectoryOf(credentials.OobKeyPath));
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return true;
+        }
+    }
+
     /// <summary>True when a reusable jail is already pinned at <paramref name="dnsServer"/>. A container
     /// that vanished under us counts as matching so the caller's own recreate path — not this probe —
     /// decides what to do about it.</summary>
@@ -484,9 +547,161 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     }
 
     /// <summary>
+    /// Restores the CLI's saved SETTINGS — the user's approved-command list above all — into the jail's
+    /// throwaway trees, so a fresh agent does not re-prompt for everything that was already approved.
+    ///
+    /// <para>Mechanically identical to the credential restore and for the same three reasons: the write
+    /// runs as the AGENT uid (the CLI has to be able to rewrite the file when the user approves
+    /// something new), it goes over exec <b>stdin</b> rather than <c>docker cp</c> (which writes
+    /// underneath the tmpfs <c>$HOME</c> and reports success while the container sees nothing), and it
+    /// is <b>write-if-absent</b> — a live jail's own copy is always fresher than the host's.</para>
+    ///
+    /// <para>The only difference is the ROOT: an entry may be relative to <c>$HOME</c> or to
+    /// <c>/workspace</c>, because a CLI's user-level and project-level settings live in different trees
+    /// and it is the PROJECT one that holds "don't ask again" grants. Both are wiped every spawn, which
+    /// is why either needs restoring at all. Paths were validated relative upstream
+    /// (<see cref="AdapterManifest.IsHomeRelativeFilePath"/>), so neither root can be escaped.</para>
+    /// </summary>
+    private async Task RestoreCliSettingsAsync(string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        if (request.CliSettingsFiles is not { Count: > 0 } files)
+            return;
+
+        foreach (var file in files)
+        {
+            if (file.Content is not { Length: > 0 })
+                continue;
+
+            var path = SettingsRootPath(file.Root) + "/" + file.RelativePath;
+            var length = file.Content.Length.ToString(CultureInfo.InvariantCulture);
+            var exec = new ExecStdinRequest(
+                containerId,
+                request.AgentUid.ToString(CultureInfo.InvariantCulture),
+                // path is argv-safe; the content is piped via stdin only — the same shape as every
+                // other in-jail write, so there is one script to reason about rather than two.
+                new[]
+                {
+                    "sh", "-c",
+                    "umask 0077\n"
+                    + "if [ -e \"$1\" ]; then head -c \"$2\" > /dev/null; exit 0; fi\n"
+                    + "mkdir -p \"$(dirname \"$1\")\" || exit 74\n"
+                    + "head -c \"$2\" > \"$1.partial\" || exit 74\n"
+                    + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$2\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
+                    + "mv \"$1.partial\" \"$1\"\n",
+                    "sh", path, length,
+                },
+                file.Content);
+
+            await WriteSecretOverExecStdinAsync(path, exec, "CLI settings restore", ct).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Keeps the CLI's WORKSPACE settings file out of the agent's commits.
+    ///
+    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so that
+    /// file is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c>
+    /// (their own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the
+    /// user's permission allowlist would start committing it into their repository and merging it to
+    /// main: a convenience feature quietly writing to the user's history. The MG-43 package cache was
+    /// moved out of the worktree for exactly this reason; this file cannot move, because it is where
+    /// the CLI reads it from.</para>
+    ///
+    /// <para><b>Why it is driven by the DECLARATION and not by the restore.</b> On a first-ever session
+    /// there is nothing to restore — the CLI creates the file itself the moment the user approves
+    /// something. Deriving the ignore list from the restore payload alone would therefore protect every
+    /// session except the one that creates the file, which is the one that matters. So the union of the
+    /// adapter's declared workspace paths and anything actually restored is used, and this runs on every
+    /// spawn.</para>
+    ///
+    /// <para>The entry goes in <c>$GIT_DIR/info/exclude</c> — the repository's LOCAL ignore file, which
+    /// lives in the per-agent repo the daemon deletes at teardown. Nothing tracked is touched, the
+    /// user's own <c>.gitignore</c> is not edited, and no state outlives the agent.</para>
+    ///
+    /// <para>Best effort by construction: a worktree that is not a git repository at all (every
+    /// substrate-less test jail) resolves no git dir and this exits 0 having done nothing. A failure
+    /// here must never fail a spawn — the settings are already in place, which is the user-visible
+    /// half.</para>
+    /// </summary>
+    private async Task ApplyWorkspaceSettingsIgnoreAsync(
+        string containerId, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        var workspacePaths = (request.WorkspaceIgnorePaths ?? Array.Empty<string>())
+            .Concat((request.CliSettingsFiles ?? Array.Empty<SandboxSettingsFile>())
+                .Where(f => f.Root == AdapterSettingsRoot.Workspace && f.Content is { Length: > 0 })
+                .Select(f => f.RelativePath))
+            .Where(AdapterManifest.IsHomeRelativeFilePath)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+        if (workspacePaths.Length == 0)
+        {
+            return;
+        }
+
+        var command = new List<string>
+        {
+            "sh", "-c",
+            "cd " + ContainerSpecBuilder.WorkspaceTarget + " 2>/dev/null || exit 0\n"
+            + "excl=$(git rev-parse --git-path info/exclude 2>/dev/null) || exit 0\n"
+            + "[ -n \"$excl\" ] || exit 0\n"
+            + "mkdir -p \"$(dirname \"$excl\")\" 2>/dev/null || exit 0\n"
+            + "for p in \"$@\"; do\n"
+            + "  grep -qxF \"/$p\" \"$excl\" 2>/dev/null || printf '/%s\\n' \"$p\" >> \"$excl\" || exit 0\n"
+            + "done\n",
+            "sh",
+        };
+        command.AddRange(workspacePaths); // positional — never interpolated into script text
+
+        try
+        {
+            await ExecAsync(containerId, command, ct).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The settings are already restored; failing the spawn over the ignore entry would trade a
+            // working feature for a cosmetic one.
+        }
+    }
+
+    /// <summary>The absolute in-jail directory a settings root names. The ONE mapping — the harvest side
+    /// (<c>SandboxAgentLauncher</c>) resolves through this same method, so the two legs of the round trip
+    /// cannot drift onto different directories.</summary>
+    public static string SettingsRootPath(AdapterSettingsRoot root) => root switch
+    {
+        AdapterSettingsRoot.Workspace => ContainerSpecBuilder.WorkspaceTarget,
+        _ => ContainerSpecBuilder.AgentHome,
+    };
+
+    /// <summary>
     /// Writes secret bytes to <paramref name="path"/> inside the container as a mode-0400 file owned by
-    /// <paramref name="ownerUid"/>. Content flows over the exec's stdin (never argv/env), the shell
-    /// tightens the umask first, and the exec runs as root so it can chown to the supervisor uid.
+    /// <paramref name="ownerUid"/>. Content flows over the exec's stdin (never argv/env), and the shell
+    /// tightens the umask first.
+    ///
+    /// <para><b>The exec runs AS THE OWNER, and there is no <c>chown</c>.</b> It used to run as uid 0
+    /// and chown the file to its owner afterwards — "root, so chown to the supervisor uid is
+    /// permitted". That premise was false for this container's whole life, and it is what broke the
+    /// coordinator: a jail is created with a non-root <c>User</c> AND <c>no-new-privileges</c>, and
+    /// Docker hands an exec in such a container an EMPTY permitted/effective capability set even when
+    /// the exec asks for uid 0. Measured on the shipping engine (Docker 20.10.24): that exec reports
+    /// <c>uid=0</c> and <c>CapPrm: 0000000000000000</c> against a bounding set of <c>fb</c>, and its
+    /// <c>chown</c> fails with <c>EPERM</c> — <c>chown: changing ownership of
+    /// '/run/secrets/agent.env.partial': Operation not permitted</c>. Removing EITHER the non-root user
+    /// or no-new-privileges restores <c>CapPrm: fb</c> and the chown succeeds; both are controls we
+    /// keep (G-15, G2 control 4), so the chown is what had to go.</para>
+    ///
+    /// <para><b>Why nothing caught it.</b> The behaviour is engine-specific: the identical container on
+    /// Engine 29.4.3 — what CI and Docker Desktop run — gives that exec <c>CapPrm: fb</c> and the chown
+    /// succeeded, so the RequiresDocker leg that delivers both secrets end to end was green throughout.
+    /// It only ever failed on <c>MainguardEnv</c>'s Docker 20.10.24, and there it was silent until the
+    /// exec's exit status started being read. That is why the guard for this lives in the no-Docker
+    /// leg (<c>ContainerSpecBuilderTests</c>, <c>SandboxSecretWriteTimeoutTests</c>): it is the only one
+    /// that does not depend on which engine happens to be under the runner.</para>
+    ///
+    /// <para>What replaces it is ownership by construction: <see cref="ContainerSpecBuilder"/> mounts
+    /// each secret's directory as a tmpfs that Docker creates — daemon-side, as real root — already
+    /// owned by that secret's uid, so the owner simply CREATES its own file and <c>chmod 0400</c>s it
+    /// (permitted to a file's owner with no capability at all). Nothing on this path depends on a
+    /// capability, on uid 0, or on whether dockerd is userns-remapped.</para>
     ///
     /// <para>The shell <b>stages and renames</b> rather than writing the destination directly, and reads
     /// an exact byte count instead of to EOF. Both changes exist for the timeout: <c>cat &gt; "$1"</c>
@@ -499,23 +714,27 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// </summary>
     internal Task WriteSecretFileAsync(string containerId, string path, byte[] content, int ownerUid, CancellationToken ct)
     {
-        var uid = ownerUid.ToString(CultureInfo.InvariantCulture);
         var length = content.Length.ToString(CultureInfo.InvariantCulture);
         var exec = new ExecStdinRequest(
             containerId,
-            "0", // root, so chown to the supervisor uid is permitted; the file ends 0400/uid.
-                 // path/uid/length are not secret (argv-safe); the secret content is piped via stdin only.
+            // The OWNER writes its own secret into its own tmpfs directory, so the file is correctly
+            // owned the moment it exists and no privileged step is needed to hand it over.
+            // path/length are not secret (argv-safe); the secret content is piped via stdin only.
+            ownerUid.ToString(CultureInfo.InvariantCulture),
             new[]
             {
                 "sh", "-c",
                 "umask 0377\n"
-                + "head -c \"$3\" > \"$1.partial\" || exit 74\n"
+                + "head -c \"$2\" > \"$1.partial\" || exit 74\n"
                 // Short read ⇒ the endpoint stopped delivering. Destroy the scratch file and fail; the
                 // destination is never created, so there is nothing readable to leak.
-                + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$3\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
-                + "chown \"$2\" \"$1.partial\" && chmod 0400 \"$1.partial\" || { rm -f \"$1.partial\"; exit 74; }\n"
+                + "[ \"$(wc -c < \"$1.partial\" | tr -d ' ')\" = \"$2\" ] || { rm -f \"$1.partial\"; exit 75; }\n"
+                // Redundant against `umask 0377` and deliberately kept: the mode is the G-13 control,
+                // and a umask is a property of the shell we happen to get rather than of the file we
+                // promised. Owner-chmod needs no capability.
+                + "chmod 0400 \"$1.partial\" || { rm -f \"$1.partial\"; exit 74; }\n"
                 + "mv \"$1.partial\" \"$1\"\n",
-                "sh", path, uid, length,
+                "sh", path, length,
             },
             content);
 
@@ -560,9 +779,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 {
                     var result = await _stdin.RunAsync(exec, token).ConfigureAwait(false);
 
-                    // The exec's exit status was previously never read, so a short write, a failed chown
-                    // or a full tmpfs all reported success and produced a jail with no credentials and no
-                    // explanation. The staged-write shells signal exactly that with 74/75.
+                    // The exec's exit status was previously never read, so a short write, a failed
+                    // chmod or a full tmpfs all reported success and produced a jail with no credentials
+                    // and no explanation. The staged-write shells signal exactly that with 74/75.
                     if (result.ExitCode != 0)
                     {
                         throw new InvalidOperationException(
@@ -570,7 +789,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                             + $"'{containerId}' — the destination was NOT written (the shell stages to "
                             + "'<path>.partial' and only renames a complete file into place). Exit 75 means "
                             + "the endpoint delivered fewer bytes than promised; 74 means the file could not "
-                            + "be created, chowned or chmodded."
+                            + "be created or chmodded — the exec runs as the secret's owner uid in a tmpfs "
+                            + "directory Docker mounted owned by that uid, so a permission error here means "
+                            + "that mount is missing or owned by someone else."
                             + (string.IsNullOrWhiteSpace(result.Output)
                                 ? " The command printed nothing."
                                 : $" It printed: {result.Output}"));

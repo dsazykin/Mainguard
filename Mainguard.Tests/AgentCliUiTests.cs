@@ -256,6 +256,80 @@ public class AgentCliUiTests
         Assert.Contains("Refresh", vm.LoadError); // names the next step
     }
 
+    // ---- per-row command enablement (the "visible but not clickable" bug class) -----------------
+    //
+    // Install/Update/Revert live on the PARENT view model but their CanExecute predicates read ROW
+    // state. [NotifyCanExecuteChangedFor] fires only from the parent's own IsBusy, so a row changing
+    // raised PropertyChanged (the button turned VISIBLE) while CanExecuteChanged never fired — and a
+    // Button caches its last CanExecute result. These pin the NOTIFICATION, which is what was missing;
+    // RowCommandEnablementTests pins the rendered Button.IsEffectivelyEnabled it produces.
+
+    [Fact]
+    public void Settings_RowGainingAnUpdate_ShouldRepublishUpdateCanExecute()
+    {
+        var row = new AgentCliRowViewModel("claude-code", "Claude Code", "2.1.210", isInstalled: true);
+        var vm = new AgentCliSettingsViewModel(new[] { row });
+        Assert.False(vm.UpdateCommand.CanExecute(row));
+
+        var raised = 0;
+        vm.UpdateCommand.CanExecuteChanged += (_, _) => raised++;
+        row.UpdateAvailableVersion = "2.1.220";
+
+        Assert.True(vm.UpdateCommand.CanExecute(row));
+        Assert.True(raised > 0,
+            "UpdateCommand never raised CanExecuteChanged when the row gained an update — the button "
+            + "shows but stays disabled.");
+    }
+
+    [Fact]
+    public void Settings_RowGainingAPreviousVersion_ShouldRepublishRevertCanExecute()
+    {
+        var row = new AgentCliRowViewModel("claude-code", "Claude Code", "2.1.220", isInstalled: true);
+        var vm = new AgentCliSettingsViewModel(new[] { row });
+        Assert.False(vm.RevertCommand.CanExecute(row));
+
+        var raised = 0;
+        vm.RevertCommand.CanExecuteChanged += (_, _) => raised++;
+        row.PreviousVersion = "2.1.210";
+
+        Assert.True(vm.RevertCommand.CanExecute(row));
+        Assert.True(raised > 0, "RevertCommand never raised CanExecuteChanged when the row gained a revert target.");
+    }
+
+    [Fact]
+    public void Settings_RowBecomingInstallable_ShouldRepublishInstallCanExecute()
+    {
+        var row = new AgentCliRowViewModel("codex", "OpenAI Codex CLI", "0.144.4", isInstalled: true);
+        var vm = new AgentCliSettingsViewModel(new[] { row });
+        Assert.False(vm.InstallCommand.CanExecute(row));
+
+        var raised = 0;
+        vm.InstallCommand.CanExecuteChanged += (_, _) => raised++;
+        row.IsInstalled = false;
+
+        Assert.True(vm.InstallCommand.CanExecute(row));
+        Assert.True(raised > 0, "InstallCommand never raised CanExecuteChanged when the row became installable.");
+    }
+
+    [Fact]
+    public async Task Settings_RowsArrivingFromRefresh_ShouldRepublishRowCommandCanExecute()
+    {
+        // Rows are replaced wholesale by RefreshAsync (Clear + Add). The freshly-added rows must be
+        // watched too — otherwise the fix would only hold for design-constructed lists.
+        var fx = new Fixture();
+        fx.Host.PreInstalled.Add("claude-code");
+        var vm = new AgentCliSettingsViewModel(fx.CreateInstaller());
+        await vm.RefreshCommand.ExecuteAsync(null);
+
+        var row = vm.Clis.Single(c => c.Id == "claude-code");
+        var raised = 0;
+        vm.UpdateCommand.CanExecuteChanged += (_, _) => raised++;
+        row.UpdateAvailableVersion = "2.1.220";
+
+        Assert.True(vm.UpdateCommand.CanExecute(row));
+        Assert.True(raised > 0, "a row created by RefreshAsync is not watched — its Update button stays dead.");
+    }
+
     // ---- helpers -------------------------------------------------------------------------------
 
     private static void SelectAll(IEnumerable<AgentCliRowViewModel> rows)

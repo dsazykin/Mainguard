@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.UI.Services;
 using Mainguard.UI.ViewModels;
 
 namespace Mainguard.Agents.UI.ViewModels;
@@ -18,6 +19,7 @@ public partial class QueueRailViewModel : ViewModelBase
 {
     private readonly IMergeQueueService _queue;
     private readonly Action<string> _openReview;
+    private readonly Action<string, bool>? _report;
 
     public ObservableCollection<QueueEntryViewModel> Entries { get; } = new();
 
@@ -25,10 +27,15 @@ public partial class QueueRailViewModel : ViewModelBase
     [ObservableProperty] private string _gateText = "";
     [ObservableProperty] private bool _isEmpty;
 
-    public QueueRailViewModel(IMergeQueueService queue, Action<string> openReview)
+    /// <param name="report">(message, isWarning) sink for the lifecycle actions' outcomes; null uses the
+    /// shell's toast stack. Injected by tests — a discard's refusal is the sentence the human reads, so it
+    /// has to be observable somewhere other than a toast.</param>
+    public QueueRailViewModel(
+        IMergeQueueService queue, Action<string> openReview, Action<string, bool>? report = null)
     {
         _queue = queue;
         _openReview = openReview;
+        _report = report;
         Refresh();
     }
 
@@ -48,7 +55,7 @@ public partial class QueueRailViewModel : ViewModelBase
             var existing = Entries.FirstOrDefault(e => e.AgentId == entry.AgentId);
             if (existing is null)
             {
-                existing = new QueueEntryViewModel(entry.AgentId, _openReview);
+                existing = new QueueEntryViewModel(entry.AgentId, _openReview, _queue, _report);
                 Entries.Insert(Math.Min(i, Entries.Count), existing);
             }
             existing.Update(entry, _queue);
@@ -78,10 +85,24 @@ public partial class QueueRailViewModel : ViewModelBase
     }
 }
 
-/// <summary>One thread on the rail. State word first (E4/N-3); badge + brush are second channels.</summary>
+/// <summary>
+/// One thread on the rail. State word first (E4/N-3); badge + brush are second channels.
+///
+/// <para>Beyond Review it carries the entry's <b>lifecycle</b> actions — the ones an entry whose agent is
+/// gone previously had none of. Every one of them is a thin drive of a daemon RPC: the transition, the
+/// record and the refusal all live in the daemon, and this class can neither remove a row from the queue
+/// nor invent an outcome. That direction is deliberate — a "remove from list" implemented here would
+/// clear the rail until the next <c>StreamQueue</c> snapshot silently put the entry back.</para>
+/// </summary>
 public partial class QueueEntryViewModel : ViewModelBase
 {
     private readonly Action<string> _openReview;
+    private readonly IMergeQueueService _queue;
+    private readonly Action<string, bool>? _report;
+
+    /// <summary>The last state the queue stream reported, so the Verify affordance can be re-armed
+    /// without waiting for a stream update that a refused request never produces.</summary>
+    private WorkerMergeState _lastState = WorkerMergeState.Working;
 
     public string AgentId { get; }
 
@@ -94,6 +115,45 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private bool _isReviewable;
     [ObservableProperty] private bool _showReviewAccent;
 
+    /// <summary>Whether the human can ask for a verification run on this entry right now. False while one
+    /// is already in flight (the daemon rejects a concurrent run) and on the terminal states.</summary>
+    [ObservableProperty] private bool _canVerify;
+
+    /// <summary>True only while this row's own request is in flight — keeps the button from being pressed
+    /// twice before the queue stream reports <c>Verifying</c>.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(VerifyButtonText))]
+    private bool _isVerifyRequestInFlight;
+
+    public string VerifyButtonText => IsVerifyRequestInFlight ? "Verifying…" : "Verify";
+
+    /// <summary>The daemon's verbatim answer to the last verification request — a refusal it never ran
+    /// ("no live jail", "no verification command"), or a run that happened and failed. Cleared on the
+    /// next request. Rendered as a fact line, never swallowed.</summary>
+    [ObservableProperty] private string _verifyMessage = "";
+
+    /// <summary>True when a discard is a legal thing to ask for — i.e. the entry is not already terminal.
+    /// The daemon refuses a terminal discard anyway; this only keeps the rail from offering it.</summary>
+    [ObservableProperty] private bool _canDiscard;
+
+    /// <summary>
+    /// True only for an entry whose row says <c>Verifying</c> while the DAEMON reports no run in flight.
+    /// Never inferred from the state alone: that inference is wrong for exactly the entries this action
+    /// exists for.
+    /// </summary>
+    [ObservableProperty] private bool _isVerificationStalled;
+
+    /// <summary>The two-step guard on the destructive action: the row asks before it drops anything.</summary>
+    [ObservableProperty] private bool _isConfirmingDiscard;
+
+    /// <summary>
+    /// True while this row's own lifecycle request is in flight — the same latch <see cref="VerifyAsync"/>
+    /// keeps, for the same reason. Without it a double-press fires two RPCs, and the second comes back as
+    /// "this entry was already discarded": a warning toast reporting a failure for the action the human
+    /// just successfully performed.
+    /// </summary>
+    private bool _lifecycleRequestInFlight;
+
     [ObservableProperty] private bool _isNeutral;
     [ObservableProperty] private bool _isMutedState;
     [ObservableProperty] private bool _isInfoState;
@@ -101,10 +161,25 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private bool _isSuccessState;
     [ObservableProperty] private bool _isDangerState;
 
-    public QueueEntryViewModel(string agentId, Action<string> openReview)
+    /// <param name="queue">The seam the Verify and entry-lifecycle commands trigger through.
+    /// <b>Required</b>, deliberately: an optional queue would let a caller construct a row whose buttons
+    /// silently do nothing, which is precisely the "built but not wired" failure these controls were
+    /// added to fix.</param>
+    /// <param name="report">(message, isWarning) sink for the entry-lifecycle outcomes; null uses the
+    /// shell's toast stack. Optional because it has a real default, unlike the queue.</param>
+    public QueueEntryViewModel(
+        string agentId,
+        Action<string> openReview,
+        IMergeQueueService queue,
+        Action<string, bool>? report = null)
     {
         AgentId = agentId;
         _openReview = openReview;
+        _queue = queue ?? throw new ArgumentNullException(nameof(queue));
+        _report = report;
+        // Decide the affordance up front rather than leaving it on `bool`'s default false: a row that
+        // renders before its first Update would otherwise show a dead Verify button.
+        RecomputeCanVerify();
     }
 
     public void Update(QueueEntry entry, IMergeQueueService queue)
@@ -112,8 +187,15 @@ public partial class QueueEntryViewModel : ViewModelBase
         Name = entry.Name;
         Branch = entry.Branch;
         Detail = entry.Detail;
+
+        // A Verifying row with no run behind it is NOT verifying, and the rail must not say it is. The
+        // daemon supplies the in-flight fact; the state alone cannot tell these apart, which is precisely
+        // how such an entry ends up reading as permanently busy.
+        IsVerificationStalled = entry.State == WorkerMergeState.Verifying && !entry.VerificationInFlight;
+
         StateWord = entry.State switch
         {
+            WorkerMergeState.Verifying when IsVerificationStalled => "Stalled",
             WorkerMergeState.StaleVerified => "Stale",
             WorkerMergeState.AwaitingReview => "Awaiting review",
             var s => s.ToString(),
@@ -122,19 +204,140 @@ public partial class QueueEntryViewModel : ViewModelBase
             ? $"main@{v.MainSha}" : "";
         IsReviewable = entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;
 
+        // The daemon now owns this row's progress; drop our optimistic in-flight latch.
+        if (entry.State == WorkerMergeState.Verifying) IsVerifyRequestInFlight = false;
+
+        _lastState = entry.State;
+        RecomputeCanVerify();
+
+        CanDiscard = entry.State
+            is not (WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded);
+        if (!CanDiscard)
+        {
+            IsConfirmingDiscard = false;
+        }
+
         (BadgeGeometryKey, IsNeutral, IsMutedState, IsInfoState, IsWarningState, IsSuccessState, IsDangerState) = entry.State switch
         {
             WorkerMergeState.Working => ("AgentWorkingIcon", true, false, false, false, false, false),
+            // A stalled Verifying reads as a warning, not as the info-blue "work in progress" it is not.
+            WorkerMergeState.Verifying when IsVerificationStalled => ("AgentStaleIcon", false, false, false, true, false, false),
             WorkerMergeState.Verifying => ("AgentVerifyingIcon", false, false, true, false, false, false),
             WorkerMergeState.Verified => ("AgentWaitingIcon", false, false, false, false, true, false),
             WorkerMergeState.AwaitingReview => ("AgentWaitingIcon", false, false, false, false, true, false),
             WorkerMergeState.StaleVerified => ("AgentStaleIcon", false, false, false, true, false, false),
             WorkerMergeState.Merged => ("CheckmarkIcon", false, false, false, false, true, false),
             WorkerMergeState.Rejected => ("DismissIcon", false, false, false, false, false, true),
+            // Discarded entries leave the daemon's live queue, so this maps a state the rail should not
+            // normally receive. It is spelled out rather than left to the fallback so that if one ever DOES
+            // arrive (a mock, a future projection) it reads as the muted, finished, not-merged thing it is
+            // — never borrowing Merged's success green.
+            WorkerMergeState.Discarded => ("DismissIcon", false, true, false, false, false, false),
             _ => ("AgentWorkingIcon", false, true, false, false, false, false),
         };
     }
 
     [RelayCommand]
     private void OpenReview() => _openReview(AgentId);
+
+    /// <summary>
+    /// The human's verification trigger — the Verify button on this row.
+    ///
+    /// <para><b>Deliberately thin.</b> It makes one call to <see cref="IMergeQueueService.RunVerificationAsync"/>
+    /// and renders the answer. It decides nothing: it does not transition the entry, does not judge
+    /// pass/fail, and does not touch any merge gate — all of that is the daemon's
+    /// <c>MergeQueue.RunVerificationAsync</c>, and the new state arrives back through the queue stream
+    /// like every other state change. Keeping the policy on the daemon is what lets phase 2's automatic
+    /// caller reuse this path exactly rather than growing a second copy of it beside this one.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task VerifyAsync()
+    {
+        if (IsVerifyRequestInFlight) return;
+
+        IsVerifyRequestInFlight = true;
+        RecomputeCanVerify();
+        VerifyMessage = "";
+        try
+        {
+            var outcome = await _queue.RunVerificationAsync(AgentId).ConfigureAwait(true);
+            VerifyMessage = outcome.Reason;
+        }
+        catch (Exception ex)
+        {
+            // A verification that could not even be requested is reported, never swallowed into a row
+            // that silently stays "not verified yet" — that silence is the defect this button fixes.
+            VerifyMessage = "Can't verify — " + ex.Message;
+        }
+        finally
+        {
+            // Always re-arm from the last known state. A request the daemon never acted on — no repo
+            // bound, daemon unreachable — moves no queue state and therefore pushes no stream update,
+            // so a button left disabled here would stay dead for the session: the very "the human is
+            // stuck with no way forward" failure this control exists to remove.
+            IsVerifyRequestInFlight = false;
+            RecomputeCanVerify();
+        }
+    }
+
+    /// <summary>The single place the Verify affordance is decided, so the command and the stream
+    /// refresh can never disagree about it.</summary>
+    private void RecomputeCanVerify() =>
+        // Offered on every state a run can legally start from — including Verified, because
+        // RE-verifying against a moved main is the normal way a stale entry gets fresh again. Withheld
+        // while a run is in flight (the daemon refuses a concurrent one) and on the terminal states,
+        // where there is nothing left to verify.
+        CanVerify = !IsVerifyRequestInFlight && _lastState is not (
+            WorkerMergeState.Verifying or WorkerMergeState.Merged or WorkerMergeState.Rejected
+            or WorkerMergeState.Discarded);
+
+    /// <summary>Arms the destructive action. Nothing has been asked of the daemon yet.</summary>
+    [RelayCommand]
+    private void BeginDiscard() => IsConfirmingDiscard = true;
+
+    /// <summary>Disarms it.</summary>
+    [RelayCommand]
+    private void CancelDiscard() => IsConfirmingDiscard = false;
+
+    /// <summary>
+    /// The confirmed discard. The reason recorded is the state the entry was in when the human dropped it
+    /// — a fact this surface actually has, rather than a prompt for prose nobody types.
+    /// </summary>
+    [RelayCommand]
+    private async Task ConfirmDiscardAsync()
+    {
+        IsConfirmingDiscard = false;
+        if (_lifecycleRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner
+                .DiscardAsync(_queue, AgentId, $"dropped from the queue while {StateWord}", _report)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>Asks the daemon to clear a Verifying state it is not actually running.</summary>
+    [RelayCommand]
+    private async Task ClearStalledVerificationAsync()
+    {
+        if (_lifecycleRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner
+                .ClearStalledVerificationAsync(_queue, AgentId, _report)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            _lifecycleRequestInFlight = false;
+        }
+    }
 }

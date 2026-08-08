@@ -105,6 +105,69 @@ public class ControlCenterRenderHarness
         HarnessHygiene.Teardown(win);
     }
 
+    /// <summary>
+    /// The verification trigger on the merge-queue rail, in every theme. Until this control existed there
+    /// was no way at all for a human to move a queued entry off "not verified yet" — the mechanism was
+    /// complete and had no production caller. The capture proves the affordance renders (and that the
+    /// disabled/in-flight states are legible) on light Daylight Loom as well as the dark themes.
+    /// </summary>
+    [AvaloniaFact]
+    public void Capture_VerifyTrigger_OnQueueRail_AllFiveThemes()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        foreach (var theme in ThemeKeys)
+        {
+            ThemeManager.Apply(theme, persist: false);
+            using var vm = NewVm(out var mock);
+            var win = HostWindow(new ControlCenterView { DataContext = vm });
+            win.Show();
+            Settle();
+
+            // loom-4 is Working — the unverified entry, and the reason the rail is stuck.
+            var row = vm.Queue.Entries.Single(e => e.AgentId == "loom-4");
+            Assert.True(row.CanVerify, "the rail offered no Verify affordance on an unverified entry");
+            Assert.False(mock.CanMerge("loom-4", out var blocked));
+            Assert.Equal("not verified yet", blocked);
+
+            win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), $"queue_verify_trigger_{theme}.png"));
+
+            // A Verifying entry must NOT offer the button — the daemon refuses a concurrent run.
+            Assert.False(vm.Queue.Entries.Single(e => e.AgentId == "loom-1").CanVerify);
+
+            HarnessHygiene.Teardown(win);
+        }
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+    }
+
+    /// <summary>
+    /// Pressing Verify on the rail drives the seam and repaints the row — the surface-level counterpart
+    /// to the daemon-level proof in <c>VerificationTriggerTests</c>.
+    /// </summary>
+    [AvaloniaFact]
+    public void VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        using var vm = NewVm(out var mock);
+        var win = HostWindow(new ControlCenterView { DataContext = vm });
+        win.Show();
+        Settle();
+
+        Assert.False(mock.CanMerge("loom-4", out var before));
+        Assert.Equal("not verified yet", before);
+
+        vm.Queue.Entries.Single(e => e.AgentId == "loom-4").VerifyCommand.Execute(null);
+        Settle();
+
+        // The entry is verified, and the rail is showing it.
+        Assert.Equal(WorkerMergeState.Verified, mock.GetQueue().Single(q => q.AgentId == "loom-4").State);
+        Assert.True(mock.CanMerge("loom-4", out var after), $"still gated after verifying: {after}");
+        Assert.Equal("Verified", vm.Queue.Entries.Single(e => e.AgentId == "loom-4").StateWord);
+
+        win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), "queue_verify_after.png"));
+        HarnessHygiene.Teardown(win);
+    }
+
     [AvaloniaFact]
     public void Capture_KillSwitch_Frozen()
     {

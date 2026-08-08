@@ -2,7 +2,12 @@ name: CI
 
 on:
   pull_request:
-    branches: [main, phase2]
+    # 'feat/**' so a STACKED pr — one whose base is another feature branch rather
+    # than a long-lived branch — still gets checks. Without it a stacked pr reports
+    # zero checks, which reads as "nothing to see" rather than "never verified":
+    # phase 3 sat unverified this way until someone noticed the empty check list.
+    # For pull_request, the branches filter matches the BASE branch.
+    branches: [main, phase2, 'feat/**', 'fix/**']
   push:
     branches: [main, phase2]
 

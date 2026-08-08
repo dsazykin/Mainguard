@@ -26,15 +26,18 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private readonly IMergeQueueRegistry _registry;
     private readonly KillSwitchGate _killGate;
     private readonly IMergeBranchDiffService _mergeDiff;
+    private readonly Mainguard.Server.Auth.IApproverIdentityResolver _identity;
     private readonly ILogger _log;
 
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
+        Mainguard.Server.Auth.IApproverIdentityResolver identity,
         ILoggerFactory loggerFactory)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
         _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
+        _identity = identity ?? throw new ArgumentNullException(nameof(identity));
         _log = (loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.Merge);
     }
@@ -302,6 +305,106 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         });
     }
 
+    /// <summary>
+    /// The human drops a queue entry — the terminal <c>Discarded</c> transition, enforced here rather than
+    /// anywhere upstream.
+    ///
+    /// <para><b>Why this is a daemon RPC and not a ViewModel command.</b> The queue is daemon-owned and
+    /// persisted; a client-side "remove from list" would clear a rail that the next <c>StreamQueue</c>
+    /// snapshot immediately refills, which is the same shape as this repository's <c>FlaggedChangeGate</c>
+    /// defect — a control that existed only in the UI layer. Everything that makes a discard mean anything
+    /// (the state transition, the persisted record, the audit event, the refusal when a merge is in
+    /// flight) is on this side of the wire.</para>
+    ///
+    /// <para><b>Refused while this repo holds an outstanding merge lease for the entry.</b> A discard
+    /// during the window between <c>BeginMerge</c> and <c>ConfirmMerge</c> would move the branch to a
+    /// terminal state under a merge that is already executing on the user's checkout, and
+    /// <c>ConfirmMerge</c> would then fail to record a merge that really landed — the queue disagreeing
+    /// with git, which is the one outcome this whole subsystem exists to prevent.</para>
+    ///
+    /// <para>The kill switch does NOT gate it. Freezing the queue stops merges; it is not a reason to
+    /// forbid the human from tidying an entry that can no longer merge either way.</para>
+    /// </summary>
+    public override Task<DiscardEntryResponse> DiscardEntry(DiscardEntryRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        var ctx = Resolve(request.RepoHandle);
+
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is not null && string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            const string held =
+                "a merge is in progress for this entry — finish or abandon it before discarding";
+            _log.LogWarning("DiscardEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, held);
+            return Task.FromResult(new DiscardEntryResponse { Discarded = false, Reason = held });
+        }
+
+        // SA-1/F2: the actor comes from the connection, never from the message — there is no actor field
+        // on DiscardEntryRequest precisely so that no caller can assert one.
+        var actor = _identity.Resolve(context);
+
+        if (!ctx.Queue.TryDiscard(request.AgentId, actor, request.Reason ?? string.Empty, out var refusal))
+        {
+            _log.LogWarning("DiscardEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, refusal);
+            return Task.FromResult(new DiscardEntryResponse { Discarded = false, Reason = refusal });
+        }
+
+        var record = ctx.Queue.GetDiscard(request.AgentId);
+        _log.LogInformation(
+            "DiscardEntry repo={Repo} agent={Agent} by={By} from={From} reason={Reason}",
+            request.RepoHandle, request.AgentId, actor,
+            record?.FromState?.ToString() ?? "(unknown)",
+            string.IsNullOrWhiteSpace(request.Reason) ? "(none given)" : request.Reason);
+
+        return Task.FromResult(new DiscardEntryResponse
+        {
+            Discarded = true,
+            Reason = "",
+            DiscardedBy = record?.By ?? actor,
+            DiscardedAt = record?.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture) ?? "",
+        });
+    }
+
+    /// <summary>
+    /// Clears a <c>Verifying</c> state with no run behind it (see the RPC comment in the proto). The
+    /// "is anything actually running" question is only answerable here — the in-flight set is daemon
+    /// memory — so both the decision and the refusal live daemon-side.
+    /// </summary>
+    public override Task<ClearStalledVerificationResponse> ClearStalledVerification(
+        ClearStalledVerificationRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        var ctx = Resolve(request.RepoHandle);
+        var actor = _identity.Resolve(context);
+        var cleared = ctx.Queue.TryClearStalledVerification(request.AgentId, actor, out var refusal);
+
+        _log.Log(cleared ? LogLevel.Information : LogLevel.Warning,
+            "ClearStalledVerification repo={Repo} agent={Agent} cleared={Cleared} {Reason}",
+            request.RepoHandle, request.AgentId, cleared, refusal);
+
+        return Task.FromResult(new ClearStalledVerificationResponse
+        {
+            Cleared = cleared,
+            Reason = refusal,
+            // Only for an entry the queue actually tracks. GetState defaults an unknown agent to
+            // Working, so reporting it unconditionally would answer a "this entry is not in the merge
+            // queue" refusal with state="Working" — asserting a state for an entry that does not exist.
+            State = cleared || ctx.Queue.Agents.Contains(request.AgentId)
+                ? ctx.Queue.GetState(request.AgentId).ToString()
+                : "",
+        });
+    }
+
     public override Task<GetMergeDiffResponse> GetMergeDiff(GetMergeDiffRequest request, ServerCallContext context)
     {
         if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
@@ -359,6 +462,8 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 GateReason = reason,
                 // P2-13 carried-in from P2-12: badge external-PR intake entries as such.
                 Origin = queue.GetOrigin(agentId).ToString(),
+                // Only the daemon can tell a branch being verified from a row that merely says so.
+                VerificationInFlight = queue.IsVerificationInFlight(agentId),
             };
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));

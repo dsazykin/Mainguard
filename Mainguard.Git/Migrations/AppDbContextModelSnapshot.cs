@@ -207,6 +207,15 @@ namespace Mainguard.Git.Migrations
                         .IsRequired()
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("DiscardReason")
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime?>("DiscardedAtUtc")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("DiscardedBy")
+                        .HasColumnType("TEXT");
+
                     b.Property<long?>("LastVerificationId")
                         .HasColumnType("INTEGER");
 

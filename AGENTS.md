@@ -251,7 +251,8 @@ Semantics rule: use tokens **by meaning, not by hue** — the same view must loo
 | `Button.Primary` | neutral/default actions (`ButtonBg` fill, hairline border) |
 | `Button.Accent` | the **one** emphasized CTA per view (`AccentBrush` fill, `OnAccent` text) |
 | `Button.Success` | positive/confirming actions (`SuccessBrush` fill, `OnAccent` text) |
-| `Button.Danger` | destructive actions (`DangerBrush` fill, `OnAccent` text) |
+| `Button.Danger` | destructive actions that ARE their surface's primary action — chiefly the confirmation step (`DangerBrush` fill, `OnAccent` text) |
+| `Button.DangerQuiet` | destructive actions that sit **beside** the view's one accent CTA and must not become a second one — `Button.Secondary`'s unfilled shape with `DangerBrush` text/hairline, so it reads destructive by hue rather than by mass (the merge-queue rail's per-row Discard) |
 | `Button.Secondary` | cancel/dismiss (transparent, muted, hairline) |
 | `Button.IconButton` | toolbar/inline icon actions — circular hover, padding 6 |
 | `Button.Pill` | capsule-shaped buttons |

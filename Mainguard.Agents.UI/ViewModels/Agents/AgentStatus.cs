@@ -60,6 +60,9 @@ public static class AgentStatusMap
         WorkerMergeState.AwaitingReview => AgentStatus.AwaitingReview,
         WorkerMergeState.Merged => AgentStatus.Verified,
         WorkerMergeState.Rejected => AgentStatus.Dead,
+        // Dead, like Rejected: finished, not merged, nothing further will happen to it. Falling through
+        // to the Working default would have badged a dropped entry as live work.
+        WorkerMergeState.Discarded => AgentStatus.Dead,
         _ => AgentStatus.Working,
     };
 }

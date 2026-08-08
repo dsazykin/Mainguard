@@ -37,6 +37,14 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
         _tokenPath = Path.Combine(dir, "daemon.token");
     }
 
+    /// <summary>
+    /// Replaces the daemon's container-stats source. Set before the host is built (i.e. before touching
+    /// <see cref="WebApplicationFactory{T}.Services"/>). Lets a test drive the resource stream with KNOWN
+    /// CPU/RAM values, so the daemon→gRPC→client→ViewModel wire can be asserted on real numbers rather
+    /// than on a formatter — the whole point being that this feature previously had no data source at all.
+    /// </summary>
+    public Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler? ResourceSampler { get; init; }
+
     /// <summary>An independent, freshly-started in-proc daemon (own token + host).</summary>
     public static DaemonFixture StartNew()
     {
@@ -107,6 +115,13 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
             services.Replace(ServiceDescriptor.Singleton(new AdmissionController(
                 sampler: () => RoomySample,
                 runningAgentCount: () => 0)));
+
+            // Container-stats source override (see ResourceSampler). Left alone when unset, so the
+            // default in-proc daemon keeps the production wiring.
+            if (ResourceSampler is { } sampler)
+            {
+                services.Replace(ServiceDescriptor.Singleton(sampler));
+            }
         });
     }
 

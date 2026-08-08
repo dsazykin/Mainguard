@@ -32,7 +32,10 @@
 - **`Views/`** — one `.axaml` (+ `.axaml.cs`) per screen/dialog. Paired 1:1 with `ViewModels/`. Secondary dialogs/panels derive from `Mainguard.UI`'s `ChromedWindow` and place its `CustomTitleBar` in row 0 for one consistent hand-drawn title bar (both moved to `Mainguard.UI` in step 2c; the derived windows stay here in the same `Mainguard.App.Shell.Views` namespace, resolving cross-assembly).
   - Shell: `MainWindow` (top nav, sidebar, overlays: command palette / delete-confirm / invalid-repo
     / the bottom-right shell-toast stack bound to `MainWindowViewModel.Toasts` — window-wide,
-    auto-dismissing, mirrors RepoDashboard's #85 toast styles). The command-palette overlay hosts
+    auto-dismissing, mirrors RepoDashboard's #85 toast styles; its `Grid.Row="1"` is load-bearing —
+    without it the host falls into the Auto-sized title-bar row and `VerticalAlignment="Bottom"`
+    renders the stack in the TOP-right corner, the 2026-08 regression pinned by
+    `Headless/MainWindowShellRenderHarness.ShellToasts_*`). The command-palette overlay hosts
     `CommandPaletteView` (T-18: a reusable palette card — query box + ranked/highlighted result rows
     with category headers, category chips, and gesture chips) bound to
     `MainWindowViewModel.CommandPalette`;
@@ -75,6 +78,12 @@
     `UserControl` — it used to be its own window opened from the repo actions menu, now it is the
     Settings **Agent CLIs** page, and `AgentCliSettingsViewModel` implements `ISettingsPage` so
     `OnActivated` kicks the catalog refresh, replacing the old window's `OnDataContextChanged` hook),
+    `ToolchainSettingsView` (**Toolchains** — the same row shape over the user-managed *language*
+    toolchain channel: per-toolchain pinned-version chip, the summary, an installed/not-installed line
+    that carries what the PROBE reported (so "a different version is present — expected 3.12.13, the
+    probe reported: go1.22.6" reads as words rather than a bare "no"), per-row Install/Remove, an
+    inline actionable failure cause, Cancel + Refresh; a `UserControl` page whose
+    `ToolchainSettingsViewModel` implements `ISettingsPage`),
     `StartupWindow`/`StartupWindowViewModel` (owner design 2026-07-17 — the control-center BLOCKING
     startup loading screen driving Core's `AppStartupSequence`: a `BootstrapStageViewModel` glyph
     checklist + one changing status line, and the CONSENTED tier-2 OS upgrade offer hosted INLINE —
@@ -101,7 +110,8 @@
     `MainWindowViewModel.RailSections`/`ActivateSection`.
     `SettingsViewModel.ActivatePage(pageId, focusHost)` builds and activates one of ~10 pages —
     **General**, **Keyboard Shortcuts**, **Accounts**, **SSH Keys**, **Git Profiles**, **AI
-    Providers**\[Pro], **Agent CLIs**\[Pro], **Mainguard OS**\[Pro], **Daemon Logs**\[Pro], **About** —
+    Providers**\[Pro], **Agent CLIs**\[Pro], **Toolchains**\[Pro], **Mainguard OS**\[Pro], **Daemon
+    Logs**\[Pro], **About** —
     lazily and caches each row's Content; any page whose ViewModel is also `IDisposable` (currently only
     Daemon Logs) has its row's cache discarded on leaving so the next visit rebuilds fresh instead of
     reusing a disposed instance. The old small 440×560 single-screen dialog (pinned-top-menu-icon
@@ -268,17 +278,42 @@
       and the rail's worker rows carry a quiet role word (subagent via `AgentRowViewModel.RoleLabel`);
       layout preset = the Settings **General** page's Layout picker (formerly a File-menu → Layout
       submenu), Flight Deck default / Conversation Deck, persisted like Theme via
-      `UserPreferences.WorkspaceLayout`; The Loom retired), `QueueRailView` (the mock merge-queue rail),
+      `UserPreferences.WorkspaceLayout`; The Loom retired). **Panel sizing (2026-08-06):** the surface
+      grid was `ColumnDefinitions="Auto,*,8,300"` — a LITERAL 8px gap where a splitter belonged and a
+      hard-coded 300px queue — so a wider window only fed the terminal and the boundary had nothing to
+      grab. The queue column is proportional now (`3*` / `*`, `MinWidth` 320 / 280, `MaxWidth` 640) with
+      a real `GridSplitter` between them, and the telemetry card's fixed `Height="240"` became a second
+      (row) splitter. Both carry the local `GridSplitter.PanelSeam` style: `BorderHairline` at rest,
+      `AccentBrush` on pointer-over / pressed / focus, `Focusable` for arrow-key resizing. The row
+      splitter rewrites its `Auto` row to a pixel length on first drag, which would leave a hole when
+      Conversation Deck hides telemetry — `ControlCenterView.axaml.cs` parks that height on hide and
+      restores it on show (its only job). No width persistence: none of the shell's other splitters
+      persist either. `QueueRailView` (the mock merge-queue rail; its rows now put the state word in an
+      `Auto` column so a 32-hex agent id can no longer push it off the edge, trim the name with a
+      full-value tooltip, and **wrap** the branch / SHA identifiers — horizontal scrolling is explicitly
+      `Disabled` there because enabling it measures at infinite width and silently defeats that wrap.
+      It also carries the entry-**lifecycle** actions, which is the rail the shipped Control Center
+      actually hosts: a `Button.DangerQuiet` **Discard** on every non-terminal row — the reported defect
+      was an entry left by a stopped agent with no control on it at all, so this is per-row rather than
+      on the front one — behind a two-step confirm whose question states that the entry will not be
+      merged and the branch is left alone, plus a `Button.Secondary` "Clear stalled run" shown only when
+      the daemon reports no run behind a `Verifying` state. The rail's ONE accent stays the Review CTA:
+      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
-      Merge/Override, gate reason line), `CoordinatorPanelView` (conversation + plan-approval card —
+      Merge/Override, gate reason line; **harness-only** — constructed solely by
+      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (conversation + plan-approval card —
       **retained for a possible future surface but no longer rendered**; since 2026-07-22 the coordinator
       is driven from its inline terminal, not this bespoke GUI), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47
       #7)** built from the live `GetMergeDiff` RPC; **no rule logic in the axaml/code-behind** — invariant
-      1), `AgentDocumentView` (terminal tail + plan tree + health strip + flagged-gate review section +
-      composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table), `ResourceMonitorView` (the
+      1; its diff readout is the one pane on this surface that scrolls HORIZONTALLY — diff lines are
+      source, so wrapping them would break column alignment and the old clip simply hid the rest),
+      `AgentDocumentView` (terminal tail + plan tree + health strip + flagged-gate review section +
+      composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table; its trimmed Detail column
+      carries a full-value tooltip — a blocked host you cannot read is a blocked host you cannot act on),
+      `ResourceMonitorView` (the
       Resources **tab** — task-manager style: totals header + CPU history decomposing into one live row
       per agent (CPU/RAM/spend/state/task, stable order so an open context menu never gets yanked),
       right-click Pause/Resume + End task with a C-pattern confirmation; **P2-47 #4 adds the editable
@@ -353,8 +388,8 @@
   Settings window: owns `Pages` (`ObservableCollection<SettingsPageRowViewModel>`) +
   `ActivePageContent` (`object?`) + `ActivatePage(pageId, focusHost)`, mirroring
   `MainWindowViewModel.RailSections`/`ActivateSection`; builds all ~10 pages (General / Keyboard
-  Shortcuts / Accounts / SSH Keys / Git Profiles / AI Providers\[Pro] / Agent CLIs\[Pro] / Mainguard
-  OS\[Pro] / Daemon Logs\[Pro] / About)), `SettingsPageRowViewModel` (a
+  Shortcuts / Accounts / SSH Keys / Git Profiles / AI Providers\[Pro] / Agent CLIs\[Pro] /
+  Toolchains\[Pro] / Mainguard OS\[Pro] / Daemon Logs\[Pro] / About)), `SettingsPageRowViewModel` (a
   `RailSectionViewModel`-shrunk-down analog for one Settings-sidebar row:
   id/label/icon/`IsActive`/`ActivateCommand` + a lazily-built, cached Content — the cache is dropped
   by `SettingsViewModel` whenever the page's ViewModel is also `IDisposable`, so a disposed
@@ -509,8 +544,21 @@
     `IsFrozen`/`KillSwitchLabel`/`ToggleKillSwitchCommand`, re-raising the two derived readouts when the
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
-    Lane-E prototype rail projection over the mock `IMergeQueueService`: state words, `CanMerge` gate
-    line, the one Review accent on the front-most fresh Verified entry),
+    rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
+    actually hosts**: state words, `CanMerge` gate line, the one Review accent on the front-most fresh
+    Verified entry, and the per-row **`VerifyCommand`** — the human verification trigger. The command is
+    deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
+    (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
+    daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
+    `CanVerify` withholds the button while a run is in flight and on the terminal states. Beside it, the
+    **entry-lifecycle** commands `BeginDiscard`/`CancelDiscard`/`ConfirmDiscard` (two-step) +
+    `ClearStalledVerification`, each an equally thin drive of a daemon RPC through `MergeActionRunner`.
+    The class can neither remove a row nor invent an outcome — a local "remove from list" would clear
+    the rail until the next `StreamQueue` snapshot silently refilled it. `IsVerificationStalled` comes
+    from the daemon's `QueueEntry.VerificationInFlight`, never inferred from `Verifying`, which is wrong
+    for exactly the frozen entries the action exists for; `CanDiscard` hides the action on terminal
+    entries (the daemon refuses them anyway). The `IMergeQueueService` argument is **required** for both
+    reasons at once: an optional seam lets a caller build a row whose buttons silently do nothing),
     `MergeQueueViewModel`/`MergeQueueRowViewModel` (P2-10: the rail bound to the **real** `MergeQueue`
     state machine — subscribes to its `Changed` event, per-row state word + `main@sha` label +
     `CanMerge`-gated Merge button with the reason as tooltip + the loud stale-override behind a confirm;
@@ -575,7 +623,39 @@
     Cancel works, and a catalog-read failure explains itself instead of throwing; now the Settings
     **Agent CLIs** page — the old repo actions menu → **Agent CLIs…** entry and
     `RepoDashboardViewModel.ManageAgentClisAsync` are gone, and `AgentCliSettingsViewModel` implements
-    `ISettingsPage` (`OnActivated` kicks `RefreshAsync`)), `VmUpgradeOfferViewModel` (the tier-2 upgrade
+    `ISettingsPage` (`OnActivated` kicks `RefreshAsync`); Install/Update/Revert are parent commands
+    whose `CanExecute` reads ROW state, so the VM watches `Clis` + each row's `PropertyChanged` and
+    re-publishes `NotifyCanExecuteChanged()` — `[NotifyCanExecuteChangedFor]` on `IsBusy` alone left
+    the buttons visible-but-dead (`Headless/RowCommandEnablementTests`); add a row property to
+    `RowCommandInputs` whenever a new row-reading `CanExecute` lands),
+    `ToolchainRowViewModel`/`ToolchainSettingsViewModel` (Settings **Toolchains** — the human half of
+    the user-managed toolchain channel (`Mainguard.Agents.Agents.Toolchains.ToolchainChannel`): a
+    repository may name a toolchain `id` and nothing else, and whether that id is actually on this
+    machine is decided here. `RefreshAsync` re-reads the curated manifest and RE-PROBES each toolchain
+    inside the VM (a toolchain that runs at the WRONG version is reported as not installed, with the
+    mismatch spelled out on the row), `InstallAsync(row)` installs ONE at its pinned, checksum-verified
+    version and `RemoveAsync(row)` removes it — both serialized (`IsBusy`) and failure-isolated to the
+    row, which carries the typed `ToolchainChannelException` message as its actionable cause; Remove
+    asks for no confirmation but ALWAYS re-probes afterwards (re-attaching a failure's cause to the
+    rebuilt row) so the list can never misreport a half-removal. Same row→command
+    `CanExecuteChanged` bridge as the Agent CLIs page (`_watched` + `RowCommandInputs` =
+    `CanInstall`/`CanRemove`), and the same two-constructor (live channel / design rows) shape),
+    `ToolchainDeclarationViewModel` (Settings **Toolchains** → the per-repository half: declaring
+    `.mainguard/toolchain` as **four discrete buttons the user presses one at a time** — Write file →
+    Stage & commit → Push → Install. **No step ever does another's work**: writing touches the working
+    tree and stages nothing, committing stages that ONE path and never pushes. That is not a style
+    preference — an action that quietly does more than its label says is the failure this shape exists
+    to prevent, and the first implementation staged inside step 1 *while its own status message said
+    nothing had been staged* (`WriteFile_ShouldWriteTheWorkingTreeOnly_AndStageNothing`). Each command
+    is enabled **iff** its `…DisabledReason` is empty (`CanWriteFile`/`CanCommit`/`CanPush`/`CanInstall`),
+    so a button cannot be disabled without a stated reason — the #302 pattern, made structurally
+    impossible rather than remembered. Never stashes, never checks out, never pushes as a side effect:
+    a dirty tree or a non-default branch is REFUSED with the reason, naming both branches. The default
+    branch is resolved dynamically via `RepoToolchainConfig.DefaultBranch` (`symbolic-ref`, `main`
+    fallback) — neither name is hardcoded anywhere, because the owner's repo is `master`. `RefreshAsync`
+    re-MEASURES the repository through one `IGitService.ExecuteWithRepo` after every step, so a change
+    made outside the app is visible on the next pass and no precondition is ever inferred),
+    `VmUpgradeOfferViewModel` (the tier-2 upgrade
     offer/progress VM: starts in the consent state (`IsOffering`), `UpgradeCommand` runs the injected
     `IVmUpgradeOrchestrator` off the UI thread and advances the `VmUpgradePlan`-seeded
     `BootstrapStageViewModel` checklist from the orchestrator's `IProgress<string>` lines (a line
@@ -753,7 +833,28 @@
     stored vault without erasing files the harvest didn't return; `DaemonBackedOrchestrator` restores
     the vault on `StartCoordinatorAsync` (`SpawnAgent.cli_credentials`) and persists `StopAgent`'s
     harvested files back through its injectable `keystoreSave` seam — secrets live ONLY in the host OS
-    keychain, never agent-side. `VmExitGuard.cs` — the pure full-exit-warning decision
+    keychain, never agent-side. **The harvest half is now DRIVEN**: `Start()` runs a `LoginHarvestPump`
+    that calls `PersistLiveAgentLoginsAsync` every `loginHarvestInterval` (default 1 min, injectable for
+    tests), and `Dispose()` runs one FINAL sweep on its own bounded token before `_cts` is cancelled.
+    Before this, `PersistLiveAgentLoginsAsync` had no callers anywhere in the repo, so only an explicit
+    in-app Stop ever wrote a `cli_login_*` entry — app close, a daemon/VM restart or a crash lost the
+    login and the user re-authenticated inside the jail every session. Pinned by
+    `CliLoginHarvestWiringTests` (the caller) and `CliLoginRoundTripDockerTests` (the round-trip).
+    `CliSettingsStore.cs` — the same round-trip for a CLI's **settings**, and deliberately a DIFFERENT
+    store: one plain JSON file per `(repo handle, adapter id)` under
+    `<data root>/cli-settings/`, not a keyring entry. Logins stay keychain-only because they are
+    credentials; settings are configuration the owner should be able to read, audit and delete, and the
+    scope is **per repository** because a permission allowlist is a standing grant of execution —
+    approving a command in one repo must not pre-approve it in another. `Load`/`Save` are total (a
+    corrupt or missing file ⇒ empty ⇒ the CLI asks again, never a failed spawn), `Save` merges rather
+    than replaces (a file one session did not rewrite must not erase a working allowlist), a blank scope
+    is never a wildcard, and scope segments that are not filename-safe are HASHED rather than sanitised
+    so two repos can never collapse onto one directory. `DaemonBackedOrchestrator` loads it on
+    `StartCoordinatorAsync` (`SpawnAgent.cli_settings`) and `PersistHarvestedSettings` files every
+    harvest under the outcome's OWN `RepoHandle` — the sweep walks every agent on the daemon, so filing
+    by "whichever repo is open" is exactly how one repo's allowlist would land under another's name.
+    See [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
+    `VmExitGuard.cs` — the pure full-exit-warning decision
     (`ShouldConfirm(stopVmOnExit, liveAgents)`) + dialog copy: a VM-stopping full exit under live agents
     confirms first; `App.RequestFullExitGuardedAsync` is the guarded path every user-facing exit takes
     (tray Exit, File → Exit, the X with close-to-tray off — `MainWindow.OnClosing` reroutes that X
@@ -763,7 +864,14 @@
     (both the review cockpit and the agent document invoke the merge fire-and-forget, so every refusal
     used to vanish into an unobserved task and the button read as "nothing happened"): awaits
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
-    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller.
+    (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
+    now the one place for the entry-lifecycle actions too (`DiscardAsync`,
+    `ClearStalledVerificationAsync`), which need the same contract for a sharper reason: the daemon
+    answers a REFUSED discard with an ordinary successful RPC carrying `discarded=false`, so "no
+    exception" is not evidence anything was removed. `DaemonBackedOrchestrator.DiscardEntryAsync` turns
+    that into a throw and this turns the throw into a warning; the success line says *dropped from the
+    merge queue* and that the branch and its commits are untouched, because a queue entry vanishing is
+    otherwise ambiguous with one that merged.
     `DaemonBackedOrchestrator.ConfirmMergeAsync` is the RT-D1 conversation itself (P2-10 §3.7):
     `BeginMerge` (the daemon's lease + `CanMerge` under it) → **the real Windows-side
     `git merge --ff-only` on the user's own checkout, via `IJournaledMergeExecutor`** → `ConfirmMerge`
@@ -771,6 +879,15 @@
     was simply absent, so pressing Merge recorded a merge (and the cached PRE-merge sha) that git had
     never performed. `SetActiveRepo(handle, localRepoPath, syncRemoteName)` carries the rest of the
     `ProvisionRepo` answer, because a handle alone can observe the queue but cannot merge.
+    `DaemonBackedOrchestrator.RunVerificationAsync` is the **verification trigger's production caller** —
+    the rung that did not exist, which is why `DaemonClient.RunVerificationAsync` was defined and never
+    invoked and every queue entry stayed at `not verified yet`. It resolves the active repo handle and
+    makes ONE RPC: no policy, no state machine, no local projection mutation. All of that belongs to the
+    daemon's `MergeQueue.RunVerificationAsync`, which runs the test command in the *agent's own jail* and
+    republishes the new state on the queue stream. A gRPC `FailedPrecondition` (no live jail / no
+    configured test command / missing toolchain) is returned as `VerificationOutcome(Ran: false)` with the
+    daemon's reason verbatim, kept distinct from a suite that genuinely failed (`Ran: true, Passed: false`);
+    the call carries a 30-minute deadline because a first run may build the toolchain image.
     `FlaggedChangeSource.cs` — `IFlaggedChangeSource` + `DaemonFlaggedChangeSource` +
     `FlaggedAckOutcome`: the seam a review surface reads its must-acknowledge items from (the daemon's
     `QueueEntry.FlaggedItems` projection) and routes per-item acknowledgments through (the daemon's
@@ -832,9 +949,9 @@
   `Mainguard.App.Shell`. Holds every Pro-only `Views/` + `ViewModels/` (Control Center / Coordinator /
   Resources / agent rail / telemetry / queue rail / merge queue / review cockpit / agent workspace +
   document / terminal / OOBE wizard / bootstrap / vibe mode / startup + shutdown windows / CLI-OAuth
-  ToS + VM-upgrade offer), the four Pro-only Settings pages (`AgentCliSettingsView`,
-  `ApiKeySettingsView`, `DaemonLogsView` — all three `UserControl`s implementing `Mainguard.UI`'s
-  `ISettingsPage`, embedded by the shell's `SettingsViewModel` — and
+  ToS + VM-upgrade offer), the five Pro-only Settings pages (`AgentCliSettingsView`,
+  `ApiKeySettingsView`, `DaemonLogsView`, `ToolchainSettingsView`, `ToolchainDeclarationView` — all `UserControl`s
+  implementing `Mainguard.UI`'s `ISettingsPage`, embedded by the shell's `SettingsViewModel` — and
   `MainguardOsPageView`/`MainguardOsPageViewModel`, the settings-page host of the old
   `AddReposToOsView`/`AddReposToOsViewModel` add-more-repos engine that also folds in the standalone
   "Rebuild sandbox images" Tools action as `RebuildSandboxImagesCommand`), the Pro-only terminal

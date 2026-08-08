@@ -34,6 +34,11 @@ public sealed class TestPortAllocationTests
     {
         LocalDev = true,
         TokenPath = TestDaemonHost.TempTokenPath("mg-portalloc"),
+        // These tests count LEASES, so the daemon under test must want exactly one port. MG-4 turned the
+        // model gateway on by default, which makes TestDaemonHost lease a second port per attempt; that
+        // is correct behaviour and would silently invalidate every count below. Pinned off here so the
+        // allocator's own arithmetic stays the only variable.
+        GatewayBindAddress = null,
     };
 
     private static int PortOf(TcpListener listener) => ((IPEndPoint)listener.LocalEndpoint).Port;

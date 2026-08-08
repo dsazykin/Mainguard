@@ -11,7 +11,15 @@
     `MAINGUARDOS_VERSION` stamp, "" when absent), versions only, no paths (G-14) — a daemon that
     predates the RPC answers `Unimplemented`, which the client treats as the skew signal itself;
     `AgentEvent` is snapshot-then-deltas; `SpawnAgentRequest.model_api_key` is `// SECRET`; PR3 adds
-    `SpawnAgentRequest.role`/`AgentInfo.role` — "", "coordinator", or "managed"), `terminal.proto`
+    `SpawnAgentRequest.role`/`AgentInfo.role` — "", "coordinator", or "managed"; the CLI **login**
+    round-trip's `CliCredentialFile{path,content}` (`// SECRET`) on
+    `SpawnAgentRequest`/`StopAgentResponse`/`HarvestAgentCredentialsResponse`; and the CLI **settings**
+    round-trip's `CliSettingsFile{root,path,content}` on the same three, where `root` is `"home"` or
+    `"workspace"` (a CLI keeps user- and project-level config in two trees, both wiped every spawn, and
+    the workspace one holds "don't ask again" grants) — NOT secrets and not keychain-backed: the durable
+    copy is a per-repo JSON file. Those responses also carry `repo_handle` (the same opaque handle the
+    client supplied on spawn), because settings are stored per repository and the client's harvest sweep
+    walks every agent on the daemon), `terminal.proto`
     (`TerminalService.Attach` bidi; output frame `oneof { bytes raw; GridUpdate grid; }` **from day
     one** — so P2-18 was not a proto break. P2-18 fleshed the grid contract out: `AttachOptions` — the
     grid-capable attach handshake (`agent_id` alone stays the raw path, flag mismatches degrade safely);
@@ -37,7 +45,16 @@
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate), `orchestrator.proto` (P2-14: `PlanApprovalService`
+    unmergeable branch rather than a gate; **`DiscardEntry`/`ClearStalledVerification`** are the human
+    entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
+    takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
+    untouched) and, like `ApprovePlanRequest`, carries **no actor field** — the discarding identity is
+    daemon-derived, because an attribution the client fills in is one any token-holder can forge; both
+    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.verification_in_flight`**
+    says whether a run is really executing, which the state alone cannot: state is persisted per
+    transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
+    with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
+    entries that need unsticking), `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`

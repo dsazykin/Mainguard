@@ -35,8 +35,14 @@ public static class SandboxCliLaunch
     /// The fixed in-container launcher script (argv-safe: the CLI command arrives as "$@").
     /// Kept single-quoted-safe: the text contains no single quotes and no interpolation.
     /// </summary>
+    /// <remarks>The credential path is <see cref="CredTmpfsSpec.DefaultCredentialPath"/> spelled
+    /// through the constant, not copied: it moved into the agent uid's OWN tmpfs directory when the
+    /// impossible in-jail chown was removed, and a second hand-written copy of the path is exactly how
+    /// a wrapper ends up sourcing a file that no longer exists — silently, since the guard is
+    /// <c>[ -r … ]</c>.</remarks>
     public const string WrapperScript =
-        "if [ -r /run/secrets/agent.env ]; then set -a; . /run/secrets/agent.env; set +a; fi; "
+        "if [ -r " + CredTmpfsSpec.DefaultCredentialPath + " ]; then set -a; . "
+        + CredTmpfsSpec.DefaultCredentialPath + "; set +a; fi; "
         + "if [ -d " + Ipc.AgentIpcPaths.SandboxMount + " ]; then PATH=\"" + Ipc.AgentIpcPaths.SandboxMount + ":$PATH\"; export PATH; fi; "
         + "exec \"$@\"";
 

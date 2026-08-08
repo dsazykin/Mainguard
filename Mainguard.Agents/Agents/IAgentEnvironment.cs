@@ -77,6 +77,23 @@ public interface IAgentEnvironment
     /// </summary>
     PackageCacheManager? PackageCaches => null;
 
+    /// <summary>
+    /// The user-managed toolchain channel (<see cref="Toolchains.ToolchainChannel"/>): the curated,
+    /// pinned toolchains a HUMAN has installed into this environment, which reach every jail as a
+    /// read-only bind mount rather than as an image layer.
+    ///
+    /// <para>Defaulted to <c>null</c> for the same reason <see cref="ToolchainImages"/> is — a substrate
+    /// with no VM to install into has none — and the spawn path treats <c>null</c> as "nothing is
+    /// installed", which is honest rather than optimistic: a repository declaring a runtime-mount
+    /// toolchain on such a substrate gets a typed refusal naming what is missing, never a jail without
+    /// it.</para>
+    /// </summary>
+    Toolchains.ToolchainChannel? Toolchains => null;
+
+    /// <summary>The VM directory holding installed toolchains, bind-mounted READ-ONLY into every jail.
+    /// Null when this substrate has none.</summary>
+    string? ToolchainsRootPath => Toolchains is null ? null : Agents.Toolchains.ToolchainPaths.VmRoot;
+
     /// <summary>Resolve the ONE host-side sync remote for a provisioned repo (name + opaque URL handle).</summary>
     SyncRemote ResolveSyncRemote(string repoHash);
 }

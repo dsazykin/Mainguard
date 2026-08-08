@@ -24,7 +24,11 @@
                           Foreground="{DynamicResource WarningBrush}" IsVisible="{Binding IsWarning}"/>
                 <TextBlock Text="{Binding KindWord}" FontSize="11" Foreground="{DynamicResource TextPrimary}"/>
               </StackPanel>
-              <TextBlock Grid.Column="3" Classes="Mono" Text="{Binding Detail}" FontSize="11" Foreground="{DynamicResource TextMuted}" TextTrimming="CharacterEllipsis"/>
+              <!-- Detail is a host / URL and stays on one line so the fact table keeps its columns; the
+                   tooltip is what makes the trim non-destructive (a blocked host you cannot read in full
+                   is a blocked host you cannot act on). -->
+              <TextBlock Grid.Column="3" Classes="Mono" Text="{Binding Detail}" FontSize="11" Foreground="{DynamicResource TextMuted}"
+                         TextTrimming="CharacterEllipsis" ToolTip.Tip="{Binding Detail}"/>
               <TextBlock Grid.Column="4" Classes="Mono" Text="{Binding Process}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
             </Grid>
           </DataTemplate>

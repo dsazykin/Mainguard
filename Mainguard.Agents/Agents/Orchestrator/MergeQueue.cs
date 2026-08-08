@@ -122,6 +122,12 @@ public sealed class InMemoryMergeQueueStore : IMergeQueueStore
                 existing.UpdatedUtc = row.UpdatedUtc;
                 existing.VerifiedAtUtc = row.VerifiedAtUtc;
                 existing.Origin = row.Origin;
+                // Kept in step with DbMergeQueueStore.Save: the in-memory store is what every test and the
+                // pre-persistence path reads back, so a field it silently drops is a field whose
+                // persistence is never actually exercised.
+                existing.DiscardedBy = row.DiscardedBy;
+                existing.DiscardedAtUtc = row.DiscardedAtUtc;
+                existing.DiscardReason = row.DiscardReason;
                 row.Id = existing.Id;
             }
         }
@@ -145,8 +151,42 @@ public sealed class InMemoryMergeQueueStore : IMergeQueueStore
         UpdatedUtc = r.UpdatedUtc,
         VerifiedAtUtc = r.VerifiedAtUtc,
         Origin = r.Origin,
+        DiscardedBy = r.DiscardedBy,
+        DiscardedAtUtc = r.DiscardedAtUtc,
+        DiscardReason = r.DiscardReason,
     };
 }
+
+/// <summary>
+/// The record a <see cref="WorkerMergeState.Discarded"/> entry leaves behind: who dropped it, when, and
+/// why. Persisted on the entry's own row, so it survives a daemon restart even though the audit sink is
+/// in-memory today.
+/// </summary>
+/// <param name="By">Daemon-derived actor (see <c>MergeQueueRow.DiscardedBy</c> for what it does and does
+/// not prove).</param>
+/// <param name="At">When the discard was recorded.</param>
+/// <param name="Reason">The human's verbatim reason; empty when they gave none.</param>
+/// <param name="FromState">The state the entry was in when it was discarded — the fact that says whether
+/// verified work was thrown away or an idle entry was tidied up. <b>Null on a record rehydrated from the
+/// store after a daemon restart:</b> the row persists where the entry ENDED, not where it came from, and
+/// the audit event is where that fact lives. Null means "not known here", never a state.</param>
+public sealed record QueueEntryDiscard(
+    string By, DateTimeOffset At, string Reason, WorkerMergeState? FromState);
+
+/// <summary>
+/// What one <see cref="MergeQueue.ResumeAfterRestartAsync"/> pass did with the entries a daemon restart
+/// left frozen at <c>Verifying</c>. The two lists are the two honest answers, and they are separate
+/// because they are not the same fact about the branch.
+/// </summary>
+/// <param name="ReRun">Entries whose jail is still up, so the interrupted verification was re-executed in
+/// it. Each of these reached a real terminal (<c>Verified</c>, or <c>Working</c> on a failure) driven by a
+/// daemon-observed container exit — i.e. an actual re-drive.</param>
+/// <param name="Stranded">Entries whose jail is <b>gone</b>. These were returned to <c>Working</c> without
+/// pretending to verify anything: with no sandbox there is nothing to run the test command in (§3.2 — host
+/// execution is a rejection trigger), so "re-drive it" is not available and claiming otherwise would be the
+/// same lie in a different state. They need a jail before they can verify again.</param>
+public sealed record RestartResumeReport(
+    IReadOnlyList<string> ReRun, IReadOnlyList<string> Stranded);
 
 /// <summary>
 /// The concrete P2-10 merge queue: an exhaustive, persisted state machine over one repo's agent
@@ -158,18 +198,29 @@ public sealed class InMemoryMergeQueueStore : IMergeQueueStore
 public sealed class MergeQueue : IMergeQueue
 {
     // Legal transitions (contract §3.1). Anything not listed throws. "Working" is reachable from every
-    // non-terminal state (new commits from the agent invalidate). Merged/Rejected are terminal.
+    // non-terminal state (new commits from the agent invalidate). Merged/Rejected/Discarded are terminal.
+    //
+    // Discarded is reachable from EVERY non-terminal state, and that breadth is the point: the entries this
+    // exists for are stranded at Working (their agent was stopped and nothing ever removed the entry) or
+    // frozen at Verifying (the daemon restarted mid-run before ResumeAfterRestartAsync could re-drive it),
+    // and an action that only worked from AwaitingReview — where Rejected already lives — would not reach a
+    // single one of them.
     private static readonly IReadOnlyDictionary<WorkerMergeState, WorkerMergeState[]> Legal =
         new Dictionary<WorkerMergeState, WorkerMergeState[]>
         {
-            [WorkerMergeState.Working] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working },
-            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.Working, WorkerMergeState.Verifying },
-            [WorkerMergeState.Verified] = new[] { WorkerMergeState.StaleVerified, WorkerMergeState.AwaitingReview, WorkerMergeState.Working },
-            [WorkerMergeState.StaleVerified] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working },
-            [WorkerMergeState.AwaitingReview] = new[] { WorkerMergeState.Merged, WorkerMergeState.Rejected, WorkerMergeState.StaleVerified, WorkerMergeState.Working },
+            [WorkerMergeState.Working] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
+            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.Working, WorkerMergeState.Verifying, WorkerMergeState.Discarded },
+            [WorkerMergeState.Verified] = new[] { WorkerMergeState.StaleVerified, WorkerMergeState.AwaitingReview, WorkerMergeState.Working, WorkerMergeState.Discarded },
+            [WorkerMergeState.StaleVerified] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
+            [WorkerMergeState.AwaitingReview] = new[] { WorkerMergeState.Merged, WorkerMergeState.Rejected, WorkerMergeState.StaleVerified, WorkerMergeState.Working, WorkerMergeState.Discarded },
             [WorkerMergeState.Merged] = Array.Empty<WorkerMergeState>(),
             [WorkerMergeState.Rejected] = Array.Empty<WorkerMergeState>(),
+            [WorkerMergeState.Discarded] = Array.Empty<WorkerMergeState>(),
         };
+
+    /// <summary>The states nothing leaves — a discard is refused from all of them, in both directions.</summary>
+    private static bool IsTerminal(WorkerMergeState state) =>
+        state is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded;
 
     private readonly object _gate = new();
     private readonly string _repoHash;
@@ -185,14 +236,38 @@ public sealed class MergeQueue : IMergeQueue
     private readonly Dictionary<string, VerificationRecord?> _lastVerification = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset?> _verifiedAt = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MergeEntryOrigin> _origins = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, QueueEntryDiscard> _discards = new(StringComparer.Ordinal);
     private readonly HashSet<string> _verifying = new(StringComparer.Ordinal);
     private string _currentMainSha;
+
+    /// <summary>Audit event a human discard appends (the durable half is the entry's own persisted row).</summary>
+    public const string DiscardedEvent = "queue_entry_discarded";
+
+    /// <summary>Audit event appended when a human clears a <c>Verifying</c> state with no run behind it.</summary>
+    public const string StalledVerificationClearedEvent = "stalled_verification_cleared";
+
+    /// <summary>
+    /// Audit event appended for every entry the restart resume acted on, carrying an <c>outcome</c> field of
+    /// <c>rerun</c> or <c>stranded</c>. Deliberately NOT
+    /// <see cref="StalledVerificationClearedEvent"/>: that event records a human deciding, and its
+    /// <c>by</c> field is a person. This one records the daemon reconciling itself after a restart, and
+    /// conflating the two would put an actor's name on something nobody did.
+    /// </summary>
+    public const string RestartResumeEvent = "verification_restart_resume";
 
     /// <summary>When true the kill switch has frozen the queue (P2-14): no merge, loudly.</summary>
     public bool IsFrozen { get; set; }
 
     /// <summary>The most recent stale-cascade re-queue work (tests await it; production ignores it).</summary>
     public Task LastCascade { get; private set; } = Task.CompletedTask;
+
+    /// <summary>
+    /// The most recent <see cref="BeginResumeAfterRestart"/> pass — same posture as
+    /// <see cref="LastCascade"/>: tests await it, production fires and forgets. A completed no-op pass
+    /// until something starts one, so a caller can always await it.
+    /// </summary>
+    public Task<RestartResumeReport> LastResume { get; private set; } =
+        Task.FromResult(new RestartResumeReport(Array.Empty<string>(), Array.Empty<string>()));
 
     /// <summary>Raised (off any lock) after any state change so the gRPC stream / UI can re-read.</summary>
     public event Action? Changed;
@@ -210,10 +285,38 @@ public sealed class MergeQueue : IMergeQueue
     /// </summary>
     public void NotifyGateChanged() => Changed?.Invoke();
 
-    /// <summary>Every agent this queue currently tracks (for stream snapshots).</summary>
+    /// <summary>
+    /// Every agent this queue currently tracks (for stream snapshots).
+    ///
+    /// <para>A <see cref="WorkerMergeState.Discarded"/> entry is deliberately NOT here. Discarding is the
+    /// human saying "take this off my queue", and an entry that stays on the rail wearing a Discarded chip
+    /// has not been taken off anything — the complaint this action answers is a queue that accumulates
+    /// entries forever. Nothing is erased by the omission: the row survives in the daemon DB carrying the
+    /// state, the actor, the timestamp and the reason (<see cref="GetDiscard"/>), <see cref="GetState"/>
+    /// still answers <c>Discarded</c>, an audit event was appended, and <see cref="EnsureEntry"/> cannot
+    /// resurrect the id. It leaves the LIVE queue, not the record.</para>
+    /// </summary>
     public IReadOnlyList<string> Agents
     {
-        get { lock (_gate) return _states.Keys.ToList(); }
+        get
+        {
+            lock (_gate)
+            {
+                return _states.Where(kv => kv.Value != WorkerMergeState.Discarded).Select(kv => kv.Key).ToList();
+            }
+        }
+    }
+
+    /// <summary>Every agent this queue holds a discard record for (the record the rail no longer shows).</summary>
+    public IReadOnlyList<string> DiscardedAgents
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _states.Where(kv => kv.Value == WorkerMergeState.Discarded).Select(kv => kv.Key).ToList();
+            }
+        }
     }
 
     /// <param name="repoHash">The repo this queue governs.</param>
@@ -276,8 +379,22 @@ public sealed class MergeQueue : IMergeQueue
                 throw new InvalidOperationException($"A verification for '{agentId}' is already in flight.");
             }
 
-            // Transition into Verifying (legal from Working / StaleVerified / Verifying-resume).
-            SetStateLocked(agentId, WorkerMergeState.Verifying);
+            try
+            {
+                // Transition into Verifying (legal from Working / StaleVerified / Verifying-resume).
+                SetStateLocked(agentId, WorkerMergeState.Verifying);
+            }
+            catch
+            {
+                // The entry went terminal (a human discard) between the caller deciding to verify and this
+                // lock, so the transition is illegal and this call is over. Undo the in-flight mark on the
+                // way out: leaving it would make IsVerificationInFlight answer TRUE forever for an entry
+                // with no run — which is the same "the row says an activity that is not happening" defect
+                // the restart resume exists to end, and nothing ever clears it because every exit path that
+                // removes an id from _verifying is downstream of this throw.
+                _verifying.Remove(agentId);
+                throw;
+            }
         }
 
         VerificationRecord record;
@@ -294,7 +411,7 @@ public sealed class MergeQueue : IMergeQueue
             {
                 _verifying.Remove(agentId);
                 // A failed run surfaces the branch back to Working (not silently retried — edge row 2).
-                SetStateLocked(agentId, WorkerMergeState.Working);
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
             }
             Changed?.Invoke();
             throw;
@@ -307,12 +424,12 @@ public sealed class MergeQueue : IMergeQueue
             if (record.Passed)
             {
                 _verifiedAt[agentId] = record.When;
-                SetStateLocked(agentId, WorkerMergeState.Verified, verifiedAt: record.When);
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.Verified, verifiedAt: record.When);
             }
             else
             {
                 // Failure surfaced, not silently retried (edge row 2).
-                SetStateLocked(agentId, WorkerMergeState.Working);
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
             }
         }
 
@@ -470,10 +587,15 @@ public sealed class MergeQueue : IMergeQueue
     {
         lock (_gate)
         {
-            var current = GetStateLocked(agentId);
-            if (current is WorkerMergeState.Merged or WorkerMergeState.Rejected)
+            // Terminal — a new branch/agent id would be a fresh row. Asked through IsTerminal rather than
+            // by listing the states: this guard named Merged and Rejected explicitly, so adding Discarded
+            // to the enum silently turned "the human dropped this entry, then its branch moved" into an
+            // illegal Discarded → Working transition. That throws out of ExternalPrIntake's per-PR poll,
+            // which swallows it and never reaches SetSeenHead — so the same head is re-fetched and the
+            // same exception is thrown on every poll, forever.
+            if (IsTerminal(GetStateLocked(agentId)))
             {
-                return; // terminal — a new branch/agent id would be a fresh row.
+                return;
             }
 
             _lastVerification[agentId] = null;
@@ -482,6 +604,172 @@ public sealed class MergeQueue : IMergeQueue
         }
 
         Changed?.Invoke();
+    }
+
+    // ---- Human entry lifecycle (NOT on IMergeQueue — see the note in TryDiscard) ----
+
+    /// <summary>The discard record for an entry, or null when it was never discarded.</summary>
+    public QueueEntryDiscard? GetDiscard(string agentId)
+    {
+        lock (_gate)
+        {
+            return _discards.TryGetValue(agentId, out var d) ? d : null;
+        }
+    }
+
+    /// <summary>
+    /// Whether a verification run is ACTUALLY executing for this entry right now.
+    ///
+    /// <para>This is the fact that separates a branch being verified from a branch whose row merely SAYS
+    /// <c>Verifying</c>. The two are indistinguishable from the state alone, and they come apart routinely:
+    /// the state is persisted per transition while the in-flight set is in-memory, so a daemon that
+    /// restarts mid-run rehydrates <c>Verifying</c> with nothing behind it. Left alone, the entry reports
+    /// "verifying" forever, to a human, about a run that does not exist.</para>
+    ///
+    /// <para><see cref="ResumeAfterRestartAsync"/> now closes that window — <see cref="MergeQueueProvisioner"/>
+    /// starts a pass the moment it rebuilds a repo's queue — so a restart-frozen row is transient rather
+    /// than permanent. This predicate stays exactly as load-bearing: it is what the resume itself measures
+    /// to skip live runs, what <c>CanMerge</c> words its refusal from, and what
+    /// <see cref="TryClearStalledVerification"/> refuses on.</para>
+    /// </summary>
+    public bool IsVerificationInFlight(string agentId)
+    {
+        lock (_gate)
+        {
+            return _verifying.Contains(agentId);
+        }
+    }
+
+    /// <summary>
+    /// The human drops an entry from the queue: a terminal <see cref="WorkerMergeState.Discarded"/>
+    /// transition carrying who, when and why.
+    ///
+    /// <para><b>Not on <see cref="IMergeQueue"/>, for the same reason <see cref="ConfirmHumanMerge"/> is
+    /// not.</b> That interface is the surface the orchestration machinery holds, and an agent-reachable
+    /// discard is a way to erase evidence — a branch that flagged an unacknowledged executable-config
+    /// change could simply delete its own queue entry and the flag with it. The daemon denies the
+    /// coordinator role the discard RPC at the interceptor, and keeping the method off the shared
+    /// interface means nothing inside the orchestrator can reach it either.</para>
+    ///
+    /// <para><b>It is not a merge, and cannot be mistaken for one.</b> No lease is taken or confirmed, no
+    /// <c>NotifyMainMoved</c> cascade fires, no T-19 journal entry is written, no
+    /// <see cref="MergeOutcome"/> exists, and the persisted state string is <c>Discarded</c> — a distinct
+    /// enum member from <see cref="WorkerMergeState.Merged"/> that no projection maps onto it.</para>
+    /// </summary>
+    /// <param name="agentId">The entry to drop.</param>
+    /// <param name="discardedBy">Daemon-derived actor. Never a client-supplied identity (SA-1/F2).</param>
+    /// <param name="reason">The human's verbatim reason; may be empty.</param>
+    /// <param name="refusal">Render-verbatim reason when this returns false.</param>
+    /// <returns>True when the entry moved to <see cref="WorkerMergeState.Discarded"/>.</returns>
+    public bool TryDiscard(string agentId, string discardedBy, string reason, out string refusal)
+    {
+        QueueEntryDiscard record;
+        WorkerMergeState from;
+        lock (_gate)
+        {
+            // An unknown id must NOT be discardable. SetStateLocked would happily invent the entry
+            // (GetStateLocked defaults every unknown agent to Working), so a typo'd or replayed id would
+            // manufacture a Discarded row for a branch this queue never tracked.
+            if (!_states.TryGetValue(agentId, out from))
+            {
+                refusal = "this entry is not in the merge queue";
+                return false;
+            }
+
+            if (IsTerminal(from))
+            {
+                refusal = from == WorkerMergeState.Discarded
+                    ? "this entry was already discarded"
+                    : $"this entry is already {from} — a terminal entry cannot be discarded";
+                return false;
+            }
+
+            record = new QueueEntryDiscard(
+                string.IsNullOrWhiteSpace(discardedBy) ? "unknown" : discardedBy,
+                _clock(),
+                reason ?? string.Empty,
+                from);
+            _discards[agentId] = record;
+
+            // The transition persists the row — state AND the discard record — in one Save.
+            SetStateLocked(agentId, WorkerMergeState.Discarded);
+
+            // A run that was in flight is no longer this entry's business. RunVerificationAsync's
+            // completion path checks for a terminal state before transitioning, so the run finishing
+            // afterwards cannot walk a discarded entry back to Verified.
+            _verifying.Remove(agentId);
+        }
+
+        _audit.Append(new AuditEvent(DiscardedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["by"] = record.By,
+            ["reason"] = record.Reason,
+            ["from_state"] = from.ToString(),
+            ["when"] = record.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        Changed?.Invoke();
+        refusal = "";
+        return true;
+    }
+
+    /// <summary>
+    /// Clears a <c>Verifying</c> state that has no run behind it, returning the entry to <c>Working</c> so
+    /// it can be verified again.
+    ///
+    /// <para>This means exactly one thing and refuses in every other case: if a verification really is
+    /// executing (<see cref="IsVerificationInFlight"/>) the call is refused, because the honest answer is
+    /// "wait", and because walking a live run's entry to <c>Working</c> would make its own completion an
+    /// illegal <c>Working → Verified</c> transition. That refusal now also covers a resume's own re-run:
+    /// <see cref="ResumeAfterRestartAsync"/> goes through <see cref="RunVerificationAsync"/>, so its runs
+    /// are in-flight like any other and a human clicking Clear during one is told to wait.</para>
+    ///
+    /// <para><b>Still the escape hatch, deliberately.</b> The restart resume handles the case it can
+    /// establish — a run interrupted by a restart — and nothing else. A queue whose repo never comes back up
+    /// (so its queue is never rebuilt and no resume ever runs), a probe that could not reach the container
+    /// runtime, an entry a future path freezes some other way: those still need a human to be able to say
+    /// "there is no run behind this". Removing this on the strength of the resume would trade a stuck entry
+    /// with a button for a stuck entry without one.</para>
+    /// </summary>
+    /// <returns>True when the entry moved back to <see cref="WorkerMergeState.Working"/>.</returns>
+    public bool TryClearStalledVerification(string agentId, string clearedBy, out string refusal)
+    {
+        lock (_gate)
+        {
+            if (!_states.TryGetValue(agentId, out var from))
+            {
+                refusal = "this entry is not in the merge queue";
+                return false;
+            }
+
+            if (from != WorkerMergeState.Verifying)
+            {
+                refusal = $"this entry is {from}, not stuck verifying — there is nothing to clear";
+                return false;
+            }
+
+            if (_verifying.Contains(agentId))
+            {
+                refusal = "a verification is running for this entry right now — wait for it to finish";
+                return false;
+            }
+
+            SetStateLocked(agentId, WorkerMergeState.Working);
+        }
+
+        _audit.Append(new AuditEvent(StalledVerificationClearedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["by"] = string.IsNullOrWhiteSpace(clearedBy) ? "unknown" : clearedBy,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        Changed?.Invoke();
+        refusal = "";
+        return true;
     }
 
     // ---- P2-12 external-PR intake (entry origin + cancel) ----------------
@@ -537,6 +825,7 @@ public sealed class MergeQueue : IMergeQueue
         {
             removed = _states.Remove(agentId);
             _origins.Remove(agentId);
+            _discards.Remove(agentId);
             _lastVerification.Remove(agentId);
             _verifiedAt.Remove(agentId);
             _verifying.Remove(agentId);
@@ -571,29 +860,176 @@ public sealed class MergeQueue : IMergeQueue
     // ---- Restart resume --------------------------------------------------
 
     /// <summary>
-    /// Resumes any interrupted <c>Verifying</c> run after a daemon restart (edge row 4 — never stuck).
-    /// Each interrupted run is re-executed; the terminal state is always reached.
+    /// Starts a <see cref="ResumeAfterRestartAsync"/> pass in the background and publishes it on
+    /// <see cref="LastResume"/>.
+    ///
+    /// <para><b>Background, not inline, and that is load-bearing.</b> The daemon's only caller
+    /// (<see cref="MergeQueueProvisioner.EnsureQueue"/>) runs inside a gRPC handler, and a resume does two
+    /// slow things per entry: it asks the container runtime whether the jail is up, and — when it is — it
+    /// runs the repo's whole test suite in that jail. Doing that inline would hang <c>ProvisionRepo</c> (and
+    /// every spawn) for the length of a test run, which is how a fix for a stuck queue becomes a stuck
+    /// daemon.</para>
     /// </summary>
-    public async Task ResumeAfterRestartAsync(CancellationToken ct = default)
+    /// <param name="hasLiveJail">agentId → does this entry still have a running sandbox. See
+    /// <see cref="ResumeAfterRestartAsync"/> for why the answer decides the arm.</param>
+    /// <param name="log">Optional milestone sink; one line per entry acted on.</param>
+    /// <param name="ct">Cancels the pass between entries.</param>
+    public Task<RestartResumeReport> BeginResumeAfterRestart(
+        Func<string, bool> hasLiveJail, Action<string>? log = null, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(hasLiveJail);
+        return LastResume = Task.Run(
+            () => ResumeAfterRestartAsync(hasLiveJail, log, ct), CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Re-drives every <c>Verifying</c> entry this queue hydrated with no run behind it — the shape a
+    /// daemon killed mid-verification leaves, because the state is persisted per transition while the
+    /// in-flight set (<see cref="IsVerificationInFlight"/>) is memory. Without this the entry reports
+    /// "verifying" forever, to a human, about a run that does not exist (edge row 4 — never stuck).
+    ///
+    /// <para><b>Two arms, because there are two different branches here and one answer cannot be honest
+    /// about both.</b></para>
+    /// <list type="bullet">
+    ///   <item><b>The jail is still up</b> — jails are persistent by design and survive the daemon, so this
+    ///   is the common case. The verification is genuinely re-executed in it and reaches a real terminal
+    ///   decided by the container-runtime exit. This is the actual re-drive.</item>
+    ///   <item><b>The jail is gone</b> — then this entry <i>cannot</i> verify: verification runs in the
+    ///   worker's own sandbox and host execution is a rejection trigger (§3.2). Calling
+    ///   <see cref="RunVerificationAsync"/> anyway would transition Verifying → Verifying, publish that to
+    ///   every observer, fail on the no-jail refusal and settle to <c>Working</c> — the same destination by
+    ///   way of a state flap and a "verification failed" shaped event for a verification that never ran. So
+    ///   the entry is moved straight to <c>Working</c> and the reason is recorded, which is what the row
+    ///   already meant and what a fresh jail can act on. Restoring a jail for it is the human's
+    ///   <c>Clear stalled run</c> escape hatch's neighbour, not this method's job.</item>
+    /// </list>
+    ///
+    /// <para>Entries with a run actually in flight are skipped, so this is safe on a live queue as well as a
+    /// freshly hydrated one — and it can never collide with <see cref="RunVerificationAsync"/>'s
+    /// already-in-flight guard.</para>
+    /// </summary>
+    /// <param name="hasLiveJail">agentId → does this entry still have a running sandbox. An exception from
+    /// the probe counts as "no jail": the daemon's own resolver already answers null for an unreachable
+    /// container runtime, and the safe reading of "we could not establish that a jail exists" is the one
+    /// that does not then claim to be verifying in it.</param>
+    /// <param name="log">Optional milestone sink; one line per entry acted on.</param>
+    /// <param name="ct">Cancels the pass between entries.</param>
+    public async Task<RestartResumeReport> ResumeAfterRestartAsync(
+        Func<string, bool> hasLiveJail, Action<string>? log = null, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(hasLiveJail);
+
         List<string> interrupted;
         lock (_gate)
         {
-            interrupted = _states.Where(kv => kv.Value == WorkerMergeState.Verifying).Select(kv => kv.Key).ToList();
+            interrupted = _states
+                .Where(kv => kv.Value == WorkerMergeState.Verifying && !_verifying.Contains(kv.Key))
+                .Select(kv => kv.Key)
+                .ToList();
         }
+
+        var reRun = new List<string>();
+        var stranded = new List<string>();
 
         foreach (var agentId in interrupted)
         {
+            ct.ThrowIfCancellationRequested();
+
+            if (!ProbeJail(hasLiveJail, agentId))
+            {
+                if (StrandInterrupted(agentId))
+                {
+                    stranded.Add(agentId);
+                    log?.Invoke(
+                        $"restart resume repo={_repoHash} agent={agentId} — the verification interrupted by "
+                        + "the restart cannot be re-run (its jail is gone); returned to Working");
+                }
+
+                continue;
+            }
+
+            // The probe blocks on the container runtime (up to ten seconds in the daemon), which is ample
+            // room for a human to discard the entry or the intake to cancel it. Re-read before committing
+            // to a run: without this the entry is reported as re-run and RunVerificationAsync throws an
+            // illegal-transition exception into the swallow below, so the report would name a run that
+            // never happened. Still a check-then-act — RunVerificationAsync takes the lock itself — which
+            // is why that method also undoes its in-flight mark when the transition is refused.
+            if (!StillInterrupted(agentId))
+            {
+                continue;
+            }
+
+            reRun.Add(agentId);
+            log?.Invoke(
+                $"restart resume repo={_repoHash} agent={agentId} — re-running the verification the "
+                + "restart interrupted, in the agent's own jail");
+            Audit(agentId, "rerun");
+
             try
             {
                 await RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {
                 // RunVerificationAsync already surfaced the branch back to Working on failure.
             }
         }
+
+        return new RestartResumeReport(reRun, stranded);
     }
+
+    private static bool ProbeJail(Func<string, bool> hasLiveJail, string agentId)
+    {
+        try
+        {
+            return hasLiveJail(agentId);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+    }
+
+    // Is this entry still the thing the pass measured — a Verifying row with no run behind it?
+    private bool StillInterrupted(string agentId)
+    {
+        lock (_gate)
+        {
+            return GetStateLocked(agentId) == WorkerMergeState.Verifying && !_verifying.Contains(agentId);
+        }
+    }
+
+    // Moves an interrupted entry off Verifying, re-reading the state under the lock: the probe ran outside
+    // it, and a human discard (or the intake's Cancel) landing in that window has decided already.
+    private bool StrandInterrupted(string agentId)
+    {
+        lock (_gate)
+        {
+            if (GetStateLocked(agentId) != WorkerMergeState.Verifying || _verifying.Contains(agentId))
+            {
+                return false;
+            }
+
+            SetStateLocked(agentId, WorkerMergeState.Working);
+        }
+
+        Audit(agentId, "stranded");
+        Changed?.Invoke();
+        return true;
+    }
+
+    private void Audit(string agentId, string outcome) =>
+        _audit.Append(new AuditEvent(RestartResumeEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["outcome"] = outcome,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
 
     // ---- Internals -------------------------------------------------------
 
@@ -627,11 +1063,23 @@ public sealed class MergeQueue : IMergeQueue
         var state = GetStateLocked(agentId);
         if (state is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview))
         {
-            reason = state == WorkerMergeState.StaleVerified
-                ? "verification is stale — re-verifying"
-                : state == WorkerMergeState.Verifying
+            reason = state switch
+            {
+                WorkerMergeState.StaleVerified => "verification is stale — re-verifying",
+                // "verifying" is only true while something is actually running. Saying it about a row
+                // that merely persists Verifying — the shape a daemon restart leaves behind — reports an
+                // activity to the human that no longer exists, and it is the reason those entries read as
+                // permanently busy instead of as needing a hand.
+                WorkerMergeState.Verifying => _verifying.Contains(agentId)
                     ? "verifying"
-                    : "not verified yet";
+                    : "verification stalled — no run in progress",
+                // Terminal states get their own words. They used to fall into "not verified yet", which is
+                // a statement about a branch that might still get there.
+                WorkerMergeState.Merged => "already merged",
+                WorkerMergeState.Rejected => "rejected in review",
+                WorkerMergeState.Discarded => "discarded — this entry was dropped from the queue",
+                _ => "not verified yet",
+            };
             return false;
         }
 
@@ -665,6 +1113,24 @@ public sealed class MergeQueue : IMergeQueue
     private WorkerMergeState GetStateLocked(string agentId) =>
         _states.TryGetValue(agentId, out var s) ? s : WorkerMergeState.Working;
 
+    /// <summary>
+    /// Applies a finished verification's outcome, unless the entry became terminal while the run was in
+    /// flight. A human who discards an entry mid-verification has decided; the run that was already
+    /// executing must not walk it back out of <c>Discarded</c> — which the state machine would refuse
+    /// anyway, by throwing an <see cref="InvalidMergeStateTransitionException"/> out of a background
+    /// completion where nobody is waiting to catch it.
+    /// </summary>
+    private void SettleAfterVerificationLocked(
+        string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null)
+    {
+        if (IsTerminal(GetStateLocked(agentId)))
+        {
+            return;
+        }
+
+        SetStateLocked(agentId, target, verifiedAt);
+    }
+
     private void SetStateLocked(string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null)
     {
         var from = GetStateLocked(agentId);
@@ -695,6 +1161,15 @@ public sealed class MergeQueue : IMergeQueue
                 ?? (_verifiedAt.TryGetValue(agentId, out var t) ? t?.UtcDateTime : null),
             Origin = (_origins.TryGetValue(agentId, out var o) ? o : MergeEntryOrigin.Local).ToString(),
         };
+
+        // The discard record rides the SAME row write as the Discarded transition, so there is no window
+        // in which the store holds a discarded entry with no record of who discarded it.
+        if (_discards.TryGetValue(agentId, out var discard))
+        {
+            row.DiscardedBy = discard.By;
+            row.DiscardedAtUtc = discard.At.UtcDateTime;
+            row.DiscardReason = discard.Reason;
+        }
         // The transition and its persistence are one transaction (Save == one SQLite SaveChanges).
         _store.Save(row);
     }
@@ -717,6 +1192,20 @@ public sealed class MergeQueue : IMergeQueue
             if (row.VerifiedAtUtc.HasValue)
             {
                 _verifiedAt[row.AgentId] = new DateTimeOffset(row.VerifiedAtUtc.Value, TimeSpan.Zero);
+            }
+
+            // A discarded entry is rehydrated INTO _states even though it never reaches the live queue
+            // again. That is what makes the discard survive a restart as a decision rather than as a
+            // deletion: EnsureEntry only creates an entry for an id _states does not already hold, so the
+            // next spawn/intake carrying this id cannot resurrect it, and GetState still answers Discarded.
+            if (row.DiscardedAtUtc.HasValue)
+            {
+                _discards[row.AgentId] = new QueueEntryDiscard(
+                    row.DiscardedBy ?? "unknown",
+                    new DateTimeOffset(row.DiscardedAtUtc.Value, TimeSpan.Zero),
+                    row.DiscardReason ?? string.Empty,
+                    // Not persisted, so not claimed. See QueueEntryDiscard.FromState.
+                    FromState: null);
             }
 
             var record = _verifications.Latest(_repoHash, row.AgentId);

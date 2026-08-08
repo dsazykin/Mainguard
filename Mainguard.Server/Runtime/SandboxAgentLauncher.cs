@@ -43,10 +43,18 @@ public sealed class SandboxAgentLauncher
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly ILogger _log;
+    private readonly Gateway.AgentGatewayCredentials? _credentials;
+    private readonly Gateway.GatewayConfinementOptions? _gatewayOptions;
 
     public SandboxAgentLauncher(
-        IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null)
+        IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null,
+        Gateway.AgentGatewayCredentials? credentials = null,
+        Gateway.GatewayConfinementOptions? gatewayOptions = null)
     {
+        // Optional so the many direct-construction tests (and the RequiresDocker spawn tests) keep
+        // compiling unchanged; DI supplies both. Absent ⇒ no confinement ⇒ today's behaviour.
+        _credentials = credentials;
+        _gatewayOptions = gatewayOptions;
         _environment = environment ?? throw new ArgumentNullException(nameof(environment));
         // Single source with the provisioner (SandboxImages.AgentBase) so the daemon preflights/spawns
         // exactly the tag the app builds/labels — including a MAINGUARD_AGENT_IMAGE override.
@@ -68,7 +76,9 @@ public sealed class SandboxAgentLauncher
         string repoHandle, string agentId, string agentKind, string? modelApiKey,
         string? ipcDirPath = null, CancellationToken ct = default,
         IReadOnlyDictionary<string, string>? extraEnv = null,
-        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null)
+        IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
+        IProgress<string>? progress = null,
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -147,7 +157,10 @@ public sealed class SandboxAgentLauncher
         // A failure is loud and stops the spawn. The alternative is a jail that quietly lacks the tools
         // the repo's verify command names, whose every verification then fails at exit 127 in a way
         // that reads like the agent's code is broken.
-        var toolchain = await EnsureToolchainAsync(repoHandle, barePath, pinnedImageRef, ct).ConfigureAwait(false);
+        // `progress` is threaded ONLY here. This build is the one step of a launch that runs for
+        // minutes, and it does so inside the spawn RPC with nothing on the wire saying so — which is
+        // why the UI could only conclude "not responding".
+        var toolchain = await EnsureToolchainAsync(repoHandle, barePath, pinnedImageRef, progress, ct).ConfigureAwait(false);
         if (toolchain is not null)
         {
             spawnImageRef = toolchain.ImageRef;
@@ -155,6 +168,13 @@ public sealed class SandboxAgentLauncher
                 "toolchain layer ready: repo={Repo} ids={Ids} image={Image} base={Base}",
                 repoHandle, string.Join(",", toolchain.Ids), toolchain.ImageRef, toolchain.BaseDigest);
         }
+
+        // The runtime-mount half of the same declaration: toolchains a HUMAN installed into this
+        // environment, which reach the jail as a read-only bind mount rather than as an image layer.
+        // Checked HERE, before the container exists, for the same reason the layer is built here — and
+        // refused loudly for the reason stated above, which applies identically to a mount that is not
+        // there.
+        var mountedToolchainIds = await EnsureMountedToolchainsAsync(repoHandle, barePath, ct).ConfigureAwait(false);
 
         // agentKind → the CLI the user dynamically installed. Resolved BEFORE the worktree so an
         // unknown kind costs nothing; the jail still spawns without a launch command (the operator
@@ -198,7 +218,16 @@ public sealed class SandboxAgentLauncher
             _log.LogInformation(
                 "egress segment ready: network={Network} proxy={Proxy}", segment.NetworkName, segment.ProxyAddress);
 
-            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials);
+            // MG-4: mint this agent's gateway confinement — a Mainguard session token for the jail, the
+            // real provider key kept daemon-side, and the agent's UPSTREAM BINDING recorded so the
+            // gateway knows which provider to forward its traffic to. Null when the gateway is disabled,
+            // when the CLI cannot be redirected, or when the proxy cannot reach the gateway — and
+            // BuildSecrets then keeps the pre-gateway behaviour exactly. This argument is what was
+            // missing in #298: without it the confinement machinery below was complete but never
+            // invoked, so every BYOK jail received the raw provider key.
+            var confinement = await TryConfineToGatewayAsync(agentId, modelApiKey, adapter, ct)
+                .ConfigureAwait(false);
+            var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement);
             var handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
                 AgentId: agentId,
@@ -208,8 +237,14 @@ public sealed class SandboxAgentLauncher
                 Secrets: secrets,
                 AgentUid: AgentUid,
                 SupervisorUid: SupervisorUid,
-                // Mount the shared CLI root read-only ONLY when CLIs are actually installed.
-                AdaptersRootPath: _adapters.HasAny() ? AdapterPaths.VmRoot : null,
+                // Mount the shared CLI root read-only ONLY when CLIs are actually installed — and mount
+                // THIS CATALOG'S root, not the fixed VM path. The catalog is injectable while the mount
+                // source was hardcoded, so the two could describe different directories: the daemon
+                // would answer "claude-code is installed" from one location and hand the jail another.
+                // Identical in production (the default catalog's root IS AdapterPaths.VmRoot); the
+                // difference only shows up where they were already inconsistent, as a container-create
+                // failure on a bind source that does not exist.
+                AdaptersRootPath: _adapters.HasAny() ? _adapters.Root : null,
                 // Coordinator-role jails only: the daemon-served spawn-channel dir (read-only mount).
                 IpcDirPath: ipcDirPath,
                 // The shared mirror at its identical VM path so the per-agent repo's alternates pointer
@@ -226,7 +261,20 @@ public sealed class SandboxAgentLauncher
                 ProxyUrl: segment.ProxyUrl(EgressProxyConfigurator.ProxyPort),
                 // MG-43: the daemon-owned package cache for THIS agent, read-write at
                 // /var/cache/mainguard — on ext4, outside the worktree, outside the tmpfs $HOME.
-                PackageCachePath: packageCachePath), ct).ConfigureAwait(false);
+                PackageCachePath: packageCachePath,
+                // The user's saved CLI settings — the approved-command list. Filtered to what THIS
+                // adapter declares, exactly as the credential files are, because the client names the
+                // paths on the wire. An untrusted spawn never reaches here with any (the caller passes
+                // none), so this filter is the second gate, not the only one.
+                CliSettingsFiles: FilterCliSettings(cliSettings, adapter),
+                // The DECLARED workspace settings paths, sent whether or not anything is being restored
+                // into them: /workspace is the tree the agent commits, and on a first-ever session the
+                // CLI creates its own settings file there the moment the user approves something. That
+                // file must never reach the user's history, and that session has no restore payload to
+                // infer the path from.
+                WorkspaceIgnorePaths: DeclaredWorkspaceSettingsPaths(adapter),
+                ToolchainsRootPath: mountedToolchainIds.Count > 0 ? _environment.ToolchainsRootPath : null,
+                ToolchainIds: mountedToolchainIds), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only
@@ -258,10 +306,25 @@ public sealed class SandboxAgentLauncher
     /// convincing-looking failed one.</para>
     /// </summary>
     private async Task<ProvisionedToolchain?> EnsureToolchainAsync(
-        string repoHandle, string barePath, string? baseDigest, CancellationToken ct)
+        string repoHandle, string barePath, string? baseDigest, IProgress<string>? progress, CancellationToken ct)
     {
         var declaration = RepoToolchainConfig.ReadMainBaseline(barePath, repoHandle);
         if (declaration.IsEmpty)
+        {
+            return null;
+        }
+
+        // Only an IMAGE-LAYER toolchain needs a builder. A declaration of nothing but runtime-mount
+        // toolchains (`python-3`) builds no layer at all, so demanding an image builder for it would
+        // refuse a perfectly satisfiable repository — and refuse it with the WRONG REASON, which is
+        // worse: "this substrate cannot build toolchain layers" sends the reader after an image-build
+        // capability that was never required. Found by the spawn test below, which drives a Python-only
+        // repository through a substrate that has no builder.
+        var needsLayer = declaration.Ids
+            .Select(ToolchainCatalog.TryGet)
+            .Any(r => r is { Delivery: ToolchainDelivery.ImageLayer });
+
+        if (!needsLayer)
         {
             return null;
         }
@@ -274,8 +337,104 @@ public sealed class SandboxAgentLauncher
                 + "would start without the tools the repository's verification command needs.");
         }
 
-        return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m))
+        return await new ToolchainProvisioner(builder, m => _log.LogInformation("{Message}", m), progress)
             .EnsureAsync(repoHandle, declaration, baseDigest, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The declared toolchains that are delivered as a read-only mount, checked to be actually installed
+    /// in this environment. Returns the ids the jail should carry; an empty list means the repo declared
+    /// none of them and no toolchain mount is attached.
+    ///
+    /// <para><b>Why this refuses instead of continuing.</b> The failure being prevented is the one the
+    /// owner hit: a repository declares Python, the jail starts without it, and the verify command dies
+    /// with <c>No module named pytest</c> — which reads like the agent wrote a broken test, not like the
+    /// environment is missing a toolchain. Verification is the gate that decides whether work may enter
+    /// the merge queue, so a jail that cannot run the repository's tests must fail as a PROVISIONING
+    /// problem, by name, with the action that fixes it. It must never produce a red verification.</para>
+    ///
+    /// <para>Note what is NOT here: an auto-install. A repository's declaration is not permission to
+    /// install software — it names a toolchain and a human decides whether this environment has it.
+    /// Installing on a repo's say-so would hand a repo-writable file the install-time execution the
+    /// closed catalog exists to deny it.</para>
+    /// </summary>
+    private async Task<IReadOnlyList<string>> EnsureMountedToolchainsAsync(
+        string repoHandle, string barePath, CancellationToken ct)
+    {
+        var declaration = RepoToolchainConfig.ReadMainBaseline(barePath, repoHandle);
+        if (declaration.IsEmpty)
+        {
+            return Array.Empty<string>();
+        }
+
+        var wanted = declaration.Ids
+            .Select(id => ToolchainCatalog.TryGet(id))
+            .Where(r => r is { Delivery: ToolchainDelivery.RuntimeMount })
+            .Select(r => r!.Id)
+            .ToList();
+
+        if (wanted.Count == 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        var channel = _environment.Toolchains;
+        if (channel is null)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this substrate ('{_environment.SubstrateId}') cannot install toolchains, so the jail would "
+                + $"start without {string.Join(" and ", wanted)} — the tools this repository's verification "
+                + "command needs.");
+        }
+
+        var missing = new List<string>();
+        var unknown = new List<string>();
+        foreach (var id in wanted)
+        {
+            var entry = channel.Manifest.TryGet(id);
+            if (entry is null)
+            {
+                missing.Add(id);
+                continue;
+            }
+
+            var status = await channel.StatusAsync(entry, ct).ConfigureAwait(false);
+            if (status.CouldNotCheck)
+            {
+                unknown.Add($"{entry.DisplayName} ({entry.Id}) — {status.Detail}");
+            }
+            else if (!status.IsInstalled)
+            {
+                missing.Add($"{entry.DisplayName} ({entry.Id}) — {status.Detail}");
+            }
+        }
+
+        // Reported FIRST, and as its own failure. "We could not look" is not "it is not there": sending
+        // someone whose environment is unreachable to Settings → Toolchains points them at a button that
+        // will fail the same way, for a reason nothing on screen mentions. A wrong-but-confident
+        // diagnosis is worse than the raw error it replaced.
+        if (unknown.Count > 0)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this repository declares {string.Join(", ", unknown)}. Mainguard could not reach its "
+                + "environment to check, so whether the toolchain is installed is UNKNOWN — this is not a "
+                + "report that it is missing. Check that MainguardEnv is running, then start the agent "
+                + "again. The jail was NOT started.");
+        }
+
+        if (missing.Count > 0)
+        {
+            throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                $"this repository declares {string.Join(", ", missing)}, which is not installed in this "
+                + "Mainguard environment. Install it in Settings → Toolchains and start the agent again. "
+                + "The jail was NOT started: a jail without the toolchain cannot run this repository's "
+                + "tests, and a verification that fails for that reason would look like failing code.");
+        }
+
+        _log.LogInformation(
+            "mounted toolchains ready: repo={Repo} ids={Ids} root={Root}",
+            repoHandle, string.Join(",", wanted), _environment.ToolchainsRootPath);
+        return wanted;
     }
 
     /// <summary>Best-effort teardown of a launched agent: remove the jail, then its MG-36 network
@@ -311,6 +470,67 @@ public sealed class SandboxAgentLauncher
         try { _environment.Worktrees.RemoveAgentWorktree(repoHash, agentId, force: true); }
         catch { /* best effort */ }
     }
+
+    /// <summary>
+    /// Mints the MG-4 gateway confinement for one spawn, or null to leave the spawn exactly as it was.
+    ///
+    /// <para>ALL of the following must hold, and each null return is a deliberate refusal rather than a
+    /// degradation:</para>
+    /// <list type="bullet">
+    ///   <item>the daemon actually bound a gateway (on by default; <c>--gateway-bind off</c> disables)
+    ///   — otherwise the CLI would be pointed at nothing and a working BYOK agent would break;</item>
+    ///   <item>that gateway is REACHABLE from this jail's egress proxy, measured rather than assumed —
+    ///   the jail's segment is <c>Internal</c>, so the proxy is its only route to the daemon;</item>
+    ///   <item>a provider key was supplied — an interactive-login (OAuth) agent has no key to confine,
+    ///   holds no credential worth stealing, and must keep its direct route untouched;</item>
+    ///   <item>the CLI declares BOTH a base-URL variable (it can be redirected) and a model host (we know
+    ///   where to forward) — a CLI missing either cannot be fronted without breaking it.</item>
+    /// </list>
+    /// </summary>
+    private async Task<GatewayConfinement?> TryConfineToGatewayAsync(
+        string agentId, string? modelApiKey, InstalledAdapterMarker? adapter, CancellationToken ct)
+    {
+        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        {
+            return null;
+        }
+
+        if (string.IsNullOrWhiteSpace(modelApiKey)
+            || adapter?.BaseUrlEnvVar is not { Length: > 0 }
+            || adapter.ModelHost is not { Length: > 0 } upstreamHost)
+        {
+            return null;
+        }
+
+        // The gateway must be REACHABLE from this jail's egress proxy before we point the CLI at it.
+        // A confined jail has no other route (its segment is Internal), so confining against an
+        // address the proxy cannot dial does not degrade the agent, it breaks it — and the failure is a
+        // proxy error that reads like a provider outage. Refusing here falls back to the exact
+        // behaviour the agent had before the gateway existed, which works. This is what makes it safe
+        // to have the gateway enabled without the operator having verified the address by hand.
+        var endpoint = GatewayEndpointOf(gateway.BaseUrl!);
+        if (!await _environment.Egress.CanProxyReachAsync(endpoint, ct).ConfigureAwait(false))
+        {
+            _log.LogWarning(
+                "gateway confinement SKIPPED: agent={Agent} endpoint={Endpoint} is not reachable from the "
+                + "egress proxy, so the jail keeps its direct provider route (and its own key). MG-4 is "
+                + "not in effect for this agent.",
+                agentId, endpoint);
+            return null;
+        }
+
+        // The one lookup that answers BOTH "who is calling" and "where does it go": the token the jail
+        // receives resolves, gateway-side, to this agent id, its budget, and this upstream host.
+        var token = _credentials.Issue(agentId, modelApiKey, upstreamHost);
+        _log.LogInformation(
+            "gateway confinement issued: agent={Agent} upstream={Upstream} baseUrlVar={Var}",
+            agentId, upstreamHost, adapter.BaseUrlEnvVar);
+        return new GatewayConfinement(gateway.BaseUrl!, token);
+    }
+
+    /// <summary>The <c>host:port</c> inside a gateway base URL — the shape the egress probe wants.</summary>
+    internal static string GatewayEndpointOf(string baseUrl) =>
+        Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri) ? $"{uri.Host}:{uri.Port}" : baseUrl;
 
     /// <summary>
     /// The credential env-file entries (P2-01), written to the agent-owned 0400 tmpfs — never
@@ -393,6 +613,128 @@ public sealed class SandboxAgentLauncher
             .Where(f => f.Content is { Length: > 0 } && allowed.Contains(f.HomeRelativePath))
             .ToArray();
         return kept.Length > 0 ? kept : null;
+    }
+
+    /// <summary>
+    /// The ONLY settings files that reach the jail: client-supplied entries whose (root, path) pair
+    /// exactly matches one the installed adapter DECLARES (its marker's <c>settingsPaths</c>) and
+    /// passes the relative-path shape gate. Same reasoning as
+    /// <see cref="FilterCliCredentials"/> — the client names paths on the wire — but the stakes are
+    /// different in kind: these files carry a PERMISSION ALLOWLIST, so an unfiltered path would let a
+    /// compromised client plant a pre-approved-command file anywhere in the agent's home or checkout.
+    /// No marker / no declared settings paths ⇒ nothing is restored.
+    /// </summary>
+    internal static IReadOnlyList<SandboxSettingsFile>? FilterCliSettings(
+        IReadOnlyList<SandboxSettingsFile>? supplied, InstalledAdapterMarker? adapter)
+    {
+        if (supplied is not { Count: > 0 } || adapter?.SettingsPaths is not { Count: > 0 } declared)
+        {
+            return null;
+        }
+
+        var allowed = new HashSet<(AdapterSettingsRoot Root, string Path)>(
+            declared.Where(d => d is not null && d.IsWellFormed()).Select(d => (d.ParsedRoot, d.Path)));
+        var kept = supplied
+            .Where(f => f.Content is { Length: > 0 }
+                        && f.Content.Length <= AdapterSettingsPolicy.MaxFileBytes
+                        && allowed.Contains((f.Root, f.RelativePath)))
+            .ToArray();
+        return kept.Length > 0 ? kept : null;
+    }
+
+    /// <summary>
+    /// The WORKSPACE-rooted settings paths this adapter declares — the files the jail must keep out of
+    /// the agent's commits. Derived from the marker rather than from whatever is being restored,
+    /// because the session that most needs the ignore is the FIRST one, which restores nothing and
+    /// whose CLI writes the file itself. Empty when the adapter declares no workspace settings.
+    /// </summary>
+    internal static IReadOnlyList<string> DeclaredWorkspaceSettingsPaths(InstalledAdapterMarker? adapter) =>
+        adapter?.SettingsPaths is not { Count: > 0 } declared
+            ? Array.Empty<string>()
+            : declared
+                .Where(d => d is not null && d.IsWellFormed() && d.ParsedRoot == AdapterSettingsRoot.Workspace)
+                .Select(d => d.Path)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+
+    /// <summary>
+    /// Harvests the CLI's SETTINGS files (the installed adapter's declared <c>settingsPaths</c>) out of
+    /// the jail, so the approvals a user gave in this session survive into the next agent.
+    ///
+    /// <para><b>This is the direction that can escalate, and the caller — not this method — decides
+    /// whether it may run.</b> The files are agent-writable by construction (the CLI has to be able to
+    /// record a new approval), so what comes back is "whatever is in the file", not "what a human
+    /// approved". <see cref="AgentSpawnService"/> therefore calls this only for a human-attended,
+    /// trusted session; see the design note for the full argument.</para>
+    ///
+    /// <para>Mechanically the twin of <see cref="HarvestCliCredentialsAsync"/>: base64 over the exec
+    /// pipe, a missing file skipped, any exec failure yielding an empty result — harvesting must never
+    /// block a stop. Files over <see cref="AdapterSettingsPolicy.MaxFileBytes"/> are refused rather
+    /// than truncated: a settings file is kilobytes, and the ceiling bounds what a jail's occupant can
+    /// push into a host-side store that later jails read.</para>
+    /// </summary>
+    public async Task<IReadOnlyList<SandboxSettingsFile>> HarvestCliSettingsAsync(
+        string containerId, string agentKind, CancellationToken ct = default)
+    {
+        var declared = _adapters.TryGet(agentKind)?.SettingsPaths;
+        if (declared is not { Count: > 0 })
+        {
+            return Array.Empty<SandboxSettingsFile>();
+        }
+
+        var harvested = new List<SandboxSettingsFile>();
+        foreach (var entry in declared)
+        {
+            if (entry is null || !entry.IsWellFormed())
+            {
+                continue;
+            }
+
+            var root = entry.ParsedRoot;
+            try
+            {
+                // Runs as the container's default user — the agent uid. Path is positional ("$1"),
+                // never interpolated into script text. The size check happens in the shell so an
+                // oversized file is never read into the daemon's memory at all.
+                var result = await _environment.Sandboxes.ExecAsync(containerId, new[]
+                {
+                    "sh", "-c",
+                    "[ -f \"$1\" ] || exit 1\n"
+                    + "[ \"$(wc -c < \"$1\" | tr -d ' ')\" -le \"$2\" ] || exit 2\n"
+                    + "base64 \"$1\"\n",
+                    "sh",
+                    DockerSandboxEngine.SettingsRootPath(root) + "/" + entry.Path,
+                    AdapterSettingsPolicy.MaxFileBytes.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                }, ct).ConfigureAwait(false);
+
+                if (result.ExitCode == 2)
+                {
+                    _log.LogWarning(
+                        "cli settings harvest refused (over {Max} bytes): kind={Kind} root={Root} path={Path}",
+                        AdapterSettingsPolicy.MaxFileBytes, agentKind, AdapterSettingsPath.SpellRoot(root), entry.Path);
+                    continue;
+                }
+
+                if (result.ExitCode != 0 || string.IsNullOrWhiteSpace(result.Stdout))
+                {
+                    continue; // no settings written yet — nothing to persist
+                }
+
+                var content = Convert.FromBase64String(
+                    string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
+                if (content.Length is > 0 and <= AdapterSettingsPolicy.MaxFileBytes)
+                {
+                    harvested.Add(new SandboxSettingsFile(root, entry.Path, content));
+                }
+            }
+            catch (Exception ex)
+            {
+                // A dead container / malformed pipe output loses this file's harvest, never the stop.
+                _log.LogWarning(ex, "cli settings harvest failed: kind={Kind} path={Path}", agentKind, entry.Path);
+            }
+        }
+
+        return harvested;
     }
 
     /// <summary>

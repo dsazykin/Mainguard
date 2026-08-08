@@ -17,8 +17,20 @@ public enum AgentLifecycleState
     Merged, Rejected, Dead, TornDown,
 }
 
-/// <summary>Branch merge-eligibility lifecycle — the P2-10 enum verbatim (OPS §4.2).</summary>
-public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected }
+/// <summary>
+/// Branch merge-eligibility lifecycle — the P2-10 enum (OPS §4.2), plus the human's
+/// <see cref="Discarded"/> terminal.
+///
+/// <para><b><see cref="Discarded"/> is deliberately its own member rather than a reuse of
+/// <see cref="Rejected"/>.</b> <c>Rejected</c> means a human read this branch's diff in review and turned
+/// the work down — it is only reachable from <c>AwaitingReview</c> and it is a statement about the code.
+/// <c>Discarded</c> is a statement about the ENTRY: the human dropped it from the queue (its agent is gone,
+/// the work was superseded, it was never going anywhere). Persisting one as the other would make the
+/// queue's own record say something that did not happen, which is the failure this queue exists to
+/// prevent. Neither is <see cref="Merged"/>, and nothing in this enum lets a discard be mistaken for
+/// one.</para>
+/// </summary>
+public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded }
 
 /// <summary>
 /// Where a merge-queue entry came from (P2-12). <see cref="Local"/> is a locally-spawned agent whose
@@ -63,6 +75,11 @@ public sealed record VerificationRecord(string AgentId, string MainSha, bool Pas
 /// <summary>P2-11: one must-acknowledge flagged item; acks bind to the diff hash daemon-side.</summary>
 public sealed record FlaggedItem(string Id, string Path, string Category, string Fact, bool Acknowledged);
 
+/// <param name="VerificationInFlight">Whether a verification run is really executing for this entry, as
+/// opposed to the entry merely being in <see cref="WorkerMergeState.Verifying"/>. Only the daemon can
+/// answer this (its in-flight set is memory; the state is persisted), and the two disagree after any
+/// restart mid-run. Defaults to false so a projection that cannot answer never claims a run is
+/// happening — the direction that matters, since claiming one is what makes an entry look busy forever.</param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -70,7 +87,8 @@ public sealed record QueueEntry(
     WorkerMergeState State,
     string Detail,
     VerificationRecord? Verification,
-    IReadOnlyList<FlaggedItem> FlaggedItems);
+    IReadOnlyList<FlaggedItem> FlaggedItems,
+    bool VerificationInFlight = false);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(
@@ -159,14 +177,30 @@ public sealed record AgentEvent(long Seq, string Type, string AgentId, string Pa
 /// <summary>P2-44: one sandbox telemetry fact (egress denial, secret access attempt, …).</summary>
 public sealed record SandboxEvent(DateTimeOffset At, string AgentId, string Kind, string Detail, string Process);
 
-/// <summary>P2-13 activity-bar resource sample (VM CPU/RAM + gateway token spend).</summary>
-public sealed record ResourceSample(DateTimeOffset At, double CpuPercent, double RamGb, decimal SpendTodayUsd);
+/// <summary>
+/// P2-13 activity-bar resource sample (VM CPU/RAM + gateway token spend).
+///
+/// <para><b>Every reading is nullable, and null means NOT MEASURED — never zero.</b> These were plain
+/// doubles, and the daemon-backed client filled them with literal <c>0</c> because nothing sampled the
+/// containers; the monitor therefore displayed a confident "CPU 0% · RAM 0.0 GB" for a fleet of busy
+/// agents. Making absence representable is what stops that from being expressible again: a formatter
+/// cannot render an unknown as 0 if the unknown never becomes a 0.</para>
+/// </summary>
+/// <param name="SpendTodayUsd">Null when spend is not measurable — see <see cref="AgentResourceUsage.IsMetered"/>.</param>
+public sealed record ResourceSample(DateTimeOffset At, double? CpuPercent, double? RamGb, decimal? SpendTodayUsd);
 
 /// <summary>One agent's live resource row for the task-manager-style monitor (revised 2026-07-11):
-/// per-agent CPU/RAM/spend plus the state word and current task, so totals decompose.</summary>
+/// per-agent CPU/RAM/spend plus the state word and current task, so totals decompose.
+/// Null CPU/RAM/spend mean not measured, never zero (see <see cref="ResourceSample"/>).</summary>
+/// <param name="IsMetered">Whether this agent's model spend is measurable at all: true exactly when the
+/// daemon issued it a gateway confinement token at spawn, so its traffic transits the metering proxy.
+/// False for OAuth sessions (they authenticate past the proxy with a credential Mainguard never issued),
+/// for BYOK CLIs that declare no base-URL/model-host pair (codex, qwen-code, opencode), and when the
+/// gateway is off. When false the UI must show no spend figure rather than <c>$0.00</c>, which would read
+/// as "you have spent nothing". See <c>docs/design/oauth-budgeting.md</c>.</param>
 public sealed record AgentResourceUsage(
     string AgentId, string Name, string StateWord, bool IsPaused,
-    double CpuPercent, double RamGb, decimal SpendUsd, string Task);
+    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false);
 
 /// <summary>P2-13/P2-08 spend caps, UI-facing shape (Core DTO — no proto/UI coupling). The per-agent
 /// and per-day caps the gateway <c>BudgetLedger</c> enforces daemon-side, surfaced so the Resource

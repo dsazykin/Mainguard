@@ -295,9 +295,165 @@ public class MergeQueueStateMachineTests
         queue = new MergeQueue("repo", "sha0", store, ver, run);
 
         Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a")); // resumed the interrupted state
-        await queue.ResumeAfterRestartAsync();
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => true);
 
         Assert.Equal(WorkerMergeState.Verified, queue.GetState("a")); // terminal state reached — not stuck
+        Assert.Equal(new[] { "a" }, report.ReRun);
+        Assert.Empty(report.Stranded);
+    }
+
+    /// <summary>
+    /// The other arm, and the reason the resume takes a jail probe at all. An entry whose sandbox died with
+    /// the daemon <b>cannot</b> verify — verification runs in the worker's own jail (§3.2) — so a resume
+    /// that "re-drove" it would announce Verifying → Verifying to every observer and then fail on the
+    /// no-jail refusal. It is returned to Working instead, with the reason recorded, and it does NOT run.
+    /// </summary>
+    [Fact]
+    public async Task Restart_WhenTheJailIsGone_ReturnsTheEntryToWorking_WithoutClaimingToVerifyInIt()
+    {
+        var store = new InMemoryMergeQueueStore();
+        store.Save(new Mainguard.Git.Models.MergeQueueRow
+        {
+            RepoHash = "repo",
+            AgentId = "a",
+            State = WorkerMergeState.Verifying.ToString(),
+            UpdatedUtc = DateTime.UtcNow,
+        });
+
+        var ran = 0;
+        var audit = new InMemoryAuditLog();
+        var queue = new MergeQueue(
+            "repo", "sha0", store, new InMemoryVerificationStore(),
+            (id, ct) =>
+            {
+                Interlocked.Increment(ref ran);
+                return Task.FromResult(new VerificationRecord(id, "sha0", true, "l", "c", "h", DateTimeOffset.UnixEpoch));
+            },
+            audit: audit);
+
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => false);
+
+        Assert.Equal(0, ran); // nothing was executed — there was nowhere to execute it
+        Assert.Equal(WorkerMergeState.Working, queue.GetState("a"));
+        Assert.Equal("Working", store.LoadAll("repo").Single(r => r.AgentId == "a").State);
+        Assert.Equal(new[] { "a" }, report.Stranded);
+        Assert.Empty(report.ReRun);
+
+        // Recorded as the daemon reconciling itself, not as a human clearing anything.
+        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.RestartResumeEvent);
+        Assert.Equal("stranded", audited.Fields["outcome"]);
+        Assert.Equal("a", audited.Fields["agent"]);
+        Assert.DoesNotContain(audit.Read(), e => e.Type == MergeQueue.StalledVerificationClearedEvent);
+    }
+
+    /// <summary>
+    /// The human wins a race with the resume. The jail probe blocks on the container runtime — ten seconds
+    /// in the daemon — which is ample room for a discard to land, and the resume runs on a background task
+    /// whose exceptions nobody sees.
+    ///
+    /// <para>Two things must hold, and neither did before the guard: the report must not name a run that
+    /// never happened, and <c>IsVerificationInFlight</c> must not be left answering TRUE forever. The
+    /// second is the nastier one — <c>RunVerificationAsync</c> adds to the in-flight set and THEN attempts
+    /// the transition, so an illegal <c>Discarded → Verifying</c> throws with the id already marked, and
+    /// every path that would remove it is downstream of the throw. That is this subsystem's own defect
+    /// shape (a row claiming an activity that is not happening) reintroduced by its fix.</para>
+    /// </summary>
+    [Fact]
+    public async Task Restart_WhenTheEntryIsDiscardedWhileTheJailProbeRuns_DoesNotRunIt_AndLeavesNoPhantomInFlight()
+    {
+        var store = new InMemoryMergeQueueStore();
+        store.Save(new Mainguard.Git.Models.MergeQueueRow
+        {
+            RepoHash = "repo",
+            AgentId = "a",
+            State = WorkerMergeState.Verifying.ToString(),
+            UpdatedUtc = DateTime.UtcNow,
+        });
+
+        var ran = 0;
+        MergeQueue queue = null!;
+        queue = new MergeQueue(
+            "repo", "sha0", store, new InMemoryVerificationStore(),
+            (id, ct) =>
+            {
+                Interlocked.Increment(ref ran);
+                return Task.FromResult(new VerificationRecord(id, "sha0", true, "l", "c", "h", DateTimeOffset.UnixEpoch));
+            });
+
+        // The probe is where the daemon blocks on Docker; the human's discard lands inside it.
+        var report = await queue.ResumeAfterRestartAsync(hasLiveJail: id =>
+        {
+            Assert.True(queue.TryDiscard(id, "uid:1000", "its agent is gone", out var refusal), refusal);
+            return true; // ...and the jail really is up, so this is the arm that would have re-run it.
+        });
+
+        Assert.Equal(0, ran);
+        Assert.Empty(report.ReRun); // not reported as re-driven — nothing was
+        Assert.Empty(report.Stranded);
+
+        // The human's decision stands, and nothing claims to be verifying it.
+        Assert.Equal(WorkerMergeState.Discarded, queue.GetState("a"));
+        Assert.False(queue.IsVerificationInFlight("a"));
+    }
+
+    /// <summary>
+    /// The same leak, asserted directly on <see cref="MergeQueue.RunVerificationAsync"/>, because the guard
+    /// lives there and the resume is only one of its callers (the stale cascade's auto re-queue and the
+    /// Verify RPC reach it too).
+    /// </summary>
+    [Fact]
+    public async Task RunVerification_OnAnEntryThatWentTerminal_ThrowsWithoutLeavingItMarkedInFlight()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+        Assert.True(h.Queue.TryDiscard("a", "uid:1000", "", out var refusal), refusal);
+
+        await Assert.ThrowsAsync<InvalidMergeStateTransitionException>(
+            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
+
+        Assert.False(h.Queue.IsVerificationInFlight("a"));
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("a"));
+    }
+
+    /// <summary>
+    /// A resume must not touch a verification that is genuinely running. The in-flight set is the only
+    /// thing that tells the two apart, and re-entering <c>RunVerificationAsync</c> for a live run would
+    /// throw "already in flight" out of a background task nobody awaits.
+    /// </summary>
+    [Fact]
+    public async Task Restart_SkipsAVerificationThatIsActuallyRunning()
+    {
+        var release = new TaskCompletionSource();
+        var starts = 0;
+        MergeQueue queue = null!;
+        queue = new MergeQueue(
+            "repo", "sha0", new InMemoryMergeQueueStore(), new InMemoryVerificationStore(),
+            async (id, ct) =>
+            {
+                Interlocked.Increment(ref starts);
+                await release.Task;
+                return new VerificationRecord(id, queue.CurrentMainSha, true, "l", "c", "h", DateTimeOffset.UnixEpoch);
+            });
+
+        var inFlight = queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+        Assert.True(queue.IsVerificationInFlight("a"));
+
+        // Both arms must leave it alone: it is neither re-run nor stranded.
+        var live = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => true);
+        var dead = await queue.ResumeAfterRestartAsync(hasLiveJail: _ => false);
+
+        Assert.Empty(live.ReRun);
+        Assert.Empty(live.Stranded);
+        Assert.Empty(dead.ReRun);
+        Assert.Empty(dead.Stranded);
+        Assert.Equal(1, starts);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+
+        release.SetResult();
+        await inFlight;
+        Assert.Equal(WorkerMergeState.Verified, queue.GetState("a"));
     }
 
     // ---- NoAutoMergePathExists (API shape) ------------------------------
@@ -321,6 +477,256 @@ public class MergeQueueStateMachineTests
         queue.NotifyMainMoved("sha1");
         queue.CanMerge("a", out _);
         Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("a"));
+    }
+
+    // ---- Human entry lifecycle: discard + the stalled-verification clear ----
+
+    /// <summary>
+    /// The defect this whole change answers, in its simplest form: an entry left at <c>Working</c> by an
+    /// agent that is gone. It is not verifiable (no jail), not reviewable, not mergeable — and before
+    /// <c>TryDiscard</c> there was no operation of any kind that could act on it, so it sat on the queue
+    /// forever. Discard is legal from <c>Working</c>, and it is terminal.
+    /// </summary>
+    [Fact]
+    public void Discard_FromWorking_IsTerminal_AndUnambiguouslyNotMerged()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("stranded", MergeEntryOrigin.Local);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("stranded"));
+
+        Assert.True(h.Queue.TryDiscard("stranded", "uid:1000", "its agent is gone", out var refusal), refusal);
+
+        // Terminal, and terminal as the thing it actually is.
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("stranded"));
+        Assert.NotEqual(WorkerMergeState.Merged, h.Queue.GetState("stranded"));
+
+        // ...in the STORE too, which is what the daemon rehydrates from and what any later reader trusts.
+        var row = h.StateStore.LoadAll("repo").Single(r => r.AgentId == "stranded");
+        Assert.Equal("Discarded", row.State);
+        Assert.Equal("uid:1000", row.DiscardedBy);
+        Assert.Equal("its agent is gone", row.DiscardReason);
+        Assert.NotNull(row.DiscardedAtUtc);
+
+        // ...and in the gate, whose reason must not read like an entry that might still get there.
+        Assert.False(h.Queue.CanMerge("stranded", out var gate));
+        Assert.Contains("discarded", gate);
+
+        // The audit event is its own type — nothing about this can be read as a merge.
+        var audited = Assert.Single(h.Audit.Read(), e => e.Type == MergeQueue.DiscardedEvent);
+        Assert.Equal("uid:1000", audited.Fields["by"]);
+        Assert.Equal("Working", audited.Fields["from_state"]);
+        Assert.DoesNotContain(h.Audit.Read(), e => e.Type.Contains("merge", StringComparison.OrdinalIgnoreCase));
+
+        // Nothing terminal is reachable from a terminal entry, in either direction.
+        Assert.False(h.Queue.TryDiscard("stranded", "uid:1000", "", out var again));
+        Assert.Contains("already discarded", again);
+        Assert.Throws<InvalidMergeStateTransitionException>(() => h.Queue.RequestReview("stranded"));
+    }
+
+    /// <summary>
+    /// A discarded entry leaves the LIVE queue and stays gone across a daemon restart — while the record of
+    /// it does not. Both halves matter: an entry that reappears on the rail was not removed, and an entry
+    /// that vanishes from the store leaves no evidence of who dropped it.
+    /// </summary>
+    [Fact]
+    public async Task Discard_LeavesTheLiveQueue_AndSurvivesARestartAsARecord()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        await VerifiedAsync(h, "keep");
+        h.Queue.EnsureEntry("drop", MergeEntryOrigin.Local);
+        Assert.Equal(new[] { "drop", "keep" }, h.Queue.Agents.OrderBy(x => x));
+
+        Assert.True(h.Queue.TryDiscard("drop", "uid:1000", "superseded", out _));
+
+        Assert.Equal(new[] { "keep" }, h.Queue.Agents);
+        Assert.Equal(new[] { "drop" }, h.Queue.DiscardedAgents);
+
+        // Restart: a brand-new queue over the SAME store (what MergeQueueProvisioner rebuilds).
+        var restarted = new MergeQueue(
+            "repo", "sha0", h.StateStore, h.VerStore,
+            (id, ct) => Task.FromResult(new VerificationRecord(id, "sha0", true, "log", "cmd", "hash", DateTimeOffset.UnixEpoch)));
+
+        Assert.DoesNotContain("drop", restarted.Agents);
+        Assert.Equal(WorkerMergeState.Discarded, restarted.GetState("drop"));
+        var record = restarted.GetDiscard("drop");
+        Assert.NotNull(record);
+        Assert.Equal("uid:1000", record!.By);
+        Assert.Equal("superseded", record.Reason);
+
+        // And it cannot be resurrected by the ordinary "an agent joined this repo" path.
+        restarted.EnsureEntry("drop", MergeEntryOrigin.Local);
+        Assert.Equal(WorkerMergeState.Discarded, restarted.GetState("drop"));
+        Assert.DoesNotContain("drop", restarted.Agents);
+    }
+
+    /// <summary>
+    /// A discarded entry whose branch then moves must be a no-op, not a throw.
+    ///
+    /// <para><c>NotifyNewCommits</c> guarded terminality by naming <c>Merged</c> and <c>Rejected</c>, so
+    /// adding <c>Discarded</c> to the enum silently turned this into an illegal <c>Discarded → Working</c>
+    /// transition. It is reachable in production: <c>ExternalPrIntake</c> calls <c>NotifyNewCommits</c>
+    /// when an intake'd PR's head moves, swallows the exception per-PR, and therefore never reaches
+    /// <c>SetSeenHead</c> — so the same head is re-fetched and the same exception thrown on every poll,
+    /// forever.</para>
+    /// </summary>
+    [Fact]
+    public void NotifyNewCommits_OnADiscardedEntry_IsANoOp_NotAThrow()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("pr-7", MergeEntryOrigin.External);
+        Assert.True(h.Queue.TryDiscard("pr-7", "uid:1000", "not wanted", out var refusal), refusal);
+
+        h.Queue.NotifyNewCommits("pr-7"); // must not throw
+
+        // ...and the human's decision still stands: a head move does not resurrect a dropped entry.
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("pr-7"));
+        Assert.DoesNotContain("pr-7", h.Queue.Agents);
+    }
+
+    /// <summary>An id the queue never tracked must not be discardable into existence.</summary>
+    [Fact]
+    public void Discard_OfAnUntrackedEntry_IsRefused_AndCreatesNothing()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+
+        Assert.False(h.Queue.TryDiscard("never-seen", "uid:1000", "", out var refusal));
+        Assert.Contains("not in the merge queue", refusal);
+        Assert.Empty(h.StateStore.LoadAll("repo"));
+        Assert.Empty(h.Queue.DiscardedAgents);
+    }
+
+    /// <summary>
+    /// The human's decision beats a run that was already executing. Without the terminal guard in the
+    /// verification completion path, the run finishing would attempt <c>Discarded → Verified</c> and throw
+    /// an illegal-transition exception out of a background continuation nobody awaits.
+    /// </summary>
+    [Fact]
+    public async Task Discard_DuringAVerification_WinsOverTheRunThatFinishesAfterIt()
+    {
+        var release = new TaskCompletionSource();
+        var store = new InMemoryMergeQueueStore();
+        MergeQueue queue = null!;
+        var run = new Func<string, CancellationToken, Task<VerificationRecord>>(async (id, ct) =>
+        {
+            await release.Task;
+            return new VerificationRecord(id, queue.CurrentMainSha, true, "log", "cmd", "hash", DateTimeOffset.UnixEpoch);
+        });
+        queue = new MergeQueue("repo", "sha0", store, new InMemoryVerificationStore(), run);
+
+        var inFlight = queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+        Assert.True(queue.IsVerificationInFlight("a"));
+
+        Assert.True(queue.TryDiscard("a", "uid:1000", "changed my mind", out var refusal), refusal);
+
+        release.SetResult();
+        await inFlight; // must not throw an illegal-transition exception
+
+        Assert.Equal(WorkerMergeState.Discarded, queue.GetState("a"));
+        Assert.Equal("Discarded", store.LoadAll("repo").Single(r => r.AgentId == "a").State);
+    }
+
+    /// <summary>
+    /// The stalled-verification case. A daemon that restarts mid-run rehydrates <c>Verifying</c> with
+    /// nothing executing (the in-flight set is memory; the state is persisted) — so until something
+    /// re-drives it the entry reports "verifying" about a run that does not exist. The clear says so, and
+    /// returns it to Working.
+    ///
+    /// <para><c>MergeQueueProvisioner</c> now starts a <c>ResumeAfterRestartAsync</c> pass whenever it
+    /// rebuilds a repo's queue, so the daemon reaches this shape by itself. This stays the human's escape
+    /// hatch for what a resume cannot establish — a repo whose queue is never rebuilt, or a container
+    /// runtime the probe could not reach — and it is asserted here directly on the queue, with no resume in
+    /// the picture, so the two mechanisms cannot mask each other.</para>
+    /// </summary>
+    [Fact]
+    public void ClearStalledVerification_UnsticksARowWithNoRunBehindIt()
+    {
+        var store = new InMemoryMergeQueueStore();
+        store.Save(new Mainguard.Git.Models.MergeQueueRow
+        {
+            RepoHash = "repo",
+            AgentId = "a",
+            State = WorkerMergeState.Verifying.ToString(),
+            UpdatedUtc = DateTime.UtcNow,
+        });
+
+        var audit = new InMemoryAuditLog();
+        var queue = new MergeQueue(
+            "repo", "sha0", store, new InMemoryVerificationStore(),
+            (id, ct) => Task.FromResult(new VerificationRecord(id, "sha0", true, "l", "c", "h", DateTimeOffset.UnixEpoch)),
+            audit: audit);
+
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+        Assert.False(queue.IsVerificationInFlight("a"));
+
+        // The gate must not claim an activity that is not happening.
+        Assert.False(queue.CanMerge("a", out var reason));
+        Assert.Equal("verification stalled — no run in progress", reason);
+
+        Assert.True(queue.TryClearStalledVerification("a", "uid:1000", out var refusal), refusal);
+        Assert.Equal(WorkerMergeState.Working, queue.GetState("a"));
+        Assert.Equal("Working", store.LoadAll("repo").Single().State);
+        Assert.Contains(audit.Read(), e => e.Type == MergeQueue.StalledVerificationClearedEvent);
+    }
+
+    /// <summary>
+    /// ...and it refuses while a run really is executing. The honest answer there is "wait" — and moving a
+    /// live run's entry to Working would make that run's own completion an illegal Working → Verified.
+    /// </summary>
+    [Fact]
+    public async Task ClearStalledVerification_IsRefusedWhileARunIsActuallyInFlight()
+    {
+        var release = new TaskCompletionSource();
+        MergeQueue queue = null!;
+        var run = new Func<string, CancellationToken, Task<VerificationRecord>>(async (id, ct) =>
+        {
+            await release.Task;
+            return new VerificationRecord(id, queue.CurrentMainSha, true, "log", "cmd", "hash", DateTimeOffset.UnixEpoch);
+        });
+        queue = new MergeQueue("repo", "sha0", new InMemoryMergeQueueStore(), new InMemoryVerificationStore(), run);
+
+        var inFlight = queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.True(queue.IsVerificationInFlight("a"));
+        Assert.True(queue.CanMerge("a", out var busy) is false && busy == "verifying");
+
+        Assert.False(queue.TryClearStalledVerification("a", "uid:1000", out var refusal));
+        Assert.Contains("running for this entry right now", refusal);
+        Assert.Equal(WorkerMergeState.Verifying, queue.GetState("a"));
+
+        release.SetResult();
+        await inFlight;
+        Assert.Equal(WorkerMergeState.Verified, queue.GetState("a"));
+    }
+
+    /// <summary>Wrong state ⇒ refused, and said plainly rather than silently no-op'd.</summary>
+    [Fact]
+    public async Task ClearStalledVerification_OnAnEntryThatIsNotVerifying_IsRefused()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        await VerifiedAsync(h, "a");
+
+        Assert.False(h.Queue.TryClearStalledVerification("a", "uid:1000", out var refusal));
+        Assert.Contains("not stuck verifying", refusal);
+        Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState("a"));
+    }
+
+    /// <summary>
+    /// The lifecycle actions stay OFF <see cref="IMergeQueue"/>, exactly as <c>ConfirmHumanMerge</c> does.
+    /// That interface is what the orchestration machinery holds; an agent-reachable discard would be a way
+    /// for a branch to erase the evidence blocking it rather than clear the gate.
+    /// </summary>
+    [Fact]
+    public void EntryLifecycleActions_AreNotOnIMergeQueue()
+    {
+        var methods = typeof(IMergeQueue).GetMethods().Select(m => m.Name).ToArray();
+        Assert.DoesNotContain("TryDiscard", methods);
+        Assert.DoesNotContain("TryClearStalledVerification", methods);
+        // The full shape is asserted by NoAutoMergePathExists; this is the discard-specific half.
     }
 
     // ---- RT-D2: gamed test command flagged before a silent merge --------

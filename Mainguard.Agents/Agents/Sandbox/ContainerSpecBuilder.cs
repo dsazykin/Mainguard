@@ -47,12 +47,32 @@ public sealed record SandboxLimits(
 }
 
 /// <summary>
-/// The two secret tmpfs files mounted at <c>/run/secrets</c> (P2-07 §3.2 + G2 control 1). Both are
+/// The two secret tmpfs files under <c>/run/secrets</c> (P2-07 §3.2 + G2 control 1). Both are
 /// mode <c>0400</c>; crucially the agent credential file is owned by the <b>agent uid</b> while the
 /// OOB session key <c>K</c> is owned by a <b>dedicated supervisor uid ≠ the agent uid</b> — so the
 /// prompt-injected agent cannot read <c>K</c> from the file (the memory path is closed by the
 /// seccomp denylist + no <c>CAP_SYS_PTRACE</c>). Contents are written after start via an stdin exec,
 /// never through <c>Env</c>/argv/persistent disk.
+///
+/// <para><b>Each secret lives in its OWNER'S OWN directory, and that is load-bearing rather than
+/// tidy.</b> The files used to sit side by side in a single root-owned <c>0711</c> directory, which
+/// meant only root could create them and the writer therefore had to <c>chown</c> each one to its
+/// owner afterwards. That <c>chown</c> could never work: the jail is created with a non-root
+/// <c>User</c> AND <c>no-new-privileges</c>, and Docker gives an exec in such a container an EMPTY
+/// permitted/effective capability set even when the exec asks for uid 0 — so the "root" exec had no
+/// <c>CAP_CHOWN</c> and every secret write died with <c>EPERM</c>. Measured on the shipping engine
+/// (Docker 20.10.24): with <c>--user 1000 --security-opt no-new-privileges</c> an exec as uid 0
+/// reports <c>CapPrm: 0000000000000000</c> against a bounding set of <c>fb</c>; drop EITHER the
+/// non-root user or no-new-privileges and the same exec reports <c>CapPrm: fb</c> and the chown
+/// succeeds. Both of those are non-negotiable controls (G-15, G2), so the CHOWN had to go.</para>
+///
+/// <para>Docker mounts a tmpfs daemon-side, as real root, and honours <c>uid=</c>/<c>gid=</c> — so a
+/// per-owner directory arrives already owned by the right uid and the secret is simply CREATED by
+/// its owner. No capability is required anywhere on the path, which is why it now works with or
+/// without a daemon-level userns remap: the ids are container-relative either way. The posture is
+/// also strictly tighter than the flat layout it replaces — the agent uid can no longer even
+/// <c>stat</c> the supervisor's directory, where before it could traverse to <c>oob.key</c> and was
+/// stopped only by the file's own mode.</para>
 /// </summary>
 public sealed record CredTmpfsSpec(
     string CredentialPath,
@@ -61,14 +81,41 @@ public sealed record CredTmpfsSpec(
     int AgentUid,
     int SupervisorUid)
 {
+    /// <summary>The traversable-but-not-listable parent of both per-owner secret directories. Stays
+    /// root-owned <c>0711</c>: nothing is written here, so nobody needs to write here.</summary>
+    public const string SecretsRoot = "/run/secrets";
+
+    /// <summary>The agent uid's own <c>0700</c> secret directory.</summary>
+    public const string AgentSecretsDir = SecretsRoot + "/agent";
+
+    /// <summary>The supervisor uid's own <c>0700</c> secret directory. The agent uid cannot open it,
+    /// list it, or create anything in it.</summary>
+    public const string SupervisorSecretsDir = SecretsRoot + "/supervisor";
+
     /// <summary>The conventional per-agent credential file (P2-01 injector content).</summary>
-    public const string DefaultCredentialPath = "/run/secrets/agent.env";
+    public const string DefaultCredentialPath = AgentSecretsDir + "/agent.env";
 
     /// <summary>The OOB session-HMAC-key file, owned by the supervisor uid.</summary>
-    public const string DefaultOobKeyPath = "/run/secrets/oob.key";
+    public const string DefaultOobKeyPath = SupervisorSecretsDir + "/oob.key";
 
     /// <summary>Secret files are read-only to their owner and no one else (G-13).</summary>
     public const int SecretMode = 0b100_000_000; // 0400 octal
+
+    /// <summary>The mode every per-owner secret directory is mounted with: the owner may traverse,
+    /// list and create; nobody else has any access at all.</summary>
+    public const string OwnedDirMode = "0700";
+
+    /// <summary>The directory a secret path lives in — the thing that has to be owned by the writer.
+    /// Hand-rolled rather than <c>Path.GetDirectoryName</c>, which yields backslashes when the daemon
+    /// build runs on Windows and would silently stop matching the container-side tmpfs key.</summary>
+    public static string DirectoryOf(string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        var cut = path.LastIndexOf('/');
+        if (cut <= 0)
+            throw new SandboxSpecException($"Secret path '{path}' has no container-absolute parent directory.");
+        return path[..cut];
+    }
 
     /// <summary>
     /// Builds the spec from the two distinct uids, enforcing G2 control 1 (supervisor uid ≠ agent
@@ -138,7 +185,9 @@ public sealed record ContainerSpecRequest(
     string? BareRepoPath = null,
     string? DnsServerAddress = null,
     string? AgentRepoPath = null,
-    string? PackageCachePath = null);
+    string? PackageCachePath = null,
+    string? ToolchainsRootPath = null,
+    IReadOnlyList<string>? ToolchainIds = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -246,6 +295,23 @@ public static class ContainerSpecBuilder
             });
         }
 
+        if (!string.IsNullOrEmpty(request.ToolchainsRootPath))
+        {
+            RejectNonExt4Source(request.ToolchainsRootPath);
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = request.ToolchainsRootPath,
+                Target = Toolchains.ToolchainPaths.SandboxMount,
+                // READ-ONLY, and this is the property that lets one toolchain tree be SHARED by every
+                // jail on the machine. A writable share would let agent A replace the interpreter that
+                // agent B's verification runs under — the merge gate decided by another tenant, which is
+                // the same reasoning that makes package caches per-agent instead. Toolchains may be
+                // shared precisely because nothing in a jail can write them.
+                ReadOnly = true,
+            });
+        }
+
         if (!string.IsNullOrEmpty(request.IpcDirPath))
         {
             RejectNonExt4Source(request.IpcDirPath);
@@ -319,6 +385,8 @@ public static class ContainerSpecBuilder
             env.AddRange(PackageCachePolicy.EnvironmentList());
         }
 
+        env.AddRange(BuildToolchainEnv(request));
+
         var dns = ResolveDnsPinning(request);
 
         var hostConfig = new HostConfig
@@ -377,11 +445,24 @@ public static class ContainerSpecBuilder
                 // under ~/.local or ~/.config (verified: opencode) dies with EACCES on first run.
                 // (Same class as the /run/secrets 0711 note below; unhit until a CLI actually ran.)
                 [AgentHome] = $"size=256m,mode=0700,uid={request.Credentials.AgentUid},gid={request.Credentials.AgentUid}",
-                // 0711 (traverse-only, not listable): each uid can reach the secret file it owns —
-                // the agent MUST be able to read its own 0400 agent.env — while the per-file 0400
-                // ownership still denies the agent uid the supervisor-owned oob.key (G2 control 1).
-                // A 0700-root dir would lock the agent out of its own credentials entirely.
-                ["/run/secrets"] = "size=1m,mode=0711",
+                // 0711 (traverse-only, not listable): each uid can reach its OWN secret directory
+                // below, and nothing is ever created directly here — so this stays root-owned with
+                // no write bit for anyone but root, and no exec ever needs to write it.
+                [CredTmpfsSpec.SecretsRoot] = "size=1m,mode=0711",
+
+                // One tmpfs per secret owner, mounted BY THE DAEMON (real root) already owned by the
+                // uid that will write into it. This is what removes the impossible chown from the
+                // secret-write path — see the CredTmpfsSpec remarks for the measurement. `uid=`/`gid=`
+                // on a tmpfs are interpreted in the container's user namespace, so these are correct
+                // whether or not dockerd is userns-remapped, exactly as $HOME above already relies on.
+                //
+                // The DIRECTORIES are the structural constants while the UIDS come from the request,
+                // and that split is deliberate: AssertSecretDirsOwned below re-derives the directory
+                // from each secret's actual path in the spec, so the mount list and the secret list are
+                // two independent statements that have to agree. Deriving both from the same expression
+                // would make the assertion true by construction and prove nothing.
+                [CredTmpfsSpec.AgentSecretsDir] = OwnedSecretDirOptions(request.Credentials.AgentUid),
+                [CredTmpfsSpec.SupervisorSecretsDir] = OwnedSecretDirOptions(request.Credentials.SupervisorUid),
             },
 
             NetworkMode = request.NetworkName,
@@ -410,6 +491,7 @@ public static class ContainerSpecBuilder
         // Re-assert the G2 per-container controls on the finished request. Dropping any is a typed
         // builder error, not a warning (rejection trigger: shipping fewer than all four G2 controls).
         AssertG2Controls(create, request.Credentials);
+        AssertSecretDirsOwned(create, request.Credentials);
         AssertNoSecretsInEnv(create);
         AssertResourceCeilings(create);
         AssertDnsPinned(create, request);
@@ -514,6 +596,65 @@ public static class ContainerSpecBuilder
         var shortHash = repoHash.Length > 12 ? repoHash[..12] : repoHash;
         var safeAgent = new string(agentId.Select(c => char.IsLetterOrDigit(c) || c is '-' or '_' ? c : '-').ToArray());
         return $"mainguard-{shortHash}-{safeAgent}";
+    }
+
+    /// <summary>
+    /// The <c>PATH</c> the agent base image bakes, verbatim from its final <c>ENV PATH=</c> line.
+    ///
+    /// <para><b>Why this is duplicated here.</b> A runtime-mount toolchain has to go on <c>PATH</c>
+    /// AHEAD of the base image's curated tools — a repository that declares Python must get the pinned
+    /// interpreter, not the incidental <c>/opt/toolchain/bin/python3</c> that has no pip. Docker's
+    /// <c>Env</c> does no shell expansion, so there is no <c>$PATH</c> to prepend to: the value handed to
+    /// <c>CreateContainerAsync</c> must be complete. That makes this constant a copy, and a copy that
+    /// drifts is a jail whose PATH silently loses the adapters mount or the nix profile — so
+    /// <c>ContainerSpecBuilderTests.BaseImagePath_MatchesTheAgentBaseImage</c> reads the Dockerfile and
+    /// fails if the two ever disagree, the same guard the catalog's nixpkgs revision already carries.</para>
+    /// </summary>
+    public const string BaseImagePath =
+        "/opt/mainguard/adapters/bin:/opt/toolchain/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin";
+
+    /// <summary>
+    /// The environment a jail needs in order to USE the toolchains its repository declared: their bin
+    /// directories at the front of <c>PATH</c>, plus whatever each one needs to find itself.
+    ///
+    /// <para>Only <see cref="ToolchainDelivery.RuntimeMount"/> toolchains appear here. An image-layer
+    /// toolchain baked its own <c>ENV PATH</c> and <c>ENV</c> lines into the layer at build time
+    /// (<see cref="ToolchainProvisioner.RenderDockerfile"/>), and setting them again here would override
+    /// the image's own with a value computed from a different source.</para>
+    ///
+    /// <para>An id that is declared but whose toolchain is not installed contributes nothing and is NOT
+    /// an error here — this builder is pure and cannot see the VM's filesystem. The check that the
+    /// toolchain is actually present belongs where it can be observed, and it is made there: by the
+    /// spawn path before the jail is created, and again by the verification path inside the live jail.</para>
+    /// </summary>
+    internal static List<string> BuildToolchainEnv(ContainerSpecRequest request)
+    {
+        var env = new List<string>();
+        if (request.ToolchainIds is not { Count: > 0 } || string.IsNullOrEmpty(request.ToolchainsRootPath))
+        {
+            return env;
+        }
+
+        var recipes = request.ToolchainIds
+            .Select(ToolchainCatalog.TryGet)
+            .Where(r => r is { Delivery: ToolchainDelivery.RuntimeMount })
+            .Select(r => r!)
+            .ToList();
+
+        if (recipes.Count == 0)
+        {
+            return env;
+        }
+
+        var pathEntries = recipes.SelectMany(r => r.PathEntries).ToList();
+        env.Add("PATH=" + string.Join(':', pathEntries) + ":" + BaseImagePath);
+
+        foreach (var (name, value) in recipes.SelectMany(r => r.Environment))
+        {
+            env.Add($"{name}={value}");
+        }
+
+        return env;
     }
 
     private static List<string> BuildProxyEnv(string proxyUrl)
@@ -689,6 +830,68 @@ public static class ContainerSpecBuilder
 
         // Control 2 (ptrace_scope) is VM-wide (P2-05); it MUST NOT appear on the create request.
         AssertNoPtraceScopeSysctl(create);
+    }
+
+    /// <summary>The tmpfs options that make a directory the private property of one container uid.</summary>
+    private static string OwnedSecretDirOptions(int uid)
+    {
+        var id = uid.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        return $"size=1m,mode={CredTmpfsSpec.OwnedDirMode},uid={id},gid={id}";
+    }
+
+    /// <summary>
+    /// Every secret is written into a tmpfs directory ALREADY OWNED by the uid that writes it.
+    ///
+    /// <para>This is the structural half of the fix for the in-jail <c>chown</c> that could never
+    /// succeed. The write path no longer has a fallback: it execs as the owner and does not chown, so
+    /// if a future edit drops one of these mounts, moves a secret into a shared directory, or points
+    /// two owners at the same directory, the write fails at runtime with an <c>EPERM</c> inside a jail
+    /// — the exact failure this whole change exists to remove. Asserting it here turns that into a
+    /// typed builder error before the container is ever created.</para>
+    ///
+    /// <para>Deliberately checks the directory of the ACTUAL path in the spec rather than the
+    /// <see cref="CredTmpfsSpec"/> constants: the record is constructible with custom paths, and a
+    /// check that reads the constants would pass while the container was built from something else.</para>
+    /// </summary>
+    private static void AssertSecretDirsOwned(CreateContainerParameters create, CredTmpfsSpec creds)
+    {
+        var tmpfs = create.HostConfig.Tmpfs ?? new Dictionary<string, string>();
+
+        AssertOwnedBy(creds.CredentialPath, creds.AgentUid, "the agent credential file");
+        AssertOwnedBy(creds.OobKeyPath, creds.SupervisorUid, "the OOB session key K");
+
+        // G2 control 1 restated as a property of the LAYOUT: sharing one directory would put both
+        // secrets back under a single owner and hand the agent uid write access to K's directory.
+        if (string.Equals(
+                CredTmpfsSpec.DirectoryOf(creds.CredentialPath),
+                CredTmpfsSpec.DirectoryOf(creds.OobKeyPath), StringComparison.Ordinal))
+        {
+            throw new SandboxSpecException(
+                "G2 control 1: the agent credential file and the OOB session key must live in DIFFERENT "
+                + $"per-owner directories; both are in '{CredTmpfsSpec.DirectoryOf(creds.OobKeyPath)}'.");
+        }
+
+        void AssertOwnedBy(string path, int uid, string what)
+        {
+            var dir = CredTmpfsSpec.DirectoryOf(path);
+            if (!tmpfs.TryGetValue(dir, out var options))
+            {
+                throw new SandboxSpecException(
+                    $"The directory '{dir}' holding {what} ('{path}') is not a tmpfs on the create request, so "
+                    + $"the in-jail write would have to create the file somewhere uid {uid} cannot write. "
+                    + $"Mounted tmpfs: {string.Join(", ", tmpfs.Keys)}.");
+            }
+
+            var expected = OwnedSecretDirOptions(uid);
+            if (!string.Equals(options, expected, StringComparison.Ordinal))
+            {
+                throw new SandboxSpecException(
+                    $"The tmpfs at '{dir}' holding {what} must be mounted '{expected}' so uid {uid} OWNS it and "
+                    + $"can create the secret without a chown (which no exec in this container can perform — "
+                    + $"non-root User plus no-new-privileges leaves even a uid-0 exec with no CAP_CHOWN). "
+                    + $"It is mounted '{options}'.");
+            }
+        }
     }
 
     private static void AssertNoPtraceScopeSysctl(CreateContainerParameters create)

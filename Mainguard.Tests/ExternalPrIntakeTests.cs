@@ -454,6 +454,45 @@ public class ExternalPrIntakeTests
     }
 
     /// <summary>
+    /// A human discard has to mean the same thing for an intake'd pull request that it means for a local
+    /// agent: the entry is off the queue and nothing is being kept warm for it.
+    ///
+    /// <para>Materializing is re-asked on EVERY poll and consulted no queue state, so a discarded entry
+    /// kept getting its jail re-provisioned — and the release path only fires when the PR CLOSES upstream,
+    /// which for an open PR is never. The worker (and its MG-36 network segment, from a bridge pool ~32
+    /// deep) would have been held indefinitely for a pull request the operator explicitly dropped.</para>
+    ///
+    /// <para>The moved-head leg is driven too, because that is the other half of the same defect: it calls
+    /// <c>NotifyNewCommits</c>, which threw <c>Discarded → Working</c> before the terminal guard was
+    /// asked through <c>IsTerminal</c>. The intake swallows that per PR and never records the head, so it
+    /// re-threw on every poll forever.</para>
+    /// </summary>
+    [Fact]
+    public async Task DiscardedEntry_ShouldReleaseTheWorker_AndStopBeingReMaterialized()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Jailed);
+
+        Assert.True(h.Queue.TryDiscard("pr-7", "uid:1000", "not wanted", out var refusal), refusal);
+        var ensuresBefore = h.Workers.Requests.Count;
+
+        // The PR is still OPEN upstream, and its head then moves (a force-push) — the two things that
+        // would otherwise keep the intake re-provisioning and re-throwing.
+        h.Fetcher.Heads[7] = "sha-7b";
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(new[] { "pr-7" }, h.Workers.Released);
+        Assert.Equal(ensuresBefore, h.Workers.Requests.Count); // no jail re-provisioned after the discard
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("pr-7"));
+        Assert.DoesNotContain("pr-7", h.Queue.Agents);
+    }
+
+    /// <summary>
     /// Closed upstream ⇒ the whole WORKER is released, not just the worktree. In the daemon that is what
     /// reclaims the jail's MG-36 network segment; Docker's local bridge pool is ~32 deep, so a segment
     /// leaked per closed pull request eventually makes every spawn on the box fail.

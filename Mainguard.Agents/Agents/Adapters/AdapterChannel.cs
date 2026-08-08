@@ -359,20 +359,23 @@ public sealed class AdapterChannel
 
         if (!install.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.InstallFailed,
-                $"Adapter '{adapterId}' install exited {install.ExitCode}: {install.Stderr}");
+                $"Adapter '{adapterId}' install failed with exit code {install.ExitCode}: {Detail(install)}");
 
         // Config shims (e.g. non-interactive flags) so the CLI never blocks the daemon on a prompt.
         foreach (var shim in spec.ConfigShims ?? Array.Empty<ConfigShim>())
             await _host.WriteFileAsync(shim.Path, shim.Content, ct).ConfigureAwait(false);
 
-        // Verify: exit 0 AND the pinned version is what actually landed.
-        var post = await _host.RunAsync(spec.HealthProbe.Command, ct).ConfigureAwait(false);
+        // Verify: exit 0 AND the pinned version is what actually landed. For a launcher-only package
+        // this also PLACES the platform executable first — see ProbeAsync.
+        var post = await ProbeAsync(spec, adapterId, ct).ConfigureAwait(false);
         if (!post.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.ProbeFailed,
-                $"Adapter '{adapterId}' health probe exited {post.ExitCode}.");
+                $"Adapter '{adapterId}' installed but is not runnable: its health probe "
+                + $"({string.Join(' ', spec.HealthProbe.Command)}) failed with exit code {post.ExitCode} — {Detail(post)}");
         if (!post.Stdout.Contains(spec.HealthProbe.ExpectedVersionSubstring, StringComparison.Ordinal))
             throw new AdapterChannelException(AdapterChannelError.VersionMismatch,
-                $"Adapter '{adapterId}' probe reported the wrong version (pinned '{spec.Version}').");
+                $"Adapter '{adapterId}' probe reported the wrong version (pinned '{spec.Version}', "
+                + $"probe reported: {Detail(post)}).");
 
         // LAST, after the green probe: the install marker the daemon reads to wire agentKind → this
         // CLI's launch argv (InstalledAdapterCatalog). Launch-less adapters are tools, not agents.
@@ -383,11 +386,111 @@ public sealed class AdapterChannel
                 InstalledAdapterMarker.Serialize(
                     new InstalledAdapterMarker(
                         spec.Id, spec.Version, spec.Launch, spec.ApiKeyEnvVar, spec.EgressHosts,
-                        spec.CredentialPaths, spec.BaseUrlEnvVar)),
+                        spec.CredentialPaths, spec.BaseUrlEnvVar, spec.ModelHost, spec.SettingsPaths)),
                 ct).ConfigureAwait(false);
         }
 
         return AdapterEnsureResult.Installed;
+    }
+
+    /// <summary>
+    /// Runs the health probe — placing the CLI's platform executable first when the adapter declares
+    /// one (<see cref="AdapterSpec.PlatformBinary"/>).
+    ///
+    /// <para><b>Why this exists.</b> Several vendors publish an npm package that is only a LAUNCHER: the
+    /// real ~300 MB executable ships in a platform-specific subpackage, and a <c>postinstall</c> script
+    /// hardlinks it over a placeholder in the launcher's <c>bin/</c>. Because every adapter installs with
+    /// <c>--ignore-scripts</c> — that postinstall is arbitrary upstream code running inside MainguardEnv
+    /// before any probe or sandbox boundary applies — the placeholder survives, and the placeholder is a
+    /// stub that prints "native binary not installed" and exits 1. That is a health probe failing on a
+    /// perfectly good install, and it fails identically for a pinned install and an update.</para>
+    ///
+    /// <para>So Mainguard performs the same FILE OPERATION itself, from a reviewed manifest, running
+    /// nothing the vendor shipped. The subpackage is already on disk: <c>--ignore-scripts</c> suppresses
+    /// lifecycle hooks, never dependency resolution, so the exact-versioned optional dependency was
+    /// fetched by the same <c>npm install</c>. Nothing here touches the network.</para>
+    ///
+    /// <para><b>Why the candidates are probed, not computed.</b> The subpackage differs by CPU feature
+    /// level and libc (a vendor may publish an AVX2 build and a baseline build side by side, and npm
+    /// installs every variant matching os/cpu). Rather than reimplement each vendor's CPU detection —
+    /// which would be a silent mis-selection the moment a vendor changed it — each declared candidate is
+    /// placed and then validated by the adapter's REAL health probe, and the first one that actually runs
+    /// wins. This is the algorithm the vendors' own postinstalls use, and it makes "which build works on
+    /// this machine" an empirical answer.</para>
+    /// </summary>
+    private async Task<AdapterCommandResult> ProbeAsync(AdapterSpec spec, string adapterId, CancellationToken ct)
+    {
+        if (spec.PlatformBinary is not { } link)
+            return await _host.RunAsync(spec.HealthProbe!.Command, ct).ConfigureAwait(false);
+
+        var target = $"{AdapterPaths.VmRoot}/{link.Target}";
+        var placementFailures = new List<string>();
+        AdapterCommandResult? lastProbe = null;
+
+        foreach (var candidate in link.Sources)
+        {
+            var placement = await PlacePlatformBinaryAsync(
+                $"{AdapterPaths.VmRoot}/{candidate}", target, ct).ConfigureAwait(false);
+            if (!placement.Succeeded)
+            {
+                // This variant simply is not on disk (npm skipped it for this os/cpu). Not yet a
+                // failure — the next candidate may be the right one for this machine.
+                placementFailures.Add($"{candidate} ({Detail(placement, 120)})");
+                continue;
+            }
+
+            lastProbe = await _host.RunAsync(spec.HealthProbe!.Command, ct).ConfigureAwait(false);
+            if (lastProbe.Succeeded)
+                return lastProbe;
+        }
+
+        // Something was placed but would not run: the probe is the authority on why, so hand its
+        // result back and let the caller report it as the probe failure it is.
+        if (lastProbe is not null)
+            return lastProbe;
+
+        // Nothing could even be placed — the CLI's executable never landed, which is an install
+        // failure rather than a probe failure, and the distinction is what makes it diagnosable.
+        throw new AdapterChannelException(AdapterChannelError.InstallFailed,
+            $"Adapter '{adapterId}' installed, but none of its platform executables could be placed at "
+            + $"'{link.Target}', so the CLI has no binary to run. Tried: {string.Join("; ", placementFailures)}");
+    }
+
+    /// <summary>
+    /// Places one platform executable over the launcher's placeholder. A hardlink first — these
+    /// binaries are ~300 MB and both paths live under the same prefix, so a copy would double the VM's
+    /// disk for every adapter — falling back to a copy when the link cannot be made (a prefix spanning
+    /// devices, or a filesystem without hardlinks). <c>ln -f</c> replaces the placeholder in one step,
+    /// and fails when the candidate is absent, which is exactly the signal the caller needs.
+    /// </summary>
+    private async Task<AdapterCommandResult> PlacePlatformBinaryAsync(string source, string target, CancellationToken ct)
+    {
+        var linked = await _host.RunAsync(new[] { "ln", "-f", source, target }, ct).ConfigureAwait(false);
+        if (!linked.Succeeded)
+        {
+            var copied = await _host.RunAsync(new[] { "cp", "-f", source, target }, ct).ConfigureAwait(false);
+            if (!copied.Succeeded)
+                return copied;
+        }
+
+        return await _host.RunAsync(new[] { "chmod", "0755", target }, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// A failed command's own explanation, collapsed to one line for a status message: stderr when it
+    /// said anything, otherwise stdout. An exit code names a SYMPTOM and no cause — "health probe
+    /// exited 1" is unactionable for everyone, while the stub's own "native binary not installed
+    /// (--ignore-scripts)" identifies the bug outright. Collapsing the newlines also stops a wrapped
+    /// message from rendering the exit code as a numbered-list item.
+    /// </summary>
+    internal static string Detail(AdapterCommandResult result, int maxLength = 400)
+    {
+        var text = string.IsNullOrWhiteSpace(result.Stderr) ? result.Stdout : result.Stderr;
+        var collapsed = string.Join(' ', (text ?? string.Empty)
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (collapsed.Length == 0)
+            return "it printed nothing";
+        return collapsed.Length <= maxLength ? collapsed : collapsed[..maxLength] + "…";
     }
 
     /// <summary>The installCmd placeholder expanded to the staged, hash-verified payload path.</summary>

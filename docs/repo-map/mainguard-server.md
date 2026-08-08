@@ -42,8 +42,9 @@
     mapping is now real (`Runtime/PrIntakeTargetResolver.cs`); a source no active repo owns still
     resolves to null and makes a poll list-and-skip (no upstream writes), the same "empty until a repo
     is active" posture the merge-reconcile takes.
-- **`Gateway/GatewayBindPolicy.cs`** (**MG-13**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. The gateway fronts the user's provider key, so a listener that answers off-box is a credential-exposure surface rather than a convenience. Pure, so every case runs without a host.
-- **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation) and the typed startup failure naming the port.
+- **`Gateway/GatewayBindPolicy.cs`** (**MG-13/MG-4**) — the pure bind-address rule for the model-gateway listener: loopback and private ranges are permitted; a wildcard bind and any public address are refused. `TryResolvePrivateHostAddress()` is the **default** bind since MG-4 turned the gateway on: a private, non-loopback IPv4 on an interface that is up, chosen deterministically so the address written into every confined jail is stable across restarts. Loopback is excluded as a default precisely because it binds cleanly and confines nothing — inside a container `127.0.0.1` is the container. It picks an address; whether a jail can REACH it is measured per spawn by `IEgressPolicy.CanProxyReachAsync`. The gateway fronts the user's provider key, so a listener that answers off-box is a credential-exposure surface rather than a convenience. Pure, so every case runs without a host.
+- **`Gateway/GatewayConfinementOptions.cs`** — `GatewayConfinementOptions` (the spawn path's answer to "is there a gateway to point this jail at, and where"; `Disabled` is the default and means the provider key goes into the jail exactly as before), `ModelHosts` (the model-API hosts, derived from `EgressAllowlist.DefaultEntries` so the allowlist and the gateway cannot drift), and `NullAgentPortMap` (Mainguard runs one gateway listener, so attribution comes from the agent token; this returns null rather than guessing an agent).
+- **`DaemonOptions.cs`** / **`DaemonStartupException.cs`** — parsed launch options (`--local-dev`/`--smoke`/`--port`, loopback-only by construction; `DataPath` overrides the P2-08 daemon SQLite path for test isolation; **`--gateway-bind`/`--gateway-port` control the model gateway, which is now ON BY DEFAULT (MG-4 item 3). It was previously settable only through `MAINGUARD_GATEWAY_BIND`, which nothing in the repo ever set, so in every supported deployment a BYOK jail received the raw provider key. `ResolveBindAddress` maps unset/`auto` → a private host address, `off` → disabled (the old posture), and an explicit address straight through to `GatewayBindPolicy`**) and the typed startup failure naming the port.
 - **`Auth/SessionTokenFile.cs`** — generates a 256-bit session token (`RandomNumberGenerator.GetBytes(32)`) written user-only-readable (Linux `~/.mainguard/daemon.token` mode 0600; Windows `%LocalAppData%\Mainguard\daemon.token` current-user ACL); prints nothing (G-13). Path via `Core.Daemon.DaemonPaths`.
 - **`Auth/SessionTransportCertificates.cs`** (MG-19) — the control plane's **peer-authentication**
   layer, so the bearer token is no longer the sole gate. Mints two fresh self-signed P-256
@@ -59,7 +60,11 @@
 - **`Auth/RoleInterceptor.cs`** (P2-14) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
-  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`) and the human-only
+  client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
+  `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
+  (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
+  blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
+  branch into the state a re-verification starts from) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
   or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
@@ -92,11 +97,27 @@
     + files when `!Smoke`; a bootstrap `LoggerFactory` logs the Lifecycle/Migration startup milestones
     before the host is built, and the migration log delegate threads through
     `GatewayServiceRegistration`).
+- **`Runtime/AgentResourceProbe.cs`** — the per-tick join behind `StreamAgentResources`: the session
+  registry (who is alive, in which container) × the container engine (`IContainerResourceSampler`) ×
+  the gateway credential store (**is this agent's spend measurable at all**). `AgentResourceReport`
+  carries nullable CPU/RAM where null means NOT MEASURED, never zero. **The metering predicate lives
+  here and nowhere else**: an agent is metered exactly when `AgentGatewayCredentials.TokenFor(agentId)`
+  is non-null, i.e. the daemon actually issued it a gateway confinement token at spawn — deliberately
+  NOT "the user supplied an API key", since `SandboxAgentLauncher.TryConfineToGatewayAsync` also
+  requires the gateway to be bound, reachable from that jail's egress proxy, and the CLI to declare BOTH
+  `baseUrlEnvVar` and `modelHost` (only `claude-code`/`gemini-cli` do, so a BYOK `codex`/`qwen-code`/
+  `opencode` agent spends real money **unmetered**). Reading the daemon's own answer rather than
+  recomputing those four conditions is the point: two derivations would eventually disagree invisibly.
+  Results are cached for `DefaultCacheWindow` so N subscribers cannot multiply engine calls.
 - **`Runtime/AgentSessionStore.cs`** — the in-memory daemon agent registry + snapshot-then-deltas
   event fan-out (host state, not transport); the gRPC classes dispatch here. Appends `spawn`/`stop`
   audit events via `IAuditLog`; `MarkState(agentId, state, reason)` (P2-09) updates a session's state
   + broadcasts a state delta (the sink the real supervisor drives so a pause/rate-limit streams to
-  clients). **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
+  clients) — and broadcasts when the **reason** changed as well as the state word, holding the last one
+  on `AgentSession.Detail` so a new reason is told from a repeat. Comparing only the state word silently
+  swallowed every update reporting progress WITHIN a state, which is the only shape a long step has: a
+  coordinator sits in `Starting` for the minutes its toolchain image builds, so each progress line died
+  here and the client, hearing nothing, could only conclude the daemon had stopped responding. **P2-47 #8:** the `AgentSession` record carries a daemon-side-only
   `ContainerId`/`RepoHash` (never serialized), and `AttachSandbox` binds a real jail to a spawned
   session (state → `Working`, `sandbox_attach` audit). **`Spawn` takes an optional explicit
   `agentId`** — it could previously only MINT GUIDs, so a session (and therefore a jail) named
@@ -134,7 +155,14 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`).
+    (`AgentStopResult`). It owns the same two halves for the **CLI SETTINGS round-trip**:
+    `FilterCliSettings` admits only (root, path) pairs the marker's `settingsPaths` declares and caps
+    each file at `AdapterSettingsPolicy.MaxFileBytes` — the stakes are higher than for a login, because
+    these files carry a permission allowlist and an unfiltered path would let a compromised client plant
+    pre-approved commands anywhere in the home or the checkout — and `HarvestCliSettingsAsync` reads
+    them back out (size-checked in the shell, so an oversized file never enters daemon memory),
+    resolving each root through `DockerSandboxEngine.SettingsRootPath` so restore and harvest cannot
+    address different directories.
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
@@ -169,8 +197,18 @@
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
     `External` and route an upstream PR's merge into a local fast-forward), and `withoutHostCredentials`
-    (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*` nor any
-    harvested CLI login, and seeds neither). **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
+    (**trust boundary** — an untrusted PR head inherits neither the per-repo cached `llm_env_*`, nor any
+    harvested CLI login, **nor any CLI SETTINGS**, and seeds none of them). The settings gate is the
+    stronger of the three: an inherited permission allowlist is inherited *execution*, so a jail holding
+    a pull request's code must start asking about every command. `cliSettings` carries the repo's saved
+    approvals in; `CliSettingsHarvestPolicy` (in this file) gates them flowing back OUT — only a
+    HUMAN-ATTENDED session is harvested, because a `Managed` worker's terminal is daemon-locked
+    read-only, so anything in its settings file was written by the agent, not approved by a person.
+    Restore is deliberately wider than harvest (a Managed worker still receives the repo's approvals or
+    it stalls on prompts nobody can answer). `AgentStopResult` carries `CliSettings` + `RepoHandle` so
+    the client files them under the right repository rather than whichever one is open. See
+    [`docs/design/agent-cli-settings-persistence.md`](../design/agent-cli-settings-persistence.md).
+    **Phase 2** adds `heldTaskTitle`/`heldTaskPrompt`/
     `heldBudgetUsd` (the work the daemon withholds until the worker's own plan is approved — the shim's
     `taskPrompt` was previously parsed off the wire and then silently dropped, so a coordinator-spawned
     worker received no task at all) and `HandleWorkerPlanRequestAsync`, the worker plan shim's handler:
@@ -192,8 +230,10 @@
   - **`Runtime/SessionKeyCache.cs`** (PR3) — memory-only per-kind model-key cache (the daemon has no
     keystore; keys only arrive on `SpawnAgent`), so a coordinator-initiated worker of the same kind
     reuses the client-supplied key; also caches the per-kind CLI login-state files a client spawn
-    restored (and a stop harvested), so an IPC-spawned worker boots signed in too; never persisted,
-    never logged.
+    restored (and a stop harvested), so an IPC-spawned worker boots signed in too; and the per-(repo,
+    kind) **CLI settings** (`RememberCliSettings`/`TryGetCliSettings`), so an IPC-spawned worker inherits
+    the repo's approved-command list instead of stalling on prompts. A blank repo handle forms no scope
+    and is dropped rather than collapsed into a shared bucket (MG-6). Never persisted, never logged.
 - **`Runtime/CoordinatorSpawnGate.cs`** (**MG-2**) — the pure admission decision in front of the
   coordinator's in-jail spawn shim:
   `Evaluate(activeManagedWorkers, maxActiveWorkers, admission, planGate?)` returns a refusal reason or
@@ -294,7 +334,13 @@
   ids/versions/env-var NAMES only, no paths/secrets; **`GetDaemonInfo`** answers the tier-1 skew probe
   from the injected `Runtime/DaemonInfoProvider.cs` — the daemon's assembly informational version +
   the `MAINGUARDOS_VERSION` parsed from `/etc/mainguardos-release` (overridable path for tests;
-  absent/unreadable stamp → "" — the probe never throws)), **`TerminalGrpcService.cs`** (P2-03/PR3: a
+  absent/unreadable stamp → "" — the probe never throws); **`StreamAgentResources`** streams live
+  per-agent CPU/RAM + the `metered` flag from `Runtime/AgentResourceProbe.cs` on a
+  `ResourcePollInterval` (5s) loop — **sampling is driven by the subscription**, so with no client
+  attached the daemon makes no engine calls. Whole-set snapshots (a torn-down agent drops out rather
+  than keeping stale numbers), and the `cpu_percent`/`mem_bytes` fields are proto3 `optional` so
+  "unknown" is carried explicitly rather than defaulting to a 0 that reads as "idle"),
+  **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
   (managed) attach gets the banner + output but `PERMISSION_DENIED` on input; otherwise the per-attach
   `PtySession` factory path through `TerminalStreamer`, else the P2-02 echo. P2-18: an
@@ -310,7 +356,9 @@
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
   stream) / **`MergeQueueGrpcService.cs`** (P2-10: `StreamQueue` re-pushes on the queue's `Changed`
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
-  list can badge external-PR entries; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  list can badge external-PR entries, plus `verification_in_flight` (via
+  `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run
+  leaves a persisted `Verifying` row with nothing executing; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the
@@ -319,7 +367,14 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY) — validation/dispatch only (no business logic —
+  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` refuses while this
+  repo's outstanding merge lease names the entry — a terminal transition inside the
+  `BeginMerge`→`ConfirmMerge` window would make `ConfirmMerge` refuse to record a merge that really
+  landed — derives the actor from `IApproverIdentityResolver` (never the request; there is no such
+  field), and answers a refusal as `discarded=false` + reason rather than a fault. It is deliberately
+  **not** kill-switch-gated: freezing the queue stops merges, and is no reason to forbid tidying an
+  entry that cannot merge either way. `ClearStalledVerification` returns a stalled `Verifying` entry to
+  `Working`, refusing while a run is genuinely in flight) — validation/dispatch only (no business logic —
   rejection trigger). **P2-14:**
   - `MergeQueueGrpcService.BeginMerge`/`ConfirmMerge` and `AgentGrpcService.SpawnAgent` now consult the
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
