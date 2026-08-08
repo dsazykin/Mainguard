@@ -169,7 +169,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the sweep for the same snapshot delta and must pass the `DriveManually` interval, which runs no loop
       at all; `Publish` is likewise serialized per agent, because §7's "both" trigger means a watcher tick
       and a pre-verification publish overlap by design and the loser used to report
-      `Failed`/`NothingToPublish` for a mirror that was in fact current).
+      `Failed`/`NothingToPublish` for a mirror that was in fact current. Also `AgentRefWatcher.Advanced`
+      — raised off any lock for the sweeps where the mirror's ref really moved (`Published`, never
+      `Unchanged`), because the loop discarded `PollOnce`'s return value and so "this agent's work moved"
+      was computed once a second and reachable by nothing. `WorkerReadinessTrigger` is the subscriber; the
+      mediator's own observer is deliberately NOT the seam, since it also sees the merge queue's
+      pre-verification publish and would feed a trigger the consequences of its own runs).
     - `MirrorMaintenance.cs` (**MG-3 §4** — the object-lifetime policy for a mirror other repos borrow
       from: **pruning breaks borrowers, repacking does not**. `ApplyGcPolicy` (`gc.auto=0` +
       `maintenance.auto=false`), `RepackWithoutPrune` (`git repack -A -d` — `-A` is load-bearing: measured
@@ -1150,7 +1155,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
       approval** — it is a resource cap and a blocked worker still holds its jail/tmpfs/network
       segment/worktree) and `MaxPlanRevisions` (3; the reject→revise budget, with the arithmetic pinned in
-      prose: reject → revise ×3, and the **4th rejection escalates**). Never in a prompt — a limit an agent
+      prose: reject → revise ×3, and the **4th rejection escalates**), plus the automatic-verify tunables
+      `AutoVerifyQuietSeconds` (90 — how long a worker's branch must stop advancing before it is read as
+      ready) and `AutoVerifyCooldownSeconds` (600 — the floor between two AUTOMATIC runs for one worker; it
+      never throttles a human's Verify). Never in a prompt — a limit an agent
       is merely told about is a suggestion (contract §5)).
     - `PlanApprovalService.cs` (the **worker-authored** plan queue + approve/reject/revise; **the approver
       identity is passed in daemon-derived, never client-supplied (SA-1/F2)** and persisted with the plan;
@@ -1174,11 +1182,36 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       empty prompt there strands a worker holding an approved plan — while the audit record and the
       `TaskReleased` event fire exactly once, decided under the gate's lock so racing callers cannot both
       win (a second `TaskReleased` is the same task handed out twice); `MayWork` /
-      `MayReceivePrompt` / `MayRequestVerification` deny steering and verification at the gate; and the
-      type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
+      `MayReceivePrompt` / `MayRequestVerification` deny steering and verification at the gate;
+      `MayAutoVerify` is the automatic trigger's predicate and is deliberately **stricter than `Allows`** —
+      an id this gate never held is *ineligible* for automatic verification rather than permitted, because
+      `Allows`'s permissive default exists so manual-mode agents and external-PR heads are not blocked from
+      merging, and reading it as consent would start spending test-suite runs on every agent in the daemon;
+      and the type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
       approved cannot merge even if it verified green. Also owns the legible-stall text —
       `BlockedWorkerCount`/`EscalatedWorkerCount`/`BackpressureSignal` render "6 workers are waiting on
       your approval … the coordinator has stopped spawning", which the contract makes a requirement).
+    - `WorkerReadinessTrigger.cs` (**phase 2's AUTOMATIC verification trigger**, and nothing more than a
+      trigger: it calls `MergeQueue.RunVerificationAsync` and owns no gate, no jail execution and no
+      transition, because two paths that can disagree about what "verified" means is the defect this area
+      exists to have repaired. Before it, the only production callers were the Verify button, the restart
+      resume and the stale cascade — so nothing fired when a delegated worker finished, and every worker
+      needed a human to press Verify. **"Ready" is ref QUIESCENCE**: it subscribes to
+      `AgentRefWatcher.Advanced` and fires once a worker's branch has stopped advancing for
+      `CoordinatorLimits.AutoVerifyQuietSeconds`, each advance restarting the window — so five commits in a
+      burst cost ONE run, not five. Four bounds answer phase 1's objections to ref movement (quiescence
+      rather than movement · once per tip sha, an ATTEMPT whether it produced a verdict or was refused · a
+      per-worker cooldown · `WorkerPlanGate.MayAutoVerify`). It asks `IsVerificationInFlight` **before** it
+      asks the merge state — a live run means the entry is already `Verifying`, so the other order made the
+      in-flight branch unreachable — and treats the queue's already-in-flight throw as a deferral, not an
+      error. **A refusal never becomes a result:** a throw out of the run means the verification was refused
+      before it produced a verdict, the queue wrote no record, and this type logs and stops — it holds no
+      verification store, so it cannot turn "we could not run your tests" into "your tests failed" (the
+      defect PR #322 fixes). Fires only from `Working` / `StaleVerified`, never creates a queue, and returns
+      a `ReadinessDecision`/`ReadinessOutcome` per examined worker so "why did this NOT fire" is answerable.
+      `PollOnce()` + an injected clock + `DriveManually` make every timing rule assertable without sleeping.
+      Rationale, the rejected candidates and the stated known limitation live in
+      `docs/design/verification-trigger.md`).
     - `WorkerPlanAuthor.cs` (**phase 2 — the worker side.** `IWorkerPlanDrafter` (author a plan from the
       repo, and from the human's feedback on a revision), `IWorkerPlanChannel` (present/revise/await —
       `LocalWorkerPlanChannel` in-process, the `mainguard-plan` shim in a jail), and `WorkerPlanAuthor`,

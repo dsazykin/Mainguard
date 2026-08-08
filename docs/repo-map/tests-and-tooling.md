@@ -722,6 +722,13 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/WorkerReadinessTriggerWiringTests.cs`** — phase 2's automatic verification
+  trigger is actually RUNNING in the daemon. Two facts, and they are not the same fact: a hosted service
+  resolves `WorkerReadinessTrigger` at boot (a DI singleton nobody asks for is never constructed, so it
+  would never subscribe and never sweep while every unit test of its rules stayed green), and the trigger
+  observes **the very `AgentRefWatcher` instance** the daemon's `WorktreeManager` sweeps with — a trigger
+  wired to a second, unwatched watcher passes everything else in this repository and never fires once in
+  production. Both run through the real `DaemonFixture` composition root.
 - **`Mainguard.Server.Tests/Agents/MergeQueueEndToEndDockerTests.cs`** (`RequiresDocker`) — **the
   merge queue driven as ONE loop instead of as a pile of parts.** Every other merge-queue test
   substitutes something load-bearing (a `runVerification` lambda that returns `Passed:true`, a
@@ -919,6 +926,21 @@
   `mainguard-plan await <id>` is the documented crash re-attach, and answering it with an empty prompt
   would strand a worker holding an approved plan — while auditing `worker_task_released` and raising
   `TaskReleased` only on the first call, asserted sequentially and under 25 rounds of 32 racing threads),
+  **`WorkerReadinessTriggerTests`** (phase 2's automatic verification trigger, driven on a virtual clock
+  with the sweep hand-cranked so the debounce and the cooldown are asserted rather than slept on. Every fire
+  is observed as a REAL `MergeQueue` state walk driven by `RunVerificationAsync`, never as a call count on a
+  seam of the trigger's own. Covers: a quiet branch verifying with nobody pressing Verify; a failing run
+  settling back through the queue **with the run count asserted alongside the state**, since `Working` is
+  the default and a trigger that ran nothing would land there too; **a REFUSED verification recording
+  nothing at all** — not a passing row and emphatically not a failing one, the control being the failing-run
+  test that DOES produce a row, so "we could not run your tests" and "your tests failed" stay
+  distinguishable (PR #322) — and not being retried on the same tip; five commits inside the window costing
+  ONE run, measured from the LAST advance; the same tip never attempted twice; a grinder held off by the
+  cooldown and staying armed; a worker still at the plan gate and an agent the gate never held both refused
+  — the latter paired with the positive that the *merge* gate still allows that id, which is what makes the
+  stricter predicate deliberate; an in-flight run deferred rather than fought over; a `Verified` entry left
+  alone because no legal edge to `Verifying` exists; and a repo with no queue skipped rather than
+  provisioned. All sixteen mutations of the fix were watched go red),
   **`CoordinatorPlanDecisionTests`** (phase 2 — the human half of the same gate: Approve/Reject must never
   latch disabled, since the blocked worker on the card holds its jail and its slot against the worker cap
   and the click is the only thing that clears it. Covers the decision throwing, the decision returning
@@ -1353,7 +1375,10 @@
   integration branch untouched; the rule-4 check reached on its own by pointing the mirror's HEAD at
   the agent branch; one agent's forged copy of another's ref not carried across; no quarantine ref
   left behind on success OR refusal; and the watcher driven through `PollOnce` — publishes on a move,
-  silent while still, KEEPS refusing rather than recording the snapshot and going quiet, and
+  silent while still, publishing an `Advanced` signal that ARMS the readiness trigger on a real commit (and
+  stops the moment the trigger is disposed — the rung the unit suite cannot reach, since a trigger with
+  perfect rules and no subscription passes every one of them), KEEPS refusing rather than
+  recording the snapshot and going quiet, and
   SELF-EVICTS an agent whose repository is gone (`SwarmReconciler` disposes an orphan by calling
   `RemoveAgentWorktree` directly and never unwatches it, and a vanished repo never publishes
   `Current`, so the entry would otherwise spawn a git process every tick for the life of the daemon) —

@@ -227,6 +227,39 @@ public sealed class WorkerPlanGate : IMergeGate
     public bool MayRequestVerification(string workerAgentId, out string reason) => MayWork(workerAgentId, out reason);
 
     /// <summary>
+    /// Whether the daemon may verify this worker's branch <b>on its own initiative</b>, with nobody having
+    /// asked — the predicate <c>WorkerReadinessTrigger</c> consults before it fires.
+    ///
+    /// <para>It is deliberately STRICTER than <see cref="MayRequestVerification"/> in one direction and it
+    /// is not <see cref="Allows"/>. <see cref="Allows"/> answers "true" for a worker this gate never held,
+    /// because a manual-mode agent or an external-PR head is not governed by the plan gate and must not be
+    /// blocked by it. That default is right for a merge gate and wrong here: an automatic trigger reading it
+    /// would begin spending test-suite runs on every agent in the daemon, including the ones whose owner is
+    /// a human driving them by hand. So an unheld worker is <i>ineligible</i> rather than permitted — the
+    /// human Verify button is what those entries have always used, and it is untouched.</para>
+    ///
+    /// <para>In the other direction it is exactly <see cref="MayWork"/>, and it must stay exactly that: a
+    /// second opinion about what "approved" means is how one of the two copies becomes decorative (MG-12).
+    /// A worker whose plan was never approved never auto-verifies, for the same reason it never received
+    /// its task.</para>
+    /// </summary>
+    /// <param name="reason">Render/log-verbatim explanation when this returns false.</param>
+    public bool MayAutoVerify(string workerAgentId, out string reason)
+    {
+        lock (_gate)
+        {
+            if (!_held.ContainsKey(workerAgentId))
+            {
+                reason = $"{workerAgentId} is not a plan-gated worker — automatic verification governs "
+                         + "coordinator-delegated workers only.";
+                return false;
+            }
+        }
+
+        return MayWork(workerAgentId, out reason);
+    }
+
+    /// <summary>
     /// <see cref="IMergeGate"/> — the backstop. A branch whose worker never had a plan approved cannot
     /// merge, whatever its tests said.
     /// </summary>

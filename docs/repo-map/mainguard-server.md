@@ -35,6 +35,15 @@
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
+  - **`Runtime/WorkerReadinessHostedService.cs`** — the boot slot whose ENTIRE job is to **resolve**
+    `WorkerReadinessTrigger` (phase 2's automatic verification trigger, registered in
+    `GatewayServiceRegistration` over the daemon's own `WorktreeManager.RefWatcher`). The trigger has no
+    RPC and no other consumer, so a DI singleton nobody asks for would never be constructed, never
+    subscribe and never sweep — registered-and-not-running, the same shape as MG-10's empty registry.
+    Resolved with `GetService`, not `GetRequiredService`: a substrate that cannot supply a ref watcher
+    still boots and still serves the human Verify button. Stop disposes the trigger (unsubscribe + wait
+    for the sweep in flight). Asserted from the real composition root by
+    `WorkerReadinessTriggerWiringTests`.
   - **`Runtime/PrIntakeHostedService.cs`** (P2-13 carried-in from P2-12) — the daemon scheduler slot
     that drives `IExternalPrIntake.RunAsync` (the external-PR poll loop); **P2-47 registered the intake
     dependency chain (`RegisterPrIntake` in `GatewayServiceRegistration`) so this now RUNS the poll loop

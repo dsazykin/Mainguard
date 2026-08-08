@@ -545,6 +545,65 @@ public sealed class AgentRefMediationTests
         Assert.Empty(RefsUnder(env.BarePath(hash), AgentRefMediator.QuarantineRefPrefix));
     }
 
+    /// <summary>
+    /// The sweep's <see cref="AgentRefWatcher.Advanced"/> signal is real, and it is what arms the automatic
+    /// verification trigger. A REAL commit in a REAL agent worktree, published by a REAL sweep, is what puts
+    /// the worker on the trigger's armed list; nothing here calls <c>NotifyAdvanced</c>.
+    ///
+    /// <para>This is the rung the unit suite deliberately cannot cover. <c>WorkerReadinessTriggerTests</c>
+    /// drives the trigger's decisions through a virtual clock, which proves every rule and proves nothing
+    /// about whether the trigger is connected to anything — and "complete mechanism, connected to nothing"
+    /// is the exact defect the automatic trigger was written to end.</para>
+    ///
+    /// <para>It also asserts the two negatives that make the signal a readiness signal rather than a noise
+    /// source: a sweep in which nothing moved does not arm anything, and a disposed trigger stops
+    /// listening.</para>
+    /// </summary>
+    [Fact]
+    public void Watcher_AdvancedArmsTheReadinessTrigger_OnARealSweepOfARealCommit()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
+
+        var plans = new Mainguard.Agents.Agents.Orchestrator.PlanApprovalService();
+        var trigger = new Mainguard.Agents.Agents.Orchestrator.WorkerReadinessTrigger(
+            source: watcher,
+            queues: new Mainguard.Agents.Agents.Orchestrator.MergeQueueRegistry(),
+            planGate: new Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate(plans),
+            sweepInterval: Mainguard.Agents.Agents.Orchestrator.WorkerReadinessTrigger.DriveManually);
+
+        try
+        {
+            watcher.Watch(hash, "a1");
+            watcher.PollOnce(); // the baseline publish of the branch as it stands
+            trigger.Forget(hash, "a1");
+            Assert.DoesNotContain((hash, "a1"), trigger.Armed);
+
+            // Still: the sweep publishes nothing, so nothing is armed.
+            Assert.Empty(watcher.PollOnce());
+            Assert.DoesNotContain((hash, "a1"), trigger.Armed);
+
+            var tip = env.CommitInWorktree(worktree, "one.txt", "one\n");
+            Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
+            Assert.Contains((hash, "a1"), trigger.Armed);
+
+            // Disposal unsubscribes: a further real advance no longer reaches it.
+            trigger.Dispose();
+            trigger.Forget(hash, "a1");
+            env.CommitInWorktree(worktree, "two.txt", "two\n");
+            Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
+            Assert.DoesNotContain((hash, "a1"), trigger.Armed);
+            Assert.NotEqual(tip, AgentTestGit.RunChecked(env.BarePath(hash), "rev-parse", "refs/heads/agent/a1").Trim());
+        }
+        finally
+        {
+            trigger.Dispose();
+        }
+    }
+
     private static IReadOnlyList<string> RefsUnder(string gitDir, string prefix)
         => AgentTestGit.RunChecked(gitDir, "for-each-ref", "--format=%(refname)", prefix)
             .Split('\n', StringSplitOptions.RemoveEmptyEntries)
