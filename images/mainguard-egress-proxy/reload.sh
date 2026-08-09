@@ -98,7 +98,9 @@ trap 'if [ "$have_lock" = yes ]; then rmdir "$LOCK_DIR" 2>/dev/null || true; fi'
 # it succeed". Re-running an identical reload that just failed has no new information to act on, while
 # restarting the daemons underneath a caller that was told "ready" is a real outage; the next config
 # push is the thing that retries, and it does so through gate 2 below.
-if [ "$BOOT" = yes ] && [ -f "$RAN_MARK" ]; then
+# PROBE M24 (DO NOT MERGE): gate 1 removed — a --boot reload no longer yields to a config push that
+# already ran, so the boot path restarts tinyproxy/dnsmasq underneath a caller already told "ready".
+if [ "$BOOT" = yes ] && [ -f "$RAN_MARK" ] && false; then
     log "boot: a config push has already reloaded this policy — leaving the daemons running"
     exit 0
 fi

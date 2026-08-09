@@ -1062,7 +1062,9 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // This is ONE ADDED ALLOWLIST ENTRY and nothing else. It moves no existing host's route, so an
         // OAuth agent — which is never confined, never given a base-URL override, and never given a
         // gateway token — reaches api.anthropic.com by exactly the path it does today.
-        effective = CombineGatewayHost(effective, _gatewayReachableAt);
+        // PROBE M23 (DO NOT MERGE): the daemon gateway's own address is no longer added to the tinyproxy
+        // filter, so a confined jail's model call is 403'd by its own proxy.
+        // effective = CombineGatewayHost(effective, _gatewayReachableAt);
 
         // MG-7/MG-18/MG-36: both the pinned-DNS self-record and the backstop's destination constraint
         // need the proxy's own addresses. Resolved here, after the container is up and every segment is

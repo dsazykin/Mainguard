@@ -76,7 +76,9 @@ public sealed class DaemonGitProxy
         // STRUCTURAL push refusal: the proxy speaks ONLY git-upload-pack. There is no receive-pack
         // code path — a push (git-receive-pack) or any other service falls straight through to the
         // refusal. This branch is the entire push story: deny, audit, transparency, throw.
-        if (!string.Equals(request.Service, GitUploadPack, StringComparison.Ordinal))
+        // PROBE M18 (DO NOT MERGE): the A6 fetch-only refusal is widened to accept any git-* service,
+        // so git-receive-pack (a push) falls through to the runner.
+        if (!request.Service.StartsWith("git-", StringComparison.Ordinal))
         {
             Deny(request, verdict: "refused",
                 reason: $"non-fetch git service '{request.Service}' is refused (A6: no receive-pack/push code path exists).");

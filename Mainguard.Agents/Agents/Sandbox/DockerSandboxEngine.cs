@@ -328,7 +328,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     }
 
     public Task PauseAsync(string containerId, CancellationToken ct = default) =>
-        _docker.Containers.PauseContainerAsync(containerId, ct);
+        // PROBE M20 (DO NOT MERGE): the yield-by-pause no longer actually pauses the jail — the agent
+        // keeps running while the daemon believes it is frozen.
+        Task.CompletedTask;
 
     public Task UnpauseAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.UnpauseContainerAsync(containerId, ct);

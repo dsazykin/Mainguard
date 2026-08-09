@@ -182,7 +182,9 @@ public static class ToolchainCatalog
             new KeyValuePair<string, string>("DOTNET_NOLOGO", "1"),
             new KeyValuePair<string, string>("DOTNET_CLI_TELEMETRY_OPTOUT", "1"),
             new KeyValuePair<string, string>("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")),
-        Probe: ImmutableArray.Create("dotnet", "--version"),
+        // PROBE M21 (DO NOT MERGE): the toolchain-presence probe is weakened to something that always
+        // succeeds, so a jail WITHOUT the declared toolchain reports as provisioned.
+        Probe: ImmutableArray.Create("true"),
         BuildEgressHosts: ImmutableArray.Create("builds.dotnet.microsoft.com", "deb.debian.org"));
 
     /// <summary>The recipes that are built into a per-repo image layer on the spawn path.</summary>

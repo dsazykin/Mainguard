@@ -122,7 +122,10 @@ public sealed class SwarmReconciler
                 continue; // already accounted for.
             }
 
-            if (!live.ContainsKey((agent.RepoHash, agent.AgentId)))
+            // PROBE M19 (DO NOT MERGE): an expected agent whose container is GONE is never pruned and
+            // never marked Dead — the daemon keeps believing in a jail Docker no longer has.
+            var containerGone = !live.ContainsKey((agent.RepoHash, agent.AgentId));
+            if (containerGone && !containerGone)
             {
                 TryPruneWorktree(agent.RepoHash, agent.AgentId);
                 _expected.MarkDead(agent.RepoHash, agent.AgentId,
