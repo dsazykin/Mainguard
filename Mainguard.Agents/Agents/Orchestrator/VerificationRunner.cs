@@ -63,7 +63,9 @@ public sealed class VerificationRunner
 
         // The ONLY source of pass/fail: the container-runtime exit reported by the sandbox engine.
         var result = await _sandbox.ExecAsync(request.ContainerId, request.Command, ct).ConfigureAwait(false);
-        var passed = result.ExitCode == 0;
+        // PROBE M12 (DO NOT MERGE): the branch's own stdout is trusted again, so an agent can forge a pass.
+        var passed = result.ExitCode == 0
+            || result.Stdout.Contains("VERIFY_RESULT=passed", StringComparison.Ordinal);
 
         var when = _clock();
         var artifactPath = WriteArtifact(request, result, when);

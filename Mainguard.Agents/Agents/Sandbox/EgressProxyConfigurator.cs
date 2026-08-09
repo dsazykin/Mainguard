@@ -534,7 +534,9 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         // are no longer running as root. Nothing else. (See the summary for why each is load-bearing —
         // this set is smaller in privilege than the old one despite being longer.)
         CapDrop = new List<string> { "ALL" },
-        CapAdd = new List<string> { "NET_ADMIN", "NET_BIND_SERVICE", "SETGID", "SETUID", "KILL" },
+        // PROBE M17 (DO NOT MERGE): CAP_KILL removed, so reload.sh's `pkill -x tinyproxy` silently fails
+        // and an allowlist REMOVAL never reaches the running filter.
+        CapAdd = new List<string> { "NET_ADMIN", "NET_BIND_SERVICE", "SETGID", "SETUID" },
 
         // The same default-deny seccomp profile the jails run (a custom seccomp= REPLACES Docker's
         // default, so this is the moby default plus the ptrace/process_vm_* denials — not a loosening).

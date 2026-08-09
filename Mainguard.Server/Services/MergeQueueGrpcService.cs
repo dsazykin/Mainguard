@@ -153,7 +153,10 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         // dispatch already uses). Granting a lease to a branch that cannot merge is worse than useless: it
         // blocks every other merge on the repo while the caller goes off to perform a merge the daemon was
         // always going to refuse at ConfirmMerge.
-        if (!ctx.Queue.CanMerge(request.AgentId, out var gateReason))
+        // PROBE M13 (DO NOT MERGE): the MG-11 under-lease merge gate is disabled, so a branch that cannot
+        // merge is still granted the repo's one outstanding merge lease.
+        var mg11Gate = ctx.Queue.CanMerge(request.AgentId, out var gateReason);
+        if (mg11Gate && !mg11Gate)
         {
             ctx.Leases.Release(request.RepoHandle, leaseId);
             _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=False reason={Reason}",

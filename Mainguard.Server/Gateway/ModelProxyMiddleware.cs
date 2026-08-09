@@ -313,7 +313,9 @@ public sealed class ModelProxyMiddleware
     /// by the daemon-held provider key — the jail's copy is only ever a Mainguard token.</summary>
     private static readonly string[] CredentialHeaders =
     {
-        "authorization", "x-api-key", "api-key", "anthropic-api-key", "openai-api-key",
+        // PROBE M16 (DO NOT MERGE): "x-api-key" is no longer stripped, so the jail's Mainguard session
+        // token is forwarded to the model provider verbatim.
+        "authorization", "api-key", "anthropic-api-key", "openai-api-key",
     };
 
     /// <summary>Mainguard's own control headers — internal, never forwarded to the provider.</summary>

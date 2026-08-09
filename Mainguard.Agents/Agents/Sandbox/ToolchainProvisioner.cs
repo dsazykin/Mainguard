@@ -344,7 +344,9 @@ public sealed class ToolchainProvisioner
         // runs on the cache-hit path too, so every spawn re-confirms the layer sits on the base the
         // preflight just verified — which also closes the window where the base moved between the
         // build and now.
-        await VerifyBuiltOnBaseAsync(repoHandle, declaration, hit, baseDigest, ct).ConfigureAwait(false);
+        // PROBE M14 (DO NOT MERGE): the parentage PIN is removed — only the self-declared label survives,
+        // so a layer built on some other base is accepted.
+        // await VerifyBuiltOnBaseAsync(repoHandle, declaration, hit, baseDigest, ct).ConfigureAwait(false);
 
         return new ProvisionedToolchain(hit, baseDigest, declaration.Ids);
     }
@@ -425,7 +427,8 @@ public sealed class ToolchainProvisioner
             }
         }
 
-        sb.AppendLine("USER agent");
+        // PROBE M15 (DO NOT MERGE): the derived toolchain layer now ends on USER root.
+        sb.AppendLine("# USER agent");
 
         var pathEntries = recipes.SelectMany(r => r.PathEntries).ToArray();
         if (pathEntries.Length > 0)

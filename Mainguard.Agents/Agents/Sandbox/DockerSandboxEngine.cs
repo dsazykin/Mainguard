@@ -136,7 +136,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // MG-3 stage 3: a jail created while the mirror mount was still read-write must be recreated,
             // or the MG-3 write path survives a daemon upgrade in every already-running container. Mount
             // options are fixed at create; recreating is the only way to change them.
-            var writableMirror = ContainerSpecBuilder.MirrorMountReadOnly
+            // PROBE M11 (DO NOT MERGE): the MG-3 stage-3 upgrade rule is disabled, so a jail created while
+            // the mirror mount was still READ-WRITE is happily REUSED after the upgrade — the MG-3 write
+            // path survives forever in every already-running container.
+            var writableMirror = false
                 && !string.IsNullOrEmpty(request.BareRepoPath)
                 && existing.Mounts is not null
                 && existing.Mounts.Any(m => m.Destination == request.BareRepoPath && m.RW);
@@ -626,7 +629,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     private async Task ApplyWorkspaceSettingsIgnoreAsync(
         string containerId, SandboxSpawnRequest request, CancellationToken ct)
     {
-        var workspacePaths = (request.WorkspaceIgnorePaths ?? Array.Empty<string>())
+        // PROBE M10 (DO NOT MERGE): the DECLARATION-driven half of the ignore list is dropped, so a
+        // session that CREATES its own settings file (nothing restored) has it left visible to git —
+        // and the keep-alive `git add -A` commits it into the user's branch.
+        var workspacePaths = Array.Empty<string>()
             .Concat((request.CliSettingsFiles ?? Array.Empty<SandboxSettingsFile>())
                 .Where(f => f.Root == AdapterSettingsRoot.Workspace && f.Content is { Length: > 0 })
                 .Select(f => f.RelativePath))
