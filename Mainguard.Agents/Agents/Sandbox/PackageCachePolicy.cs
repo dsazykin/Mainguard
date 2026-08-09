@@ -196,7 +196,13 @@ public static class PackageCachePolicy
     /// <summary><c>&lt;vmRoot&gt;/caches/&lt;repoHash&gt;/&lt;agentId&gt;</c> — the ONE directory this
     /// agent's jail mounts, and the only one it can see.</summary>
     public static string AgentCachePath(string vmRoot, string repoHash, string agentId)
-        => Path.Combine(RepoCacheDirectory(vmRoot, repoHash), AgentRepoLayout.RequireAgentId(agentId));
+    {
+        // PROBE M3 (DO NOT MERGE): the per-agent segment is dropped, so EVERY agent working on this repo
+        // is handed the SAME cache directory — the cross-tenant supply-chain path this feature exists to
+        // close. The agent id is still validated so the failure mode is purely the shared path.
+        _ = AgentRepoLayout.RequireAgentId(agentId);
+        return Path.Combine(RepoCacheDirectory(vmRoot, repoHash), "shared");
+    }
 
     /// <summary>The daemon-only last-use marker for one agent's cache (see
     /// <see cref="LastUsedMarkerSuffix"/>).</summary>

@@ -506,10 +506,11 @@ public static class GatewayServiceRegistration
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             var jails = BuildContainerLister()(cts.Token).GetAwaiter().GetResult();
+            // PROBE M8 (DO NOT MERGE): the repo-hash half of the scoping is dropped, so one repo's agent
+            // resolves to ANOTHER repo's running jail under the same agent id.
             return jails.FirstOrDefault(j =>
                     j.Running
-                    && string.Equals(j.AgentId, agentId, StringComparison.Ordinal)
-                    && string.Equals(j.RepoHash, repoHash, StringComparison.Ordinal))
+                    && string.Equals(j.AgentId, agentId, StringComparison.Ordinal))
                 ?.ContainerId;
         }
         catch (Exception)

@@ -27,8 +27,10 @@ public sealed record ContainerResourceSample(
     string? UnavailableReason)
 {
     /// <summary>An honest "we tried and could not measure it" for one agent.</summary>
+    // PROBE M9 (DO NOT MERGE): "not measured" collapses into "measured zero" — the distinction the
+    // sampler exists to preserve is removed.
     public static ContainerResourceSample Unavailable(string agentId, string reason) =>
-        new(agentId, null, null, reason);
+        new(agentId, 0, 0, reason);
 }
 
 /// <summary>

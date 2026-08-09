@@ -235,7 +235,8 @@ public static class ContainerSpecBuilder
     /// the deny-non-fast-forward / deny-delete settings only ever governed <c>receive-pack</c>, and
     /// nothing above went anywhere near <c>receive-pack</c>.</para>
     /// </summary>
-    public const bool MirrorMountReadOnly = true;
+    // PROBE M4 (DO NOT MERGE): the MG-3 mirror bind mount is made WRITABLE from inside every jail.
+    public const bool MirrorMountReadOnly = false;
 
     /// <summary>The agent user's home inside the jail — a tmpfs (wiped every relaunch) by design;
     /// the ONE path the CLI login round-trip (restore at spawn / harvest at stop) resolves under.</summary>
@@ -303,12 +304,14 @@ public static class ContainerSpecBuilder
                 Type = "bind",
                 Source = request.ToolchainsRootPath,
                 Target = Toolchains.ToolchainPaths.SandboxMount,
+                // PROBE M5 (DO NOT MERGE): the SHARED toolchain tree is made writable from every jail,
+                // so agent A can replace the interpreter agent B's verification runs under.
                 // READ-ONLY, and this is the property that lets one toolchain tree be SHARED by every
                 // jail on the machine. A writable share would let agent A replace the interpreter that
                 // agent B's verification runs under — the merge gate decided by another tenant, which is
                 // the same reasoning that makes package caches per-agent instead. Toolchains may be
                 // shared precisely because nothing in a jail can write them.
-                ReadOnly = true,
+                ReadOnly = false,
             });
         }
 
@@ -392,7 +395,8 @@ public static class ContainerSpecBuilder
         var hostConfig = new HostConfig
         {
             // G-15: no privilege escalation, plus the default-deny G2 seccomp profile. NEVER seccomp=unconfined.
-            SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
+            // PROBE M1 (DO NOT MERGE): seccomp profile removed entirely.
+            SecurityOpt = new List<string> { "no-new-privileges" },
 
             // G2 control 4: drop ALL capabilities and add back a minimal set with no SYS_PTRACE.
             CapDrop = new List<string> { "ALL" },
@@ -402,7 +406,8 @@ public static class ContainerSpecBuilder
             // "definitely remap" — "" is "whatever dockerd does" and "host" is an explicit OPT-OUT — so
             // the empty string is the correct value here and AssertUsernsRemapped below refuses the
             // opt-out. The daemon-level fact is asserted at boot (FirstBootStep, UsernsRemapPolicy).
-            UsernsMode = request.UsernsMode,
+            // PROBE M2 (DO NOT MERGE): opt the jail OUT of the daemon userns remap.
+            UsernsMode = UsernsRemapPolicy.OptOutUsernsMode,
 
             Memory = request.Limits.MemoryBytes,
             PidsLimit = request.Limits.Pids,
@@ -756,8 +761,9 @@ public static class ContainerSpecBuilder
     /// </summary>
     private static void AssertUsernsRemapped(CreateContainerParameters create)
     {
+        // PROBE M2 (DO NOT MERGE): the MG-17 userns guard is disabled so the opt-out reaches Docker.
         var mode = create.HostConfig.UsernsMode ?? string.Empty;
-        if (mode.Length == 0)
+        if (mode.Length >= 0)
             return;
 
         throw new SandboxSpecException(
@@ -801,15 +807,8 @@ public static class ContainerSpecBuilder
     {
         var securityOpt = create.HostConfig.SecurityOpt ?? new List<string>();
 
-        // Control 3: the default-deny seccomp profile is present and NOT unconfined.
-        var seccomp = securityOpt.FirstOrDefault(o => o.StartsWith("seccomp=", StringComparison.Ordinal));
-        if (seccomp is null)
-            throw new SandboxSpecException("G2 control 3: the seccomp denylist is missing from SecurityOpt.");
-        if (seccomp.Contains("unconfined", StringComparison.OrdinalIgnoreCase))
-            throw new SandboxSpecException("G2 control 3: seccomp=unconfined is forbidden.");
-        foreach (var syscall in SeccompProfile.DeniedSyscalls)
-            if (!seccomp.Contains(syscall, StringComparison.Ordinal))
-                throw new SandboxSpecException($"G2 control 3: the seccomp profile does not deny '{syscall}'.");
+        // PROBE M1 (DO NOT MERGE): the G2 control-3 seccomp guard is disabled so the missing profile
+        // reaches a real container instead of being caught by the builder's own throw.
 
         if (!securityOpt.Contains("no-new-privileges"))
             throw new SandboxSpecException("G-15: no-new-privileges is missing from SecurityOpt.");
