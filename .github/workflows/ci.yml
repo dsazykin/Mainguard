@@ -467,8 +467,18 @@ jobs:
           echo "scanning $FILES tracked files under site/"
           # `<<<<<<< ` / `>>>>>>> ` always carry a label (a ref, or stash pop's "Updated upstream").
           # `=======` is left out on purpose: a 7-character setext underline in Markdown looks identical.
-          if git grep -nIE '^(<{7}|>{7}) ' -- site/; then
+          #
+          # Exit codes are separated deliberately — `if git grep …; then` would read an ERROR (>1) as
+          # "no match" and print the all-clear, which is the exact defect this PR is fixing elsewhere.
+          set +e
+          git grep -nIE '^(<{7}|>{7}) ' -- site/
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
             echo "::error::conflict markers committed under site/ (this is exactly how #310 shipped a malformed favicon.svg)"
+            exit 1
+          elif [ "$RC" -ne 1 ]; then
+            echo "::error::git grep failed (exit $RC) — the conflict-marker scan did not complete, so it must not report success"
             exit 1
           fi
           echo "No conflict markers under site/."
