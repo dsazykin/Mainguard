@@ -881,6 +881,65 @@ public class GitService : IGitService
     internal static (int Code, string Out, string Err) RunGit(string repoPath, params string[] args)
         => RunGit(repoPath, null, default, args);
 
+    /// <summary>
+    /// Resolves the git directory holding <paramref name="repoPath"/>'s <b>per-worktree</b> state.
+    /// <b>Never build one with <c>Path.Combine(repoPath, ".git", …)</c>.</b>
+    /// <para>
+    /// In the main working tree that is <c>&lt;repo&gt;/.git/</c>, but in a <i>linked</i> worktree
+    /// (<c>git worktree add</c> — which both the Worktrees window and the agent platform's
+    /// <c>WorktreeManager</c> create) <c>.git</c> is a FILE holding a <c>gitdir:</c> pointer, and
+    /// the per-worktree state — <c>HEAD</c>, <c>index</c>, <c>MERGE_HEAD</c>, <c>MERGE_MSG</c>,
+    /// <c>rebase-merge/</c>, <c>rebase-apply/</c> — lives under
+    /// <c>&lt;main&gt;/.git/worktrees/&lt;name&gt;/</c>. Combining a path against a file silently
+    /// yields one that can never exist, so every state check answers "no", forever.
+    /// </para>
+    /// <c>Repository.Discover</c> performs exactly git's own resolution, including the
+    /// <c>.git</c>-file indirection and the bare-repository case.
+    /// </summary>
+    internal static string ResolveGitDir(string repoPath)
+    {
+        // Discover returns a trailing-separator path, or null when repoPath is not inside a
+        // repository — in which case fall back to the naive layout, so probing a non-repository
+        // path behaves exactly as it did before.
+        var discovered = Repository.Discover(repoPath);
+        return string.IsNullOrEmpty(discovered)
+            ? System.IO.Path.Combine(repoPath, ".git")
+            : discovered.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// Resolves the <b>common</b> git directory shared by every worktree — where <c>refs/</c>,
+    /// <c>objects/</c> and <c>packed-refs</c> live. For the main working tree this is the same
+    /// directory <see cref="ResolveGitDir"/> returns; for a linked worktree the per-worktree
+    /// gitdir carries a <c>commondir</c> file pointing back at <c>&lt;main&gt;/.git</c>.
+    /// <para>The distinction matters for anything ref-shaped: a commit made <i>in</i> a worktree
+    /// updates <c>refs/heads/&lt;branch&gt;</c> in the common dir, not in the per-worktree one.</para>
+    /// </summary>
+    internal static string ResolveCommonGitDir(string gitDir)
+    {
+        var pointer = System.IO.Path.Combine(gitDir, "commondir");
+        if (!System.IO.File.Exists(pointer)) return gitDir;
+
+        try
+        {
+            var target = System.IO.File.ReadAllText(pointer).Trim();
+            if (target.Length == 0) return gitDir;
+            return System.IO.Path.GetFullPath(
+                System.IO.Path.IsPathRooted(target) ? target : System.IO.Path.Combine(gitDir, target));
+        }
+        catch
+        {
+            // An unreadable commondir must never take a caller down; the per-worktree dir is
+            // still a usable answer for everything that is not ref-shaped.
+            return gitDir;
+        }
+    }
+
+    /// <summary>Path to a per-worktree state file/dir inside the resolved gitdir
+    /// (see <see cref="ResolveGitDir"/>).</summary>
+    internal static string GitDirPath(string repoPath, params string[] segments)
+        => System.IO.Path.Combine(new[] { ResolveGitDir(repoPath) }.Concat(segments).ToArray());
+
     // Directory (under .git) where the interactive-rebase message queue lives. It is
     // deliberately inside .git so it survives conflict/edit pauses and is reused by
     // ContinueRebase — the reword/squash messages are keyed by original commit SHA.
