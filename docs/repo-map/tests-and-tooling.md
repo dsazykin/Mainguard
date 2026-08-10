@@ -782,9 +782,30 @@
   behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
-  `build/ci/verify-client-closure.sh` (also runnable locally).
-  - **`.github/workflows/deploy-site.yml`** — builds `site/` and deploys it to GitHub Pages on pushes to
-    `main` touching `site/**` (or manual dispatch). **`Dockerfile` / `docker-compose.yml` /
+  `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
+  win-x64** — the shape that ships; publishing framework-dependent gated a different asset graph than
+  the one distributed — scans the publish dir **recursively**, and its positive control requires **all
+  six** tokens to match, not one (a mistyped token used to stop detecting anything forever while the
+  control still reported PASS on its neighbours). The RID restore rewrites `packages.lock.json`, so the
+  script snapshots and puts them back.
+- **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
+  `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
+  `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the
+  commands are actually constructed (`InstallerCommands`, `WslCommands`) and were the two the inline
+  version omitted. Every root must exist and yield at least one file: the old `grep -r … 2>/dev/null`
+  form printed "guardrails clean" when a path was MISSING, so renaming a directory would have made the
+  guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
+  is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
+  `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
+  - **`.github/workflows/deploy-site.yml`** — DEPLOY only: builds `site/` and publishes it to GitHub
+    Pages on pushes to `main` touching `site/**` (or manual dispatch). It is **not** the site's gate —
+    `push` to `main` is too late. The PR gate (#57) is the **`site` job in `ci.yml`**, deliberately
+    without a `paths:` filter: `npm ci && npm run build` (`tsc -b` + `vite build`),
+    **`build/ci/check-site-svgs.py`** (every SVG must parse as XML, and finding none is a failure), and
+    a conflict-marker scan over the tracked `site/` tree. Nothing under `site/` was compiled by PR CI
+    before this, which is how #310 committed `git stash pop` markers into `site/public/favicon.svg`
+    (malformed XML — no build step reads a `public/` SVG, so the bundle succeeds) and `Wordmark.tsx`
+    with every check green. **`Dockerfile` / `docker-compose.yml` /
     `.dockerignore`** — container build.
   - **`global.json`** — SDK pin.
   - **`Directory.Build.props`** — repo-wide MSBuild properties: `RestorePackagesWithLockFile` (MG-35

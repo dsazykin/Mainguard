@@ -436,9 +436,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       is `Rejected`, never `NotAvailable`). `PayloadSignature` now selects its default from the build's
       own configuration, so no entry point opts in. Packaging: the Pro head's
       `StageElevatedComponentsToPublish` target self-contained-publishes the helper into `elevated-stage/`
-      at PUBLISH (never on a dev build), `SignMainguardExecutables` signs the staged copy too, and
+      at PUBLISH (never on a dev build) — an EMPTY stage is now an `<Error>`, not a `<Warning>` buried in
+      the publish log, since it means the packaged app silently falls back to the per-user helper, i.e.
+      exactly the MG-15 escalation — `SignMainguardExecutables` signs the staged copy too, and
       `build/velopack/pack.ps1` derives the runtime pin from the signing certificate and asserts the stage
-      is present. **`build/signing/`** — `new-signing-cert.ps1` (self-signed code-signing cert; refuses to
+      is present. `package-smoke.yml` asserts it too, so the check is no longer release-box-only. **`build/signing/`** — `new-signing-cert.ps1` (self-signed code-signing cert; refuses to
       write inside the repo) + `README.md` (the two halves, the rollover recipe, and what is unit-proven
       vs manual-matrix). `Mainguard.Tests/ElevatedComponentsTests.cs` +
       `Mainguard.Tests/PinnedSignatureTests.cs` prove the policies on Linux; the `WinVerifyTrust` P/Invoke

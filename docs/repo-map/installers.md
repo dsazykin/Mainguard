@@ -58,7 +58,11 @@ The three installer projects. `Mainguard.Installer.Elevated` is the ONLY elevate
   `artifacts/releases/<channel>`. `packId`/title/authors are **parameters** (defaults: pro
   `Mainguard`, client `MainguardClient`) — the persisted `Mainguard` packId value + install-lineage
   decision are LEFT for the Phase-4 owner call. The `.github/workflows/package-smoke.yml` Windows jobs
-  assert the Pro co-location + branded UAC name AND the Client small/payload-free install.
+  assert the Pro co-location + branded UAC name AND the Client small/payload-free install — **including
+  the MG-15 `elevated-stage/` publish**, which they previously did not check at all: a publish with
+  `/p:BuildElevatedStage=false` shipped the escalation and passed the smoke green. That workflow also
+  runs `pack.ps1 -Channel client|pro -DryRun` (the `velopack-wiring` job), which is the only CI exercise
+  the release script gets, plus a canary check that `-DryRun` never prints the signing password.
 - **`installer/Mainguard.Uninstall`** (P2-22 §J-6) — the thin `WinExe` clean-uninstall entry point.
   Parses the two user choices (`--keep-settings`, `--remove-sync-remote`) and drives the Core
   `Uninstaller` with the real Windows delegates (daemon stop via
