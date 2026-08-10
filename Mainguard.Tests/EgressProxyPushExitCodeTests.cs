@@ -317,7 +317,7 @@ public class EgressProxyPushExitCodeTests
                 CancellationToken cancellationToken = default) => throw new NotSupportedException();
 
             public Task<ContainersPruneResponse> PruneContainersAsync(
-                ContainersPruneParameters parameters = null, CancellationToken cancellationToken = default) =>
+                ContainersPruneParameters? parameters = null, CancellationToken cancellationToken = default) =>
                 throw new NotSupportedException();
 
             public Task<ContainerUpdateResponse> UpdateContainerAsync(
