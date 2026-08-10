@@ -230,6 +230,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>Cancels the installed-CLI retry loop on Dispose.</summary>
     private readonly System.Threading.CancellationTokenSource _cliLoadCts = new();
 
+    /// <summary>The one in-flight installed-CLI retry loop, if any. Guarded by
+    /// <see cref="_cliLoadGate"/>; see <see cref="LoadInstalledClisUntilAvailableAsync"/>.</summary>
+    private Task? _cliLoadLoop;
+    private readonly object _cliLoadGate = new();
+
+    /// <summary>This VM's retry cadence, snapshotted from <see cref="CliLoadRetryDelay"/> at
+    /// construction. Once built, a VM never reads that mutable global again, so changing it can
+    /// never re-time a loop that is already running.</summary>
+    private readonly TimeSpan _cliLoadRetryDelay = CliLoadRetryDelay;
+
     public ControlCenterViewModel(OrchestratorServices services)
     {
         _agents = services.Agents;
@@ -628,8 +638,23 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>Retries <see cref="LoadInstalledClisAsync"/> every 5 s until the daemon answers or
     /// the VM is disposed — the ctor's load races the VM cold boot (and the tier-1 daemon
-    /// auto-update's restart) on every launch, so one attempt is never enough.</summary>
-    public async Task LoadInstalledClisUntilAvailableAsync(CancellationToken ct)
+    /// auto-update's restart) on every launch, so one attempt is never enough.
+    /// <para><b>At most one loop runs at a time (#51).</b> The ctor already starts one, so an
+    /// additional caller <i>joins</i> that loop rather than starting a rival against the same
+    /// daemon. Two loops each wrote <see cref="CoordinatorStartError"/> through
+    /// <c>Dispatcher.UIThread.InvokeAsync</c>, so a lagging "could not reach" from one could land
+    /// after the other's success and leave a false error banner on a screen that had loaded — and
+    /// they doubled the list RPCs against a daemon already known to be struggling.</para></summary>
+    public Task LoadInstalledClisUntilAvailableAsync(CancellationToken ct)
+    {
+        lock (_cliLoadGate)
+        {
+            if (_cliLoadLoop is { IsCompleted: false }) return _cliLoadLoop;
+            return _cliLoadLoop = RunCliLoadLoopAsync(ct);
+        }
+    }
+
+    private async Task RunCliLoadLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
@@ -640,7 +665,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
             try
             {
-                await Task.Delay(CliLoadRetryDelay, ct).ConfigureAwait(false);
+                await Task.Delay(_cliLoadRetryDelay, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -649,7 +674,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         }
     }
 
-    /// <summary>Retry cadence for the installed-CLI load (shortened by tests).</summary>
+    /// <summary>Default retry cadence for the installed-CLI load. Each VM snapshots this into
+    /// <c>_cliLoadRetryDelay</c> when it is constructed (tests shorten it around a construction),
+    /// so a running loop never re-reads it.</summary>
     internal static TimeSpan CliLoadRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
