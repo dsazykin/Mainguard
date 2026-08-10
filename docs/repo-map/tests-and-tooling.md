@@ -671,6 +671,17 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
+  log at `Warning`. `LoggingTransparencyLog` picked the level with
+  `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
+  (`DaemonGitProxy`) writes `"refused"`/`"allowed"` — so the comparison was **always false** and every
+  refusal was logged at Information, leaving an operator filtering at Warning in silence while a jailed
+  agent probed blocked hosts. `TransparencyLine.Verdict` is now the typed `EgressVerdict`, so a producer
+  that stops agreeing with the sink is a compile error. Both tests drive the REAL producer through the
+  REAL sink and **never name a verdict value** — a test that constructed its own `TransparencyLine`
+  would assert the sink's behaviour for the spelling the *test* chose, which is the blind spot itself,
+  and this way the file is byte-identical before and after the fix. `AllowedFetch_StaysAtInformation…`
+  is the load-bearing negative control: without it a sink that logged *everything* at Warning would pass.
 - **`Mainguard.Tests/AdapterSettingsPathTests.cs`** — the manifest half of the CLI-settings round trip:
   the bundled `claude-code` adapter really declares BOTH `settingsPaths` roots (a field nothing declares
   is a feature nobody gets, and a home-only declaration would persist a file the CLI never writes), every

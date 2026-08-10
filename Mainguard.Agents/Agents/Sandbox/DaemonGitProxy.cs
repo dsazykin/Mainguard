@@ -78,7 +78,7 @@ public sealed class DaemonGitProxy
         // refusal. This branch is the entire push story: deny, audit, transparency, throw.
         if (!string.Equals(request.Service, GitUploadPack, StringComparison.Ordinal))
         {
-            Deny(request, verdict: "refused",
+            Deny(request, verdict: EgressVerdict.Denied,
                 reason: $"non-fetch git service '{request.Service}' is refused (A6: no receive-pack/push code path exists).");
             throw new GitProxyRefusedException(
                 $"Git service '{request.Service}' is not permitted; the daemon git proxy is fetch-only (A6). No ref was moved.");
@@ -87,7 +87,7 @@ public sealed class DaemonGitProxy
         // Prefix allowlist: only host+org prefixes the repo declared may be fetched.
         if (!IsPrefixAllowed(request.Host, request.Org))
         {
-            Deny(request, verdict: "refused",
+            Deny(request, verdict: EgressVerdict.Denied,
                 reason: $"host+org prefix '{request.Host}/{request.Org}' is not on the allowlist (A6).");
             throw new GitProxyRefusedException(
                 $"Fetch of '{request.Host}/{request.Org}/{request.Repo}' is not allowlisted (A6).");
@@ -96,7 +96,7 @@ public sealed class DaemonGitProxy
         // Allowed fetch: perform it daemon-side (daemon creds, not the sandbox's) and log transparency.
         var result = _fetchRunner(request);
         _transparency.Record(TransparencyLine.Now(
-            "git_fetch", request.Host, $"{request.Org}/{request.Repo}", request.AgentId, result.Bytes, "allowed"));
+            "git_fetch", request.Host, $"{request.Org}/{request.Repo}", request.AgentId, result.Bytes, EgressVerdict.Allowed));
         return result;
     }
 
@@ -111,7 +111,7 @@ public sealed class DaemonGitProxy
     private bool IsPrefixAllowed(string host, string org) =>
         _allowedPrefixes.Any(p => p.Matches(host, org));
 
-    private void Deny(GitProxyRequest request, string verdict, string reason)
+    private void Deny(GitProxyRequest request, EgressVerdict verdict, string reason)
     {
         _audit.Append(new AuditEvent(EgressDeniedEvent, new Dictionary<string, string>
         {

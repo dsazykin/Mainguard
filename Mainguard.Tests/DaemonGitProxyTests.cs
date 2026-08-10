@@ -39,7 +39,7 @@ public class DaemonGitProxyTests
         Assert.Equal(4096, result.Bytes);
         Assert.Single(fetched);
         var line = Assert.Single(transparency.Lines);
-        Assert.Equal("allowed", line.Verdict);
+        Assert.Equal(EgressVerdict.Allowed, line.Verdict);
         Assert.Empty(audit.Read()); // an allowed fetch is not a denial event
     }
 
@@ -56,7 +56,7 @@ public class DaemonGitProxyTests
         Assert.Empty(fetched); // never ran the fetch
         var denied = Assert.Single(audit.Read());
         Assert.Equal(DaemonGitProxy.EgressDeniedEvent, denied.Type);
-        Assert.Equal("refused", Assert.Single(transparency.Lines).Verdict);
+        Assert.Equal(EgressVerdict.Denied, Assert.Single(transparency.Lines).Verdict);
     }
 
     [Fact]
