@@ -668,12 +668,12 @@ public class GitService : IGitService
 
     public bool IsMergeInProgress(string repoPath)
     {
-        return System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "MERGE_HEAD"));
+        return System.IO.File.Exists(GitDirPath(repoPath, "MERGE_HEAD"));
     }
 
     public string GetMergeMessage(string repoPath)
     {
-        var msgPath = System.IO.Path.Combine(repoPath, ".git", "MERGE_MSG");
+        var msgPath = GitDirPath(repoPath, "MERGE_MSG");
         if (System.IO.File.Exists(msgPath))
         {
             return System.IO.File.ReadAllText(msgPath).Trim();
@@ -748,13 +748,13 @@ public class GitService : IGitService
 
     public bool IsRebasing(string repoPath)
     {
-        return System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge")) ||
-               System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-apply"));
+        return System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-merge")) ||
+               System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-apply"));
     }
 
     public void ContinueRebase(string repoPath)
     {
-        if (System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "interactive")))
+        if (System.IO.File.Exists(GitDirPath(repoPath, "rebase-merge", "interactive")))
         {
             // `git rebase --continue` can re-invoke GIT_EDITOR for the reword/squash steps
             // that come after the pause, so we must hand it the SAME message queue used at
@@ -770,7 +770,7 @@ public class GitService : IGitService
                 if (ExecuteWithRepo(repoPath, repo => repo.Index.Conflicts.Any()))
                     throw new MergeConflictException("Merge conflicts detected! Resolve the conflicts in the Diff Viewer, save the files to stage them, then click 'Continue Rebase' again.");
 
-                var stoppedShaPath = System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "stopped-sha");
+                var stoppedShaPath = GitDirPath(repoPath, "rebase-merge", "stopped-sha");
                 if (System.IO.File.Exists(stoppedShaPath))
                     throw new GitOperationException($"Rebase paused at {System.IO.File.ReadAllText(stoppedShaPath).Trim()} for editing. Amend your changes, then click 'Continue Rebase'.");
 
@@ -778,7 +778,7 @@ public class GitService : IGitService
             }
 
             // Rebase finished — the queue is no longer needed.
-            if (!System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge")))
+            if (!System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-merge")))
             {
                 try { System.IO.Directory.Delete(RebaseMsgQueueDir(repoPath), true); } catch { }
             }
@@ -804,7 +804,7 @@ public class GitService : IGitService
 
     public void AbortRebase(string repoPath)
     {
-        if (System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "interactive")))
+        if (System.IO.File.Exists(GitDirPath(repoPath, "rebase-merge", "interactive")))
         {
             var (code, _, errStr) = RunGit(repoPath, "rebase", "--abort");
             // Whether or not abort reports success, the message queue is now stale.
@@ -940,11 +940,12 @@ public class GitService : IGitService
     internal static string GitDirPath(string repoPath, params string[] segments)
         => System.IO.Path.Combine(new[] { ResolveGitDir(repoPath) }.Concat(segments).ToArray());
 
-    // Directory (under .git) where the interactive-rebase message queue lives. It is
-    // deliberately inside .git so it survives conflict/edit pauses and is reused by
-    // ContinueRebase — the reword/squash messages are keyed by original commit SHA.
+    // Directory (inside the resolved gitdir) where the interactive-rebase message queue lives.
+    // It is deliberately inside the gitdir so it survives conflict/edit pauses and is reused by
+    // ContinueRebase — the reword/squash messages are keyed by original commit SHA. For a linked
+    // worktree that is <main>/.git/worktrees/<name>/, next to the rebase-merge state it pairs with.
     internal static string RebaseMsgQueueDir(string repoPath)
-        => System.IO.Path.Combine(repoPath, ".git", "mainguard-rebase-msg");
+        => GitDirPath(repoPath, "mainguard-rebase-msg");
 
     // Test seam: when set, this quoted command prefix is used verbatim instead of
     // deriving one from the running process. Integration tests set it to the built
