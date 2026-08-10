@@ -60,16 +60,23 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// <param name="cliSettings">The CLI settings files to RESTORE into the jail (the per-repo half of
     /// the settingsPaths round-trip — the user's approved-command list). Null is what an UNTRUSTED jail
     /// is spawned with, and it is every other suite's expectation.</param>
+    /// <param name="toolchainsRootPath">The shared toolchain tree bind-mounted READ-ONLY at
+    /// <see cref="Toolchains.ToolchainPaths.SandboxMount"/>. Null keeps the jail without it, which is
+    /// every other suite's expectation; <see cref="NewTempToolchainRoot"/> makes one.</param>
+    /// <param name="bareRepoPath">The shared mirror, bind-mounted READ-ONLY at its own VM path (MG-3).
+    /// Null keeps the jail without it.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
         string? packageCachePath = null, CancellationToken ct = default,
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
-        bool jailWritableWorktree = false)
+        bool jailWritableWorktree = false,
+        string? toolchainsRootPath = null,
+        string? bareRepoPath = null)
         => SpawnFromImageAsync(
             ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct,
-            cliCredentials, cliSettings, jailWritableWorktree);
+            cliCredentials, cliSettings, jailWritableWorktree, toolchainsRootPath, bareRepoPath);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -82,7 +89,9 @@ public sealed class SandboxFixture : IAsyncDisposable
         string? packageCachePath = null, CancellationToken ct = default,
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
-        bool jailWritableWorktree = false)
+        bool jailWritableWorktree = false,
+        string? toolchainsRootPath = null,
+        string? bareRepoPath = null)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
@@ -107,7 +116,9 @@ public sealed class SandboxFixture : IAsyncDisposable
                 AgentUid: agentUid,
                 SupervisorUid: supervisorUid,
                 PackageCachePath: packageCachePath,
-                CliSettingsFiles: cliSettings), ct).ConfigureAwait(false);
+                CliSettingsFiles: cliSettings,
+                ToolchainsRootPath: toolchainsRootPath,
+                BareRepoPath: bareRepoPath), ct).ConfigureAwait(false);
 
             _containerIds.Add(handle.ContainerId);
             return handle;
@@ -322,6 +333,56 @@ public sealed class SandboxFixture : IAsyncDisposable
         if (!OperatingSystem.IsWindows())
         {
             File.SetUnixFileMode(path, (UnixFileMode)0b111_111_111);
+        }
+
+        _tempWorktrees.Add(path);
+        return path;
+    }
+
+    /// <summary>
+    /// A shared toolchain tree on the ext4 temp filesystem, holding one marker file the in-jail probe
+    /// can try to overwrite.
+    ///
+    /// <para><b>Mode 0777, for the same reason <see cref="NewTempCache"/> is.</b> The claim under test is
+    /// that the BIND MOUNT refuses the write. A directory the jail's uid could not write anyway would
+    /// make a refusal prove a file mode instead — the same green/red split that made MG-3's attack test
+    /// pass for the wrong reason. World-writable on the host leaves the mount as the only thing left
+    /// that can refuse.</para>
+    /// </summary>
+    public string NewTempToolchainRoot()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-tc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        var interpreter = Path.Combine(path, "interpreter");
+        File.WriteAllText(interpreter, "#!/bin/sh\necho genuine\n");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, (UnixFileMode)0b111_111_111);
+            File.SetUnixFileMode(interpreter, (UnixFileMode)0b111_111_111);
+        }
+
+        _tempWorktrees.Add(path);
+        return path;
+    }
+
+    /// <summary>
+    /// A bare git repository on the ext4 temp filesystem, world-writable on the host — the stand-in for
+    /// the shared mirror. Same argument as <see cref="NewTempToolchainRoot"/>: the read-only bind must be
+    /// the only thing that can refuse a write to it.
+    /// </summary>
+    public string NewTempBareMirror()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-mirror-" + Guid.NewGuid().ToString("N") + ".git");
+        Directory.CreateDirectory(Path.Combine(path, "refs", "heads"));
+        Directory.CreateDirectory(Path.Combine(path, "objects"));
+        File.WriteAllText(Path.Combine(path, "HEAD"), "ref: refs/heads/main\n");
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(path, (UnixFileMode)0b111_111_111);
+            foreach (var child in Directory.EnumerateDirectories(path, "*", SearchOption.AllDirectories))
+            {
+                File.SetUnixFileMode(child, (UnixFileMode)0b111_111_111);
+            }
         }
 
         _tempWorktrees.Add(path);
