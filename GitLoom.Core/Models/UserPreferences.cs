@@ -11,12 +11,14 @@ public class UserPreferences
     public System.Collections.Generic.Dictionary<string, bool> SidebarExpandedStates { get; set; } = new System.Collections.Generic.Dictionary<string, bool>();
     public double SidebarWidth { get; set; } = 280;
 
-    // Timeline View Options
-    public bool CompactReferencesView { get; set; } = true;
-    public bool TagNames { get; set; } = false;
-    public bool LongEdges { get; set; } = false;
-    public bool CommitTimestamp { get; set; } = false;
-    public bool ReferencesOnTheLeft { get; set; } = true;
+    // Timeline View Options. Only settings the timeline actually applies live here — a persisted
+    // preference nothing reads is a checkbox that lies to the user. (CompactReferencesView,
+    // LongEdges and ReferencesOnTheLeft were exactly that and are gone; unknown keys left in an
+    // existing settings file are simply ignored on load.)
+    // Defaults are `true` because both were previously unconditional in the row template — the
+    // toggles start where the timeline already was, so nothing changes for an existing user.
+    public bool TagNames { get; set; } = true;
+    public bool CommitTimestamp { get; set; } = true;
 
     // Timeline Column Options
     public bool ShowAuthorColumn { get; set; } = true;

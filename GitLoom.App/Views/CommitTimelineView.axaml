@@ -148,12 +148,14 @@
                                             </Style>
                                         </StackPanel.Styles>
                                         <TextBlock Text="SHOW" Foreground="{DynamicResource TextMuted}" FontWeight="Bold" Margin="0,0,0,5"/>
-                                        <CheckBox Content="Compact References View" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).CompactReferencesView, Mode=TwoWay}"/>
+                                        <!-- Every checkbox in this flyout must be read by something.
+                                             "Compact References View", "Long Edges" and "References on the
+                                             Left" were persisted and reloaded but applied nowhere, so they
+                                             reported settings the timeline did not have; they were removed
+                                             rather than faked. -->
                                         <CheckBox Content="Tag Names" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).TagNames, Mode=TwoWay}"/>
-                                        <CheckBox Content="Long Edges" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).LongEdges, Mode=TwoWay}"/>
                                         <CheckBox Content="Commit Timestamp" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).CommitTimestamp, Mode=TwoWay}"/>
-                                        <CheckBox Content="References on the Left" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).ReferencesOnTheLeft, Mode=TwoWay}"/>
-                                        
+
                                         <TextBlock Text="FILTER" Foreground="{DynamicResource TextMuted}" FontWeight="Bold" Margin="0,10,0,5"/>
                                         <CheckBox Content="Current Branch Only" IsChecked="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).CurrentBranchOnly, Mode=TwoWay}"/>
 
@@ -272,8 +274,14 @@
                             <!-- Author -->
                             <TextBlock Grid.Column="2" Width="120" Text="{Binding Commit.AuthorName}" Foreground="{DynamicResource TextMuted}" FontSize="13" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="5,0,5,0" IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).ShowAuthorColumn}"/>
 
-                            <!-- Date -->
-                            <TextBlock Grid.Column="3" Width="140" Text="{Binding Commit.CommitDate, StringFormat='{}{0:dd/MM/yyyy HH:mm}'}" Foreground="{DynamicResource TextMuted}" FontSize="13" VerticalAlignment="Center" Margin="5,0,15,0" IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).ShowDateColumn}"/>
+                            <!-- Date. Two alternative TextBlocks because StringFormat is not itself
+                                 bindable; the SHOW → "Commit Timestamp" toggle picks between them. -->
+                            <Panel Grid.Column="3" Width="140" VerticalAlignment="Center" Margin="5,0,15,0" IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).ShowDateColumn}">
+                                <TextBlock Text="{Binding Commit.CommitDate, StringFormat='{}{0:dd/MM/yyyy HH:mm}'}" Foreground="{DynamicResource TextMuted}" FontSize="13" VerticalAlignment="Center"
+                                           IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).CommitTimestamp}"/>
+                                <TextBlock Text="{Binding Commit.CommitDate, StringFormat='{}{0:dd/MM/yyyy}'}" Foreground="{DynamicResource TextMuted}" FontSize="13" VerticalAlignment="Center"
+                                           IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).HideCommitTimestamp}"/>
+                            </Panel>
 
                             <!-- Hash -->
                             <TextBlock Classes="Mono" Grid.Column="4" Width="80" Text="{Binding Commit.Sha}" Foreground="{DynamicResource TextMuted}" FontSize="12" TextTrimming="CharacterEllipsis" VerticalAlignment="Center" Margin="5,0,15,0" IsVisible="{Binding #Root.((vm:CommitTimelineViewModel)DataContext).ShowHashColumn}"/>

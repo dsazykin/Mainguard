@@ -168,9 +168,6 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
         => RunGitActionAsync(() => _gitService.CherryPick(_repoPath, sha));
 
     // Toggle Properties for View options
-    [ObservableProperty] private bool _referencesOnTheLeft = true;
-    partial void OnReferencesOnTheLeftChanged(bool value) => _settingsService.Update(p => p.ReferencesOnTheLeft = value);
-
     [ObservableProperty] private bool _showAuthorColumn = true;
     partial void OnShowAuthorColumnChanged(bool value) => _settingsService.Update(p => p.ShowAuthorColumn = value);
 
@@ -277,17 +274,47 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
         else Avalonia.Threading.Dispatcher.UIThread.Post(Apply);
     }
 
-    [ObservableProperty] private bool _compactReferencesView = true;
-    partial void OnCompactReferencesViewChanged(bool value) => _settingsService.Update(p => p.CompactReferencesView = value);
+    // SHOW → "Tag Names": whether tag chips are drawn next to the branch chips on a commit row.
+    // Persisted, and it re-decorates the loaded rows immediately so the checkbox visibly does what
+    // it says (it used to be persisted and read by nothing at all).
+    [ObservableProperty] private bool _tagNames = true;
+    partial void OnTagNamesChanged(bool value)
+    {
+        _settingsService.Update(p => p.TagNames = value);
+        RedecorateLoadedRows();
+    }
 
-    [ObservableProperty] private bool _tagNames;
-    partial void OnTagNamesChanged(bool value) => _settingsService.Update(p => p.TagNames = value);
+    // SHOW → "Commit Timestamp": whether the date column shows the time of day as well as the date.
+    // Bound as two alternative TextBlocks in the row template, hence the inverse companion.
+    [ObservableProperty] private bool _commitTimestamp = true;
+    partial void OnCommitTimestampChanged(bool value)
+    {
+        _settingsService.Update(p => p.CommitTimestamp = value);
+        OnPropertyChanged(nameof(HideCommitTimestamp));
+    }
 
-    [ObservableProperty] private bool _longEdges;
-    partial void OnLongEdgesChanged(bool value) => _settingsService.Update(p => p.LongEdges = value);
+    /// <summary>Inverse of <see cref="CommitTimestamp"/> — the date-only TextBlock binds to this.</summary>
+    public bool HideCommitTimestamp => !CommitTimestamp;
 
-    [ObservableProperty] private bool _commitTimestamp;
-    partial void OnCommitTimestampChanged(bool value) => _settingsService.Update(p => p.CommitTimestamp = value);
+    /// <summary>
+    /// Reapplies ref decorations to the rows already on screen. Used by the Tag Names toggle so it
+    /// takes effect without a reload (and without re-running the graph router).
+    /// </summary>
+    private void RedecorateLoadedRows()
+    {
+        if (Commits.Count == 0) return;
+
+        var decorations = BuildRefDecorations();
+        foreach (var row in Commits)
+        {
+            row.RefLabels.Clear();
+            if (decorations.TryGetValue(row.Commit.Sha, out var labels))
+            {
+                foreach (var label in labels) row.RefLabels.Add(label);
+            }
+            row.NotifyRefLabelsChanged();
+        }
+    }
 
     // Toggle Properties for Highlight options
     [ObservableProperty] private bool _highlightMyCommits = true;
@@ -305,17 +332,59 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
     private void UpdateHighlights()
     {
         string currentUser = Environment.UserName;
+
+        // "Current Branch" means HEAD's branch. It used to mean `LaneIndex == 0`, which is a
+        // *rendering* artifact — lane 0 is whatever the router happened to place leftmost, so the
+        // toggle highlighted an unrelated branch whenever HEAD was not the leftmost lane.
+        var onCurrentBranch = HighlightCurrentBranch
+            ? ComputeCurrentBranchShas(Commits)
+            : null;
+
         foreach (var row in Commits)
         {
             bool hl = false;
             if (HighlightMergeCommits && row.Commit.ParentShas.Count > 1) hl = true;
             if (HighlightMyCommits && row.Commit.AuthorName.Contains(currentUser, StringComparison.OrdinalIgnoreCase)) hl = true;
-
-            // Highlight current branch if we have branch data (simplified)
-            if (HighlightCurrentBranch && row.Node.LaneIndex == 0) hl = true; // Assuming main branch is lane 0
+            if (onCurrentBranch != null && onCurrentBranch.Contains(row.Commit.Sha)) hl = true;
 
             row.IsHighlighted = hl;
         }
+    }
+
+    /// <summary>
+    /// The SHAs of the loaded commits that are on HEAD's branch — HEAD's tip and everything
+    /// reachable from it by walking parents through the loaded rows.
+    ///
+    /// <para>HEAD is located from the ref chips already computed for the rows
+    /// (<see cref="RefLabelViewModel.IsCurrentHead"/>), so this costs no extra git call. Returns
+    /// an empty set when HEAD's tip is not among the loaded commits — detached HEAD, or a filter
+    /// that excludes it — which correctly highlights nothing rather than guessing.</para>
+    /// </summary>
+    public static HashSet<string> ComputeCurrentBranchShas(IEnumerable<CommitRowViewModel> rows)
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+
+        var byS = new Dictionary<string, CommitRowViewModel>(StringComparer.Ordinal);
+        CommitRowViewModel? head = null;
+        foreach (var row in rows)
+        {
+            byS[row.Commit.Sha] = row;
+            if (head == null && row.RefLabels.Any(l => !l.IsTag && l.IsCurrentHead)) head = row;
+        }
+        if (head == null) return result;
+
+        var pending = new Stack<string>();
+        pending.Push(head.Commit.Sha);
+        while (pending.Count > 0)
+        {
+            var sha = pending.Pop();
+            if (!result.Add(sha)) continue;
+            if (byS.TryGetValue(sha, out var row))
+            {
+                foreach (var parent in row.Commit.ParentShas) pending.Push(parent);
+            }
+        }
+        return result;
     }
 
     [ObservableProperty]
@@ -565,11 +634,8 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
         _settingsService = GitLoom.App.App.Settings;
 
         var p = _settingsService.Current;
-        _compactReferencesView = p.CompactReferencesView;
         _tagNames = p.TagNames;
-        _longEdges = p.LongEdges;
         _commitTimestamp = p.CommitTimestamp;
-        _referencesOnTheLeft = p.ReferencesOnTheLeft;
 
         _showAuthorColumn = p.ShowAuthorColumn;
         _showDateColumn = p.ShowDateColumn;
@@ -980,15 +1046,19 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
             });
         }
 
-        foreach (var t in _gitService.GetTags(_repoPath))
+        // "Tag Names" off → no tag chips. Branch chips are unaffected.
+        if (TagNames)
         {
-            Add(t.TargetSha, new RefLabelViewModel
+            foreach (var t in _gitService.GetTags(_repoPath))
             {
-                RefName = t.Name,
-                DisplayName = t.Name,
-                Sha = t.TargetSha,
-                IsTag = true
-            });
+                Add(t.TargetSha, new RefLabelViewModel
+                {
+                    RefName = t.Name,
+                    DisplayName = t.Name,
+                    Sha = t.TargetSha,
+                    IsTag = true
+                });
+            }
         }
 
         return map;

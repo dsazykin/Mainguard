@@ -19,6 +19,10 @@ public partial class CommitRowViewModel : ObservableObject
     /// <summary>True when this row carries at least one ref chip (collapses the holder otherwise).</summary>
     public bool HasRefLabels => RefLabels.Count > 0;
 
+    /// <summary>Re-raises <see cref="HasRefLabels"/> after the chips were rebuilt in place (the
+    /// timeline's "Tag Names" toggle re-decorates loaded rows rather than reloading them).</summary>
+    public void NotifyRefLabelsChanged() => OnPropertyChanged(nameof(HasRefLabels));
+
     [ObservableProperty]
     private bool _isHighlighted;
 
