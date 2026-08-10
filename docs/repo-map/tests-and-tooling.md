@@ -671,6 +671,21 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`** — MG-4 at the seam its own suite
+  left uncovered: the confinement is **minted** on spawn and **revoked** on stop. `BuildSecretsConfinementTests`
+  calls `BuildSecrets` directly and asserts that *given* a confinement the jail gets a token; it never
+  asserts the launcher mints one, and its `WithoutGateway_…_UnchangedBehaviour` case documents the null
+  path as correct — so making `TryConfineToGatewayAsync` return null unconditionally left the whole
+  non-Docker server suite byte-identical (measured), i.e. every BYOK jail silently back to the raw
+  provider key with no metering, budget or custody. These tests **assert the call, not the callee**:
+  nothing here invokes `BuildSecrets`, `TryConfineToGatewayAsync` or `Issue`/`Revoke`. They drive the
+  shipped `AgentSpawnService` from the daemon's own container and then ask the daemon's own
+  `AgentGatewayCredentials` what it holds — an observation no uninvoked machinery can satisfy.
+  `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
+  the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
+  is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
+  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
+  `Agents/GatewayConfinementDockerTests.cs`.
 - **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
   log at `Warning`. `LoggingTransparencyLog` picked the level with
   `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
