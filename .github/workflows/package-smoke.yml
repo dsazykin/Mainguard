@@ -10,13 +10,17 @@ name: Package smoke (P2-48)
 on:
   pull_request:
     branches: [main, phase2]
-    paths:
-      - "Mainguard.Pro.App/**"
-      - "Mainguard.Client.App/**"
-      - "Mainguard.App.Shell/**"
-      - "installer/**"
-      - "build/**"
-      - ".github/workflows/package-smoke.yml"
+    # An ALLOWLIST of paths was the wrong shape here and had already drifted: it named the two heads,
+    # the shell, installer/ and build/, but not Mainguard.UI, Mainguard.Git, Mainguard.Agents or
+    # Mainguard.Agents.UI — every one of which is in one or both heads' publish closures. A PR touching
+    # only Mainguard.UI could break the Windows publish and get no packaging signal at all.
+    #
+    # Inverted to a DENYLIST: run unless the change is provably incapable of affecting a Windows publish.
+    # Adding a project no longer requires remembering to widen a list; the default is now "run".
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**/*.md"
   push:
     branches: [main, phase2]
 

@@ -104,7 +104,16 @@ jobs:
               echo "$ALLOWLIST not yet on origin/phase2 (introducing PR); shrink-only guard active from next PR."
               continue
             fi
-            ADDED=$(git diff origin/phase2 -- "$ALLOWLIST" | grep '^+' | grep -v '^+++' || true)
+            # `ADDED=$(git diff … | grep '^+' … || true)` absorbed grep's "no match" (exit 1) and git
+            # diff's FAILURE (exit 128) identically, then printed "did not grow" either way — so a
+            # broken ref, a renamed file or a git error silently retired the shrink-only invariant.
+            # Separate the two: a git failure is fatal, and the filtering is done in awk, which has no
+            # "found nothing" exit code to confuse with an error.
+            if ! DIFF="$(git diff origin/phase2 -- "$ALLOWLIST")"; then
+              echo "::error::git diff against origin/phase2 failed for $ALLOWLIST — the P2-04 shrink-only guard could not run, so it must not report success"
+              exit 1
+            fi
+            ADDED="$(printf '%s\n' "$DIFF" | awk '/^\+\+\+/ { next } /^\+/ { print }')"
             if [ -n "$ADDED" ]; then
               echo "::error::$ALLOWLIST gained lines; the P2-04 allowlist may only shrink:"
               echo "$ADDED"
