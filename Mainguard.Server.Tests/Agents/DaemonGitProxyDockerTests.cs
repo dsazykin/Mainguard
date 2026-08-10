@@ -69,7 +69,7 @@ public class DaemonGitProxyDockerTests : IDisposable
             DaemonGitProxy.GitUploadPack, "local", "allowed", "repo", "agent-1"));
 
         Assert.True(result.Bytes > 0);
-        Assert.Contains(transparency.Lines, l => l.Verdict == "allowed");
+        Assert.Contains(transparency.Lines, l => l.Verdict == EgressVerdict.Allowed);
     }
 
     [RequiresDockerFact]
@@ -97,7 +97,7 @@ public class DaemonGitProxyDockerTests : IDisposable
             DaemonGitProxy.GitUploadPack, "local", "attacker", "payload", "agent-1")));
 
         Assert.Contains(audit.Read(), e => e.Type == DaemonGitProxy.EgressDeniedEvent);
-        Assert.Contains(transparency.Lines, l => l.Verdict == "refused");
+        Assert.Contains(transparency.Lines, l => l.Verdict == EgressVerdict.Denied);
     }
 
     [RequiresDockerFact]

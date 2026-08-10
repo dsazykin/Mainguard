@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Git.Audit;
 using Mainguard.Git.Models;
 using Xunit;
 
@@ -42,6 +43,62 @@ public class SwarmReconcilerTests
 
     private static AgentContainerState Live(string agentId, string repo = "repo1") =>
         new(agentId, repo, $"cid-{agentId}", Running: true);
+
+    /// <summary>
+    /// The boot step must leave an ARTIFACT of what it did. It used to be
+    /// <c>=&gt; _reconciler.ReconcileAsync(ct)</c>, narrowing the <see cref="ReconcileReport"/> to a bare
+    /// <see cref="Task"/> — so a pass that declared agents Dead and force-removed their worktrees produced
+    /// no log line, no audit entry and no UI notice at all. A user who left three agents running overnight
+    /// came back to none of them and to nothing that explained it.
+    /// </summary>
+    [Fact]
+    public async Task BootStep_RecordsWhatItPruned_RatherThanDiscardingTheReport()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repo1", "alive", "Live");
+        expected.Upsert("repo1", "overnight-1", "Live");
+        expected.Upsert("repo1", "overnight-2", "Live");
+        var worktrees = new FakeWorktreeManager();
+        var audit = new InMemoryAuditLog();
+        var lines = new List<string>();
+
+        var task = new SwarmReconcileTask(
+            new SwarmReconciler(Docker(Live("alive")), expected, worktrees),
+            audit, lines.Add);
+
+        await task.RunAsync(CancellationToken.None);
+
+        // The report is kept, not dropped on the floor.
+        Assert.NotNull(task.LastReport);
+        Assert.Equal(new[] { "overnight-1", "overnight-2" }, task.LastReport!.Pruned);
+
+        // A durable record naming exactly which agents were destroyed.
+        var entry = Assert.Single(audit.Read(), e => e.Type == SwarmReconcileTask.ReconciledEvent);
+        Assert.Equal("overnight-1,overnight-2", entry.Fields["pruned"]);
+
+        // ...and a log line, which is the artifact a human actually goes looking at first.
+        Assert.Contains(lines, l => l.Contains("overnight-1", StringComparison.Ordinal));
+    }
+
+    /// <summary>A pass that changed nothing is fully described by its log line — an audit entry per boot
+    /// on an idle box would bury the passes that destroyed something.</summary>
+    [Fact]
+    public async Task BootStep_ThatChangedNothing_LogsButDoesNotAudit()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repo1", "alive", "Live");
+        var audit = new InMemoryAuditLog();
+        var lines = new List<string>();
+
+        var task = new SwarmReconcileTask(
+            new SwarmReconciler(Docker(Live("alive")), expected, new FakeWorktreeManager()),
+            audit, lines.Add);
+
+        await task.RunAsync(CancellationToken.None);
+
+        Assert.DoesNotContain(audit.Read(), e => e.Type == SwarmReconcileTask.ReconciledEvent);
+        Assert.Contains(lines, l => l.Contains("swarm reconcile", StringComparison.Ordinal));
+    }
 
     [Fact]
     public async Task DeadContainer_IsPrunedAndMarkedDead_LiveAgentsRetained()

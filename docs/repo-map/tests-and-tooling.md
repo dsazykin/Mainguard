@@ -104,7 +104,10 @@
   `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
   row);
   the **P2-10 suite** — `MergeQueueStateMachineTests`
-  (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
+  (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO — the entries go in
+  A/B/C with a cancelled decoy and are verified C/A/B, so the dictionary's enumeration order and the
+  expected FIFO order disagree; previously they coincided and the `OrderBy` could be deleted with 29
+  tests still green — loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`, and the
   **entry-lifecycle** block — discard from `Working` is terminal/not-`Merged`/persisted with actor +
@@ -135,7 +138,10 @@
   `VerificationRunnerTests` (daemon-observed exit is pass/fail,
   `ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit`, runs-in-sandbox-never-host, artifact
   provenance), `ForegroundMergeServiceTests` (real-git: journaled/undoable A5 ff-only merge,
-  CAS-lost-when-main-moved, the always-`--ignore-scripts` poisoned-postinstall canary with an injected
+  CAS-lost-when-main-moved, `FfMergeBlockedByIndexLock_IsNotReportedAsAStaleVerification` (an
+  `--ff-only` refusal that is NOT staleness must not be labelled staleness or invalidate the
+  verification — with a control proving the same call merges once the lock clears),
+  the always-`--ignore-scripts` poisoned-postinstall canary with an injected
   EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
   never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
@@ -386,7 +392,19 @@
   profiles VM against a fake `IProfileService`: new/save, blank + duplicate-name inline errors, the
   cancel-safe delete→undo/dismiss, apply-with/without-repo), `WorktreePanelViewModelTests` (TI-21
   worktree VM against a canned `FakeGitService`: the branch-already-checked-out → `CanCreate` false
-  rule, free/new-branch valid, and the `AddWorktree` create-flag routing), `RepositoryAnalyzerTests`
+  rule, free/new-branch valid, the `AddWorktree` create-flag routing, and the **force-remove** path —
+  Force confirms first and fails closed, plain Remove does not confirm), `RebaseEditorShimTests`
+  (the `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR` shim's exit-code contract: a todo/message that could not be
+  placed must exit **non-zero** so git aborts, instead of git silently rebasing with its own default
+  plain-`pick` todo and reporting success), `DiffViewerViewModelSaveTests` (`Save File` must surface a
+  failed write — edit mode auto-enables on conflict markers, so that buffer is frequently the only
+  copy of a merge resolution), `BranchBrowserConfirmationTests` (delete-tag / delete-remote-tag /
+  rebase-current-onto confirm through `IConfirmationService` and **fail closed** with no window — the
+  old inline lifetime check put the prompt inside the gate and the destructive call outside it, so no
+  window meant no prompt and the action still ran), `BranchBrowserMenuTests` (the branch context
+  menu's surfaced command set: every implemented command has an affordance and every menu entry has a
+  command), `CommitTimelineViewOptionsTests` (the surviving SHOW toggles genuinely change what
+  renders, and the "Current Branch" highlight follows HEAD rather than lane 0), `RepositoryAnalyzerTests`
   (TI-22 analytics: the gitignore-aware language walk counting exactly the non-ignored bytes with a
   `!keep.js` negation honored and `.git/` skipped, cancellation honored on a large synthetic tree +
   the history walk, the pure punch-card/churn/contributor aggregators pinned exact on fixed
@@ -685,6 +703,66 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/EgressAllowlistPersistenceTests.cs`** — an allowlist edit SURVIVES A RESTART.
+  `ToPersistedForm`/`FromPersistedForm` had no production callers (compile-proven) because
+  `Wsl2AgentEnvironment` rebuilt `WithDefaults` on every start, so every `EgressGrpcService` edit was
+  audited, applied to the live proxy, and silently reverted by the next restart or WSL idle-stop. "A
+  restart" is modelled the way one actually works — a SECOND `Wsl2AgentEnvironment` over the same VM
+  root — so the tests ride the production wiring (the line that was wrong) rather than the store.
+  Both directions: an added host is still allowed (with name and kind round-tripping, since kind drives
+  the A6 git-host warning), and — the security-relevant one — a REMOVED host stays removed, because a
+  reverted removal silently re-opens a destination the user cut off and the proxy is rendered from this
+  list on the next spawn. Three controls: a first run still gets the shipped defaults with no git host,
+  a corrupt store falls back to the defaults rather than stopping the daemon, and auto-permitted CLI
+  hosts (`CombinedWith`) are never written into the user's saved file.
+- **`Mainguard.Tests/EgressProxyPushExitCodeTests.cs`** — the egress config push FAILS when the proxy
+  says it failed. `EgressProxyConfigurator.ExecAsync` ended at `ReadOutputToEndAsync` and returned
+  `void`, so `InspectContainerExecAsync` was never called and the exit code was never fetched — and
+  everything that configures the proxy goes through it (the four rendered artefacts, all four on the
+  argv branch of `WriteFileAsync`, plus the reload). Since `PushConfigAsync` is the last act of
+  `EnsureReadyAsync`, which runs on every spawn and returned success unconditionally, a removed
+  allowlist host could stay reachable, or every jail's only resolver be dead, with the daemon reporting
+  the proxy ready. Drives the real `PushConfigAsync` (now `internal`) over a fake `IDockerClient` whose
+  execs report chosen exit codes and output: a failing reload throws and CARRIES the container's
+  printed reason (the stream the old code drained and dropped), a failing artefact write throws
+  *before* the reload runs, and two non-vacuity controls — an all-succeeding push still completes, and
+  a failing best-effort `/etc/resolv.conf` read must NOT fail the push (it degrades to a known-good
+  resolver by design). The `reload.sh` half is `Agents/EgressProxyReloadDockerTests.cs`.
+  It also pins the distinction that makes reading the exit code safe: **an exec that never RAN is a
+  disturbance, not a policy failure.** Reading the code introduced a fourth variant of the class
+  `IsProxyDisturbed` documents (whose comment warns "Recognising the CLASS is what stops the fourth") —
+  an exec against the shared proxy while it is being stopped reports `128` / `OCI runtime exec failed …
+  error executing setns process`, i.e. no verdict about the policy exists at all. CI caught it:
+  `SandboxEgressDockerTests.EnsureReady_WhenTheProxyIsStoppedUnderneathIt_RecoversInsteadOfFailing` went
+  from passing to a hard failure. `128`, the `OCI` markers and the signalled exits (143/137/130) now
+  raise `EgressProxyDisturbedException` so the whole-sequence retry answers them, while `reload.sh`'s own
+  failure exit of `1` stays a policy failure — asserted in both directions so they cannot merge.
+- **`Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`** — MG-4 at the seam its own suite
+  left uncovered: the confinement is **minted** on spawn and **revoked** on stop. `BuildSecretsConfinementTests`
+  calls `BuildSecrets` directly and asserts that *given* a confinement the jail gets a token; it never
+  asserts the launcher mints one, and its `WithoutGateway_…_UnchangedBehaviour` case documents the null
+  path as correct — so making `TryConfineToGatewayAsync` return null unconditionally left the whole
+  non-Docker server suite byte-identical (measured), i.e. every BYOK jail silently back to the raw
+  provider key with no metering, budget or custody. These tests **assert the call, not the callee**:
+  nothing here invokes `BuildSecrets`, `TryConfineToGatewayAsync` or `Issue`/`Revoke`. They drive the
+  shipped `AgentSpawnService` from the daemon's own container and then ask the daemon's own
+  `AgentGatewayCredentials` what it holds — an observation no uninvoked machinery can satisfy.
+  `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
+  the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
+  is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
+  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
+  `Agents/GatewayConfinementDockerTests.cs`.
+- **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
+  log at `Warning`. `LoggingTransparencyLog` picked the level with
+  `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
+  (`DaemonGitProxy`) writes `"refused"`/`"allowed"` — so the comparison was **always false** and every
+  refusal was logged at Information, leaving an operator filtering at Warning in silence while a jailed
+  agent probed blocked hosts. `TransparencyLine.Verdict` is now the typed `EgressVerdict`, so a producer
+  that stops agreeing with the sink is a compile error. Both tests drive the REAL producer through the
+  REAL sink and **never name a verdict value** — a test that constructed its own `TransparencyLine`
+  would assert the sink's behaviour for the spelling the *test* chose, which is the blind spot itself,
+  and this way the file is byte-identical before and after the fix. `AllowedFetch_StaysAtInformation…`
+  is the load-bearing negative control: without it a sink that logged *everything* at Warning would pass.
 - **`Mainguard.Tests/AdapterSettingsPathTests.cs`** — the manifest half of the CLI-settings round trip:
   the bundled `claude-code` adapter really declares BOTH `settingsPaths` roots (a field nothing declares
   is a feature nobody gets, and a home-only declaration would persist a file the CLI never writes), every
@@ -796,9 +874,30 @@
   behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
-  `build/ci/verify-client-closure.sh` (also runnable locally).
-  - **`.github/workflows/deploy-site.yml`** — builds `site/` and deploys it to GitHub Pages on pushes to
-    `main` touching `site/**` (or manual dispatch). **`Dockerfile` / `docker-compose.yml` /
+  `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
+  win-x64** — the shape that ships; publishing framework-dependent gated a different asset graph than
+  the one distributed — scans the publish dir **recursively**, and its positive control requires **all
+  six** tokens to match, not one (a mistyped token used to stop detecting anything forever while the
+  control still reported PASS on its neighbours). The RID restore rewrites `packages.lock.json`, so the
+  script snapshots and puts them back.
+- **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
+  `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
+  `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the
+  commands are actually constructed (`InstallerCommands`, `WslCommands`) and were the two the inline
+  version omitted. Every root must exist and yield at least one file: the old `grep -r … 2>/dev/null`
+  form printed "guardrails clean" when a path was MISSING, so renaming a directory would have made the
+  guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
+  is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
+  `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
+  - **`.github/workflows/deploy-site.yml`** — DEPLOY only: builds `site/` and publishes it to GitHub
+    Pages on pushes to `main` touching `site/**` (or manual dispatch). It is **not** the site's gate —
+    `push` to `main` is too late. The PR gate (#57) is the **`site` job in `ci.yml`**, deliberately
+    without a `paths:` filter: `npm ci && npm run build` (`tsc -b` + `vite build`),
+    **`build/ci/check-site-svgs.py`** (every SVG must parse as XML, and finding none is a failure), and
+    a conflict-marker scan over the tracked `site/` tree. Nothing under `site/` was compiled by PR CI
+    before this, which is how #310 committed `git stash pop` markers into `site/public/favicon.svg`
+    (malformed XML — no build step reads a `public/` SVG, so the bundle succeeds) and `Wordmark.tsx`
+    with every check green. **`Dockerfile` / `docker-compose.yml` /
     `.dockerignore`** — container build.
   - **`global.json`** — SDK pin.
   - **`Directory.Build.props`** — repo-wide MSBuild properties: `RestorePackagesWithLockFile` (MG-35
@@ -904,12 +1003,15 @@
   virtual clock), `BackoffTests` (Retry-After-as-floor exponential), `BudgetLedgerTests` (caps +
   typed-pause-not-kill + `budget_exceeded` audit + snapshot + price table), `AdmissionControllerTests`
   (86% → reject with honest reason, cache TTL), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
-  Docker-as-truth + RT-D1 ordering), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
+  Docker-as-truth + RT-D1 ordering + `BootStep_RecordsWhatItPruned_RatherThanDiscardingTheReport`, since
+  a boot pass that destroys agents must leave an audit entry and a log line naming them, and its
+  counterpart that a pass changing nothing logs but does not audit), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
   **P2-09 pure tests (Core):** `GitMutationGuardTests` (mid-rebase/detached/merge verdicts + the
   `index.lock` backoff-then-typed-failure + the no-active-token refusal), `YieldProtocolTests`
   (ready-path round-trip with no pause + the timeout `docker pause`-then-resume-unpause path, via
   fakes), `LeaderReattachTests` (the `LeaderRegistry` round-trip + the boot reattach reconcile reaping
-  dead-container sessions). **P2-12 pure tests (Core):** `ExternalPrIntakeTests` (fixture-driven
+  dead-container sessions + `BootStep_RecordsWhatItReaped_RatherThanDiscardingTheReport`, since reaping
+  kills the agent's PTY and drops it from the durable registry). **P2-12 pure tests (Core):** `ExternalPrIntakeTests` (fixture-driven
   through the T-23 provider seam + the **worker-host**/fetch seams — materialize only bot PRs,
   idempotent double-subscribe/same-PR, force-push invalidation+re-queue, closed-PR cancel+**release
   the whole worker** (not just the worktree — the jail's MG-36 segment is what actually leaks),
@@ -1140,9 +1242,17 @@
   reflection over the registered engine's own delegates, that its target resolver really is
   `PrIntakeTargetResolver.Resolve` and not a hardwired `null`, and that its worker host really is the
   daemon's `ExternalPrWorkerHost`: a hardwired constant is invisible from the outside, since the
-  engine resolves and the hosted service starts either way), and that the daemon's
-  `MergeQueueProvisioner` really was constructed with `checkAgentBranch` — an optional argument whose
-  absence restores the silent stranded-branch behaviour exactly while every other test stays green),
+  engine resolves and the hosted service starts either way); and the **optional-tail guards**, which
+  generalise what used to be one ad-hoc `checkAgentBranch` assertion —
+  `MergeQueueProvisioner_OptionalControlTail_IsWiredExactly` compares
+  `WiredOptionalControls` against an EXACT set and pins `AuditLog` to the daemon's own sink (proven to
+  redden on the deletion of each of `audit`/`log`/`publishAgentRef`/`checkAgentBranch`, and on an audit
+  log that is non-null but not the daemon's),
+  `KillSwitch_OptionalControlTail_IsWiredExactly_AndItsJournalIsDurable` does the same for the kill
+  switch plus `Assert.IsType<JsonKillJournal>`,
+  `KillSwitch_ControlChannelRtt_IsExplicitlyUnmeasured_NotSilentlyZero` pins the RT-D4 posture as a
+  stated decision (and is MEANT to fail the day a real transport lands), and
+  `BootReconcileSteps_AreWiredToRecordWhatTheyDestroy` pins both boot tasks' audit sinks),
   **`ExternalPrIntakeSpawnWiringTests`**
   (the intake→spawn decisions at the tier that needs no Docker: the explicit-`pr-<n>`-id scheme and
   its duplicate-id refusal; `EnsureWorkerAsync` adopting a live session and a restart-orphaned jail;
@@ -1355,7 +1465,11 @@
   failures, the **resume/adoption** set — `AdoptAgentWorktree` starts a new worktree on the EXISTING
   `agent/<id>` with the dead jail's commits and file contents intact (a `worktree add -b` would fail every
   line of it), refuses typed with `AgentBranchMissingException` and creates nothing when the branch is
-  gone, and carries across commits the mirror never saw before deleting the repository that holds them;
+  gone, carries across commits the mirror never saw before deleting the repository that holds them, and
+  — `Adopt_WhenTheRescuePublishFails_RefusesTyped_AndKeepsTheUnpublishedWork` — refuses the whole
+  adoption with `AgentBranchRescueFailedException` when that rescue publish fails transiently (driven by
+  a stale `.lock` on the mirror's ref), leaving the unpublished commit on disk for a retry instead of
+  deleting the only copy;
   plus the decisive contrast between `RemoveAgentWorktreeKeepingBranch` and `RemoveAgentWorktree`, one of
   which leaves the branch adoptable and the other of which does not — **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names
@@ -1370,6 +1484,12 @@
   `RepackWithoutPrune_KeepsEveryObjectResolvable_EvenUnreachableOnesAgentsMayBorrow` (the
   discriminator: with `-a` instead of `-A` the object is gone) and
   `Prune_IsRefusedWhileAnAgentIsAttached_AndReclaimsOnceTheLastOneDetaches`;
+  `Mirror_DisablesAutomaticMaintenance_AndSaysSoWhenItCannot` (the second door — a `maintenance.auto`
+  that cannot be set now throws instead of returning silently, driven by a multi-valued key) and
+  `ForeignAgentBranch_ThatCannotBeDeleted_FailsLoudly_RatherThanStayingVisible` (the MG-3 isolation
+  boundary: a blocked `update-ref -d` leaves another agent's branch checkout-able, so it must refuse the
+  spawn — driven through the internal `AgentRepoManager.DropForeignAgentRefs`, since `Create` re-clones
+  from scratch and cannot be interrupted);
   `PublishedWork_IsCopiedIntoTheMirror_NotBorrowedFromTheAgentRepository` (destroy the agent repo and
   the mirror still serves the commit — the property that makes teardown safe) and the no-residue
   teardown), `AgentRefMediationTests.cs` (**MG-3 stage 2** on real git — fast-forward publish +
@@ -1398,7 +1518,20 @@
   (TI-P2-07 §A.5, PR-blocking in Linux CI): `Fixtures/SandboxFixture.cs` (spawns a real hardened agent
   jail through `DockerSandboxEngine` + `EgressProxyConfigurator` on an ext4 temp worktree and cleans
   up — the §A.4 infrastructure contract the egress/inspect/git-proxy/memory-scrape tests stand on;
-  agent image ref via `MAINGUARD_AGENT_IMAGE`), `Fixtures/RequiresDockerFact.cs`
+  agent image ref via `MAINGUARD_AGENT_IMAGE`; `NewTempToolchainRoot`/`NewTempBareMirror` hand the jail
+  world-writable host trees so an in-jail refusal proves the MOUNT and not a file mode, the same
+  argument `NewTempCache` and `NewJailWritableTempWorktree` already make;
+  `CreateAndStartFromImageWithoutUserOverrideAsync` starts a container with NO `User` on the create
+  request, which is the only way to observe an image layer's own `USER` directive),
+  `Fixtures/JailSyscallProbe.cs` (tickets #59/#60 — attempts `process_vm_readv`/`ptrace` for real
+  through libc inside a live jail, framing every call's return value AND errno so a probe that never ran
+  is a MISSING frame rather than an absence that reads as a refusal; each cross-process call is paired
+  with a SELF-directed one that only a seccomp filter can refuse. Runs on the base image's nix
+  `python3`, because the jail has no compiler and these syscalls have no shell equivalent that is not
+  the read-semantics trap this replaces), `Fixtures/JobSummary.cs` (appends facts to
+  `$GITHUB_STEP_SUMMARY`; a no-op off CI. Exists because at `--verbosity normal` xUnit prints a test's
+  output only when it FAILS, so an instrument meant to report on GREEN runs would report on nothing —
+  extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
   present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
   reconciler test that stands up its own trivial image; class-level
@@ -1525,10 +1658,34 @@
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
   supervisor-owned `/run/secrets/supervisor/oob.key` — probed as EACH SECRET'S OWNER, since the agent
   cannot see into the supervisor's `0700` directory at all and asking it would conflate "not delivered"
-  with "properly hidden"; plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
+  with "properly hidden". **The MEMORY half of that same test is now attempted rather than inferred**
+  (tickets #59/#60): it used to be `cat /proc/1/mem …; echo $?` with a non-zero exit required, and that
+  could not fail — `cat` on ANY `/proc/<pid>/mem` reads from offset 0, never mapped, so it exits
+  non-zero before one permission check matters (`cat /proc/self/mem`, own memory, also exits 1), and it
+  passed under `--privileged` + `seccomp=unconfined` + `CAP_SYS_PTRACE`. It now runs
+  `Fixtures/JailSyscallProbe.cs`, which calls `process_vm_readv`/`ptrace` through libc in the live jail
+  and pairs every cross-process attempt with a SELF-directed one — against its own address space the
+  kernel's ptrace check returns early and Yama does not apply, so only the seccomp filter can refuse it;
+  a cross-process probe alone goes green on a jail with no profile at all, because the runner's
+  `ptrace_scope=1` refuses it anyway. Plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
   container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
   and no network is recreated by the checks that already existed, and that first version stayed green
-  with the new check disabled). **These RequiresDocker legs only ever run against
+  with the new check disabled). `Agents/JailRuntimePostureDockerTests.cs` (**tickets #59/#60** — the
+  jail's posture read FROM INSIDE A RUNNING CONTAINER rather than from the create request that asked
+  for it, because seven controls were measured removable from a real jail with the whole 98-test suite
+  green: the capability **bounding** set from `/proc/self/status` — never `CapEff`, which is empty for
+  uid 1000 even under `--privileged` and so could never have caught anything — with `CAP_SYS_PTRACE`
+  absent and `CAP_SYS_ADMIN`/`CAP_NET_RAW` absent to separate "dropped" from "the daemon's defaults were
+  accepted"; `NoNewPrivs`/`Seccomp: 2` (which catches `seccomp=unconfined` but NOT the profile being
+  dropped, since Docker then applies its own default and the field still reads 2 — which profile is
+  loaded is what the syscall probe measures); the userns posture with its limit stated out loud (on a
+  daemon with no remap configured, `""` and `"host"` are runtime-identical and no in-container
+  observation can separate them); the shared toolchain mount refusing a write with **EROFS
+  specifically**, controlled by a world-writable host tree, a successful read of the same mount, and a
+  successful write to `/tmp`; two agents in ONE repo getting caches neither can read, derived from the
+  SHIPPED `PackageCacheManager` — the pre-existing cross-tenant tests pass paths the TEST invented, so
+  they stay green against one shared cache per repo; and the RW-mirror jail being recreated rather than
+  reused, planted "identical except" for that one mount bit). **These RequiresDocker legs only ever run against
   a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
   EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
   plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on
@@ -1549,7 +1706,12 @@
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),
   `dotnet --version` answering `10.0.3x` inside the jail, the layered jail still running as uid 1000
   on a read-only rootfs (a layer ending on `USER root` would undo a control `ContainerSpecBuilder`
-  cannot re-check, since it asserts the create SPEC and the user comes from the IMAGE), the
+  cannot re-check, since it asserts the create SPEC and the user comes from the IMAGE — **and `id -u`
+  alone was NOT that check, which is how M15 hid**: the create request sets `User = AgentUid`, which
+  wins over the image, so Docker reports 1000 whatever the layer ends on and dropping `USER agent` from
+  the generated Dockerfile left the test green. It now reads the layer's own image `Config.User` and
+  runs a container from the layer via `SandboxFixture.CreateAndStartFromImageWithoutUserOverrideAsync`
+  with **no `User` on the create request** — the only way to ask the image the question), the
   `mainguard.toolchain.base-digest` label equalling what the base ref resolves to right now, the spawn
   ref being the layer's own digest, the second `EnsureAsync` measured as a cache hit, and
   `RecordTheEngineAndItsImageStoreBehaviour` — an observation, not a gate: it prints the engine
@@ -1576,7 +1738,13 @@
   applied-digest record is gone; and — the constraint the skip must never trade away — a host REMOVED
   from the allowlist really does become filtered, asserted on tinyproxy's 403 rather than on "the
   request failed" so it holds on a runner with no route out. Every assertion is paired with a control
-  that fails if the skip became unconditional), `Agents/SandboxNetworkIsolationDockerTests.cs`
+  that fails if the skip became unconditional. It also owns the **reload EXIT STATUS**:
+  `AReloadWhoseDaemonCannotStart_ExitsNonZero_RatherThanReportingSuccess` gives dnsmasq a config the
+  binary refuses — a REAL failure, not a simulated one — and asserts the script exits non-zero and
+  records `failed`, with a healthy reload exiting 0 as the control. `reload.sh` used to write
+  `stale`/`failed` and `exit 0` regardless, and nothing in the daemon read the status files; this is the
+  script half of the pair whose daemon half is `Mainguard.Tests/EgressProxyPushExitCodeTests.cs`),
+  `Agents/SandboxNetworkIsolationDockerTests.cs`
   (**MG-36 east-west isolation, read off real containers**: two jails on two per-agent segments — A
   cannot reach B's listener and cannot pivot via the proxy's address on B's segment, while the paired
   positive controls (B reaches its own listener; A reaches the proxy on its own segment) fail if the

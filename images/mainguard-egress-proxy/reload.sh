@@ -319,3 +319,32 @@ fi
 # "A reload has run in this container's lifetime" — the boot reload's gate (see MG-41 gate 1 above).
 # Written last so it means the whole sequence completed, and on the tmpfs so a `docker start` re-arms it.
 : > "$RAN_MARK"
+
+# THE EXIT STATUS. This script used to write `stale`/`failed` into the .status files and exit 0 anyway,
+# so the only consumers of a failed reload were the RequiresDocker tests reading those files — nothing in
+# the daemon read them, and the daemon's exec discarded the exit code as well. Between the two, a reload
+# that left the PREVIOUS allowlist in force (stale: an unkillable predecessor, so a host the user just
+# removed stays reachable) or left the jails with NO resolver at all (failed: dnsmasq is the only one
+# since MG-7) reported success, and EnsureReadyAsync went on to tell the caller the proxy was ready.
+#
+# Both halves had to change together or either one masks the other: the daemon now inspects the exec's
+# exit code, and this is the exit code it inspects.
+#
+# `none` is NOT a failure: an artefact the daemon did not render is a daemon with nothing to say about
+# that component (a pre-P2-08 proxy has no tinyproxy-upstreams), not a component that broke. Only the
+# two verdicts this script writes when it tried and did not succeed count.
+reload_status=0
+for daemon in dnsmasq tinyproxy; do
+    case "$(cat "$CONF_DIR/$daemon.status" 2>/dev/null || echo none)" in
+        stale)
+            log "FAILED: $daemon could not be stopped, so it is still serving the PREVIOUS policy"
+            reload_status=1
+            ;;
+        failed)
+            log "FAILED: $daemon did not come back up, so its policy is not being served at all"
+            reload_status=1
+            ;;
+    esac
+done
+
+exit "$reload_status"

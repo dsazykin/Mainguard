@@ -197,10 +197,18 @@ public static class GatewayServiceRegistration
                     registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(agentId, postSha);
                 });
 
+            // Both reconcile steps now RECORD what they did. Boot reconcile is the one pass that can
+            // declare an agent Dead, force-remove its worktree, kill its PTY and drop it from the durable
+            // leader registry — and both reports were being narrowed to a bare Task, so a user who left
+            // agents running overnight had no artifact of any kind explaining why they were gone.
+            var audit = sp.GetRequiredService<IAuditLog>();
             return DaemonBootSequence.Build(
                 sp.GetRequiredService<SwarmReconciler>(),
                 mergeReconcile: mergeReconcile,
-                leaderReattach: new LeaderReattachTask(sp.GetRequiredService<SessionLeader>(), BuildContainerLister()));
+                leaderReattach: new LeaderReattachTask(
+                    sp.GetRequiredService<SessionLeader>(), BuildContainerLister(), audit, log),
+                audit: audit,
+                log: log);
         });
 
         // P2-47: the external-PR intake dependency chain (P2-12). Registering IExternalPrIntake here

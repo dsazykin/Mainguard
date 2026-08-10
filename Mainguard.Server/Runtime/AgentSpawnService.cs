@@ -82,6 +82,7 @@ public sealed class AgentSpawnService
     private readonly Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits _limits;
     private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner _mergeQueues;
     private readonly IAuditLog _audit;
+    private readonly Gateway.AgentGatewayCredentials _gatewayCredentials;
     private readonly ILogger _spawnLog;
     private readonly ILogger _coordLog;
 
@@ -97,6 +98,7 @@ public sealed class AgentSpawnService
         Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits limits,
         Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner mergeQueues,
         IAuditLog audit,
+        Gateway.AgentGatewayCredentials gatewayCredentials,
         ILoggerFactory loggerFactory)
     {
         _store = store;
@@ -110,6 +112,12 @@ public sealed class AgentSpawnService
         _limits = limits;
         _mergeQueues = mergeQueues;
         _audit = audit;
+        // MG-4. Required, not optional: this is the only thing that revokes a stopped agent's gateway
+        // token and drops the daemon's custody of its provider key. Registered unconditionally by
+        // GatewayServiceRegistration (gateway on or off), so a container that cannot supply it is a
+        // wiring regression — and it must fail at startup rather than degrade into the defect this
+        // parameter exists to close, where StopAsync silently left both alive for the daemon's lifetime.
+        _gatewayCredentials = gatewayCredentials ?? throw new ArgumentNullException(nameof(gatewayCredentials));
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _spawnLog = loggerFactory.CreateLogger(DaemonLogCategories.Spawn);
         _coordLog = loggerFactory.CreateLogger(DaemonLogCategories.Coordinator);
@@ -455,6 +463,20 @@ public sealed class AgentSpawnService
             _binder.ReleaseLeader(agentId);
             _ipc.CloseEndpoint(agentId);
             _locks.Unlock(agentId);
+
+            // MG-4: drop this agent's gateway token AND the daemon's custody of its provider key.
+            // `Revoke` had no production callers at all — the spawn path minted a credential on every
+            // BYOK spawn and nothing ever released it, so a stopped agent left a LIVE token (replayable
+            // by anything that had read it out of the jail) and a resident provider key for the rest of
+            // the daemon's lifetime. The gateway is on by default, so that was the normal case, not an
+            // edge one.
+            //
+            // Id-keyed, so it belongs in THIS block rather than beside the container teardown below:
+            // AgentGatewayCredentials is keyed by agent id alone, so revoking while another repo's
+            // session still answers to the same id would tear down a LIVE agent's confinement — its
+            // next model call would arrive with an unknown token and be refused. Same reasoning, and
+            // the same guard, as the leader/IPC/lock releases above.
+            _gatewayCredentials.Revoke(agentId);
         }
 
         IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile> credentials =

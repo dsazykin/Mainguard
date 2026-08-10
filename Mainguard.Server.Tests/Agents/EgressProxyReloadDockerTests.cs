@@ -143,6 +143,70 @@ public class EgressProxyReloadDockerTests
         Assert.NotEqual(afterBoot.Dnsmasq, afterPush.Dnsmasq);
     }
 
+    // ---- the reload's EXIT STATUS: a failed reload must be visible to the daemon ----
+
+    /// <summary>
+    /// A reload that could not load the policy exits NON-ZERO.
+    ///
+    /// <para><b>The defect.</b> <c>reload.sh</c> recorded <c>stale</c>/<c>failed</c> in
+    /// <c>/run/mainguard/*.status</c> and <c>exit 0</c>'d anyway, and it printed "dnsmasq FAILED to
+    /// start" plus a log tail onto a stream the daemon read and discarded. Nothing in the daemon ever
+    /// read those status files — only these tests did. On the other side,
+    /// <c>EgressProxyConfigurator.ExecAsync</c> never called <c>InspectContainerExecAsync</c>, so it
+    /// never fetched the exit code either. Between the two, <c>EnsureReadyAsync</c> — whose LAST act is
+    /// this push, on EVERY spawn — returned success no matter what the proxy said.</para>
+    ///
+    /// <para><b>Both halves had to change together, which is why this test is here and not only in
+    /// <c>Mainguard.Tests/EgressProxyPushExitCodeTests.cs</c>.</b> That one proves the daemon reacts to a
+    /// non-zero exit; this one proves the script actually produces one, against the real image. Either
+    /// alone leaves the pair silent: a script that always exits 0 makes the daemon's new check
+    /// unreachable, and a daemon that ignores the code makes the script's new status meaningless.</para>
+    ///
+    /// <para>The failure is REAL rather than simulated: dnsmasq is given a config it refuses, so it
+    /// exits and <c>wait_started</c> genuinely times out. Since MG-7 dnsmasq is the jails' only
+    /// resolver, so this is the whole-fleet egress outage the daemon used to report as "ready".</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task AReloadWhoseDaemonCannotStart_ExitsNonZero_RatherThanReportingSuccess()
+    {
+        await using var fx = new SandboxFixture();
+        await fx.EnsureEgressReadyAsync();
+
+        var proxy = EgressProxyConfigurator.ProxyContainerName;
+
+        // THE CONTROL, first: a healthy reload of the policy the daemon just pushed exits 0. Without it,
+        // "the exit code was non-zero" is equally well explained by a script that now always fails —
+        // which would break every spawn on every healthy daemon.
+        var healthy = await fx.ExecAsync(proxy, "sh", "/etc/mainguard/reload.sh");
+        _output.WriteLine($"healthy reload: exit={healthy.ExitCode} out={healthy.Stdout.Trim()}");
+        Assert.Equal(0, healthy.ExitCode);
+
+        try
+        {
+            // A dnsmasq config the binary refuses outright, so it exits instead of binding :53.
+            var poisoned = await fx.ExecAsync(proxy,
+                "sh", "-c", "printf '%s\\n' 'this-is-not-a-valid-dnsmasq-directive' > /run/mainguard/dnsmasq.conf");
+            Assert.Equal(0, poisoned.ExitCode);
+
+            // THE PROPERTY.
+            var failed = await fx.ExecAsync(proxy, "sh", "/etc/mainguard/reload.sh");
+            _output.WriteLine($"failed reload: exit={failed.ExitCode} out={failed.Stdout.Trim()}");
+
+            Assert.NotEqual(0, failed.ExitCode);
+
+            // …and for the right reason: the script's own verdict says dnsmasq did not come up. This is
+            // what distinguishes a real detection from a script that fell over somewhere else.
+            var status = await fx.ExecAsync(proxy, "sh", "-c", "cat /run/mainguard/dnsmasq.status");
+            Assert.Equal("failed", status.Stdout.Trim());
+        }
+        finally
+        {
+            // Restore a good policy for the rest of the suite: the push re-renders dnsmasq.conf from the
+            // allowlist and reloads it. This is also, incidentally, the recovery path in production.
+            await fx.EnsureEgressReadyAsync();
+        }
+    }
+
     // ---- (a) an unchanged policy must not restart anything, and a changed one must ----
 
     /// <summary>

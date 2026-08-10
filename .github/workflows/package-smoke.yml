@@ -10,13 +10,17 @@ name: Package smoke (P2-48)
 on:
   pull_request:
     branches: [main, phase2]
-    paths:
-      - "Mainguard.Pro.App/**"
-      - "Mainguard.Client.App/**"
-      - "Mainguard.App.Shell/**"
-      - "installer/**"
-      - "build/**"
-      - ".github/workflows/package-smoke.yml"
+    # An ALLOWLIST of paths was the wrong shape here and had already drifted: it named the two heads,
+    # the shell, installer/ and build/, but not Mainguard.UI, Mainguard.Git, Mainguard.Agents or
+    # Mainguard.Agents.UI — every one of which is in one or both heads' publish closures. A PR touching
+    # only Mainguard.UI could break the Windows publish and get no packaging signal at all.
+    #
+    # Inverted to a DENYLIST: run unless the change is provably incapable of affecting a Windows publish.
+    # Adding a project no longer requires remembering to widen a list; the default is now "run".
+    paths-ignore:
+      - "docs/**"
+      - "site/**"
+      - "**/*.md"
   push:
     branches: [main, phase2]
 
@@ -47,16 +51,31 @@ jobs:
           -o artifacts/publish/Mainguard
           /p:MainguardOsPayload=${{ github.workspace }}/build/mainguardos/out/MainguardOS.tar.gz
 
-      - name: Assert elevated helper + payload are co-located and app version-stamps
+      - name: Assert elevated helper + payload + elevated stage are co-located and app version-stamps
         shell: pwsh
         run: |
           $dir = "artifacts/publish/Mainguard"
           $helper = Join-Path $dir "Mainguard.Installer.Elevated.exe"
           $payload = Join-Path $dir "payload/MainguardOS.tar.gz"
           $app = Join-Path $dir "Mainguard.Pro.App.exe"
+          # MG-15: the elevated-components STAGE is what gets promoted into %ProgramFiles%\Mainguard\elevated
+          # behind the OOBE's UAC prompt. Without it the app falls back to launching the helper out of the
+          # per-user install directory — the escalation this release removed. pack.ps1 asserts this, but
+          # pack.ps1 runs on the owner's release box; until now nothing in CI checked it, and the MSBuild
+          # target that produces the stage only warned when it came out empty. Assert it here, where every
+          # PR sees it.
+          $stage = Join-Path $dir "elevated-stage/Mainguard.Installer.Elevated.exe"
           if (-not (Test-Path $helper))  { throw "MISSING elevated helper: $helper" }
           if (-not (Test-Path $payload)) { throw "MISSING bundled payload: $payload" }
           if (-not (Test-Path $app))     { throw "MISSING app exe: $app" }
+          if (-not (Test-Path $stage))   { throw "MISSING elevated-components stage: $stage — the packaged app cannot relocate the elevated helper out of %LocalAppData% (MG-15)." }
+          # An EMPTY stage is the same failure with a directory in front of it: the stage carries the
+          # helper's whole self-contained closure, so a handful of files means the publish did not land.
+          $stageFiles = @(Get-ChildItem (Join-Path $dir "elevated-stage") -Recurse -File)
+          Write-Host "Elevated stage files: $($stageFiles.Count)"
+          if ($stageFiles.Count -lt 10) {
+            throw "Elevated-components stage has only $($stageFiles.Count) files — a self-contained publish of the helper is far larger; the stage did not land (MG-15)."
+          }
           $v = (Get-Item $app).VersionInfo
           Write-Host "App FileVersion:     $($v.FileVersion)"
           Write-Host "Helper FileDescription (UAC name): $((Get-Item $helper).VersionInfo.FileDescription)"
@@ -101,3 +120,54 @@ jobs:
           $sizeMb = [math]::Round(((Get-ChildItem $dir -Recurse -File | Measure-Object Length -Sum).Sum / 1MB), 1)
           Write-Host "Client publish size: $sizeMb MB"
           Write-Host "Client publish smoke PASSED (no payload, no elevated helper)."
+
+  # ---------------------------------------------------------------------------------------------------
+  # pack.ps1 is the release script, and until now it appeared in NO workflow — not even -DryRun. Every
+  # invariant it owns (the MG-15 elevated-stage assertion, the signing-pin derivation, the two-channel
+  # packId/feed split) was therefore manual-only: it could break at any commit and only be discovered on
+  # the owner's release box at release time. -DryRun resolves the full per-channel plan and runs nothing,
+  # so it is exactly the part CI can exercise without `vpk`, a payload or a certificate.
+  #
+  # ubuntu-latest: `-DryRun` executes no Windows tooling, and pwsh is preinstalled — this costs 1x
+  # minutes rather than the 2x a windows runner bills.
+  # ---------------------------------------------------------------------------------------------------
+  velopack-wiring:
+    name: Velopack channel wiring (pack.ps1 -DryRun)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve both channel plans
+        shell: pwsh
+        run: |
+          # `*>&1`, not `2>&1`: pack.ps1 reports through Write-Host, which goes to the INFORMATION
+          # stream — a `2>&1` capture would come back empty and this check would test nothing.
+          foreach ($channel in @('client', 'pro')) {
+            Write-Host "===================== $channel ====================="
+            $out = (& "$PWD/build/velopack/pack.ps1" -Channel $channel -DryRun *>&1 | Out-String)
+            Write-Host $out
+            if ($out -notmatch 'Plan resolved for channel') {
+              throw "pack.ps1 -Channel $channel -DryRun did not resolve a plan."
+            }
+          }
+          Write-Host "Both Velopack channel plans resolve."
+
+      # Regression guard for the -DryRun secret leak: the mode documented as "verify the wiring safely"
+      # used to echo /p:MainguardSigningCertPassword=<pw> and signtool's /p "<pw>" verbatim. A canary
+      # password goes in; if it comes out in ANY line of output, this fails.
+      - name: -DryRun must never print the signing password
+        shell: pwsh
+        run: |
+          $canary = 'CANARY-SIGNING-PASSWORD-DO-NOT-PRINT'
+          $out = (& "$PWD/build/velopack/pack.ps1" -Channel pro -DryRun `
+                    -SigningCertPath '/nonexistent/mainguard.pfx' `
+                    -SigningCertPassword $canary `
+                    -PinnedThumbprints 'DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF' *>&1 | Out-String)
+          Write-Host $out
+          if ($out -match [regex]::Escape($canary)) {
+            throw "pack.ps1 -DryRun printed the signing certificate password. Redact it before printing the command."
+          }
+          if ($out -notmatch 'REDACTED') {
+            throw "pack.ps1 -DryRun printed neither the password nor a redaction marker — the signing arguments are not reaching the printed plan, so this guard is not testing anything."
+          }
+          Write-Host "-DryRun kept the signing password out of its output."

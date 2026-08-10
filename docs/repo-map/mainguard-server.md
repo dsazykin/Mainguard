@@ -4,6 +4,12 @@
 - **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
+  registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
+  test-isolated session token like the plan store) and states the `KillSwitch`'s **whole** optional tail
+  — `journal`, `audit`, the named `KillSwitchTiming.UnmeasuredRtt` sentinel (there is no
+  control-channel RTT source in this daemon and the record must say so rather than imply a healthy
+  channel) and the `onRttSpike` sink — because it previously passed only `gate`/`target`/`audit` and
+  nothing asserted that composition at all;
   - `StartAsync` (typed port-bound failure) and `RunSmokeAsync` (authenticated loopback self-probe,
     which now goes over the real pinned mTLS transport); **MG-19: `ConfigureServices` runs BEFORE
     `ConfigureKestrel` and returns the `SessionTransportCertificates`, because the listener must present
@@ -15,7 +21,9 @@
     to the isolated session token, `ResolveDataPath`); also registers the P2-09 `SessionLeader` + its
     durable `LeaderRegistry` (path next to the token, `ResolveLeaderRegistryPath`).
 - **`Gateway/GatewayServiceRegistration.cs`** — DI wiring for the P2-08 gateway (`AiGateway`,
-  `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence`); best-effort
+  `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence` — both boot reconcile
+  steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
+  leaves an artifact); best-effort
   DB-backed stores with an in-memory fallback so the daemon always starts, all resolved from DI so a
   test host can override them; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
@@ -214,6 +222,16 @@
     `CreateAgentWorktree`, and switches the post-failure cleanup to the branch-preserving one. It asks no
     authorization question — that is `AgentResumeService`'s job, and a spawn that could name any id
     without it would let one agent adopt another's branch.
+    **MG-4 credential release (stop):** takes a REQUIRED `AgentGatewayCredentials` and calls `Revoke` in
+    the stop path. That method previously had **no production callers** — deleting it left both heads
+    compiling — so with the gateway on by default every stopped BYOK agent left a live, replayable
+    gateway token AND the daemon's copy of the user's provider key resident for the rest of the daemon's
+    lifetime. It sits inside the `FindAll(agentId).Count == 0` block beside the leader/IPC/lock releases
+    because the credential store is keyed by agent id ALONE: revoking while another repo's session still
+    answers to that id would break a LIVE agent's next model call. The dependency is required rather than
+    optional (it is registered unconditionally, gateway on or off) so a lost registration is a startup
+    failure instead of a silent return to the defect. Pinned by
+    `Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`.
   - **`Runtime/AgentResumeService.cs`** — the human-only resume for a STRANDED merge-queue entry (jail
     gone, branch intact), behind `AgentService.ResumeAgent`. Holds ALL of the authorization, keyed on
     `(RepoHash, AgentId)`: the entry must exist in THIS repo's live queue and be non-terminal, the id must

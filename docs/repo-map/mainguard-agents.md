@@ -123,8 +123,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `AgentRepoManager` (`Create` = `git clone --bare --shared <mirror>` — `--shared` writes a one-line
       `objects/info/alternates` and copies **no** objects, measured ~26 KB per agent on a seed repo — then
       drops the cloned `origin`, sets `core.sharedRepository=group` + `gc.auto=0`, prunes other agents'
-      `agent/*` refs, and group-shares the tree; plus `Remove`/`Exists`/`ListAgentIds`/`AnyAttached`, the
-      last being the “is a borrower still attached?” question the prune policy turns on)).
+      `agent/*` refs (`DropForeignAgentRefs` — the `update-ref -d` exit code is CHECKED and a failure
+      throws, because a surviving `refs/heads/agent/<other>` is a branch this agent can check out with
+      another agent's work in it: the MG-3 isolation boundary, and the spawn is refused rather than
+      completed with it unheld), and group-shares the tree; plus
+      `Remove`/`Exists`/`ListAgentIds`/`AnyAttached`, the last being the “is a borrower still
+      attached?” question the prune policy turns on)).
     - `AgentBranchGuard.cs` (**agent branch confinement** — the two non-boundary layers that keep an
       agent's work where the merge queue can see it, after live phase-1 testing found an agent could
       `git checkout -b …`, commit, and have the work become *invisible* with no warning, error or queue
@@ -165,7 +169,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Failed`/`NothingToPublish` for a mirror that was in fact current).
     - `MirrorMaintenance.cs` (**MG-3 §4** — the object-lifetime policy for a mirror other repos borrow
       from: **pruning breaks borrowers, repacking does not**. `ApplyGcPolicy` (`gc.auto=0` +
-      `maintenance.auto=false`), `RepackWithoutPrune` (`git repack -A -d` — `-A` is load-bearing: measured
+      `maintenance.auto=false` — BOTH checked: the second exists because a newer git's background
+      maintenance is a second door, so a `maintenance.auto` that silently failed to apply would let it
+      prune objects alternates borrowers need, breaking the agent repos later with missing objects and
+      nothing pointing back at the cause), `RepackWithoutPrune` (`git repack -A -d` — `-A` is load-bearing: measured
       on git 2.53, `-a -d` DELETES an unreachable object that lives in a pack while `-A -d` loosens it,
       and deletion is the one thing an alternates borrower cannot survive), `PruneWhenIdle`
       (repack-then-`git prune`, refused outright while any agent is attached — `git prune` only ever
@@ -188,7 +195,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a
       jail spawned for a stranded queue entry starts on that entry's existing branch with its commits
       intact: rescue-publish the dead jail's own repo into the mirror first (a crash can leave commits the
-      mirror never saw), then require `refs/heads/agent/<id>` or throw `AgentBranchMissingException` —
+      mirror never saw — and that rescue's OUTCOME is read: a transient `Failed` refuses the whole
+      adoption with `AgentBranchRescueFailedException` so `ClearWorktreeResidue` never deletes the only
+      copy, while `NothingToPublish` warns + raises the G-17 `agent_rescue_empty` event), then require
+      `refs/heads/agent/<id>` or throw `AgentBranchMissingException` —
       never a silent fresh branch off main — then clear the residue and re-clone; `CreateAgentWorktree`
       and this one are each other's mirror image, one refusing when the branch exists and the other when
       it does not) and **`RemoveAgentWorktreeKeepingBranch`** (the resume's rollback: the same clear
@@ -436,9 +446,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       is `Rejected`, never `NotAvailable`). `PayloadSignature` now selects its default from the build's
       own configuration, so no entry point opts in. Packaging: the Pro head's
       `StageElevatedComponentsToPublish` target self-contained-publishes the helper into `elevated-stage/`
-      at PUBLISH (never on a dev build), `SignMainguardExecutables` signs the staged copy too, and
+      at PUBLISH (never on a dev build) — an EMPTY stage is now an `<Error>`, not a `<Warning>` buried in
+      the publish log, since it means the packaged app silently falls back to the per-user helper, i.e.
+      exactly the MG-15 escalation — `SignMainguardExecutables` signs the staged copy too, and
       `build/velopack/pack.ps1` derives the runtime pin from the signing certificate and asserts the stage
-      is present. **`build/signing/`** — `new-signing-cert.ps1` (self-signed code-signing cert; refuses to
+      is present. `package-smoke.yml` asserts it too, so the check is no longer release-box-only. **`build/signing/`** — `new-signing-cert.ps1` (self-signed code-signing cert; refuses to
       write inside the repo) + `README.md` (the two halves, the rollover recipe, and what is unit-proven
       vs manual-matrix). `Mainguard.Tests/ElevatedComponentsTests.cs` +
       `Mainguard.Tests/PinnedSignatureTests.cs` prove the policies on Linux; the `WinVerifyTrust` P/Invoke
@@ -485,10 +497,31 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`defaultAction SCMP_ACT_ERRNO`) with `process_vm_readv`/`process_vm_writev`/`ptrace` removed from
       every allow rule and explicitly denied — embedded verbatim from
       `images/mainguard-agent-base/seccomp.json` as the single source of truth; `SecurityOptValue` =
-      `seccomp=<json>`, never `unconfined`).
+      `seccomp=<json>`, never `unconfined`. `DescribeDenialGap(json)` parses the profile's RULES and
+      answers whether the three memory-inspection syscalls are really denied — each named in an
+      `SCMP_ACT_ERRNO` group AND in no `SCMP_ACT_ALLOW` group, because libseccomp applies the first
+      matching rule so an allow entry shadows a denial outright. It exists because
+      `ContainerSpecBuilder.AssertG2Controls` used to substring-search the whole `seccomp=<json>` blob
+      for each NAME, and **stock moby carries all three names in its allow group** — so the guard for
+      this profile's sole hardening delta was one the un-hardened upstream profile also passes. Pinned
+      by `SeccompProfileTests`, which asserts both that the new guard rejects an upstream-shaped
+      document and that the OLD guard's predicate accepts it).
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
+      **Edits are now DURABLE.** `ToPersistedForm`/`FromPersistedForm` had no production callers on
+      either side: `Wsl2AgentEnvironment` built `WithDefaults(audit)` on every daemon start, so an
+      `EgressGrpcService` add/remove mutated an in-memory list that was audited, re-rendered onto the
+      live proxy, and silently reverted by the next restart or WSL idle-stop — the user re-approving the
+      same host forever while the audit log logged each one as a fresh decision, and, in the removal
+      direction, a host the user cut off quietly coming back. `IEgressAllowlistStore` +
+      `FileEgressAllowlistStore` (`<vmRoot>/egress-allowlist.json`, atomic temp-file+replace) hold the
+      state; `LoadOrDefaults` is the production entry point and falls back to `DefaultEntries` on a
+      missing or corrupt file rather than refusing to boot — the SAFE direction, since the fallback is
+      the shipped restrictive set. `EmitChange` saves after the audit append, so a store failure can
+      never cost the security record. `CombinedWith` deliberately carries NO store: it is the
+      render-time union with installed CLIs' auto-permitted hosts, not a user edit. Pinned by
+      `Mainguard.Tests/EgressAllowlistPersistenceTests.cs`.
     - `EgressProxyConfig.cs` (pure renderer: tinyproxy allow-filter + dnsmasq pinned-DNS + iptables
       backstop from the allowlist. The backstop is rendered as a complete `*filter` table piped to
       **`iptables-restore`**, i.e. applied in ONE netlink transaction: it used to be `iptables -F` plus
@@ -947,7 +980,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `IExpectedAgentStore`/`InMemoryExpectedAgentStore`; the RT-D1 ordered `DaemonBootSequence` with the
       merge-reconcile slot FIRST — the daemon now supplies the real P2-10 `MergeReconcileTask` there;
       `MergeReconcilePlaceholderTask` remains only as `DaemonBootSequence.Build`'s no-arg fallback — then
-      `SwarmReconcileTask`; **no PID/lock-file reads**).
+      `SwarmReconcileTask`, which **reads** its `ReconcileReport` (`LastReport`, a boot log line, and a
+      `boot_swarm_reconcile` audit entry naming every pruned/adopted/stopped agent when the pass changed
+      something — narrowing it to a bare `Task` left a user whose agents were destroyed overnight with no
+      artifact at all; `RecordsOutcome` pins the daemon's audit wiring, `DaemonBootSequence.Tasks`
+      exposes the steps to assert it); **no PID/lock-file reads**).
     - `GatewayPersistence.cs` (SQLite-backed `DbSpendStore`/`DbExpectedAgentStore`/`DbBudgetStore` + the
       `IBudgetStore`/`InMemoryBudgetStore` seam, each op on a short-lived `AppDbContext`;
       `IBudgetStore.Set` takes per-agent AND per-day caps — P2-13 carried-in from P2-08). Models
@@ -987,7 +1024,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       temp-then-rename), the daemon reads it on boot — **no daemon-side pidfiles**).
     - `LeaderReattachTask.cs` (the `IBootTask` that runs the reattach after the P2-08 swarm reconcile →
       boot order containers → leaders → PTY reattach; appended via `DaemonBootSequence.Build`'s new
-      `leaderReattach` param). Exception `GitMutationLockException` (in `Exceptions/`).
+      `leaderReattach` param. Its `LeaderReconcileReport` is **read**, not discarded — `LastReport`, a
+      boot log line, and a `boot_leader_reattach` audit entry whenever the pass reaped a session, because
+      reaping kills the agent's PTY and drops it from the durable registry; `RecordsOutcome` pins the
+      daemon's audit wiring). Exception `GitMutationLockException` (in `Exceptions/`).
   - **`Agents/Orchestrator/` (P2-10 merge queue + verification runs + stale invalidation — the
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
@@ -1079,7 +1119,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
       verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
       `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
-      agent→approved-plan binding exists yet. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
+      agent→approved-plan binding exists yet. **The whole optional tail is now data**:
+      `WiredOptionalControls` (a set of the argument names actually passed) plus `AuditLog`, asserted
+      EXACTLY at the composition root — measured, deleting `audit:`/`log:`/`publishAgentRef:` from
+      `GatewayServiceRegistration` left 504 tests green, and each substitutes a weaker behaviour silently
+      (a throwaway audit sink, no merge log, verification against whatever the ref watcher last saw).
+      `resolveApprovedPlan`'s absence is pinned as hard as the others' presence. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
       now also calls `MergeQueue.BeginResumeAfterRestart`, passing `resolveContainerId` as the jail probe
       — this is `ResumeAfterRestartAsync`'s production caller. It is here rather than in
       `DaemonBootSequence` because a boot task would have nothing to iterate: the registry is empty at
@@ -1200,7 +1245,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       of the measured RTT, and `RttWouldExceedCeiling` feeds the P2-08 A3 `Unresponsive` signal; RT-D3:
       audit is best-effort during the kill (never blocks), a store outage records a pending gap that
       `NotifyAuditStoreRecovered` flushes as the chained `killswitch_audit_gap{killEpochId,observedAt}`;
-      `InMemoryKillJournal`, `KillSnapshot`/`KillReport`).
+      `KillSnapshot`/`KillReport` both carry `RttMeasured`, because
+      `KillSwitchTiming.UnmeasuredRtt` — the named sentinel the daemon passes, since P2-09's
+      `IAgentControlChannel` has no production transport — must not read as a measured-healthy channel
+      (`KillSwitch.MeasuresControlChannelRtt` is the same fact, asserted at the composition root);
+      `KillSwitch.WiredOptionalControls`/`Journal`/`AuditLog` expose the composition so the daemon's
+      whole optional tail is pinned by a test rather than by a line in `DaemonHost`; journals are
+      `IKillJournal` — `JsonKillJournal` (append-only JSONL beside the session token, **what the daemon
+      registers**, so a kill epoch survives the restart that follows an emergency stop) and
+      `InMemoryKillJournal` (tests only), both with `ReadAll`).
   - **`Agents/Adapters/`** (P2-22 pinned adapter channel — the real mechanism to run version-pinned
     agent CLIs inside the VM, replacing P2-14's interim spawn shape; daemon-side, no UI).
     - `AdapterManifest.cs` (the `adapters.json` schema —
@@ -1356,8 +1409,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     main under the **A5 ref-level compare-and-swap** — `git merge --ff-only` IS the atomic CAS on
     `refs/heads/main` (a verified branch was keep-alive-rebased onto its main, so it fast-forwards; a
     moved main makes `--ff-only` refuse → the CAS loses → no merge → re-verify), **not** an
-    `index.lock`-scoped read. Wrapped in one T-19 `IOperationJournal` op (undoable/replayable — reuses
-    the single journal, not a second one). The RT-D1 two-step conversation (`BeginMerge` lease →
+    `index.lock`-scoped read. A refused merge is CLASSIFIED rather than assumed
+    (`ClassifyFailedFfMerge`): the old code discarded git's exit detail and reported every non-zero exit
+    as "verification is stale" with `CasLost: true`, which is wrong — and expensively wrong — for
+    `index.lock` contention, a refusing pre-merge hook, a full disk or unrelated histories, since it
+    also told the queue to throw the verification away. It now asks
+    `merge-base --is-ancestor main <source>`: still an ancestor ⇒ report git's own stderr with `CasLost`
+    false, not an ancestor ⇒ the staleness message, earned; a probe that cannot answer ⇒ "cause could
+    not be established". `ExternalPrMergeService` does the same at its local leg. Wrapped in one T-19
+    `IOperationJournal` op (undoable/replayable — reuses the single journal, not a second one). The RT-D1 two-step conversation (`BeginMerge` lease →
     `PerformJournaledMerge` → `ConfirmMerge`); post-merge dependency refresh is **always
     `--ignore-scripts`** (poisoned lifecycle hooks never run) wrapped in NTFS `EPERM`/`EBUSY` retry.
   - `ExternalPrMergeService.cs` — the P2-12 **external** counterpart of that middle leg

@@ -173,18 +173,51 @@ public sealed class MergeQueueProvisioner
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
         _checkAgentBranch = checkAgentBranch;
+
+        // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
+        // is here rather than only the one that happened to get a test.
+        var wired = new SortedSet<string>(StringComparer.Ordinal);
+        if (audit is not null) { wired.Add(nameof(audit)); }
+        if (log is not null) { wired.Add(nameof(log)); }
+        if (publishAgentRef is not null) { wired.Add(nameof(publishAgentRef)); }
+        if (resolveApprovedPlan is not null) { wired.Add(nameof(resolveApprovedPlan)); }
+        if (checkAgentBranch is not null) { wired.Add(nameof(checkAgentBranch)); }
+        WiredOptionalControls = wired;
     }
 
     /// <summary>
-    /// Whether this provisioner will actually establish which branch an agent is on before verifying it.
+    /// Every optional constructor argument this provisioner was <b>actually given</b>, by parameter name.
     ///
-    /// <para>Exposed for one reason: the check is an optional constructor argument, so the daemon failing
-    /// to pass it would restore the silent behaviour exactly, with every other test in this repository
-    /// still green. That is the shape of defect this codebase keeps producing — a control that is
-    /// implemented, tested, and wired nowhere — so the composition root asserts on this rather than
-    /// trusting a line in a registration file.</para>
+    /// <para><b>Why this exists as a set rather than as one bool per control.</b> Each argument in the
+    /// optional tail defaults to something that silently substitutes a weaker behaviour, and deleting the
+    /// corresponding line from the daemon's registration was MEASURED to leave the whole suite green:
+    /// dropping <c>audit</c> falls back to a throwaway <see cref="InMemoryAuditLog"/>, so
+    /// <c>queue_entry_discarded</c>, <c>stale_override_used</c>, <c>verification_restart_resume</c>, the
+    /// branch-drift <c>DriftEvent</c> and the flagged-change gate's events detach from the daemon's sink;
+    /// dropping <c>publishAgentRef</c> verifies whatever the ref watcher last saw rather than the agent's
+    /// tip, i.e. verified bytes ≠ submitted bytes; dropping <c>log</c> removes the merge category's only
+    /// production writer; dropping <c>checkAgentBranch</c> restores the silent stranded-branch behaviour.
+    /// A bool per control invites a test per control, and the four that had no test are precisely the four
+    /// that could be deleted unnoticed — so the composition root asserts the whole tail ONCE, against an
+    /// exact expected set. Adding a new optional argument, or dropping an existing one, both fail that
+    /// assertion until the daemon's intent is restated.</para>
+    ///
+    /// <para>The set is deliberately EXACT rather than a minimum: <c>resolveApprovedPlan</c> is absent on
+    /// purpose (there is no agent→approved-plan binding in the daemon to give it — see the NOTE in
+    /// <c>GatewayServiceRegistration</c>), and an absence that is a decision has to be as pinned as a
+    /// presence, or the decision quietly becomes an oversight the first time someone passes a guess.</para>
     /// </summary>
-    public bool ChecksAgentBranchAlignment => _checkAgentBranch is not null;
+    public IReadOnlySet<string> WiredOptionalControls { get; }
+
+    /// <summary>
+    /// The audit sink every queue, gate and drift report this provisioner builds appends to.
+    ///
+    /// <para>Exposed alongside <see cref="WiredOptionalControls"/> because "an audit log was passed" and
+    /// "the daemon's audit log was passed" are different facts, and only the second one means the audit
+    /// trail is attached to anything a reader could ever reach. The composition root asserts reference
+    /// identity with the host's registered <see cref="IAuditLog"/>.</para>
+    /// </summary>
+    public IAuditLog AuditLog => _audit;
 
     /// <summary>
     /// Ensures a live, registered queue for <paramref name="repoHandle"/> and returns it; null when the repo

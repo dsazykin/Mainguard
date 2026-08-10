@@ -286,10 +286,21 @@
         </Border>
 
         <!-- EDIT VIEW -->
-        <Grid Grid.Row="1" IsVisible="{Binding IsEditMode}" RowDefinitions="Auto, *">
-            
+        <Grid Grid.Row="1" IsVisible="{Binding IsEditMode}" RowDefinitions="Auto, Auto, *">
+
+            <!-- SAVE FAILURE BAR. The editor buffer is frequently the only copy of a merge
+                 resolution (edit mode auto-enables on conflict markers), so a failed write can
+                 never be allowed to look like a save. -->
+            <Border Grid.Row="0" Background="{DynamicResource SurfaceCard}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1"
+                    IsVisible="{Binding HasSaveError}" Padding="15,10">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <PathIcon Data="{StaticResource WarningIcon}" Width="16" Height="16" Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="{Binding SaveError}" Foreground="{DynamicResource DangerBrush}" FontSize="12" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Border>
+
             <!-- CONFLICT RESOLUTION BAR -->
-            <Border Grid.Row="0" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1"
+            <Border Grid.Row="1" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1"
                     IsVisible="{Binding HasConflicts}" Padding="15,10">
                 <Grid ColumnDefinitions="*, Auto">
                     <StackPanel Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
@@ -307,7 +318,7 @@
             </Border>
 
             <!-- AVALONIA EDIT TEXT EDITOR -->
-            <AvaloniaEdit:TextEditor Grid.Row="1" 
+            <AvaloniaEdit:TextEditor Grid.Row="2"
                                      x:Name="Editor"
                                      ShowLineNumbers="True"
                                      Background="{DynamicResource SurfaceDeep}"

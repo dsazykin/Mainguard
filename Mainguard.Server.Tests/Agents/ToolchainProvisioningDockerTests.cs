@@ -85,6 +85,18 @@ public class ToolchainProvisioningDockerTests
     /// running container must still be the non-root agent uid, on the same read-only rootfs. A layer
     /// that ended on <c>USER root</c> would undo a control <see cref="ContainerSpecBuilder"/> cannot
     /// re-check, because it asserts the create SPEC and the user comes from the IMAGE.
+    ///
+    /// <para><b>Why <c>id -u</c> alone was not evidence, which is how M15 hid.</b> The production spawn
+    /// path sets <c>User = AgentUid</c> on the create request (<c>ContainerSpecBuilder</c>), and that
+    /// override wins over the image's own <c>USER</c> directive. So Docker reports 1000 whatever the
+    /// layer ends on: dropping <c>USER agent</c> from the generated Dockerfile left this test green. It
+    /// looked like runtime evidence and measured the builder.</para>
+    ///
+    /// <para>The two assertions below observe the LAYER. The first reads the image's own configured user
+    /// — the recorded effect of the <c>USER</c> directive, with no create request involved at all. The
+    /// second runs a container from the layer with the request's <c>User</c> left UNSET, so the only
+    /// thing that can decide the uid is the image; that is the same jail the daemon would get if the
+    /// override were ever removed, and it is where a root-ending layer becomes uid 0.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task TheLayeredJail_StillRunsAsTheNonRootAgentUid()
@@ -93,8 +105,25 @@ public class ToolchainProvisioningDockerTests
         await using var fx = new SandboxFixture();
 
         var layer = await BuildLayerAsync(fx, "dotnet-10\n", cts.Token);
-        var handle = await fx.SpawnFromImageAsync(layer.ImageRef, agentId: "tc-uid", ct: cts.Token);
 
+        // (1) The layer's own recorded user, read off the image config. No create request in the path.
+        var image = await fx.Docker.Images.InspectImageAsync(layer.ImageRef, cts.Token);
+        _out.WriteLine($"layer image Config.User => '{image.Config.User}'");
+        Assert.False(string.IsNullOrEmpty(image.Config.User),
+            "the derived layer records NO user, so it ends as root — the base image's `USER agent` was lost.");
+        Assert.NotEqual("root", image.Config.User);
+        Assert.NotEqual("0", image.Config.User);
+
+        // (2) …and the uid a container from that layer actually runs as when nothing overrides it.
+        var unoverridden = await fx.CreateAndStartFromImageWithoutUserOverrideAsync(
+            layer.ImageRef, "tc-uid-layer", cts.Token);
+        var layerUid = await fx.Engine.ExecAsync(unoverridden, new[] { "id", "-u" }, cts.Token);
+        _out.WriteLine($"id -u with no User on the create request => '{layerUid.Stdout.Trim()}'");
+        Assert.Equal("1000", layerUid.Stdout.Trim());
+
+        // (3) The production jail, which does carry the override — kept because the two facts together
+        // are what the control needs: the layer says non-root AND the spawned jail is non-root.
+        var handle = await fx.SpawnFromImageAsync(layer.ImageRef, agentId: "tc-uid", ct: cts.Token);
         var uid = await fx.Engine.ExecAsync(handle.ContainerId, new[] { "id", "-u" }, cts.Token);
         Assert.Equal("1000", uid.Stdout.Trim());
 
@@ -223,38 +252,12 @@ public class ToolchainProvisioningDockerTests
             _out.WriteLine(line);
         }
 
-        WriteToJobSummary("Docker engine + image store (MG-42)", lines);
+        JobSummary.Write("Docker engine + image store (MG-42)", lines);
 
         // The only thing worth asserting here: the base resolves to a content digest at all, which is
         // the input the whole pin is built on. Everything else above is evidence for the next reader.
         Assert.True(SandboxImageDigest.IsDigest(SandboxImageDigest.Normalize(inspect.ID)),
             $"the base image's id '{inspect.ID}' is not a usable content digest");
-    }
-
-    /// <summary>
-    /// Appends a fenced block to the GitHub Actions run summary when running under Actions; a no-op
-    /// anywhere else. Best-effort by construction — a diagnostic must never be the reason a suite fails.
-    /// </summary>
-    private static void WriteToJobSummary(string heading, IReadOnlyList<string> lines)
-    {
-        var path = Environment.GetEnvironmentVariable("GITHUB_STEP_SUMMARY");
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return;
-        }
-
-        try
-        {
-            System.IO.File.AppendAllText(
-                path,
-                $"### {heading}\n\n```\n{string.Join("\n", lines)}\n```\n\n");
-        }
-        catch (System.IO.IOException)
-        {
-        }
-        catch (UnauthorizedAccessException)
-        {
-        }
     }
 
     // ---- harness ---------------------------------------------------------

@@ -98,10 +98,26 @@ Determinism comes from two pins plus a deterministic repack:
    but a future package that ships a setcap binary would lose its capabilities silently — check
    before adding one.
 
-The `build-inputs hash` = `sha256(Dockerfile + packages.pinned.txt + mainguardd.service)` is stamped into
-`/etc/mainguardos-release` (alongside `DEBIAN_SNAPSHOT` and the base digest), so the payload
-self-describes exactly what produced it. CI (`payload-reproducible` job) builds the tarball **twice**
-and asserts an identical sha256.
+The `build-inputs hash` covers **every file `docker build` consumes** — the `Dockerfile`, each of its
+`COPY` sources (`packages.pinned.txt`, `mainguardd.service`, and the whole published `payload/daemon/`
+tree) and `build.sh` itself — framed as `<relative path>\0<content>` per file, ordinal-sorted, then
+sha256'd. It is stamped into `/etc/mainguardos-release` (alongside `DEBIAN_SNAPSHOT` and the base
+digest), so the payload self-describes exactly what produced it. `build.sh --print-inputs-hash` prints
+it for the current context.
+
+> It used to be `sha256(Dockerfile + packages.pinned.txt + mainguardd.service)`, which read none of the
+> daemon — the majority of the payload and all of its behaviour — so two payloads built from entirely
+> different `Mainguard.Server` source carried the same hash, and changes to `build.sh`'s repack flags
+> were invisible too. `build.sh` now refuses to stamp a hash if the Dockerfile `COPY`s anything that is
+> not in `INPUT_SPECS`, which is how that omission is kept from recurring.
+>
+> The version is stamped separately (`MAINGUARDOS_VERSION`), so it is deliberately **not** an input to
+> this hash: the pair (version, inputs hash) describes the payload, and a version bump alone should not
+> look like an input change.
+
+CI (`payload-reproducible` job) builds the tarball **twice** and asserts an identical sha256, that both
+runs stamped the same 64-hex `BUILD_INPUTS_HASH` (never the `unknown` `ARG` default, never empty), and
+that the value inside the shipped rootfs matches the one the build computed.
 
 ### Bumping the version floor (CVE cadence)
 
