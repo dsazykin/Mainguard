@@ -797,8 +797,15 @@
   guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
   is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
   `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
-  - **`.github/workflows/deploy-site.yml`** — builds `site/` and deploys it to GitHub Pages on pushes to
-    `main` touching `site/**` (or manual dispatch). **`Dockerfile` / `docker-compose.yml` /
+  - **`.github/workflows/deploy-site.yml`** — DEPLOY only: builds `site/` and publishes it to GitHub
+    Pages on pushes to `main` touching `site/**` (or manual dispatch). It is **not** the site's gate —
+    `push` to `main` is too late. The PR gate (#57) is the **`site` job in `ci.yml`**, deliberately
+    without a `paths:` filter: `npm ci && npm run build` (`tsc -b` + `vite build`),
+    **`build/ci/check-site-svgs.py`** (every SVG must parse as XML, and finding none is a failure), and
+    a conflict-marker scan over the tracked `site/` tree. Nothing under `site/` was compiled by PR CI
+    before this, which is how #310 committed `git stash pop` markers into `site/public/favicon.svg`
+    (malformed XML — no build step reads a `public/` SVG, so the bundle succeeds) and `Wordmark.tsx`
+    with every check green. **`Dockerfile` / `docker-compose.yml` /
     `.dockerignore`** — container build.
   - **`global.json`** — SDK pin.
   - **`Directory.Build.props`** — repo-wide MSBuild properties: `RestorePackagesWithLockFile` (MG-35

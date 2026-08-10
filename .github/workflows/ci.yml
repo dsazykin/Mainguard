@@ -410,6 +410,60 @@ jobs:
       - name: Positive control — Pro head DOES carry the agent platform (all tokens)
         run: build/ci/verify-client-closure.sh --head Mainguard.Pro.App --mode present
 
+  # ------------------------------------------------------------------------------------------------
+  # Ticket #57 — the site was never built on a PR.
+  # ------------------------------------------------------------------------------------------------
+  # deploy-site.yml triggers on `push` to main only, so nothing under site/ was compiled or validated
+  # by PR CI. That is how #310 merged 11 lines of `git stash pop` conflict markers into
+  # site/public/favicon.svg (malformed XML — an XML parser fails at line 4) and src/.../Wordmark.tsx,
+  # with every check green: the broken files were only looked at after they reached main.
+  #
+  # Deliberately NO `paths:` filter — this job lives in ci.yml, which runs on every PR. A path filter
+  # is how a guard silently stops running, and this whole job exists because a guard silently was not
+  # running.
+  site:
+    name: Site builds & assets parse (#57)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install (locked)
+        working-directory: site
+        run: npm ci
+
+      # `npm run build` is `tsc -b && vite build` — the type check AND the bundle, i.e. the same command
+      # deploy-site.yml runs. A PR that breaks either now fails here instead of on main.
+      - name: Build (tsc -b + vite build)
+        working-directory: site
+        run: npm run build
+
+      # A .tsx with conflict markers fails the build above; an SVG does not — nothing compiles it, so a
+      # malformed favicon ships. Parse every SVG as XML, and assert we actually parsed some.
+      - name: Every SVG is well-formed XML
+        run: python3 build/ci/check-site-svgs.py
+
+      # The general form of the #310 failure: unresolved merge/stash conflict markers committed into a
+      # tree nothing compiles. Cheap, and catches the .md/.json/.svg cases the build cannot.
+      - name: No conflict markers under site/
+        run: |
+          set -euo pipefail
+          FILES=$(git ls-files site/ | wc -l)
+          test "$FILES" -gt 0 || { echo "::error::git ls-files site/ returned nothing — vacuous scan"; exit 1; }
+          echo "scanning $FILES tracked files under site/"
+          # `<<<<<<< ` / `>>>>>>> ` always carry a label (a ref, or stash pop's "Updated upstream").
+          # `=======` is left out on purpose: a 7-character setext underline in Markdown looks identical.
+          if git grep -nIE '^(<{7}|>{7}) ' -- site/; then
+            echo "::error::conflict markers committed under site/ (this is exactly how #310 shipped a malformed favicon.svg)"
+            exit 1
+          fi
+          echo "No conflict markers under site/."
+
   daemon-smoke:
     name: Daemon --local-dev smoke (Windows)
     runs-on: windows-latest
