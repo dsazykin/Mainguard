@@ -127,6 +127,109 @@ public sealed class AgentRepoTests
         Assert.NotEqual(0, AgentTestGit.Run(bare, "cat-file", "-e", orphan).Code);
     }
 
+    /// <summary>
+    /// The OTHER door in the §4 policy — <c>maintenance.auto</c> — must be pinned as hard as
+    /// <c>gc.auto</c>, i.e. its exit code has to be CHECKED.
+    ///
+    /// <para>It used to be a <c>TryRun</c> whose exit went into <c>_</c>. The comment beside it says the
+    /// second setting exists because "setting only gc.auto would leave a second door open on a newer
+    /// git" — and on precisely that newer git, background maintenance prunes objects live alternates
+    /// borrowers need. Nothing fails at the moment the setting silently does not apply; the agent
+    /// repositories break later with missing objects, far enough from the cause that nobody connects
+    /// them. A two-door policy where one door reports its failure and the other does not is a one-door
+    /// policy with a comment.</para>
+    ///
+    /// <para>The failure is provoked with a multi-valued key, which is a real state a hand-edited or
+    /// tool-written config reaches: <c>git config &lt;key&gt; &lt;value&gt;</c> refuses to collapse
+    /// multiple values into one (exit 5).</para>
+    /// </summary>
+    [Fact]
+    public void Mirror_DisablesAutomaticMaintenance_AndSaysSoWhenItCannot()
+    {
+        using var env = new AgentRepoEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        // Both doors are shut by an ordinary provision.
+        Assert.Equal("0", AgentTestGit.RunChecked(bare, "config", "gc.auto").Trim());
+        Assert.Equal("false", AgentTestGit.RunChecked(bare, "config", "maintenance.auto").Trim());
+
+        // Now make the second setting fail while the first still succeeds.
+        AgentTestGit.RunChecked(bare, "config", "--replace-all", "maintenance.auto", "alpha");
+        AgentTestGit.RunChecked(bare, "config", "--add", "maintenance.auto", "beta");
+
+        var ex = Assert.Throws<RepoProvisioningException>(() => MirrorMaintenance.ApplyGcPolicy(bare));
+        Assert.Contains("config", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// MG-3 isolation: another agent's branch must be GONE from a per-agent repository, and a delete that
+    /// did not happen must be reported rather than swallowed.
+    ///
+    /// <para>The old code checked <c>for-each-ref</c>'s exit code and discarded <c>update-ref -d</c>'s,
+    /// which is the wrong way round — a failed listing means there is nothing to reason about, a failed
+    /// delete means the ref is still there. And a surviving <c>refs/heads/agent/&lt;other&gt;</c> is a
+    /// branch this agent can <c>git checkout</c> inside its own writable repository, with the whole of
+    /// another agent's work in it. Provoked with the stale ref lock a crashed or concurrent git leaves
+    /// behind, which is the failure class this application exists to prevent.</para>
+    /// </summary>
+    [Fact]
+    public void ForeignAgentBranch_ThatCannotBeDeleted_FailsLoudly_RatherThanStayingVisible()
+    {
+        using var env = new AgentRepoEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        // Agent b1 does some work and publishes it, so the mirror carries refs/heads/agent/b1.
+        var b1 = env.Worktrees.CreateAgentWorktree(hash, "b1");
+        AgentTestGit.SetIdentity(b1);
+        File.WriteAllText(Path.Combine(b1, "secret.txt"), "b1's work\n");
+        AgentTestGit.RunChecked(b1, "add", "-A");
+        AgentTestGit.RunChecked(b1, "commit", "-m", "b1 work");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "b1"));
+
+        // The happy path first: a1's clone brings b1's branch along and the drop removes it.
+        env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var a1Repo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+        Assert.NotEqual(0,
+            AgentTestGit.Run(a1Repo, "rev-parse", "--verify", "--quiet", "refs/heads/agent/b1").Code);
+
+        // Now put b1's branch back in a1's repository — written as a loose ref rather than fetched,
+        // because the in-jail reference-transaction guard refuses any write outside agent/a1 — and block
+        // its deletion with the stale ref lock a crashed git leaves. Then re-run the drop directly, which
+        // is the only way to reach it (Create() re-clones from scratch every time).
+        var b1Sha = AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/b1").Trim();
+        var foreignRef = Path.Combine(a1Repo, "refs", "heads", "agent", "b1");
+        Directory.CreateDirectory(Path.GetDirectoryName(foreignRef)!);
+        File.WriteAllText(foreignRef, b1Sha + "\n");
+        Assert.Equal(0,
+            AgentTestGit.Run(a1Repo, "rev-parse", "--verify", "--quiet", "refs/heads/agent/b1").Code);
+
+        var refLock = foreignRef + ".lock";
+        File.WriteAllText(refLock, string.Empty);
+
+        try
+        {
+            var ex = Assert.Throws<RepoProvisioningException>(
+                () => AgentRepoManager.DropForeignAgentRefs(a1Repo, "a1"));
+            Assert.Contains("agent/b1", ex.Message, StringComparison.Ordinal);
+
+            // The whole point: the ref really is still there, so silence would have been a lie.
+            Assert.Equal(0,
+                AgentTestGit.Run(a1Repo, "rev-parse", "--verify", "--quiet", "refs/heads/agent/b1").Code);
+        }
+        finally
+        {
+            File.Delete(refLock);
+        }
+
+        // Control: with the lock gone the same call succeeds and the branch is gone — so the throw above
+        // measured the blocked delete, not a permanently broken repository.
+        AgentRepoManager.DropForeignAgentRefs(a1Repo, "a1");
+        Assert.NotEqual(0,
+            AgentTestGit.Run(a1Repo, "rev-parse", "--verify", "--quiet", "refs/heads/agent/b1").Code);
+    }
+
     // ---- Teardown ---------------------------------------------------------
 
     /// <summary>

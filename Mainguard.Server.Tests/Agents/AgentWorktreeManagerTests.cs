@@ -202,6 +202,69 @@ public sealed class AgentWorktreeManagerTests
     }
 
     /// <summary>
+    /// ...and when that rescue FAILS, the adoption must refuse rather than proceed.
+    ///
+    /// <para>The rescue publish's outcome used to be discarded, three lines before
+    /// <c>ClearWorktreeResidue</c> deletes the only copy of the unpublished commits.
+    /// <c>OnPublishOutcome</c> returns early unless <c>result.Refused</c>, so a <c>Failed</c> outcome —
+    /// defined as "git itself failed (unreadable repo, races, disk)", i.e. exactly the transient case the
+    /// rescue exists for — reached nothing at all: no log line, no audit event, no failed call, and the
+    /// agent's last commits deleted a moment later.</para>
+    ///
+    /// <para>Modelled here with a stale <c>.lock</c> on the mirror's own ref, which is what a crashed or
+    /// concurrent git leaves behind and is the exact failure class this application exists to prevent. The
+    /// unpublished work must still be on disk afterwards, so a retry once the lock clears recovers it.</para>
+    /// </summary>
+    [Fact]
+    public void Adopt_WhenTheRescuePublishFails_RefusesTyped_AndKeepsTheUnpublishedWork()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var first = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var published = CommitInWorktree(first, "one.txt", "1", "feat: published");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
+
+        // The commits the mirror never saw — the asset the rescue exists to save.
+        var unpublished = CommitInWorktree(first, "two.txt", "2", "feat: never published");
+        Assert.NotEqual(published, unpublished);
+
+        // The crash shape, exactly as Adopt_CarriesAcrossCommitsTheMirrorNeverSaw sets it up: the previous
+        // jail's worktree and per-agent repository are still on disk, holding the only copy of `two.txt`.
+        var agentRepo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+
+        // A stale lock on refs/heads/agent/a1 in the mirror: the fetch into quarantine still succeeds, so
+        // the rescue gets as far as the compare-and-swap and then cannot take the ref.
+        var refLock = Path.Combine(bare, "refs", "heads", "agent", "a1.lock");
+        Directory.CreateDirectory(Path.GetDirectoryName(refLock)!);
+        File.WriteAllText(refLock, string.Empty);
+
+        try
+        {
+            var ex = Assert.Throws<AgentBranchRescueFailedException>(
+                () => env.Worktrees.AdoptAgentWorktree(hash, "a1"));
+            Assert.Equal(hash, ex.RepoHash);
+            Assert.Equal("a1", ex.AgentId);
+
+            // THE point: the only copy of the unpublished commit is still there, so a retry recovers it.
+            Assert.True(Directory.Exists(agentRepo), "the rescue failed, so its source must NOT be deleted");
+            Assert.Equal(
+                unpublished,
+                AgentTestGit.RunChecked(agentRepo, "rev-parse", "--verify", "refs/heads/agent/a1").Trim());
+        }
+        finally
+        {
+            File.Delete(refLock);
+        }
+
+        // ...and once the lock clears, the ordinary adoption carries the work across as it always did.
+        var adopted = env.Worktrees.AdoptAgentWorktree(hash, "a1");
+        Assert.Equal(unpublished, AgentTestGit.RunChecked(adopted, "rev-parse", "HEAD").Trim());
+        Assert.Equal("2", File.ReadAllText(Path.Combine(adopted, "two.txt")));
+    }
+
+    /// <summary>
     /// The two removals differ in exactly one thing, and it is the thing that matters: a teardown ends the
     /// agent (branch deleted, no residue), while a resume's rollback must leave the branch standing —
     /// running the teardown there would destroy the only surviving copy of the work being recovered.

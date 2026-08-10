@@ -285,7 +285,7 @@ public sealed class AgentRepoManager
     /// repository (see <c>WorktreeManager.CreateAgentWorktree</c>), so the agent gets a failed spawn with
     /// a named reason instead of a jail that can see another agent's branch.</para>
     /// </summary>
-    private static void DropForeignAgentRefs(string agentRepoPath, string agentId)
+    internal static void DropForeignAgentRefs(string agentRepoPath, string agentId)
     {
         var mine = AgentRepoLayout.RefFor(agentId);
         if (AgentGitCommand.TryRun(

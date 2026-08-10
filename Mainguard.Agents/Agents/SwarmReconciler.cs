@@ -228,6 +228,10 @@ public sealed class DaemonBootSequence
     /// <summary>The ordered task names (for the RT-D1 ordering assertion).</summary>
     public IReadOnlyList<string> TaskNames => _tasks.Select(t => t.Name).ToArray();
 
+    /// <summary>The tasks themselves, so a composition-root test can assert HOW each was built and not
+    /// only that a step with the right name is present.</summary>
+    public IReadOnlyList<IBootTask> Tasks => _tasks;
+
     /// <summary>Runs every task in order; stops on the first failure (boot is fail-fast).</summary>
     public async Task RunAsync(CancellationToken ct = default)
     {
@@ -304,6 +308,11 @@ public sealed class SwarmReconcileTask : IBootTask
     }
 
     public string Name => "swarm-reconcile";
+
+    /// <summary>Whether this step will leave a durable record of a destructive pass. The audit sink is an
+    /// optional argument, so the daemon failing to pass it restores the silent behaviour exactly with
+    /// every test here still green — the composition root asserts on this.</summary>
+    public bool RecordsOutcome => _audit is not null;
 
     /// <summary>The most recent pass's report — null before the first run. Kept so a caller (and the
     /// boot-order test) can assert on the outcome rather than only on the fact that a Task completed.</summary>

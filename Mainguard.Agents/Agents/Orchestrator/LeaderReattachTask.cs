@@ -40,6 +40,11 @@ public sealed class LeaderReattachTask : IBootTask
 
     public string Name => "leader-reattach";
 
+    /// <summary>Whether this step will leave a durable record of the sessions it reaped — the same
+    /// optional-argument exposure <see cref="SwarmReconcileTask.RecordsOutcome"/> covers, asserted at the
+    /// composition root for the same reason.</summary>
+    public bool RecordsOutcome => _audit is not null;
+
     /// <summary>The most recent pass's report — null before the first run.</summary>
     public LeaderReconcileReport? LastReport { get; private set; }
 

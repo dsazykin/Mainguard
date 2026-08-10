@@ -153,6 +153,31 @@ public sealed class CompositionRootResolutionTests
     }
 
     /// <summary>
+    /// Both boot reconcile steps are built with an audit sink, so a pass that destroys something leaves an
+    /// artifact.
+    ///
+    /// <para>Boot reconcile is the one pass that can declare an agent Dead and force-remove its worktree,
+    /// kill its PTY and drop it from the durable leader registry. Both steps discarded their reports
+    /// entirely, and the sinks that fixed that are optional constructor arguments — the same silent-delete
+    /// exposure as the merge-queue and kill-switch tails, so it is pinned the same way.</para>
+    /// </summary>
+    [Fact]
+    public void BootReconcileSteps_AreWiredToRecordWhatTheyDestroy()
+    {
+        using var host = new DaemonFixture();
+
+        var boot = host.Services.GetRequiredService<DaemonBootSequence>();
+
+        var swarm = Assert.IsType<SwarmReconcileTask>(
+            boot.Tasks.Single(t => t.Name == "swarm-reconcile"));
+        Assert.True(swarm.RecordsOutcome, "a boot pass that prunes agents must leave an audit record");
+
+        var reattach = Assert.IsType<LeaderReattachTask>(
+            boot.Tasks.Single(t => t.Name == "leader-reattach"));
+        Assert.True(reattach.RecordsOutcome, "a boot pass that reaps PTY sessions must leave an audit record");
+    }
+
+    /// <summary>
     /// P2-47 anti-idle proof: the external-PR intake dependency chain resolves and
     /// <see cref="PrIntakeHostedService"/> is registered as a hosted service, so the daemon's scheduler
     /// runs the poll loop instead of returning early. Each link (transport / store / worktrees / fetcher)
