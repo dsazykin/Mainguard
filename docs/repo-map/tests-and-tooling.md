@@ -671,6 +671,19 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/EgressProxyPushExitCodeTests.cs`** — the egress config push FAILS when the proxy
+  says it failed. `EgressProxyConfigurator.ExecAsync` ended at `ReadOutputToEndAsync` and returned
+  `void`, so `InspectContainerExecAsync` was never called and the exit code was never fetched — and
+  everything that configures the proxy goes through it (the four rendered artefacts, all four on the
+  argv branch of `WriteFileAsync`, plus the reload). Since `PushConfigAsync` is the last act of
+  `EnsureReadyAsync`, which runs on every spawn and returned success unconditionally, a removed
+  allowlist host could stay reachable, or every jail's only resolver be dead, with the daemon reporting
+  the proxy ready. Drives the real `PushConfigAsync` (now `internal`) over a fake `IDockerClient` whose
+  execs report chosen exit codes and output: a failing reload throws and CARRIES the container's
+  printed reason (the stream the old code drained and dropped), a failing artefact write throws
+  *before* the reload runs, and two non-vacuity controls — an all-succeeding push still completes, and
+  a failing best-effort `/etc/resolv.conf` read must NOT fail the push (it degrades to a known-good
+  resolver by design). The `reload.sh` half is `Agents/EgressProxyReloadDockerTests.cs`.
 - **`Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`** — MG-4 at the seam its own suite
   left uncovered: the confinement is **minted** on spawn and **revoked** on stop. `BuildSecretsConfinementTests`
   calls `BuildSecrets` directly and asserts that *given* a confinement the jail gets a token; it never
@@ -1651,7 +1664,13 @@
   applied-digest record is gone; and — the constraint the skip must never trade away — a host REMOVED
   from the allowlist really does become filtered, asserted on tinyproxy's 403 rather than on "the
   request failed" so it holds on a runner with no route out. Every assertion is paired with a control
-  that fails if the skip became unconditional), `Agents/SandboxNetworkIsolationDockerTests.cs`
+  that fails if the skip became unconditional. It also owns the **reload EXIT STATUS**:
+  `AReloadWhoseDaemonCannotStart_ExitsNonZero_RatherThanReportingSuccess` gives dnsmasq a config the
+  binary refuses — a REAL failure, not a simulated one — and asserts the script exits non-zero and
+  records `failed`, with a healthy reload exiting 0 as the control. `reload.sh` used to write
+  `stale`/`failed` and `exit 0` regardless, and nothing in the daemon read the status files; this is the
+  script half of the pair whose daemon half is `Mainguard.Tests/EgressProxyPushExitCodeTests.cs`),
+  `Agents/SandboxNetworkIsolationDockerTests.cs`
   (**MG-36 east-west isolation, read off real containers**: two jails on two per-agent segments — A
   cannot reach B's listener and cannot pivot via the proxy's address on B's segment, while the paired
   positive controls (B reaches its own listener; A reaches the proxy on its own segment) fail if the
