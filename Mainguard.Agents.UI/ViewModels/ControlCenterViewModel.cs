@@ -644,7 +644,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// daemon. Two loops each wrote <see cref="CoordinatorStartError"/> through
     /// <c>Dispatcher.UIThread.InvokeAsync</c>, so a lagging "could not reach" from one could land
     /// after the other's success and leave a false error banner on a screen that had loaded — and
-    /// they doubled the list RPCs against a daemon already known to be struggling.</para></summary>
+    /// they doubled the list RPCs against a daemon already known to be struggling.</para>
+    /// <para>Consequence of joining: the loop is driven by the token of whoever <i>started</i> it
+    /// (in practice the ctor's, cancelled on Dispose). A later caller's token does not cancel a
+    /// loop it merely joined — it is a cold-boot retry owned by the VM, not by the caller.</para>
+    /// </summary>
     public Task LoadInstalledClisUntilAvailableAsync(CancellationToken ct)
     {
         lock (_cliLoadGate)
