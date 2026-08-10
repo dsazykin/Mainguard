@@ -46,11 +46,18 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
             : userName;
         var distro = string.IsNullOrEmpty(distroName) ? "MainguardEnv" : distroName;
 
+        // The VM root, resolved HERE rather than left to each collaborator's own default, because the
+        // allowlist store below needs the same directory the mirrors and worktrees live in. Identical to
+        // what RepoProvisioner/WorktreeManager would resolve for a null vmRoot, so nothing moves.
+        var root = string.IsNullOrWhiteSpace(vmRoot)
+            ? System.IO.Path.Combine(Mainguard.Git.MainguardPaths.HomeDirectory(), "mainguard")
+            : vmRoot;
+
         // The Windows-facing UNC root of the VM's ~/<user>/mainguard/repos directory.
         _uncPrefix = $@"\\wsl.localhost\{distro}\home\{user}\mainguard\repos";
 
         // The provisioner's Windows-facing handle for a hash IS the resolved sync-remote URL.
-        var provisioner = new RepoProvisioner(vmRoot, hash => ResolveSyncRemote(hash).Url);
+        var provisioner = new RepoProvisioner(root, hash => ResolveSyncRemote(hash).Url);
         Repos = provisioner;
 
         // P2-07: hardened sandbox engine + default-deny egress. The Docker client connects lazily —
@@ -65,9 +72,9 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // so it inherits the MG-17 group-share the boot step provisions. The worktree manager is handed
         // the manager (not just the root) because a retired agent's cache is that agent's, and the one
         // teardown path every caller already goes through is RemoveAgentWorktree.
-        var packageCaches = new PackageCacheManager(vmRoot);
+        var packageCaches = new PackageCacheManager(root);
         PackageCaches = packageCaches;
-        Worktrees = new WorktreeManager(vmRoot, audit: audit, packageCaches: packageCaches);
+        Worktrees = new WorktreeManager(root, audit: audit, packageCaches: packageCaches);
         // Auto-permit on install: the proxy config also permits the hosts each installed agent CLI
         // declared it needs (read fresh per spawn from the registry markers), so an installed CLI
         // reaches its own service hosts (e.g. claude-code → platform.claude.com) with no hand-editing.
@@ -76,8 +83,15 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // ALONE, with no CLI re-install.
         var adapters = new InstalledAdapterCatalog();
         var declaredHosts = LoadBundledEgressHosts();
+        // The user's SAVED allowlist, not a fresh copy of the defaults. This line used to be
+        // `EgressAllowlist.WithDefaults(audit)`, and because it runs on every daemon start, every
+        // allowlist edit the user made through EgressGrpcService.Add/RemoveAllowlistHost was reverted by
+        // the next restart or WSL idle-stop — audited and re-rendered onto the live proxy, then silently
+        // gone. `ToPersistedForm`/`FromPersistedForm` already existed for exactly this and had no
+        // production callers on either side. A first run (no file yet) still gets DefaultEntries, so the
+        // shipped posture is unchanged.
         var egress = new EgressProxyConfigurator(
-            docker, EgressAllowlist.WithDefaults(audit),
+            docker, EgressAllowlist.LoadOrDefaults(audit, FileEgressAllowlistStore.UnderVmRoot(root)),
             // NOT the configurator's `gatewayUpstream:` — that emits tinyproxy `upstream` directives for
             // every model host, which would drag OAuth agents' traffic through the gateway and 401 it.
             // Confinement is per-agent and BYOK-only; the proxy just has to be willing to CARRY a

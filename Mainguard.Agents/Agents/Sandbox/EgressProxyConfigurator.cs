@@ -1032,8 +1032,11 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// <summary>The reload entrypoint, still on the read-only image layer.</summary>
     private const string ReloadScript = "/etc/mainguard/reload.sh";
 
-    /// <summary>Renders the allowlist to the proxy's config files + backstop script and applies them live.</summary>
-    private async Task PushConfigAsync(string proxyId, CancellationToken ct)
+    /// <summary>Renders the allowlist to the proxy's config files + backstop script and applies them live.
+    /// <para><c>internal</c> (not private) so the exit-code contract of the four artefact writes and the
+    /// reload can be asserted without standing up Docker — this is the step whose failures were being
+    /// discarded, and it is the last act of <c>EnsureReadyAsync</c> on every spawn.</para></summary>
+    internal async Task PushConfigAsync(string proxyId, CancellationToken ct)
     {
         // Auto-permit on install: union the installed agent CLIs' declared hosts (read fresh so a
         // CLI installed since the last spawn is included) into what the proxy renders — as direct-route
@@ -1211,20 +1214,10 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// argument. Reading output back is the direction that does work.</summary>
     private async Task<string> ExecCaptureAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(ExecTimeout);
-        var bounded = timeout.Token;
-
-        var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
-        {
-            User = "0",
-            AttachStdout = true,
-            AttachStderr = true,
-            Cmd = cmd.ToList(),
-        }, bounded).ConfigureAwait(false);
-        using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
-        var (stdout, _) = await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
-        return stdout;
+        // Deliberately UNCHECKED: the one caller (ReadProxyResolversAsync) is documented best-effort and
+        // degrades to a known-good default, so a non-zero exit here must not become a spawn failure.
+        var result = await ExecRawAsync(containerId, cmd, ct).ConfigureAwait(false);
+        return result.Stdout;
     }
 
     /// <summary>
@@ -1307,29 +1300,88 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
 
     private async Task<long> ExecExitCodeAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
     {
-        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeout.CancelAfter(ExecTimeout);
-        var bounded = timeout.Token;
-
-        var exec = await _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
-        {
-            User = "0",
-            AttachStdout = true,
-            AttachStderr = true,
-            Cmd = cmd.ToList(),
-        }, bounded).ConfigureAwait(false);
-
-        using (var stream = await _docker.Exec
-                   .StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false))
-        {
-            await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
-        }
-
-        var inspect = await _docker.Exec.InspectContainerExecAsync(exec.ID, bounded).ConfigureAwait(false);
-        return inspect.ExitCode;
+        var result = await ExecRawAsync(containerId, cmd, ct).ConfigureAwait(false);
+        return result.ExitCode;
     }
 
+    /// <summary>
+    /// Runs a command in the proxy container and <b>fails the caller if it failed</b>.
+    ///
+    /// <para><b>The defect this closes.</b> This method used to end at <c>ReadOutputToEndAsync</c> and
+    /// return <c>void</c>: <c>InspectContainerExecAsync</c> was never called, so the exit code was never
+    /// fetched and every verdict the container produced was discarded. Everything that configures the
+    /// proxy goes through here — the four rendered policy artefacts (all four take the argv branch of
+    /// <see cref="WriteFileAsync"/>; the stdin branch that DID check is documented as reachable only
+    /// above 64 KiB, i.e. never) and the reload itself. And because <see cref="PushConfigAsync"/> is the
+    /// last act of <c>EnsureReadyAsync</c>, which runs on EVERY spawn and returned success
+    /// unconditionally, the daemon reported "proxy ready" while the live policy was whatever survived:
+    /// a host the user had just REMOVED from the allowlist still reachable, or every jail's only
+    /// resolver dead. <c>reload.sh</c> printing "dnsmasq FAILED to start" with a log tail changed
+    /// nothing — that stream was read and dropped on the floor.</para>
+    ///
+    /// <para>The neighbouring stdin transport already did exactly this check, and its comment — "The
+    /// exit status was never read here either" — names the same bug on the path almost nothing takes.
+    /// This is that check, moved onto the path everything takes.</para>
+    ///
+    /// <para><b>A failure to RUN is not a failure of the policy.</b> Reading the exit code adds a fourth
+    /// variant of the disturbance class documented on <see cref="IsProxyDisturbed"/>: an exec against a
+    /// container that is being stopped or removed does not report the command's verdict, it reports that
+    /// the command never started (<c>128</c>, <c>OCI runtime exec failed … error executing setns
+    /// process</c>), and a signalled command reports <c>128+N</c>. The proxy is a SHARED singleton this
+    /// method does not own, so that is a routine race, and it gets the same answer every other variant
+    /// gets — re-run the whole adopt-or-create sequence. Only a command that actually ran and said no is
+    /// a policy failure, and only that propagates.</para>
+    ///
+    /// <para>A policy failure deliberately does NOT retry: nothing removed or signalled the container, so
+    /// running the identical push again would produce the identical refusal. It fails the spawn instead
+    /// of handing an agent a jail whose containment is not what the daemon just claimed it was.</para>
+    /// </summary>
     private async Task ExecAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
+    {
+        var result = await ExecRawAsync(containerId, cmd, ct).ConfigureAwait(false);
+        if (result.ExitCode == 0)
+        {
+            return;
+        }
+
+        if (IsExecNeverRan(result.ExitCode, result.Combined) || IsExternalStopExit(result.ExitCode))
+        {
+            throw new EgressProxyDisturbedException(
+                containerId, "stopped or removed while a config exec was in flight");
+        }
+
+        throw new EgressProxyExecFailedException(containerId, cmd, result.ExitCode, result.Combined);
+    }
+
+    /// <summary>
+    /// Did the exec fail to START, rather than the command failing?
+    ///
+    /// <para>Docker reports "I could not run this at all" as exit <c>128</c> with an <c>OCI runtime exec
+    /// failed</c> message, and the overwhelmingly common cause on a shared container is that it is being
+    /// stopped or removed underneath the call — the <c>setns</c> failure in that message is the exec
+    /// trying to enter namespaces that are going away. It is treated as a disturbance rather than a
+    /// policy failure because no verdict was ever produced: the artefact was not rejected, it was not
+    /// delivered.</para>
+    ///
+    /// <para>The commands this class runs are <c>sh -c 'printf …'</c> and <c>sh reload.sh</c>, neither of
+    /// which can plausibly exit 128 on its own — and <c>reload.sh</c>'s own failure exit is <c>1</c>, so
+    /// this cannot swallow the verdict it was added to surface.</para>
+    /// </summary>
+    internal static bool IsExecNeverRan(long exitCode, string output) =>
+        exitCode == 128
+        || output.Contains("OCI runtime exec failed", StringComparison.OrdinalIgnoreCase)
+        || output.Contains("unable to start container process", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The one exec primitive: create, attach, drain BOTH streams, then inspect for the exit code.
+    ///
+    /// <para>The inspect must come after the attach stream is drained and disposed — the exit code is not
+    /// final until the process has exited, and reading to EOF is what establishes that. This is the
+    /// ordering <see cref="ExecExitCodeAsync"/> already used for the MG-4 reachability probe; the other
+    /// two exec helpers simply never did the last step.</para>
+    /// </summary>
+    private async Task<ExecOutcome> ExecRawAsync(
+        string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeout.CancelAfter(ExecTimeout);
@@ -1342,8 +1394,70 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             AttachStderr = true,
             Cmd = cmd.ToList(),
         }, bounded).ConfigureAwait(false);
-        using var stream = await _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false);
-        await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+
+        string stdout, stderr;
+        using (var stream = await _docker.Exec
+                   .StartAndAttachContainerExecAsync(exec.ID, tty: false, bounded).ConfigureAwait(false))
+        {
+            (stdout, stderr) = await stream.ReadOutputToEndAsync(bounded).ConfigureAwait(false);
+        }
+
+        var inspect = await _docker.Exec.InspectContainerExecAsync(exec.ID, bounded).ConfigureAwait(false);
+        return new ExecOutcome(inspect.ExitCode, stdout ?? string.Empty, stderr ?? string.Empty);
+    }
+
+    /// <summary>What one exec in the proxy container actually did. Both streams are kept because
+    /// reload.sh reports WHY on them — dnsmasq's start failure and its log tail included.</summary>
+    private readonly record struct ExecOutcome(long ExitCode, string Stdout, string Stderr)
+    {
+        /// <summary>Both streams, for the failure message. This is the diagnosis the old code read off
+        /// the wire and then discarded.</summary>
+        public string Combined =>
+            string.Join("\n", new[] { Stdout, Stderr }.Where(s => !string.IsNullOrWhiteSpace(s))).Trim();
+    }
+}
+
+/// <summary>
+/// A command that configures the egress proxy ran and REPORTED FAILURE — a policy artefact that could
+/// not be written, or a reload that could not load it.
+///
+/// <para>Raised rather than logged because of what the alternative means: <c>EnsureReadyAsync</c> is the
+/// last thing between a spawn and a jail joining the network, so swallowing this hands an agent a
+/// container whose default-deny egress is not the policy the daemon just rendered. The two concrete
+/// shapes are a stale daemon (an unkillable predecessor still serving the PREVIOUS allowlist, so a host
+/// the user just removed stays reachable) and a dead one (dnsmasq down — and since MG-7 it is the jails'
+/// ONLY resolver, that is a whole-fleet egress outage). Both used to end with the daemon reporting the
+/// proxy ready.</para>
+/// </summary>
+public sealed class EgressProxyExecFailedException : Exception
+{
+    public EgressProxyExecFailedException(
+        string containerId, IReadOnlyList<string> command, long exitCode, string output)
+        : base(BuildMessage(containerId, command, exitCode, output))
+    {
+        ContainerId = containerId;
+        ExitCode = exitCode;
+        Output = output;
+    }
+
+    public string ContainerId { get; }
+
+    public long ExitCode { get; }
+
+    /// <summary>Whatever the command printed — for the reload this carries the reason.</summary>
+    public string Output { get; }
+
+    private static string BuildMessage(
+        string containerId, IReadOnlyList<string> command, long exitCode, string output)
+    {
+        // The first two argv entries identify the step ("sh /etc/mainguard/reload.sh", "sh -c") without
+        // dragging a whole rendered policy artefact into an exception message.
+        var what = string.Join(" ", command.Take(2));
+        var detail = string.IsNullOrWhiteSpace(output) ? " It printed nothing." : $" It printed: {output}";
+        return $"Configuring the egress proxy failed: '{what}' in container '{containerId}' exited "
+               + $"{exitCode}." + detail
+               + " The proxy's live policy is NOT the policy that was just rendered, so no jail may be "
+               + "attached to it.";
     }
 }
 

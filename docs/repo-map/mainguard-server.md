@@ -214,6 +214,16 @@
     `CreateAgentWorktree`, and switches the post-failure cleanup to the branch-preserving one. It asks no
     authorization question — that is `AgentResumeService`'s job, and a spawn that could name any id
     without it would let one agent adopt another's branch.
+    **MG-4 credential release (stop):** takes a REQUIRED `AgentGatewayCredentials` and calls `Revoke` in
+    the stop path. That method previously had **no production callers** — deleting it left both heads
+    compiling — so with the gateway on by default every stopped BYOK agent left a live, replayable
+    gateway token AND the daemon's copy of the user's provider key resident for the rest of the daemon's
+    lifetime. It sits inside the `FindAll(agentId).Count == 0` block beside the leader/IPC/lock releases
+    because the credential store is keyed by agent id ALONE: revoking while another repo's session still
+    answers to that id would break a LIVE agent's next model call. The dependency is required rather than
+    optional (it is registered unconditionally, gateway on or off) so a lost registration is a startup
+    failure instead of a silent return to the defect. Pinned by
+    `Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`.
   - **`Runtime/AgentResumeService.cs`** — the human-only resume for a STRANDED merge-queue entry (jail
     gone, branch intact), behind `AgentService.ResumeAgent`. Holds ALL of the authorization, keyed on
     `(RepoHash, AgentId)`: the entry must exist in THIS repo's live queue and be non-terminal, the id must

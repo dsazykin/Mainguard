@@ -683,6 +683,66 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/EgressAllowlistPersistenceTests.cs`** — an allowlist edit SURVIVES A RESTART.
+  `ToPersistedForm`/`FromPersistedForm` had no production callers (compile-proven) because
+  `Wsl2AgentEnvironment` rebuilt `WithDefaults` on every start, so every `EgressGrpcService` edit was
+  audited, applied to the live proxy, and silently reverted by the next restart or WSL idle-stop. "A
+  restart" is modelled the way one actually works — a SECOND `Wsl2AgentEnvironment` over the same VM
+  root — so the tests ride the production wiring (the line that was wrong) rather than the store.
+  Both directions: an added host is still allowed (with name and kind round-tripping, since kind drives
+  the A6 git-host warning), and — the security-relevant one — a REMOVED host stays removed, because a
+  reverted removal silently re-opens a destination the user cut off and the proxy is rendered from this
+  list on the next spawn. Three controls: a first run still gets the shipped defaults with no git host,
+  a corrupt store falls back to the defaults rather than stopping the daemon, and auto-permitted CLI
+  hosts (`CombinedWith`) are never written into the user's saved file.
+- **`Mainguard.Tests/EgressProxyPushExitCodeTests.cs`** — the egress config push FAILS when the proxy
+  says it failed. `EgressProxyConfigurator.ExecAsync` ended at `ReadOutputToEndAsync` and returned
+  `void`, so `InspectContainerExecAsync` was never called and the exit code was never fetched — and
+  everything that configures the proxy goes through it (the four rendered artefacts, all four on the
+  argv branch of `WriteFileAsync`, plus the reload). Since `PushConfigAsync` is the last act of
+  `EnsureReadyAsync`, which runs on every spawn and returned success unconditionally, a removed
+  allowlist host could stay reachable, or every jail's only resolver be dead, with the daemon reporting
+  the proxy ready. Drives the real `PushConfigAsync` (now `internal`) over a fake `IDockerClient` whose
+  execs report chosen exit codes and output: a failing reload throws and CARRIES the container's
+  printed reason (the stream the old code drained and dropped), a failing artefact write throws
+  *before* the reload runs, and two non-vacuity controls — an all-succeeding push still completes, and
+  a failing best-effort `/etc/resolv.conf` read must NOT fail the push (it degrades to a known-good
+  resolver by design). The `reload.sh` half is `Agents/EgressProxyReloadDockerTests.cs`.
+  It also pins the distinction that makes reading the exit code safe: **an exec that never RAN is a
+  disturbance, not a policy failure.** Reading the code introduced a fourth variant of the class
+  `IsProxyDisturbed` documents (whose comment warns "Recognising the CLASS is what stops the fourth") —
+  an exec against the shared proxy while it is being stopped reports `128` / `OCI runtime exec failed …
+  error executing setns process`, i.e. no verdict about the policy exists at all. CI caught it:
+  `SandboxEgressDockerTests.EnsureReady_WhenTheProxyIsStoppedUnderneathIt_RecoversInsteadOfFailing` went
+  from passing to a hard failure. `128`, the `OCI` markers and the signalled exits (143/137/130) now
+  raise `EgressProxyDisturbedException` so the whole-sequence retry answers them, while `reload.sh`'s own
+  failure exit of `1` stays a policy failure — asserted in both directions so they cannot merge.
+- **`Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`** — MG-4 at the seam its own suite
+  left uncovered: the confinement is **minted** on spawn and **revoked** on stop. `BuildSecretsConfinementTests`
+  calls `BuildSecrets` directly and asserts that *given* a confinement the jail gets a token; it never
+  asserts the launcher mints one, and its `WithoutGateway_…_UnchangedBehaviour` case documents the null
+  path as correct — so making `TryConfineToGatewayAsync` return null unconditionally left the whole
+  non-Docker server suite byte-identical (measured), i.e. every BYOK jail silently back to the raw
+  provider key with no metering, budget or custody. These tests **assert the call, not the callee**:
+  nothing here invokes `BuildSecrets`, `TryConfineToGatewayAsync` or `Issue`/`Revoke`. They drive the
+  shipped `AgentSpawnService` from the daemon's own container and then ask the daemon's own
+  `AgentGatewayCredentials` what it holds — an observation no uninvoked machinery can satisfy.
+  `AnOAuthSpawn_MintsNothing…` is the negative control (a daemon that minted unconditionally would pass
+  the first test while breaking the OAuth path), and the revoke test also asserts `ResolveAgent(token)`
+  is null, so a revoke that orphaned the reverse map would not pass. Docker-free: a fake substrate whose
+  sandbox engine RECORDS every `SandboxSpawnRequest`. The real-jail leg is
+  `Agents/GatewayConfinementDockerTests.cs`.
+- **`Mainguard.Server.Tests/EgressRefusalLogLevelTests.cs`** — an egress **refusal** reaches the daemon
+  log at `Warning`. `LoggingTransparencyLog` picked the level with
+  `string.Equals(line.Verdict, "Denied", …)` against a free-form string field whose only daemon producer
+  (`DaemonGitProxy`) writes `"refused"`/`"allowed"` — so the comparison was **always false** and every
+  refusal was logged at Information, leaving an operator filtering at Warning in silence while a jailed
+  agent probed blocked hosts. `TransparencyLine.Verdict` is now the typed `EgressVerdict`, so a producer
+  that stops agreeing with the sink is a compile error. Both tests drive the REAL producer through the
+  REAL sink and **never name a verdict value** — a test that constructed its own `TransparencyLine`
+  would assert the sink's behaviour for the spelling the *test* chose, which is the blind spot itself,
+  and this way the file is byte-identical before and after the fix. `AllowedFetch_StaysAtInformation…`
+  is the load-bearing negative control: without it a sink that logged *everything* at Warning would pass.
 - **`Mainguard.Tests/AdapterSettingsPathTests.cs`** — the manifest half of the CLI-settings round trip:
   the bundled `claude-code` adapter really declares BOTH `settingsPaths` roots (a field nothing declares
   is a feature nobody gets, and a home-only declaration would persist a file the CLI never writes), every
@@ -1637,7 +1697,13 @@
   applied-digest record is gone; and — the constraint the skip must never trade away — a host REMOVED
   from the allowlist really does become filtered, asserted on tinyproxy's 403 rather than on "the
   request failed" so it holds on a runner with no route out. Every assertion is paired with a control
-  that fails if the skip became unconditional), `Agents/SandboxNetworkIsolationDockerTests.cs`
+  that fails if the skip became unconditional. It also owns the **reload EXIT STATUS**:
+  `AReloadWhoseDaemonCannotStart_ExitsNonZero_RatherThanReportingSuccess` gives dnsmasq a config the
+  binary refuses — a REAL failure, not a simulated one — and asserts the script exits non-zero and
+  records `failed`, with a healthy reload exiting 0 as the control. `reload.sh` used to write
+  `stale`/`failed` and `exit 0` regardless, and nothing in the daemon read the status files; this is the
+  script half of the pair whose daemon half is `Mainguard.Tests/EgressProxyPushExitCodeTests.cs`),
+  `Agents/SandboxNetworkIsolationDockerTests.cs`
   (**MG-36 east-west isolation, read off real containers**: two jails on two per-agent segments — A
   cannot reach B's listener and cannot pivot via the proxy's address on B's segment, while the paired
   positive controls (B reaches its own listener; A reaches the proxy on its own segment) fail if the
