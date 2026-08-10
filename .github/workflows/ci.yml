@@ -220,10 +220,27 @@ jobs:
             echo "::error::MainguardOS.tar.gz is not hash-stable across builds ($A != $B)"
             exit 1
           fi
-          # The versioned release stamp must be present inside the payload.
+          # The versioned release stamp must carry REAL VALUES, not merely exist. `grep -q
+          # '^BUILD_INPUTS_HASH='` accepted the literal `unknown` (the ARG default at Dockerfile:22)
+          # and accepted an empty value — i.e. it asserted the KEY, which is the one thing that cannot
+          # go wrong. Assert the shape of the value, and that both builds agree on it.
           grep -q '^MAINGUARDOS_VERSION=ci-repro' "$RUNNER_TEMP/out-a/mainguardos-release"
-          grep -q '^BUILD_INPUTS_HASH=' "$RUNNER_TEMP/out-a/mainguardos-release"
-          echo "Payload is hash-stable and version-stamped."
+          for side in a b; do
+            HASH=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-$side/mainguardos-release")
+            echo "build $side BUILD_INPUTS_HASH: '${HASH}'"
+            if [ "$HASH" = "unknown" ]; then
+              echo "::error::BUILD_INPUTS_HASH is the literal ARG default 'unknown' — build.sh did not pass --build-arg BUILD_INPUTS_HASH"; exit 1
+            fi
+            if ! printf '%s' "$HASH" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::BUILD_INPUTS_HASH is not a sha256 ('${HASH}') — an empty or malformed stamp is not evidence of anything"; exit 1
+            fi
+          done
+          HA=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-a/mainguardos-release")
+          HB=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-b/mainguardos-release")
+          if [ "$HA" != "$HB" ]; then
+            echo "::error::the two builds stamped DIFFERENT build-inputs hashes ($HA != $HB) — an input is non-deterministic"; exit 1
+          fi
+          echo "Payload is hash-stable and version-stamped (BUILD_INPUTS_HASH=$HA)."
 
       # Daemon-startup smoke in the SHIPPED TARBALL, as the REAL service identity (uid 1000,
       # HOME=/home/mainguard, CWD=/ — the exact context systemd gives mainguardd in the VM). Three shipped
@@ -243,6 +260,17 @@ jobs:
         run: |
           set -euo pipefail
           docker import "$RUNNER_TEMP/out-a/MainguardOS.tar.gz" mainguardos-shipped:ci-repro
+
+          # The stamp OUTSIDE the payload proves what build.sh computed; the stamp INSIDE the shipped
+          # rootfs proves the --build-arg actually reached the image. They must agree — that is the only
+          # thing that makes /etc/mainguardos-release usable as evidence on a user's machine.
+          OUTSIDE=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-a/mainguardos-release")
+          INSIDE=$(docker run --rm mainguardos-shipped:ci-repro sed -n 's/^BUILD_INPUTS_HASH=//p' /etc/mainguardos-release)
+          echo "BUILD_INPUTS_HASH outside=$OUTSIDE inside=$INSIDE"
+          if [ -z "$INSIDE" ] || [ "$INSIDE" != "$OUTSIDE" ]; then
+            echo "::error::/etc/mainguardos-release inside the shipped tarball says '$INSIDE' but the build computed '$OUTSIDE'"; exit 1
+          fi
+
           docker run --rm mainguardos-shipped:ci-repro bash -c '
             set -u
             # Fail fast and precisely: mainguardd cannot create ~/.mainguard if the packaging step handed
