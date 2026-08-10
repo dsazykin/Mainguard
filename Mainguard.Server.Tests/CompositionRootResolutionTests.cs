@@ -93,6 +93,66 @@ public sealed class CompositionRootResolutionTests
     }
 
     /// <summary>
+    /// The same assertion for the daemon's <see cref="KillSwitch"/>, which had none at all.
+    ///
+    /// <para>Production passed only <c>gate</c>, <c>target</c> and <c>audit</c>, and deleting even
+    /// <c>audit:</c> left the whole Kill-filtered suite green (11 passed) — so two of the remaining
+    /// defaults were live in the shipped daemon rather than hypothetical. <c>journal</c> defaulted to an
+    /// <c>InMemoryKillJournal</c> nothing held a reference to, which makes step 3's "snapshot written
+    /// BEFORE returning" write nowhere that survives the restart an emergency stop is followed by; and
+    /// <c>rttBudget</c> defaulted to a bare <c>() =&gt; TimeSpan.Zero</c>, which is indistinguishable from a
+    /// measured-healthy channel.</para>
+    /// </summary>
+    [Fact]
+    public void KillSwitch_OptionalControlTail_IsWiredExactly_AndItsJournalIsDurable()
+    {
+        using var host = new DaemonFixture();
+        var sp = host.Services;
+
+        var kill = sp.GetRequiredService<KillSwitch>();
+
+        Assert.Equal(
+            new[] { "audit", "journal", "onRttSpike", "rttBudget" },
+            kill.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
+
+        // The journal must be the durable, registered one — a snapshot in the killed process's heap is
+        // gone exactly when someone comes to read it.
+        Assert.IsType<JsonKillJournal>(kill.Journal);
+        Assert.Same(sp.GetRequiredService<IKillJournal>(), kill.Journal);
+
+        // ...and the audit events must land in the daemon's sink, not a throwaway.
+        Assert.Same(sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>(), kill.AuditLog);
+
+        // The A3 feed has somewhere to go the moment a measurement exists.
+        Assert.True(kill.ReportsRttSpike);
+    }
+
+    /// <summary>
+    /// The daemon's RT-D4 posture, pinned as a decision rather than left as a silent default.
+    ///
+    /// <para>There is no control-channel RTT to measure: P2-09's <c>IAgentControlChannel</c> has no
+    /// production transport and <c>SandboxKillTarget.RequestYieldAsync</c> answers <c>false</c> without a
+    /// round trip. The old default said that with <c>() =&gt; TimeSpan.Zero</c>, which a
+    /// <see cref="KillReport"/> cannot tell apart from a measured-healthy channel; the sentinel says it
+    /// out loud and stamps <c>RttMeasured: false</c> on the report and the journal snapshot.</para>
+    ///
+    /// <para><b>This test is expected to fail the day a real transport lands</b> — at which point the
+    /// person wiring the EWMA flips it deliberately, which is the whole point of pinning it.</para>
+    /// </summary>
+    [Fact]
+    public void KillSwitch_ControlChannelRtt_IsExplicitlyUnmeasured_NotSilentlyZero()
+    {
+        using var host = new DaemonFixture();
+
+        var kill = host.Services.GetRequiredService<KillSwitch>();
+
+        Assert.False(
+            kill.MeasuresControlChannelRtt,
+            "the daemon has no control-channel RTT source; if one was just wired, update this assertion "
+            + "and KillSwitchTiming.UnmeasuredRtt's remarks rather than leaving the posture undeclared");
+    }
+
+    /// <summary>
     /// P2-47 anti-idle proof: the external-PR intake dependency chain resolves and
     /// <see cref="PrIntakeHostedService"/> is registered as a hosted service, so the daemon's scheduler
     /// runs the poll loop instead of returning early. Each link (transport / store / worktrees / fetcher)
