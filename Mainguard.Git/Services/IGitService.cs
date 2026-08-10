@@ -53,7 +53,15 @@ public interface IGitService
     /// </summary>
     string GetFileDiff(string repoPath, string filePath, bool isStaged, bool ignoreWhitespace);
 
-    void Commit(string repoPath, string message);
+    /// <summary>
+    /// Commits the staging index. With <paramref name="amend"/> the commit <i>replaces</i> HEAD
+    /// (<c>git commit --amend</c>) instead of being added on top, keeping the original author.
+    /// <para>Two edges are refused rather than surprising the user: an unborn branch (nothing to
+    /// amend) throws <see cref="Exceptions.GitOperationException"/>, and a HEAD its branch has
+    /// already published throws <see cref="Exceptions.AmendPushedCommitException"/> — rewriting it
+    /// would diverge the branch. Amending the root commit is allowed.</para>
+    /// </summary>
+    void Commit(string repoPath, string message, bool amend = false);
 
     void Push(string repoPath);
     void Pull(string repoPath);

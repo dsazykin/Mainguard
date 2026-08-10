@@ -407,9 +407,14 @@ public class GitService : IGitService
         return new Signature(name, email, now);
     }
 
-    public void Commit(string repoPath, string message)
+    public void Commit(string repoPath, string message, bool amend = false)
     {
-        using var op = _journal.BeginOperation(repoPath, JournalKinds.Commit, Describe("Commit", message));
+        // Refuse the two unsafe amends before anything is journalled or written.
+        if (amend) GuardAmend(repoPath);
+
+        using var op = _journal.BeginOperation(repoPath,
+            amend ? JournalKinds.AmendCommitMessage : JournalKinds.Commit,
+            Describe(amend ? "Amend commit" : "Commit", message));
         // Signing is a git-orchestration concern (gpg/ssh agents, pinentry) that LibGit2Sharp
         // can't drive, so when the preference is on we hand the commit to the git CLI and let it
         // sign from the (locally written) repo config. GIT_TERMINAL_PROMPT=0 is inherited by
@@ -420,7 +425,8 @@ public class GitService : IGitService
             // error as the unsigned path, before we shell out.
             ExecuteWithRepo(repoPath, repo => GetSignature(repo));
             ApplySigningConfig(repoPath);
-            RunGitChecked(repoPath, "commit", "-m", message);
+            if (amend) RunGitChecked(repoPath, "commit", "--amend", "-m", message);
+            else RunGitChecked(repoPath, "commit", "-m", message);
             return;
         }
 
@@ -429,10 +435,43 @@ public class GitService : IGitService
             // Resolve the identity from config, throwing a typed error if unset.
             var signature = GetSignature(repo);
 
+            // An amend keeps the ORIGINAL author and only re-stamps the committer — that is what
+            // `git commit --amend` does, and therefore what the signing path above already does.
+            // Passing `signature` for both would quietly reassign authorship on the unsigned path.
+            var author = amend ? repo.Head.Tip!.Author : signature;
+
             // Commits whatever is currently in the Staging Index
-            repo.Commit(message, signature, signature);
+            repo.Commit(message, author, signature, new CommitOptions { AmendPreviousCommit = amend });
         });
     }
+
+    /// <summary>
+    /// Pre-flight for <c>Commit(..., amend: true)</c>. Amending the <b>root</b> commit is fine
+    /// (a parentless amend simply rewrites the root), but there are two amends we refuse:
+    /// an unborn branch has no commit to amend at all, and a HEAD already contained in the
+    /// branch's upstream is published — rewriting it diverges the branch and the next push is
+    /// rejected, which is exactly the "silently created a diverged branch" outcome the checkbox
+    /// must not produce. The upstream ref is the local view of the remote (it can be stale), so
+    /// this is a best-effort guard against the common case, not a network round-trip.
+    /// </summary>
+    private void GuardAmend(string repoPath) => ExecuteWithRepo(repoPath, repo =>
+    {
+        var tip = repo.Head.Tip;
+        if (tip == null)
+            throw new GitOperationException(
+                "There is nothing to amend — this branch has no commits yet. Clear \"Amend last commit\" and commit normally.");
+
+        var upstream = repo.Head.TrackedBranch;
+        if (upstream?.Tip != null && IsAncestorOrSame(repo, tip, upstream.Tip))
+        {
+            var branchName = repo.Info.IsHeadDetached ? string.Empty : repo.Head.FriendlyName;
+            var upstreamName = upstream.FriendlyName;
+            throw new AmendPushedCommitException(branchName, upstreamName,
+                $"The last commit is already published on '{upstreamName}'. Amending it would rewrite " +
+                $"history that has been pushed and leave '{branchName}' diverged from its upstream. " +
+                "Commit your changes on top instead, or reset and force-push deliberately.");
+        }
+    });
 
     /// <summary>
     /// Writes the signing preferences into the repo's <b>local</b> config (never global) so a
