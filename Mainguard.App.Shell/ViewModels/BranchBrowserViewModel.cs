@@ -4,6 +4,7 @@ using System.Collections.ObjectModel;
 using System.Linq;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Mainguard.Git.Exceptions;
 using Mainguard.Git.Models;
 using Mainguard.Git.Services;
 using Mainguard.UI.ViewModels;
@@ -570,10 +571,15 @@ public partial class BranchBrowserViewModel : ViewModelBase
         {
             if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop && desktop.MainWindow != null)
             {
+                // Say what is actually true: a local delete is recorded in the operation
+                // journal and can be undone from History; deleting a remote branch pushes
+                // the deletion, which the journal cannot reverse.
                 var vm = new ConfirmationDialogViewModel
                 {
                     Title = "Delete Branch",
-                    Message = $"Are you sure you want to delete the branch '{branch.FriendlyName}'?\nThis action cannot be undone.",
+                    Message = branch.IsRemote
+                        ? $"Are you sure you want to delete the remote branch '{branch.FriendlyName}'?\nThis pushes the deletion to the remote and cannot be undone from History."
+                        : $"Are you sure you want to delete the branch '{branch.FriendlyName}'?\nYou can undo this from History.",
                     ConfirmButtonText = "Delete"
                 };
 
@@ -597,13 +603,13 @@ public partial class BranchBrowserViewModel : ViewModelBase
                     try
                     {
                         var localName = branch.FriendlyName.Substring(branch.FriendlyName.IndexOf('/') + 1);
-                        _gitService.DeleteBranch(_repoPath, localName);
+                        await DeleteBranchGuardedAsync(localName);
                     }
                     catch (Exception) { /* Ignore if local doesn't exist */ }
                 }
             }
 
-            _gitService.DeleteBranch(_repoPath, branch.Name);
+            if (!await DeleteBranchGuardedAsync(branch.Name)) return;
             ErrorMessage = string.Empty;
             _onBranchChangedAction?.Invoke();
             _showNotificationAction?.Invoke($"Deleted branch '{branch.FriendlyName}'");
@@ -612,6 +618,43 @@ public partial class BranchBrowserViewModel : ViewModelBase
         {
             ErrorMessage = $"Delete failed: {ex.Message}";
             _showNotificationAction?.Invoke(ErrorMessage);
+        }
+    }
+
+    /// <summary>
+    /// Deletes a branch with git's <c>-d</c> safety. The service refuses an unmerged branch
+    /// (<see cref="BranchNotMergedException"/>) instead of orphaning its commits, so the user is
+    /// asked once, explicitly, before we force. Returns false when they declined; every other
+    /// failure propagates to the caller's handler.
+    /// </summary>
+    private async System.Threading.Tasks.Task<bool> DeleteBranchGuardedAsync(string branchName)
+    {
+        try
+        {
+            _gitService.DeleteBranch(_repoPath, branchName, force: false);
+            return true;
+        }
+        catch (BranchNotMergedException ex)
+        {
+            if (Avalonia.Application.Current?.ApplicationLifetime is not Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop
+                || desktop.MainWindow == null)
+            {
+                // No window to ask in — never force behind the user's back.
+                throw;
+            }
+
+            var vm = new ConfirmationDialogViewModel
+            {
+                Title = "Branch Not Merged",
+                Message = ex.Message,
+                ConfirmButtonText = "Delete anyway"
+            };
+            var dialog = new Views.ConfirmationDialog { DataContext = vm };
+            await dialog.ShowDialog(desktop.MainWindow);
+            if (!vm.IsConfirmed) return false;
+
+            _gitService.DeleteBranch(_repoPath, branchName, force: true);
+            return true;
         }
     }
 

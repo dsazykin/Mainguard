@@ -194,7 +194,21 @@
   ChangelogGenerator nothing-ever-dropped), `GitServiceIndexLockTests` (Part-5 reliability: a held
   `.git/index.lock` clears mid-backoff → silent retry success; wedged → typed actionable
   `GitOperationException`, repo stays usable; reads unaffected), `GraphHitTesterTests` (pure graph
-  hit-testing, T-09), `CommitTimelineMenuTests` (graph context-menu construction, hard-reset/delete
+  hit-testing, T-09), `GitServiceWorktreeStateTests` (`RequiresGitCli`: merge/rebase state against a
+  **real linked worktree**, where `.git` is a file — `IsRebasing`, `IsMergeInProgress`/
+  `GetMergeMessage`, `GetRebaseProgress`, the rebase message-queue dir, `ResolveGitDir`/
+  `ResolveCommonGitDir`, and the two `RepositoryWatcher` cases: per-worktree `HEAD` and shared
+  `refs/`), `GitServiceAmendTests` (`Commit(..., amend)`: replaces HEAD carrying the staged file,
+  keeps the ORIGINAL author — matching `git commit --amend` and the CLI signing path — rewrites the
+  parentless root commit, and refuses both an unborn branch and a HEAD the upstream already
+  contains), `StagingPanelViewModelTests` (the "Amend last commit" checkbox over a real fixture
+  repo: ticking it replaces HEAD via Commit **and** Commit & Push, the flag clears after a
+  successful commit so it is never a sticky mode, an unticked box still appends),
+  `GitServiceBranchDeleteTests` (`DeleteBranch(force)`: git's `-d` rule — unmerged is refused with
+  `BranchNotMergedException`, `force: true` proceeds, contained-in-HEAD *or* in-upstream deletes
+  freely), `BranchDeleteConfirmationTests` (headless: the Delete-key delete no longer claims a
+  journalled local delete "cannot be undone", and unmerged work is discarded only after a second
+  explicit confirmation), `CommitTimelineMenuTests` (graph context-menu construction, hard-reset/delete
   confirmation routing, drag merge/rebase flyout, T-09), `LabelDragGestureTests` (T-09b pure: the
   drag-gesture threshold state machine — a sub-threshold move never begins a drag (click/right-click
   preserved), a past-threshold move begins it once, Cancel clears state), `PinnedRefsTests`

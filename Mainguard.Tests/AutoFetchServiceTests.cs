@@ -191,7 +191,7 @@ public class AutoFetchServiceTests
         public void DiscardHunk(string repoPath, string patch) => Nope();
         public string GetFileDiff(string repoPath, string filePath, bool isStaged) => Nope<string>();
         public string GetFileDiff(string repoPath, string filePath, bool isStaged, bool ignoreWhitespace) => Nope<string>();
-        public void Commit(string repoPath, string message) => Nope();
+        public void Commit(string repoPath, string message, bool amend = false) => Nope();
         public void Push(string repoPath) => Nope();
         public void Pull(string repoPath) => Nope();
         public void Pull(string repoPath, PullStrategy strategy) => Nope();
