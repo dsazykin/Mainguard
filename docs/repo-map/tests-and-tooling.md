@@ -1384,7 +1384,20 @@
   (TI-P2-07 §A.5, PR-blocking in Linux CI): `Fixtures/SandboxFixture.cs` (spawns a real hardened agent
   jail through `DockerSandboxEngine` + `EgressProxyConfigurator` on an ext4 temp worktree and cleans
   up — the §A.4 infrastructure contract the egress/inspect/git-proxy/memory-scrape tests stand on;
-  agent image ref via `MAINGUARD_AGENT_IMAGE`), `Fixtures/RequiresDockerFact.cs`
+  agent image ref via `MAINGUARD_AGENT_IMAGE`; `NewTempToolchainRoot`/`NewTempBareMirror` hand the jail
+  world-writable host trees so an in-jail refusal proves the MOUNT and not a file mode, the same
+  argument `NewTempCache` and `NewJailWritableTempWorktree` already make;
+  `CreateAndStartFromImageWithoutUserOverrideAsync` starts a container with NO `User` on the create
+  request, which is the only way to observe an image layer's own `USER` directive),
+  `Fixtures/JailSyscallProbe.cs` (tickets #59/#60 — attempts `process_vm_readv`/`ptrace` for real
+  through libc inside a live jail, framing every call's return value AND errno so a probe that never ran
+  is a MISSING frame rather than an absence that reads as a refusal; each cross-process call is paired
+  with a SELF-directed one that only a seccomp filter can refuse. Runs on the base image's nix
+  `python3`, because the jail has no compiler and these syscalls have no shell equivalent that is not
+  the read-semantics trap this replaces), `Fixtures/JobSummary.cs` (appends facts to
+  `$GITHUB_STEP_SUMMARY`; a no-op off CI. Exists because at `--verbosity normal` xUnit prints a test's
+  output only when it FAILS, so an instrument meant to report on GREEN runs would report on nothing —
+  extracted from `ToolchainProvisioningDockerTests`, which now shares it), `Fixtures/RequiresDockerFact.cs`
   (`[RequiresDockerFact]` skips unless Docker is reachable AND the CI-built agent-base image is
   present; the sibling `[RequiresDockerDaemonFact]` gates on Docker-daemon presence only — for P2-08's
   reconciler test that stands up its own trivial image; class-level
@@ -1511,10 +1524,34 @@
   cred tmpfs 0400/tmpfs per-agent, and the G2 key-custody proof — the agent uid cannot read the
   supervisor-owned `/run/secrets/supervisor/oob.key` — probed as EACH SECRET'S OWNER, since the agent
   cannot see into the supervisor's `0700` directory at all and asking it would conflate "not delivered"
-  with "properly hidden"; plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
+  with "properly hidden". **The MEMORY half of that same test is now attempted rather than inferred**
+  (tickets #59/#60): it used to be `cat /proc/1/mem …; echo $?` with a non-zero exit required, and that
+  could not fail — `cat` on ANY `/proc/<pid>/mem` reads from offset 0, never mapped, so it exits
+  non-zero before one permission check matters (`cat /proc/self/mem`, own memory, also exits 1), and it
+  passed under `--privileged` + `seccomp=unconfined` + `CAP_SYS_PTRACE`. It now runs
+  `Fixtures/JailSyscallProbe.cs`, which calls `process_vm_readv`/`ptrace` through libc in the live jail
+  and pairs every cross-process attempt with a SELF-directed one — against its own address space the
+  kernel's ptrace check returns early and Yama does not apply, so only the seccomp filter can refuse it;
+  a cross-process probe alone goes green on a jail with no profile at all, because the runner's
+  `ptrace_scope=1` refuses it anyway. Plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
   container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
   and no network is recreated by the checks that already existed, and that first version stayed green
-  with the new check disabled). **These RequiresDocker legs only ever run against
+  with the new check disabled). `Agents/JailRuntimePostureDockerTests.cs` (**tickets #59/#60** — the
+  jail's posture read FROM INSIDE A RUNNING CONTAINER rather than from the create request that asked
+  for it, because seven controls were measured removable from a real jail with the whole 98-test suite
+  green: the capability **bounding** set from `/proc/self/status` — never `CapEff`, which is empty for
+  uid 1000 even under `--privileged` and so could never have caught anything — with `CAP_SYS_PTRACE`
+  absent and `CAP_SYS_ADMIN`/`CAP_NET_RAW` absent to separate "dropped" from "the daemon's defaults were
+  accepted"; `NoNewPrivs`/`Seccomp: 2` (which catches `seccomp=unconfined` but NOT the profile being
+  dropped, since Docker then applies its own default and the field still reads 2 — which profile is
+  loaded is what the syscall probe measures); the userns posture with its limit stated out loud (on a
+  daemon with no remap configured, `""` and `"host"` are runtime-identical and no in-container
+  observation can separate them); the shared toolchain mount refusing a write with **EROFS
+  specifically**, controlled by a world-writable host tree, a successful read of the same mount, and a
+  successful write to `/tmp`; two agents in ONE repo getting caches neither can read, derived from the
+  SHIPPED `PackageCacheManager` — the pre-existing cross-tenant tests pass paths the TEST invented, so
+  they stay green against one shared cache per repo; and the RW-mirror jail being recreated rather than
+  reused, planted "identical except" for that one mount bit). **These RequiresDocker legs only ever run against
   a modern engine (Docker Desktop / CI, Engine 29.4.3), so they could not catch the in-jail `chown`
   EPERM that broke every spawn on `MainguardEnv`'s Docker 20.10.24** — on 20.10.24 a non-root `User`
   plus `no-new-privileges` leaves even a uid-0 exec with an empty permitted capability set, and on
@@ -1535,7 +1572,12 @@
   fails in the base image, so a green suite cannot be hiding that the layer was never needed),
   `dotnet --version` answering `10.0.3x` inside the jail, the layered jail still running as uid 1000
   on a read-only rootfs (a layer ending on `USER root` would undo a control `ContainerSpecBuilder`
-  cannot re-check, since it asserts the create SPEC and the user comes from the IMAGE), the
+  cannot re-check, since it asserts the create SPEC and the user comes from the IMAGE — **and `id -u`
+  alone was NOT that check, which is how M15 hid**: the create request sets `User = AgentUid`, which
+  wins over the image, so Docker reports 1000 whatever the layer ends on and dropping `USER agent` from
+  the generated Dockerfile left the test green. It now reads the layer's own image `Config.User` and
+  runs a container from the layer via `SandboxFixture.CreateAndStartFromImageWithoutUserOverrideAsync`
+  with **no `User` on the create request** — the only way to ask the image the question), the
   `mainguard.toolchain.base-digest` label equalling what the base ref resolves to right now, the spawn
   ref being the layer's own digest, the second `EnsureAsync` measured as a cache hit, and
   `RecordTheEngineAndItsImageStoreBehaviour` — an observation, not a gate: it prints the engine

@@ -193,10 +193,43 @@ public class SandboxHardeningDockerTests
             handle.ContainerId, "touch", CredTmpfsSpec.DefaultOobKeyPath + ".partial");
         Assert.NotEqual(0, plant.ExitCode);
 
-        // The memory-scrape vector is closed structurally by the seccomp denylist + no CAP_SYS_PTRACE
-        // (asserted on every create request by ContainerSpecBuilderTests). A live ptrace attempt has no
-        // syscall to make; here we prove the process cannot even see another uid's proc memory node.
-        var scrape = await fx.ExecAsync(handle.ContainerId, "sh", "-c", "cat /proc/1/mem >/dev/null 2>&1; echo $?");
-        Assert.NotEqual("0", scrape.Stdout.Trim());
+        // ---- and the MEMORY half of the same control, attempted for real ----
+        //
+        // This used to be `cat /proc/1/mem >/dev/null 2>&1; echo $?` with a non-zero exit required, and
+        // that assertion could not fail: `cat` on ANY /proc/<pid>/mem reads sequentially from offset 0,
+        // an address never mapped in any process, so it exits non-zero before one permission check
+        // matters. Measured: `cat /proc/self/mem` — the caller's OWN memory, every check trivially
+        // satisfied — also exits 1. It held under `--privileged` + `seccomp=unconfined` +
+        // CAP_SYS_PTRACE. It was the sole runtime evidence for G2 control 1 and it was evidence of
+        // kernel read semantics, not of hardening. The probe below makes the syscalls.
+        var frames = await JailSyscallProbe.RunAsync(fx, handle.ContainerId);
+
+        // Self-directed first, and it is the frame that makes every other one attributable: against its
+        // OWN address space the kernel's ptrace check returns early, Yama does not apply, the address is
+        // mapped and the length is right. A refusal here can only be the seccomp filter — and without
+        // the profile this call SUCCEEDS and returns the byte count. A cross-process probe alone would
+        // go green on a jail carrying no profile at all, because the runner's ptrace_scope=1 refuses it
+        // anyway.
+        var (selfRc, selfErrno) = JailSyscallProbe.ReadCall(frames, JailSyscallProbe.ProcessVmReadvSelf);
+        Assert.True(selfRc < 0,
+            $"process_vm_readv read {selfRc} bytes of this process's own memory — the seccomp filter is not "
+            + "in the path. Stock moby's default profile ALLOWS this syscall; the three memory-inspection "
+            + "denials are the only thing this profile adds over it.");
+        Assert.Equal(JailSyscallProbe.Eperm, selfErrno);
+
+        var (tracemeRc, tracemeErrno) = JailSyscallProbe.ReadCall(frames, JailSyscallProbe.PtraceTraceme);
+        Assert.True(tracemeRc < 0,
+            "ptrace(PTRACE_TRACEME) succeeded. It requires no capability and no permission over any other "
+            + "task, so the only thing that can refuse it is the seccomp filter — and it did not.");
+        Assert.Equal(JailSyscallProbe.Eperm, tracemeErrno);
+
+        // Then the vector this control is named for: another process's memory, both ways in.
+        var (initRc, initErrno) = JailSyscallProbe.ReadCall(frames, JailSyscallProbe.ProcessVmReadvInit);
+        Assert.True(initRc < 0, $"process_vm_readv read {initRc} bytes out of pid 1's address space.");
+        Assert.Equal(JailSyscallProbe.Eperm, initErrno);
+
+        var (attachRc, attachErrno) = JailSyscallProbe.ReadCall(frames, JailSyscallProbe.PtraceAttachInit);
+        Assert.True(attachRc < 0, "ptrace(PTRACE_ATTACH) attached to pid 1.");
+        Assert.Equal(JailSyscallProbe.Eperm, attachErrno);
     }
 }

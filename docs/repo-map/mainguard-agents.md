@@ -485,7 +485,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`defaultAction SCMP_ACT_ERRNO`) with `process_vm_readv`/`process_vm_writev`/`ptrace` removed from
       every allow rule and explicitly denied — embedded verbatim from
       `images/mainguard-agent-base/seccomp.json` as the single source of truth; `SecurityOptValue` =
-      `seccomp=<json>`, never `unconfined`).
+      `seccomp=<json>`, never `unconfined`. `DescribeDenialGap(json)` parses the profile's RULES and
+      answers whether the three memory-inspection syscalls are really denied — each named in an
+      `SCMP_ACT_ERRNO` group AND in no `SCMP_ACT_ALLOW` group, because libseccomp applies the first
+      matching rule so an allow entry shadows a denial outright. It exists because
+      `ContainerSpecBuilder.AssertG2Controls` used to substring-search the whole `seccomp=<json>` blob
+      for each NAME, and **stock moby carries all three names in its allow group** — so the guard for
+      this profile's sole hardening delta was one the un-hardened upstream profile also passes. Pinned
+      by `SeccompProfileTests`, which asserts both that the new guard rejects an upstream-shaped
+      document and that the OLD guard's predicate accepts it).
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
