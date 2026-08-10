@@ -499,6 +499,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `EgressAllowlist.cs` (model + JSON persistence + `allowlist_changed` audit events; `DefaultEntries`
       = model APIs + package registries with **no git host** (A6);
       `EgressAllowlistEntry.DefeatsA6`/`LooksLikeGitHost` flag a git-host entry).
+      **Edits are now DURABLE.** `ToPersistedForm`/`FromPersistedForm` had no production callers on
+      either side: `Wsl2AgentEnvironment` built `WithDefaults(audit)` on every daemon start, so an
+      `EgressGrpcService` add/remove mutated an in-memory list that was audited, re-rendered onto the
+      live proxy, and silently reverted by the next restart or WSL idle-stop — the user re-approving the
+      same host forever while the audit log logged each one as a fresh decision, and, in the removal
+      direction, a host the user cut off quietly coming back. `IEgressAllowlistStore` +
+      `FileEgressAllowlistStore` (`<vmRoot>/egress-allowlist.json`, atomic temp-file+replace) hold the
+      state; `LoadOrDefaults` is the production entry point and falls back to `DefaultEntries` on a
+      missing or corrupt file rather than refusing to boot — the SAFE direction, since the fallback is
+      the shipped restrictive set. `EmitChange` saves after the audit append, so a store failure can
+      never cost the security record. `CombinedWith` deliberately carries NO store: it is the
+      render-time union with installed CLIs' auto-permitted hosts, not a user edit. Pinned by
+      `Mainguard.Tests/EgressAllowlistPersistenceTests.cs`.
     - `EgressProxyConfig.cs` (pure renderer: tinyproxy allow-filter + dnsmasq pinned-DNS + iptables
       backstop from the allowlist. The backstop is rendered as a complete `*filter` table piped to
       **`iptables-restore`**, i.e. applied in ONE netlink transaction: it used to be `iptables -F` plus

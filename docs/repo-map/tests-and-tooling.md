@@ -671,6 +671,18 @@
   sandbox engine answers the daemon's OWN harvest exec (`sh -c '[ -f "$1" ] && base64 "$1"'`) with the
   login bytes, and only for the path the temp install marker declares. The real-jail leg is
   `Agents/CliLoginRoundTripDockerTests.cs`.
+- **`Mainguard.Tests/EgressAllowlistPersistenceTests.cs`** — an allowlist edit SURVIVES A RESTART.
+  `ToPersistedForm`/`FromPersistedForm` had no production callers (compile-proven) because
+  `Wsl2AgentEnvironment` rebuilt `WithDefaults` on every start, so every `EgressGrpcService` edit was
+  audited, applied to the live proxy, and silently reverted by the next restart or WSL idle-stop. "A
+  restart" is modelled the way one actually works — a SECOND `Wsl2AgentEnvironment` over the same VM
+  root — so the tests ride the production wiring (the line that was wrong) rather than the store.
+  Both directions: an added host is still allowed (with name and kind round-tripping, since kind drives
+  the A6 git-host warning), and — the security-relevant one — a REMOVED host stays removed, because a
+  reverted removal silently re-opens a destination the user cut off and the proxy is rendered from this
+  list on the next spawn. Three controls: a first run still gets the shipped defaults with no git host,
+  a corrupt store falls back to the defaults rather than stopping the daemon, and auto-permitted CLI
+  hosts (`CombinedWith`) are never written into the user's saved file.
 - **`Mainguard.Tests/EgressProxyPushExitCodeTests.cs`** — the egress config push FAILS when the proxy
   says it failed. `EgressProxyConfigurator.ExecAsync` ended at `ReadOutputToEndAsync` and returned
   `void`, so `InspectContainerExecAsync` was never called and the exit code was never fetched — and
