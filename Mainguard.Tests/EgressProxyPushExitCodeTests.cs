@@ -139,6 +139,77 @@ public class EgressProxyPushExitCodeTests
         Assert.Contains(docker.Commands, c => c.Contains("/etc/mainguard/reload.sh"));
     }
 
+    /// <summary>
+    /// An exec that never RAN is a disturbance, not a policy failure — and this distinction is the whole
+    /// reason reading the exit code is not simply "throw on non-zero".
+    ///
+    /// <para>The proxy is a shared singleton `EnsureReadyAsync` does not own. An exec against it while it
+    /// is being stopped or removed reports <c>128</c> / <c>OCI runtime exec failed … error executing
+    /// setns process</c> — the command was never delivered, so no verdict about the policy exists. That
+    /// is the documented `IsProxyDisturbed` class (container removed / SIGTERM'd / not running
+    /// mid-adoption), whose comment warns that fixing the manifestations one at a time does not
+    /// converge: "Recognising the CLASS is what stops the fourth." Reading the exit code introduced
+    /// exactly that fourth variant, and CI caught it —
+    /// `SandboxEgressDockerTests.EnsureReady_WhenTheProxyIsStoppedUnderneathIt_RecoversInsteadOfFailing`
+    /// went from passing to a hard failure, because a routine race was being reported as a broken
+    /// policy. It must raise the disturbance so the existing whole-sequence retry answers it.</para>
+    /// </summary>
+    [Fact]
+    public async Task AnExecThatNeverRan_IsADisturbance_NotAPolicyFailure()
+    {
+        // Verbatim from the CI failure, exit code included.
+        var docker = new FakeDockerClient
+        {
+            ExitCodeFor = _ => 128,
+            OutputFor = _ => "OCI runtime exec failed: exec failed: unable to start container process: "
+                             + "error executing setns process: exit status 1",
+        };
+
+        var ex = await Record.ExceptionAsync(
+            () => Build(docker).PushConfigAsync(ProxyId, CancellationToken.None));
+
+        Assert.IsNotType<EgressProxyExecFailedException>(ex);
+        Assert.True(
+            EgressProxyConfigurator.IsProxyDisturbed(ex!),
+            $"a stopped-underneath-us proxy must stay retryable, but the push raised {ex?.GetType().Name}");
+    }
+
+    /// <summary>A signalled command (128+N — SIGTERM/SIGKILL/SIGINT) is the same story: something
+    /// stopped it, which for a shared singleton is a race rather than a verdict.</summary>
+    [Theory]
+    [InlineData(143)] // SIGTERM — docker stop
+    [InlineData(137)] // SIGKILL — docker kill / force-remove
+    [InlineData(130)] // SIGINT
+    public async Task ASignalledExec_IsADisturbance_NotAPolicyFailure(long exitCode)
+    {
+        var docker = new FakeDockerClient { ExitCodeFor = _ => exitCode };
+
+        var ex = await Record.ExceptionAsync(
+            () => Build(docker).PushConfigAsync(ProxyId, CancellationToken.None));
+
+        Assert.True(EgressProxyConfigurator.IsProxyDisturbed(ex!));
+    }
+
+    /// <summary>
+    /// The boundary that keeps the two apart: <c>reload.sh</c>'s own failure exit is <c>1</c>, so the
+    /// disturbance classification above must not swallow the verdict this change exists to surface.
+    /// </summary>
+    [Fact]
+    public async Task AReloadsOwnFailureExit_IsNotMistakenForADisturbance()
+    {
+        var docker = new FakeDockerClient
+        {
+            ExitCodeFor = cmd => cmd.Contains("/etc/mainguard/reload.sh") ? 1 : 0,
+        };
+
+        var ex = await Assert.ThrowsAsync<EgressProxyExecFailedException>(
+            () => Build(docker).PushConfigAsync(ProxyId, CancellationToken.None));
+
+        Assert.False(
+            EgressProxyConfigurator.IsProxyDisturbed(ex),
+            "a failed reload must NOT be retried into silence — re-running it produces the same refusal");
+    }
+
     // =============================================================================================
     // A Docker endpoint whose execs report whatever this test says they report.
     // =============================================================================================

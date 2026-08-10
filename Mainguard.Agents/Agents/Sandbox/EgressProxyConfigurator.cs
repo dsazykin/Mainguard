@@ -1323,19 +1323,54 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// exit status was never read here either" — names the same bug on the path almost nothing takes.
     /// This is that check, moved onto the path everything takes.</para>
     ///
-    /// <para>The throw propagates out of <c>EnsureReadyAsync</c> rather than being retried: it is not an
-    /// <c>IsProxyDisturbed</c> condition (nothing removed or signalled the container — it ran the command
-    /// and the command said no), so a broken policy push fails the spawn instead of handing an agent a
-    /// jail whose containment is not what the daemon just claimed it was.</para>
+    /// <para><b>A failure to RUN is not a failure of the policy.</b> Reading the exit code adds a fourth
+    /// variant of the disturbance class documented on <see cref="IsProxyDisturbed"/>: an exec against a
+    /// container that is being stopped or removed does not report the command's verdict, it reports that
+    /// the command never started (<c>128</c>, <c>OCI runtime exec failed … error executing setns
+    /// process</c>), and a signalled command reports <c>128+N</c>. The proxy is a SHARED singleton this
+    /// method does not own, so that is a routine race, and it gets the same answer every other variant
+    /// gets — re-run the whole adopt-or-create sequence. Only a command that actually ran and said no is
+    /// a policy failure, and only that propagates.</para>
+    ///
+    /// <para>A policy failure deliberately does NOT retry: nothing removed or signalled the container, so
+    /// running the identical push again would produce the identical refusal. It fails the spawn instead
+    /// of handing an agent a jail whose containment is not what the daemon just claimed it was.</para>
     /// </summary>
     private async Task ExecAsync(string containerId, IReadOnlyList<string> cmd, CancellationToken ct)
     {
         var result = await ExecRawAsync(containerId, cmd, ct).ConfigureAwait(false);
-        if (result.ExitCode != 0)
+        if (result.ExitCode == 0)
         {
-            throw new EgressProxyExecFailedException(containerId, cmd, result.ExitCode, result.Combined);
+            return;
         }
+
+        if (IsExecNeverRan(result.ExitCode, result.Combined) || IsExternalStopExit(result.ExitCode))
+        {
+            throw new EgressProxyDisturbedException(
+                containerId, "stopped or removed while a config exec was in flight");
+        }
+
+        throw new EgressProxyExecFailedException(containerId, cmd, result.ExitCode, result.Combined);
     }
+
+    /// <summary>
+    /// Did the exec fail to START, rather than the command failing?
+    ///
+    /// <para>Docker reports "I could not run this at all" as exit <c>128</c> with an <c>OCI runtime exec
+    /// failed</c> message, and the overwhelmingly common cause on a shared container is that it is being
+    /// stopped or removed underneath the call — the <c>setns</c> failure in that message is the exec
+    /// trying to enter namespaces that are going away. It is treated as a disturbance rather than a
+    /// policy failure because no verdict was ever produced: the artefact was not rejected, it was not
+    /// delivered.</para>
+    ///
+    /// <para>The commands this class runs are <c>sh -c 'printf …'</c> and <c>sh reload.sh</c>, neither of
+    /// which can plausibly exit 128 on its own — and <c>reload.sh</c>'s own failure exit is <c>1</c>, so
+    /// this cannot swallow the verdict it was added to surface.</para>
+    /// </summary>
+    internal static bool IsExecNeverRan(long exitCode, string output) =>
+        exitCode == 128
+        || output.Contains("OCI runtime exec failed", StringComparison.OrdinalIgnoreCase)
+        || output.Contains("unable to start container process", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The one exec primitive: create, attach, drain BOTH streams, then inspect for the exit code.

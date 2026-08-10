@@ -696,6 +696,15 @@
   *before* the reload runs, and two non-vacuity controls — an all-succeeding push still completes, and
   a failing best-effort `/etc/resolv.conf` read must NOT fail the push (it degrades to a known-good
   resolver by design). The `reload.sh` half is `Agents/EgressProxyReloadDockerTests.cs`.
+  It also pins the distinction that makes reading the exit code safe: **an exec that never RAN is a
+  disturbance, not a policy failure.** Reading the code introduced a fourth variant of the class
+  `IsProxyDisturbed` documents (whose comment warns "Recognising the CLASS is what stops the fourth") —
+  an exec against the shared proxy while it is being stopped reports `128` / `OCI runtime exec failed …
+  error executing setns process`, i.e. no verdict about the policy exists at all. CI caught it:
+  `SandboxEgressDockerTests.EnsureReady_WhenTheProxyIsStoppedUnderneathIt_RecoversInsteadOfFailing` went
+  from passing to a hard failure. `128`, the `OCI` markers and the signalled exits (143/137/130) now
+  raise `EgressProxyDisturbedException` so the whole-sequence retry answers them, while `reload.sh`'s own
+  failure exit of `1` stays a policy failure — asserted in both directions so they cannot merge.
 - **`Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`** — MG-4 at the seam its own suite
   left uncovered: the confinement is **minted** on spawn and **revoked** on stop. `BuildSecretsConfinementTests`
   calls `BuildSecrets` directly and asserts that *given* a confinement the jail gets a token; it never
