@@ -782,7 +782,12 @@
   behaviour, not an exit code. Its `client-closure` job (ADR-0001 payoff, automated) publishes the
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
-  `build/ci/verify-client-closure.sh` (also runnable locally).
+  `build/ci/verify-client-closure.sh` (also runnable locally). That script publishes **self-contained
+  win-x64** — the shape that ships; publishing framework-dependent gated a different asset graph than
+  the one distributed — scans the publish dir **recursively**, and its positive control requires **all
+  six** tokens to match, not one (a mistyped token used to stop detecting anything forever while the
+  control still reported PASS on its neighbours). The RID restore rewrites `packages.lock.json`, so the
+  script snapshots and puts them back.
 - **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
   `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
   `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the

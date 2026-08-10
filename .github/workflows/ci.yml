@@ -383,9 +383,12 @@ jobs:
         with:
           global-json-file: global.json
 
-      # verify-client-closure.sh publishes framework-dependent (no RID), so its implicit restore is
-      # the same RID-less graph the lockfiles describe — restore it locked first (MG-35), and the
-      # publish below then finds everything already resolved.
+      # MG-35: this locks the RID-LESS graph, which is what the committed lockfiles describe. The gate
+      # itself now publishes self-contained win-x64 (below), and that RID restore is deliberately NOT
+      # locked — same reasoning as payload-reproducible: a RID restore resolves an ADDITIONAL
+      # `net10.0/win-x64` target that a plain restore strips again, so committing it would churn the
+      # lockfiles on every ordinary restore. The script snapshots and restores them so nothing leaks
+      # into the working tree.
       - name: Restore (locked)
         run: dotnet restore --locked-mode
 
@@ -394,11 +397,17 @@ jobs:
       # platform. This gate publishes the head and fails if its .deps.json / publish dir names any of
       # Mainguard.Agents(.UI) / Mainguard.Protos / Docker.DotNet / Porta.Pty / Grpc — the automated form of
       # the manual deps.json proof. The same script runs LOCALLY (it falls back to dotnet.exe under WSL).
+      #
+      # It publishes SELF-CONTAINED win-x64 — the shape that actually ships. It used to publish
+      # framework-dependent, which resolves a different asset graph, so the closure being gated was not
+      # the closure being distributed.
       - name: Client head closure is FREE of the agent platform
         run: build/ci/verify-client-closure.sh
 
-      # Positive control (bonus): prove the matcher is not vacuous — the Pro head DOES ship the platform.
-      - name: Positive control — Pro head DOES carry the agent platform
+      # Positive control: prove the matcher is not vacuous — the Pro head DOES ship the platform, and
+      # must match EVERY token. It used to pass on a single hit, so one mistyped token could stop
+      # detecting anything forever while this still reported PASS on the strength of its neighbours.
+      - name: Positive control — Pro head DOES carry the agent platform (all tokens)
         run: build/ci/verify-client-closure.sh --head Mainguard.Pro.App --mode present
 
   daemon-smoke:
