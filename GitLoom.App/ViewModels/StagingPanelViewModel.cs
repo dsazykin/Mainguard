@@ -344,7 +344,7 @@ public partial class StagingPanelViewModel : ViewModelBase
 
     private System.Threading.Tasks.Task DoCommitAsync()
     {
-        _gitService.Commit(_repoPath, EffectiveCommitMessage);
+        _gitService.Commit(_repoPath, EffectiveCommitMessage, AmendLastCommit);
         ResetComposerAfterCommit();
         _onCommitAction?.Invoke();
         return System.Threading.Tasks.Task.CompletedTask;
@@ -355,6 +355,10 @@ public partial class StagingPanelViewModel : ViewModelBase
     {
         CommitMessage = string.Empty;
         CommitComposer.Clear();
+        // Amend is a per-commit choice, never a mode: leaving it ticked would make the NEXT
+        // commit silently rewrite the one just made. Only reached on success, so a rejected
+        // amend (published HEAD) keeps the box ticked and the message intact for a retry.
+        AmendLastCommit = false;
     }
 
     [RelayCommand(CanExecute = nameof(CanCommit))]
@@ -379,7 +383,7 @@ public partial class StagingPanelViewModel : ViewModelBase
 
     private System.Threading.Tasks.Task DoCommitAndPushAsync()
     {
-        _gitService.Commit(_repoPath, EffectiveCommitMessage);
+        _gitService.Commit(_repoPath, EffectiveCommitMessage, AmendLastCommit);
         ResetComposerAfterCommit();
         _onCommitAction?.Invoke();
 
