@@ -104,7 +104,10 @@
   `VerifyCommand_OnRail_MovesTheEntryOffNotVerifiedYet` (pressing it drives the seam and repaints the
   row);
   the **P2-10 suite** — `MergeQueueStateMachineTests`
-  (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO, loud override
+  (exhaustive legal + typed-illegal transitions, property test, stale-cascade FIFO — the entries go in
+  A/B/C with a cancelled decoy and are verified C/A/B, so the dictionary's enumeration order and the
+  expected FIFO order disagree; previously they coincided and the `OrderBy` could be deleted with 29
+  tests still green — loud override
   audited/`CanMerge`-still-false, no-test-command typed, immutable records, restart-resume,
   `NoAutoMergePathExists`, RT-D2 gamed-command flagged + `VerificationCommandResolver`, and the
   **entry-lifecycle** block — discard from `Working` is terminal/not-`Merged`/persisted with actor +
@@ -135,7 +138,10 @@
   `VerificationRunnerTests` (daemon-observed exit is pass/fail,
   `ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit`, runs-in-sandbox-never-host, artifact
   provenance), `ForegroundMergeServiceTests` (real-git: journaled/undoable A5 ff-only merge,
-  CAS-lost-when-main-moved, the always-`--ignore-scripts` poisoned-postinstall canary with an injected
+  CAS-lost-when-main-moved, `FfMergeBlockedByIndexLock_IsNotReportedAsAStaleVerification` (an
+  `--ff-only` refusal that is NOT staleness must not be labelled staleness or invalidate the
+  verification — with a control proving the same call merges once the lock clears),
+  the always-`--ignore-scripts` poisoned-postinstall canary with an injected
   EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
   never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
@@ -983,12 +989,15 @@
   virtual clock), `BackoffTests` (Retry-After-as-floor exponential), `BudgetLedgerTests` (caps +
   typed-pause-not-kill + `budget_exceeded` audit + snapshot + price table), `AdmissionControllerTests`
   (86% → reject with honest reason, cache TTL), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
-  Docker-as-truth + RT-D1 ordering), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
+  Docker-as-truth + RT-D1 ordering + `BootStep_RecordsWhatItPruned_RatherThanDiscardingTheReport`, since
+  a boot pass that destroys agents must leave an audit entry and a log line naming them, and its
+  counterpart that a pass changing nothing logs but does not audit), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
   **P2-09 pure tests (Core):** `GitMutationGuardTests` (mid-rebase/detached/merge verdicts + the
   `index.lock` backoff-then-typed-failure + the no-active-token refusal), `YieldProtocolTests`
   (ready-path round-trip with no pause + the timeout `docker pause`-then-resume-unpause path, via
   fakes), `LeaderReattachTests` (the `LeaderRegistry` round-trip + the boot reattach reconcile reaping
-  dead-container sessions). **P2-12 pure tests (Core):** `ExternalPrIntakeTests` (fixture-driven
+  dead-container sessions + `BootStep_RecordsWhatItReaped_RatherThanDiscardingTheReport`, since reaping
+  kills the agent's PTY and drops it from the durable registry). **P2-12 pure tests (Core):** `ExternalPrIntakeTests` (fixture-driven
   through the T-23 provider seam + the **worker-host**/fetch seams — materialize only bot PRs,
   idempotent double-subscribe/same-PR, force-push invalidation+re-queue, closed-PR cancel+**release
   the whole worker** (not just the worktree — the jail's MG-36 segment is what actually leaks),
@@ -1219,9 +1228,17 @@
   reflection over the registered engine's own delegates, that its target resolver really is
   `PrIntakeTargetResolver.Resolve` and not a hardwired `null`, and that its worker host really is the
   daemon's `ExternalPrWorkerHost`: a hardwired constant is invisible from the outside, since the
-  engine resolves and the hosted service starts either way), and that the daemon's
-  `MergeQueueProvisioner` really was constructed with `checkAgentBranch` — an optional argument whose
-  absence restores the silent stranded-branch behaviour exactly while every other test stays green),
+  engine resolves and the hosted service starts either way); and the **optional-tail guards**, which
+  generalise what used to be one ad-hoc `checkAgentBranch` assertion —
+  `MergeQueueProvisioner_OptionalControlTail_IsWiredExactly` compares
+  `WiredOptionalControls` against an EXACT set and pins `AuditLog` to the daemon's own sink (proven to
+  redden on the deletion of each of `audit`/`log`/`publishAgentRef`/`checkAgentBranch`, and on an audit
+  log that is non-null but not the daemon's),
+  `KillSwitch_OptionalControlTail_IsWiredExactly_AndItsJournalIsDurable` does the same for the kill
+  switch plus `Assert.IsType<JsonKillJournal>`,
+  `KillSwitch_ControlChannelRtt_IsExplicitlyUnmeasured_NotSilentlyZero` pins the RT-D4 posture as a
+  stated decision (and is MEANT to fail the day a real transport lands), and
+  `BootReconcileSteps_AreWiredToRecordWhatTheyDestroy` pins both boot tasks' audit sinks),
   **`ExternalPrIntakeSpawnWiringTests`**
   (the intake→spawn decisions at the tier that needs no Docker: the explicit-`pr-<n>`-id scheme and
   its duplicate-id refusal; `EnsureWorkerAsync` adopting a live session and a restart-orphaned jail;
@@ -1434,7 +1451,11 @@
   failures, the **resume/adoption** set — `AdoptAgentWorktree` starts a new worktree on the EXISTING
   `agent/<id>` with the dead jail's commits and file contents intact (a `worktree add -b` would fail every
   line of it), refuses typed with `AgentBranchMissingException` and creates nothing when the branch is
-  gone, and carries across commits the mirror never saw before deleting the repository that holds them;
+  gone, carries across commits the mirror never saw before deleting the repository that holds them, and
+  — `Adopt_WhenTheRescuePublishFails_RefusesTyped_AndKeepsTheUnpublishedWork` — refuses the whole
+  adoption with `AgentBranchRescueFailedException` when that rescue publish fails transiently (driven by
+  a stale `.lock` on the mirror's ref), leaving the unpublished commit on disk for a retry instead of
+  deleting the only copy;
   plus the decisive contrast between `RemoveAgentWorktreeKeepingBranch` and `RemoveAgentWorktree`, one of
   which leaves the branch adoptable and the other of which does not — **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names
@@ -1449,6 +1470,12 @@
   `RepackWithoutPrune_KeepsEveryObjectResolvable_EvenUnreachableOnesAgentsMayBorrow` (the
   discriminator: with `-a` instead of `-A` the object is gone) and
   `Prune_IsRefusedWhileAnAgentIsAttached_AndReclaimsOnceTheLastOneDetaches`;
+  `Mirror_DisablesAutomaticMaintenance_AndSaysSoWhenItCannot` (the second door — a `maintenance.auto`
+  that cannot be set now throws instead of returning silently, driven by a multi-valued key) and
+  `ForeignAgentBranch_ThatCannotBeDeleted_FailsLoudly_RatherThanStayingVisible` (the MG-3 isolation
+  boundary: a blocked `update-ref -d` leaves another agent's branch checkout-able, so it must refuse the
+  spawn — driven through the internal `AgentRepoManager.DropForeignAgentRefs`, since `Create` re-clones
+  from scratch and cannot be interrupted);
   `PublishedWork_IsCopiedIntoTheMirror_NotBorrowedFromTheAgentRepository` (destroy the agent repo and
   the mirror still serves the commit — the property that makes teardown safe) and the no-residue
   teardown), `AgentRefMediationTests.cs` (**MG-3 stage 2** on real git — fast-forward publish +

@@ -162,6 +162,57 @@ public class ForegroundMergeServiceTests : IDisposable
         Assert.Equal(movedMain, Rev(repo.RepoPath, "main")); // main untouched
     }
 
+    /// <summary>
+    /// An <c>--ff-only</c> merge that fails for a reason OTHER than staleness must not be reported as
+    /// staleness.
+    ///
+    /// <para>The merge used to be <c>var (code, _, _) = RunGit(…)</c> followed by a hardcoded
+    /// "verification is stale — the branch no longer fast-forwards onto main" on any non-zero exit, with
+    /// <c>CasLost: true</c>. <c>index.lock</c> contention is the case picked here because it is the exact
+    /// bug class this application exists to prevent, and because it is the worst one to mislabel: the
+    /// branch fast-forwards perfectly, the verification is fine, and telling the queue the verification is
+    /// stale sends it into a re-verify loop that can never succeed and never names its cause. A refusing
+    /// pre-merge hook, a full disk and unrelated histories all land the same way.</para>
+    /// </summary>
+    [Fact]
+    public void FfMergeBlockedByIndexLock_IsNotReportedAsAStaleVerification()
+    {
+        var repo = BuildRepo();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+
+        // Exactly what a crashed or concurrent git leaves behind.
+        var indexLock = Path.Combine(repo.RepoPath, ".git", "index.lock");
+        File.WriteAllText(indexLock, string.Empty);
+
+        try
+        {
+            var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+                repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+            Assert.False(result.Merged);
+            Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main")); // nothing landed
+
+            // The verification is NOT invalidated: the branch still fast-forwards, so re-verifying it
+            // would burn a jail run to reach the same answer while the real obstacle sits untouched.
+            Assert.False(result.CasLost);
+
+            // ...and the human is told what actually happened, not the old assumption.
+            Assert.DoesNotContain(
+                "no longer fast-forwards", result.Reason ?? "", StringComparison.Ordinal);
+            Assert.Contains("index.lock", result.Reason ?? "", StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(indexLock);
+        }
+
+        // Control: with the lock gone, the same call merges — so the test above measured the lock and not
+        // a repo that was broken to begin with.
+        var after = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+        Assert.True(after.Merged);
+    }
+
     // ---- IgnoreScripts canary -------------------------------------------
 
     [Fact]

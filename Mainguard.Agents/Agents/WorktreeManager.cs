@@ -214,6 +214,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// <summary>The G-17 audit type for a refused publish (MG-3).</summary>
     public const string AgentRefRefusedEvent = "agent_ref_refused";
 
+    /// <summary>The G-17 audit type for a resume whose rescue publish found nothing to carry, recorded
+    /// because the very next step deletes the repository it looked in.</summary>
+    public const string AgentRescueEmptyEvent = "agent_rescue_empty";
+
     // A refusal is the interesting half: it means an agent rewrote history the mirror had already
     // published (or aimed at something that is not its own branch), and it must not pass silently just
     // because the caller wanted a bool.
@@ -334,9 +338,47 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         //     is the last moment those commits can be saved. Mediated (fast-forward only, never a delete),
         //     and best effort: an unreadable residue must not stop the resume, it must not silently lose
         //     work either — which is why it is attempted rather than skipped.
+        //
+        //     ...and "best effort" has to mean the OUTCOME IS READ. This call's result used to be dropped
+        //     on the floor three lines before ClearWorktreeResidue deletes the only copy of those commits.
+        //     OnPublishOutcome returns early unless result.Refused, so `Failed` and `NothingToPublish`
+        //     reached nothing at all — and `Failed` is defined as "git itself failed (unreadable repo,
+        //     races, disk)", which is exactly the transient case the paragraph above is about. A momentary
+        //     error therefore discarded the agent's last commits with no log line, no audit event and no
+        //     failed call.
         if (_agentRepos.Exists(repoHash, agentId))
         {
-            PublishAgentBranch(repoHash, agentId);
+            var rescue = _refs.Publish(repoHash, agentId);
+            switch (rescue.Outcome)
+            {
+                case AgentRefPublishOutcome.Failed:
+                    // REFUSE the adoption. The residue below is the only copy, the failure is transient by
+                    // definition, and a retried resume once the disk/race clears loses nothing — whereas
+                    // proceeding is unrecoverable. Deliberately NOT extended to the Refused outcomes: a
+                    // non-fast-forward is a permanent property of those commits, so refusing on it would
+                    // strand the agent forever instead of once. Those are logged + audited by
+                    // OnPublishOutcome, which the mediator has already invoked.
+                    throw new AgentBranchRescueFailedException(repoHash, agentId, rescue.Reason);
+
+                case AgentRefPublishOutcome.NothingToPublish:
+                    // Not fatal — step (2) immediately asks the mirror whether the branch exists at all and
+                    // refuses with AgentBranchMissingException when it does not. But it must not be
+                    // SILENT: this is the daemon about to delete a repository it could not read a branch
+                    // out of, and if that repository held work on some other branch, this line is the only
+                    // trace that it existed.
+                    _warningSink?.Invoke(
+                        $"MG-3: nothing to rescue from agent '{agentId}' in repo '{repoHash}' before its "
+                        + $"residue is cleared — {rescue.Reason}");
+                    _audit?.Append(new AuditEvent(AgentRescueEmptyEvent, new Dictionary<string, string>
+                    {
+                        ["repo"] = repoHash,
+                        ["agent"] = agentId,
+                        ["reason"] = rescue.Reason ?? string.Empty,
+                        ["when"] = DateTimeOffset.UtcNow.ToString(
+                            "O", System.Globalization.CultureInfo.InvariantCulture),
+                    }));
+                    break;
+            }
         }
 
         // (2) The branch IS the thing being resumed. Checked AFTER the rescue publish, so an agent whose

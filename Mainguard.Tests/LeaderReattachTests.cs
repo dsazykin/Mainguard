@@ -47,6 +47,40 @@ public sealed class LeaderReattachTests : IDisposable
         Assert.Single(new LeaderRegistry(Path.Combine(_dir, "sessions.json")).Load());
     }
 
+    /// <summary>
+    /// The boot step must leave an ARTIFACT of the sessions it reaped. Its
+    /// <see cref="LeaderReconcileReport"/> used to be discarded — and reaping a leader session KILLS the
+    /// agent's PTY and drops it from the durable registry, so a boot pass could silently end every
+    /// terminal a user left running with nothing anywhere recording which ones.
+    /// </summary>
+    [Fact]
+    public async System.Threading.Tasks.Task BootStep_RecordsWhatItReaped_RatherThanDiscardingTheReport()
+    {
+        var registry = new LeaderRegistry(Path.Combine(_dir, "sessions.json"));
+        var leader = new SessionLeader(registry);
+        leader.Register(new LeaderSession("alive", "repo1", "cid-1", 80, 24, "/s/alive"));
+        leader.Register(new LeaderSession("overnight", "repo1", "cid-2", 80, 24, "/s/overnight"));
+
+        var audit = new Mainguard.Git.Audit.InMemoryAuditLog();
+        var lines = new System.Collections.Generic.List<string>();
+        var task = new LeaderReattachTask(
+            leader,
+            _ => System.Threading.Tasks.Task.FromResult<System.Collections.Generic.IReadOnlyList<AgentContainerState>>(
+                new[] { new AgentContainerState("alive", "repo1", "cid-1", Running: true) }),
+            audit,
+            lines.Add);
+
+        await task.RunAsync(System.Threading.CancellationToken.None);
+
+        Assert.NotNull(task.LastReport);
+        Assert.Equal(new[] { "overnight" }, task.LastReport!.Reaped);
+
+        var entry = Assert.Single(audit.Read(), e => e.Type == LeaderReattachTask.ReattachedEvent);
+        Assert.Equal("overnight", entry.Fields["reaped"]);
+        Assert.Equal("alive", entry.Fields["reattached"]);
+        Assert.Contains(lines, l => l.Contains("overnight", StringComparison.Ordinal));
+    }
+
     [Fact]
     public void Reattach_ReapsDeadContainers_KeepsLive()
     {
