@@ -59,25 +59,37 @@ public sealed class CompositionRootResolutionTests
     }
 
     /// <summary>
-    /// The stranded-branch check is actually wired into the daemon's provisioner.
+    /// The optional constructor tail of <see cref="MergeQueueProvisioner"/> is wired EXACTLY as the daemon
+    /// intends — every argument, not just the one that happened to get a test.
     ///
-    /// <para>It is an optional constructor argument that defaults to null, and null means the old
-    /// behaviour precisely: an agent whose work sits on a branch other than <c>agent/&lt;id&gt;</c> gets
-    /// verified against an empty branch and nothing anywhere says so. Every other test of the detection
-    /// passes its own callback, so dropping the one line in <c>GatewayServiceRegistration</c> would leave
-    /// them all green and the product unfixed — which is the exact failure mode this file exists for.</para>
+    /// <para>Each of those arguments defaults to something that silently substitutes a weaker behaviour, so
+    /// deleting its line from <c>GatewayServiceRegistration</c> leaves the product changed and the suite
+    /// green. That was measured: removing <c>audit</c>, <c>log</c> and <c>publishAgentRef</c> together left
+    /// 504 tests passing. Only <c>checkAgentBranch</c> had a guard, which is why it is the only one that
+    /// could not be deleted quietly — and one guard per control is exactly the pattern that produced four
+    /// unguarded controls. So this asserts the whole tail as a set, once.</para>
+    ///
+    /// <para>The comparison is EXACT in both directions. <c>resolveApprovedPlan</c> must stay absent (the
+    /// daemon has no agent→approved-plan binding to give it, and a guessed one would compare diffs against
+    /// the wrong scope and report that as enforcement); a new optional argument must fail here until
+    /// someone states whether the daemon passes it. What each name buys is documented on
+    /// <see cref="MergeQueueProvisioner.WiredOptionalControls"/>.</para>
     /// </summary>
     [Fact]
-    public void MergeQueueProvisioner_IsWiredToCheckWhichBranchAnAgentIsActuallyOn()
+    public void MergeQueueProvisioner_OptionalControlTail_IsWiredExactly()
     {
         using var host = new DaemonFixture();
+        var sp = host.Services;
 
-        var provisioner = host.Services.GetRequiredService<MergeQueueProvisioner>();
+        var provisioner = sp.GetRequiredService<MergeQueueProvisioner>();
 
-        Assert.True(
-            provisioner.ChecksAgentBranchAlignment,
-            "the daemon's MergeQueueProvisioner must be constructed with checkAgentBranch, or work "
-            + "committed off agent/<id> is silently verified as an empty branch again");
+        Assert.Equal(
+            new[] { "audit", "checkAgentBranch", "log", "publishAgentRef" },
+            provisioner.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
+
+        // ...and `audit` must be the DAEMON's sink. A non-null audit log that is not this one is the null
+        // default's behaviour with an extra step: the queue's events go somewhere nothing can reach.
+        Assert.Same(sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>(), provisioner.AuditLog);
     }
 
     /// <summary>
