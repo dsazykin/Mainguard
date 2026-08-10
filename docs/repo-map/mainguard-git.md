@@ -381,7 +381,13 @@ The all-editions base. Git logic goes here.
   `agent/<id>` and the mirror has no such branch, so there is nothing to resume. A refusal and never a
   fallback: creating the branch instead would report success for an operation that recovered no commits
   at all. Carries `(RepoHash, AgentId, Branch)` — the pair, because an id is unique per repo, not
-  globally; `SandboxSpecException` — P2-07
+  globally; `AgentBranchRescueFailedException` — same file, the OTHER half of that resume: the rescue
+  publish that carries commits out of the dead jail's own repository failed for a transient reason
+  (`AgentRefPublishOutcome.Failed` — unreadable repo, races, disk), and the adoption is refused rather
+  than allowed to proceed into `ClearWorktreeResidue`, which deletes the only copy. Deliberately NOT
+  raised for a *refused* publish (a non-fast-forward is permanent, so refusing there would strand the
+  agent forever rather than once). Carries `(RepoHash, AgentId, Reason)`;
+  `SandboxSpecException` — P2-07
   hardened-spec violation raised at construction (Windows/UNC mount source, a dropped G2 control, or a
   secret in `Env`); `GitProxyRefusedException` — P2-07 A6 daemon-git-proxy refusal (non-fetch service
   or non-allowlisted prefix); `DeclaredDependencyDeniedException` — P2-07 F5 out-of-scope module
@@ -400,7 +406,7 @@ The all-editions base. Git logic goes here.
   MiB tmpfs `$HOME` and dies at `ENOSPC` — which the merge queue would record as an ordinary failed
   verification). Throw these from Core; catch in ViewModels to drive dialogs.
 - **`Migrations/`** — generated EF migrations + `AppDbContextModelSnapshot.cs`. Never hand-edit an applied one.
-- **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture).
+- **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture). **Read the remarks on `IAuditLog.Read` before adding an `Append` call site:** there are 28 `Append` calls across 13 production files and ZERO production readers — no RPC, no ViewModel — and the shipped implementation is in-memory, so an audited event is unreachable during and after the incident it describes. P2-15 is the plan and this interface is the seam it lands behind; until then an `Append` is evidence for a later investigation and never the user-visible record of anything, so any path that destroys work pairs it with a log line, a typed refusal or a UI notice.
 - **`Services/`** — the service layer every ViewModel talks to. Interface-first:
   - `IGitService.cs` / `GitServices.cs` — the core git engine. **All** LibGit2Sharp access goes
     through `GitServices.ExecuteWithRepo(...)`, which owns the **bounded index.lock retry** (4 attempts,
