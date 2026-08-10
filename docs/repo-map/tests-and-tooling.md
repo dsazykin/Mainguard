@@ -783,6 +783,15 @@
   Client head and fails if the closure names any agent-platform assembly (`Mainguard.Agents(.UI)` /
   `Mainguard.Protos` / `Docker.DotNet` / `Porta.Pty` / `Grpc`), via
   `build/ci/verify-client-closure.sh` (also runnable locally).
+- **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
+  `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
+  `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the
+  commands are actually constructed (`InstallerCommands`, `WslCommands`) and were the two the inline
+  version omitted. Every root must exist and yield at least one file: the old `grep -r … 2>/dev/null`
+  form printed "guardrails clean" when a path was MISSING, so renaming a directory would have made the
+  guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
+  is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
+  `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
   - **`.github/workflows/deploy-site.yml`** — builds `site/` and deploys it to GitHub Pages on pushes to
     `main` touching `site/**` (or manual dispatch). **`Dockerfile` / `docker-compose.yml` /
     `.dockerignore`** — container build.

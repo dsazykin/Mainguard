@@ -330,18 +330,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # P2-21 §7 reviewer script: RunOnce for resume and G-12 --shutdown must both be absent from the
-      # installer tree and the payload/resume scripts.
-      - name: No RunOnce, no --shutdown in installer/resume paths
-        run: |
-          set -euo pipefail
-          if grep -rniI "RunOnce" installer/ build/mainguardos/ 2>/dev/null; then
-            echo "::error::RunOnce found — resume MUST use the elevated Scheduled Task (P2-21 §7)"; exit 1
-          fi
-          if grep -rnI -- "--shutdown" installer/ build/mainguardos/ 2>/dev/null; then
-            echo "::error::'--shutdown' found — G-12 forbids the VM-wide shutdown verb"; exit 1
-          fi
-          echo "Installer guardrails clean (no RunOnce, no --shutdown)."
+      # P2-21 §7 reviewer script: RunOnce for resume and G-12 --shutdown must both be absent.
+      #
+      # This used to be four lines of inline grep over `installer/ build/mainguardos/`, which is where
+      # the violation CANNOT be — those are thin drivers; the command construction lives in
+      # Mainguard.Agents (InstallerCommands / WslCommands) and Mainguard.Server, both of which the scan
+      # dropped. It also reported "clean" when a scanned path did not exist (`grep` exits 2, the
+      # `2>/dev/null` ate the diagnostic, the `if` saw non-zero), so renaming either directory would
+      # have made the guard pass forever having read nothing.
+      #
+      # The script now owns the scope, asserts each root exists AND yields files, and prints the count.
+      # See its header for why prose mentions are exempt and what the compensating unit test covers.
+      - name: No RunOnce, no --shutdown in the installer/resume command paths
+        run: build/ci/verify-installer-guardrails.sh
 
   client-closure:
     name: Client head closure excludes the agent platform (ADR-0001)
