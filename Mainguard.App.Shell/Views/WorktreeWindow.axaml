@@ -48,6 +48,8 @@
                                         <Button Content="Open" Classes="Primary" Padding="12,4" Command="{Binding OpenCommand}"/>
                                         <Button Content="Remove" Classes="Danger" Padding="12,4" Command="{Binding RemoveCommand}" IsVisible="{Binding CanRemove}"
                                                 ToolTip.Tip="Remove this worktree (fails if it has changes — use Force)"/>
+                                        <Button Content="Force" Classes="Danger" Padding="12,4" Command="{Binding ForceRemoveCommand}" IsVisible="{Binding CanRemove}"
+                                                ToolTip.Tip="Remove this worktree even if it has uncommitted changes — those changes are discarded permanently. Asks for confirmation first."/>
                                     </StackPanel>
                                 </Grid>
                             </Border>

@@ -159,4 +159,80 @@ public class WorktreePanelViewModelTests
 
         Assert.True(vm.CanCreate);
     }
+
+    // ---- Force remove ---------------------------------------------------------------
+    // ForceRemoveCommand shipped implemented but bound nowhere, while the Remove button's own
+    // tooltip told the user to "use Force" — so a dirty worktree could not be removed from the app
+    // at all. It is now bound to a Force button, and because it discards uncommitted work it is
+    // gated on a confirmation that fails closed.
+
+    private sealed class FakeConfirmationService : Mainguard.App.Shell.Services.IConfirmationService
+    {
+        public bool Result { get; set; }
+        public bool Asked { get; private set; }
+        public string? LastTitle { get; private set; }
+
+        public Task<bool> ConfirmAsync(string title, string message, string confirmButtonText)
+        {
+            Asked = true;
+            LastTitle = title;
+            return Task.FromResult(Result);
+        }
+    }
+
+    [Fact]
+    public async Task Remove_WithoutForce_ShouldNotConfirm_AndShouldCallRemoveWorktreeUnforced()
+    {
+        (string repo, string path, bool force)? call = null;
+        var fake = FakeWith(("main", false, true), ("feature", false, false));
+        fake.RemoveWorktreeImpl = (r, p, f) => call = (r, p, f);
+        var confirm = new FakeConfirmationService { Result = false };
+
+        var vm = new WorktreePanelViewModel(fake, "/repo", null, confirm);
+        var row = vm.Worktrees.Single(w => !w.IsMain);
+
+        await row.RemoveCommand.ExecuteAsync(null);
+
+        Assert.False(confirm.Asked); // git itself refuses a dirty unforced remove — nothing to warn about
+        Assert.NotNull(call);
+        Assert.False(call!.Value.force);
+    }
+
+    [Fact]
+    public async Task ForceRemove_WhenConfirmed_ShouldCallRemoveWorktreeWithForce()
+    {
+        (string repo, string path, bool force)? call = null;
+        var fake = FakeWith(("main", false, true), ("feature", false, false));
+        fake.RemoveWorktreeImpl = (r, p, f) => call = (r, p, f);
+        var confirm = new FakeConfirmationService { Result = true };
+
+        var vm = new WorktreePanelViewModel(fake, "/repo", null, confirm);
+        var row = vm.Worktrees.Single(w => !w.IsMain);
+
+        await row.ForceRemoveCommand.ExecuteAsync(null);
+
+        Assert.True(confirm.Asked);
+        Assert.Equal("Force remove worktree", confirm.LastTitle);
+        Assert.NotNull(call);
+        Assert.Equal("/repo", call!.Value.repo);
+        Assert.Equal("/wt/feature", call.Value.path);
+        Assert.True(call.Value.force);
+    }
+
+    [Fact]
+    public async Task ForceRemove_WhenDeclined_ShouldNotTouchTheWorktree()
+    {
+        var called = false;
+        var fake = FakeWith(("main", false, true), ("feature", false, false));
+        fake.RemoveWorktreeImpl = (_, _, _) => called = true;
+        var confirm = new FakeConfirmationService { Result = false };
+
+        var vm = new WorktreePanelViewModel(fake, "/repo", null, confirm);
+        var row = vm.Worktrees.Single(w => !w.IsMain);
+
+        await row.ForceRemoveCommand.ExecuteAsync(null);
+
+        Assert.True(confirm.Asked);
+        Assert.False(called);
+    }
 }

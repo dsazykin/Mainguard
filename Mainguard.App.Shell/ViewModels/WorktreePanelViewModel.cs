@@ -26,6 +26,7 @@ public partial class WorktreePanelViewModel : ViewModelBase
     private readonly IGitService _git;
     private readonly string _repoPath;
     private readonly Action<string>? _onOpenWorktree;
+    private readonly Mainguard.App.Shell.Services.IConfirmationService _confirm;
 
     public ObservableCollection<WorktreeRowViewModel> Worktrees { get; } = new();
 
@@ -53,11 +54,13 @@ public partial class WorktreePanelViewModel : ViewModelBase
 
     public Action? CloseAction { get; set; }
 
-    public WorktreePanelViewModel(IGitService git, string repoPath, Action<string>? onOpenWorktree = null)
+    public WorktreePanelViewModel(IGitService git, string repoPath, Action<string>? onOpenWorktree = null,
+        Mainguard.App.Shell.Services.IConfirmationService? confirm = null)
     {
         _git = git;
         _repoPath = repoPath;
         _onOpenWorktree = onOpenWorktree;
+        _confirm = confirm ?? new Mainguard.App.Shell.Services.DialogConfirmationService();
         Reload();
     }
 
@@ -134,7 +137,22 @@ public partial class WorktreePanelViewModel : ViewModelBase
     }
 
     internal async Task RemoveAsync(WorktreeRowViewModel row, bool force)
-        => await RunAsync(() => _git.RemoveWorktree(_repoPath, row.Path, force));
+    {
+        // A plain remove is safe — git refuses it when the worktree has changes. Force is the one
+        // that throws away uncommitted work, so it always confirms first, and it fails closed:
+        // no desktop lifetime (headless) → DialogConfirmationService declines and nothing is lost.
+        if (force)
+        {
+            bool confirmed = await _confirm.ConfirmAsync(
+                "Force remove worktree",
+                $"Force-remove the worktree at '{row.Path}'?\n" +
+                "Any uncommitted changes in it are discarded permanently and cannot be recovered.",
+                "Force Remove");
+            if (!confirmed) return;
+        }
+
+        await RunAsync(() => _git.RemoveWorktree(_repoPath, row.Path, force));
+    }
 
     [RelayCommand]
     private async Task Prune() => await RunAsync(() => _git.PruneWorktrees(_repoPath));
@@ -202,6 +220,9 @@ public partial class WorktreeRowViewModel : ViewModelBase
     [RelayCommand]
     private Task Remove() => _parent.RemoveAsync(this, force: false);
 
+    /// <summary>Removes a worktree git refuses to remove because it is dirty. Bound to the "Force"
+    /// button next to Remove — without it a dirty worktree could not be removed from the app at
+    /// all, while Remove's own tooltip told the user to "use Force".</summary>
     [RelayCommand]
     private Task ForceRemove() => _parent.RemoveAsync(this, force: true);
 }
