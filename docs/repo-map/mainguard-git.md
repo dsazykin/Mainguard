@@ -370,7 +370,11 @@ The all-editions base. Git logic goes here.
   `GitOperationException`, `SshAuthenticationException`, `RemoteNotFoundException`,
   `GitIdentityMissingException`, `UndoBlockedException` — T-19 undo/redo refusal: dirty tree,
   non-undoable entry, or truncated redo; `DuplicateProfileNameException` — T-21 profile name already
-  in use; `BootstrapException` — P2-05 bootstrap-step failure, carries the failing `StepName`;
+  in use; `BranchNotMergedException` — carries `BranchName`; the `git branch -d` refusal raised by
+  `DeleteBranch(force: false)` on a branch merged into neither HEAD nor its upstream, so the UI can
+  offer an explicit "delete anyway" instead of orphaning the commits; `AmendPushedCommitException` —
+  carries `BranchName`/`UpstreamName`; refuses an amend of a HEAD the upstream already contains, so
+  the amend checkbox can never silently diverge a branch; `BootstrapException` — P2-05 bootstrap-step failure, carries the failing `StepName`;
   `WslNotInstalledException` — WSL2 absent, actionable (points at the P2-21 installer enablement; the
   bootstrapper never runs `wsl --install`); `WslCommandException` — a non-zero `wsl.exe` exit, carries
   exit code + stderr; `RepoProvisioningException` — P2-06 daemon-side git failure
@@ -407,7 +411,13 @@ The all-editions base. Git logic goes here.
     25/50/100 ms backoff on `LockedFileException` — raised before anything mutates, so the retry is
     safe; exhausted → typed `GitOperationException` naming `index.lock` and the way out; ADR-001, pinned
     by `GitServiceIndexLockTests`). Commit, stage, branch, tag, merge, rebase, stash, cherry-pick,
-    reset, diff, history. Remotes management (T-10): CRUD
+    reset, diff, history. **Git-directory resolution:** `ResolveGitDir` (via `Repository.Discover`,
+    so it follows the `.git`-file indirection of a linked worktree exactly as git does),
+    `ResolveCommonGitDir` (the `commondir` pointer — where `refs/` and `objects/` live) and the
+    `GitDirPath(repoPath, …)` helper every per-worktree state read goes through. `Commit` takes an
+    `amend` flag (keeps the original author, refuses an unborn branch and an already-published HEAD);
+    `DeleteBranch` applies git's `-d` rule and refuses an unmerged branch unless forced.
+    Remotes management (T-10): CRUD
     (`GetRemotes`/`AddRemote`/`RemoveRemote`/`RenameRemote`/`SetRemoteUrl`), the
     `ResolveRemoteName`/`GetDefaultRemoteName` resolver that replaced every hardcoded `"origin"`
     (tracked → origin → sole remote → typed `RemoteNotFoundException`), a remote-named `Fetch` overload,
@@ -500,8 +510,16 @@ The all-editions base. Git logic goes here.
     text-scanned), and feeds the pure `Safety/PreCommitScanEngine`. No network, no CLI. Thresholds come
     from `UserPreferences` (`PreCommitMaxFileMB`, `PreCommitScanEnabled`).
   - `ISettingsService.cs` / `SettingsService.cs` — user preferences + workspace/category persistence via `AppDbContext`.
-  - `RepositoryWatcher.cs` — `FileSystemWatcher` wrapper that raises change events so the UI can refresh.
-  - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence controller.
+  - `RepositoryWatcher.cs` — `FileSystemWatcher` wrapper that raises change events so the UI can
+    refresh. Watches the working tree **plus** any git root outside it: in a linked worktree the
+    per-worktree gitdir and the shared common dir both sit elsewhere, so watching the tree alone
+    saw working-tree edits only and missed every commit/checkout/stage/rebase step. Roots come from
+    `GitService.ResolveGitDir` + `ResolveCommonGitDir` and are matched longest-first, so a
+    per-worktree `HEAD` is not misread as `worktrees/<name>/HEAD` under the common dir. An ordinary
+    repo is unchanged — `.git` is already inside the watched tree, so no extra watcher is created.
+  - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence
+    controller. All rebase-state reads go through `GitService.GitDirPath`, never
+    `Path.Combine(repoPath, ".git", …)`.
   - `IPinnedRefService.cs` / `PinnedRefService.cs` — per-repo pinned branches/tags (T-09), persisted via `AppDbContext`; pinned refs order first into the commit-graph router (left-most lanes).
   - `IProfileService.cs` / `ProfileService.cs` — switchable Git identity profiles (T-21). SQLite
     CRUD via `AppDbContext` (case-insensitive unique name → typed `DuplicateProfileNameException` on
