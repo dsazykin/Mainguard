@@ -7,6 +7,14 @@
   interactive-rebase editor argv shims (`--rebase-editor` writes the todo list, `--rebase-msg`
   supplies the reword/squash message keyed by original SHA — `TryHandleShim` runs + returns *before*
   Avalonia starts, don't reorder), the single-instance guard, and `BuildAvaloniaApp`.
+  `TryHandleShim` hands back an **exit code** the head must assign to `Environment.ExitCode`.
+- **`RebaseEditorShim.cs`** (shell) — the shim's actual work, split out so it is testable.
+  **The exit code is the contract with git**: git reads 0 from `GIT_SEQUENCE_EDITOR` as "the editor
+  wrote your todo" and otherwise proceeds with its own default todo — a plain `pick` of every commit —
+  silently discarding every reorder/squash/drop/fixup and then reporting the rebase as a success. So
+  every failure to place the todo/message returns non-zero (git aborts, branch untouched) and writes
+  the reason to stderr, which git relays. Never swallow an exception in this path. "No staged message
+  for this step" is a legitimate exit 0; a staged message that could not be placed is not.
   - **`Mainguard.Client.App/Program.cs`** (`App.Edition = new ClientManifest()`) and
     **`Mainguard.Pro.App/Program.cs`** (`App.Edition = new ProManifest()` + wires the Pro-launch seams +
     `WireProComposition`) are the actual `Main`s. **`App.axaml` / `App.axaml.cs`** (shell) — app
@@ -998,7 +1006,8 @@
   `VtScreen`/terminal grid-readback hooks). Referenced by `Mainguard.Pro.App` (the Pro head — the ONLY
   project that references both this and the shell).
 - **`Mainguard.Client.App`** (step 2f, WinExe) — the plain **Git-client exe head**. Thin
-  `Program.Main`: `ShellEntryPoint.TryHandleShim(args)` (git-editor shims run + return first),
+  `Program.Main`: `ShellEntryPoint.TryHandleShim(args, out var exit)` (git-editor shims run + return
+  first; `Environment.ExitCode = exit` — a failed shim MUST report non-zero),
   `App.Edition = new ClientManifest()`, `ShellEntryPoint.RunDesktop(args)`. **References
   `Mainguard.App.Shell` ONLY** — so its published closure carries only `Mainguard.App.Shell` (the
   shell) + `Mainguard.UI` + `Mainguard.Git`, with ZERO `Mainguard.Agents(.UI)` / `Mainguard.Protos` /
