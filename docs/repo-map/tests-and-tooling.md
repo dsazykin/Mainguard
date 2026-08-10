@@ -372,7 +372,19 @@
   profiles VM against a fake `IProfileService`: new/save, blank + duplicate-name inline errors, the
   cancel-safe delete→undo/dismiss, apply-with/without-repo), `WorktreePanelViewModelTests` (TI-21
   worktree VM against a canned `FakeGitService`: the branch-already-checked-out → `CanCreate` false
-  rule, free/new-branch valid, and the `AddWorktree` create-flag routing), `RepositoryAnalyzerTests`
+  rule, free/new-branch valid, the `AddWorktree` create-flag routing, and the **force-remove** path —
+  Force confirms first and fails closed, plain Remove does not confirm), `RebaseEditorShimTests`
+  (the `GIT_SEQUENCE_EDITOR`/`GIT_EDITOR` shim's exit-code contract: a todo/message that could not be
+  placed must exit **non-zero** so git aborts, instead of git silently rebasing with its own default
+  plain-`pick` todo and reporting success), `DiffViewerViewModelSaveTests` (`Save File` must surface a
+  failed write — edit mode auto-enables on conflict markers, so that buffer is frequently the only
+  copy of a merge resolution), `BranchBrowserConfirmationTests` (delete-tag / delete-remote-tag /
+  rebase-current-onto confirm through `IConfirmationService` and **fail closed** with no window — the
+  old inline lifetime check put the prompt inside the gate and the destructive call outside it, so no
+  window meant no prompt and the action still ran), `BranchBrowserMenuTests` (the branch context
+  menu's surfaced command set: every implemented command has an affordance and every menu entry has a
+  command), `CommitTimelineViewOptionsTests` (the surviving SHOW toggles genuinely change what
+  renders, and the "Current Branch" highlight follows HEAD rather than lane 0), `RepositoryAnalyzerTests`
   (TI-22 analytics: the gitignore-aware language walk counting exactly the non-ignored bytes with a
   `!keep.js` negation honored and `.git/` skipped, cancellation honored on a large synthetic tree +
   the history walk, the pure punch-card/churn/contributor aggregators pinned exact on fixed
