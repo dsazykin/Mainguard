@@ -1137,16 +1137,44 @@ public partial class CommitTimelineViewModel : ViewModelBase, IDisposable
         var refName = SelectedRefName;
         if (string.IsNullOrEmpty(refName)) return;
 
+        // Delete-key deletes a LOCAL branch, which the operation journal records and can
+        // restore — so the old "cannot be undone" line was simply false. Say what is true.
         bool confirmed = await _confirmationService.ConfirmAsync(
             "Delete branch",
-            $"Are you sure you want to delete the branch '{refName}'?\nThis action cannot be undone.",
+            $"Are you sure you want to delete the branch '{refName}'?\nYou can undo this from History.",
             "Delete");
         if (!confirmed) return;
 
-        await RunGitActionAsync(() => _gitService.DeleteBranch(_repoPath, refName, false));
+        if (!await DeleteBranchGuardedAsync(refName)) return;
         _pinnedRefService.Unpin(_repoPath, refName); // drop any pin for a now-gone ref
         BranchBrowser.LoadBranches();
         SelectedRefName = null;
+    }
+
+    /// <summary>
+    /// Deletes a branch with git's <c>-d</c> safety: the service refuses an unmerged branch
+    /// (<see cref="GitLoom.Core.Exceptions.BranchNotMergedException"/>) rather than orphaning its
+    /// commits, and the discard is only forced after a second, explicit confirmation. Returns
+    /// false when the user declined.
+    /// </summary>
+    private async System.Threading.Tasks.Task<bool> DeleteBranchGuardedAsync(string refName)
+    {
+        GitLoom.Core.Exceptions.BranchNotMergedException? notMerged = null;
+        await RunGitActionAsync(() =>
+        {
+            // Caught inside the action so RunGitActionAsync keeps handling every other
+            // failure (and the busy flag / reload) exactly as before.
+            try { _gitService.DeleteBranch(_repoPath, refName, force: false); }
+            catch (GitLoom.Core.Exceptions.BranchNotMergedException ex) { notMerged = ex; }
+        });
+        if (notMerged == null) return true;
+
+        bool force = await _confirmationService.ConfirmAsync(
+            "Branch not merged", notMerged.Message, "Delete anyway");
+        if (!force) return false;
+
+        await RunGitActionAsync(() => _gitService.DeleteBranch(_repoPath, refName, force: true));
+        return true;
     }
 
     [RelayCommand]

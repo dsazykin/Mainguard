@@ -1313,11 +1313,32 @@ public class GitService : IGitService
         // Pushes the branch to the resolved remote and sets it as upstream (see Push).
         => PushSetUpstream(repoPath, ResolveRemoteName(repoPath), branchName);
 
+    /// <summary>
+    /// Deletes a local or remote branch. <paramref name="force"/> is the <c>git branch -d</c> ⇄
+    /// <c>-D</c> switch: without it an unmerged <b>local</b> branch is refused with a typed
+    /// <see cref="BranchNotMergedException"/> rather than silently orphaning its commits.
+    /// (Remote deletes are a push and have no local merged-check to make.)
+    /// </summary>
     public void DeleteBranch(string repoPath, string branchName, bool force = false)
     {
+        // Both pre-flight questions — is this a remote branch, and is a local one safe to
+        // delete — are answered in one short-lived handle BEFORE the journal scope opens, so a
+        // refused delete never records a journal entry for an operation that did not happen.
+        var (isRemote, notMergedReason) = ExecuteWithRepo(repoPath, repo =>
+        {
+            var branch = repo.Branches[branchName];
+            if (branch == null) return (false, (string?)null);
+            if (branch.IsRemote || force) return (branch.IsRemote, (string?)null);
+            return (false, IsSafeToDelete(repo, branch)
+                ? null
+                : $"Branch '{branchName}' is not fully merged — deleting it would leave its commits " +
+                  "unreachable. Merge it first, or delete it anyway to discard the work.");
+        });
+
+        if (notMergedReason != null) throw new BranchNotMergedException(branchName, notMergedReason);
+
         // A local-branch delete is undoable (the branch ref + upstream config is restored);
         // a remote-branch delete pushes the deletion, which the journal cannot reverse.
-        bool isRemote = ExecuteWithRepo(repoPath, repo => repo.Branches[branchName]?.IsRemote ?? false);
         using var op = _journal.BeginOperation(repoPath, JournalKinds.DeleteBranch, $"Delete branch {branchName}",
             undoBlockedReason: isRemote ? "Deleting a remote branch cannot be undone from the journal." : null);
         ExecuteWithRepo(repoPath, repo =>
@@ -1338,6 +1359,29 @@ public class GitService : IGitService
             }
         });
     }
+
+    /// <summary>
+    /// git's own <c>-d</c> rule: a branch may be deleted without force when its tip is already
+    /// contained in HEAD, or in the upstream it tracks (published work is not orphaned by
+    /// dropping the local ref). An empty branch has nothing to orphan.
+    /// </summary>
+    private static bool IsSafeToDelete(Repository repo, Branch branch)
+    {
+        var tip = branch.Tip;
+        if (tip == null) return true;
+
+        var upstreamTip = branch.TrackedBranch?.Tip;
+        if (upstreamTip != null && IsAncestorOrSame(repo, tip, upstreamTip)) return true;
+
+        var headTip = repo.Head.Tip;
+        return headTip != null && IsAncestorOrSame(repo, tip, headTip);
+    }
+
+    /// <summary>True when <paramref name="candidate"/> is <paramref name="descendant"/> or one of
+    /// its ancestors — i.e. <paramref name="descendant"/> already contains it.</summary>
+    private static bool IsAncestorOrSame(Repository repo, Commit candidate, Commit descendant)
+        => candidate.Id == descendant.Id
+           || repo.ObjectDatabase.FindMergeBase(candidate, descendant)?.Id == candidate.Id;
 
     public bool HasUncommittedChanges(string repoPath)
     {
