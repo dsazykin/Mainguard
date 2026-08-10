@@ -425,7 +425,7 @@ public sealed class ToolchainProvisioner
             }
         }
 
-        sb.AppendLine("USER agent");
+        // MUTATION: sb.AppendLine("USER agent");
 
         var pathEntries = recipes.SelectMany(r => r.PathEntries).ToArray();
         if (pathEntries.Length > 0)

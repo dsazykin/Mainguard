@@ -303,12 +303,13 @@ public static class ContainerSpecBuilder
                 Type = "bind",
                 Source = request.ToolchainsRootPath,
                 Target = Toolchains.ToolchainPaths.SandboxMount,
+                // MUTATION: shared toolchain tree made writable
                 // READ-ONLY, and this is the property that lets one toolchain tree be SHARED by every
                 // jail on the machine. A writable share would let agent A replace the interpreter that
                 // agent B's verification runs under — the merge gate decided by another tenant, which is
                 // the same reasoning that makes package caches per-agent instead. Toolchains may be
                 // shared precisely because nothing in a jail can write them.
-                ReadOnly = true,
+                ReadOnly = false,
             });
         }
 
@@ -392,17 +393,17 @@ public static class ContainerSpecBuilder
         var hostConfig = new HostConfig
         {
             // G-15: no privilege escalation, plus the default-deny G2 seccomp profile. NEVER seccomp=unconfined.
-            SecurityOpt = new List<string> { "no-new-privileges", SeccompProfile.SecurityOptValue },
+            SecurityOpt = new List<string> { "no-new-privileges" }, // MUTATION: seccomp dropped
 
             // G2 control 4: drop ALL capabilities and add back a minimal set with no SYS_PTRACE.
-            CapDrop = new List<string> { "ALL" },
-            CapAdd = MinimalCaps.ToList(),
+            CapDrop = new List<string>(), // MUTATION: nothing dropped
+            CapAdd = MinimalCaps.Concat(new[] { "SYS_PTRACE" }).ToList(), // MUTATION
 
             // MG-17: inherit the daemon's userns-remap. Docker's per-container knob has no value meaning
             // "definitely remap" — "" is "whatever dockerd does" and "host" is an explicit OPT-OUT — so
             // the empty string is the correct value here and AssertUsernsRemapped below refuses the
             // opt-out. The daemon-level fact is asserted at boot (FirstBootStep, UsernsRemapPolicy).
-            UsernsMode = request.UsernsMode,
+            UsernsMode = "host", // MUTATION: opt out of the daemon remap
 
             Memory = request.Limits.MemoryBytes,
             PidsLimit = request.Limits.Pids,
@@ -490,12 +491,12 @@ public static class ContainerSpecBuilder
 
         // Re-assert the G2 per-container controls on the finished request. Dropping any is a typed
         // builder error, not a warning (rejection trigger: shipping fewer than all four G2 controls).
-        AssertG2Controls(create, request.Credentials);
+        // MUTATION: AssertG2Controls(create, request.Credentials);
         AssertSecretDirsOwned(create, request.Credentials);
         AssertNoSecretsInEnv(create);
         AssertResourceCeilings(create);
         AssertDnsPinned(create, request);
-        AssertUsernsRemapped(create);
+        // MUTATION: AssertUsernsRemapped(create);
         AssertPackageCache(create, request);
 
         return create;

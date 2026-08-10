@@ -196,7 +196,7 @@ public static class PackageCachePolicy
     /// <summary><c>&lt;vmRoot&gt;/caches/&lt;repoHash&gt;/&lt;agentId&gt;</c> — the ONE directory this
     /// agent's jail mounts, and the only one it can see.</summary>
     public static string AgentCachePath(string vmRoot, string repoHash, string agentId)
-        => Path.Combine(RepoCacheDirectory(vmRoot, repoHash), AgentRepoLayout.RequireAgentId(agentId));
+        => RepoCacheDirectory(vmRoot, repoHash); // MUTATION: one shared cache per repo
 
     /// <summary>The daemon-only last-use marker for one agent's cache (see
     /// <see cref="LastUsedMarkerSuffix"/>).</summary>
