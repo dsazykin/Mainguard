@@ -1,8 +1,8 @@
 using System;
+using LibGit2Sharp;
 using Mainguard.Git.Exceptions;
 using Mainguard.Git.Services;
 using Mainguard.Tests.Fixtures;
-using LibGit2Sharp;
 using Xunit;
 
 namespace Mainguard.Tests;
