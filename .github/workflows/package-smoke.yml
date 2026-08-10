@@ -140,9 +140,11 @@ jobs:
       - name: Resolve both channel plans
         shell: pwsh
         run: |
+          # `*>&1`, not `2>&1`: pack.ps1 reports through Write-Host, which goes to the INFORMATION
+          # stream — a `2>&1` capture would come back empty and this check would test nothing.
           foreach ($channel in @('client', 'pro')) {
             Write-Host "===================== $channel ====================="
-            $out = (& "$PWD/build/velopack/pack.ps1" -Channel $channel -DryRun 2>&1 | Out-String)
+            $out = (& "$PWD/build/velopack/pack.ps1" -Channel $channel -DryRun *>&1 | Out-String)
             Write-Host $out
             if ($out -notmatch 'Plan resolved for channel') {
               throw "pack.ps1 -Channel $channel -DryRun did not resolve a plan."
@@ -160,7 +162,7 @@ jobs:
           $out = (& "$PWD/build/velopack/pack.ps1" -Channel pro -DryRun `
                     -SigningCertPath '/nonexistent/mainguard.pfx' `
                     -SigningCertPassword $canary `
-                    -PinnedThumbprints 'DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF' 2>&1 | Out-String)
+                    -PinnedThumbprints 'DEADBEEFDEADBEEFDEADBEEFDEADBEEFDEADBEEF' *>&1 | Out-String)
           Write-Host $out
           if ($out -match [regex]::Escape($canary)) {
             throw "pack.ps1 -DryRun printed the signing certificate password. Redact it before printing the command."
