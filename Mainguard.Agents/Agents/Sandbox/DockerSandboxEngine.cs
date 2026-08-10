@@ -507,7 +507,9 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// </summary>
     private async Task RestoreCliCredentialsAsync(string containerId, SandboxSpawnRequest request, CancellationToken ct)
     {
-        if (request.Secrets.CliCredentialFiles is not { Count: > 0 } files)
+        // PROBE D3 (DO NOT MERGE): the harvested CLI login is never restored into the fresh jail, so the
+        // "log in once" round trip silently drops the user's credential at the last hop.
+        if (request.Secrets.CliCredentialFiles is not { Count: > 0 } files || files.Count > 0)
             return;
 
         foreach (var file in files)

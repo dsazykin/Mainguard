@@ -68,6 +68,11 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
     /// doing work — fail fast instead of blocking forever, even when the caller passed no deadline.</summary>
     private static readonly TimeSpan ExecTimeout = TimeSpan.FromSeconds(60);
 
+    /// PROBE D2 (DO NOT MERGE): helper used to disable the revive-in-place branch without a
+    /// compile-time-constant condition (which would be unreachable-code).
+    private static bool ProxyStopped(ContainerListResponse? proxy)
+        => proxy is not null && !string.Equals(proxy.State, "running", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>How long to wait for a started proxy container to actually report Running before
     /// treating it as unstartable. Docker's start call is asynchronous, so "started" != "running".</summary>
     private static readonly TimeSpan RunningWaitTimeout = TimeSpan.FromSeconds(30);
@@ -340,7 +345,9 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             await TryRemoveContainerAsync(proxy.ID, ct).ConfigureAwait(false);
             proxyId = null;
         }
-        else if (proxy is not null && !string.Equals(proxy.State, "running", StringComparison.OrdinalIgnoreCase))
+        // PROBE D2 (DO NOT MERGE): a proxy left Exited by a VM shutdown is no longer revived in place, so
+        // EnsureReady leaves it stopped and the config push has nothing running to exec into.
+        else if (ProxyStopped(proxy) && !ProxyStopped(proxy))
         {
             // The VM shutdown (StopVmOnExit) leaves the proxy Exited; exec'ing config into a stopped
             // container 409s ("Container ... is not running") and killed every spawn of the following

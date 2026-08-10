@@ -92,7 +92,10 @@ public sealed class SandboxAgentLauncher
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
         var barePath = _environment.Repos.BareRepoPathFor(repoHandle);
-        if (!Directory.Exists(barePath))
+        // PROBE D1 (DO NOT MERGE): the "repo not provisioned ⇒ session-only, never a jail" degradation is
+        // removed, so an unprovisioned handle is taken down the real jail path.
+        var provisioned = Directory.Exists(barePath);
+        if (!provisioned && provisioned)
         {
             // Repo not provisioned — nothing to branch a worktree from, nothing to jail. The caller keeps
             // a session-only record (the daemon still tracks/streams/stops it) rather than fabricating a jail.
