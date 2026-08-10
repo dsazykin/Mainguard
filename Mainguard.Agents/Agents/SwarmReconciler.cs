@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Git.Audit;
 using Mainguard.Git.Models;
 
 namespace Mainguard.Agents.Agents;
@@ -245,12 +246,14 @@ public sealed class DaemonBootSequence
     public static DaemonBootSequence Build(
         SwarmReconciler reconciler,
         IBootTask? mergeReconcile = null,
-        IBootTask? leaderReattach = null)
+        IBootTask? leaderReattach = null,
+        IAuditLog? audit = null,
+        Action<string>? log = null)
     {
         var tasks = new List<IBootTask>
         {
             mergeReconcile ?? new MergeReconcilePlaceholderTask(),
-            new SwarmReconcileTask(reconciler),
+            new SwarmReconcileTask(reconciler, audit, log),
         };
 
         if (leaderReattach is not null)
@@ -270,16 +273,68 @@ public sealed class MergeReconcilePlaceholderTask : IBootTask
     public Task RunAsync(CancellationToken ct) => Task.CompletedTask;
 }
 
-/// <summary>The boot step that runs the <see cref="SwarmReconciler"/>.</summary>
+/// <summary>
+/// The boot step that runs the <see cref="SwarmReconciler"/> — <b>and records what it did</b>.
+///
+/// <para>This used to be <c>=&gt; _reconciler.ReconcileAsync(ct)</c>, narrowing a
+/// <see cref="ReconcileReport"/> to a bare <see cref="Task"/>. That report is the only account of a boot
+/// pass that declares agents Dead and force-removes their worktrees, adopts orphan jails, or stops them:
+/// dropping it meant a user who left three agents running overnight came back to none of them, with no
+/// log line, no audit entry and nothing anywhere to explain it. Every destructive outcome now leaves an
+/// artifact before the daemon finishes booting.</para>
+/// </summary>
 public sealed class SwarmReconcileTask : IBootTask
 {
-    private readonly SwarmReconciler _reconciler;
+    /// <summary>The G-17 audit type for one boot swarm-reconcile pass.</summary>
+    public const string ReconciledEvent = "boot_swarm_reconcile";
 
-    public SwarmReconcileTask(SwarmReconciler reconciler) => _reconciler = reconciler;
+    private readonly SwarmReconciler _reconciler;
+    private readonly IAuditLog? _audit;
+    private readonly Action<string>? _log;
+
+    /// <param name="reconciler">The reconciler this step drives.</param>
+    /// <param name="audit">G-17 sink for the pass's outcome. Optional so the many unit tests that drive
+    /// this step directly stay unchanged; the daemon passes it.</param>
+    /// <param name="log">Milestone sink (the daemon's boot log category).</param>
+    public SwarmReconcileTask(SwarmReconciler reconciler, IAuditLog? audit = null, Action<string>? log = null)
+    {
+        _reconciler = reconciler ?? throw new ArgumentNullException(nameof(reconciler));
+        _audit = audit;
+        _log = log;
+    }
 
     public string Name => "swarm-reconcile";
 
-    public Task RunAsync(CancellationToken ct) => _reconciler.ReconcileAsync(ct);
+    /// <summary>The most recent pass's report — null before the first run. Kept so a caller (and the
+    /// boot-order test) can assert on the outcome rather than only on the fact that a Task completed.</summary>
+    public ReconcileReport? LastReport { get; private set; }
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        var report = await _reconciler.ReconcileAsync(ct).ConfigureAwait(false);
+        LastReport = report;
+
+        _log?.Invoke(
+            $"swarm reconcile: pruned={Describe(report.Pruned)} adopted={Describe(report.Adopted)} "
+            + $"stopped={Describe(report.Stopped)}");
+
+        // Only when something actually happened: an audit entry per boot on an idle box is noise that
+        // buries the passes that mattered. A pass that changed nothing is fully described by the log line.
+        if (report.Pruned.Count + report.Adopted.Count + report.Stopped.Count > 0)
+        {
+            _audit?.Append(new AuditEvent(ReconciledEvent, new Dictionary<string, string>
+            {
+                ["pruned"] = string.Join(",", report.Pruned),
+                ["adopted"] = string.Join(",", report.Adopted),
+                ["stopped"] = string.Join(",", report.Stopped),
+                ["when"] = DateTimeOffset.UtcNow.ToString(
+                    "O", System.Globalization.CultureInfo.InvariantCulture),
+            }));
+        }
+    }
+
+    private static string Describe(IReadOnlyList<string> ids) =>
+        ids.Count == 0 ? "none" : string.Join(",", ids);
 }
 
 /// <summary>An in-memory <see cref="IExpectedAgentStore"/> for tests and the pre-persistence daemon path.</summary>

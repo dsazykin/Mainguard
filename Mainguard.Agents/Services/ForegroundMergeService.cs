@@ -248,19 +248,23 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         }
 
         var mergeExit = -1;
+        var mergeError = string.Empty;
         // One journaled operation (T-19) — the merge is undoable and replayable by the RT-D1 reconcile.
         using (_journal.BeginOperation(request.RepoPath, JournalKinds.Merge, $"Merge {branch}"))
         {
-            var (code, _, _) = GitService.RunGit(request.RepoPath, "merge", "--ff-only", mergeSource);
+            // The stderr is CAPTURED, not discarded into `_`. See the classification below for why: a
+            // non-zero exit here used to be reported unconditionally as "verification is stale", which is
+            // actively wrong for index.lock contention, a refusing pre-merge hook, a full disk, or
+            // unrelated histories — and this file's own doc names discarded exit codes as the bug class it
+            // exists to fix.
+            var (code, _, err) = GitService.RunGit(request.RepoPath, "merge", "--ff-only", mergeSource);
             mergeExit = code;
+            mergeError = err;
         }
 
         if (mergeExit != 0)
         {
-            // The CAS lost: agent/<id> is no longer a fast-forward of main (main moved or the branch
-            // was not rebased onto this main). No merge landed.
-            return new ForegroundMergeResult(false, null, CasLost: true,
-                "verification is stale — the branch no longer fast-forwards onto main; re-verifying");
+            return ClassifyFailedFfMerge(request, branch, mergeSource, mergeError);
         }
 
         var newMainSha = RevParse(request.RepoPath, "--verify", request.MainBranch);
@@ -276,6 +280,55 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     {
         Leases.Confirm(repoHash, lease.LeaseId, newMainSha);
         _onMerged?.Invoke(lease.AgentId, newMainSha);
+    }
+
+    /// <summary>
+    /// Says WHY an <c>--ff-only</c> merge refused, instead of assuming.
+    ///
+    /// <para>The old code was <c>var (code, _, _) = RunGit(…)</c> followed by a hardcoded "verification is
+    /// stale — the branch no longer fast-forwards onto main" on any non-zero exit. Staleness is only one
+    /// of the reasons git refuses: <c>index.lock</c> contention (the exact class of bug this application
+    /// exists to prevent), a repository-configured pre-merge hook that refused, a full disk, unrelated
+    /// histories, a corrupt object. Every one of those was reported to the human as staleness, and
+    /// <c>CasLost: true</c> additionally told the queue to throw the verification away and re-run it —
+    /// which for a jammed <c>index.lock</c> is a re-verification loop that can never succeed and never
+    /// names its cause.</para>
+    ///
+    /// <para>So the staleness claim is now MEASURED: <c>merge-base --is-ancestor main &lt;source&gt;</c>
+    /// answers exactly the question <c>--ff-only</c> asked. Still an ancestor ⇒ the branch does
+    /// fast-forward and something else refused, so git's own stderr is reported and <c>CasLost</c> stays
+    /// false (nothing about the verification is invalidated). Not an ancestor ⇒ genuinely stale, which is
+    /// the original message, now earned. A probe that itself fails to answer (git broken, repo
+    /// unreadable — anything but exit 0/1) is reported as unknown rather than guessed.</para>
+    /// </summary>
+    private static ForegroundMergeResult ClassifyFailedFfMerge(
+        ForegroundMergeRequest request, string branch, string mergeSource, string mergeError)
+    {
+        var detail = FirstLine(mergeError);
+        var (probeCode, _, _) = GitService.RunGit(
+            request.RepoPath, "merge-base", "--is-ancestor", request.MainBranch, mergeSource);
+
+        return probeCode switch
+        {
+            // Exit 0: main IS still an ancestor of the branch, i.e. the fast-forward was available and
+            // something other than staleness refused it.
+            0 => new ForegroundMergeResult(false, null, CasLost: false,
+                $"the merge of '{branch}' into '{request.MainBranch}' failed, and NOT because the "
+                + $"verification is stale — '{branch}' still fast-forwards onto '{request.MainBranch}'. "
+                + $"git said: {detail}"),
+
+            // Exit 1: not an ancestor — the CAS genuinely lost (main moved, or the branch was never
+            // rebased onto this main). The verification is stale and re-verification is the right answer.
+            1 => new ForegroundMergeResult(false, null, CasLost: true,
+                $"verification is stale — the branch no longer fast-forwards onto "
+                + $"'{request.MainBranch}'; re-verifying ({detail})"),
+
+            // Anything else: the probe could not answer, so neither can we. Do not invalidate the
+            // verification on a guess.
+            _ => new ForegroundMergeResult(false, null, CasLost: false,
+                $"the merge of '{branch}' into '{request.MainBranch}' failed and the cause could not be "
+                + $"established (the fast-forward probe itself exited {probeCode}). git said: {detail}"),
+        };
     }
 
     /// <summary>

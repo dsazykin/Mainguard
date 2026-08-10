@@ -407,18 +407,36 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
         // The A5 ref-level CAS, same as the local leg: git advances refs/heads/main only while main is
         // still an ancestor. Journaled (T-19) so it is undoable and the boot reconcile can replay it.
         var mergeExit = -1;
+        var mergeError = string.Empty;
         using (_journal.BeginOperation(
             request.RepoPath, JournalKinds.Merge, $"Merge pull request #{prNumber}"))
         {
-            var (code, _, _) = GitService.RunGit(
+            // stderr CAPTURED, not discarded — see the classification below.
+            var (code, _, err) = GitService.RunGit(
                 request.RepoPath, "merge", "--ff-only", $"{hostRemote}/{request.MainBranch}");
             mergeExit = code;
+            mergeError = err;
         }
 
         if (mergeExit != 0)
         {
-            return MergedUpstreamButNotLocally(
-                prNumber, $"'{request.MainBranch}' doesn't fast-forward onto '{hostRemote}/{request.MainBranch}'");
+            // Same defect as ForegroundMergeService's: a hardcoded "doesn't fast-forward" on ANY non-zero
+            // exit, when index.lock contention, a refusing pre-merge hook, a full disk or unrelated
+            // histories all land here too. Ask git the fast-forward question directly instead of assuming
+            // the answer, and otherwise report what git actually said.
+            var upstreamRef = $"{hostRemote}/{request.MainBranch}";
+            var (probeCode, _, _) = GitService.RunGit(
+                request.RepoPath, "merge-base", "--is-ancestor", request.MainBranch, upstreamRef);
+            var detail = FirstLine(mergeError);
+
+            return MergedUpstreamButNotLocally(prNumber, probeCode switch
+            {
+                0 => $"the local merge failed even though '{request.MainBranch}' DOES fast-forward onto "
+                     + $"'{upstreamRef}' — so this is not a divergence. git said: {detail}",
+                1 => $"'{request.MainBranch}' doesn't fast-forward onto '{upstreamRef}' ({detail})",
+                _ => $"the local merge failed and the cause could not be established (the fast-forward "
+                     + $"probe itself exited {probeCode}). git said: {detail}",
+            });
         }
 
         var newMainSha = RevParse(request.RepoPath, "--verify", request.MainBranch);
