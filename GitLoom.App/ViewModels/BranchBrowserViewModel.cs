@@ -40,6 +40,13 @@ public partial class BranchBrowserViewModel : ViewModelBase
     // T-23: opens the Pull Requests panel straight into "create" for the current branch.
     private readonly Action? _onCreatePullRequestAction;
     private readonly Action<GitBranchItem>? _onCheckoutInWorktreeAction;
+    // Destructive actions confirm through this, never through an inline
+    // `if (ApplicationLifetime is IClassicDesktopStyleApplicationLifetime …)` around the dialog:
+    // that shape puts the *confirmation* inside the gate and the destructive call outside it, so a
+    // missing desktop lifetime silently skips the prompt and still performs the action, and the
+    // confirmation cannot be tested at all. DialogConfirmationService declines when there is no
+    // window, so this fails closed by construction. Same pattern as CommitTimelineViewModel.
+    private readonly GitLoom.App.Services.IConfirmationService _confirm;
 
     [ObservableProperty]
     private string _errorMessage = string.Empty;
@@ -50,7 +57,7 @@ public partial class BranchBrowserViewModel : ViewModelBase
     [ObservableProperty]
     private string _currentBranchName = "Branches";
 
-    public BranchBrowserViewModel(IGitService gitService, string repoPath, Action? onBranchChangedAction = null, Action<string>? showNotificationAction = null, Action<string>? onCompareBranchAction = null, Action? onCreatePullRequestAction = null, Action<GitBranchItem>? onCheckoutInWorktreeAction = null)
+    public BranchBrowserViewModel(IGitService gitService, string repoPath, Action? onBranchChangedAction = null, Action<string>? showNotificationAction = null, Action<string>? onCompareBranchAction = null, Action? onCreatePullRequestAction = null, Action<GitBranchItem>? onCheckoutInWorktreeAction = null, GitLoom.App.Services.IConfirmationService? confirmationService = null)
     {
         _gitService = gitService;
         _repoPath = repoPath;
@@ -59,6 +66,7 @@ public partial class BranchBrowserViewModel : ViewModelBase
         _onCompareBranchAction = onCompareBranchAction;
         _onCreatePullRequestAction = onCreatePullRequestAction;
         _onCheckoutInWorktreeAction = onCheckoutInWorktreeAction;
+        _confirm = confirmationService ?? new GitLoom.App.Services.DialogConfirmationService();
     }
 
     // T-29: branch-context "Check out in new worktree" — fetches nothing, just creates a worktree
@@ -248,7 +256,11 @@ public partial class BranchBrowserViewModel : ViewModelBase
 
         menu.SubItems.Add(new SeparatorViewModel());
 
-        // Group 2: Remote Operations
+        // Group 2: Remote Operations. Update/Pull work on any local branch, checked out or not —
+        // both check the branch out first, which is what makes "update a branch you are not
+        // standing on" possible at all (before this there was no menu path to it whatsoever).
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Update {branch.FriendlyName} from upstream", Command = UpdateBranchCommand, CommandParameter = branch });
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Pull {branch.FriendlyName} (rebase)", Command = PullWithRebaseCommand, CommandParameter = branch });
         menu.SubItems.Add(new MenuItemViewModel { Header = "Push", Command = PushBranchCommand, CommandParameter = branch });
         menu.SubItems.Add(new MenuItemViewModel { Header = "Create pull request", Command = CreatePullRequestCommand, CommandParameter = branch });
 
@@ -256,7 +268,8 @@ public partial class BranchBrowserViewModel : ViewModelBase
 
         // Group 3: Integration
         menu.SubItems.Add(new MenuItemViewModel { Header = $"Merge {branch.FriendlyName} into {currentBranchName}", Command = MergeIntoCommand, CommandParameter = branch, IsEnabled = !branch.IsCurrentRepositoryHead });
-        menu.SubItems.Add(new MenuItemViewModel { Header = $"Rebase {currentBranchName} onto {branch.FriendlyName}", Command = RebaseIntoCommand, CommandParameter = branch, IsEnabled = !branch.IsCurrentRepositoryHead });
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Rebase {currentBranchName} onto {branch.FriendlyName}", Command = RebaseCurrentOntoCommand, CommandParameter = branch, IsEnabled = !branch.IsCurrentRepositoryHead });
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Check out {branch.FriendlyName} and rebase it onto {currentBranchName}", Command = CheckoutAndRebaseCommand, CommandParameter = branch, IsEnabled = !branch.IsCurrentRepositoryHead });
 
         menu.SubItems.Add(new SeparatorViewModel());
 
@@ -288,9 +301,12 @@ public partial class BranchBrowserViewModel : ViewModelBase
 
         menu.SubItems.Add(new SeparatorViewModel());
 
-        // Group 2: Integration
+        // Group 2: Integration. Pull (rebase) belongs here for a remote-tracking ref: it fetches
+        // and rebases HEAD onto that ref, which is the only "update" that means anything for a ref
+        // you cannot stand on.
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Pull {branch.FriendlyName} into {currentBranchName} (rebase)", Command = PullWithRebaseCommand, CommandParameter = branch });
         menu.SubItems.Add(new MenuItemViewModel { Header = $"Merge {branch.FriendlyName} into {currentBranchName}", Command = MergeIntoCommand, CommandParameter = branch });
-        menu.SubItems.Add(new MenuItemViewModel { Header = $"Rebase {currentBranchName} onto {branch.FriendlyName}", Command = RebaseIntoCommand, CommandParameter = branch });
+        menu.SubItems.Add(new MenuItemViewModel { Header = $"Rebase {currentBranchName} onto {branch.FriendlyName}", Command = RebaseCurrentOntoCommand, CommandParameter = branch });
 
         menu.SubItems.Add(new SeparatorViewModel());
 
@@ -365,46 +381,13 @@ public partial class BranchBrowserViewModel : ViewModelBase
         }
     }
 
-    [RelayCommand]
-    private void RebaseInto(GitBranchItem targetBranch)
-    {
-        try
-        {
-            var branches = _gitService.GetBranches(_repoPath).ToList();
-            var currentBranch = branches.FirstOrDefault(b => b.IsCurrentRepositoryHead);
-            string currentBranchName = currentBranch?.FriendlyName ?? "main";
-
-            _gitService.Rebase(_repoPath, targetBranch.FriendlyName);
-            _onBranchChangedAction?.Invoke();
-            _showNotificationAction?.Invoke($"Successfully rebased {currentBranchName} onto {targetBranch.FriendlyName}.");
-        }
-        catch (Exception ex)
-        {
-            ErrorMessage = $"Rebase failed: {ex.Message}";
-            _showNotificationAction?.Invoke(ErrorMessage);
-        }
-    }
-
-    [RelayCommand]
-    private async System.Threading.Tasks.Task RebaseLocalIntoTrackedAsync(GitBranchItem localBranch)
-    {
-        try
-        {
-            bool success = await PerformCheckoutWithFallbackAsync(localBranch.Name, localBranch.FriendlyName);
-            if (success)
-            {
-                _gitService.Rebase(_repoPath, $"origin/{localBranch.FriendlyName}");
-                _onBranchChangedAction?.Invoke();
-                _showNotificationAction?.Invoke($"Successfully rebased {localBranch.FriendlyName} onto origin/{localBranch.FriendlyName}.");
-            }
-        }
-        catch (Exception ex)
-        {
-            ErrorMessage = $"Rebase failed: {ex.Message}";
-            _showNotificationAction?.Invoke(ErrorMessage);
-        }
-    }
-
+    /// <summary>
+    /// Fetches, then rebases <paramref name="branch"/> onto its <c>origin/</c> counterpart.
+    ///
+    /// <para>For a local branch that is <b>not</b> checked out, this checks it out first — you
+    /// cannot advance a branch you are not standing on by rebasing HEAD, that updates the wrong
+    /// branch. This is what makes "update a branch you are not on" reachable at all.</para>
+    /// </summary>
     [RelayCommand]
     private async System.Threading.Tasks.Task PullWithRebaseAsync(GitBranchItem branch)
     {
@@ -631,55 +614,34 @@ public partial class BranchBrowserViewModel : ViewModelBase
         }
     }
 
-    [RelayCommand]
-    private void NotImplemented()
-    {
-        ErrorMessage = "Action coming soon!";
-        _showNotificationAction?.Invoke(ErrorMessage);
-    }
-
+    /// <summary>
+    /// Rebases the checked-out branch onto <paramref name="branch"/>. This is the menu's only
+    /// rebase-current-onto path: it replaced an identical unconfirmed command, because rewriting
+    /// the history of the branch you are standing on always asks first.
+    /// </summary>
     [RelayCommand]
     private async System.Threading.Tasks.Task RebaseCurrentOntoAsync(GitBranchItem branch)
     {
         try
         {
-            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop && desktop.MainWindow != null)
-            {
-                var vm = new ConfirmationDialogViewModel
-                {
-                    Title = "Rebase",
-                    Message = $"Are you sure you want to rebase your current branch onto '{branch.FriendlyName}'?",
-                    ConfirmButtonText = "Rebase"
-                };
-                var dialog = new Views.ConfirmationDialog { DataContext = vm };
-                await dialog.ShowDialog(desktop.MainWindow);
+            var branches = _gitService.GetBranches(_repoPath).ToList();
+            var currentBranch = branches.FirstOrDefault(b => b.IsCurrentRepositoryHead);
+            string currentBranchName = currentBranch?.FriendlyName ?? "the current branch";
 
-                if (!vm.IsConfirmed) return;
-            }
+            bool confirmed = await _confirm.ConfirmAsync(
+                "Rebase",
+                $"Rebase '{currentBranchName}' onto '{branch.FriendlyName}'?\nThis rewrites the commits on '{currentBranchName}'.",
+                "Rebase");
+            if (!confirmed) return;
 
             _gitService.Rebase(_repoPath, branch.FriendlyName);
             _onBranchChangedAction?.Invoke();
-            _showNotificationAction?.Invoke($"Successfully rebased current branch onto '{branch.FriendlyName}'.");
+            _showNotificationAction?.Invoke($"Successfully rebased {currentBranchName} onto '{branch.FriendlyName}'.");
         }
         catch (Exception ex)
         {
             ErrorMessage = $"Rebase failed: {ex.Message}";
             _showNotificationAction?.Invoke(ErrorMessage);
-        }
-    }
-
-    [RelayCommand]
-    private void ShowDiff(GitBranchItem branch)
-    {
-        try
-        {
-            // For now, we generate a high-level patch or notify. The backend takes a specific file, but we can pass null for the whole tree diffing if supported by LibGit2Sharp, or just simulate the UI action.
-            // Since GitService.GetDiffAgainstCommit takes a file path, we might just want to show the count of worktrees as a test for Phase 4.5.
-            _showNotificationAction?.Invoke($"Diff generation backend ready for {branch.FriendlyName}. Connect DiffViewer UI next.");
-        }
-        catch (Exception ex)
-        {
-            _showNotificationAction?.Invoke($"Diff failed: {ex.Message}");
         }
     }
 
@@ -796,26 +758,43 @@ public partial class BranchBrowserViewModel : ViewModelBase
         }
     }
 
+    /// <summary>
+    /// Brings <paramref name="branch"/> up to date with its upstream (merge strategy).
+    ///
+    /// <para>The old body merged <c>origin/&lt;branch&gt;</c> into whatever HEAD happened to be
+    /// when the branch was not checked out — which updates the <b>wrong</b> branch and can drag
+    /// unrelated commits into the branch you are standing on. It checks the branch out first now,
+    /// then pulls, so the branch named in the menu is the branch that moves.</para>
+    /// </summary>
     [RelayCommand]
-    private void UpdateBranch(GitBranchItem branch)
+    private async System.Threading.Tasks.Task UpdateBranchAsync(GitBranchItem branch)
     {
         try
         {
-            if (branch.IsCurrentRepositoryHead)
+            if (!branch.IsCurrentRepositoryHead)
             {
-                _gitService.Pull(_repoPath);
+                bool checkedOut = await PerformCheckoutWithFallbackAsync(branch.Name, branch.FriendlyName);
+                if (!checkedOut) return;
             }
-            else
-            {
-                _gitService.Fetch(_repoPath);
-                _gitService.Merge(_repoPath, $"origin/{branch.FriendlyName}");
-            }
+
+            // Pull (not Fetch + Merge origin/<name>) so the branch's configured upstream is what
+            // is honoured, including branches that track a non-origin remote.
+            _gitService.Pull(_repoPath);
             _onBranchChangedAction?.Invoke();
             _showNotificationAction?.Invoke($"Successfully updated '{branch.FriendlyName}'.");
         }
         catch (Exception ex)
         {
-            _showNotificationAction?.Invoke($"Update Failed: {ex.Message}");
+            if (Unwrap<GitLoom.Core.Exceptions.MergeConflictException>(ex) is not null)
+            {
+                await ShowConflictResolverAsync();
+                await CheckAndShowMergeCommitDialogAsync();
+                _onBranchChangedAction?.Invoke();
+                return;
+            }
+
+            ErrorMessage = $"Update failed: {ex.Message}";
+            _showNotificationAction?.Invoke(ErrorMessage);
         }
     }
 
@@ -890,46 +869,6 @@ public partial class BranchBrowserViewModel : ViewModelBase
     }
 
 
-    [RelayCommand]
-    private async System.Threading.Tasks.Task PullWithMerge(GitBranchItem branch)
-    {
-        try
-        {
-            _gitService.Fetch(_repoPath);
-
-            if (branch.IsRemote)
-            {
-                var branches = _gitService.GetBranches(_repoPath).ToList();
-                var currentBranch = branches.FirstOrDefault(b => b.IsCurrentRepositoryHead);
-                string currentBranchName = currentBranch?.FriendlyName ?? "main";
-
-                _gitService.Merge(_repoPath, branch.FriendlyName);
-                _onBranchChangedAction?.Invoke();
-                _showNotificationAction?.Invoke($"Successfully pulled and merged {branch.FriendlyName} into {currentBranchName}.");
-            }
-            else
-            {
-                _gitService.Merge(_repoPath, $"origin/{branch.FriendlyName}");
-                _onBranchChangedAction?.Invoke();
-                _showNotificationAction?.Invoke($"Successfully pulled and merged origin/{branch.FriendlyName} into {branch.FriendlyName}.");
-            }
-        }
-        catch (System.Exception ex)
-        {
-            if (Unwrap<GitLoom.Core.Exceptions.MergeConflictException>(ex) is not null)
-            {
-                await ShowConflictResolverAsync();
-            }
-            else
-            {
-                _showNotificationAction?.Invoke($"Pull with Merge failed: {ex.Message}");
-            }
-        }
-
-        await CheckAndShowMergeCommitDialogAsync();
-        _onBranchChangedAction?.Invoke();
-    }
-
     // ---- Tags (T-05) -------------------------------------------------------
 
     [RelayCommand]
@@ -969,18 +908,11 @@ public partial class BranchBrowserViewModel : ViewModelBase
     {
         try
         {
-            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop && desktop.MainWindow != null)
-            {
-                var vm = new ConfirmationDialogViewModel
-                {
-                    Title = "Delete Tag",
-                    Message = $"Are you sure you want to delete the tag '{tag.Name}'?\nThis action cannot be undone.",
-                    ConfirmButtonText = "Delete"
-                };
-                var dialog = new Views.ConfirmationDialog { DataContext = vm };
-                await dialog.ShowDialog(desktop.MainWindow);
-                if (!vm.IsConfirmed) return;
-            }
+            bool confirmed = await _confirm.ConfirmAsync(
+                "Delete Tag",
+                $"Are you sure you want to delete the tag '{tag.Name}'?\nThis action cannot be undone.",
+                "Delete");
+            if (!confirmed) return;
 
             await System.Threading.Tasks.Task.Run(() => _gitService.DeleteTag(_repoPath, tag.Name));
             ErrorMessage = string.Empty;
@@ -1000,18 +932,11 @@ public partial class BranchBrowserViewModel : ViewModelBase
     {
         try
         {
-            if (Avalonia.Application.Current?.ApplicationLifetime is Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime desktop && desktop.MainWindow != null)
-            {
-                var vm = new ConfirmationDialogViewModel
-                {
-                    Title = "Delete Remote Tag",
-                    Message = $"Delete the tag '{tag.Name}' from 'origin'?\nThe local tag is kept.",
-                    ConfirmButtonText = "Delete"
-                };
-                var dialog = new Views.ConfirmationDialog { DataContext = vm };
-                await dialog.ShowDialog(desktop.MainWindow);
-                if (!vm.IsConfirmed) return;
-            }
+            bool confirmed = await _confirm.ConfirmAsync(
+                "Delete Remote Tag",
+                $"Delete the tag '{tag.Name}' from 'origin'?\nThe local tag is kept.",
+                "Delete");
+            if (!confirmed) return;
 
             await System.Threading.Tasks.Task.Run(() => _gitService.DeleteRemoteTag(_repoPath, "origin", tag.Name));
             _showNotificationAction?.Invoke($"Deleted tag '{tag.Name}' from origin.");

@@ -88,7 +88,10 @@ public sealed class FakeGitService : IGitService
     public void PushForceWithLease(string repoPath, string remoteName, string branchName) => Nope();
     public void PushTags(string repoPath, string remoteName) => Nope();
     public void PushSetUpstream(string repoPath, string remoteName, string branchName) => Nope();
-    public void Rebase(string repoPath, string targetBranchName) => Nope();
+    /// <summary>Stub for <see cref="Rebase"/> (branch-menu confirmation tests). Unstubbed → throws.</summary>
+    public Action<string, string>? RebaseImpl { get; set; }
+    public void Rebase(string repoPath, string targetBranchName)
+        => (RebaseImpl ?? ((_, _) => Nope()))(repoPath, targetBranchName);
     public void RebaseOntoCommit(string repoPath, string commitSha) => Nope();
     public void Merge(string repoPath, string sourceBranchName) => Nope();
     public bool IsMergeInProgress(string repoPath) => Nope<bool>();
@@ -120,11 +123,20 @@ public sealed class FakeGitService : IGitService
     public void DeleteBranch(string repoPath, string branchName, bool force = false) => Nope();
     public void StashChanges(string repoPath, string message) => Nope();
     public bool HasUncommittedChanges(string repoPath) => Nope<bool>();
-    public IEnumerable<GitTagItem> GetTags(string repoPath) => Nope<IEnumerable<GitTagItem>>();
+    /// <summary>Stub for <see cref="GetTags"/>. Unstubbed → throws.</summary>
+    public Func<string, IEnumerable<GitTagItem>>? GetTagsImpl { get; set; }
+    public IEnumerable<GitTagItem> GetTags(string repoPath)
+        => (GetTagsImpl ?? throw new NotSupportedException("GetTagsImpl not set"))(repoPath);
     public void CreateTag(string repoPath, string name, string targetSha, string? message) => Nope();
-    public void DeleteTag(string repoPath, string name) => Nope();
+    /// <summary>Stub for <see cref="DeleteTag"/> (branch-menu confirmation tests). Unstubbed → throws.</summary>
+    public Action<string, string>? DeleteTagImpl { get; set; }
+    public void DeleteTag(string repoPath, string name)
+        => (DeleteTagImpl ?? ((_, _) => Nope()))(repoPath, name);
     public void PushTag(string repoPath, string remoteName, string name) => Nope();
-    public void DeleteRemoteTag(string repoPath, string remoteName, string name) => Nope();
+    /// <summary>Stub for <see cref="DeleteRemoteTag"/> (branch-menu confirmation tests). Unstubbed → throws.</summary>
+    public Action<string, string, string>? DeleteRemoteTagImpl { get; set; }
+    public void DeleteRemoteTag(string repoPath, string remoteName, string name)
+        => (DeleteRemoteTagImpl ?? ((_, _, _) => Nope()))(repoPath, remoteName, name);
     public void CheckoutTag(string repoPath, string name) => Nope();
     public IEnumerable<GitStashItem> GetStashes(string repoPath) => Nope<IEnumerable<GitStashItem>>();
     public void StashPush(string repoPath, string message) => Nope();
