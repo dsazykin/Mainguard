@@ -195,6 +195,36 @@ public sealed class SandboxFixture : IAsyncDisposable
         return created.ID;
     }
 
+    /// <summary>
+    /// Starts a container from <paramref name="imageRef"/> with <b>no <c>User</c> on the create
+    /// request</b>, so the uid it runs as can only have come from the image's own <c>USER</c> directive.
+    ///
+    /// <para>This exists for one measurement. The production spawn path sets <c>User = AgentUid</c>, and
+    /// that override wins over the image — so <c>id -u</c> in a normally-spawned jail answers 1000
+    /// whatever the layer ends on, which is exactly how a derived layer losing its <c>USER agent</c>
+    /// stayed invisible. Removing the override is the only way to ask the image the question.</para>
+    ///
+    /// <para>Deliberately NOT hardened and deliberately not on a segment: hardening would be a claim this
+    /// container is not making, and reusing <see cref="ContainerSpecBuilder"/> would put the override
+    /// straight back. What is under test is one field of one image config.</para>
+    /// </summary>
+    public async Task<string> CreateAndStartFromImageWithoutUserOverrideAsync(
+        string imageRef, string agentId, CancellationToken ct = default)
+    {
+        var created = await Docker.Containers.CreateContainerAsync(new CreateContainerParameters
+        {
+            Name = "mainguard-layeruid-" + agentId + "-" + Guid.NewGuid().ToString("N")[..8],
+            Image = imageRef,
+            // User deliberately unset — that is the whole point of this helper.
+            Cmd = new List<string> { "sleep", "infinity" },
+            Labels = new Dictionary<string, string> { ["mainguard.role"] = "layer-uid-probe" },
+        }, ct).ConfigureAwait(false);
+
+        _containerIds.Add(created.ID);
+        await Docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+        return created.ID;
+    }
+
     /// <summary>The container's IPv4 on <paramref name="networkName"/> (its segment).</summary>
     public async Task<string?> AddressOnAsync(string containerId, string networkName, CancellationToken ct = default)
     {
