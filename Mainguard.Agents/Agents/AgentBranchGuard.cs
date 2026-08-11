@@ -309,11 +309,11 @@ public static class AgentBranchGuard
     public static string UnarmedWarning(string agentId, string hookPath, string detail)
         => $"Mainguard wrote the branch guard hook for agent '{agentId}' to '{hookPath}', but git CANNOT "
            + $"RUN it there: {detail}. The guard is NOT ARMED — an agent that runs `git checkout -b …` "
-           + "will not be stopped, and its work will strand silently. The usual cause is an agent "
-           + "repository on a filesystem mounted `noexec` (git then reports the hook as \"not set as "
-           + "executable\" and skips it, whatever the mode bits say); move the VM root to a filesystem "
-           + "that permits execution. Drift is still REPORTED at verification time by the branch probe, "
-           + "so nothing is lost silently — but it is caught hours later instead of at the keystroke.";
+           + "will not be stopped, and its work will strand. The usual cause is an agent repository on a "
+           + "filesystem mounted `noexec` (git then reports the hook as \"not set as executable\" and "
+           + "skips it, whatever the mode bits say); move the VM root to a filesystem that permits "
+           + "execution. That drift is still REPORTED at verification time by the branch probe, so it "
+           + "will not pass unnoticed — but it is caught hours later instead of at the keystroke.";
 
     /// <summary>
     /// Establishes whether git will actually RUN the hook at <paramref name="hookPath"/>, by running it.
