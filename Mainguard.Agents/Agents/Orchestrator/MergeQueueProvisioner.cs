@@ -88,6 +88,9 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, string, AgentBranchAlignment>? _checkAgentBranch;
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
+    private readonly IYieldProtocol? _yield;
+    private readonly Func<string, string, AgentWorktreeLocation?>? _locateAgentWorktree;
+    private readonly IAgentSupervisor _agentStates;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
@@ -141,6 +144,28 @@ public sealed class MergeQueueProvisioner
     /// <para>Null (every pre-existing test) restores the old behaviour exactly: nothing is checked. The
     /// daemon passes it.</para>
     /// </param>
+    /// <param name="yieldProtocol">
+    /// P2-09's cooperative yield — the <b>only</b> gateway to a mutable worktree (invariant 2), and
+    /// therefore a hard precondition of the keep-alive rebase rather than a companion feature of it. The
+    /// worktree this cascade rewrites is bind-mounted read-write into a RUNNING jail; rebasing it while the
+    /// agent's own CLI is mid <c>git commit</c> is the <c>.git/index.lock</c> collision this application
+    /// exists to prevent, and a worse version of it, because the daemon would be the second writer.
+    /// <see cref="GitMutationGuard.RunGuarded{T}"/> refuses to run at all without an active token, so this
+    /// is not a policy the rebase could be talked out of.
+    /// <para>Null leaves the cascade at re-verify-only. See <see cref="ReparentsStaleBranches"/>.</para>
+    /// </param>
+    /// <param name="locateAgentWorktree">
+    /// (repoHash, agentId) → where this agent's worktree lives, which mirror it rebases from, and onto
+    /// which branch — or <b>null when the agent no longer has one</b>. That nullability is the contract:
+    /// a stale entry whose agent was stopped has nothing to rebase, and the cascade has to be able to tell
+    /// that apart from a rebase that failed.
+    /// </param>
+    /// <param name="agentStates">
+    /// Where the run-state of an agent the cascade touched is reflected (<c>Rebasing</c>, and — the one
+    /// that matters — <c>Conflict</c>). The daemon passes the real <c>PtyAgentSupervisor</c>, so the state
+    /// reaches clients on the agent-event stream; the default no-op supervisor keeps the pure-unit paths
+    /// working.
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -155,7 +180,10 @@ public sealed class MergeQueueProvisioner
         Action<string>? log = null,
         Func<string, string, bool>? publishAgentRef = null,
         Func<string, TaskPlan?>? resolveApprovedPlan = null,
-        Func<string, string, AgentBranchAlignment>? checkAgentBranch = null)
+        Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
+        IYieldProtocol? yieldProtocol = null,
+        Func<string, string, AgentWorktreeLocation?>? locateAgentWorktree = null,
+        IAgentSupervisor? agentStates = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -173,6 +201,9 @@ public sealed class MergeQueueProvisioner
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
         _checkAgentBranch = checkAgentBranch;
+        _yield = yieldProtocol;
+        _locateAgentWorktree = locateAgentWorktree;
+        _agentStates = agentStates ?? NullAgentSupervisor.Instance;
 
         // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
         // is here rather than only the one that happened to get a test.
@@ -182,8 +213,22 @@ public sealed class MergeQueueProvisioner
         if (publishAgentRef is not null) { wired.Add(nameof(publishAgentRef)); }
         if (resolveApprovedPlan is not null) { wired.Add(nameof(resolveApprovedPlan)); }
         if (checkAgentBranch is not null) { wired.Add(nameof(checkAgentBranch)); }
+        if (yieldProtocol is not null) { wired.Add(nameof(yieldProtocol)); }
+        if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
+        if (agentStates is not null) { wired.Add(nameof(agentStates)); }
         WiredOptionalControls = wired;
     }
+
+    /// <summary>
+    /// Whether this provisioner's queues actually REPARENT a staled branch, rather than merely re-running
+    /// its tests against a main it does not descend from.
+    ///
+    /// <para>Exposed for the same reason <see cref="WiredOptionalControls"/> is: the keep-alive rebase is
+    /// composed from two optional arguments, and a provisioner missing either one silently falls back to
+    /// the re-verify-only cascade — which is not a degraded fix, it is the original defect. One name for
+    /// the composed capability means the composition root can assert the capability instead of the parts.</para>
+    /// </summary>
+    public bool ReparentsStaleBranches => _yield is not null && _locateAgentWorktree is not null;
 
     /// <summary>
     /// Every optional constructor argument this provisioner was <b>actually given</b>, by parameter name.
@@ -320,6 +365,11 @@ public sealed class MergeQueueProvisioner
         // a merge precondition rather than a rendering.
         var flaggedChanges = new FlaggedChangeGate(_audit);
 
+        // P2-09's keep-alive rebaser, per repo because its `locate` closes over the repo handle. Built
+        // here and not once per provisioner so a repo whose mirror the daemon cannot resolve simply has
+        // no rebaser, rather than one that throws on every cascade.
+        var rebaser = BuildRebaser(repoHandle);
+
         MergeQueue queue = null!;
         queue = new MergeQueue(
             repoHash: repoHandle,
@@ -328,9 +378,13 @@ public sealed class MergeQueueProvisioner
             verifications: _verificationStore(repoHandle),
             runVerification: (agentId, ct) =>
                 RunVerificationAsync(repoHandle, agentId, queue, changedTestCommand, flaggedChanges, ct),
-            // Null requeue = re-verify, which is the production stale-cascade behaviour (§3.3): a staled
-            // branch re-runs its own verification against the new main rather than sitting stale forever.
-            requeue: null,
+            // P2-10 §3.3 step 2, and the whole point of this change: "yield → keep-alive rebase onto new
+            // main → RunVerificationAsync". This argument was `null` — i.e. re-verify only — which reads
+            // like a lighter cascade and is not one. `git merge --ff-only` is the merge, so the instant
+            // any agent merges, every co-tenant branch stops descending from main; re-verifying them
+            // re-establishes a PASS against work that was never rebased, the entry returns to Verified,
+            // and the merge is then refused as stale. Nothing in the daemon could break that loop.
+            requeue: (agentId, ct) => RequeueStaleAsync(repoHandle, agentId, queue, rebaser, ct),
             gates: new IMergeGate[] { changedTestCommand, flaggedChanges },
             audit: _audit);
 
@@ -339,6 +393,216 @@ public sealed class MergeQueueProvisioner
             ChangedTestCommand = changedTestCommand,
             FlaggedChanges = flaggedChanges,
         };
+    }
+
+    /// <summary>Audit event carrying the T-04 <see cref="ConflictHandoff"/> payload for a conflicted
+    /// keep-alive rebase — the durable record of a worktree parked for a human.</summary>
+    public const string KeepAliveConflictEvent = "keepalive_rebase_conflict";
+
+    /// <summary>
+    /// The per-repo keep-alive rebaser, or null when this provisioner was not given the two things a
+    /// rebase cannot be performed without (the yield gateway and a way to find the worktree).
+    /// </summary>
+    private IKeepAliveRebaser? BuildRebaser(string repoHandle)
+    {
+        if (_yield is null || _locateAgentWorktree is null)
+        {
+            return null;
+        }
+
+        var locate = _locateAgentWorktree;
+        return new KeepAliveRebaser(
+            yield: _yield,
+            // RequeueStaleAsync establishes the location BEFORE it calls a cycle, so this only ever runs
+            // for an agent already known to have one. The throw is the contract restated, not a path.
+            locate: agentId => locate(repoHandle, agentId)
+                ?? throw new InvalidOperationException(
+                    $"Agent '{agentId}' in repo '{repoHandle}' has no worktree to rebase."),
+            // The run state reaches clients on the agent-event stream, which is what makes a Conflict
+            // visible at all: AgentRunState.Conflict had no production writer, so the one arm of the cycle
+            // that requires a human was also the one arm nothing rendered.
+            setState: (agentId, state) => MarkRunState(repoHandle, agentId, state),
+            onConflict: handoff => OnRebaseConflict(repoHandle, handoff));
+    }
+
+    /// <summary>
+    /// One stale-cascade re-entry for one branch: <b>reparent, then re-verify</b> — and re-verify
+    /// <i>only</i> if the reparent actually happened.
+    ///
+    /// <para><b>The ordering is the fix.</b> Verification pins its record to the queue's current main and
+    /// asks nothing about ancestry, so a branch that was not rebased passes and looks fresh; only
+    /// <c>--ff-only</c> ever finds out, at merge time, and its refusal sends the entry straight back round
+    /// the same loop. So the rebase is a precondition of the re-verification, not a step beside it, and a
+    /// cycle that did not put the branch on top of main ends the re-entry at <c>Working</c> with the
+    /// measured reason instead.</para>
+    ///
+    /// <para><b>Every arm here ends somewhere a human can act from.</b> That is the second requirement,
+    /// and it is why there are four of them:</para>
+    /// <list type="bullet">
+    ///   <item><b>No jail</b> — the agent was stopped, so there is nothing to yield and (§3.2) nothing to
+    ///   verify in either. The entry returns to <c>Working</c> naming the missing sandbox, which is what
+    ///   the <c>ResumeAgent</c> path exists to answer. It is deliberately NOT handed to
+    ///   <c>RunVerificationAsync</c> to fail: that route reaches the same state through a
+    ///   "verification failed"-shaped event for a verification that never ran.</item>
+    ///   <item><b>No worktree</b> — the jail is up but its worktree is gone (a pruned or half-torn-down
+    ///   agent). Same terminus, different reason; a rebase would throw and the cascade would swallow it.</item>
+    ///   <item><b>Conflict</b> — the rebase hit the human's changes. The worktree stays parked mid-rebase
+    ///   for T-04, the jail stays paused, and <see cref="OnRebaseConflict"/> makes that state legible.</item>
+    ///   <item><b>Skipped</b> — the guard refused (the agent is mid its own rebase), or main could not be
+    ///   carried across. Nothing was mutated; the branch is simply not reparentable this instant.</item>
+    /// </list>
+    ///
+    /// <para>Nothing here throws for a reason other than cancellation: <see cref="MergeQueue"/> runs the
+    /// cascade on a background task whose <c>catch</c> is silent, so an exception escaping this method is
+    /// a branch that vanishes from the cascade with no record anywhere. Failures are converted into the
+    /// same <c>Working</c>-plus-reason terminus as everything else.</para>
+    /// </summary>
+    private async Task RequeueStaleAsync(
+        string repoHandle, string agentId, MergeQueue queue, IKeepAliveRebaser? rebaser, CancellationToken ct)
+    {
+        if (rebaser is null)
+        {
+            // No rebase capability was wired (the pure-unit paths). Preserve the historical behaviour
+            // exactly rather than inventing a third one.
+            await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+            return;
+        }
+
+        // The same jail question the verification itself asks, asked first — because if the answer is no,
+        // neither the yield nor the verification can happen, and there is nothing to be gained from
+        // finding that out twice.
+        if (string.IsNullOrEmpty(_resolveContainerId(repoHandle, agentId)))
+        {
+            Block(repoHandle, agentId, queue,
+                "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent",
+                "no-live-jail");
+            return;
+        }
+
+        AgentWorktreeLocation? location;
+        try
+        {
+            location = _locateAgentWorktree!(repoHandle, agentId);
+        }
+        catch (Exception ex)
+        {
+            location = null;
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} worktree lookup FAILED ({ex.Message})");
+        }
+
+        if (location is null || string.IsNullOrEmpty(location.WorktreePath)
+            || !System.IO.Directory.Exists(location.WorktreePath))
+        {
+            Block(repoHandle, agentId, queue,
+                "this branch needs rebasing onto the new main and its worktree is gone — resume the agent",
+                "no-worktree");
+            return;
+        }
+
+        RebaseCycleResult cycle;
+        try
+        {
+            cycle = await rebaser.NotifyMainMoved(agentId, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Block(repoHandle, agentId, queue,
+                $"this branch could not be rebased onto the new main ({ex.Message})", "rebase-threw");
+            return;
+        }
+
+        if (cycle.Kind == RebaseCycleKind.Conflict)
+        {
+            Block(repoHandle, agentId, queue,
+                "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
+                + "rebase in progress and needs a human to resolve it",
+                "conflict");
+            return;
+        }
+
+        if (!cycle.BranchIsOnTopOfMain)
+        {
+            Block(repoHandle, agentId, queue,
+                $"this branch is not on top of the new main yet — {cycle.Detail ?? "the keep-alive rebase was skipped"}",
+                "skipped");
+            return;
+        }
+
+        _log?.Invoke(
+            $"merge queue repo={repoHandle} agent={agentId} reparented onto main "
+            + $"(wip={cycle.WipCommitCreated}) — re-verifying");
+
+        await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+    }
+
+    // The one terminus for every way a re-entry can fail to reparent: Working, with the reason a human
+    // reads on the queue rail (MergeQueue renders it verbatim as the CanMerge reason) and an audit event.
+    private void Block(string repoHandle, string agentId, MergeQueue queue, string reason, string detail)
+    {
+        _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} stale re-queue BLOCKED ({detail}) — {reason}");
+        queue.TryReturnToWorking(agentId, reason, detail);
+    }
+
+    /// <summary>
+    /// Reflects a keep-alive run state on the agent, so the states the cycle transitions through are
+    /// observable rather than internal to a background task.
+    /// </summary>
+    private void MarkRunState(string repoHandle, string agentId, AgentRunState state)
+    {
+        var detail = state switch
+        {
+            AgentRunState.Yielding => "Yielding for a keep-alive rebase onto the new main.",
+            AgentRunState.Rebasing => "Rebasing onto the new main after a merge.",
+            AgentRunState.Conflict => "The keep-alive rebase conflicted; the jail is paused pending resolution.",
+            _ => null,
+        };
+
+        try
+        {
+            _agentStates.MarkState(agentId, state.ToString(), detail);
+        }
+        catch (Exception ex)
+        {
+            // Reporting a state must never be able to fail a rebase.
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} state mark FAILED ({ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// The T-04 handoff route, given a destination.
+    ///
+    /// <para><b>There is no T-04 resolver yet, and this does not pretend otherwise.</b> What it does is
+    /// make the conflict a thing that exists outside the background task that produced it: the worktree
+    /// path and branch land in the audit trail (so the resolver, when it lands, has the handoff it was
+    /// always meant to receive), the merge log names it, and the agent is marked
+    /// <see cref="AgentRunState.Conflict"/> — which the daemon's supervisor streams to clients as a state
+    /// change. The queue entry is separately returned to <c>Working</c> carrying the same explanation, so
+    /// the branch reads as needing a human rather than as quietly unverified.</para>
+    ///
+    /// <para>Before this, all of that was dead: <see cref="AgentRunState.Conflict"/> had no production
+    /// writer, <see cref="ConflictHandoff"/> was constructed nowhere outside tests, and a conflicted
+    /// worktree was left parked with nothing anywhere naming it — indistinguishable from an agent that
+    /// simply stopped making progress.</para>
+    /// </summary>
+    private void OnRebaseConflict(string repoHandle, ConflictHandoff handoff)
+    {
+        _log?.Invoke(
+            $"merge queue repo={repoHandle} agent={handoff.AgentId} keep-alive rebase CONFLICTED against "
+            + $"'{handoff.MainBranch}' — worktree {handoff.WorktreePath} is parked mid-rebase and the jail "
+            + "stays paused until it is resolved");
+
+        _audit.Append(new AuditEvent(KeepAliveConflictEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHandle,
+            ["agent"] = handoff.AgentId,
+            ["worktree"] = handoff.WorktreePath,
+            ["main_branch"] = handoff.MainBranch,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
     }
 
     /// <summary>
