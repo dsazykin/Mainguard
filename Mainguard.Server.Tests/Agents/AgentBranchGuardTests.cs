@@ -274,29 +274,68 @@ public sealed class AgentBranchGuardTests
     [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
     public void TheArmingMeasurement_AnswersNo_ForAHookGitWouldSkip()
     {
-        // Real files on a real filesystem — no seam. Both shapes are ones a written-and-chmodded hook
-        // actually takes in production: the exec bit absent (what `noexec` makes git see), and a CRLF
-        // script (`bad interpreter`), which this file has worried about since it was written and which no
-        // mode check can detect.
+        // Real files on a real filesystem — no seam. Every case is a shape a written-and-chmodded hook
+        // actually takes in production, and none of them is detectable by looking at mode bits.
         using var env = new WorktreeEnv();
         var dir = Directory.CreateDirectory(Path.Combine(env.VmRoot, "arming")).FullName;
 
+        // The control first: an ordinary hook on an ordinary VM root arms. If this ever fails, the
+        // measurement is refusing everything and the three refusals below would prove nothing.
         var executable = Path.Combine(dir, "executable");
         File.WriteAllText(executable, "#!/bin/sh\nexit 0\n");
         MakeExecutable(executable);
         Assert.Null(AgentBranchGuard.MeasureHookCanRun(executable));
 
-        var noExecBit = Path.Combine(dir, "no-exec-bit");
-        File.WriteAllText(noExecBit, "#!/bin/sh\nexit 0\n");
-        File.SetUnixFileMode(noExecBit, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        Assert.NotNull(AgentBranchGuard.MeasureHookCanRun(noExecBit));
-
+        // `bad interpreter` — the CRLF trap this file has warned about since it was written. A mode
+        // check cannot see it; running the thing can.
         var crlf = Path.Combine(dir, "crlf");
         File.WriteAllText(crlf, "#!/bin/sh\r\nexit 0\r\n");
         MakeExecutable(crlf);
         Assert.NotNull(AgentBranchGuard.MeasureHookCanRun(crlf));
 
+        // Executable, well-formed, and still unrunnable — the interpreter is gone.
+        var noInterpreter = Path.Combine(dir, "no-interpreter");
+        File.WriteAllText(noInterpreter, "#!/nonexistent/mainguard-probe-sh\nexit 0\n");
+        MakeExecutable(noInterpreter);
+        Assert.NotNull(AgentBranchGuard.MeasureHookCanRun(noInterpreter));
+
         Assert.NotNull(AgentBranchGuard.MeasureHookCanRun(Path.Combine(dir, "absent")));
+
+        // The closest unprivileged analogue of the `noexec` mount that caused #68: git's predicate is
+        // `access(X_OK)`, and clearing the bit is the other way to make it answer EACCES. Conditional
+        // ONLY because some filesystems a developer may put the VM root on (WSL's DrvFs, exFAT) ignore
+        // chmod entirely and report 0777 back — there the case is not weakly true, it is unstateable.
+        // The four unconditional assertions above are what carry this test everywhere.
+        var noExecBit = Path.Combine(dir, "no-exec-bit");
+        File.WriteAllText(noExecBit, "#!/bin/sh\nexit 0\n");
+        File.SetUnixFileMode(noExecBit, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        if (!File.GetUnixFileMode(noExecBit).HasFlag(UnixFileMode.UserExecute))
+        {
+            Assert.NotNull(AgentBranchGuard.MeasureHookCanRun(noExecBit));
+        }
+    }
+
+    [LinuxOnlyFact]
+    [System.Runtime.Versioning.UnsupportedOSPlatform("windows")]
+    public void TheHarnessItself_PutsAgentRepositoriesWhereHooksCanRun()
+    {
+        // #68 was not a bug in the guard — it was a bug in WHERE this suite built its repositories. The
+        // VM root came from Path.GetTempPath(), and inside the jail that is a Docker tmpfs mounted
+        // `noexec`, so git skipped every hook the suite installed. One test failed and three passed
+        // while measuring nothing. This asserts the harness's own precondition directly, so the next
+        // time it breaks the failure names the harness instead of appearing as a mysterious guard
+        // regression.
+        using var env = new WorktreeEnv();
+        var probe = Path.Combine(env.VmRoot, "harness-probe");
+        File.WriteAllText(probe, "#!/bin/sh\nexit 0\n");
+        MakeExecutable(probe);
+
+        var reason = AgentBranchGuard.MeasureHookCanRun(probe);
+        Assert.True(
+            reason is null,
+            $"the test VM root '{env.VmRoot}' cannot execute scripts ({reason}), so every hook this "
+            + "suite installs would be silently skipped by git. Set MAINGUARD_TEST_VM_ROOT to a "
+            + "directory on a filesystem that permits execution.");
     }
 
     [Fact]
