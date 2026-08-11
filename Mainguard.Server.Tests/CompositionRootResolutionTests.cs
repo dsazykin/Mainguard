@@ -84,8 +84,19 @@ public sealed class CompositionRootResolutionTests
         var provisioner = sp.GetRequiredService<MergeQueueProvisioner>();
 
         Assert.Equal(
-            new[] { "audit", "checkAgentBranch", "log", "publishAgentRef" },
+            new[]
+            {
+                "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
+                "publishAgentRef", "publishRebasedAgentRef", "yieldProtocolFor",
+            },
             provisioner.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
+
+        // The four newest names compose ONE capability, and the set above cannot say whether they compose
+        // it correctly — three of four present is the re-verify-only cascade with extra arguments. This is
+        // the capability, asserted directly: does this daemon's stale cascade REPARENT a branch, or only
+        // re-run its tests against a main it no longer descends from? The second is the defect that let
+        // exactly one agent per repository ever merge.
+        Assert.True(provisioner.ReparentsStaleBranches);
 
         // ...and `audit` must be the DAEMON's sink. A non-null audit log that is not this one is the null
         // default's behaviour with an extra step: the queue's events go somewhere nothing can reach.
