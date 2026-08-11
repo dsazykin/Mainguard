@@ -140,7 +140,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       stash/tag/fetch and the `ORIG_HEAD`/`AUTO_MERGE`/`REBASE_HEAD` pseudo-refs pass, and HEAD moves
       stay legal or rebase would break), allow deletions, and allow no-op rewrites so `git pack-refs`/
       `git gc` still work in a jail that is ALREADY stranded. The daemon needs no exemption: its git runs
-      `-c core.hooksPath=/dev/null` (MG-1). `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
+      `-c core.hooksPath=/dev/null` (MG-1). **`InstallHook` returns ARMED, not written (#68)** — writing
+      the file and setting 0755 establishes only the mode BITS, and git decides a hook exists with
+      `access(path, X_OK)`, which answers EACCES on a `noexec` mount whatever the bits say (git then
+      prints a *hint* and carries on with exit 0). `MeasureHookCanRun` therefore RUNS the hook it just
+      wrote — invoking it with a phase other than `prepared`, which the script's own first line makes a
+      side-effect-free exit 0 — so a `noexec` filesystem *and* a CRLF `bad interpreter` are both caught,
+      neither of which any mode check can see. When it cannot fire, `UnarmedWarning` goes to the
+      `WorktreeManager` warning sink and `InstallHook` returns false: a spawn still succeeds (layer 3
+      reports the drift regardless) but never QUIETLY, because a control that knows it is inert must not
+      look armed. Windows is exempt by measurement — git-for-windows runs hooks through its bundled
+      shell with no exec bit to check. `AgentBranchGuard.Probe` + `AgentBranchAlignment` are the
       backstop — measured `symbolic-ref`/`rev-parse`/`merge-base --is-ancestor`, never a guess, with
       `Unknown` deliberately distinct from "aligned"; `Describe` is the operator report naming the actual
       branch, the expected branch and a recovery that was actually computed. Auto-recovery is
@@ -206,7 +216,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       its interface default THROWS rather than falling back to the branch-deleting removal, and the
       launcher swallows the throw so the worst outcome is residue, never lost commits); `FinishWorktree`
       is the shared tail (quarantine remote, pnpm hook, `GroupShareRecursive`, branch guard, publish) so
-      a create and an adoption cannot drift into differently-configured worktrees; a
+      a create and an adoption cannot drift into differently-configured worktrees — the branch-guard
+      install is deliberately not thrown on but its NOT-ARMED report reaches the same `_warningSink`
+      (#68), so a spawn whose guard rail cannot fire still happens and still says so; a
       REFUSED publish also raises the G-17 `agent_ref_refused` audit event
       (`WorktreeManager.AgentRefRefusedEvent`) alongside the warning, because "an agent tried to rewrite
       history the mirror already published" must leave a durable record and not just a log line, `Prune`,

@@ -1,4 +1,6 @@
 using System;
+using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 
 namespace Mainguard.Agents.Agents;
@@ -128,6 +130,14 @@ public sealed record AgentBranchAlignment(
 ///   the work is proposed as ready, rather than silently producing an empty result.</item>
 /// </list>
 ///
+/// <para><b>Layer 2 must never LOOK armed when it is not.</b> Writing the hook file is not the same fact
+/// as git being willing to run it, and for one release they were treated as the same fact: on a
+/// filesystem mounted <c>noexec</c> the file is present with mode 0755, git skips it with a hint, and
+/// <c>checkout -b</c> succeeds. <see cref="InstallHook"/> therefore returns whether the guard is ARMED —
+/// measured by <see cref="MeasureHookCanRun"/>, which runs the hook — and reports it through the warning
+/// sink when it is not. An inert control that reports success is worse than no control, because it moves
+/// the discovery of the drift from the keystroke to the post-mortem.</para>
+///
 /// <para><b>Why the defect was invisible.</b> The mediator carries only
 /// <c>refs/heads/agent/&lt;id&gt;</c>, so an agent that commits on another branch leaves that ref exactly
 /// where it was. Every downstream consumer reads a ref that is present, readable and stale — there is no
@@ -230,14 +240,32 @@ public static class AgentBranchGuard
     /// <para>Best effort by contract: a jail with no hook is the state every pre-existing agent is already
     /// in, and it is covered by <see cref="Probe"/>. Failing a spawn because a guard rail could not be
     /// written would be strictly worse than the drift it prevents.</para>
+    ///
+    /// <para><b>The return value means ARMED, not written</b> — see <see cref="MeasureHookCanRun"/> for why
+    /// those are different things, and for the measurement that separates them. A caller that wants to know
+    /// whether an agent will actually be stopped must read this, not <c>File.Exists</c>.</para>
     /// </summary>
-    public static bool InstallHook(string agentRepoPath, string agentId, Action<string>? warningSink = null)
+    /// <param name="agentRepoPath">The agent's own repository (the hook goes in its <c>hooks/</c>).</param>
+    /// <param name="agentId">The agent whose branch the hook will protect.</param>
+    /// <param name="warningSink">Receives the not-armed report when the hook cannot fire.</param>
+    /// <param name="armingProbe">
+    /// Overrides <see cref="MeasureHookCanRun"/>. Exists ONLY so a test can drive the not-armed reporting
+    /// path without mounting a <c>noexec</c> filesystem, which is not possible unprivileged. The default is
+    /// the real measurement, and the real measurement's own behaviour is pinned separately against real
+    /// files — so this seam proves the REPORTING, never the detection.
+    /// </param>
+    public static bool InstallHook(
+        string agentRepoPath,
+        string agentId,
+        Action<string>? warningSink = null,
+        Func<string, string?>? armingProbe = null)
     {
+        string hookPath;
         try
         {
             var hooksDir = Path.Combine(agentRepoPath, "hooks");
             Directory.CreateDirectory(hooksDir);
-            var hookPath = Path.Combine(hooksDir, HookName);
+            hookPath = Path.Combine(hooksDir, HookName);
             File.WriteAllText(hookPath, HookScript(agentId));
 
             if (!OperatingSystem.IsWindows())
@@ -252,8 +280,6 @@ public static class AgentBranchGuard
                     | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
                     | UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
             }
-
-            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException
                                        or ArgumentException)
@@ -264,7 +290,130 @@ public static class AgentBranchGuard
                 + "drift is still reported at verification time.");
             return false;
         }
+
+        // Written is not armed. Ask the artefact itself.
+        var detail = (armingProbe ?? MeasureHookCanRun)(hookPath);
+        if (detail is null)
+        {
+            return true;
+        }
+
+        warningSink?.Invoke(UnarmedWarning(agentId, hookPath, detail));
+        return false;
     }
+
+    /// <summary>
+    /// The operator-facing report for a hook that was written and CANNOT FIRE. Public so the one place
+    /// that produces it and the one place that asserts on it are the same string.
+    /// </summary>
+    public static string UnarmedWarning(string agentId, string hookPath, string detail)
+        => $"Mainguard wrote the branch guard hook for agent '{agentId}' to '{hookPath}', but git CANNOT "
+           + $"RUN it there: {detail}. The guard is NOT ARMED — an agent that runs `git checkout -b …` "
+           + "will not be stopped, and its work will strand. The usual cause is an agent repository on a "
+           + "filesystem mounted `noexec` (git then reports the hook as \"not set as executable\" and "
+           + "skips it, whatever the mode bits say); move the VM root to a filesystem that permits "
+           + "execution. That drift is still REPORTED at verification time by the branch probe, so it "
+           + "will not pass unnoticed — but it is caught hours later instead of at the keystroke.";
+
+    /// <summary>
+    /// Establishes whether git will actually RUN the hook at <paramref name="hookPath"/>, by running it.
+    /// Returns null when it will, or the reason it will not.
+    ///
+    /// <para><b>Why this exists — measured, and it is the defect this file shipped with.</b> Writing the
+    /// file and setting <c>u+x,g+x,o+x</c> establishes only that the MODE BITS are right. git decides
+    /// whether a hook exists with <c>access(path, X_OK)</c>, and on a filesystem mounted <c>noexec</c>
+    /// that call returns <c>EACCES</c> no matter what the bits say. git then prints a HINT — "the hook was
+    /// ignored because it's not set as executable" — and carries on with exit 0. The hook is present, its
+    /// mode is 0755, and nothing runs it. Measured inside this product's own jail: the container's
+    /// <c>/tmp</c> is a Docker tmpfs, and Docker's default tmpfs flags are <c>nosuid,nodev,noexec</c>, so
+    /// a repository created there gets a guard that looks installed and refuses nothing.</para>
+    ///
+    /// <para><b>Why it runs the hook instead of checking bits or P/Invoking <c>access</c>.</b> The bits are
+    /// what already lied. An actual execution is the only thing that answers the question git asks, and it
+    /// catches the second failure this file already worried about for free: a CRLF script is <c>bad
+    /// interpreter</c> inside the jail, which no mode check can see. The hook's own first line is
+    /// <c>[ "$1" = "prepared" ] || exit 0</c>, so invoking it with any other phase is a side-effect-free
+    /// exit 0 that reads nothing from stdin — the probe is the real artefact on the real filesystem, not a
+    /// stand-in for it.</para>
+    ///
+    /// <para><b>What it does NOT establish.</b> It runs as the DAEMON's uid; the agent meets the hook as a
+    /// different uid through the shared group (MG-17). Group-readability/executability of the bits is a
+    /// separate property, asserted separately. What varies in practice — and what silently disarmed the
+    /// guard — is the mount, which is uid-independent, and that is what this answers.</para>
+    ///
+    /// <para><b>Windows is exempt by measurement, not by omission.</b> git-for-windows has no executable
+    /// bit to check and runs hooks through its bundled shell, so a <c>#!/bin/sh</c> hook fires there while
+    /// being no kind of Windows executable — starting it as a process would fail and the failure would mean
+    /// nothing. The jail is Linux; this is the developer-workstation path.</para>
+    /// </summary>
+    public static string? MeasureHookCanRun(string hookPath)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return null;
+        }
+
+        if (!File.Exists(hookPath))
+        {
+            return "the hook is not on disk";
+        }
+
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = hookPath,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = Path.GetDirectoryName(hookPath)!,
+            };
+
+            // Any phase except `prepared`, so the script's own first line exits 0 before it decides
+            // anything. `committed` is the phase git itself uses for the after-the-fact report.
+            psi.ArgumentList.Add("committed");
+
+            using var process = Process.Start(psi);
+            if (process is null)
+            {
+                return "the hook could not be started";
+            }
+
+            process.StandardInput.Close();
+            var stderr = process.StandardError.ReadToEnd();
+            if (!process.WaitForExit(ProbeTimeoutMs))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or NotSupportedException
+                                               or Win32Exception)
+                {
+                    // Nothing to add: the timeout below is already the finding.
+                }
+
+                return $"the hook did not exit within {ProbeTimeoutMs} ms";
+            }
+
+            return process.ExitCode == 0
+                ? null
+                : $"running it exited {process.ExitCode}"
+                  + (stderr.Trim().Length > 0 ? $" ({stderr.Trim()})" : string.Empty);
+        }
+        catch (Exception ex) when (ex is Win32Exception or IOException or UnauthorizedAccessException
+                                       or InvalidOperationException or NotSupportedException)
+        {
+            // A `noexec` mount lands HERE: exec fails with EACCES, which .NET surfaces as a
+            // Win32Exception ("Permission denied") from Process.Start.
+            return ex.Message;
+        }
+    }
+
+    /// <summary>How long the arming probe waits for a script whose whole job is to exit immediately.</summary>
+    private const int ProbeTimeoutMs = 5000;
 
     /// <summary>
     /// Establishes which branch the agent's worktree is actually committing on.

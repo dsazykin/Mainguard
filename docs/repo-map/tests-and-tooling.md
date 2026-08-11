@@ -888,6 +888,18 @@
   six** tokens to match, not one (a mistyped token used to stop detecting anything forever while the
   control still reported PASS on its neighbours). The RID restore rewrites `packages.lock.json`, so the
   script snapshots and puts them back.
+- **`.github/workflows/e2e-verification.yml`** — the **`Full in-jail verification (slow, opt-in)`** job:
+  the only place `MAINGUARD_VERIFY_E2E=1` is set, so it is the only thing that runs the two
+  `[RequiresDockerAndOptInFact]` legs (`VerifyInJailDockerTests` + `PythonToolchainDockerTests`). It
+  builds the version-labelled images, reclaims runner disk **before** `Setup .NET` (that step installs
+  into `/usr/share/dotnet`, which the reclaim deletes — the other order was measured to break the job),
+  and asserts from the `.trx` that **2 tests actually executed**: a run in which both skipped exits 0,
+  which is exactly how this gate reported success while measuring nothing for its whole existence.
+  Runs on **every PR, with no `paths:` filter** (#68). The filter it shipped with was unsound rather
+  than merely narrow: the leg runs `.mainguard/verify` = `dotnet test Mainguard.slnx`, i.e. the whole
+  suite inside the jail, so its blast radius is the repository — and the first defect it caught
+  (`AgentBranchGuard`, #68) was in a file the filter did not name, so the gate could not have re-run on
+  its own fix. Measured cost is ~11 min, comparable to `build-and-test`.
 - **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
   `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
   `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the
@@ -1466,8 +1478,14 @@
   VALUES, not the shape, because the old code passed every shape test while returning 0. It also pins
   the metering predicate on a real daemon (an agent `AgentGatewayCredentials.Issue`d a token is
   metered; one without is not, and carries no spend figure at all). **`Agents/`** hosts the TI-P2-06 integration suite on
-  `DualRepoFixture`: `AgentTestGit.cs` (test-only git CLI helper + temp-VM-root/cleanup — not a
-  production runner), `SessionKeyCacheScopeTests.cs` (MG-6 — the memory-only credential cache is
+  `DualRepoFixture`: `AgentTestGit.cs` (test-only git CLI helper + VM-root/cleanup — not a
+  production runner. The VM root is **measured, not assumed**: `MAINGUARD_TEST_VM_ROOT` → temp → the
+  test assembly's own directory, taking the first whose scripts actually EXECUTE, via the product's own
+  `AgentBranchGuard.MeasureHookCanRun` so harness and code-under-test cannot disagree about
+  "executable". It was `Path.GetTempPath()` unconditionally, which is #68: inside the jail `/tmp` is a
+  Docker tmpfs, default flags `nosuid,nodev,noexec`, so git skipped every hook this suite installed —
+  one test failed and three passed vacuously. No-op on a host, where temp wins),
+  `SessionKeyCacheScopeTests.cs` (MG-6 — the memory-only credential cache is
   scoped to **(repo, kind)**, never the bare agent kind: a model key / harvested CLI OAuth files /
   llm_env_* entries cached for one repo are invisible to another, each repo keeps its own key with no
   last-writer-wins clobber, a blank repo handle never forms a shared bucket, and a miss returns null
@@ -1483,7 +1501,16 @@
   residue and work on `agent/<id>` still succeeds; a 5-case theory pins that stash/tag/pack-refs/gc/
   detach are untouched; `TheHookSurvivesAnUpgradeOverAJailThatIsALREADYStranded` covers the population
   this ships to, where `pack-refs` re-states a pre-existing loose foreign branch as a create; and
-  `TheHookDoesNotObstructTheDaemonsOwnGit` pins that spawn/teardown are unaffected),
+  `TheHookDoesNotObstructTheDaemonsOwnGit` pins that spawn/teardown are unaffected. **Arming (#68):**
+  every layer-2 test now opens with `AssertGuardIsArmed` — git can RUN the hook — instead of
+  `File.Exists`, which is the assertion that passed throughout the period the guard was inert;
+  `TheHarnessItself_PutsAgentRepositoriesWhereHooksCanRun` pins the harness precondition so the next
+  regression names the harness rather than looking like a guard defect;
+  `TheArmingMeasurement_AnswersNo_ForAHookGitWouldSkip` pins the real measurement against real files
+  (CRLF `bad interpreter`, missing interpreter, absent file, and — where the filesystem honours chmod —
+  a cleared exec bit); and `AGuardThatCannotFire_IsReported_AndDoesNotClaimToBeInstalled` +
+  `AnArmedGuard_IsReportedAsInstalled_AndWarnsAboutNothing` pin both directions of the not-armed
+  report),
   `AgentWorktreeManagerTests.cs` (add/remove/prune round-trip, duplicate-id + dirty-remove typed
   failures, the **resume/adoption** set — `AdoptAgentWorktree` starts a new worktree on the EXISTING
   `agent/<id>` with the dead jail's commits and file contents intact (a `worktree add -b` would fail every

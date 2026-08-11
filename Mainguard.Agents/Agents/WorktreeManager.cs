@@ -460,6 +460,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // hook keeps its own narrower mode instead of being widened back to group-writable. It is
         // ergonomics, not a boundary — see AgentBranchGuard — and it is best effort: a spawn must
         // never fail because a guard rail could not be written.
+        //
+        // The return value is ARMED, not written, and it is deliberately not thrown on: a spawn whose
+        // guard rail could not be armed still has to happen (layer 3 reports the drift either way), but
+        // it must not happen QUIETLY. AgentBranchGuard warns through this same sink with the reason,
+        // which is the whole difference between a control that is inert and a control that is inert and
+        // says so — the guard was measured to be silently inert on a `noexec` agent repository.
         AgentBranchGuard.InstallHook(agentRepoPath, agentId, _warningSink);
 
         // Seed the merge queue's input contract: refs/heads/agent/<id> exists in the MIRROR from the
