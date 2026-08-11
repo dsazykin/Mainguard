@@ -195,6 +195,38 @@ public class CoordinatorPlanGateRenderHarness
     }
 
     /// <summary>
+    /// The captures the mount has to be judged on: the gate sitting on the <b>real</b> coordinator surface,
+    /// above the real terminal, in all five themes. Daylight Loom is a LIGHT theme — the warning border and
+    /// the Approve accent have to read there too, which is why nothing on the card sets a raw colour.
+    /// </summary>
+    [AvaloniaFact]
+    public void Capture_ThePlanGateOnTheShippedSurface_AllThemes()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        foreach (var theme in ThemeKeys)
+        {
+            ThemeManager.Apply(theme, persist: false);
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            using var vm = new ControlCenterViewModel(mock);
+            vm.FocusCoordinator();
+            Assert.True(vm.Coordinator.HasGateContent);
+
+            var view = new ControlCenterView { DataContext = vm };
+            var win = new Window { Width = 1420, Height = 920, Content = view };
+            win.Show();
+            Settle();
+
+            Assert.Single(view.GetVisualDescendants().OfType<PlanGateView>());
+            win.CaptureRenderedFrame()?.Save(
+                Path.Combine(ArtifactsDir(), $"plan_gate_on_control_center_{theme}.png"));
+
+            win.Content = null;
+            HarnessHygiene.Teardown(win);
+        }
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+    }
+
+    /// <summary>
     /// The negative control for the mount test: with nothing waiting, the gate must take <b>no</b> vertical
     /// space on the coordinator surface. A region that is always there is a region the terminal has
     /// permanently lost.
