@@ -52,6 +52,44 @@ public interface IAgentControlChannel
     Task<bool> WaitForAsync(string marker, TimeSpan timeout, CancellationToken ct = default);
 }
 
+/// <summary>
+/// The control channel for a daemon that has <b>no cooperative transport bound</b> — which is every
+/// daemon shipped so far. It answers "the agent did not acknowledge" <i>immediately</i> rather than after
+/// the cooperative window, and that difference is the whole reason it is a named type instead of a
+/// missing one.
+///
+/// <para><b>Why this is honest rather than a stub.</b> The cooperative half of the yield needs a wrapper
+/// INSIDE the jail to write <see cref="YieldProtocol.UpdateReady"/> back; nothing in the shipped adapter
+/// wrapper does. So the true answer to "did the agent reach a safe point on request" is not "yes" and not
+/// "we waited ten seconds and heard nothing" — it is "there is no channel to ask on". Saying so at once
+/// takes the <see cref="YieldOutcome.ByPause"/> path immediately: the jail is frozen through the freezer
+/// cgroup, which needs no cooperation from the agent, and the worktree is quiescent by force instead of by
+/// agreement. The mutation-safety property (invariant 2) is identical on both paths; only the courtesy
+/// differs.</para>
+///
+/// <para><b>What the alternative would have cost.</b> Waiting the full ten seconds per agent for a marker
+/// nobody will ever send turns one human merge into a ten-second stall per co-tenant branch before any of
+/// them is even rebased — a cascade over five agents would idle for the better part of a minute waiting on
+/// a transport that does not exist. This matches
+/// <c>SandboxKillTarget.RequestYieldAsync</c>, which already answers false without a round trip for the
+/// same reason.</para>
+///
+/// <para>Replace this with the real named-pipe channel when the wrapper grows one; nothing else in the
+/// protocol changes, because the pause fallback stays the backstop for an agent that does not answer.</para>
+/// </summary>
+public sealed class UnboundAgentControlChannel : IAgentControlChannel
+{
+    /// <summary>The single instance — it holds no state and names a fact about the daemon, not an agent.</summary>
+    public static UnboundAgentControlChannel Instance { get; } = new();
+
+    /// <summary>Nothing is listening; the marker is dropped rather than queued for a reader that will never exist.</summary>
+    public Task SendAsync(string marker, CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>Always false, and always at once — see the type remarks for why the timeout is not waited out.</summary>
+    public Task<bool> WaitForAsync(string marker, TimeSpan timeout, CancellationToken ct = default) =>
+        Task.FromResult(false);
+}
+
 /// <summary>The cooperative-yield request seam. The single gateway to a mutable worktree.</summary>
 public interface IYieldProtocol
 {
