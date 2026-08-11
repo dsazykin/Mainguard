@@ -332,7 +332,10 @@ public sealed class WorkerPlanGate : IMergeGate
     {
         lock (_gate)
         {
-            if (!_held.ContainsKey(workerAgentId))
+            // Resolved unique-or-nothing, like every other bare-id entry point here: an id two repos both
+            // hold is ambiguous, and an ambiguous id must not license the daemon to start a test run on
+            // its own initiative against whichever repo the dictionary happened to enumerate first.
+            if (FindLocked(workerAgentId) is null)
             {
                 reason = $"{workerAgentId} is not a plan-gated worker — automatic verification governs "
                          + "coordinator-delegated workers only.";
