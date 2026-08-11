@@ -88,8 +88,8 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, string, AgentBranchAlignment>? _checkAgentBranch;
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
-    private readonly IYieldProtocol? _yield;
-    private readonly Func<string, string, AgentWorktreeLocation?>? _locateAgentWorktree;
+    private readonly Func<string, IYieldProtocol>? _yieldFor;
+    private readonly Func<string, string, string?>? _locateAgentWorktree;
     private readonly IAgentSupervisor _agentStates;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
@@ -155,10 +155,14 @@ public sealed class MergeQueueProvisioner
     /// <para>Null leaves the cascade at re-verify-only. See <see cref="ReparentsStaleBranches"/>.</para>
     /// </param>
     /// <param name="locateAgentWorktree">
-    /// (repoHash, agentId) → where this agent's worktree lives, which mirror it rebases from, and onto
-    /// which branch — or <b>null when the agent no longer has one</b>. That nullability is the contract:
-    /// a stale entry whose agent was stopped has nothing to rebase, and the cascade has to be able to tell
-    /// that apart from a rebase that failed.
+    /// (repoHash, agentId) → the directory this agent's worktree lives in, or <b>null/empty when it has
+    /// none</b>. That nullability is the contract, not a convenience: a stale entry whose agent was
+    /// stopped has nothing to rebase, and the cascade has to be able to tell that apart from a rebase
+    /// that failed.
+    /// <para>Only the worktree comes from here. The mirror it rebases FROM and the branch it rebases ONTO
+    /// are the ones this provisioner already resolved for the queue's own <c>main@sha</c>, so the rebase
+    /// target and the verification baseline cannot drift apart — which they silently would if two callers
+    /// each answered "what is main" for the same repo.</para>
     /// </param>
     /// <param name="agentStates">
     /// Where the run-state of an agent the cascade touched is reflected (<c>Rebasing</c>, and — the one
@@ -181,8 +185,8 @@ public sealed class MergeQueueProvisioner
         Func<string, string, bool>? publishAgentRef = null,
         Func<string, TaskPlan?>? resolveApprovedPlan = null,
         Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
-        IYieldProtocol? yieldProtocol = null,
-        Func<string, string, AgentWorktreeLocation?>? locateAgentWorktree = null,
+        Func<string, IYieldProtocol>? yieldProtocolFor = null,
+        Func<string, string, string?>? locateAgentWorktree = null,
         IAgentSupervisor? agentStates = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
@@ -201,7 +205,7 @@ public sealed class MergeQueueProvisioner
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
         _checkAgentBranch = checkAgentBranch;
-        _yield = yieldProtocol;
+        _yieldFor = yieldProtocolFor;
         _locateAgentWorktree = locateAgentWorktree;
         _agentStates = agentStates ?? NullAgentSupervisor.Instance;
 
@@ -213,7 +217,7 @@ public sealed class MergeQueueProvisioner
         if (publishAgentRef is not null) { wired.Add(nameof(publishAgentRef)); }
         if (resolveApprovedPlan is not null) { wired.Add(nameof(resolveApprovedPlan)); }
         if (checkAgentBranch is not null) { wired.Add(nameof(checkAgentBranch)); }
-        if (yieldProtocol is not null) { wired.Add(nameof(yieldProtocol)); }
+        if (yieldProtocolFor is not null) { wired.Add(nameof(yieldProtocolFor)); }
         if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
         if (agentStates is not null) { wired.Add(nameof(agentStates)); }
         WiredOptionalControls = wired;
@@ -228,7 +232,7 @@ public sealed class MergeQueueProvisioner
     /// the re-verify-only cascade — which is not a degraded fix, it is the original defect. One name for
     /// the composed capability means the composition root can assert the capability instead of the parts.</para>
     /// </summary>
-    public bool ReparentsStaleBranches => _yield is not null && _locateAgentWorktree is not null;
+    public bool ReparentsStaleBranches => _yieldFor is not null && _locateAgentWorktree is not null;
 
     /// <summary>
     /// Every optional constructor argument this provisioner was <b>actually given</b>, by parameter name.
@@ -405,17 +409,16 @@ public sealed class MergeQueueProvisioner
     /// </summary>
     private IKeepAliveRebaser? BuildRebaser(string repoHandle)
     {
-        if (_yield is null || _locateAgentWorktree is null)
+        if (_yieldFor is null || _locateAgentWorktree is null)
         {
             return null;
         }
 
-        var locate = _locateAgentWorktree;
         return new KeepAliveRebaser(
-            yield: _yield,
-            // RequeueStaleAsync establishes the location BEFORE it calls a cycle, so this only ever runs
+            yield: _yieldFor(repoHandle),
+            // RequeueStaleAsync establishes the worktree BEFORE it calls a cycle, so this only ever runs
             // for an agent already known to have one. The throw is the contract restated, not a path.
-            locate: agentId => locate(repoHandle, agentId)
+            locate: agentId => LocateAgentWorktree(repoHandle, agentId)
                 ?? throw new InvalidOperationException(
                     $"Agent '{agentId}' in repo '{repoHandle}' has no worktree to rebase."),
             // The run state reaches clients on the agent-event stream, which is what makes a Conflict
@@ -479,19 +482,7 @@ public sealed class MergeQueueProvisioner
             return;
         }
 
-        AgentWorktreeLocation? location;
-        try
-        {
-            location = _locateAgentWorktree!(repoHandle, agentId);
-        }
-        catch (Exception ex)
-        {
-            location = null;
-            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} worktree lookup FAILED ({ex.Message})");
-        }
-
-        if (location is null || string.IsNullOrEmpty(location.WorktreePath)
-            || !System.IO.Directory.Exists(location.WorktreePath))
+        if (LocateAgentWorktree(repoHandle, agentId) is null)
         {
             Block(repoHandle, agentId, queue,
                 "this branch needs rebasing onto the new main and its worktree is gone — resume the agent",
@@ -537,6 +528,37 @@ public sealed class MergeQueueProvisioner
             + $"(wip={cycle.WipCommitCreated}) — re-verifying");
 
         await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Where this agent's keep-alive rebase runs, or null when it has no worktree on disk.
+    ///
+    /// <para>The mirror and the main branch are resolved HERE rather than taken from the caller, and from
+    /// the same two calls <see cref="EnsureQueue"/> uses to key the queue's <c>main@sha</c>. That is what
+    /// makes "the main this branch is rebased onto" and "the main this branch is verified against"
+    /// provably the same ref: two independent answers to that question would disagree exactly once, at
+    /// which point a branch would be rebased onto one main and declared fresh against another.</para>
+    /// </summary>
+    private AgentWorktreeLocation? LocateAgentWorktree(string repoHandle, string agentId)
+    {
+        string? worktree;
+        try
+        {
+            worktree = _locateAgentWorktree?.Invoke(repoHandle, agentId);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} worktree lookup FAILED ({ex.Message})");
+            return null;
+        }
+
+        if (string.IsNullOrEmpty(worktree) || !System.IO.Directory.Exists(worktree))
+        {
+            return null;
+        }
+
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        return new AgentWorktreeLocation(worktree, barePath, ResolveDefaultBranch(barePath));
     }
 
     // The one terminus for every way a re-entry can fail to reparent: Working, with the reason a human
