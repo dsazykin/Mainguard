@@ -10,21 +10,33 @@ name: E2E verification (in-jail, opt-in)
 # verification path — the thing that decides whether an agent's work may enter the merge queue —
 # was measured by nothing on any pull request.
 #
-# WHY THEY ARE STILL NOT IN THE PR GATE
-# ------------------------------------
-# Because the cost was measured rather than assumed, and it is not small:
+# WHAT THEY ACTUALLY COST — MEASURED ON A HOSTED RUNNER, NOT INFERRED
+# -------------------------------------------------------------------
+# The first real run of this workflow (PR #342) settled it, and the answer was NOT what either the
+# ticket or the tests' own docstrings predicted:
 #
-#   * VerifyInJail runs this repository's real `.mainguard/verify`, which is a full RELEASE
-#     restore + build + test of Mainguard.slnx INSIDE a jail, over a default-deny egress proxy.
-#     Its own budget is 90 MINUTES and its restore is a ~1.7 GB download (see the class docs).
-#     For scale: the ordinary `build-and-test` job is that same solution build WITHOUT the
-#     container, the proxy, or a cold package cache.
-#   * PythonToolchain downloads a ~350 MB pinned interpreter and installs pytest from PyPI through
-#     the same proxy. Budget: 30 minutes.
+#   * VerifyInJail        7 m 35 s   — a full Release restore + build + test of Mainguard.slnx
+#                                      inside the jail, cold, populating a 2.2 GB package cache.
+#   * PythonToolchain           9 s
+#   * whole job (incl. image builds + solution build)   ~11 minutes.
 #
-# Adding that to every PR would multiply the merge-gate wall time several times over for a signal
-# that changes only when the verification path itself changes. So the opt-in gate is KEPT — but as
-# a decision that is renewed, not an inheritance:
+# The class docstrings say "tens of minutes" with 90- and 30-minute budgets. Those budgets are
+# ceilings, and reasoning from them — as the first draft of this file did — overestimated the cost
+# by roughly an order of magnitude. ~11 minutes is comparable to the ordinary `build-and-test` job.
+#
+# So the honest position is that COST is no longer much of an argument for keeping these out of the
+# PR gate. What keeps them out today is that the gate is RED: see below. Once that is fixed, moving
+# this job to every PR is a small, well-founded change — widen the trigger and delete this note.
+#
+# THE GATE IS CURRENTLY RED, AND THAT IS THE FINDING
+# --------------------------------------------------
+# On its first run, `.mainguard/verify` came back exit 1 from inside the jail because ONE test fails
+# there: `AgentBranchGuardTests.SpawnInstallsTheHook_AndItRefusesABranchTheAgentTriesToCreate`
+# (509 passed / 1 failed / 120 skipped in Mainguard.Server.Tests; Mainguard.Tests fully green).
+# Nothing in PR #342 touches that test — it has simply been broken in-jail with nothing running it,
+# which is precisely the breakage ticket #65 predicted an unmeasured gate would be hiding.
+#
+# So the opt-in gate is KEPT for now — but as a decision that is renewed, not an inheritance:
 #
 #   1. schedule          — it runs nightly, so a break is found within a day rather than never.
 #   2. workflow_dispatch — a human can demand it at any time (e.g. before cutting a release).

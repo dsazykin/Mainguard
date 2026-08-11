@@ -899,8 +899,13 @@
   Docker tests (`VerifyInJailDockerTests`, `PythonToolchainDockerTests`) were gated behind that
   variable and NO job set it, so they were the permanent "2 skipped" in every sandbox-suite run and
   the in-jail verification path — the gate on entering the merge queue — was measured by nothing.
-  The gate is KEPT (measured: a 90-minute full Release solution build in a jail plus a 30-minute
-  toolchain install), but it is now a renewed decision: nightly `schedule`, `workflow_dispatch`, and
+  Measured on the first real run: **~11 minutes for the whole job** (VerifyInJail 7 m 35 s cold,
+  PythonToolchain 9 s) — an order of magnitude under the 90-/30-minute budgets in the tests' own
+  docstrings, so cost is a weak argument for excluding them. What keeps them out of the PR gate for
+  now is that the gate is **red**: in-jail `.mainguard/verify` exits 1 because
+  `AgentBranchGuardTests.SpawnInstallsTheHook_AndItRefusesABranchTheAgentTriesToCreate` fails there —
+  exactly the breakage an unmeasured gate was hiding. The gate is KEPT but is now a renewed
+  decision: nightly `schedule`, `workflow_dispatch`, and
   `pull_request` on the verification path — which includes the workflow file itself, so the PR that
   changes the gate exercises it. Matching is against filter clauses only, never the file's text: the
   first cut used a plain `grep` and the workflow's own header comment satisfied it.
