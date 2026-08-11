@@ -47,7 +47,22 @@ public sealed class DaemonBackedOrchestrator :
     /// this same name, so the two legs of the RT-D1 conversation must agree on it.</summary>
     private const string MainBranchName = "main";
 
-    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
+    /// <summary>Delay between a pump's stream ending/faulting and its re-subscribe.</summary>
+    /// <remarks>Settable so a reconnect test observes a second subscribe in milliseconds rather than
+    /// seconds. It changes the CADENCE only, never whether the re-subscribe happens.</remarks>
+    internal static TimeSpan ReconnectDelay { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Test seam: the agent-event stream <see cref="AgentPumpAsync"/> subscribes to. Never set in
+    /// production, where it is <c>DaemonClient.StreamAgentEventsAsync</c>.
+    ///
+    /// <para>It exists because the property under test is <b>re-subscription</b>: that the pump opens
+    /// the stream AGAIN after the previous subscription ended. That is unobservable through the real
+    /// client — its own transport loop only ever returns on a terminal
+    /// <c>PermissionDenied</c> or on cancellation, which is exactly the case the missing
+    /// <see cref="ReconnectLoopAsync"/> made permanent.</para>
+    /// </summary>
+    internal Func<CancellationToken, IAsyncEnumerable<Proto.AgentEvent>>? AgentEventStreamOverride { get; set; }
 
     /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
@@ -353,18 +368,36 @@ public sealed class DaemonBackedOrchestrator :
 
     // ---- pumps -----------------------------------------------------------
 
+    /// <summary>
+    /// The agent-event pump. Reconnects like every other pump — it did not, and that was the single
+    /// most damaging version of the bug in this class.
+    ///
+    /// <para><b>Why it mattered.</b> This is the stream every other agent surface is derived from: the
+    /// rail, the coordinator card, the spawn watchdogs, the egress-block prompt. It used to run one
+    /// bare <c>await foreach</c> inside <c>catch (Exception) { }</c>, so ANY fault ended the task for
+    /// good — and <see cref="Start"/> guards on <c>_agentPump is not null</c>, so nothing could ever
+    /// restart it for the lifetime of the process. Worse, the fault did not have to come from the
+    /// daemon: <see cref="ApplyAgentEvent"/> raises <see cref="EventReceived"/>, <see cref="Changed"/>
+    /// and <see cref="EgressBlocked"/> synchronously on this thread, so one throwing UI subscriber
+    /// killed the stream. Nothing reported it either — <c>DaemonClient.State</c> stays
+    /// <c>Connected</c> because the connection is fine, so there is no banner. The visible symptom is
+    /// an agent list frozen at its last good snapshot, forever, with the app looking healthy.</para>
+    /// </summary>
     private async Task AgentPumpAsync(CancellationToken ct)
     {
-        try
+        var stream = AgentEventStreamOverride ?? (token => _client.StreamAgentEventsAsync(token));
+        await ReconnectLoopAsync(async token =>
         {
-            await foreach (var e in _client.StreamAgentEventsAsync(ct).ConfigureAwait(false))
+            await foreach (var e in stream(token).ConfigureAwait(false))
             {
                 ApplyAgentEvent(e);
             }
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception) { }
+        }, ct).ConfigureAwait(false);
     }
+
+    /// <summary>Runs the agent-event pump against <paramref name="ct"/> for a test, so the reconnect
+    /// property is asserted without <see cref="Start"/>'s once-per-process guard or the five other pumps.</summary>
+    internal Task RunAgentPumpForTestAsync(CancellationToken ct) => AgentPumpAsync(ct);
 
     private async Task PlanPumpAsync(CancellationToken ct)
     {
@@ -579,7 +612,8 @@ public sealed class DaemonBackedOrchestrator :
                 if (IsTerminal(newState) && reason.Length > 0
                     && Mainguard.Agents.Agents.Sandbox.EgressBlockDetector.TryDetectBlockedHost(reason) is { Length: > 0 } blockedHost)
                 {
-                    EgressBlocked?.Invoke(new EgressBlockInfo(e.AgentId, agentKind ?? e.AgentId, blockedHost));
+                    RaiseIsolated(() => EgressBlocked?.Invoke(
+                        new EgressBlockInfo(e.AgentId, agentKind ?? e.AgentId, blockedHost)));
                 }
 
                 break;
@@ -589,9 +623,34 @@ public sealed class DaemonBackedOrchestrator :
                 break;
         }
 
-        EventReceived?.Invoke(new AgentEvent(
-            Interlocked.Increment(ref _seq), e.EventCase.ToString(), e.AgentId, string.Empty, DateTimeOffset.UtcNow));
-        Changed?.Invoke();
+        RaiseIsolated(() => EventReceived?.Invoke(new AgentEvent(
+            Interlocked.Increment(ref _seq), e.EventCase.ToString(), e.AgentId, string.Empty, DateTimeOffset.UtcNow)));
+        RaiseIsolated(() => Changed?.Invoke());
+    }
+
+    /// <summary>
+    /// Raises one subscriber-facing event without letting a bad subscriber take anything else down.
+    ///
+    /// <para>The projection appliers run ON the pump thread and raise <see cref="EventReceived"/>,
+    /// <see cref="Changed"/> and <see cref="EgressBlocked"/> synchronously, so an exception out of any
+    /// handler used to propagate all the way to the pump. Two things went wrong at once: every later
+    /// raise in the same call was skipped (a throwing <see cref="EventReceived"/> subscriber meant
+    /// <see cref="Changed"/> never fired, so the rail did not redraw even though the projection had
+    /// already been updated under the lock), and the exception ended the stream. Reconnecting alone
+    /// would not have fixed the second half — a handler that throws on every snapshot would simply
+    /// re-throw on the re-subscribe and spin. The projection is authoritative and is already committed
+    /// by the time we get here, so a handler fault is contained to that handler.</para>
+    /// </summary>
+    private static void RaiseIsolated(Action raise)
+    {
+        try
+        {
+            raise();
+        }
+        catch (Exception)
+        {
+            // One subscriber's fault must never stop the stream that feeds every other surface.
+        }
     }
 
     /// <summary>

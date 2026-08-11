@@ -347,13 +347,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         for (int i = Agents.Count - 1; i >= 0; i--)
             if (snapshot.All(a => a.AgentId != Agents[i].AgentId))
                 Agents.RemoveAt(i);
-        foreach (var info in snapshot.OrderByDescending(a => a.SpawnedAt)) // LIFO (P2-13)
+
+        // Reconcile IN the projection's order, rank by rank (LIFO, P2-13). Existing rows are moved
+        // rather than replaced, so a row's identity — and therefore the rail's selection — survives.
+        //
+        // This used to be a foreach that did `Agents.Insert(0, …)` for every new row, which is only
+        // correct when rows arrive ONE at a time: fed a multi-agent batch it laid them down in reverse,
+        // so the rail rendered oldest-first — the exact opposite of the LIFO it documents. That is not
+        // a rare path. It is every bulk snapshot: opening the surface with agents already running, and
+        // every re-subscribe after the agent stream drops.
+        var ordered = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection.LifoOrder(snapshot);
+        for (var rank = 0; rank < ordered.Count; rank++)
         {
-            var existing = Agents.FirstOrDefault(r => r.AgentId == info.AgentId);
-            if (existing is null) Agents.Insert(0, new AgentRowViewModel(info));
-            else existing.Update(info);
+            var info = ordered[rank];
+            var at = IndexOfAgent(info.AgentId);
+            if (at < 0)
+            {
+                Agents.Insert(rank, new AgentRowViewModel(info));
+            }
+            else
+            {
+                Agents[at].Update(info);
+                if (at != rank) Agents.Move(at, rank);
+            }
         }
+
         RefreshAttention();
+    }
+
+    private int IndexOfAgent(string agentId)
+    {
+        for (var i = 0; i < Agents.Count; i++)
+            if (Agents[i].AgentId == agentId)
+                return i;
+        return -1;
     }
 
     private void RefreshAttention()
@@ -418,10 +445,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private void RefreshCoordinatorCli()
     {
         var host = _agents as Services.ICliAgentHost;
-        var coordinators = _agents.ListAgents()
-            .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)
-            .OrderByDescending(a => a.SpawnedAt)
-            .ToList();
+        var coordinators = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection.LifoOrder(
+            _agents.ListAgents().Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator));
 
         var live = coordinators.FirstOrDefault(a => !IsTerminalState(a.State));
         var startedId = host?.CoordinatorAgentId is { Length: > 0 } id ? id : null;
@@ -842,9 +867,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// teardown and there is no id to end.</summary>
     private async Task StopCoordinatorCoreAsync()
     {
-        var coordinatorId = _agents.ListAgents()
-            .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)
-            .OrderByDescending(a => a.SpawnedAt)
+        var coordinatorId = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection
+            .LifoOrder(_agents.ListAgents()
+                .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator))
             .FirstOrDefault(a => !IsTerminalState(a.State))?.AgentId
             ?? (_agents as Services.ICliAgentHost)?.CoordinatorAgentId;
         if (coordinatorId is not { Length: > 0 })
