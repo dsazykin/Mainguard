@@ -27,33 +27,176 @@ namespace Mainguard.Tests;
 /// <see cref="CoordinatorPanelViewModel.Refresh"/> keep the very same
 /// <see cref="PlanCardViewModel"/> instance mounted rather than replacing it with a fresh, enabled one.</item>
 /// </list>
+///
+/// <para><b>And what each button actually sends.</b> This suite used to assert only that the buttons came
+/// back, which measured almost nothing: swapping <c>ApproveAsync</c> to <c>DecideAsync(approve: false)</c>
+/// and <c>RejectAsync</c> to <c>DecideAsync(approve: true)</c>, and dropping <c>FeedbackText</c> from the
+/// rejection entirely, left all six tests <b>green</b>. The fake counted its decisions into a
+/// <c>DecisionCalls</c> property nothing ever read, and three tests rested on
+/// <c>Assert.False(card.IsDeciding)</c> — which is the field's default value and therefore also passes on
+/// a card that never ran a decision at all. So every decision is now recorded with its
+/// <i>(plan id, approve flag, feedback)</i> and asserted, and the latch is asserted as a
+/// <b>transition</b> — true while the daemon call is in flight, false after — because only the transition
+/// can fail.</para>
+///
+/// <para>The feedback string is pinned separately and deliberately. On a rejection it is not a UI detail:
+/// the daemon delivers that exact text to the worker as the thing it must revise against, and a rejection
+/// that arrives empty costs one of three permitted revisions and tells the worker nothing. A dropped
+/// binding there is invisible on screen — the box still holds what was typed — and shows up only as a
+/// worker that keeps producing the same plan.</para>
 /// </summary>
 public class CoordinatorPlanDecisionTests
 {
-    // ---- The failing decision --------------------------------------------
+    // ---- What each button sends ------------------------------------------
 
+    /// <summary>
+    /// Approve must send an <b>approval</b>, for the plan on the card. Nothing else in the suite pinned
+    /// this, so an Approve button wired to <c>DecideAsync(approve: false)</c> — which rejects the plan,
+    /// spends a revision and sends the worker back to re-plan work the human just consented to — was a
+    /// green build.
+    /// </summary>
     [Fact]
-    public async Task AnApprovalThatThrows_LeavesTheButtonsUsable()
+    public async Task Approve_SendsAnApprovalForThatPlan()
     {
-        var panel = new CoordinatorPanelViewModel(new FakeCoordinator { Throw = new InvalidOperationException("daemon unreachable") });
+        var coordinator = new FakeCoordinator();
+        var panel = new CoordinatorPanelViewModel(coordinator);
         var card = panel.PendingPlan!;
         Assert.NotNull(card);
 
         await card.ApproveCommand.ExecuteAsync(null);
 
+        var decision = Assert.Single(coordinator.Decisions);
+        Assert.Equal("plan-7", decision.PlanId);
+        Assert.True(decision.Approve, "Approve sent a REJECTION — the buttons are inverted");
+    }
+
+    /// <summary>
+    /// Reject must send a rejection <b>carrying the operator's words verbatim</b>. The daemon hands that
+    /// string to the worker as the feedback it revises against, so a dropped binding here is not a
+    /// cosmetic loss: the rejection still costs one of three revisions, and the worker is sent back to
+    /// try again having been told nothing. On screen the two are identical — the box still shows what
+    /// was typed either way — which is exactly why it has to be asserted at this seam.
+    /// </summary>
+    [Fact]
+    public async Task Reject_SendsARejection_CarryingTheTypedFeedbackVerbatim()
+    {
+        var coordinator = new FakeCoordinator();
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        var card = panel.PendingPlan!;
+        card.FeedbackText = "narrow the scope to TokenClock; leave RefreshService alone";
+
+        await card.RejectCommand.ExecuteAsync(null);
+
+        var decision = Assert.Single(coordinator.Decisions);
+        Assert.Equal("plan-7", decision.PlanId);
+        Assert.False(decision.Approve, "Reject sent an APPROVAL — the buttons are inverted");
+        Assert.Equal("narrow the scope to TokenClock; leave RefreshService alone", decision.Feedback);
+    }
+
+    /// <summary>
+    /// An empty box is still a rejection, and the emptiness has to reach the daemon as emptiness rather
+    /// than be quietly turned into something. The shipped orchestrator substitutes an honest placeholder
+    /// at the wire; the panel's job is only to not invent words the operator did not type.
+    /// </summary>
+    [Fact]
+    public async Task RejectWithNothingTyped_IsStillARejection_AndInventsNoFeedback()
+    {
+        var coordinator = new FakeCoordinator();
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        var card = panel.PendingPlan!;
+
+        await card.RejectCommand.ExecuteAsync(null);
+
+        var decision = Assert.Single(coordinator.Decisions);
+        Assert.False(decision.Approve);
+        Assert.Equal("", decision.Feedback);
+    }
+
+    // ---- The latch, asserted as a transition ------------------------------
+
+    /// <summary>
+    /// <c>IsDeciding</c> asserted the only way it can fail. <c>Assert.False(card.IsDeciding)</c> at the
+    /// end of a decision is the field's <b>default</b>, so it passes on a card that never latched, never
+    /// ran, or has no decision path at all. What has to hold is the transition: latched while the daemon
+    /// call is in flight — so a second click cannot spend a second revision — and released afterwards.
+    /// </summary>
+    [Fact]
+    public async Task ADecisionInFlight_LatchesTheButtons_AndReleasesThemAfterwards()
+    {
+        var gate = new TaskCompletionSource();
+        var coordinator = new FakeCoordinator { Gate = gate };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        var card = panel.PendingPlan!;
+        Assert.False(card.IsDeciding);
+
+        var inFlight = card.ApproveCommand.ExecuteAsync(null);
+
+        Assert.True(card.IsDeciding, "the card never latched — a second click would spend a second decision");
+        Assert.False(inFlight.IsCompleted);
+
+        gate.SetResult();
+        await inFlight;
+
+        Assert.False(card.IsDeciding); // the human can act again
+        Assert.Single(coordinator.Decisions);
+    }
+
+    // ---- The failing decision --------------------------------------------
+
+    [Fact]
+    public async Task AnApprovalThatThrows_LeavesTheButtonsUsable()
+    {
+        var coordinator = new FakeCoordinator { Throw = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        var card = panel.PendingPlan!;
+        Assert.NotNull(card);
+
+        await card.ApproveCommand.ExecuteAsync(null);
+
+        // The approval was attempted, as an approval — the failure is the daemon's, not a mis-wired button.
+        Assert.True(Assert.Single(coordinator.Decisions).Approve);
         Assert.False(card.IsDeciding); // the human can try again
     }
 
     [Fact]
     public async Task ARejectionThatThrows_LeavesTheButtonsUsable()
     {
-        var panel = new CoordinatorPanelViewModel(new FakeCoordinator { Throw = new InvalidOperationException("daemon unreachable") });
+        var coordinator = new FakeCoordinator { Throw = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
         var card = panel.PendingPlan!;
         card.FeedbackText = "narrow the scope";
 
         await card.RejectCommand.ExecuteAsync(null);
 
+        var attempt = Assert.Single(coordinator.Decisions);
+        Assert.False(attempt.Approve);
+        Assert.Equal("narrow the scope", attempt.Feedback);
         Assert.False(card.IsDeciding);
+    }
+
+    /// <summary>
+    /// The retry must be a retry of the <b>same</b> decision, with the same words. A card that keeps its
+    /// feedback on screen but drops it on the second attempt sends the worker an empty rejection that the
+    /// operator has no way to notice: the box in front of them still reads what they wrote.
+    /// </summary>
+    [Fact]
+    public async Task ARetriedRejection_SendsTheSameFeedbackAgain()
+    {
+        var coordinator = new FakeCoordinator { Throw = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        var card = panel.PendingPlan!;
+        card.FeedbackText = "narrow the scope";
+
+        await card.RejectCommand.ExecuteAsync(null);
+        coordinator.Throw = null;
+        await card.RejectCommand.ExecuteAsync(null);
+
+        Assert.Equal(2, coordinator.Decisions.Count);
+        Assert.All(coordinator.Decisions, d =>
+        {
+            Assert.False(d.Approve);
+            Assert.Equal("narrow the scope", d.Feedback);
+        });
     }
 
     /// <summary>
@@ -145,6 +288,9 @@ public class CoordinatorPlanDecisionTests
 
     // ---- fake ------------------------------------------------------------
 
+    /// <summary>What the panel actually asked the daemon to do. The whole point of the fake.</summary>
+    private sealed record RecordedDecision(string PlanId, bool Approve, string? Feedback);
+
     /// <summary>A coordinator holding one pending plan that never resolves unless told to.</summary>
     private sealed class FakeCoordinator : ICoordinatorService
     {
@@ -153,7 +299,15 @@ public class CoordinatorPlanDecisionTests
         /// <summary>Set to make the decision call fail the way an unreachable daemon does.</summary>
         public Exception? Throw { get; set; }
 
-        public int DecisionCalls { get; private set; }
+        /// <summary>Set to hold the decision open, so the in-flight latch is observable.</summary>
+        public TaskCompletionSource? Gate { get; set; }
+
+        /// <summary>
+        /// Every decision, in order, with the arguments it carried. This replaces a bare
+        /// <c>DecisionCalls</c> counter that no test ever read — and which therefore let an inverted
+        /// Approve button and a dropped feedback string both ship green.
+        /// </summary>
+        public List<RecordedDecision> Decisions { get; } = new();
 
         public IReadOnlyList<ChatLine> GetTranscript() => Array.Empty<ChatLine>();
 
@@ -180,17 +334,21 @@ public class CoordinatorPlanDecisionTests
 
         public Task SendAsync(string text) => Task.CompletedTask;
 
-        public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
+        public async Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
         {
-            DecisionCalls++;
+            Decisions.Add(new RecordedDecision(planId, approve, feedback));
             if (Throw is not null)
             {
                 throw Throw;
             }
 
+            if (Gate is not null)
+            {
+                await Gate.Task;
+            }
+
             // Deliberately does NOT move the plan: the daemon may not have applied the decision yet, and
             // that is the case the panel has to survive.
-            return Task.CompletedTask;
         }
     }
 }

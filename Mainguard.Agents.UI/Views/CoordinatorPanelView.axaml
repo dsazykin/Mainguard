@@ -1,6 +1,7 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+             xmlns:views="using:Mainguard.Agents.UI.Views"
              x:Class="Mainguard.Agents.UI.Views.CoordinatorPanelView"
              x:DataType="vm:CoordinatorPanelViewModel">
 
@@ -13,25 +14,9 @@
        (with a visible revision budget); and when blocked workers fill the worker cap, the coordinator
        has stopped spawning — which a human cannot distinguish from a hang unless we say it. -->
 
-  <Grid RowDefinitions="Auto,*,Auto,Auto,Auto" Margin="10">
+  <Grid RowDefinitions="Auto,*,Auto,Auto" Margin="10">
     <StackPanel Grid.Row="0" Margin="0,0,0,8" Spacing="3">
       <TextBlock Text="Coordinator" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-      <TextBlock Text="{Binding PressureText}" FontSize="11" Foreground="{DynamicResource WarningBrush}"
-                 IsVisible="{Binding PressureText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-
-      <!-- The legible stall. Bordered and named when the cap is saturated by blocked plans, because at
-           that point it is not a status line — it is the explanation for why nothing is happening. -->
-      <Border Classes="Card" Padding="8,6" CornerRadius="6" BorderThickness="1"
-              BorderBrush="{DynamicResource WarningBrush}"
-              IsVisible="{Binding BackpressureText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-        <StackPanel Spacing="2">
-          <TextBlock Text="Waiting on you" FontSize="10" FontWeight="SemiBold"
-                     Foreground="{DynamicResource WarningBrush}"
-                     IsVisible="{Binding IsCapSaturatedByBlockedWorkers}"/>
-          <TextBlock Text="{Binding BackpressureText}" FontSize="11" TextWrapping="Wrap"
-                     Foreground="{DynamicResource TextPrimary}"/>
-        </StackPanel>
-      </Border>
 
       <TextBlock Text="The Coordinator plans and delegates — it never touches code or merges. Each worker writes its own plan and waits for you."
                  FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
@@ -67,79 +52,15 @@
       </ItemsControl>
     </ScrollViewer>
 
-    <!-- Escalated workers: the revision budget is spent, so there is deliberately no decision button.
-         The loop is over; what is left is a human choosing to steer the worker or end it. -->
-    <ItemsControl Grid.Row="2" ItemsSource="{Binding EscalatedPlans}" Margin="0,8,0,0">
-      <ItemsControl.ItemTemplate>
-        <DataTemplate x:DataType="vm:EscalatedPlanViewModel">
-          <Border Classes="Card" Padding="10" Margin="0,0,0,6" CornerRadius="8"
-                  BorderThickness="1" BorderBrush="{DynamicResource DangerBrush}">
-            <StackPanel Spacing="4">
-              <TextBlock Text="Escalated to you" FontSize="10" FontWeight="SemiBold"
-                         Foreground="{DynamicResource DangerBrush}"/>
-              <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
-                         Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
-              <TextBlock Text="{Binding HeadlineText}" FontSize="11" TextWrapping="Wrap"
-                         Foreground="{DynamicResource TextPrimary}"/>
-              <TextBlock Text="{Binding LastFeedbackText}" FontSize="11" TextWrapping="Wrap"
-                         Foreground="{DynamicResource TextMuted}"
-                         IsVisible="{Binding HasLastFeedback}"/>
-            </StackPanel>
-          </Border>
-        </DataTemplate>
-      </ItemsControl.ItemTemplate>
-    </ItemsControl>
+    <!-- The gate itself, from the single shared definition in PlanGateView: backpressure, escalations,
+         and one approval card per blocked worker. The shipped Control Center hosts the same control above
+         the coordinator's terminal, so there is exactly one place the card is described. -->
+    <ScrollViewer Grid.Row="2" MaxHeight="420" Margin="0,8,0,8"
+                  IsVisible="{Binding HasGateContent}">
+      <views:PlanGateView/>
+    </ScrollViewer>
 
-    <!-- The worker-authored plan approval card (§5.2): Scope is the load-bearing field -->
-    <Border Grid.Row="3" Classes="Card" Padding="10" Margin="0,8,0,8"
-            BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1" CornerRadius="8"
-            IsVisible="{Binding PendingPlan, Converter={x:Static ObjectConverters.IsNotNull}}">
-      <StackPanel Spacing="6" DataContext="{Binding PendingPlan}" x:DataType="vm:PlanCardViewModel">
-        <Grid ColumnDefinitions="*,Auto">
-          <TextBlock Grid.Column="0" Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
-                     TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-          <TextBlock Grid.Column="1" Text="{Binding RevisionText}" FontSize="11" VerticalAlignment="Center"
-                     Foreground="{DynamicResource WarningBrush}"
-                     IsVisible="{Binding IsRevision}"/>
-        </Grid>
-        <TextBlock Text="{Binding RevisedAgainstText}" FontSize="11" TextWrapping="Wrap"
-                   Foreground="{DynamicResource TextMuted}"
-                   IsVisible="{Binding HasFeedbackHistory}"/>
-        <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto,Auto">
-          <TextBlock Grid.Row="0" Grid.Column="0" Text="Scope" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding ScopeText}" FontSize="11"
-                     TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-          <TextBlock Grid.Row="1" Grid.Column="0" Text="Approach" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Approach}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-          <TextBlock Grid.Row="2" Grid.Column="0" Text="Test" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding TestStrategy}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-        </Grid>
-        <TextBlock Text="{Binding FactsText}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
-
-        <!-- Rejection is feedback, not death: what is typed here is delivered to the worker, which
-             revises against it and presents again. An empty box costs a round of the budget. -->
-        <TextBox Text="{Binding FeedbackText}" FontSize="11" AcceptsReturn="True" MaxHeight="72"
-                 Watermark="What should the worker change? This text goes back to it."/>
-        <TextBlock Text="This is the last revision — rejecting again stops the worker and escalates to you."
-                   FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
-                   IsVisible="{Binding NextRejectionEscalates}"/>
-
-        <!-- A decision that did not land says so here. Without this the card is indistinguishable from a
-             card whose approval worked, and the human waits on a worker that is still blocked. -->
-        <TextBlock Text="{Binding DecisionErrorText}" FontSize="11" TextWrapping="Wrap"
-                   Foreground="{DynamicResource DangerBrush}"
-                   IsVisible="{Binding HasDecisionError}"/>
-
-        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-          <Button Classes="Secondary" Content="{Binding RejectButtonText}" FontSize="12"
-                  Command="{Binding RejectCommand}" IsEnabled="{Binding !IsDeciding}"/>
-          <Button Classes="Accent" Content="Approve plan" FontSize="12"
-                  Command="{Binding ApproveCommand}" IsEnabled="{Binding !IsDeciding}"/>
-        </StackPanel>
-      </StackPanel>
-    </Border>
-
-    <Grid Grid.Row="4" ColumnDefinitions="*,Auto">
+    <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
       <TextBox Grid.Column="0" Text="{Binding ComposerText}" Watermark="Message the Coordinator…"
                FontSize="12" AcceptsReturn="False"/>
       <Button Grid.Column="1" Classes="Primary" Content="Send" FontSize="12" Margin="8,0,0,0"

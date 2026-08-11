@@ -244,7 +244,34 @@ public static class GatewayServiceRegistration
             BaseUrl: BuildGatewayBaseUrl(options),
             Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
 
+        // Phase 2's automatic verification trigger. Until now the ONLY production callers of
+        // MergeQueue.RunVerificationAsync were the human Verify button, the restart resume and the stale
+        // cascade — so nothing fired when a delegated worker finished its approved work, and the whole
+        // phase-2 flow required a human to press Verify on every worker. This is that missing caller, and
+        // it is deliberately nothing more than a caller: it watches the ref watcher's own sweep, waits for
+        // the worker's branch to go quiet, asks the plan gate, and then calls the SAME method the button
+        // calls. See docs/design/verification-trigger.md.
+        //
+        // Registered as a factory over the concrete WorktreeManager because the trigger must observe the
+        // watcher the daemon actually runs. Absent that substrate (a manager that is not a WorktreeManager)
+        // there is no observation to make, so the service simply does not exist and the daemon keeps the
+        // human path — GetService in WorkerReadinessHostedService is what makes that a supported state
+        // rather than a boot failure.
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager worktrees
+                ? new WorkerReadinessTrigger(
+                    source: worktrees.RefWatcher,
+                    queues: sp.GetRequiredService<IMergeQueueRegistry>(),
+                    planGate: sp.GetRequiredService<WorkerPlanGate>(),
+                    limits: sp.GetRequiredService<CoordinatorLimits>(),
+                    log: log)
+                : null!);
+
         services.AddHostedService<GatewayHostedService>();
+        // ...and the slot that RESOLVES the trigger at boot. Without it the singleton above would be
+        // registered and never constructed — registered-but-never-running is the exact defect this
+        // subsystem exists to have repaired once.
+        services.AddHostedService<Runtime.WorkerReadinessHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();

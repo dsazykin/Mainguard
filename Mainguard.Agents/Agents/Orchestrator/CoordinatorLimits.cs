@@ -32,4 +32,35 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// looping. The maximal reading was taken deliberately — "rejection is feedback, not death" argues for
 /// giving the plan every permitted round before the worker gives up on it.</para>
 /// </param>
-public sealed record CoordinatorLimits(int MaxActiveWorkers = 6, int MaxPlanRevisions = 3);
+/// <param name="AutoVerifyQuietSeconds">
+/// How long a worker's <c>refs/heads/agent/&lt;id&gt;</c> must stop advancing before
+/// <see cref="WorkerReadinessTrigger"/> reads the branch as ready and verifies it. Every observed advance
+/// restarts the window, so a worker that lands five commits over three minutes costs ONE verification
+/// rather than five — which is the whole reason the trigger debounces instead of firing per commit.
+///
+/// <para><b>Tuned toward the cheaper failure.</b> Too short and a mid-task pause is read as completion: the
+/// cost is one wasted suite run in the worker's own jail, and a <c>VerificationRecord</c> that is still
+/// true (the tests DID pass on that tip — the record never claims the worker was finished). Too long and a
+/// finished worker's entry simply sits at <c>Working</c> until someone presses Verify, which is the state
+/// this trigger exists to end. The second failure is the one that wastes a human, so the number leans
+/// short.</para>
+/// </param>
+/// <param name="AutoVerifyCooldownSeconds">
+/// The floor on the gap between two AUTOMATIC verifications of the same worker. The quiet period bounds a
+/// burst; this bounds a grinder — an agent committing steadily just under the quiet period would otherwise
+/// run the repo's whole test suite as fast as the suite completes. Nothing here throttles the human Verify
+/// button or the stale cascade: a cooldown on a human's explicit request would be a control refusing the
+/// person it exists to serve.
+/// </param>
+public sealed record CoordinatorLimits(
+    int MaxActiveWorkers = 6,
+    int MaxPlanRevisions = 3,
+    int AutoVerifyQuietSeconds = 90,
+    int AutoVerifyCooldownSeconds = 600)
+{
+    /// <summary><see cref="AutoVerifyQuietSeconds"/> as a <see cref="System.TimeSpan"/>.</summary>
+    public System.TimeSpan AutoVerifyQuietPeriod => System.TimeSpan.FromSeconds(AutoVerifyQuietSeconds);
+
+    /// <summary><see cref="AutoVerifyCooldownSeconds"/> as a <see cref="System.TimeSpan"/>.</summary>
+    public System.TimeSpan AutoVerifyCooldown => System.TimeSpan.FromSeconds(AutoVerifyCooldownSeconds);
+}

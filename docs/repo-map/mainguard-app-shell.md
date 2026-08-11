@@ -301,9 +301,17 @@
       nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line; **harness-only** — constructed solely by
-      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (conversation + plan-approval card —
-      **retained for a possible future surface but no longer rendered**; since 2026-07-22 the coordinator
-      is driven from its inline terminal, not this bespoke GUI), `ReviewCockpitView` (P2-11: the review
+      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (the coordinator
+      conversation — **retained for a possible future surface but no longer rendered**; since 2026-07-22
+      the coordinator is driven from its inline terminal, not this bespoke GUI. It no longer *defines* the
+      plan cards: it hosts `PlanGateView` like everyone else), `PlanGateView` (**the phase-2 plan gate,
+      the one definition of the approval card** — the daemon's backpressure sentence, the escalated
+      workers, and one Approve/Reject card per blocked worker with Scope + Approach + the feedback box.
+      Split out of `CoordinatorPanelView` because the coordinator conversation moved into a real PTY and a
+      PTY cannot render a button: the gate is a decision about a *worker*, taken out of band from whatever
+      the coordinator is saying, so it has to be hostable without the chat. **Mounted by
+      `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
+      that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47
@@ -574,8 +582,13 @@
     `SeverityVocabulary` glyph map is a rendering-only projection — no rule logic),
     `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel`/`EscalatedPlanViewModel`
     (the coordinator conversation + the **worker-authored** plan approval card; Approve is the panel's
-    accent — **retained but no longer mounted on the coordinator surface, which is the inline terminal
-    now**. **Phase 2** renders the three states the plan gate otherwise makes invisible: the card names
+    accent. The conversation half is no longer mounted (the coordinator surface is the inline terminal
+    now), but the **plan-gate half is** — `ControlCenterView` binds this same VM into `PlanGateView`
+    above the coordinator's terminal, so `PendingPlans`/`EscalatedPlans`/`BackpressureText` are live
+    shipped state rather than harness-only state. `PendingPlans` is a **collection, one card per blocked
+    worker** (reconciled in place on `(PlanId, Revision)` so a refresh never eats half-typed feedback or a
+    just-raised error), with `PendingPlan` kept as its head; `HasGateContent` is what lets a host collapse
+    the whole region when nothing is waiting. **Phase 2** renders the three states the plan gate otherwise makes invisible: the card names
     the worker that wrote the plan and says it is *blocked until you decide*; Reject carries a feedback
     box, because that text is delivered back to the worker to revise against, plus the revision counter
     against the daemon's budget and a warning when the next rejection would stop the worker rather than
