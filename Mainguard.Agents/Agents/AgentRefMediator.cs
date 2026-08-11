@@ -128,12 +128,42 @@ public sealed class AgentRefMediator
     /// unchanged and still load-bearing: it is what covers a second <i>process</i>, which no lock can.</para>
     /// </summary>
     public AgentRefPublishResult Publish(string repoHash, string agentId)
+        => PublishInternal(repoHash, agentId, daemonRebase: false);
+
+    /// <summary>
+    /// The same mediated publish, for the one rewrite the daemon performs ITSELF: P2-09's keep-alive
+    /// rebase (<see cref="Orchestrator.KeepAliveRebaser"/>).
+    ///
+    /// <para><b>Why rule 2 cannot simply apply here.</b> A rebase replaces every commit on the branch with
+    /// a new one on top of main, so the mirror's current tip is by construction NOT an ancestor of the
+    /// result. Under the ordinary rule the daemon's own reparenting is refused as "the agent rewrote
+    /// published history" and never reaches the mirror — where the merge queue, the review cockpit and the
+    /// host's sync fetch all read from. The rebase then happens, succeeds, and changes nothing anyone can
+    /// see: the branch the human merges is still the un-rebased one, whose <c>--ff-only</c> merge still
+    /// refuses. Rule 2 does not go away here; it is replaced by the property it was protecting.</para>
+    ///
+    /// <para><b>What is checked instead, and why it is not weaker.</b> Rule 2 exists to stop published
+    /// work being thrown away. That is asked directly: <c>git cherry &lt;new&gt; &lt;old&gt;</c> compares
+    /// by <b>patch-id</b>, so every commit the mirror already carried must be present in the new tip as
+    /// the same change, whatever its sha. A rebase passes (same patches, new parents); dropping a commit,
+    /// editing one's content away, or pointing the branch at unrelated work all fail — and those are the
+    /// cases the ancestor check was catching. Content is what the merge diff and the P2-11 acknowledgments
+    /// are computed from, which is why patch-id and not commit identity is the honest comparison.</para>
+    ///
+    /// <para><b>This is not a bypass an agent can reach.</b> Nothing in a jail calls it; the caller is the
+    /// daemon's own stale cascade, immediately after a cycle the daemon ran, on a worktree it quiesced
+    /// through the yield first. Rules 1, 3 and 4 are unchanged and still enforced below.</para>
+    /// </summary>
+    public AgentRefPublishResult PublishRebase(string repoHash, string agentId)
+        => PublishInternal(repoHash, agentId, daemonRebase: true);
+
+    private AgentRefPublishResult PublishInternal(string repoHash, string agentId, bool daemonRebase)
     {
         var gate = _gates.GetOrAdd((repoHash, agentId), static _ => new object());
         AgentRefPublishResult result;
         lock (gate)
         {
-            result = PublishCore(repoHash, agentId);
+            result = PublishCore(repoHash, agentId, daemonRebase);
         }
 
         // Outside the lock: the observer is the audit/warning sink, and housekeeping must not hold a
@@ -142,7 +172,7 @@ public sealed class AgentRefMediator
         return result;
     }
 
-    private AgentRefPublishResult PublishCore(string repoHash, string agentId)
+    private AgentRefPublishResult PublishCore(string repoHash, string agentId, bool daemonRebase)
     {
         string target, quarantine, source, barePath, agentRepoPath;
         try
@@ -221,10 +251,24 @@ public sealed class AgentRefMediator
             if (oldSha.Length > 0
                 && AgentGitCommand.TryRun(barePath, out _, "merge-base", "--is-ancestor", oldSha, newSha) != 0)
             {
-                return new AgentRefPublishResult(
-                    repoHash, agentId, AgentRefPublishOutcome.RefusedNonFastForward, oldSha, newSha,
-                    $"{newSha[..Math.Min(8, newSha.Length)]} does not contain the mirror's current "
-                    + $"{oldSha[..Math.Min(8, oldSha.Length)]}; the agent rewrote published history");
+                // ...except for the daemon's OWN rebase, where the ancestor test is the wrong instrument
+                // and the property it stands for is asked directly instead. See PublishRebase.
+                if (!daemonRebase)
+                {
+                    return new AgentRefPublishResult(
+                        repoHash, agentId, AgentRefPublishOutcome.RefusedNonFastForward, oldSha, newSha,
+                        $"{newSha[..Math.Min(8, newSha.Length)]} does not contain the mirror's current "
+                        + $"{oldSha[..Math.Min(8, oldSha.Length)]}; the agent rewrote published history");
+                }
+
+                if (DroppedCommits(barePath, oldSha, newSha) is { Length: > 0 } dropped)
+                {
+                    return new AgentRefPublishResult(
+                        repoHash, agentId, AgentRefPublishOutcome.RefusedNonFastForward, oldSha, newSha,
+                        $"the rebased {newSha[..Math.Min(8, newSha.Length)]} drops {dropped.Length} commit(s) "
+                        + $"the mirror already carried at {oldSha[..Math.Min(8, oldSha.Length)]} "
+                        + $"({string.Join(", ", dropped)}); a rebase may reparent published work, never lose it");
+                }
             }
 
             // CAS on the value the decision was taken against. The all-zero old value means "must not
@@ -243,6 +287,40 @@ public sealed class AgentRefMediator
         {
             TryDeleteRef(barePath, quarantine);
         }
+    }
+
+    /// <summary>
+    /// Commits reachable from <paramref name="oldSha"/> that are NOT present in
+    /// <paramref name="newSha"/> as the same change — i.e. work a rewrite would lose.
+    ///
+    /// <para><c>git cherry &lt;upstream&gt; &lt;head&gt;</c> compares by patch-id and prefixes each commit
+    /// with <c>+</c> (not in upstream) or <c>-</c> (an equivalent change is). Asked as
+    /// <c>cherry &lt;new&gt; &lt;old&gt;</c> it therefore enumerates precisely "what did the mirror have
+    /// that the new tip does not", which is the question rule 2 is really asking. A rebase answers with
+    /// nothing; a dropped or gutted commit answers with itself.</para>
+    ///
+    /// <para>A probe that cannot run at all is reported as a loss (the returned array is non-empty), so
+    /// an unreadable repository refuses the rewrite rather than permitting it — an unanswerable safety
+    /// question is not a yes.</para>
+    /// </summary>
+    private static string[] DroppedCommits(string barePath, string oldSha, string newSha)
+    {
+        if (AgentGitCommand.TryRun(barePath, out var output, "cherry", newSha, oldSha) != 0)
+        {
+            return new[] { "the patch-equivalence probe could not run" };
+        }
+
+        var dropped = new List<string>();
+        foreach (var line in output.Split('\n'))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("+", StringComparison.Ordinal))
+            {
+                dropped.Add(trimmed.Length > 9 ? trimmed[2..10] : trimmed);
+            }
+        }
+
+        return dropped.ToArray();
     }
 
     private static void TryDeleteRef(string gitDir, string refName)

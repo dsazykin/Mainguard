@@ -91,6 +91,7 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, IYieldProtocol>? _yieldFor;
     private readonly Func<string, string, string?>? _locateAgentWorktree;
     private readonly IAgentSupervisor _agentStates;
+    private readonly Func<string, string, bool>? _publishRebasedAgentRef;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
@@ -164,6 +165,13 @@ public sealed class MergeQueueProvisioner
     /// target and the verification baseline cannot drift apart — which they silently would if two callers
     /// each answered "what is main" for the same repo.</para>
     /// </param>
+    /// <param name="publishRebasedAgentRef">
+    /// (repoHash, agentId) → carry the branch the keep-alive rebase just REPARENTED into the mirror.
+    /// Distinct from <paramref name="publishAgentRef"/> and not optional in spirit: a rebase is never a
+    /// fast-forward, so the ordinary mediated publish refuses it as rewritten history, and a cycle whose
+    /// result never reaches the mirror is a cycle with no observable effect at all. False from this means
+    /// the mirror still holds the un-rebased branch, which the cascade reports rather than re-verifies.
+    /// </param>
     /// <param name="agentStates">
     /// Where the run-state of an agent the cascade touched is reflected (<c>Rebasing</c>, and — the one
     /// that matters — <c>Conflict</c>). The daemon passes the real <c>PtyAgentSupervisor</c>, so the state
@@ -187,7 +195,8 @@ public sealed class MergeQueueProvisioner
         Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
         Func<string, IYieldProtocol>? yieldProtocolFor = null,
         Func<string, string, string?>? locateAgentWorktree = null,
-        IAgentSupervisor? agentStates = null)
+        IAgentSupervisor? agentStates = null,
+        Func<string, string, bool>? publishRebasedAgentRef = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -208,6 +217,7 @@ public sealed class MergeQueueProvisioner
         _yieldFor = yieldProtocolFor;
         _locateAgentWorktree = locateAgentWorktree;
         _agentStates = agentStates ?? NullAgentSupervisor.Instance;
+        _publishRebasedAgentRef = publishRebasedAgentRef;
 
         // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
         // is here rather than only the one that happened to get a test.
@@ -220,6 +230,7 @@ public sealed class MergeQueueProvisioner
         if (yieldProtocolFor is not null) { wired.Add(nameof(yieldProtocolFor)); }
         if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
         if (agentStates is not null) { wired.Add(nameof(agentStates)); }
+        if (publishRebasedAgentRef is not null) { wired.Add(nameof(publishRebasedAgentRef)); }
         WiredOptionalControls = wired;
     }
 
@@ -232,7 +243,8 @@ public sealed class MergeQueueProvisioner
     /// the re-verify-only cascade — which is not a degraded fix, it is the original defect. One name for
     /// the composed capability means the composition root can assert the capability instead of the parts.</para>
     /// </summary>
-    public bool ReparentsStaleBranches => _yieldFor is not null && _locateAgentWorktree is not null;
+    public bool ReparentsStaleBranches =>
+        _yieldFor is not null && _locateAgentWorktree is not null && _publishRebasedAgentRef is not null;
 
     /// <summary>
     /// Every optional constructor argument this provisioner was <b>actually given</b>, by parameter name.
@@ -520,6 +532,20 @@ public sealed class MergeQueueProvisioner
             Block(repoHandle, agentId, queue,
                 $"this branch is not on top of the new main yet — {cycle.Detail ?? "the keep-alive rebase was skipped"}",
                 "skipped");
+            return;
+        }
+
+        // The reparented branch has to REACH the mirror, and the ordinary publish cannot carry it: a
+        // rebase is not a fast-forward, so MG-3's mediator refuses it as rewritten history. Left there,
+        // the whole cycle succeeds and changes nothing observable — the queue, the cockpit and the human's
+        // merge all read the mirror, and the mirror would still hold the un-rebased branch whose --ff-only
+        // merge refuses. This is the daemon-rebase publish, checked for lost work by patch-id instead.
+        if (_publishRebasedAgentRef is not null && !_publishRebasedAgentRef(repoHandle, agentId))
+        {
+            Block(repoHandle, agentId, queue,
+                "this branch was rebased onto the new main but the rebased branch could not be published "
+                + "to the mirror — the merge would still see the old, unmergeable branch",
+                "publish-refused");
             return;
         }
 

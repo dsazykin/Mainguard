@@ -163,7 +163,15 @@ public static class GatewayServiceRegistration
             // to clients as agent state changes; AgentRunState.Conflict had no production writer at all
             // before this, so the one arm of the rebase that stops and waits for a person was also the one
             // arm nothing anywhere rendered.
-            agentStates: sp.GetRequiredService<IAgentSupervisor>()));
+            agentStates: sp.GetRequiredService<IAgentSupervisor>(),
+            // ...and the one that carries the result out. A rebase is not a fast-forward, so MG-3's ref
+            // mediator refuses it through the ordinary publish above as "the agent rewrote published
+            // history" — which would leave every cycle succeeding and changing nothing anyone can see,
+            // because the queue, the cockpit and the human's merge all read the mirror. PublishRebase
+            // asks the question rule 2 stands for (was published work LOST) by patch-id instead.
+            publishRebasedAgentRef: (repoHash, agentId) =>
+                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
