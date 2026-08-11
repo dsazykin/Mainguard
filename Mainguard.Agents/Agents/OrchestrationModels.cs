@@ -93,6 +93,17 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// the field — must not give that answer by default, so "no jail" and "no idea" are different values.
 /// Null leaves every surface exactly as it was.</para>
 /// </param>
+/// <param name="VerifiedMainSha">
+/// The <c>main@sha</c> this branch's verification ran against, straight off the daemon's
+/// <c>verified_main_sha</c>. It is what the review cockpit's "verified @ &lt;sha&gt;" stamp reads, and the
+/// only thing that tells a reviewer whether the green they are looking at was measured against today's
+/// main or a week-old one.
+///
+/// <para>Deliberately NOT folded into <see cref="VerificationRecord"/>: that record also carries
+/// <c>Passed</c> and the test counts, and the wire has none of them. Constructing one here would have
+/// meant inventing a pass/fail verdict to carry a sha, which is exactly the kind of fabricated
+/// reassurance this surface exists to prevent. Null means the daemon did not say.</para>
+/// </param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -102,7 +113,8 @@ public sealed record QueueEntry(
     VerificationRecord? Verification,
     IReadOnlyList<FlaggedItem> FlaggedItems,
     bool VerificationInFlight = false,
-    bool? HasLiveSandbox = null);
+    bool? HasLiveSandbox = null,
+    string? VerifiedMainSha = null);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(

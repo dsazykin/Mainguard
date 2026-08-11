@@ -93,6 +93,17 @@ public interface IAgentWorktreeManager
     bool PublishAgentBranch(string repoHash, string agentId) => false;
 
     /// <summary>
+    /// MG-3 / P2-09 — the same carry-across for a branch the <b>daemon itself</b> just rebased onto main.
+    ///
+    /// <para>Separate from <see cref="PublishAgentBranch"/> because a rebase is never a fast-forward, so
+    /// the ordinary publish refuses it as rewritten history and the keep-alive's whole effect stops at
+    /// the agent's own repository — invisible to the merge queue, the cockpit and the host's sync fetch.
+    /// The rewrite is instead checked for LOST work by patch-id (see <c>AgentRefMediator.PublishRebase</c>);
+    /// rules 1, 3 and 4 are unchanged.</para>
+    /// </summary>
+    bool PublishRebasedAgentBranch(string repoHash, string agentId) => false;
+
+    /// <summary>
     /// MG-3 — start watching this agent's own <c>refs/heads/agent/&lt;id&gt;</c> and publish it into the
     /// mirror whenever it moves (design §7: the daemon watches AND re-fetches before verification).
     /// Called at spawn. Default no-op for the substrate-less test doubles.
@@ -449,6 +460,12 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // hook keeps its own narrower mode instead of being widened back to group-writable. It is
         // ergonomics, not a boundary — see AgentBranchGuard — and it is best effort: a spawn must
         // never fail because a guard rail could not be written.
+        //
+        // The return value is ARMED, not written, and it is deliberately not thrown on: a spawn whose
+        // guard rail could not be armed still has to happen (layer 3 reports the drift either way), but
+        // it must not happen QUIETLY. AgentBranchGuard warns through this same sink with the reason,
+        // which is the whole difference between a control that is inert and a control that is inert and
+        // says so — the guard was measured to be silently inert on a `noexec` agent repository.
         AgentBranchGuard.InstallHook(agentRepoPath, agentId, _warningSink);
 
         // Seed the merge queue's input contract: refs/heads/agent/<id> exists in the MIRROR from the
@@ -469,6 +486,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
+
+    /// <inheritdoc />
+    public bool PublishRebasedAgentBranch(string repoHash, string agentId)
+        => _refs.PublishRebase(repoHash, agentId).Current;
 
     /// <summary>
     /// MG-3 stage 2 — the mediated publish, with the outcome rather than a bool. The four rules

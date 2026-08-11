@@ -44,20 +44,34 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     [ObservableProperty]
     private bool _isLastFetchStale;
 
+    // True while background fetch is failing for this repo (expired token, deleted remote, no network).
+    // Drives the warning colour on the freshness label — the label's TEXT says so too, because a colour
+    // alone is not a message.
+    [ObservableProperty]
+    private bool _isAutoFetchFailing;
+
     private System.DateTimeOffset? _lastFetched;
+
+    // Guards the one-and-only auto-fetch failure toast per outage: the user is TOLD the first time, and
+    // then the persistent label carries it. Reset by the next success, so a new outage speaks again.
+    private bool _autoFetchFailureAnnounced;
 
     // Toasts (#85): stacked, newest at the bottom, capped at 3 -- each owns its own auto-dismiss
     // timer (see ToastViewModel) so a burst of notifications never silently drops earlier ones.
     private const int MaxToasts = 3;
     public System.Collections.ObjectModel.ObservableCollection<ToastViewModel> Toasts { get; } = new();
 
-    [ObservableProperty]
-    private bool _isSshPassphrasePromptVisible;
-
-    [ObservableProperty]
-    private string _sshPassphraseInput = string.Empty;
-
-    private string _pendingAction = string.Empty;
+    // NOTE (removed, deliberately): there used to be an inline SSH-passphrase prompt here —
+    // IsSshPassphrasePromptVisible / SshPassphraseInput / Save+CancelSshPassphraseCommand. All four
+    // layers of it were dead. No .axaml bound any of them, so the prompt could not appear; the handler
+    // that set the flag showed no notification, so the failure was silent; the exception that triggered
+    // it was never thrown by anything; and the secret it wrote ("ssh_passphrase") was never read, since
+    // SshKeyService keys passphrases per key as "sshpass_<path>". Reinstating it would have meant
+    // building a modal AND an SSH_ASKPASS bridge to hand the secret to ssh — a feature, not a defect
+    // fix, and one that wants the passphrase off the keyring-only path this app is careful about.
+    // What replaced it: SshAuthenticationException is now genuinely thrown (GitService), and
+    // HandleGitActionException below reports it and routes to Settings → SSH Keys, which is where
+    // passphrases are actually stored.
 
     public StagingPanelViewModel StagingPanel { get; }
     public DiffViewerViewModel DiffViewer { get; }
@@ -136,10 +150,11 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
         _watcher.RepositoryChanged += OnRepositoryChanged;
 
         // Background auto-fetch: on each successful fetch, refresh ahead/behind and the
-        // "last fetched" label on the UI thread. Failures stay silent (no toast spam).
+        // "last fetched" label on the UI thread. Failures are surfaced too — see OnAutoFetchFailed.
         _autoFetch = new AutoFetchService(_gitService,
             () => Mainguard.App.Shell.App.Settings?.Current ?? new Mainguard.Git.Models.UserPreferences());
         _autoFetch.Fetched += OnAutoFetched;
+        _autoFetch.FetchFailed += OnAutoFetchFailed;
         _autoFetch.Watch(_repoPath);
 
         // Refresh the relative "N min ago" label once a minute so it ages correctly.
@@ -148,13 +163,44 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
             System.TimeSpan.FromMinutes(1), System.TimeSpan.FromMinutes(1));
     }
 
+    /// <summary>The background auto-fetch loop this dashboard owns. Exposed so a test can drive one real
+    /// cycle (<c>RunCycleAsync</c>) against a real broken remote and observe what the USER is told —
+    /// rather than poking the private handler and proving only that a field moved.</summary>
+    internal AutoFetchService AutoFetch => _autoFetch;
+
     private void OnAutoFetched(string repoPath)
     {
         _lastFetched = _autoFetch.GetLastFetched(repoPath);
         Dispatcher.UIThread.Post(async () =>
         {
+            IsAutoFetchFailing = false;
+            _autoFetchFailureAnnounced = false;
             UpdateLastFetchedLabel();
             await RefreshCoreAsync();
+        });
+    }
+
+    /// <summary>
+    /// Background fetch failed. The point of surfacing this is NOT the failure itself — it is that the
+    /// ahead/behind badge stops being true the moment fetching stops, and the freshness label beside it
+    /// keeps counting up from the last SUCCESS, which reads as "we checked, you're up to date". An
+    /// expired token or a deleted remote therefore used to present as a repo that is simply not moving.
+    ///
+    /// <para>One toast per outage (the actionable moment), then a persistent warning on the label so the
+    /// state is still legible ten minutes later. Not per-cycle: that is the toast spam the original
+    /// design note was right to refuse — it just refused it by saying nothing at all.</para>
+    /// </summary>
+    private void OnAutoFetchFailed(string repoPath, int consecutiveFailures, string reason)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            IsAutoFetchFailing = true;
+            UpdateLastFetchedLabel();
+
+            if (_autoFetchFailureAnnounced) return;
+            _autoFetchFailureAnnounced = true;
+            ShowNotification(
+                $"Background fetch failed — ahead/behind counts may be out of date. {reason}", true);
         });
     }
 
@@ -162,18 +208,22 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     {
         if (_lastFetched is not { } when)
         {
-            LastFetchedText = string.Empty;
+            // Never fetched successfully AND currently failing: say so, rather than showing nothing at
+            // all — an empty label is indistinguishable from auto-fetch being switched off.
+            LastFetchedText = IsAutoFetchFailing ? "Fetch failing" : string.Empty;
             IsLastFetchStale = false;
             return;
         }
 
         var elapsed = System.DateTimeOffset.Now - when;
         var minutes = (int)elapsed.TotalMinutes;
-        LastFetchedText = minutes <= 0
+        var fetched = minutes <= 0
             ? "Fetched just now"
             : minutes == 1 ? "Fetched 1 min ago" : $"Fetched {minutes} min ago";
-        // Dimmed once the picture is more than 15 minutes old (closes the 1.12 stale badge).
-        IsLastFetchStale = minutes > 15;
+        LastFetchedText = IsAutoFetchFailing ? $"Fetch failing — {fetched.ToLowerInvariant()}" : fetched;
+        // Dimmed once the picture is more than 15 minutes old (closes the 1.12 stale badge). A failing
+        // fetch is never dimmed — it is the one state that must not recede.
+        IsLastFetchStale = minutes > 15 && !IsAutoFetchFailing;
     }
 
     private void OnRepositoryChanged()
@@ -261,29 +311,6 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
         });
     }
 
-    [RelayCommand]
-    private void SaveSshPassphrase()
-    {
-        var keyring = new Mainguard.Git.Security.SecureKeyring();
-        keyring.SaveSecret("ssh_passphrase", SshPassphraseInput);
-        IsSshPassphrasePromptVisible = false;
-        SshPassphraseInput = string.Empty;
-
-        // Retry the pending action
-        if (_pendingAction == "Push") PushCommand.Execute(null);
-        else if (_pendingAction == "Pull") PullCommand.Execute(null);
-        else if (_pendingAction == "Fetch") FetchCommand.Execute(null);
-        else if (_pendingAction == "UpdateProject") UpdateProjectCommand.Execute(null);
-    }
-
-    [RelayCommand]
-    private void CancelSshPassphrase()
-    {
-        IsSshPassphrasePromptVisible = false;
-        SshPassphraseInput = string.Empty;
-        ShowNotification("Action cancelled because SSH passphrase was not provided.", true);
-    }
-
     // Returns the exception of type T whether it is the thrown exception itself
     // or wrapped as its InnerException, so callers can surface the typed
     // exception's own actionable message rather than an outer wrapper's text.
@@ -292,10 +319,12 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
 
     private void HandleGitActionException(System.Exception ex, string actionName)
     {
-        if (Unwrap<Mainguard.Git.Exceptions.SshAuthenticationException>(ex) is not null)
+        if (Unwrap<Mainguard.Git.Exceptions.SshAuthenticationException>(ex) is { } ssh)
         {
-            _pendingAction = actionName;
-            IsSshPassphrasePromptVisible = true;
+            // An SSH key problem is NOT a token problem: the Accounts/PAT route below cannot fix it.
+            // Say what failed, then land the user on the page that owns SSH keys and their passphrases.
+            ShowNotification($"{actionName} failed: {ssh.Message}", true);
+            _ = ManageSshKeysAsync();
         }
         else if (Unwrap<Mainguard.Git.Exceptions.MergeConflictException>(ex) is { } conflict)
         {
@@ -817,6 +846,7 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     public void Dispose()
     {
         _autoFetch.Fetched -= OnAutoFetched;
+        _autoFetch.FetchFailed -= OnAutoFetchFailed;
         _autoFetch.Dispose();
         _lastFetchedTicker?.Dispose();
         foreach (var toast in Toasts) toast.Dispose();

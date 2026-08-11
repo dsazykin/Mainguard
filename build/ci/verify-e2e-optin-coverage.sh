@@ -24,8 +24,9 @@
 # WHAT THIS GUARD DOES NOT DO
 # ---------------------------
 # It does not prove the workflow's schedule fires, and it cannot: GitHub honours `schedule` only for
-# workflows on the DEFAULT branch. That is covered instead by the workflow's own `pull_request` path
-# trigger, which includes the workflow file itself — so changing the gate runs the gate.
+# workflows on the DEFAULT branch. That leg stays unproven until this reaches main. The
+# `pull_request` leg needs no such proof — since #68 the workflow carries no `paths:` filter, so it
+# runs on every PR and is observed directly.
 #
 # Usage:  build/ci/verify-e2e-optin-coverage.sh
 # Exit:   0 = every opt-in test is wired, 1 = a gap, 2 = the guard could not scan.

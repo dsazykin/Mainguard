@@ -313,12 +313,24 @@
                             </Button.Flyout>
                         </Button>
 
-                        <!-- Auto-fetch freshness (T-10): dims once the picture is >15 min stale. -->
+                        <!-- Auto-fetch freshness (T-10): dims once the picture is >15 min stale, and turns
+                             warning-coloured while background fetch is FAILING — at which point this label
+                             and the ahead/behind badge next to it are both describing a stale picture. -->
                         <TextBlock Text="{Binding LastFetchedText}" FontSize="11" VerticalAlignment="Center"
                                    DataContext="{Binding CurrentWorkspace}" x:DataType="vm:RepoDashboardViewModel"
-                                   Foreground="{DynamicResource TextMuted}"
+                                   ToolTip.Tip="{Binding LastFetchedText}"
                                    Opacity="{Binding IsLastFetchStale, Converter={x:Static BoolToOpacityConverter.Instance}}"
-                                   IsVisible="{Binding LastFetchedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                                   IsVisible="{Binding LastFetchedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"
+                                   Classes.fetchFailing="{Binding IsAutoFetchFailing}">
+                            <TextBlock.Styles>
+                                <Style Selector="TextBlock">
+                                    <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
+                                </Style>
+                                <Style Selector="TextBlock.fetchFailing">
+                                    <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
+                                </Style>
+                            </TextBlock.Styles>
+                        </TextBlock>
                     </StackPanel>
 
                     <!-- EXPANDED: replaces the row above entirely while toggled on (JetBrains-style —

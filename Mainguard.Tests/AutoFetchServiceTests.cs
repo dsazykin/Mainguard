@@ -93,26 +93,73 @@ public class AutoFetchServiceTests
     }
 
     // 7e — network failures are counted (and surfaced) but never thrown; resets on success.
+    // Cycles are pumped until three failures land rather than assuming three cycles produce three
+    // failures: a failed repo now sits out cycles (see the backoff test below).
     [Fact]
     public async Task RunCycle_ShouldCountFailures_NeverThrow_AndResetOnSuccess()
     {
         var git = new FakeGit { FailNextFetches = 3 };
         using var svc = new AutoFetchService(git, () => Prefs(10));
         var failureEvents = new List<int>();
-        svc.FetchFailed += (_, count) => failureEvents.Add(count);
+        svc.FetchFailed += (_, count, _) => failureEvents.Add(count);
         svc.Watch("/repo/a");
 
-        await svc.RunCycleAsync();
-        await svc.RunCycleAsync();
-        await svc.RunCycleAsync();
+        for (var i = 0; i < 10 && failureEvents.Count < 3; i++) await svc.RunCycleAsync();
 
         Assert.Equal(3, svc.GetFailureCount("/repo/a"));
         Assert.Equal(new[] { 1, 2, 3 }, failureEvents);
         Assert.Null(svc.GetLastFetched("/repo/a")); // never succeeded
 
-        await svc.RunCycleAsync(); // 4th succeeds
+        for (var i = 0; i < 10 && svc.GetLastFetched("/repo/a") is null; i++) await svc.RunCycleAsync();
         Assert.Equal(0, svc.GetFailureCount("/repo/a"));
         Assert.NotNull(svc.GetLastFetched("/repo/a"));
+    }
+
+    /// <summary>
+    /// The failure reason travels with the event. FAILS BEFORE / PASSES AFTER: <c>FetchFailed</c> carried
+    /// only a count, so even a subscriber could not say WHY — and the count alone is not something a user
+    /// can act on. The reason is what turns "background fetch failed" into "your token expired".
+    /// </summary>
+    [Fact]
+    public async Task FetchFailed_CarriesTheReason_NotJustACount()
+    {
+        var git = new FakeGit { FailNextFetches = 1, FailureMessage = "authentication failed for 'origin'" };
+        using var svc = new AutoFetchService(git, () => Prefs(10));
+        var reasons = new List<string>();
+        svc.FetchFailed += (_, _, reason) => reasons.Add(reason);
+        svc.Watch("/repo/a");
+
+        await svc.RunCycleAsync();
+
+        Assert.Equal(new[] { "authentication failed for 'origin'" }, reasons);
+    }
+
+    /// <summary>
+    /// FAILS BEFORE / PASSES AFTER. <c>_failures</c> was counted and then used for nothing, so a repo
+    /// whose remote no longer exists re-ran the identical failing fetch on every single cadence tick for
+    /// as long as the app stayed open. Consecutive failures now back the repo off exponentially.
+    /// </summary>
+    [Fact]
+    public async Task RepeatedFailures_BackOff_InsteadOfRetryingEveryCycle()
+    {
+        var git = new FakeGit { FailNextFetches = int.MaxValue };
+        using var svc = new AutoFetchService(git, () => Prefs(10));
+        svc.Watch("/repo/a");
+
+        // 20 cycles against a remote that is simply gone.
+        for (var i = 0; i < 20; i++) await svc.RunCycleAsync();
+
+        // Backoff of 1,2,4,8 cycles between attempts → far fewer than one attempt per cycle.
+        var attempts = git.FetchAttempts;
+        Assert.True(attempts < 20, $"expected the failing repo to back off, but it retried {attempts}/20 cycles");
+        Assert.Equal(attempts, svc.GetFailureCount("/repo/a"));
+
+        // Backoff must not become a wedge: the repo is still retried, and a success clears it.
+        Assert.True(attempts >= 4, $"backoff starved the repo entirely ({attempts} attempts in 20 cycles)");
+        git.FailNextFetches = 0;
+        for (var i = 0; i < 20 && svc.GetLastFetched("/repo/a") is null; i++) await svc.RunCycleAsync();
+        Assert.NotNull(svc.GetLastFetched("/repo/a"));
+        Assert.Equal(0, svc.GetFailureCount("/repo/a"));
     }
 
     // Unwatch stops future cycles from touching a repo.
@@ -140,8 +187,13 @@ public class AutoFetchServiceTests
         public CurrentOperation Operation { get; set; } = CurrentOperation.None;
         public ManualResetEventSlim? FetchGate { get; set; }
         public int FailNextFetches { get; set; }
+        public string FailureMessage { get; set; } = "simulated network failure";
         public bool LastPrune { get; private set; }
         public int InFetch;
+
+        /// <summary>Every Fetch CALL, successful or not — <see cref="FetchCount"/> only counts the
+        /// successes, which cannot distinguish "backed off" from "kept failing".</summary>
+        public int FetchAttempts;
 
         public int FetchCount(string repo)
         {
@@ -153,6 +205,7 @@ public class AutoFetchServiceTests
         public void Fetch(string repoPath, bool prune = false)
         {
             Interlocked.Increment(ref InFetch);
+            Interlocked.Increment(ref FetchAttempts);
             try
             {
                 FetchGate?.Wait();
@@ -162,7 +215,7 @@ public class AutoFetchServiceTests
                     if (FailNextFetches > 0)
                     {
                         FailNextFetches--;
-                        throw new InvalidOperationException("simulated network failure");
+                        throw new InvalidOperationException(FailureMessage);
                     }
                     _fetches[repoPath] = (_fetches.TryGetValue(repoPath, out var c) ? c : 0) + 1;
                 }

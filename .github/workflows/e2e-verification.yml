@@ -25,23 +25,32 @@ name: E2E verification (in-jail, opt-in)
 # by roughly an order of magnitude. ~11 minutes is comparable to the ordinary `build-and-test` job.
 #
 # So the honest position is that COST is no longer much of an argument for keeping these out of the
-# PR gate. What keeps them out today is that the gate is RED: see below. Once that is fixed, moving
-# this job to every PR is a small, well-founded change — widen the trigger and delete this note.
+# PR gate. What kept them out was that the gate was RED. That is fixed (#68), so per this file's own
+# stated condition the trigger is now every PR and the path filter is gone.
 #
-# THE GATE IS CURRENTLY RED, AND THAT IS THE FINDING
-# --------------------------------------------------
-# On its first run, `.mainguard/verify` came back exit 1 from inside the jail because ONE test fails
+# WHAT THE GATE CAUGHT ON ITS FIRST RUN, AND WHAT IT ACTUALLY WAS (#68)
+# ---------------------------------------------------------------------
+# On its first run, `.mainguard/verify` came back exit 1 from inside the jail because ONE test failed
 # there: `AgentBranchGuardTests.SpawnInstallsTheHook_AndItRefusesABranchTheAgentTriesToCreate`
 # (509 passed / 1 failed / 120 skipped in Mainguard.Server.Tests; Mainguard.Tests fully green).
-# Nothing in PR #342 touches that test — it has simply been broken in-jail with nothing running it,
+# Nothing in PR #342 touched that test — it had simply been broken in-jail with nothing running it,
 # which is precisely the breakage ticket #65 predicted an unmeasured gate would be hiding.
 #
-# So the opt-in gate is KEPT for now — but as a decision that is renewed, not an inheritance:
+# The measured cause was NOT a git version floor (the leading hypothesis). The jail's git is 2.39.5,
+# well past the 2.28 that added `reference-transaction`. The cause was the FILESYSTEM: the suite
+# built its per-agent repositories under `Path.GetTempPath()`, and inside the jail that is a Docker
+# tmpfs — whose default flags are `nosuid,nodev,noexec`. git decides a hook exists with
+# `access(path, X_OK)`, which answers EACCES on a `noexec` mount whatever the mode bits say; git
+# prints a hint and carries on with exit 0. The hook was present at 0755 and never ran. One test
+# failed and three more passed VACUOUSLY, since they assert that ordinary git is NOT blocked — which
+# an inert hook satisfies perfectly.
+#
+# That is also why the path filter had to go rather than merely grow: see the trigger below.
+#
+# The other two legs of the decision stand, and are renewed rather than inherited:
 #
 #   1. schedule          — it runs nightly, so a break is found within a day rather than never.
 #   2. workflow_dispatch — a human can demand it at any time (e.g. before cutting a release).
-#   3. pull_request      — it runs on PRs that touch the VERIFICATION PATH itself, which is the
-#                          only class of change that can plausibly break it.
 #
 # and, separately, `build/ci/verify-e2e-optin-coverage.sh` runs on EVERY PR and fails if any
 # opt-in test is not named below. That is what stops the exclusion from silently re-inheriting:
@@ -51,10 +60,9 @@ name: E2E verification (in-jail, opt-in)
 # ----------------------------------------------------------------------------------------------
 # GitHub only honours `schedule` and `workflow_dispatch` for workflow files that exist on the
 # DEFAULT branch. This file arrives on `phase2`, so legs 1 and 2 above are INERT until phase2
-# reaches main. Leg 3 (`pull_request`) works immediately, and `.github/workflows/e2e-verification.yml`
-# is deliberately one of its own path triggers — so the PR that changes this gate is the PR that
-# proves the gate runs. That self-test is the reason ticket #65 could be closed once on the
-# strength of a workflow edit that never actually executed anything.
+# reaches main. `pull_request` works immediately and now fires on every PR, so the PR that changes
+# this gate is still the PR that proves the gate runs — that self-test is the reason ticket #65 could
+# be closed once on the strength of a workflow edit that never actually executed anything.
 # =================================================================================================
 
 on:
@@ -65,25 +73,17 @@ on:
 
   workflow_dispatch:
 
+  # EVERY pull request — no path filter. Taking the condition this file set for itself (below): the
+  # gate is green, so the trigger widens.
+  #
+  # The path filter is not merely no longer needed, it was UNSOUND, and #68 is the proof. The leg runs
+  # `.mainguard/verify`, which is `dotnet test Mainguard.slnx` — the WHOLE suite, inside the jail. Any
+  # product file and any test file can therefore break it. The first thing it ever caught was
+  # AgentBranchGuard, which the filter did not name and never would have: the gate could not have
+  # re-run on the fix for the bug it itself found. A filter can only be right for a job whose blast
+  # radius is enumerable, and this job's is the repository.
   pull_request:
     branches: [main, phase2, 'feat/**', 'fix/**']
-    # The VERIFICATION PATH. A path filter is normally how a guard silently stops running, which is
-    # why ci.yml refuses to use one — but here the filter IS the decision: these legs are too slow
-    # to run unconditionally, and every-PR coverage is provided by the coverage guard in ci.yml
-    # instead. Keep this list wider than feels necessary; a missed path costs a nightly, an
-    # over-broad one costs a slow PR.
-    paths:
-      - '.mainguard/**'                                    # the verify/toolchain commands themselves
-      - 'Mainguard.Agents/Agents/Sandbox/**'               # jail spawn + PackageCacheManager
-      - 'Mainguard.Agents/Agents/Toolchains/**'            # the user-managed toolchain channel
-      - 'Mainguard.Agents/Agents/Orchestrator/Verification*.cs'
-      - 'Mainguard.Server.Tests/Agents/VerifyInJailDockerTests.cs'
-      - 'Mainguard.Server.Tests/Agents/PythonToolchainDockerTests.cs'
-      - 'Mainguard.Server.Tests/Fixtures/RequiresDockerFact.cs'  # the opt-in gate itself
-      - 'images/mainguard-agent-base/**'                   # the jail's toolchain layer
-      - 'images/mainguard-egress-proxy/**'                 # the default-deny proxy they download through
-      - '.github/workflows/e2e-verification.yml'           # self-test: changing the gate exercises it
-      - 'build/ci/verify-e2e-optin-coverage.sh'
 
 concurrency:
   group: e2e-verification-${{ github.ref }}
