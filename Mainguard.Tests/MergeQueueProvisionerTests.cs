@@ -710,6 +710,82 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));
     }
 
+    /// <summary>
+    /// Decision: a rebase that CONFLICTS must leave the user something to act on, not a parked worktree
+    /// nobody surfaces.
+    ///
+    /// <para>The conflict arm was entirely dead in production — <c>AgentRunState.Conflict</c> had no
+    /// writer, <c>ConflictHandoff</c> was constructed nowhere outside tests, and the T-04 resolver it was
+    /// meant to reach does not exist yet. So the worktree would have been parked mid-rebase with the jail
+    /// paused and <i>nothing anywhere naming it</i>, which is byte-for-byte indistinguishable from an
+    /// agent that quietly stopped making progress.</para>
+    ///
+    /// <para>What this asserts is the three places the conflict now exists outside the background task
+    /// that produced it: the agent's run state (streamed to clients by the daemon's supervisor), the audit
+    /// trail (carrying the T-04 handoff payload for the resolver when it lands), and the queue entry's own
+    /// gate reason. The worktree stays parked — deliberately, no automatic <c>rebase --abort</c> — and the
+    /// jail stays paused, which is what the resolver needs; the change is that all of that is now legible.</para>
+    /// </summary>
+    [Fact]
+    public async Task AConflictingRebase_ParksTheWorktree_AndSaysSoInThreePlaces()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        // Both agents edit the SAME file differently — the rebase cannot replay the second onto the first.
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "shared.cs", "public class Shared { int First; }\n");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
+
+        var states = new List<(string Agent, string State)>();
+        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId, states: states);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        // (1) The agent's run state — the one the daemon's supervisor streams to clients.
+        Assert.Contains(states, s => s.Agent == SecondAgent && s.State == nameof(AgentRunState.Conflict));
+
+        // (2) The audit trail, carrying the T-04 handoff payload (which worktree, which branch).
+        var handoff = Assert.Single(_audit.Read(), e =>
+            e.Type == MergeQueueProvisioner.KeepAliveConflictEvent && e.Fields["agent"] == SecondAgent);
+        Assert.NotEmpty(handoff.Fields["worktree"]);
+
+        // (3) The queue entry itself: not falsely Verified, not stuck at StaleVerified, and its refusal
+        // says what happened rather than "not verified yet".
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Contains("conflict", reason);
+        Assert.Contains("resolve", reason);
+
+        // The rebase is LEFT in progress for the resolver — no automatic abort (a rejection trigger).
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        Assert.True(Directory.Exists(Path.Combine(ResolveGitDir(worktree), "rebase-merge")));
+    }
+
+    /// <summary>A linked worktree's <c>.git</c> is a file pointing at the real gitdir.</summary>
+    private static string ResolveGitDir(string worktreePath)
+    {
+        var dotGit = Path.Combine(worktreePath, ".git");
+        if (Directory.Exists(dotGit))
+        {
+            return dotGit;
+        }
+
+        foreach (var line in File.ReadAllLines(dotGit))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("gitdir:", StringComparison.Ordinal))
+            {
+                var target = trimmed["gitdir:".Length..].Trim();
+                return Path.IsPathRooted(target) ? target : Path.GetFullPath(Path.Combine(worktreePath, target));
+            }
+        }
+
+        return dotGit;
+    }
+
     // ---- harness ---------------------------------------------------------
 
     /// <summary>
@@ -718,7 +794,8 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// </summary>
     /// <param name="jailFor">agentId → its live jail, or null when the agent has been stopped.</param>
     private MergeQueueProvisioner NewRebasingProvisioner(
-        out FakeSandboxEngine engine, Func<string, string?> jailFor)
+        out FakeSandboxEngine engine, Func<string, string?> jailFor,
+        List<(string Agent, string State)>? states = null)
     {
         var sandbox = new FakeSandboxEngine(exitCode: 0);
         engine = sandbox;
@@ -747,16 +824,35 @@ public sealed class MergeQueueProvisionerTests : IDisposable
                 containerIdFor: jailFor),
             locateAgentWorktree: (repoHash, agentId) => new WorktreeManager(vmRoot).WorktreePathFor(repoHash, agentId),
             publishRebasedAgentRef: (repoHash, agentId) =>
-                new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId));
+                new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId),
+            agentStates: states is null ? null : new RecordingSupervisor(states));
     }
 
     /// <summary>Lands the agent's work on the agent branch, exactly as <see cref="CommitOnAgentBranch"/>
     /// does, for the multi-agent tests that need more than one id.</summary>
-    private void CommitOnAgentBranchFor(string repoHash, string agentId, string fileName)
+    private void CommitOnAgentBranchFor(string repoHash, string agentId, string fileName, string? content = null)
     {
         var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, agentId);
-        WriteAndCommit(worktree, fileName, $"public class {Path.GetFileNameWithoutExtension(fileName)} {{ }}\n",
+        WriteAndCommit(worktree, fileName,
+            content ?? $"public class {Path.GetFileNameWithoutExtension(fileName)} {{ }}\n",
             $"{agentId}'s actual work");
+    }
+
+    /// <summary>Records every run state the keep-alive cycle reflects on an agent.</summary>
+    private sealed class RecordingSupervisor : IAgentSupervisor
+    {
+        private readonly List<(string Agent, string State)> _states;
+
+        public RecordingSupervisor(List<(string Agent, string State)> states) => _states = states;
+
+        public void PauseInput(string agentId) { }
+
+        public void ResumeInput(string agentId) { }
+
+        public void MarkState(string agentId, string state, string? reason)
+        {
+            lock (_states) { _states.Add((agentId, state)); }
+        }
     }
 
     /// <summary>
