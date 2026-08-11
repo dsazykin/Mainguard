@@ -1146,6 +1146,58 @@ public class GitService : IGitService
     }
 
     /// <summary>
+    /// Turns a refused SSH key exchange into a message the user can act on, by looking at the key
+    /// Mainguard would have used and whether a passphrase for it is in the keyring.
+    ///
+    /// <para>The three cases have three different remedies, and telling them apart is the whole point:
+    /// no key at all (generate or add one), an encrypted key with a stored passphrase (the passphrase is
+    /// stored but the running <c>ssh</c> never asked Mainguard for it — the key must be loaded into the
+    /// agent), and a key with no stored passphrase (it is either locked or not trusted by the host).</para>
+    /// </summary>
+    private static SshAuthenticationException BuildSshAuthenticationException(Exception inner)
+    {
+        string? keyPath = null;
+        var hasStored = false;
+        try
+        {
+            var ssh = new Mainguard.Git.Security.SshKeyService();
+            // Same preference order as CredentialResolver.ResolveDefaultKey — the message must name the
+            // key the operation would actually have used.
+            var keys = ssh.ListKeys();
+            var key = keys.FirstOrDefault(k => k.Name is "id_ed25519")
+                ?? keys.FirstOrDefault(k => k.Name is "id_rsa")
+                ?? keys.FirstOrDefault();
+            if (key is not null)
+            {
+                keyPath = key.PrivateKeyPath;
+                hasStored = !string.IsNullOrEmpty(ssh.GetPassphrase(key.PrivateKeyPath));
+            }
+        }
+        catch
+        {
+            // Unreadable ~/.ssh or no keyring on this box: fall through to the generic message rather
+            // than replacing an auth error with a filesystem one.
+        }
+
+        var message = keyPath is null
+            ? "SSH authentication failed: no usable SSH key was found in ~/.ssh. "
+              + "Open Settings → SSH Keys to generate one and add it to your host."
+            : hasStored
+                ? $"SSH authentication failed for {System.IO.Path.GetFileName(keyPath)}. Its passphrase is "
+                  + "saved in Mainguard, but the system ssh agent was not holding the unlocked key — "
+                  + "run ssh-add for it, or check the key is added to your host in Settings → SSH Keys."
+                : $"SSH authentication failed for {System.IO.Path.GetFileName(keyPath)}. The key is either "
+                  + "passphrase-protected with no saved passphrase, or not accepted by the host. "
+                  + "Open Settings → SSH Keys to save its passphrase or copy the public key to your host.";
+
+        return new SshAuthenticationException(message, inner)
+        {
+            KeyPath = keyPath,
+            HasStoredPassphrase = hasStored,
+        };
+    }
+
+    /// <summary>
     /// Runs a git command against the given remote, injecting a token via git's
     /// credential mechanism when one is available for that remote's host. The
     /// token is passed in the child process ENVIRONMENT and read by an inline
@@ -1168,6 +1220,16 @@ public class GitService : IGitService
             }
             catch (AuthenticationRequiredException ex)
             {
+                // An SSH-form remote that was refused is NOT a "sign in / store a token" problem, and
+                // routing it to the PAT dialog (which is what the generic branch below does) offers a
+                // remedy that cannot work. git's stderr for a locked or untrusted key is
+                // "Permission denied (publickey)", which the classifier in RunGitChecked matches as a
+                // generic auth failure — so every SSH key problem used to arrive at the token dialog.
+                if (Mainguard.Git.Security.SshKeyService.IsSshRemote(url))
+                {
+                    throw BuildSshAuthenticationException(ex);
+                }
+
                 // T-14: an unknown-host-no-token failure carries the host so the UI can
                 // route to the per-host PAT dialog instead of a generic auth notice.
                 throw new AuthenticationRequiredException(ex.Message, string.IsNullOrEmpty(host) ? null : host, ex);

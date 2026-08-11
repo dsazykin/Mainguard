@@ -217,8 +217,16 @@
   remotes CRUD + push options: tracked-remote resolution, zero-remote typed throw, the
   force-with-lease succeed/stale-fail safety pair, set-upstream config, push-tags — the CLI push paths
   carry `RequiresGitCli`), `AutoFetchServiceTests` (T-10 auto-fetch:
-  cadence/enable/skip-in-op/no-self-overlap/failure-count via a fake `IGitService` + the
-  `RunCycleAsync` seam — no real waiting), `GitServiceBlameTests` (T-11 blame: per-line→SHA mapping
+  cadence/enable/skip-in-op/no-self-overlap/failure-count + the failure REASON on `FetchFailed` and the
+  consecutive-failure backoff, via a fake `IGitService` + the `RunCycleAsync` seam — no real waiting),
+  `AutoFetchFailureSurfacingTests` (the other half, end to end: a real failing fetch against a deleted
+  bare remote must reach the USER — one error toast per outage plus a "Fetch failing" freshness label —
+  because `FetchFailed` previously had no production subscriber at all, so a stale ahead/behind badge
+  sat next to a label still counting up from the last success),
+  `SshAuthenticationSurfacingTests` (`SshAuthenticationException` is genuinely THROWN for an SSH-form
+  remote whose key is refused — it had 1 definition, 1 catch and 0 throws — so the failure stops being
+  reported as "sign in to &lt;host&gt;" over the PAT dialog; drives a real `git fetch` whose
+  `core.sshCommand` answers the way a locked key does, so no SSH server is needed), `GitServiceBlameTests` (T-11 blame: per-line→SHA mapping
   over disjoint-edit commits, starting-at-prior-commit, typed throw on missing path, cache
   invalidation on HEAD change), `BlameCacheTests` (T-11 bounded-LRU eviction + per-repo invalidation),
   `BlameViewModelTests` (T-11 cancel-stale-load on rapid file switch), `GitServiceFileHistoryTests`
@@ -949,8 +957,23 @@
   probe is pinned in BOTH directions, an occupied candidate is injected and must be rejected, the
   search is bounded, a port is stolen mid-body on cue and must be retried on a different one, and the
   control proves a failure on a still-dead port surfaces on the first attempt)**. **P2-13
-  activity-bar/docking tests:** `AttentionDerivationTests`, `ActivityBarOrderingTests`,
+  activity-bar/docking tests:** `AttentionDerivationTests`, `ActivityBarOrderingTests` (+
+  `ActivityBarRailUsesProjectionTests` — the rail really ROUTES through `AgentListProjection.LifoOrder`
+  rather than re-spelling it inline, proved through a same-spawn-instant tie only the helper breaks;
+  plus the bulk-snapshot ordering, which the old per-row `Insert(0, …)` reversed),
   `NotificationSuppressionTests`, `DockLayoutPersistenceTests` (pure),
+  **`DockLayoutRestoreTests` (the persistence is actually WIRED: `AgentWorkspaceViewModel` reports its
+  pane order, restores a saved one, saves on close before teardown clears the graph, lets the live deck
+  preference beat the file, and never loses a pane to a stale/duplicate/unknown `ToolOrder`)**,
+  **`AgentPumpResilienceTests` (the agent-event pump re-subscribes after its stream ends — it was the
+  one pump with no `ReconnectLoopAsync`, so any fault froze the rail for the process lifetime with
+  `ConnectionState` still `Connected` and no banner — and one throwing UI subscriber no longer skips
+  the `Changed` redraw or kills the stream)**,
+  **`EgressAllowlistReachabilityTests` (the allowlist editor reads/writes the live gateway, reports an
+  unreachable daemon instead of rendering an empty policy, and is reachable both at rest — the
+  coordinator toolbar — and from the block prompt)**,
+  **`ReviewCockpitVerifiedShaTests` (the daemon's `verified_main_sha` reaches the cockpit's
+  "verified @ sha" stamp, and an unverified entry draws no stamp rather than a fabricated one)**,
   **`ControlCenterLiveWiringTests` (P2-47 integration proof #2 — the "no mock AND no empty-stub"
   guard: the shipped `App.CreateProductionOrchestratorServices` bundle exposes the real
   `DaemonBackedOrchestrator` behind EVERY seam — agents/queue/coordinator/kill/telemetry — and never a

@@ -20,7 +20,9 @@ namespace Mainguard.Git.Services;
 /// <item>Never runs concurrently with itself for the same repo (per-repo in-flight guard).</item>
 /// <item>Skips a repo mid merge/rebase (<see cref="CurrentOperation"/> != None) so it never interferes.</item>
 /// <item>Skips entirely when <see cref="UserPreferences.AutoFetchMinutes"/> is 0 (disabled).</item>
-/// <item>Fetch failures are counted and surfaced via <see cref="FetchFailed"/> — never thrown, never toasted.</item>
+/// <item>Fetch failures are counted and surfaced via <see cref="FetchFailed"/> — never thrown.</item>
+/// <item>Consecutive failures back the repo off exponentially (<see cref="MaxBackoffCycles"/> cap),
+/// so a dead remote is retried at a decreasing rate instead of once a minute forever.</item>
 /// </list>
 ///
 /// Determinism: the timer cadence and clock are test seams (<see cref="IntervalOverride"/>,
@@ -36,6 +38,13 @@ public sealed class AutoFetchService : IDisposable
     private readonly ConcurrentDictionary<string, byte> _inFlight = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, DateTimeOffset> _lastFetched = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, int> _failures = new(StringComparer.Ordinal);
+    /// <summary>Cycles still to skip for a repo before its next retry (the backoff counter).</summary>
+    private readonly ConcurrentDictionary<string, int> _cooldown = new(StringComparer.Ordinal);
+
+    /// <summary>The backoff ceiling, in cycles. At the default 5-minute cadence a repo whose remote is
+    /// gone settles at one attempt per ~80 minutes rather than one every five — enough to notice a token
+    /// being renewed, cheap enough to leave running all day.</summary>
+    internal const int MaxBackoffCycles = 16;
 
     private readonly object _loopLock = new();
     private CancellationTokenSource? _cts;
@@ -51,9 +60,17 @@ public sealed class AutoFetchService : IDisposable
     /// <summary>Raised on the thread pool after a repo fetches successfully.</summary>
     public event Action<string /*repoPath*/>? Fetched;
 
-    /// <summary>Raised when a fetch fails, carrying the running consecutive-failure count
-    /// so the UI can show a subtle warning state (no modal / toast spam).</summary>
-    public event Action<string /*repoPath*/, int /*consecutiveFailures*/>? FetchFailed;
+    /// <summary>
+    /// Raised when a fetch fails, carrying the running consecutive-failure count and the reason, so the
+    /// UI can show a subtle warning state (no modal / toast spam).
+    ///
+    /// <para>Nothing in the app subscribed to this. The one production consumer
+    /// (<c>RepoDashboardViewModel</c>) listened to <see cref="Fetched"/> alone, so an expired token or a
+    /// deleted remote left "Fetched N min ago" quietly frozen at its last success while the ahead/behind
+    /// badge beside it went stale — the user's only signal that their branch is behind, silently wrong,
+    /// with the label still saying it was checked recently.</para>
+    /// </summary>
+    public event Action<string /*repoPath*/, int /*consecutiveFailures*/, string /*reason*/>? FetchFailed;
 
     /// <summary>Test seam: overrides the derived <c>AutoFetchMinutes</c> cadence. Never set in production.</summary>
     internal TimeSpan? IntervalOverride { get; set; }
@@ -149,6 +166,16 @@ public sealed class AutoFetchService : IDisposable
             return null;
         }
 
+        // Failure backoff: a repo that just failed sits out the next few cycles. The counter is
+        // consumed here rather than in the catch so one cycle == one decrement regardless of how many
+        // repos are watched. Without this, a remote that is simply gone re-ran the same failing fetch
+        // (and its process spawn) every single cadence tick for as long as the app stayed open.
+        if (_cooldown.TryGetValue(repoPath, out var remaining) && remaining > 0)
+        {
+            _cooldown[repoPath] = remaining - 1;
+            return null;
+        }
+
         // Per-repo overlap guard: only one auto-fetch per repo at a time.
         if (!_inFlight.TryAdd(repoPath, 0)) return null;
 
@@ -159,18 +186,31 @@ public sealed class AutoFetchService : IDisposable
                 _git.Fetch(repoPath, prune: true);
                 _lastFetched[repoPath] = Clock();
                 _failures[repoPath] = 0;
+                _cooldown[repoPath] = 0;
                 Fetched?.Invoke(repoPath);
             }
-            catch
+            catch (Exception ex)
             {
                 var count = _failures.AddOrUpdate(repoPath, 1, (_, c) => c + 1);
-                FetchFailed?.Invoke(repoPath, count);
+                _cooldown[repoPath] = BackoffCycles(count);
+                FetchFailed?.Invoke(repoPath, count, ex.Message);
             }
             finally
             {
                 _inFlight.TryRemove(repoPath, out _);
             }
         });
+    }
+
+    /// <summary>Cycles to skip after <paramref name="consecutiveFailures"/> failures: 1, 2, 4, 8, …
+    /// capped at <see cref="MaxBackoffCycles"/>. The first failure costs one skipped cycle, so a single
+    /// blip barely delays recovery.</summary>
+    internal static int BackoffCycles(int consecutiveFailures)
+    {
+        if (consecutiveFailures <= 0) return 0;
+        var cycles = 1;
+        for (var i = 1; i < consecutiveFailures && cycles < MaxBackoffCycles; i++) cycles *= 2;
+        return Math.Min(cycles, MaxBackoffCycles);
     }
 
     public void Dispose()
