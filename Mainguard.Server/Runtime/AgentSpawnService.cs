@@ -580,7 +580,7 @@ public sealed class AgentSpawnService
         // but "and the served surface is exactly these five" was a property of control flow that no
         // reader and no test could check — which is the failure mode §5 names (MG-12: two copies of a
         // rule, one of them decorative).
-        if (!CoordinatorHandlers.TryGetValue(request.Op, out var handler))
+        if (!_coordinatorHandlers.TryGetValue(request.Op, out var handler))
         {
             return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
         }
@@ -601,9 +601,6 @@ public sealed class AgentSpawnService
     /// </summary>
     private readonly ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
         _coordinatorHandlers;
-
-    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
-        CoordinatorHandlers => _coordinatorHandlers;
 
     private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
         BuildCoordinatorHandlers()
@@ -663,7 +660,7 @@ public sealed class AgentSpawnService
     /// of contract §3's exhaustiveness claim: it must set-equal <see cref="AgentIpcRequest.CoordinatorOps"/>.
     /// </summary>
     internal IReadOnlySet<string> ServedCoordinatorOps =>
-        CoordinatorHandlers.Keys.ToHashSet(StringComparer.Ordinal);
+        _coordinatorHandlers.Keys.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>
     /// <c>spawn_worker</c> (contract §3) — start a Managed worker on the described task, under the caps.
@@ -955,7 +952,7 @@ public sealed class AgentSpawnService
         // Same shape as the coordinator's, and for the same reason: WorkerOps is the allow-list, consulted
         // before anything is routed, so the worker's served surface is an object a test can hold rather
         // than a set of case labels a reader has to trust.
-        if (!WorkerHandlers.TryGetValue(request.Op, out var handler))
+        if (!_workerHandlers.TryGetValue(request.Op, out var handler))
         {
             return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
         }
@@ -970,9 +967,6 @@ public sealed class AgentSpawnService
     /// </summary>
     private readonly ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
         _workerHandlers;
-
-    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
-        WorkerHandlers => _workerHandlers;
 
     private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
         BuildWorkerHandlers()
@@ -990,7 +984,7 @@ public sealed class AgentSpawnService
     }
 
     /// <summary>Exactly what a worker endpoint will serve; must set-equal <see cref="AgentIpcRequest.WorkerOps"/>.</summary>
-    internal IReadOnlySet<string> ServedWorkerOps => WorkerHandlers.Keys.ToHashSet(StringComparer.Ordinal);
+    internal IReadOnlySet<string> ServedWorkerOps => _workerHandlers.Keys.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>What am I here to plan? The brief and the live plan's state — never the task prompt.</summary>
     private AgentIpcResponse Brief(string workerAgentId)
