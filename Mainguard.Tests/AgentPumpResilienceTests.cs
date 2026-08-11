@@ -6,8 +6,8 @@ using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Net.Client;
 using Mainguard.Agents.UI.Services;
-using Proto = Mainguard.Protos.V1;
 using Xunit;
+using Proto = Mainguard.Protos.V1;
 
 namespace Mainguard.Tests;
 
