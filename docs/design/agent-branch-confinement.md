@@ -67,9 +67,14 @@ This is not hypothetical. It is how the guard shipped: the test suite built its 
 under `Path.GetTempPath()`, and when the suite runs inside the jail (`.mainguard/verify` is
 `dotnet test Mainguard.slnx`) that is a Docker tmpfs, whose default flags are `nosuid,nodev,noexec`. The
 jail's git is 2.39.5 — the `reference-transaction` hook has been supported since 2.28, so the version was
-never the problem. **The guard fired on the host and never in the jail, which is the only place agents
-run.** One test failed; three more passed vacuously, because they assert that ordinary git is *not*
-blocked, which an inert hook satisfies perfectly.
+never the problem. One test failed; three more passed vacuously, because they assert that ordinary git is
+*not* blocked, which an inert hook satisfies perfectly.
+
+Be precise about the blast radius: **real agents were not unprotected.** In production the agent
+repository is a bind mount from an ext4 VM path (`ContainerSpecBuilder.BuildMounts` →
+`RejectNonExt4Source(request.AgentRepoPath)`), and a bind mount adds no `noexec`, so the hook fired. What
+was broken is that the only thing *measuring* the guard measured a filesystem the product never uses —
+and that the guard could not have reported it if the VM root ever moved somewhere without exec.
 
 So `InstallHook` returns **ARMED, not written**: `MeasureHookCanRun` runs the hook it just wrote (with a
 phase other than `prepared`, which the script's own first line makes a side-effect-free exit 0), catching
