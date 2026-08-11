@@ -73,7 +73,7 @@
                  a Start / Stop / Restart toolbar. Start spawns a REAL CLI in its own hardened jail and its
                  interactive terminal appears below; that terminal is how you talk to it (and where CLI login
                  happens when no key is stored). -->
-            <Grid RowDefinitions="Auto,*" Margin="10">
+            <Grid RowDefinitions="Auto,Auto,*" Margin="10">
 
               <!-- header + lifecycle controls -->
               <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,8">
@@ -111,8 +111,29 @@
                 </StackPanel>
               </Grid>
 
+              <!-- THE PLAN GATE (phase 2, contract §2). This is the human half of the loop: each worker
+                   writes its own plan and STOPS until this is decided.
+
+                   It lives here, above the coordinator's terminal, rather than in the right rail or inside
+                   the (no longer rendered) chat panel, for one reason: the state it exists to explain is a
+                   silence in THIS pane. A worker held at the gate keeps its jail and its slot against the
+                   worker cap, so a full cap of blocked workers means the coordinator has stopped spawning
+                   — and the operator watching for that is watching this terminal, where nothing is
+                   happening and nothing says why. The decision and the explanation for the silence belong
+                   in the same field of view. The merge queue on the right is the wrong home: that rail is
+                   work already done, and approval is the gate BEFORE work starts.
+
+                   The region costs nothing when idle: HasGateContent collapses it entirely unless a plan,
+                   an escalation or a backpressure sentence is waiting, and the ScrollViewer bounds it so a
+                   saturated cap's six cards scroll rather than squeezing the terminal off the surface. -->
+              <ScrollViewer Grid.Row="1" MaxHeight="360" Margin="0,0,0,8"
+                            IsVisible="{Binding Coordinator.HasGateContent}"
+                            HorizontalScrollBarVisibility="Disabled">
+                <views:PlanGateView DataContext="{Binding Coordinator}"/>
+              </ScrollViewer>
+
               <!-- body: the built-in terminal once a coordinator exists; otherwise the start explainer -->
-              <Border Grid.Row="1" Background="{DynamicResource SurfaceCard}" CornerRadius="8" ClipToBounds="True"
+              <Border Grid.Row="2" Background="{DynamicResource SurfaceCard}" CornerRadius="8" ClipToBounds="True"
                       BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
                 <Panel>
                   <!-- coordinator exists (live or dead) → its interactive terminal, or a placeholder

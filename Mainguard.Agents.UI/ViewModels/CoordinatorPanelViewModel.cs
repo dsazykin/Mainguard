@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
 using System.Threading.Tasks;
@@ -35,7 +36,19 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     /// <summary>Workers that stopped after spending their revision budget — these need a human, not a click.</summary>
     public ObservableCollection<EscalatedPlanViewModel> EscalatedPlans { get; } = new();
 
+    /// <summary>
+    /// One card per <b>blocked worker</b>, not one card for the queue.
+    ///
+    /// <para>This is a collection rather than a single slot because the state the gate exists to explain is
+    /// specifically the plural one: blocked workers fill the worker cap and the coordinator stops spawning.
+    /// Showing only the head of that queue renders the cap-saturated case as a single pending decision and
+    /// leaves the operator no way to see — let alone clear — the other five.</para>
+    /// </summary>
+    public ObservableCollection<PlanCardViewModel> PendingPlans { get; } = new();
+
+    /// <summary>The head of <see cref="PendingPlans"/>; kept because the single-decision path reads better.</summary>
     [ObservableProperty] private PlanCardViewModel? _pendingPlan;
+
     [ObservableProperty] private string _composerText = "";
     [ObservableProperty] private string _pressureText = "";
 
@@ -46,6 +59,14 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [ObservableProperty] private bool _isCapSaturatedByBlockedWorkers;
 
     [ObservableProperty] private bool _isEmpty;
+
+    /// <summary>
+    /// True when the gate has something the human must read: a decision to make, a worker that escalated,
+    /// or the daemon's backpressure sentence. Hosts bind their whole region to this, so an idle
+    /// orchestration costs no vertical space at all — the gate appears because something is waiting, which
+    /// is the only reason it should ever be on screen.
+    /// </summary>
+    [ObservableProperty] private bool _hasGateContent;
 
     public CoordinatorPanelViewModel(ICoordinatorService coordinator)
     {
@@ -62,12 +83,32 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         IsEmpty = Transcript.Count == 0;
 
         var cards = _coordinator.GetWorkerPlans();
-        var pending = cards.Where(c => c.IsPending).ToList();
-        var first = pending.FirstOrDefault();
-        if (first is null)
-            PendingPlan = null;
-        else if (PendingPlan?.PlanId != first.PlanId || PendingPlan?.Revision != first.Revision)
-            PendingPlan = new PlanCardViewModel(first, DecideAsync);
+        var pending = cards.Where(c => c.IsPending).OrderBy(c => c.PresentedAt).ToList();
+
+        // Reconcile in place rather than rebuild. A card whose (id, revision) is unchanged is the SAME
+        // decision, and replacing its ViewModel would throw away the feedback the human is halfway through
+        // typing and the error text from a decision that just failed — on a surface whose whole job is to
+        // let them retry. Cards are only created for plans that are new or newly revised.
+        var kept = new List<PlanCardViewModel>(pending.Count);
+        foreach (var plan in pending)
+        {
+            var existing = PendingPlans.FirstOrDefault(
+                c => c.PlanId == plan.PlanId && c.Revision == plan.Revision);
+            kept.Add(existing ?? new PlanCardViewModel(plan, DecideAsync));
+        }
+
+        for (int i = PendingPlans.Count - 1; i >= 0; i--)
+        {
+            if (!kept.Contains(PendingPlans[i])) PendingPlans.RemoveAt(i);
+        }
+
+        for (int i = 0; i < kept.Count; i++)
+        {
+            if (i >= PendingPlans.Count) PendingPlans.Add(kept[i]);
+            else if (!ReferenceEquals(PendingPlans[i], kept[i])) PendingPlans[i] = kept[i];
+        }
+
+        PendingPlan = PendingPlans.FirstOrDefault();
 
         EscalatedPlans.Clear();
         foreach (var escalated in cards.Where(c => c.IsEscalated))
@@ -80,6 +121,8 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         var backpressure = _coordinator.GetBackpressure();
         BackpressureText = backpressure.Signal;
         IsCapSaturatedByBlockedWorkers = backpressure.CapSaturatedByBlockedWorkers;
+
+        HasGateContent = PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0;
     }
 
     private async Task DecideAsync(string planId, bool approve, string? feedback)
