@@ -61,13 +61,17 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     private const int MaxToasts = 3;
     public System.Collections.ObjectModel.ObservableCollection<ToastViewModel> Toasts { get; } = new();
 
-    [ObservableProperty]
-    private bool _isSshPassphrasePromptVisible;
-
-    [ObservableProperty]
-    private string _sshPassphraseInput = string.Empty;
-
-    private string _pendingAction = string.Empty;
+    // NOTE (removed, deliberately): there used to be an inline SSH-passphrase prompt here —
+    // IsSshPassphrasePromptVisible / SshPassphraseInput / Save+CancelSshPassphraseCommand. All four
+    // layers of it were dead. No .axaml bound any of them, so the prompt could not appear; the handler
+    // that set the flag showed no notification, so the failure was silent; the exception that triggered
+    // it was never thrown by anything; and the secret it wrote ("ssh_passphrase") was never read, since
+    // SshKeyService keys passphrases per key as "sshpass_<path>". Reinstating it would have meant
+    // building a modal AND an SSH_ASKPASS bridge to hand the secret to ssh — a feature, not a defect
+    // fix, and one that wants the passphrase off the keyring-only path this app is careful about.
+    // What replaced it: SshAuthenticationException is now genuinely thrown (GitService), and
+    // HandleGitActionException below reports it and routes to Settings → SSH Keys, which is where
+    // passphrases are actually stored.
 
     public StagingPanelViewModel StagingPanel { get; }
     public DiffViewerViewModel DiffViewer { get; }
@@ -307,29 +311,6 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
         });
     }
 
-    [RelayCommand]
-    private void SaveSshPassphrase()
-    {
-        var keyring = new Mainguard.Git.Security.SecureKeyring();
-        keyring.SaveSecret("ssh_passphrase", SshPassphraseInput);
-        IsSshPassphrasePromptVisible = false;
-        SshPassphraseInput = string.Empty;
-
-        // Retry the pending action
-        if (_pendingAction == "Push") PushCommand.Execute(null);
-        else if (_pendingAction == "Pull") PullCommand.Execute(null);
-        else if (_pendingAction == "Fetch") FetchCommand.Execute(null);
-        else if (_pendingAction == "UpdateProject") UpdateProjectCommand.Execute(null);
-    }
-
-    [RelayCommand]
-    private void CancelSshPassphrase()
-    {
-        IsSshPassphrasePromptVisible = false;
-        SshPassphraseInput = string.Empty;
-        ShowNotification("Action cancelled because SSH passphrase was not provided.", true);
-    }
-
     // Returns the exception of type T whether it is the thrown exception itself
     // or wrapped as its InnerException, so callers can surface the typed
     // exception's own actionable message rather than an outer wrapper's text.
@@ -338,10 +319,12 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
 
     private void HandleGitActionException(System.Exception ex, string actionName)
     {
-        if (Unwrap<Mainguard.Git.Exceptions.SshAuthenticationException>(ex) is not null)
+        if (Unwrap<Mainguard.Git.Exceptions.SshAuthenticationException>(ex) is { } ssh)
         {
-            _pendingAction = actionName;
-            IsSshPassphrasePromptVisible = true;
+            // An SSH key problem is NOT a token problem: the Accounts/PAT route below cannot fix it.
+            // Say what failed, then land the user on the page that owns SSH keys and their passphrases.
+            ShowNotification($"{actionName} failed: {ssh.Message}", true);
+            _ = ManageSshKeysAsync();
         }
         else if (Unwrap<Mainguard.Git.Exceptions.MergeConflictException>(ex) is { } conflict)
         {
