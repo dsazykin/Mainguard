@@ -4,9 +4,13 @@
 - **`Mainguard.Tests/MainguardPathsGuardTests.cs`** — the structural guard for the mainguardd
   crash-loop bug class: scans the shipping source and fails on any `Environment.GetFolderPath` outside
   `MainguardPaths.cs` (see that entry).
-  - **`Mainguard.Tests/MainguardPathsMigrationTests.cs`** — the Phase-4 Windows data-root migration
-    policy over `MainguardPaths.TryMigrateDataRoot`: moves legacy→current only when current is absent
-    (preserving contents), no-ops when current already exists or on a fresh install, and is idempotent.
+  - **`Mainguard.Tests/TestDataRootIsolation.cs`** (PR #287) — a `[ModuleInitializer]` pointing the
+    ENTIRE desktop test assembly at a throwaway `%TEMP%` data root before any test runs, via
+    `MainguardPaths.DataRootOverrideVariable`. Per-assembly by construction, so a new test cannot
+    forget to opt in; an externally pinned root is respected, and abandoned runs are swept.
+  - **`Mainguard.Tests/DataRootIsolationTests.cs`** — the teeth behind it: the run must not resolve to
+    (or sit inside) the developer's real `~/.mainguard`, which the suite otherwise shared — one SQLite
+    file, one `config.json`, one keyring. Delete the initializer body and every fact here goes red.
   - **`Mainguard.Tests/AgentCliUiTests.cs`** — the P2-22 §J-5 CLI-picker surfaces (OOBE step + settings
     window) driven over fake channel/host seams with the REAL `AgentCliInstaller`/`AdapterChannel`: an
     install failure never blocks finishing setup, failures name an actionable cause (hash-mismatch →
@@ -1199,7 +1203,17 @@
   `StartAttempts`. Neither mechanism suffices alone: the allocator cannot stop a foreign process
   taking the port, and a retry alone would still let two of our own hosts collide)**,
   `TestPortAllocationTests` (the fixtures' own deterministic proof — both mechanisms driven through
-  injectable seams, since a race cannot be failed on demand). Test classes: `DaemonAuthTests` (auth
+  injectable seams, since a race cannot be failed on demand),
+  **`Mainguard.Server.Tests/TestDataRootIsolation.cs`** (the daemon twin of the desktop suite's
+  module initializer: PR #287 flagged this assembly as "likely" affected without proving it, and it
+  was — every `DaemonHost.Resolve*` store path falls back to `MainguardPaths.DataRoot()` when handed
+  no token path, and one clean run rewrote the real mTLS identity, held `mainguard-daemon.db` open and
+  left 13 live agent-IPC sockets in the user's data root) and
+  **`Mainguard.Server.Tests/DataRootIsolationTests.cs`** (its teeth, and more: besides proving the run
+  is not on the real root, `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
+  the SHIPPED resolver set that each one both TAKES and USES a token path — the case a hand-widened
+  exact-set list would wave through, and the one that would make every concurrent in-proc host share a
+  single file). Test classes: `DaemonAuthTests` (auth
   coverage incl. the reflect-every-method `[Theory]` + loopback bind),
   **`DaemonTransportSecurityTests` (MG-19 — every test holds a VALID bearer token, so each one proves
   the token is no longer sufficient on its own: plaintext h2c refused, no-client-certificate refused,
