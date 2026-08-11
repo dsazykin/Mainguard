@@ -109,6 +109,22 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         _depsRefreshRunner = depsRefreshRunner ?? DefaultDepsRefreshRunner;
     }
 
+    /// <summary>
+    /// The refusal a stale override earns on a service that was built with nowhere to record it.
+    ///
+    /// <para><b>Why the override is refused rather than merely un-audited.</b> P2-10 step 4 defines this
+    /// path as three things at once — loudly labeled, journaled, and audited (<c>stale_override_used</c>) —
+    /// and only the first two survive a missing sink. An override that merges without leaving the record
+    /// is not a lighter version of the feature; it is the one merge in the product that bypasses the gate,
+    /// performed with no trace that it happened. <c>onStaleOverride</c> was optional and every production
+    /// composition omitted it, so <c>MergeQueue.RecordStaleOverrideUse</c> had no caller anywhere: the
+    /// audit half of the contract was already dead, waiting for the first caller of the other half to make
+    /// it matter. Binding them here means the affordance cannot ship without its record.</para>
+    /// </summary>
+    internal const string UnauditableOverrideRefusal =
+        "the stale-merge override is refused here: this merge service has no audit sink for "
+        + "stale_override_used, and an override that leaves no record is not the documented override";
+
     // The lease store is optional ONLY for the PerformJournaledMerge-only caller (see the ctor doc). Any
     // lease-owning entry point that reaches this on a null store is a composition error, not a merge refusal.
     private IMergeLeaseStore Leases => _leases ?? throw new InvalidOperationException(
@@ -118,6 +134,13 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
 
     public ForegroundMergeResult MergeAgentBranch(ForegroundMergeRequest request)
     {
+        // Refused before the lease is even taken: an override this service cannot record must not hold a
+        // repo's merge lease while it discovers that.
+        if (request.AllowStaleOverride && _onStaleOverride is null)
+        {
+            return new ForegroundMergeResult(false, null, CasLost: false, UnauditableOverrideRefusal);
+        }
+
         var lease = BeginMerge(request);
         if (lease is null)
         {
@@ -177,6 +200,14 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// </summary>
     public ForegroundMergeResult PerformJournaledMerge(ForegroundMergeRequest request, MergeLeaseRow lease)
     {
+        // (0) The same refusal MergeAgentBranch makes, restated on the entry point the Windows GUI drives
+        // directly under a daemon-granted lease. Both legs are reachable independently, so a guard on one
+        // of them is a guard on neither.
+        if (request.AllowStaleOverride && _onStaleOverride is null)
+        {
+            return new ForegroundMergeResult(false, null, CasLost: false, UnauditableOverrideRefusal);
+        }
+
         // (1) A dirty working tree cannot be merged into: `checkout`/`merge` would refuse (or, worse, be
         // refused AFTER we thought we had switched branches). Untracked files are deliberately tolerated —
         // they never block a checkout or a fast-forward, and refusing on them would block honest merges.
@@ -244,7 +275,20 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         if (stale && request.AllowStaleOverride)
         {
             // The loud, separate override path (P2-10 step 4): journaled by the merge below + audited here.
-            _onStaleOverride?.Invoke(request.AgentId, request.OverrideReason ?? "stale override");
+            // Non-conditional: the null case was refused at (0), so this cannot silently skip.
+            //
+            // NOTE what the override does NOT buy, because the wording of its refusal has misled before.
+            // It skips the freshness PRE-CHECK; it does not touch the merge. The merge below is still
+            // `--ff-only`, and a branch that is genuinely stale — verified against a main that has since
+            // moved — is by construction not a descendant of main, so git refuses it here exactly as it
+            // would without the override, and ClassifyFailedFfMerge reports "the branch no longer
+            // fast-forwards onto main". The override is therefore NOT, and never was, an escape from a
+            // co-tenant staled by someone else's merge: only the keep-alive rebase (P2-09, wired into the
+            // stale cascade by MergeQueueProvisioner) makes such a branch mergeable, by making it a
+            // fast-forward again. What the override IS for is the case where main moved but the branch
+            // still fast-forwards — the merge is available and the recorded evidence is simply older than
+            // the ref — and edge row 5, a repo with no verification command to be fresh about.
+            _onStaleOverride!.Invoke(request.AgentId, request.OverrideReason ?? "stale override");
         }
 
         var mergeExit = -1;

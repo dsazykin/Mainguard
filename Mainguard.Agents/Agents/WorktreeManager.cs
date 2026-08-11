@@ -93,6 +93,17 @@ public interface IAgentWorktreeManager
     bool PublishAgentBranch(string repoHash, string agentId) => false;
 
     /// <summary>
+    /// MG-3 / P2-09 — the same carry-across for a branch the <b>daemon itself</b> just rebased onto main.
+    ///
+    /// <para>Separate from <see cref="PublishAgentBranch"/> because a rebase is never a fast-forward, so
+    /// the ordinary publish refuses it as rewritten history and the keep-alive's whole effect stops at
+    /// the agent's own repository — invisible to the merge queue, the cockpit and the host's sync fetch.
+    /// The rewrite is instead checked for LOST work by patch-id (see <c>AgentRefMediator.PublishRebase</c>);
+    /// rules 1, 3 and 4 are unchanged.</para>
+    /// </summary>
+    bool PublishRebasedAgentBranch(string repoHash, string agentId) => false;
+
+    /// <summary>
     /// MG-3 — start watching this agent's own <c>refs/heads/agent/&lt;id&gt;</c> and publish it into the
     /// mirror whenever it moves (design §7: the daemon watches AND re-fetches before verification).
     /// Called at spawn. Default no-op for the substrate-less test doubles.
@@ -469,6 +480,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
+
+    /// <inheritdoc />
+    public bool PublishRebasedAgentBranch(string repoHash, string agentId)
+        => _refs.PublishRebase(repoHash, agentId).Current;
 
     /// <summary>
     /// MG-3 stage 2 — the mediated publish, with the outcome rather than a bool. The four rules

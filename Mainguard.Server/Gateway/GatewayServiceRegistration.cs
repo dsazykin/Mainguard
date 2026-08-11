@@ -124,7 +124,54 @@ public static class GatewayServiceRegistration
             // verified as an empty branch. Passing it is what makes the check exist in the daemon at all —
             // the parameter defaults to null, and a null here would be the silent behaviour again.
             checkAgentBranch: (repoHash, agentId) =>
-                sp.GetRequiredService<IAgentEnvironment>().Worktrees.CheckAgentBranch(repoHash, agentId)));
+                sp.GetRequiredService<IAgentEnvironment>().Worktrees.CheckAgentBranch(repoHash, agentId),
+            // ---- P2-10 §3.3 step 2: the keep-alive rebase, wired at last -----------------------------
+            //
+            // Without these three the stale cascade only RE-VERIFIES, and re-verification moves no branch:
+            // the merge is `git merge --ff-only`, so once any agent merges, every co-tenant branch stops
+            // being a fast-forward of main, passes its tests again against work that was never rebased,
+            // returns to Verified, and has its merge refused as stale — forever, with no daemon-side way
+            // out. Only one agent per repository could ever merge.
+            //
+            // Per repo, not per daemon: the yield's pause path resolves a container id, and an agent id is
+            // unique only within a repository (an intake'd `pr-7` exists in as many repos as subscribe to
+            // one). A single global protocol would pause another repo's agent to rebase this one's.
+            yieldProtocolFor: repoHash => new YieldProtocol(
+                // UnboundAgentControlChannel is a measurement, not a placeholder: nothing in the shipped
+                // adapter wrapper writes [IPC_UPDATE_READY] back, so every yield takes the docker-pause
+                // path. Saying so up front is what keeps the cascade fast — the alternative is a
+                // ten-second cooperative window per agent per merge, spent waiting on a transport that
+                // does not exist. The pause is the containment either way (freezer cgroup, no cooperation
+                // required); the ack was only ever the courtesy that avoids it.
+                channelFor: _ => UnboundAgentControlChannel.Instance,
+                sandbox: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
+                // The SAME (repo, agent) → jail answer the verification and the restart resume use, so
+                // "does this agent have a live sandbox" has one rule in the daemon rather than three.
+                containerIdFor: agentId =>
+                    ResolveVerificationJail(sp.GetRequiredService<AgentSessionStore>(), repoHash, agentId),
+                supervisor: sp.GetRequiredService<IAgentSupervisor>()),
+            // Where the rebase happens. Only the worktree comes from here — the provisioner resolves the
+            // mirror and the main branch from the same two calls that key the queue's own main@sha, so
+            // the ref a branch is rebased ONTO and the ref its verification is pinned AGAINST cannot
+            // drift apart. Null for a substrate with no real worktrees, which reads as "no worktree" and
+            // is exactly right for one.
+            locateAgentWorktree: (repoHash, agentId) =>
+                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                    ?.WorktreePathFor(repoHash, agentId),
+            // The run states the cycle transitions through — Yielding, Rebasing and, the one that needs a
+            // human, Conflict. PtyAgentSupervisor writes them into the session store, which streams them
+            // to clients as agent state changes; AgentRunState.Conflict had no production writer at all
+            // before this, so the one arm of the rebase that stops and waits for a person was also the one
+            // arm nothing anywhere rendered.
+            agentStates: sp.GetRequiredService<IAgentSupervisor>(),
+            // ...and the one that carries the result out. A rebase is not a fast-forward, so MG-3's ref
+            // mediator refuses it through the ordinary publish above as "the agent rewrote published
+            // history" — which would leave every cycle succeeding and changing nothing anyone can see,
+            // because the queue, the cockpit and the human's merge all read the mirror. PublishRebase
+            // asks the question rule 2 stands for (was published work LOST) by patch-id instead.
+            publishRebasedAgentRef: (repoHash, agentId) =>
+                (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
+                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has

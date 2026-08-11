@@ -253,10 +253,22 @@ public sealed class MergeQueue : IMergeQueue
     private readonly Dictionary<string, MergeEntryOrigin> _origins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, QueueEntryDiscard> _discards = new(StringComparer.Ordinal);
     private readonly HashSet<string> _verifying = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, string> _requeueBlocks = new(StringComparer.Ordinal);
     private string _currentMainSha;
 
     /// <summary>Audit event a human discard appends (the durable half is the entry's own persisted row).</summary>
     public const string DiscardedEvent = "queue_entry_discarded";
+
+    /// <summary>
+    /// Audit event appended when the stale cascade could not reparent a branch, carrying the
+    /// <c>reason</c> the entry was returned to <c>Working</c> instead of re-verified.
+    ///
+    /// <para>This is the record of the one thing the cascade must never do silently: leave a branch it
+    /// could not put back on top of main. Re-verifying such a branch produces a fresh-looking
+    /// <c>Verified</c> whose merge is then refused by <c>--ff-only</c>, forever, with nothing anywhere
+    /// saying why.</para>
+    /// </summary>
+    public const string RequeueBlockedEvent = "stale_requeue_blocked";
 
     /// <summary>Audit event appended when a human clears a <c>Verifying</c> state with no run behind it.</summary>
     public const string StalledVerificationClearedEvent = "stalled_verification_cleared";
@@ -339,7 +351,13 @@ public sealed class MergeQueue : IMergeQueue
     /// <param name="store">Persisted queue-state store (SQLite in the daemon).</param>
     /// <param name="verifications">The immutable verification-record store.</param>
     /// <param name="runVerification">Runs the test command in the agent sandbox and returns the daemon-observed record.</param>
-    /// <param name="requeue">P2-09 yield → rebase → re-verify re-entry (default: re-verify only).</param>
+    /// <param name="requeue">
+    /// P2-09 yield → keep-alive rebase → re-verify re-entry. <b>The default (re-verify only) is not a
+    /// lighter version of this — it is the defect.</b> Re-verification moves no branch onto the new main,
+    /// so a co-tenant of a merged branch passes its tests, returns to <c>Verified</c> against a main it
+    /// does not descend from, and has its <c>--ff-only</c> merge refused; the cascade re-verifies it and
+    /// the loop never ends. <see cref="MergeQueueProvisioner"/> supplies the real one.
+    /// </param>
     /// <param name="gates">Composable merge gates ANDed into <see cref="CanMerge"/> (P2-11/P2-35 hooks).</param>
     /// <param name="audit">Audit sink for the loud override path (<c>stale_override_used</c>).</param>
     /// <param name="clock">Injectable clock (tests use a virtual one).</param>
@@ -615,10 +633,68 @@ public sealed class MergeQueue : IMergeQueue
 
             _lastVerification[agentId] = null;
             _verifiedAt[agentId] = null;
+            // The agent moved on, so whatever the last cascade could not reparent is no longer the story
+            // of this branch: the new commits are, and they are verifiable from Working like any other.
+            _requeueBlocks.Remove(agentId);
             SetStateLocked(agentId, WorkerMergeState.Working);
         }
 
         Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// The stale cascade's honest terminus when a branch could NOT be put back on top of main: the entry
+    /// returns to <c>Working</c> carrying <paramref name="reason"/>, which <see cref="CanMerge"/> then
+    /// renders verbatim instead of the generic "not verified yet".
+    ///
+    /// <para><b>Why this exists rather than just re-verifying.</b> A staled branch that was not reparented
+    /// does not fast-forward onto main, and verification does not care: it runs the test command, passes,
+    /// and pins the record to the queue's CURRENT main — so the entry becomes <c>Verified</c>, fresh by
+    /// every check <see cref="CanMerge"/> makes, and the <c>--ff-only</c> merge refuses it. The cascade
+    /// re-verifies, it passes again, and the loop has no exit. Returning the entry to <c>Working</c> with
+    /// the measured reason is the difference between an entry a human can act on and one that lies to
+    /// them on every refresh.</para>
+    ///
+    /// <para>The verification record is cleared with the state, exactly as <see cref="NotifyNewCommits"/>
+    /// does: whatever evidence existed was against a main this branch is no longer parented on.</para>
+    /// </summary>
+    /// <param name="agentId">The entry the cascade could not reparent.</param>
+    /// <param name="reason">Render-verbatim explanation (§3.4 vocabulary), e.g. the missing jail or the
+    /// rebase conflict. Empty falls back to the generic wording.</param>
+    /// <param name="detail">Optional extra field for the audit event (never shown as the gate reason).</param>
+    /// <returns>False when the entry is unknown or already terminal — a human discard that landed while
+    /// the cascade was running has decided, and this must not walk it back.</returns>
+    public bool TryReturnToWorking(string agentId, string reason, string? detail = null)
+    {
+        lock (_gate)
+        {
+            if (!_states.TryGetValue(agentId, out var from) || IsTerminal(from))
+            {
+                return false;
+            }
+
+            _lastVerification[agentId] = null;
+            _verifiedAt[agentId] = null;
+            if (!string.IsNullOrWhiteSpace(reason))
+            {
+                _requeueBlocks[agentId] = reason;
+            }
+
+            SetStateLocked(agentId, WorkerMergeState.Working);
+        }
+
+        _audit.Append(new AuditEvent(RequeueBlockedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["reason"] = reason ?? string.Empty,
+            ["detail"] = detail ?? string.Empty,
+            ["main_sha"] = CurrentMainSha,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        Changed?.Invoke();
+        return true;
     }
 
     // ---- Human entry lifecycle (NOT on IMergeQueue — see the note in TryDiscard) ----
@@ -844,6 +920,7 @@ public sealed class MergeQueue : IMergeQueue
             _lastVerification.Remove(agentId);
             _verifiedAt.Remove(agentId);
             _verifying.Remove(agentId);
+            _requeueBlocks.Remove(agentId);
             _store.Delete(_repoHash, agentId);
         }
 
@@ -1093,6 +1170,11 @@ public sealed class MergeQueue : IMergeQueue
                 WorkerMergeState.Merged => "already merged",
                 WorkerMergeState.Rejected => "rejected in review",
                 WorkerMergeState.Discarded => "discarded — this entry was dropped from the queue",
+                // A branch the stale cascade could not reparent is at Working like any other unverified
+                // branch, and "not verified yet" would be the second time that fact was reported as
+                // something milder than it is. The measured reason replaces it until the entry moves.
+                WorkerMergeState.Working when _requeueBlocks.TryGetValue(agentId, out var blocked)
+                    => blocked,
                 _ => "not verified yet",
             };
             return false;
@@ -1155,6 +1237,13 @@ public sealed class MergeQueue : IMergeQueue
             {
                 throw new InvalidMergeStateTransitionException(from, target);
             }
+        }
+
+        // Any move OFF Working retires the cascade's refusal: the entry is verifying, verified or gone,
+        // and a stale reason outliving the state it explained is how a fixed branch keeps reading broken.
+        if (target != WorkerMergeState.Working)
+        {
+            _requeueBlocks.Remove(agentId);
         }
 
         _states[agentId] = target;
