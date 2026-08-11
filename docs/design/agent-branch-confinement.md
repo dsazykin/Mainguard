@@ -56,6 +56,28 @@ Anything enforced agent-side is advisory by construction. This project already a
 elsewhere — `MaxPlanRevisions` lives in `CoordinatorLimits` rather than in a prompt. A future reader must
 not mistake the hook for the boundary and weaken the daemon-side rule because "we prevent it now".
 
+### Layer 2 has an environmental precondition, and it is not visible in the file (#68)
+
+Writing the hook and setting mode `0755` establishes only the mode **bits**. git decides a hook exists
+with `access(path, X_OK)`, which returns `EACCES` on a filesystem mounted `noexec` whatever the bits say;
+git then emits a *hint* — `the hook was ignored because it's not set as executable` — and completes the
+ref update with **exit 0**. The file is present, its mode is right, and nothing runs it.
+
+This is not hypothetical. It is how the guard shipped: the test suite built its per-agent repositories
+under `Path.GetTempPath()`, and when the suite runs inside the jail (`.mainguard/verify` is
+`dotnet test Mainguard.slnx`) that is a Docker tmpfs, whose default flags are `nosuid,nodev,noexec`. The
+jail's git is 2.39.5 — the `reference-transaction` hook has been supported since 2.28, so the version was
+never the problem. **The guard fired on the host and never in the jail, which is the only place agents
+run.** One test failed; three more passed vacuously, because they assert that ordinary git is *not*
+blocked, which an inert hook satisfies perfectly.
+
+So `InstallHook` returns **ARMED, not written**: `MeasureHookCanRun` runs the hook it just wrote (with a
+phase other than `prepared`, which the script's own first line makes a side-effect-free exit 0), catching
+both a `noexec` mount and a CRLF `bad interpreter`. When it cannot fire, the reason goes to the
+`WorktreeManager` warning sink and the spawn continues — layer 3 still reports the drift — but never
+silently. **A control that knows it is inert must not look armed.** The corresponding rule for anything
+that tests this layer: assert the hook *fires*, never that its file exists.
+
 ---
 
 ## 3. Layer 2: what the hook does, and the four exemptions
@@ -179,6 +201,10 @@ Covered, each proven non-vacuous by mutating the fix and watching the test go re
 | `AgentBranchGuardTests` hook set (3) | remove the `InstallHook` call from spawn |
 | `TheHookSurvivesAnUpgradeOverAJailThatIsALREADYStranded` | drop the pack-refs no-op exemption |
 | `TheHookLeavesOrdinaryGitAlone` (5 cases) | drop the `refs/heads/` scoping |
+| `TheHarnessItself_PutsAgentRepositoriesWhereHooksCanRun` (#68) | put the test VM root back on unconditional `Path.GetTempPath()` and run the suite in the jail |
+| `TheArmingMeasurement_AnswersNo_ForAHookGitWouldSkip` (#68) | make `MeasureHookCanRun` check mode bits instead of running the hook |
+| `AGuardThatCannotFire_IsReported_AndDoesNotClaimToBeInstalled` (#68) | let `InstallHook` return `true` on the strength of the write |
+| `AnArmedGuard_IsReportedAsInstalled_AndWarnsAboutNothing` (#68) | hard-wire `InstallHook` to "not armed" |
 | `MergeQueueProvisioner_IsWiredToCheckWhichBranchAnAgentIsActuallyOn` | drop the argument in `GatewayServiceRegistration` |
 
 **Not covered, stated rather than implied:**
