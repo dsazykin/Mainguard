@@ -32,6 +32,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private readonly IDisposable? _owner;
     private readonly Dictionary<string, AgentDocumentViewModel> _documents = new();
 
+    /// <summary>Where the per-agent-kind dock arrangement is remembered between sessions. Injectable so a
+    /// test writes to a temp directory instead of the user's real data root.</summary>
+    private readonly Services.DockLayoutPersistence _dockLayouts;
+
     // The agent rail (worker list + kill switch) as its own surface (2d): the shell reaches it only as
     // opaque object through AgentRailContent → ViewLocator → AgentRailView, never naming AgentRowViewModel
     // or the kill-switch members. A thin view over this VM — the single owner of the agent projection and
@@ -241,7 +245,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private readonly TimeSpan _cliLoadRetryDelay = CliLoadRetryDelay;
 
     public ControlCenterViewModel(OrchestratorServices services)
+        : this(services, dockLayouts: null) { }
+
+    /// <param name="dockLayouts">Where per-agent-kind pane arrangements are remembered. Injectable so a
+    /// test drives a real save/restore against a temp directory instead of the user's data root.</param>
+    public ControlCenterViewModel(OrchestratorServices services, Services.DockLayoutPersistence? dockLayouts)
     {
+        _dockLayouts = dockLayouts ?? new Services.DockLayoutPersistence();
         _agents = services.Agents;
         _queue = services.Queue;
         _coordinator = services.Coordinator;
@@ -965,11 +975,26 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // Mount the agent into the ONE reused dock workspace host (leak-free content-swap): a live terminal
         // as the primary pane, the agent document as the diff pane. Opening another agent costs three
         // content swaps, not a fresh dock graph.
-        Workspace ??= new AgentWorkspaceViewModel(agentId, WorkspaceLayoutKind);
+        // Pane arrangement is remembered per agent KIND, not per agent: an agent id is a per-run string,
+        // so keying on it would write a file per agent and restore nothing. DockLayoutPersistence had
+        // round-trip and corruption-tolerance tests and no production caller at all, so rearranging
+        // panes was discarded on every close.
+        Workspace ??= new AgentWorkspaceViewModel(
+            agentId, WorkspaceLayoutKind,
+            persistence: _dockLayouts, layoutKey: LayoutKeyForAgent(agentId));
         var terminal = CreateTerminalFor(agentId);
         Workspace.ShowAgent(agentId, terminal, doc, null);
 
         IsCoordinatorFocus = false;
+    }
+
+    /// <summary>The workspace-layout bucket for an agent: its KIND (e.g. <c>claude-code</c>), falling back
+    /// to a shared default when the projection has not resolved a kind yet. <c>AgentInfo.Name</c> carries
+    /// the kind — <c>MapInfo</c> puts <c>agent_kind</c> there.</summary>
+    private string LayoutKeyForAgent(string agentId)
+    {
+        var kind = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId)?.Name;
+        return string.IsNullOrWhiteSpace(kind) || kind == agentId ? "default" : kind!;
     }
 
     /// <summary>Builds (and attaches) a fresh live terminal for <paramref name="agentId"/>, tearing down the

@@ -39,6 +39,8 @@ public sealed class AgentWorkspaceViewModel : ViewModelBase, IDisposable
     private readonly WorkspaceTool _terminalTool;
     private readonly WorkspaceTool _diffTool;
     private readonly WorkspaceTool _stagingTool;
+    private readonly Services.DockLayoutPersistence? _persistence;
+    private readonly string? _layoutKey;
     private bool _disposed;
 
     /// <summary>The agent currently shown in this workspace host.</summary>
@@ -49,23 +51,90 @@ public sealed class AgentWorkspaceViewModel : ViewModelBase, IDisposable
     /// <summary>The Dock root the <c>DockControl</c> binds to.</summary>
     public IRootDock Layout { get; }
 
+    /// <param name="persistence">Where the pane arrangement is remembered between sessions. Null keeps
+    /// the previous behaviour (a fresh default layout every time), which is what tests and the render
+    /// harness want.</param>
+    /// <param name="layoutKey">The bucket the arrangement is remembered under — the agent KIND, not the
+    /// agent id. Supplied by the caller because this VM only knows the id (a per-run hex string), and
+    /// keying on that would write one file per agent and restore nothing, ever.</param>
     public AgentWorkspaceViewModel(
         string agentId,
         WorkspaceLayoutKind layout = WorkspaceLayoutKind.FlightDeck,
         object? terminal = null,
         object? diff = null,
-        object? staging = null)
+        object? staging = null,
+        Services.DockLayoutPersistence? persistence = null,
+        string? layoutKey = null)
     {
         AgentId = agentId;
         LayoutKind = layout;
+        _persistence = persistence;
+        _layoutKey = string.IsNullOrWhiteSpace(layoutKey) ? null : layoutKey;
 
         _terminalTool = new WorkspaceTool { Id = "terminal", Title = "Terminal", Content = terminal ?? "Terminal", CanClose = false };
         _diffTool = new WorkspaceTool { Id = "diff", Title = "Agent diff", Content = diff ?? "Agent diff (read-only)", CanClose = false };
         _stagingTool = new WorkspaceTool { Id = "staging", Title = "Staging", Content = staging ?? "Staging", CanClose = false };
 
-        _factory = new WorkspaceDockFactory(_terminalTool, _diffTool, _stagingTool, layout);
+        // The remembered pane order. Only ToolOrder is restored: the LAYOUT KIND is a live user
+        // preference (the Flight Deck / Conversation Deck toggle) and must win over anything on disk,
+        // or switching decks would silently snap back on the next open.
+        var restored = _persistence is not null && _layoutKey is not null
+            ? _persistence.Load(_layoutKey, layout).ToolOrder
+            : null;
+
+        _factory = new WorkspaceDockFactory(_terminalTool, _diffTool, _stagingTool, layout, restored);
         Layout = _factory.CreateLayout();
         _factory.InitLayout(Layout);
+
+        if (_persistence is not null && _layoutKey is not null)
+        {
+            // Dock raises these when panes are dragged between docks or reordered. Splitter drags are
+            // deliberately not among them — proportions are not part of DockLayoutState.
+            _factory.DockableMoved += OnDockableMoved;
+            _factory.DockableSwapped += OnDockableSwapped;
+            _factory.DockableAdded += OnDockableAdded;
+            _factory.DockableRemoved += OnDockableRemoved;
+        }
+    }
+
+    // Dock declares a distinct EventArgs type per event, so these are four one-line adapters onto the
+    // same save. All four matter: a drag between docks is Moved/Swapped, a pane torn into a floating
+    // window (or docked back) is Removed/Added.
+    private void OnDockableMoved(object? s, Dock.Model.Core.Events.DockableMovedEventArgs e) => SaveArrangement();
+    private void OnDockableSwapped(object? s, Dock.Model.Core.Events.DockableSwappedEventArgs e) => SaveArrangement();
+    private void OnDockableAdded(object? s, Dock.Model.Core.Events.DockableAddedEventArgs e) => SaveArrangement();
+    private void OnDockableRemoved(object? s, Dock.Model.Core.Events.DockableRemovedEventArgs e) => SaveArrangement();
+
+    /// <summary>Writes the current pane order back to disk. Best-effort by construction — the
+    /// persistence layer swallows IO failures, because a full disk must never break the workspace.</summary>
+    private void SaveArrangement()
+    {
+        if (_disposed || _persistence is null || _layoutKey is null) return;
+        _persistence.Save(_layoutKey, new Services.DockLayoutState(
+            Services.DockLayoutState.CurrentVersion, LayoutKind, CurrentToolOrder()));
+    }
+
+    /// <summary>The pane ids in their current visual order, depth-first through the dock tree. This is
+    /// the piece that did not exist: <c>DockLayoutPersistence</c> round-tripped a <c>ToolOrder</c>
+    /// nothing could produce and nothing consumed.</summary>
+    internal IReadOnlyList<string> CurrentToolOrder()
+    {
+        var ids = new List<string>();
+        Collect(Layout);
+        return ids;
+
+        void Collect(IDockable dockable)
+        {
+            if (dockable is WorkspaceTool tool)
+            {
+                if (!string.IsNullOrEmpty(tool.Id)) ids.Add(tool.Id!);
+                return;
+            }
+
+            if (dockable is IDock dock && dock.VisibleDockables is { } children)
+                foreach (var child in children)
+                    Collect(child);
+        }
     }
 
     /// <summary>
@@ -93,7 +162,19 @@ public sealed class AgentWorkspaceViewModel : ViewModelBase, IDisposable
     public void Dispose()
     {
         if (_disposed) return;
+
+        // Last write while the graph is still intact — teardown clears VisibleDockables, so a save
+        // after this point would record an empty arrangement over a good one.
+        SaveArrangement();
         _disposed = true;
+
+        if (_persistence is not null && _layoutKey is not null)
+        {
+            _factory.DockableMoved -= OnDockableMoved;
+            _factory.DockableSwapped -= OnDockableSwapped;
+            _factory.DockableAdded -= OnDockableAdded;
+            _factory.DockableRemoved -= OnDockableRemoved;
+        }
 
         // Close floating dock windows FIRST — the documented Dock.Avalonia leak this task owns.
         try
@@ -147,51 +228,84 @@ internal sealed class WorkspaceDockFactory : Factory
     private readonly WorkspaceTool _diff;
     private readonly WorkspaceTool _staging;
     private readonly WorkspaceLayoutKind _kind;
+    private readonly IReadOnlyList<string>? _toolOrder;
 
-    public WorkspaceDockFactory(WorkspaceTool terminal, WorkspaceTool diff, WorkspaceTool staging, WorkspaceLayoutKind kind)
+    /// <param name="toolOrder">The remembered pane order (<c>DockLayoutState.ToolOrder</c>), or null for
+    /// the built-in order. Both decks place ONE pane in the primary slot and the other two in the
+    /// secondary pair, so an order is honoured by choosing which pane takes which slot — the shapes are
+    /// unchanged. Unknown or missing ids are ignored and the remaining panes keep their default relative
+    /// order, so a stale file can never lose a pane.</param>
+    public WorkspaceDockFactory(
+        WorkspaceTool terminal, WorkspaceTool diff, WorkspaceTool staging, WorkspaceLayoutKind kind,
+        IReadOnlyList<string>? toolOrder = null)
     {
         _terminal = terminal;
         _diff = diff;
         _staging = staging;
         _kind = kind;
+        _toolOrder = toolOrder;
+    }
+
+    /// <summary>The three panes in the order the layout should lay them down: the remembered order where
+    /// it names known panes, then any pane the file did not mention, in the built-in order. Total by
+    /// construction — every pane appears exactly once whatever the file says.</summary>
+    internal IReadOnlyList<WorkspaceTool> OrderedTools()
+    {
+        var defaults = new[] { _terminal, _diff, _staging };
+        if (_toolOrder is not { Count: > 0 }) return defaults;
+
+        var ordered = new List<WorkspaceTool>(3);
+        foreach (var id in _toolOrder)
+        {
+            var match = defaults.FirstOrDefault(
+                t => string.Equals(t.Id, id, StringComparison.Ordinal) && !ordered.Contains(t));
+            if (match is not null) ordered.Add(match);
+        }
+
+        foreach (var tool in defaults)
+            if (!ordered.Contains(tool))
+                ordered.Add(tool);
+
+        return ordered;
     }
 
     public override IRootDock CreateLayout()
     {
-        var terminalDock = ToolDockFor(_terminal, "TerminalDock", 0.55);
-        var diffDock = ToolDockFor(_diff, "DiffDock", 0.6);
-        var stagingDock = ToolDockFor(_staging, "StagingDock", 0.4);
+        var tools = OrderedTools();
+        var primaryDock = ToolDockFor(tools[0], "PrimaryDock", 0.55);
+        var secondaryDock = ToolDockFor(tools[1], "SecondaryDock", 0.6);
+        var tertiaryDock = ToolDockFor(tools[2], "TertiaryDock", 0.4);
 
         IDock main;
         if (_kind == WorkspaceLayoutKind.ConversationDeck)
         {
-            // Terminal spans the top; diff + staging share the bottom row.
+            // Primary pane spans the top; the other two share the bottom row.
             var bottomRow = new ProportionalDock
             {
                 Orientation = Orientation.Horizontal,
                 Proportion = 0.4,
-                VisibleDockables = CreateList<IDockable>(diffDock, new ProportionalDockSplitter(), stagingDock),
+                VisibleDockables = CreateList<IDockable>(secondaryDock, new ProportionalDockSplitter(), tertiaryDock),
             };
-            terminalDock.Proportion = 0.6;
+            primaryDock.Proportion = 0.6;
             main = new ProportionalDock
             {
                 Orientation = Orientation.Vertical,
-                VisibleDockables = CreateList<IDockable>(terminalDock, new ProportionalDockSplitter(), bottomRow),
+                VisibleDockables = CreateList<IDockable>(primaryDock, new ProportionalDockSplitter(), bottomRow),
             };
         }
         else
         {
-            // Flight Deck (default): terminal on the left; diff over staging on the right.
+            // Flight Deck (default): primary pane on the left; the other two stacked on the right.
             var rightColumn = new ProportionalDock
             {
                 Orientation = Orientation.Vertical,
                 Proportion = 0.45,
-                VisibleDockables = CreateList<IDockable>(diffDock, new ProportionalDockSplitter(), stagingDock),
+                VisibleDockables = CreateList<IDockable>(secondaryDock, new ProportionalDockSplitter(), tertiaryDock),
             };
             main = new ProportionalDock
             {
                 Orientation = Orientation.Horizontal,
-                VisibleDockables = CreateList<IDockable>(terminalDock, new ProportionalDockSplitter(), rightColumn),
+                VisibleDockables = CreateList<IDockable>(primaryDock, new ProportionalDockSplitter(), rightColumn),
             };
         }
 

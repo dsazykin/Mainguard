@@ -805,6 +805,13 @@
   - `DockLayoutPersistence.cs` (P2-13: saves/restores a per-agent-kind `DockLayoutState` as versioned
     JSON under `%AppData%/Mainguard/workspace-layouts`; restore is total —
     absence/parse-failure/schema-drift falls back to the default layout, never throws).
+    Driven by `AgentWorkspaceViewModel` (`persistence`/`layoutKey` ctor args, supplied from
+    `ControlCenterViewModel.SelectAgent` keyed on the agent KIND): loaded before `CreateLayout`, saved on
+    Dock's `DockableMoved`/`Swapped`/`Added`/`Removed` and once more on `Dispose` before teardown clears
+    the graph. Only `ToolOrder` is restored — the layout KIND is the live Flight/Conversation preference
+    and wins over the file. `WorkspaceDockFactory.OrderedTools()` is the consumer that makes restore
+    real (`CreateLayout` previously ignored `ToolOrder` entirely) and is total: unknown/duplicate/missing
+    ids can never lose a pane.
   - `AgentNotificationService.cs` (P2-13: OS/in-window toast on an agent transition INTO waiting/blocked
     (AwaitingReview/Conflict), suppressed when the app is foregrounded on that agent; first observation
     baselines silently; `IAgentNotifier` seam with the `WindowNotificationManager`-backed default + a
