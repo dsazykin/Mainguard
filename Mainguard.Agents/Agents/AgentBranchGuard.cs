@@ -245,7 +245,20 @@ public static class AgentBranchGuard
     /// those are different things, and for the measurement that separates them. A caller that wants to know
     /// whether an agent will actually be stopped must read this, not <c>File.Exists</c>.</para>
     /// </summary>
-    public static bool InstallHook(string agentRepoPath, string agentId, Action<string>? warningSink = null)
+    /// <param name="agentRepoPath">The agent's own repository (the hook goes in its <c>hooks/</c>).</param>
+    /// <param name="agentId">The agent whose branch the hook will protect.</param>
+    /// <param name="warningSink">Receives the not-armed report when the hook cannot fire.</param>
+    /// <param name="armingProbe">
+    /// Overrides <see cref="MeasureHookCanRun"/>. Exists ONLY so a test can drive the not-armed reporting
+    /// path without mounting a <c>noexec</c> filesystem, which is not possible unprivileged. The default is
+    /// the real measurement, and the real measurement's own behaviour is pinned separately against real
+    /// files — so this seam proves the REPORTING, never the detection.
+    /// </param>
+    public static bool InstallHook(
+        string agentRepoPath,
+        string agentId,
+        Action<string>? warningSink = null,
+        Func<string, string?>? armingProbe = null)
     {
         string hookPath;
         try
@@ -279,7 +292,7 @@ public static class AgentBranchGuard
         }
 
         // Written is not armed. Ask the artefact itself.
-        var detail = MeasureHookCanRun(hookPath);
+        var detail = (armingProbe ?? MeasureHookCanRun)(hookPath);
         if (detail is null)
         {
             return true;
