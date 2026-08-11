@@ -8,7 +8,9 @@ using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Agents.Mock;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.Agents.UI.Views;
 using Mainguard.UI.Theming;
@@ -96,7 +98,134 @@ public class CoordinatorPlanGateRenderHarness
             Assert.True(vm.IsCapSaturatedByBlockedWorkers);
             Assert.Contains("6 workers are waiting on your approval", vm.BackpressureText, StringComparison.Ordinal);
             Assert.Contains("stopped spawning", vm.BackpressureText, StringComparison.Ordinal);
+
+            // …and all six are decidable. The stall is caused by six blocked workers, so a surface that
+            // renders one card describes a queue the operator cannot clear: five of the six decisions
+            // holding the cap shut would be unreachable.
+            Assert.Equal(6, vm.PendingPlans.Count);
         });
+    }
+
+    /// <summary>
+    /// One card <b>per blocked worker</b>, rendered — measured on the visual tree rather than on the
+    /// collection, because "the ViewModel has six" and "the human can decide six" are different claims and
+    /// only the second one clears the cap.
+    /// </summary>
+    [AvaloniaFact]
+    public void EveryBlockedWorker_GetsItsOwnDecidableCard()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        var vm = new CoordinatorPanelViewModel(Fake.Backpressure());
+        var gate = new PlanGateView { DataContext = vm };
+        var win = new Window { Width = 520, Height = 1600, Content = gate };
+        win.Show();
+        Settle();
+
+        var approve = gate.GetVisualDescendants().OfType<Button>()
+            .Where(b => (b.Content as string) == "Approve plan" && b.IsEffectivelyVisible)
+            .ToList();
+        Assert.Equal(6, approve.Count);
+        Assert.All(approve, b => Assert.True(b.IsEnabled));
+
+        // Each card carries the Scope of its own worker, not a repeat of the first one's.
+        var workers = gate.GetVisualDescendants().OfType<TextBlock>()
+            .Select(t => t.Text ?? "")
+            .Where(t => t.Contains("Written by loom-", StringComparison.Ordinal))
+            .ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(6, workers.Count);
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// <b>The gate is mounted on the surface that ships.</b>
+    ///
+    /// <para>This is the assertion whose absence made phase 2 undriveable. Every other test in this file
+    /// renders <c>CoordinatorPanelView</c> — a control the application never constructs — so the daemon's
+    /// plan gate could be complete, tested end to end, and pinned in five themes while the operator had no
+    /// button to press anywhere in the product. A gate the human cannot reach is not a gate; it is a
+    /// worker that never starts.</para>
+    ///
+    /// <para>So this one builds the real <c>ControlCenterView</c> off a real <c>ControlCenterViewModel</c>
+    /// and requires the gate to be there, visible, bound to the coordinator's own state, with a live
+    /// Approve on it.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void TheShippedControlCenterSurface_MountsThePlanGate()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+
+        // The fixture has to actually be holding a decision, or this measures nothing.
+        Assert.NotEmpty(vm.Coordinator.PendingPlans);
+        Assert.True(vm.Coordinator.HasGateContent);
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = 1420, Height = 920, Content = view };
+        win.Show();
+        Settle();
+        HarnessHygiene.AssertNoUnresolvedViews(view);
+
+        var gate = Assert.Single(view.GetVisualDescendants().OfType<PlanGateView>());
+        Assert.True(gate.IsEffectivelyVisible,
+            "the plan gate is in the tree but not visible — the operator still cannot approve anything");
+        Assert.Same(vm.Coordinator, gate.DataContext);
+        Assert.True(gate.Bounds.Height > 0 && gate.Bounds.Width > 0,
+            $"the gate rendered at {gate.Bounds.Width}x{gate.Bounds.Height} — it occupies no space");
+
+        var approve = view.GetVisualDescendants().OfType<Button>()
+            .Single(b => (b.Content as string) == "Approve plan");
+        Assert.True(approve.IsEffectivelyVisible);
+        Assert.True(approve.IsEnabled);
+
+        // …and the coordinator's terminal did not get pushed off the surface to make room for it.
+        var terminalHost = view.GetVisualDescendants().OfType<Border>()
+            .First(b => b.Name == null && b.Bounds.Height > 200);
+        Assert.True(terminalHost.Bounds.Height > 200);
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// The negative control for the mount test: with nothing waiting, the gate must take <b>no</b> vertical
+    /// space on the coordinator surface. A region that is always there is a region the terminal has
+    /// permanently lost.
+    /// </summary>
+    [AvaloniaFact]
+    public void WithNothingWaiting_TheGateTakesNoSpaceOnTheShippedSurface()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = 1420, Height = 920, Content = view };
+        win.Show();
+        Settle();
+
+        // Clear the gate the way approving everything would.
+        vm.Coordinator.PendingPlans.Clear();
+        vm.Coordinator.EscalatedPlans.Clear();
+        vm.Coordinator.BackpressureText = "";
+        vm.Coordinator.HasGateContent = false;
+        Settle();
+
+        var gate = Assert.Single(view.GetVisualDescendants().OfType<PlanGateView>());
+        Assert.False(gate.IsEffectivelyVisible, "an idle plan gate must collapse, not sit there empty");
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
     }
 
     [AvaloniaFact]

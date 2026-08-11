@@ -91,6 +91,17 @@
     backpressure banner names the count and the stopped coordinator — so a render that silently loses one
     fails here rather than in a screenshot nobody opened. Paired with a negative
     (`NoBlockedWorkers_ShowsNoBackpressureLine`): an always-on warning is the same as no warning.
+    **`TheShippedControlCenterSurface_MountsThePlanGate`** is the one that matters most, and it is here
+    because its absence let phase 2 ship undriveable: the five state renders above build
+    `CoordinatorPanelView`, a control **the application never constructs**, so the entire gate could be
+    complete, daemon-tested and pinned in five themes while the operator had no button to press anywhere
+    in the product. It builds the real `ControlCenterView` off a real `ControlCenterViewModel` and
+    requires a visible, non-zero-sized `PlanGateView` bound to the coordinator's own state with a live
+    Approve on it — verified red by deleting the mount. Its negative
+    (`WithNothingWaiting_TheGateTakesNoSpaceOnTheShippedSurface`) requires the region to collapse when
+    idle, and `EveryBlockedWorker_GetsItsOwnDecidableCard` counts **six** enabled Approve buttons for six
+    blocked workers off the visual tree, because "the ViewModel holds six" and "the human can clear six"
+    are different claims and only the second one unblocks the cap.
 - **`Mainguard.Tests/`** — xUnit tests for Core (`MockOrchestratorTests` — the Lane E mock daemon's
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
@@ -947,7 +958,14 @@
   while the plan stays pending with the same id/revision — the case where `Refresh` keeps the *same*
   `PlanCardViewModel` mounted — the card naming a failure instead of reverting silently, a successful retry
   clearing the stale message, and the shipped `DaemonBackedOrchestrator` **propagating** a failed decision
-  rather than swallowing it),
+  rather than swallowing it. **It also pins what each button SENDS**, which it did not: inverting
+  `ApproveAsync`/`RejectAsync` and dropping `FeedbackText` altogether left the whole suite green, because
+  the fake counted into a `DecisionCalls` nobody read and three tests rested on
+  `Assert.False(IsDeciding)` — the field's own default. The fake now records every decision as
+  *(plan id, approve, feedback)* and each is asserted; the feedback string is pinned separately because
+  the daemon hands it to the worker verbatim, so a dropped binding costs one of three revisions and tells
+  the worker nothing while the operator's box still shows what they typed; and the latch is asserted as a
+  **transition** through a held `TaskCompletionSource`, since only a transition can fail),
   `KillSwitchTests` (`FanOutUnder5s`+snapshot+frozen; the **RT-D4 `HardCeiling_IndependentOfRtt`**
   clamp with the A3 spike; the **SA-1/F4 `FreezesQueueBeforeFanOut`** timeline; the **RT-D3
   audit-outage→recovery `killswitch_audit_gap`**), and `Integration/ScriptedCoordinatorEndToEndTests`
