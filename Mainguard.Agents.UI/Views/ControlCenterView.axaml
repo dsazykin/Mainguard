@@ -108,6 +108,12 @@
                           IsVisible="{Binding ShowStopCoordinator}"
                           Command="{Binding StopCoordinatorCommand}"
                           IsEnabled="{Binding !IsStoppingCoordinator}"/>
+                  <!-- The standing route to the sandbox egress allowlist. Reachable at rest, not only
+                       after something has already been blocked — the policy is worth reading before it
+                       kills a CLI, and the block prompt is a bad place to discover it exists. -->
+                  <Button Classes="Secondary" Content="Network…" FontSize="12"
+                          ToolTip.Tip="Agent network allowlist — the hosts agents may reach"
+                          Command="{Binding OpenEgressAllowlistCommand}"/>
                 </StackPanel>
               </Grid>
 
@@ -292,6 +298,11 @@
                      Foreground="{DynamicResource WarningBrush}"
                      IsVisible="{Binding Error, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
           <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+            <!-- Unblock can only ever add the ONE host parsed out of the death message. When that is
+                 not enough (two hosts, or a mis-parse), this is the way to the full list. -->
+            <Button Classes="Secondary" Content="Manage allowlist…" FontSize="12"
+                    IsVisible="{Binding CanManageAllowlist}"
+                    Command="{Binding ManageAllowlistCommand}" IsEnabled="{Binding !IsBusy}"/>
             <Button Classes="Secondary" Content="Keep blocked" FontSize="12"
                     Command="{Binding KeepBlockedCommand}" IsEnabled="{Binding !IsBusy}"/>
             <Button Classes="Primary" Content="Unblock and retry" FontSize="12"

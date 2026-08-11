@@ -405,7 +405,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     {
         // One prompt at a time; a fresh block supersedes the old (the newest is what the user acts on).
         EgressBlockPrompt = new EgressBlockPromptViewModel(
-            info.Host, info.AgentLabel, UnblockHostAsync, () => EgressBlockPrompt = null);
+            info.Host, info.AgentLabel, UnblockHostAsync, () => EgressBlockPrompt = null,
+            manageAllowlist: () => OpenEgressAllowlistCommand.ExecuteAsync(null));
     });
 
     /// <summary>Unblock: add the refused host to the daemon allowlist (re-renders the proxy live), dismiss the
@@ -429,6 +430,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>Dismiss the egress block prompt (the overlay's backdrop / close).</summary>
     [RelayCommand]
     private void CloseEgressBlockPrompt() => EgressBlockPrompt = null;
+
+    /// <summary>
+    /// Opens the egress allowlist editor against the LIVE daemon allowlist.
+    ///
+    /// <para>The view existed and was constructed by nothing but a render harness, which left the
+    /// sandbox egress policy enforced but neither inspectable nor editable. The only affordance an
+    /// operator had was the block prompt's "Unblock and retry", and that can add exactly the one host
+    /// the detector managed to parse out of a dead CLI's exit message — there was no way to see what was
+    /// already allowed, allow a host in advance, or take one back off the list.</para>
+    ///
+    /// <para>Falls back to the in-memory seed when there is no daemon behind the surface (the mock /
+    /// design harness), so the editor still renders its real content rather than an error.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenEgressAllowlistAsync()
+    {
+        var gateway = _agents is Services.DaemonBackedOrchestrator daemon
+            ? daemon.CreateEgressAllowlistGateway()
+            : new Services.InMemoryEgressAllowlistGateway();
+
+        var vm = new EgressAllowlistViewModel(gateway);
+        await vm.InitializeAsync();
+
+        var owner = (Application.Current?.ApplicationLifetime
+            as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?.MainWindow;
+        var window = new Views.EgressAllowlistView { DataContext = vm };
+        if (owner is null)
+        {
+            window.Show();
+            return;
+        }
+
+        await window.ShowDialog(owner);
+    }
 
     /// <summary>Terminal lifecycle states — the same set <see cref="LiveAgentCount"/> excludes.</summary>
     private static bool IsTerminalState(AgentLifecycleState state) =>

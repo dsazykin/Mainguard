@@ -302,6 +302,12 @@ public sealed class DaemonBackedOrchestrator :
     /// sharing this adapter's DaemonClient. The caller (the agent workspace) owns + disposes it per attach.</summary>
     public ITerminalGateway CreateTerminalGateway() => new DaemonTerminalGateway(_client);
 
+    /// <summary>The live egress-allowlist seam over this adapter's DaemonClient — the same factory shape
+    /// as <see cref="CreateTerminalGateway"/>. Without it the allowlist editor had no gateway it could be
+    /// shown with except the hardcoded in-memory seed, so the sandbox egress policy was enforced but
+    /// neither inspectable nor editable.</summary>
+    public IEgressAllowlistGateway CreateEgressAllowlistGateway() => new DaemonEgressAllowlistGateway(_client);
+
     /// <summary>Fix 2: raised when a spawned agent's CLI DIED on a host the default-deny proxy refused,
     /// so the operator can unblock it and retry. Fired from the agent-event pump thread (the consumer
     /// marshals to the UI thread).</summary>

@@ -789,10 +789,19 @@
   - `MainWindowViewModel.OpenRepository` calls it best-effort on project open (a missing/unreachable
     daemon is a silent no-op).
   - `IEgressAllowlistGateway.cs` (P2-07: the App's seam to the daemon-owned egress allowlist —
-    `List`/`Add`/`Remove` over `EgressAllowlistItem`; `InMemoryEgressAllowlistGateway` seeds the
-    defaults for the render harness/preview, the production impl forwards to the daemon over gRPC so the
-    App never references `Docker.DotNet`/the sandbox engine seams — ESC-I2/G-18). ESC-I2: the App never
-    references the daemon substrate facade — it speaks only gRPC + `IGitService`.
+    `ListAsync`/`AddAsync`/`RemoveAsync` over `EgressAllowlistItem`; `InMemoryEgressAllowlistGateway`
+    seeds the defaults for the render harness/preview, the production impl forwards to the daemon over
+    gRPC so the App never references `Docker.DotNet`/the sandbox engine seams — ESC-I2/G-18). ESC-I2:
+    the App never references the daemon substrate facade — it speaks only gRPC + `IGitService`. Async
+    because the shipped implementation is a round trip: the seam was declared synchronous, which only
+    the in-memory seed could satisfy, so the editor had no live gateway to be shown with.
+  - `DaemonEgressAllowlistGateway.cs` (the SHIPPED `IEgressAllowlistGateway`, over `EgressService`'s
+    `ListAllowlist`/`AddAllowlistHost`/`RemoveAllowlistHost`. Stateless — every read is a fresh
+    `ListAllowlist`, so the editor reflects the daemon's authoritative list including entries the
+    unblock prompt added. Built via `DaemonBackedOrchestrator.CreateEgressAllowlistGateway()`, the same
+    factory shape as `CreateTerminalGateway`; reached from `ControlCenterViewModel`'s
+    `OpenEgressAllowlistCommand` — the coordinator toolbar's "Network…" button and the egress block
+    prompt's "Manage allowlist…").
   - `DockLayoutPersistence.cs` (P2-13: saves/restores a per-agent-kind `DockLayoutState` as versioned
     JSON under `%AppData%/Mainguard/workspace-layouts`; restore is total —
     absence/parse-failure/schema-drift falls back to the default layout, never throws).
