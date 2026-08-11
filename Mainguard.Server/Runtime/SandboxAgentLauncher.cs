@@ -39,6 +39,14 @@ public sealed class SandboxAgentLauncher
     private const int AgentUid = 1000;
     private const int SupervisorUid = 1001;
 
+    /// <summary>
+    /// The key variable used when no adapter marker is present at all (unknown kind / dev box without a
+    /// catalog). Named once so <see cref="BuildSecrets"/> and the ticket #52 confinement-refusal warnings
+    /// cannot name different variables — a warning that reports the wrong variable is worse than none,
+    /// since the operator would go looking for a key that is not there.
+    /// </summary>
+    private const string LegacyApiKeyEnvVar = "ANTHROPIC_API_KEY";
+
     private readonly IAgentEnvironment _environment;
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
@@ -528,15 +536,44 @@ public sealed class SandboxAgentLauncher
     private async Task<GatewayConfinement?> TryConfineToGatewayAsync(
         string agentId, string? modelApiKey, InstalledAdapterMarker? adapter, CancellationToken ct)
     {
-        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        // No key at all — an interactive-login (OAuth) agent. Nothing is confined and nothing is at
+        // risk, so this is the one refusal that stays quiet: warning here would train the operator to
+        // ignore the warnings that DO mean a key is sitting in a container.
+        if (string.IsNullOrWhiteSpace(modelApiKey))
         {
             return null;
         }
 
-        if (string.IsNullOrWhiteSpace(modelApiKey)
-            || adapter?.BaseUrlEnvVar is not { Length: > 0 }
+        // Ticket #52 — from here down a BYOK key EXISTS, so every remaining refusal ends with
+        // BuildSecrets writing the raw provider key into the jail. That outcome used to be reached in
+        // total silence, which made a confined agent and an unconfined one indistinguishable in the
+        // daemon log: the only loud path was the unreachable-gateway one below. An operator could not
+        // answer "is this agent's key in its container?" from any evidence the daemon produced.
+        //
+        // Each refusal now names ITSELF and its cause, because the two have different remedies: the
+        // gateway being off is an operator setting, while an adapter that cannot be redirected is a
+        // vendor fact no configuration change will fix (see the verified table in adapters.starter.json
+        // — codex, qwen-code and opencode expose no base-URL environment variable at all).
+        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        {
+            _log.LogWarning(
+                "gateway confinement OFF: agent={Agent} adapter={Adapter} supplied a BYOK provider key, but "
+                + "the model gateway is disabled, so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
+                + "MG-4 is not in effect for this agent and its model spend is not metered.",
+                agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
+            return null;
+        }
+
+        if (adapter?.BaseUrlEnvVar is not { Length: > 0 }
             || adapter.ModelHost is not { Length: > 0 } upstreamHost)
         {
+            _log.LogWarning(
+                "gateway confinement IMPOSSIBLE: agent={Agent} adapter={Adapter} declares no "
+                + "baseUrlEnvVar/modelHost pair, so its CLI cannot be pointed at the gateway and THE RAW "
+                + "KEY IS INJECTED INTO THE JAIL under {KeyVar}. This is a property of the vendor's CLI, "
+                + "not a misconfiguration — MG-4 cannot be applied to this agent, and its model spend is "
+                + "not metered.",
+                agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
             return null;
         }
 
@@ -603,7 +640,7 @@ public sealed class SandboxAgentLauncher
 
         if (!string.IsNullOrWhiteSpace(modelApiKey))
         {
-            var envVar = adapter is null ? "ANTHROPIC_API_KEY" : adapter.ApiKeyEnvVar;
+            var envVar = adapter is null ? LegacyApiKeyEnvVar : adapter.ApiKeyEnvVar;
             if (envVar is { Length: > 0 })
             {
                 // MG-4: when the gateway is available AND this CLI declares a base-URL variable, the

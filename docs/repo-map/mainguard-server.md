@@ -408,9 +408,15 @@
     daemon `PlanApprovalService`; **`ApprovePlan` resolves the approver via `IApproverIdentityResolver`
     from the connection — the request has no identity field**, SA-1/F2) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
-  - **`Runtime/SessionStoreKillTarget.cs`** — the interim `IKillTarget` over `AgentSessionStore` (marks
-    live sessions `Paused` on a kill; the real cooperative-yield→`docker pause` target swaps in behind
-    the seam).
+  - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
+    three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
+    in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
+    leave keystrokes reaching a killed agent), then `docker pause` the jail via
+    `ISandboxEngine.PauseAsync` (freezer cgroup — no cooperation needed from the untrusted agent),
+    then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
+    REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
+    kept executing and every terminal stayed typeable — containment that was really just relabelling.
+    Resume deliberately does NOT un-contain; recovery is an explicit per-agent action.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `PlanApprovalService` over a restart-safe `JsonPlanApprovalStore`, the

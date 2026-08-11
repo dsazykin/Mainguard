@@ -4,9 +4,13 @@
 - **`Mainguard.Tests/MainguardPathsGuardTests.cs`** — the structural guard for the mainguardd
   crash-loop bug class: scans the shipping source and fails on any `Environment.GetFolderPath` outside
   `MainguardPaths.cs` (see that entry).
-  - **`Mainguard.Tests/MainguardPathsMigrationTests.cs`** — the Phase-4 Windows data-root migration
-    policy over `MainguardPaths.TryMigrateDataRoot`: moves legacy→current only when current is absent
-    (preserving contents), no-ops when current already exists or on a fresh install, and is idempotent.
+  - **`Mainguard.Tests/TestDataRootIsolation.cs`** (PR #287) — a `[ModuleInitializer]` pointing the
+    ENTIRE desktop test assembly at a throwaway `%TEMP%` data root before any test runs, via
+    `MainguardPaths.DataRootOverrideVariable`. Per-assembly by construction, so a new test cannot
+    forget to opt in; an externally pinned root is respected, and abandoned runs are swept.
+  - **`Mainguard.Tests/DataRootIsolationTests.cs`** — the teeth behind it: the run must not resolve to
+    (or sit inside) the developer's real `~/.mainguard`, which the suite otherwise shared — one SQLite
+    file, one `config.json`, one keyring. Delete the initializer body and every fact here goes red.
   - **`Mainguard.Tests/AgentCliUiTests.cs`** — the P2-22 §J-5 CLI-picker surfaces (OOBE step + settings
     window) driven over fake channel/host seams with the REAL `AgentCliInstaller`/`AdapterChannel`: an
     install failure never blocks finishing setup, failures name an actionable cause (hash-mismatch →
@@ -909,6 +913,29 @@
   guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
   is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
   `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
+- **`build/ci/verify-e2e-optin-coverage.sh`** (#65) — asserts every `[RequiresDockerAndOptInFact]` test
+  is named in the `--filter` of **`.github/workflows/e2e-verification.yml`**, that the workflow
+  actually sets `MAINGUARD_VERIFY_E2E=1`, and that no filter clause is stale. The two most end-to-end
+  Docker tests (`VerifyInJailDockerTests`, `PythonToolchainDockerTests`) were gated behind that
+  variable and NO job set it, so they were the permanent "2 skipped" in every sandbox-suite run and
+  the in-jail verification path — the gate on entering the merge queue — was measured by nothing.
+  This script is what stops that from silently recurring: a new `[RequiresDockerAndOptInFact]` test
+  cannot be added without wiring it into the workflow above, and a renamed one cannot leave a filter
+  clause matching nothing (`dotnet test` runs zero tests and exits 0 perfectly happily). Matching is
+  against `--filter` clauses only, never the file's text: the first cut used a plain `grep` and the
+  workflow's own header comment satisfied it, which is the same species of defect it exists to catch.
+  On its first real run the gate immediately caught a live one — the `noexec` `AgentBranchGuard`
+  failure fixed in #68 — which is the argument for #65 made concretely rather than in the abstract.
+- **`build/ci/verify-repo-map-complete.sh`** + **`docs/repo-map/known-unindexed.txt`** (#66) — makes
+  "an unindexed file is an incomplete change" enforceable. It sweeps every tracked `.cs` file against
+  this index; a file counts as indexed if its path, filename, `.cs`/`.axaml.cs`-stripped stem, any
+  type it declares, or a covering directory entry appears anywhere here. Deliberately generous, so it
+  under-reports rather than failing a PR over prose formatting. The ~110-file backlog that existed
+  when it was written is recorded in the allowlist, which **may only shrink** (paired job in
+  `allowlist-shrink-guard`, so appending a file instead of indexing it fails too). Regenerate with
+  `--write-allowlist`. Two controls it will not run without: a positive control that a known-indexed
+  name is found (it caught the corpus being read as EMPTY through an over-long shell variable, which
+  would have reported every file as a gap), and a vacuity check on the file list.
   - **`.github/workflows/deploy-site.yml`** — DEPLOY only: builds `site/` and publishes it to GitHub
     Pages on pushes to `main` touching `site/**` (or manual dispatch). It is **not** the site's gate —
     `push` to `main` is too late. The PR gate (#57) is the **`site` job in `ci.yml`**, deliberately
@@ -1234,7 +1261,17 @@
   `StartAttempts`. Neither mechanism suffices alone: the allocator cannot stop a foreign process
   taking the port, and a retry alone would still let two of our own hosts collide)**,
   `TestPortAllocationTests` (the fixtures' own deterministic proof — both mechanisms driven through
-  injectable seams, since a race cannot be failed on demand). Test classes: `DaemonAuthTests` (auth
+  injectable seams, since a race cannot be failed on demand),
+  **`Mainguard.Server.Tests/TestDataRootIsolation.cs`** (the daemon twin of the desktop suite's
+  module initializer: PR #287 flagged this assembly as "likely" affected without proving it, and it
+  was — every `DaemonHost.Resolve*` store path falls back to `MainguardPaths.DataRoot()` when handed
+  no token path, and one clean run rewrote the real mTLS identity, held `mainguard-daemon.db` open and
+  left 13 live agent-IPC sockets in the user's data root) and
+  **`Mainguard.Server.Tests/DataRootIsolationTests.cs`** (its teeth, and more: besides proving the run
+  is not on the real root, `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
+  the SHIPPED resolver set that each one both TAKES and USES a token path — the case a hand-widened
+  exact-set list would wave through, and the one that would make every concurrent in-proc host share a
+  single file). Test classes: `DaemonAuthTests` (auth
   coverage incl. the reflect-every-method `[Theory]` + loopback bind),
   **`DaemonTransportSecurityTests` (MG-19 — every test holds a VALID bearer token, so each one proves
   the token is no longer sufficient on its own: plaintext h2c refused, no-client-certificate refused,
