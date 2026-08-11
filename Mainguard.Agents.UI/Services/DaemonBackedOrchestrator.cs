@@ -760,7 +760,11 @@ public sealed class DaemonBackedOrchestrator :
                     // daemon that predates the field leaves it unset, and mapping that to `false` would
                     // render every one of its entries as stranded and offer to spawn jails for agents that
                     // are running. Unset means unknown, and unknown changes nothing.
-                    HasLiveSandbox: entry.HasHasLiveSandbox ? entry.HasLiveSandbox : null));
+                    HasLiveSandbox: entry.HasHasLiveSandbox ? entry.HasLiveSandbox : null,
+                    // The daemon has always sent this and the client has always thrown it away, which is
+                    // why the review cockpit's "verified @ <sha>" stamp never rendered: the value existed
+                    // on the wire and stopped here.
+                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }

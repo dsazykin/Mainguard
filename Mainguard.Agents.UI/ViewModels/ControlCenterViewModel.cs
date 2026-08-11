@@ -1079,7 +1079,18 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             if (diff is not null)
             {
                 var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
-                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files);
+                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files)
+                {
+                    // The "verified @ <sha>" stamp. The bare 4-arg ctor left every enrichment property
+                    // unset, so BuildHeader was a no-op and a reviewer was told nothing about what the
+                    // branch's green was measured against. This one is real data: the daemon has always
+                    // sent verified_main_sha; the client dropped it in the queue projection. Null when
+                    // the entry has not been verified, in which case no stamp is drawn — an absent
+                    // stamp is the honest rendering of "not verified", and inventing one would be the
+                    // exact false reassurance this surface exists to prevent.
+                    VerifiedAgainstSha = _queue.GetQueue()
+                        .FirstOrDefault(e => e.AgentId == agentId)?.VerifiedMainSha,
+                };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same
                 // path the agent document uses. It was built with none: `changedGate: null`, `queue: null`
