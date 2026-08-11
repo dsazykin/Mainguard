@@ -83,8 +83,13 @@ public sealed record AgentIpcRequest(
     // These four constants ARE the coordinator's surface. `CoordinatorOps` below is the allow-list the
     // daemon dispatches against; anything absent from it is refused by name. Adding a member here is a
     // deliberate contract change (§3: "Adding to this list is a deliberate contract change, reviewed as
-    // such — not an implementation detail"), which is why the set is asserted against the contract
-    // document itself by CoordinatorSurfaceLockTests.
+    // such — not an implementation detail"), and `CoordinatorRoleLockTests` is what makes it one: it
+    // pins this set's exact contents, and pins that the daemon's served surface set-equals it.
+    //
+    // NOTE what that test does NOT do, because a citation is exactly what stops a reviewer checking:
+    // it asserts against a hardcoded expectation in the test file, NOT against docs/design/
+    // coordinator-contract.md. Nothing reads the contract markdown. Keeping this list and §3 in
+    // agreement is a human review step, and calling it automated would be the more expensive lie.
 
     /// <summary><c>spawn_worker</c> — start a worker on a described task.</summary>
     public const string SpawnOp = "spawn";
@@ -105,6 +110,13 @@ public sealed record AgentIpcRequest(
     /// The complete set of ops a coordinator endpoint will serve (contract §3). The daemon dispatches
     /// against this set rather than against a <c>switch</c>'s reachable cases, so "the list is exhaustive"
     /// is one testable object instead of a property of control flow that has to be re-read to be believed.
+    ///
+    /// <para>That sentence was aspirational until it was made true: <c>AgentSpawnService</c> used to route
+    /// on a bare <c>switch</c> and this set was referenced by nothing but a test, so an added case served a
+    /// fifth, unlisted coordinator tool with the suite green. The service now builds its handler table
+    /// against this set and exposes the result as <c>ServedCoordinatorOps</c>, which the role-lock test
+    /// requires to set-equal this — so a handler added without a contract change is unreachable, and one
+    /// added with a contract change goes red here.</para>
     /// </summary>
     public static readonly System.Collections.Generic.IReadOnlySet<string> CoordinatorOps =
         new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)

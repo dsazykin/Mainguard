@@ -1177,7 +1177,17 @@
   (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4
   capability by its RPC spelling (`BeginMerge`, `ConfirmMerge`, `AbandonMerge`,
   `AcknowledgeFlaggedChange`, `ApprovePlan`, `RejectPlan`, `GetScrollback`), every worker plan-gate op,
-  and assorted others — are each refused, and removing the deny turns ALL 18 red. §7 ownership scoping is
+  and assorted others — are each refused, and removing the deny turns ALL 18 red.
+  **`TheDaemonServesExactlyTheContractSurface_AndNothingElse` is the assertion that was missing**, and its
+  absence made the rest weaker than it read: the allow-list was consumed by nothing, dispatch was a bare
+  `switch`, and adding `case "read_worker_scrollback"` served an unlisted fifth coordinator tool with all
+  95 tests green — the 18-name theory cannot catch name 19, and the positive control (`"exec"`, which IS
+  on the list) went red, proving the gap was coverage rather than method. The daemon now builds its
+  handler tables against `CoordinatorOps`/`WorkerOps` and this test set-equals the served surface to them
+  in both directions, so an op with no handler is caught too. Verified against both mutation shapes: an
+  unlisted handler fails `AgentSpawnService`'s constructor (30/30 red — the daemon does not come up), and
+  a handler listed in `CoordinatorOps` — the only spelling that could work — goes red on the
+  contract-set assertion. §7 ownership scoping is
   keyed `(RepoHash, AgentId)`: two repos each running `pr-7` under different coordinators do not see each
   other (the test that only a second repo can express), a stranger's worker cannot be read, steered or
   proposed for verification, and "not yours" is answered IDENTICALLY to "no such worker" so the channel is

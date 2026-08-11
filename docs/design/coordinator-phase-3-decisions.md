@@ -73,10 +73,25 @@ one the jail can actually reach, so that is where the policy lives. `Coordinator
 in-process surface for the scripted loop and is no longer the only place the four tools exist.
 
 **The deny is an allow-list, not a `default:` that happens to be reachable.**
-`AgentIpcRequest.CoordinatorOps` is the set; the handler serves an op only because a `case` names it.
+`AgentIpcRequest.CoordinatorOps` is the set, and the daemon builds its handler table *against* that set at
+construction: an op is served because the set contains it, and a handler registered for anything else
+makes `AgentSpawnService`'s constructor **throw** rather than becoming a fifth coordinator tool.
 `CoordinatorRoleLockTests.EveryOperationOutsideTheContractSurface_IsRefused` walks 18 op names — every §4
 capability by its RPC spelling, every worker plan-gate op, and assorted others — and asserts each is
 refused. Removing the deny turns **all 18 red** (mutation M1, §3 below).
+
+**This was not true when it was first written, and the correction is the interesting part.** The sentence
+above originally described a bare `switch`, and `CoordinatorOps` was consumed by *nothing* — it appeared
+in a comment, its own declaration and a `<see cref>`. Adding
+`case "read_worker_scrollback": return new AgentIpcResponse(Ok: true);` therefore shipped a fifth,
+unlisted coordinator tool — reading another session's scrollback, which §4 forbids by name — with the
+whole 95-test suite **green**. The positive control (the identical mutation spelled `"exec"`, which *is*
+one of the 18) went red, so the method was sound and the coverage was not: an 18-name blocklist cannot
+catch name 19, and there was nothing else looking. The allow-list is now load-bearing rather than
+decorative, and `TheDaemonServesExactlyTheContractSurface_AndNothingElse` asserts the served set against
+the contract set in both directions. Re-run of the same mutation after the fix: **30 of 30 red** (the
+daemon refuses to construct); the variant that also adds the name to `CoordinatorOps` — the only spelling
+that could ever work — goes red on the contract-set assertion instead.
 
 ### 2.2 Ownership is `(RepoHash, AgentId)` — and a stranger's worker is answered as a missing one
 

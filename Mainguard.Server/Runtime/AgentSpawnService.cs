@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -124,6 +125,14 @@ public sealed class AgentSpawnService
         ArgumentNullException.ThrowIfNull(loggerFactory);
         _spawnLog = loggerFactory.CreateLogger(DaemonLogCategories.Spawn);
         _coordLog = loggerFactory.CreateLogger(DaemonLogCategories.Coordinator);
+
+        // Built EAGERLY, because the check inside is the role lock and a role lock that runs on the first
+        // IPC request runs after the daemon has already told the operator it is up. A handler registered
+        // for an op the contract does not list is a programming error — a coordinator capability added
+        // without the contract change §3 requires — so it takes the daemon down here rather than becoming
+        // a surface nobody reviewed.
+        _coordinatorHandlers = BuildCoordinatorHandlers();
+        _workerHandlers = BuildWorkerHandlers();
     }
 
     /// <summary>
@@ -560,103 +569,184 @@ public sealed class AgentSpawnService
             "spawn-shim request: op={Op} kind={Kind} from coordinator={Coordinator}",
             request.Op, request.AgentKind, coordinatorAgentId);
 
-        switch (request.Op)
+        // Contract §3 is EXHAUSTIVE: "Anything not on this list is denied." The allow-list is consulted
+        // FIRST and it is the real gate — an op is served because CoordinatorOps contains it, never
+        // because some case label happened to name it.
+        //
+        // It used to be the other way round. Dispatch was a bare `switch` whose `default:` carried a
+        // comment claiming the set was the allow-list, while CoordinatorOps was referenced by nothing but
+        // a test: adding `case "read_worker_scrollback": return Ok(true);` served a fifth, unlisted
+        // coordinator tool with the whole 95-test suite green. Deny-by-default was true of that switch,
+        // but "and the served surface is exactly these five" was a property of control flow that no
+        // reader and no test could check — which is the failure mode §5 names (MG-12: two copies of a
+        // rule, one of them decorative).
+        if (!CoordinatorHandlers.TryGetValue(request.Op, out var handler))
         {
-            case AgentIpcRequest.SpawnOp:
-                if (string.IsNullOrWhiteSpace(request.AgentKind))
-                {
-                    return new AgentIpcResponse(Ok: false, Error: "an agent kind is required (mainguard-agent spawn <agent-kind>)");
-                }
+            return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
+        }
 
-                // Id-only by necessity: the shim's identity is positional (only that coordinator's jail
-                // has the socket) and the socket carries no repo. Safe — a coordinator id is always a
-                // minted GUID; the only ids that repeat across repos are the intake's `pr-<n>`, and an
-                // external-PR worker is Managed, so it never gets an IPC endpoint to ask through.
-                var coordinator = _store.Find(coordinatorAgentId);
-                if (coordinator is null)
-                {
-                    return new AgentIpcResponse(Ok: false, Error: "this coordinator session is no longer live");
-                }
+        return await handler(request, coordinatorAgentId, ct).ConfigureAwait(false);
+    }
 
-                if (coordinator.RepoHash is not { Length: > 0 } repoHandle)
-                {
-                    return new AgentIpcResponse(Ok: false, Error: "the coordinator has no provisioned repo to spawn against");
-                }
+    /// <summary>
+    /// The coordinator's served surface, <b>as an object</b>: contract §3's op names bound to the methods
+    /// that serve them, and nothing else can be dialled.
+    ///
+    /// <para>Checked against <see cref="AgentIpcRequest.CoordinatorOps"/> at construction, so the two
+    /// cannot drift: a handler registered for an op the contract does not list <b>refuses to build</b>
+    /// rather than quietly becoming a fifth coordinator tool. Adding one is therefore exactly what §3 says
+    /// it is — a deliberate contract change — and it is the set, not a case label, that decides. Exposed
+    /// to tests as <see cref="ServedCoordinatorOps"/>, because "the list is exhaustive" is then one
+    /// assertable object rather than a claim about which case labels a reader managed to find.</para>
+    /// </summary>
+    private readonly ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        _coordinatorHandlers;
 
-                // MG-2: the wired shim spawn is the agent-reachable path, so the hard caps that live in
-                // the (un-wired) CoordinatorTools must be re-applied here server-side — a coordinator
-                // must not be able to fan out unlimited Managed workers or spawn under memory pressure.
-                //
-                // MaxActiveWorkers is a BOX-wide allowance (as is the AdmissionController's agent count),
-                // so the counted population is every Managed session on the daemon, unchanged by the
-                // (repo, id) key — List() still returns one entry per session. It is now strictly more
-                // accurate: a second repo's `pr-7` is a real session that consumes a slot, where before it
-                // could not be recorded at all and so was invisible to the cap.
-                //
-                // Phase 2: a worker blocked on plan approval is a live Managed session, so it is already
-                // inside this count — which is exactly the decided behaviour (the cap is a RESOURCE cap and
-                // a blocked worker still holds its jail). What was missing is legibility: a coordinator
-                // refused here used to be told only "let one finish", which is wrong and unactionable when
-                // the truth is "six plans are sitting in front of you".
-                var activeManaged = _store.List().Count(s => s.Role == AgentRoles.Managed);
-                var refusal = CoordinatorSpawnGate.Evaluate(
-                    activeManaged, _limits.MaxActiveWorkers, _admission, _planGate);
-                if (refusal is not null)
-                {
-                    _coordLog.LogWarning(
-                        "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, refusal);
-                    _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
-                    {
-                        ["coordinator_id"] = coordinatorAgentId,
-                        ["active_managed"] = activeManaged.ToString(),
-                        ["max_active_workers"] = _limits.MaxActiveWorkers.ToString(),
-                        ["blocked_on_plan_approval"] = _planGate.BlockedWorkerCount.ToString(),
-                        ["reason"] = refusal,
-                    }));
-                    return new AgentIpcResponse(Ok: false, Error: refusal);
-                }
+    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        CoordinatorHandlers => _coordinatorHandlers;
 
-                try
-                {
-                    // The task the coordinator described goes to the plan gate, NOT into the jail. Before
-                    // phase 2 this field was parsed off the wire and then silently dropped — the worker
-                    // never received the task at all. It now has a home, and a gate: the daemon hands it
-                    // over only once a human has approved the worker's own plan.
-                    var agentId = await SpawnAsync(
-                        repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
-                        AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
-                        parentAgentId: coordinatorAgentId,
-                        heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task",
-                        heldTaskPrompt: request.TaskPrompt ?? "").ConfigureAwait(false);
+    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        BuildCoordinatorHandlers()
+    {
+        var table = new Dictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>(
+            StringComparer.Ordinal)
+        {
+            [AgentIpcRequest.SpawnOp] = SpawnWorkerAsync,
+            // One tool, two forms: `get_worker_status` scoped to the whole fan-out or to one worker.
+            [AgentIpcRequest.ListOp] = (r, c, _) => Task.FromResult(Status(r, c)),
+            [AgentIpcRequest.StatusOp] = (r, c, _) => Task.FromResult(Status(r, c)),
+            [AgentIpcRequest.PromptOp] = PromptAsync,
+            [AgentIpcRequest.VerifyOp] = VerifyAsync,
+        };
 
-                    return new AgentIpcResponse(
-                        Ok: true,
-                        AgentId: agentId,
-                        Status: "AwaitingPlan",
-                        Error: null);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    return new AgentIpcResponse(Ok: false, Error: ex.Message);
-                }
+        return LockToContract(table, AgentIpcRequest.CoordinatorOps, "coordinator");
+    }
 
-            case AgentIpcRequest.ListOp:
-            case AgentIpcRequest.StatusOp:
-                return Status(request, coordinatorAgentId);
+    /// <summary>
+    /// The role lock itself: a handler table may serve <b>only</b> ops the contract lists, and it must
+    /// serve all of them.
+    ///
+    /// <para>Both directions are refusals rather than silent corrections, and the asymmetry is the point.
+    /// Dropping an unlisted handler quietly would restore exactly the failure this replaced — the set
+    /// looking authoritative while the real surface lived somewhere else — only inverted. A missing
+    /// handler is refused too: a listed op with nothing behind it answers "unknown op", which reads to a
+    /// coordinator as "the contract lied" and to a reviewer as nothing at all.</para>
+    /// </summary>
+    private static ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        LockToContract(
+            Dictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>> table,
+            IReadOnlySet<string> contractOps,
+            string role)
+    {
+        var unlisted = table.Keys.Where(op => !contractOps.Contains(op)).OrderBy(op => op, StringComparer.Ordinal).ToArray();
+        if (unlisted.Length > 0)
+        {
+            throw new InvalidOperationException(
+                $"the {role} IPC surface would serve {string.Join(", ", unlisted.Select(o => $"'{o}'"))}, " +
+                "which coordinator contract §3 does not list. Adding an operation is a deliberate contract " +
+                "change: add it to the contract's op set (and its §3 table) or do not register a handler.");
+        }
 
-            case AgentIpcRequest.PromptOp:
-                return await PromptAsync(request, coordinatorAgentId, ct).ConfigureAwait(false);
+        var missing = contractOps.Where(op => !table.ContainsKey(op)).OrderBy(op => op, StringComparer.Ordinal).ToArray();
+        if (missing.Length > 0)
+        {
+            throw new InvalidOperationException(
+                $"the {role} IPC surface lists {string.Join(", ", missing.Select(o => $"'{o}'"))} " +
+                "but has no handler for it — a contract operation that answers \"unknown op\".");
+        }
 
-            case AgentIpcRequest.VerifyOp:
-                return await VerifyAsync(request, coordinatorAgentId, ct).ConfigureAwait(false);
+        return table.ToImmutableDictionary(StringComparer.Ordinal);
+    }
 
-            default:
-                // Contract §3 is EXHAUSTIVE: "Anything not on this list is denied." This is the whole of
-                // the coordinator's deny path, and it is deny-by-default — an op is served only because a
-                // case above names it, never because nothing refused it. CoordinatorSurfaceLockTests walks
-                // every op name in the protocol (including the worker's) plus the RPC names §4 forbids and
-                // asserts each one lands here.
-                return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
+    /// <summary>
+    /// Exactly what a coordinator endpoint will serve, for the role-lock test. This is the observable form
+    /// of contract §3's exhaustiveness claim: it must set-equal <see cref="AgentIpcRequest.CoordinatorOps"/>.
+    /// </summary>
+    internal IReadOnlySet<string> ServedCoordinatorOps =>
+        CoordinatorHandlers.Keys.ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
+    /// <c>spawn_worker</c> (contract §3) — start a Managed worker on the described task, under the caps.
+    /// The described task itself goes to the plan gate, not into the jail.
+    /// </summary>
+    private async Task<AgentIpcResponse> SpawnWorkerAsync(
+        AgentIpcRequest request, string coordinatorAgentId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.AgentKind))
+        {
+            return new AgentIpcResponse(Ok: false, Error: "an agent kind is required (mainguard-agent spawn <agent-kind>)");
+        }
+
+        // Id-only by necessity: the shim's identity is positional (only that coordinator's jail
+        // has the socket) and the socket carries no repo. Safe — a coordinator id is always a
+        // minted GUID; the only ids that repeat across repos are the intake's `pr-<n>`, and an
+        // external-PR worker is Managed, so it never gets an IPC endpoint to ask through.
+        var coordinator = _store.Find(coordinatorAgentId);
+        if (coordinator is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: "this coordinator session is no longer live");
+        }
+
+        if (coordinator.RepoHash is not { Length: > 0 } repoHandle)
+        {
+            return new AgentIpcResponse(Ok: false, Error: "the coordinator has no provisioned repo to spawn against");
+        }
+
+        // MG-2: the wired shim spawn is the agent-reachable path, so the hard caps that live in
+        // the (un-wired) CoordinatorTools must be re-applied here server-side — a coordinator
+        // must not be able to fan out unlimited Managed workers or spawn under memory pressure.
+        //
+        // MaxActiveWorkers is a BOX-wide allowance (as is the AdmissionController's agent count),
+        // so the counted population is every Managed session on the daemon, unchanged by the
+        // (repo, id) key — List() still returns one entry per session. It is now strictly more
+        // accurate: a second repo's `pr-7` is a real session that consumes a slot, where before it
+        // could not be recorded at all and so was invisible to the cap.
+        //
+        // Phase 2: a worker blocked on plan approval is a live Managed session, so it is already
+        // inside this count — which is exactly the decided behaviour (the cap is a RESOURCE cap and
+        // a blocked worker still holds its jail). What was missing is legibility: a coordinator
+        // refused here used to be told only "let one finish", which is wrong and unactionable when
+        // the truth is "six plans are sitting in front of you".
+        var activeManaged = _store.List().Count(s => s.Role == AgentRoles.Managed);
+        var refusal = CoordinatorSpawnGate.Evaluate(
+            activeManaged, _limits.MaxActiveWorkers, _admission, _planGate);
+        if (refusal is not null)
+        {
+            _coordLog.LogWarning(
+                "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, refusal);
+            _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
+            {
+                ["coordinator_id"] = coordinatorAgentId,
+                ["active_managed"] = activeManaged.ToString(),
+                ["max_active_workers"] = _limits.MaxActiveWorkers.ToString(),
+                ["blocked_on_plan_approval"] = _planGate.BlockedWorkerCount.ToString(),
+                ["reason"] = refusal,
+            }));
+            return new AgentIpcResponse(Ok: false, Error: refusal);
+        }
+
+        try
+        {
+            // The task the coordinator described goes to the plan gate, NOT into the jail. Before
+            // phase 2 this field was parsed off the wire and then silently dropped — the worker
+            // never received the task at all. It now has a home, and a gate: the daemon hands it
+            // over only once a human has approved the worker's own plan.
+            var agentId = await SpawnAsync(
+                repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
+                AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
+                parentAgentId: coordinatorAgentId,
+                heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task",
+                heldTaskPrompt: request.TaskPrompt ?? "").ConfigureAwait(false);
+
+            return new AgentIpcResponse(
+                Ok: true,
+                AgentId: agentId,
+                Status: "AwaitingPlan",
+                Error: null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new AgentIpcResponse(Ok: false, Error: ex.Message);
         }
     }
 
@@ -862,18 +952,45 @@ public sealed class AgentSpawnService
         _coordLog.LogInformation(
             "plan-shim request: op={Op} from worker={Worker}", request.Op, workerAgentId);
 
-        // One method per op. Each plan-gate op has real branching, and a braced `case { … }` block is
-        // both harder to read and (per .editorconfig) indented two levels deeper than the code around it.
-        // The switch stays a routing table.
-        return request.Op switch
+        // Same shape as the coordinator's, and for the same reason: WorkerOps is the allow-list, consulted
+        // before anything is routed, so the worker's served surface is an object a test can hold rather
+        // than a set of case labels a reader has to trust.
+        if (!WorkerHandlers.TryGetValue(request.Op, out var handler))
         {
-            AgentIpcRequest.BriefOp => Brief(workerAgentId),
-            AgentIpcRequest.PresentPlanOp => await PresentPlanAsync(request, workerAgentId, ct).ConfigureAwait(false),
-            AgentIpcRequest.RevisePlanOp => await RevisePlanAsync(request, workerAgentId, ct).ConfigureAwait(false),
-            AgentIpcRequest.AwaitDecisionOp => await AwaitDecisionAsync(request, workerAgentId, ct).ConfigureAwait(false),
-            _ => new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'"),
-        };
+            return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
+        }
+
+        return await handler(request, workerAgentId, ct).ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// The worker endpoint's served surface. One method per op — each plan-gate op has real branching, so
+    /// the table stays a routing table. Intersected with <see cref="AgentIpcRequest.WorkerOps"/> for the
+    /// same reason the coordinator's is: an unlisted handler is unreachable rather than quietly served.
+    /// </summary>
+    private readonly ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        _workerHandlers;
+
+    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        WorkerHandlers => _workerHandlers;
+
+    private ImmutableDictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>
+        BuildWorkerHandlers()
+    {
+        var table = new Dictionary<string, Func<AgentIpcRequest, string, CancellationToken, Task<AgentIpcResponse>>>(
+            StringComparer.Ordinal)
+        {
+            [AgentIpcRequest.BriefOp] = (_, w, _) => Task.FromResult(Brief(w)),
+            [AgentIpcRequest.PresentPlanOp] = PresentPlanAsync,
+            [AgentIpcRequest.RevisePlanOp] = RevisePlanAsync,
+            [AgentIpcRequest.AwaitDecisionOp] = AwaitDecisionAsync,
+        };
+
+        return LockToContract(table, AgentIpcRequest.WorkerOps, "worker");
+    }
+
+    /// <summary>Exactly what a worker endpoint will serve; must set-equal <see cref="AgentIpcRequest.WorkerOps"/>.</summary>
+    internal IReadOnlySet<string> ServedWorkerOps => WorkerHandlers.Keys.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>What am I here to plan? The brief and the live plan's state — never the task prompt.</summary>
     private AgentIpcResponse Brief(string workerAgentId)

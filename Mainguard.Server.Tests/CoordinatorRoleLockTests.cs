@@ -125,6 +125,44 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
     }
 
     /// <summary>
+    /// <b>The daemon serves exactly the contract's set — measured on the daemon, not on the set.</b>
+    ///
+    /// <para>This is the assertion the surface lock was missing, and its absence made every other test in
+    /// this file weaker than it read. Dispatch used to be a bare <c>switch</c> and <c>CoordinatorOps</c>
+    /// was consumed by <i>nothing</i> — it appeared in a comment, its own declaration, and a
+    /// <c>&lt;see cref&gt;</c>. So the set was decorative: adding
+    /// <c>case "read_worker_scrollback": return new AgentIpcResponse(Ok: true);</c> to the handler shipped
+    /// a fifth, unlisted coordinator tool — precisely the §4 capability the contract forbids by name — and
+    /// all 95 tests stayed green. The refusal theory above could not catch it because it is a hardcoded
+    /// list of 18 names, and the mutation simply is not one of them; the positive control (the same
+    /// mutation spelled <c>"exec"</c>, which IS on the list) went red, which is what proved the gap rather
+    /// than the method.</para>
+    ///
+    /// <para>The daemon now builds its handler table <i>against</i> <c>CoordinatorOps</c>, at construction,
+    /// and publishes the result. Two mutations, both red, and neither of them subtle: a handler registered
+    /// <b>without</b> listing the op refuses to build — <c>AgentSpawnService</c>'s constructor throws, so
+    /// the daemon does not come up and every test in this file that dials the socket fails; a handler
+    /// registered <b>with</b> the op listed fails the contract-set assertion above. There is no longer a
+    /// way to add a coordinator tool that is both functional and quiet. This test holds the third edge:
+    /// the surface must also serve <i>everything</i> §3 lists, so a contract op with no handler behind it
+    /// cannot sit there answering "unknown op".</para>
+    /// </summary>
+    [Fact]
+    public void TheDaemonServesExactlyTheContractSurface_AndNothingElse()
+    {
+        Assert.Equal(
+            AgentIpcRequest.CoordinatorOps.OrderBy(o => o, StringComparer.Ordinal).ToArray(),
+            _rig.Spawns.ServedCoordinatorOps.OrderBy(o => o, StringComparer.Ordinal).ToArray());
+
+        Assert.Equal(
+            AgentIpcRequest.WorkerOps.OrderBy(o => o, StringComparer.Ordinal).ToArray(),
+            _rig.Spawns.ServedWorkerOps.OrderBy(o => o, StringComparer.Ordinal).ToArray());
+
+        // …and the two served surfaces are disjoint on the daemon too, not merely in the protocol's sets.
+        Assert.Empty(_rig.Spawns.ServedCoordinatorOps.Intersect(_rig.Spawns.ServedWorkerOps, StringComparer.Ordinal));
+    }
+
+    /// <summary>
     /// §3 "Anything not on this list is denied", and §4's items by name. Every one of these is refused on a
     /// live coordinator endpoint. The §4 RPC spellings are included deliberately: they are the capabilities
     /// the contract forbids, and this asserts there is no back door to them on the one channel a

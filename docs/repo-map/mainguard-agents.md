@@ -103,7 +103,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
     two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
     happens to reach — so "the list is exhaustive" is one testable thing instead of a property of control
-    flow. Adding a member is a deliberate contract change),
+    flow. Adding a member is a deliberate contract change. **That claim was decorative until it was made
+    true**: the set was referenced by nothing but a test while `HandleShimRequestAsync` dispatched on a
+    bare `switch`, so an added `case` served an unlisted fifth coordinator tool with the suite green.
+    `AgentSpawnService` now builds its handler tables against these sets at construction and **throws**
+    on an unlisted handler),
     `AgentSpawnShim.cs` (the `mainguard-agent` python3 shim script the daemon writes into the
     **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
     G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>

@@ -207,8 +207,17 @@
     (`SandboxAgentLauncher`) → CLI bind → managed-worker terminal lock (P2-14); stop tears down record,
     PTY, endpoint, lock, jail, worktree. Typed `AgentSpawnRefusedException` keeps it transport-agnostic.
     **Phase 3 — the role lock (coordinator contract §8).** The coordinator shim handler now serves the
-    contract's four tools and nothing else: `spawn` / `status` (+`list`) / `prompt` / `verify`, with a
-    deny-by-default `default:` case. Every op naming an agent resolves it through `OwnedWorker`, scoped
+    contract's four tools and nothing else: `spawn` / `status` (+`list`) / `prompt` / `verify`.
+    **The allow-list is the dispatcher**, not a comment above a `switch`: `BuildCoordinatorHandlers` /
+    `BuildWorkerHandlers` bind op → method and run both tables through `LockToContract`, which throws
+    unless the table set-equals `AgentIpcRequest.CoordinatorOps` / `WorkerOps`; they are built in the
+    **constructor**, so a handler registered for an op §3 does not list takes the daemon down at startup
+    instead of shipping an unreviewed fifth coordinator tool, and a listed op with no handler behind it is
+    caught in the same place. `ServedCoordinatorOps`/`ServedWorkerOps` publish the result so the role-lock
+    test can assert the surface rather than infer it from case labels. (It was a bare `switch` with a
+    deny-by-default `default:` until then; the deny was real, but "and the surface is exactly these five"
+    was a property of control flow, and adding one `case` served an unlisted op with the suite green.)
+    Every op naming an agent resolves it through `OwnedWorker`, scoped
     `(RepoHash, AgentId)` to the caller's own fan-out — a stranger's worker is refused with the SAME string
     as a nonexistent one, so the channel is not an existence oracle. A coordinator spawn now sets
     `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
