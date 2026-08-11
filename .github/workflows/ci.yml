@@ -122,6 +122,32 @@ jobs:
             echo "$ALLOWLIST did not grow vs origin/phase2."
           done
 
+      # Ticket #66 — the repo-map backlog obeys the same shrink-only rule, for the same reason. The
+      # completeness guard (installer-guardrails job) fails a NEW unindexed file; without this, the
+      # obvious way to make that guard pass would be to append the file to the backlog list, which
+      # would make the whole thing decorative. Recorded gaps may be deleted (someone wrote the entry);
+      # they may never be added.
+      - name: Ensure the repo-map backlog did not grow vs phase2
+        run: |
+          set -euo pipefail
+          ALLOWLIST=docs/repo-map/known-unindexed.txt
+          if ! git cat-file -e "origin/phase2:$ALLOWLIST" 2>/dev/null; then
+            echo "$ALLOWLIST not yet on origin/phase2 (introducing PR); shrink-only guard active from next PR."
+            exit 0
+          fi
+          if ! DIFF="$(git diff origin/phase2 -- "$ALLOWLIST")"; then
+            echo "::error::git diff against origin/phase2 failed for $ALLOWLIST — the shrink-only guard could not run, so it must not report success"
+            exit 1
+          fi
+          # Comment lines are exempt: the header is prose, and rewording it is not adding a gap.
+          ADDED="$(printf '%s\n' "$DIFF" | awk '/^\+\+\+/ { next } /^\+[[:space:]]*#/ { next } /^\+[[:space:]]*$/ { next } /^\+/ { print }')"
+          if [ -n "$ADDED" ]; then
+            echo "::error::$ALLOWLIST gained entries. A new file must get a docs/repo-map/ entry, not a line here:"
+            echo "$ADDED"
+            exit 1
+          fi
+          echo "$ALLOWLIST did not grow vs origin/phase2."
+
   sandbox-security:
     name: Sandbox security suite (RequiresDocker, Linux)
     runs-on: ubuntu-latest
@@ -395,6 +421,16 @@ jobs:
       # notices stopped running cannot — and that is the failure this ticket actually was.
       - name: Every opt-in E2E test is wired into a job that runs it (#65)
         run: build/ci/verify-e2e-optin-coverage.sh
+
+      # ------------------------------------------------------------------------------------------
+      # Ticket #66 — "an unindexed file is an incomplete change" was a rule nothing checked.
+      # ------------------------------------------------------------------------------------------
+      # It had drifted: Mainguard.Server.Tests/DataRootIsolationTests.cs had no entry, and a full sweep
+      # found ~110 more. The backlog is recorded in docs/repo-map/known-unindexed.txt and may only
+      # shrink (enforced in allowlist-shrink-guard); this step fails a NEW file that is unindexed and
+      # not on that list, which is what makes the rule real from now on rather than aspirational.
+      - name: Every .cs file has a docs/repo-map entry (#66)
+        run: build/ci/verify-repo-map-complete.sh
 
   client-closure:
     name: Client head closure excludes the agent platform (ADR-0001)

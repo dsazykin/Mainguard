@@ -893,6 +893,27 @@
   guard pass forever having read nothing. Pure-comment matches are exempt (documenting the prohibition
   is not breaking it); the runtime-composed case is covered by `WslCommands.AllBuilders()` +
   `BootstrapStateMachineTests.Lifecycle_ShouldNeverEmitShutdown`.
+- **`build/ci/verify-e2e-optin-coverage.sh`** (#65) — asserts every `[RequiresDockerAndOptInFact]` test
+  is named in the `--filter` of **`.github/workflows/e2e-verification.yml`**, that the workflow
+  actually sets `MAINGUARD_VERIFY_E2E=1`, and that no filter clause is stale. The two most end-to-end
+  Docker tests (`VerifyInJailDockerTests`, `PythonToolchainDockerTests`) were gated behind that
+  variable and NO job set it, so they were the permanent "2 skipped" in every sandbox-suite run and
+  the in-jail verification path — the gate on entering the merge queue — was measured by nothing.
+  The gate is KEPT (measured: a 90-minute full Release solution build in a jail plus a 30-minute
+  toolchain install), but it is now a renewed decision: nightly `schedule`, `workflow_dispatch`, and
+  `pull_request` on the verification path — which includes the workflow file itself, so the PR that
+  changes the gate exercises it. Matching is against filter clauses only, never the file's text: the
+  first cut used a plain `grep` and the workflow's own header comment satisfied it.
+- **`build/ci/verify-repo-map-complete.sh`** + **`docs/repo-map/known-unindexed.txt`** (#66) — makes
+  "an unindexed file is an incomplete change" enforceable. It sweeps every tracked `.cs` file against
+  this index; a file counts as indexed if its path, filename, `.cs`/`.axaml.cs`-stripped stem, any
+  type it declares, or a covering directory entry appears anywhere here. Deliberately generous, so it
+  under-reports rather than failing a PR over prose formatting. The ~110-file backlog that existed
+  when it was written is recorded in the allowlist, which **may only shrink** (paired job in
+  `allowlist-shrink-guard`, so appending a file instead of indexing it fails too). Regenerate with
+  `--write-allowlist`. Two controls it will not run without: a positive control that a known-indexed
+  name is found (it caught the corpus being read as EMPTY through an over-long shell variable, which
+  would have reported every file as a gap), and a vacuity check on the file list.
   - **`.github/workflows/deploy-site.yml`** — DEPLOY only: builds `site/` and publishes it to GitHub
     Pages on pushes to `main` touching `site/**` (or manual dispatch). It is **not** the site's gate —
     `push` to `main` is too late. The PR gate (#57) is the **`site` job in `ci.yml`**, deliberately
