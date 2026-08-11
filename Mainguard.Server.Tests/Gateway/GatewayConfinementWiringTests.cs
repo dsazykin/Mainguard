@@ -144,6 +144,84 @@ public sealed class GatewayConfinementWiringTests
     }
 
     // =============================================================================================
+    // 3. Ticket #52 — a jail that receives the RAW KEY must say so.
+    // =============================================================================================
+    //
+    // The gap was not that unconfinable CLIs exist — codex/qwen-code/opencode genuinely expose no
+    // base-URL environment variable, re-verified against upstream source (see adapters.starter.json).
+    // The gap was that the refusal was SILENT: TryConfineToGatewayAsync returned null without a word,
+    // so a jail holding the user's real provider key and a jail holding a scoped session token
+    // produced identical daemon logs. Nobody could answer "is my key inside that container?".
+    //
+    // These assert the WARNING, because an unasserted log line is deletable without anything failing,
+    // and that is this repo's most reliably recurring defect.
+
+    /// <summary>
+    /// The shipped codex/opencode shape: the gateway is up and willing, the user supplied a BYOK key,
+    /// and the CLI simply cannot be redirected. The key goes in — that is the deliberate, documented
+    /// choice (breaking the CLI would be worse) — but it must be ANNOUNCED, naming the adapter and the
+    /// variable the key landed under, so the log is enough to audit key custody.
+    /// </summary>
+    [Fact]
+    public async Task AnUnconfinableCli_StillGetsTheRawKey_ButTheDaemonSaysSoOutLoud()
+    {
+        using var rig = ConfinementRig.Create(confinable: false);
+
+        var agentId = await rig.SpawnAsync(RealKey);
+
+        // Precondition: this really is the raw-key path, not a confinement that quietly worked.
+        Assert.Null(rig.Credentials.TokenFor(agentId));
+        var env = rig.Engine.LastSpawn!.Secrets.AgentEnv;
+        Assert.Equal(RealKey, env[ApiKeyVar]);
+        Assert.DoesNotContain(BaseUrlVar, env.Keys);
+
+        var warning = Assert.Single(rig.Logs, l => l.Contains("confinement IMPOSSIBLE", StringComparison.Ordinal));
+        Assert.Contains(agentId, warning, StringComparison.Ordinal);
+        Assert.Contains(AgentKind, warning, StringComparison.Ordinal);   // WHICH agent is exposed
+        Assert.Contains(ApiKeyVar, warning, StringComparison.Ordinal);   // and under which variable
+
+        // The warning must never quote the key it is warning about — a log that leaks the secret is a
+        // worse outcome than the silence it replaces.
+        Assert.DoesNotContain(RealKey, warning, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other way a BYOK key reaches a jail unconfined: the gateway is switched off. Same exposure,
+    /// different remedy (an operator setting rather than a vendor limitation), so it is a distinct
+    /// message — an operator who reads "IMPOSSIBLE" would go looking for a CLI fix that does not apply.
+    /// </summary>
+    [Fact]
+    public async Task WithTheGatewayOff_TheRawKeyStillGoesIn_AndIsReportedAsAConfigurationChoice()
+    {
+        using var rig = ConfinementRig.Create(gatewayEnabled: false);
+
+        var agentId = await rig.SpawnAsync(RealKey);
+
+        Assert.Equal(RealKey, rig.Engine.LastSpawn!.Secrets.AgentEnv[ApiKeyVar]);
+
+        var warning = Assert.Single(rig.Logs, l => l.Contains("confinement OFF", StringComparison.Ordinal));
+        Assert.Contains(agentId, warning, StringComparison.Ordinal);
+        Assert.DoesNotContain(RealKey, warning, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The negative control, and the reason the key check comes FIRST in the launcher. An OAuth agent
+    /// supplies no key, so nothing is exposed and there is nothing to warn about. Warning here would be
+    /// worse than useless: it would fire on the most common spawn shape and train the operator to
+    /// ignore exactly the messages above, which is how a loud signal becomes a silent one again.
+    /// </summary>
+    [Fact]
+    public async Task AnOAuthSpawn_WarnsAboutNothing_BecauseNoKeyIsExposed()
+    {
+        using var rig = ConfinementRig.Create(confinable: false);
+
+        await rig.SpawnAsync(modelApiKey: null);
+
+        Assert.DoesNotContain(rig.Logs, l => l.Contains("confinement IMPOSSIBLE", StringComparison.Ordinal));
+        Assert.DoesNotContain(rig.Logs, l => l.Contains("confinement OFF", StringComparison.Ordinal));
+    }
+
+    // =============================================================================================
     // The rig: an in-proc daemon, a fake substrate, the production spawn/stop chain.
     // =============================================================================================
 
@@ -164,12 +242,29 @@ public sealed class GatewayConfinementWiringTests
 
         public required RecordingSandboxEngine Engine { get; init; }
 
+        /// <summary>
+        /// The fixture the host was derived from — held because it owns the log-capture sink.
+        /// <c>WithWebHostBuilder</c> returns a NEW factory but re-runs this fixture's
+        /// <c>ConfigureWebHost</c>, so the provider registered there is this instance's, and
+        /// <see cref="DaemonFixture.CapturedLogs"/> sees what the derived host logged.
+        /// </summary>
+        public required DaemonFixture Fixture { get; init; }
+
+        /// <summary>What the daemon logged during this rig's lifetime.</summary>
+        public IReadOnlyList<string> Logs => Fixture.CapturedLogs;
+
         public AgentSpawnService Spawns => Host.Services.GetRequiredService<AgentSpawnService>();
 
         public AgentGatewayCredentials Credentials =>
             Host.Services.GetRequiredService<AgentGatewayCredentials>();
 
-        public static ConfinementRig Create()
+        /// <param name="confinable">
+        /// Whether the installed adapter declares the MG-4 pair. <c>false</c> models the shipped
+        /// codex/qwen-code/opencode case — a CLI the vendor gives no base-URL variable — which is the
+        /// branch ticket #52 is about.
+        /// </param>
+        /// <param name="gatewayEnabled">Whether the daemon's model gateway is configured at all.</param>
+        public static ConfinementRig Create(bool confinable = true, bool gatewayEnabled = true)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-gw-confine-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -186,11 +281,12 @@ public sealed class GatewayConfinementWiringTests
                     ApiKeyEnvVar: ApiKeyVar,
                     EgressHosts: null,
                     CredentialPaths: null,
-                    BaseUrlEnvVar: BaseUrlVar,
-                    ModelHost: UpstreamHost)));
+                    BaseUrlEnvVar: confinable ? BaseUrlVar : null,
+                    ModelHost: confinable ? UpstreamHost : null)));
 
             var engine = new RecordingSandboxEngine();
-            var host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
+            var fixture = new DaemonFixture();
+            var host = fixture.WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             {
                 services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine));
                 services.AddSingleton(new InstalledAdapterCatalog(registry));
@@ -198,7 +294,9 @@ public sealed class GatewayConfinementWiringTests
                 // The gateway ON. In production this comes from the daemon's resolved bind address; the
                 // address itself is irrelevant here because no request is issued — what matters is that
                 // the spawn path is in the posture where it is SUPPOSED to confine.
-                services.AddSingleton(new GatewayConfinementOptions(GatewayBaseUrl, Enabled: true));
+                services.AddSingleton(gatewayEnabled
+                    ? new GatewayConfinementOptions(GatewayBaseUrl, Enabled: true)
+                    : GatewayConfinementOptions.Disabled);
 
                 // The CLI bind would otherwise try a real `docker exec` PTY against a fake container id.
                 services.AddSingleton(sp => new AgentCliBinder(
@@ -209,7 +307,7 @@ public sealed class GatewayConfinementWiringTests
                     _ => new InertTerminalSession()));
             }));
 
-            return new ConfinementRig(root) { Host = host, Engine = engine };
+            return new ConfinementRig(root) { Host = host, Engine = engine, Fixture = fixture };
         }
 
         /// <summary>One spawn through the SHIPPED chain, returning the agent id it minted.</summary>
@@ -219,6 +317,7 @@ public sealed class GatewayConfinementWiringTests
         public void Dispose()
         {
             Host.Dispose();
+            Fixture.Dispose();
             try { Directory.Delete(_root, recursive: true); } catch { /* never fail a test from cleanup */ }
         }
 
