@@ -44,7 +44,17 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     [ObservableProperty]
     private bool _isLastFetchStale;
 
+    // True while background fetch is failing for this repo (expired token, deleted remote, no network).
+    // Drives the warning colour on the freshness label — the label's TEXT says so too, because a colour
+    // alone is not a message.
+    [ObservableProperty]
+    private bool _isAutoFetchFailing;
+
     private System.DateTimeOffset? _lastFetched;
+
+    // Guards the one-and-only auto-fetch failure toast per outage: the user is TOLD the first time, and
+    // then the persistent label carries it. Reset by the next success, so a new outage speaks again.
+    private bool _autoFetchFailureAnnounced;
 
     // Toasts (#85): stacked, newest at the bottom, capped at 3 -- each owns its own auto-dismiss
     // timer (see ToastViewModel) so a burst of notifications never silently drops earlier ones.
@@ -136,10 +146,11 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
         _watcher.RepositoryChanged += OnRepositoryChanged;
 
         // Background auto-fetch: on each successful fetch, refresh ahead/behind and the
-        // "last fetched" label on the UI thread. Failures stay silent (no toast spam).
+        // "last fetched" label on the UI thread. Failures are surfaced too — see OnAutoFetchFailed.
         _autoFetch = new AutoFetchService(_gitService,
             () => Mainguard.App.Shell.App.Settings?.Current ?? new Mainguard.Git.Models.UserPreferences());
         _autoFetch.Fetched += OnAutoFetched;
+        _autoFetch.FetchFailed += OnAutoFetchFailed;
         _autoFetch.Watch(_repoPath);
 
         // Refresh the relative "N min ago" label once a minute so it ages correctly.
@@ -148,13 +159,44 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
             System.TimeSpan.FromMinutes(1), System.TimeSpan.FromMinutes(1));
     }
 
+    /// <summary>The background auto-fetch loop this dashboard owns. Exposed so a test can drive one real
+    /// cycle (<c>RunCycleAsync</c>) against a real broken remote and observe what the USER is told —
+    /// rather than poking the private handler and proving only that a field moved.</summary>
+    internal AutoFetchService AutoFetch => _autoFetch;
+
     private void OnAutoFetched(string repoPath)
     {
         _lastFetched = _autoFetch.GetLastFetched(repoPath);
         Dispatcher.UIThread.Post(async () =>
         {
+            IsAutoFetchFailing = false;
+            _autoFetchFailureAnnounced = false;
             UpdateLastFetchedLabel();
             await RefreshCoreAsync();
+        });
+    }
+
+    /// <summary>
+    /// Background fetch failed. The point of surfacing this is NOT the failure itself — it is that the
+    /// ahead/behind badge stops being true the moment fetching stops, and the freshness label beside it
+    /// keeps counting up from the last SUCCESS, which reads as "we checked, you're up to date". An
+    /// expired token or a deleted remote therefore used to present as a repo that is simply not moving.
+    ///
+    /// <para>One toast per outage (the actionable moment), then a persistent warning on the label so the
+    /// state is still legible ten minutes later. Not per-cycle: that is the toast spam the original
+    /// design note was right to refuse — it just refused it by saying nothing at all.</para>
+    /// </summary>
+    private void OnAutoFetchFailed(string repoPath, int consecutiveFailures, string reason)
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            IsAutoFetchFailing = true;
+            UpdateLastFetchedLabel();
+
+            if (_autoFetchFailureAnnounced) return;
+            _autoFetchFailureAnnounced = true;
+            ShowNotification(
+                $"Background fetch failed — ahead/behind counts may be out of date. {reason}", true);
         });
     }
 
@@ -162,18 +204,22 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     {
         if (_lastFetched is not { } when)
         {
-            LastFetchedText = string.Empty;
+            // Never fetched successfully AND currently failing: say so, rather than showing nothing at
+            // all — an empty label is indistinguishable from auto-fetch being switched off.
+            LastFetchedText = IsAutoFetchFailing ? "Fetch failing" : string.Empty;
             IsLastFetchStale = false;
             return;
         }
 
         var elapsed = System.DateTimeOffset.Now - when;
         var minutes = (int)elapsed.TotalMinutes;
-        LastFetchedText = minutes <= 0
+        var fetched = minutes <= 0
             ? "Fetched just now"
             : minutes == 1 ? "Fetched 1 min ago" : $"Fetched {minutes} min ago";
-        // Dimmed once the picture is more than 15 minutes old (closes the 1.12 stale badge).
-        IsLastFetchStale = minutes > 15;
+        LastFetchedText = IsAutoFetchFailing ? $"Fetch failing — {fetched.ToLowerInvariant()}" : fetched;
+        // Dimmed once the picture is more than 15 minutes old (closes the 1.12 stale badge). A failing
+        // fetch is never dimmed — it is the one state that must not recede.
+        IsLastFetchStale = minutes > 15 && !IsAutoFetchFailing;
     }
 
     private void OnRepositoryChanged()
@@ -817,6 +863,7 @@ public partial class RepoDashboardViewModel : ViewModelBase, System.IDisposable
     public void Dispose()
     {
         _autoFetch.Fetched -= OnAutoFetched;
+        _autoFetch.FetchFailed -= OnAutoFetchFailed;
         _autoFetch.Dispose();
         _lastFetchedTicker?.Dispose();
         foreach (var toast in Toasts) toast.Dispose();
