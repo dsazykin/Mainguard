@@ -381,6 +381,21 @@ jobs:
       - name: No RunOnce, no --shutdown in the installer/resume command paths
         run: build/ci/verify-installer-guardrails.sh
 
+      # ------------------------------------------------------------------------------------------
+      # Ticket #65 — an opt-in test that no job opts into is a test that cannot fail.
+      # ------------------------------------------------------------------------------------------
+      # The two `[RequiresDockerAndOptInFact]` in-jail verification tests skip unless
+      # MAINGUARD_VERIFY_E2E=1, and for their whole existence NOTHING set it: they were the constant
+      # "2 skipped" in every sandbox-security run, covering the path that decides whether an agent's
+      # work may merge. They now run in e2e-verification.yml (nightly + on verification-path PRs);
+      # this guard is what keeps that true, by failing any PR that adds an opt-in test without wiring
+      # it in, renames one out from under the filter, or leaves the workflow unable to opt in.
+      #
+      # It lives in an existing every-PR job on purpose. A slow gate can be justified; a gate nobody
+      # notices stopped running cannot — and that is the failure this ticket actually was.
+      - name: Every opt-in E2E test is wired into a job that runs it (#65)
+        run: build/ci/verify-e2e-optin-coverage.sh
+
   client-closure:
     name: Client head closure excludes the agent platform (ADR-0001)
     runs-on: ubuntu-latest

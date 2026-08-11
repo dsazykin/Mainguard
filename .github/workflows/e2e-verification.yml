@@ -1,0 +1,168 @@
+name: E2E verification (in-jail, opt-in)
+
+# =================================================================================================
+# Ticket #65 — the two most end-to-end Docker tests never gated anything.
+# =================================================================================================
+# `VerifyInJailDockerTests.TheRepositorysVerifyCommand_CompletesInARealJail` and
+# `PythonToolchainDockerTests.APythonRepository_VerifiesGreenWhenItsTestsPass_AndRedWhenTheyFail`
+# are `[RequiresDockerAndOptInFact]`, i.e. they skip unless MAINGUARD_VERIFY_E2E=1. No workflow set
+# it. They were therefore the constant 2 skips in every `sandbox-security` run, and the full in-jail
+# verification path — the thing that decides whether an agent's work may enter the merge queue —
+# was measured by nothing on any pull request.
+#
+# WHY THEY ARE STILL NOT IN THE PR GATE
+# ------------------------------------
+# Because the cost was measured rather than assumed, and it is not small:
+#
+#   * VerifyInJail runs this repository's real `.mainguard/verify`, which is a full RELEASE
+#     restore + build + test of Mainguard.slnx INSIDE a jail, over a default-deny egress proxy.
+#     Its own budget is 90 MINUTES and its restore is a ~1.7 GB download (see the class docs).
+#     For scale: the ordinary `build-and-test` job is that same solution build WITHOUT the
+#     container, the proxy, or a cold package cache.
+#   * PythonToolchain downloads a ~350 MB pinned interpreter and installs pytest from PyPI through
+#     the same proxy. Budget: 30 minutes.
+#
+# Adding that to every PR would multiply the merge-gate wall time several times over for a signal
+# that changes only when the verification path itself changes. So the opt-in gate is KEPT — but as
+# a decision that is renewed, not an inheritance:
+#
+#   1. schedule          — it runs nightly, so a break is found within a day rather than never.
+#   2. workflow_dispatch — a human can demand it at any time (e.g. before cutting a release).
+#   3. pull_request      — it runs on PRs that touch the VERIFICATION PATH itself, which is the
+#                          only class of change that can plausibly break it.
+#
+# and, separately, `build/ci/verify-e2e-optin-coverage.sh` runs on EVERY PR and fails if any
+# opt-in test is not named below. That is what stops the exclusion from silently re-inheriting:
+# a new `[RequiresDockerAndOptInFact]` test cannot be added without wiring it into this file.
+#
+# ON `schedule` AND `workflow_dispatch` NOT BEING LIVE YET — READ THIS BEFORE BELIEVING THE GATE
+# ----------------------------------------------------------------------------------------------
+# GitHub only honours `schedule` and `workflow_dispatch` for workflow files that exist on the
+# DEFAULT branch. This file arrives on `phase2`, so legs 1 and 2 above are INERT until phase2
+# reaches main. Leg 3 (`pull_request`) works immediately, and `.github/workflows/e2e-verification.yml`
+# is deliberately one of its own path triggers — so the PR that changes this gate is the PR that
+# proves the gate runs. That self-test is the reason ticket #65 could be closed once on the
+# strength of a workflow edit that never actually executed anything.
+# =================================================================================================
+
+on:
+  schedule:
+    # 05:00 UTC — after the working day in the repo's timezone, so a nightly break is waiting in the
+    # morning rather than competing with PR runs for runner capacity.
+    - cron: '0 5 * * *'
+
+  workflow_dispatch:
+
+  pull_request:
+    branches: [main, phase2, 'feat/**', 'fix/**']
+    # The VERIFICATION PATH. A path filter is normally how a guard silently stops running, which is
+    # why ci.yml refuses to use one — but here the filter IS the decision: these legs are too slow
+    # to run unconditionally, and every-PR coverage is provided by the coverage guard in ci.yml
+    # instead. Keep this list wider than feels necessary; a missed path costs a nightly, an
+    # over-broad one costs a slow PR.
+    paths:
+      - '.mainguard/**'                                    # the verify/toolchain commands themselves
+      - 'Mainguard.Agents/Agents/Sandbox/**'               # jail spawn + PackageCacheManager
+      - 'Mainguard.Agents/Agents/Toolchains/**'            # the user-managed toolchain channel
+      - 'Mainguard.Agents/Agents/Orchestrator/Verification*.cs'
+      - 'Mainguard.Server.Tests/Agents/VerifyInJailDockerTests.cs'
+      - 'Mainguard.Server.Tests/Agents/PythonToolchainDockerTests.cs'
+      - 'Mainguard.Server.Tests/Fixtures/RequiresDockerFact.cs'  # the opt-in gate itself
+      - 'images/mainguard-agent-base/**'                   # the jail's toolchain layer
+      - 'images/mainguard-egress-proxy/**'                 # the default-deny proxy they download through
+      - '.github/workflows/e2e-verification.yml'           # self-test: changing the gate exercises it
+      - 'build/ci/verify-e2e-optin-coverage.sh'
+
+concurrency:
+  group: e2e-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify-e2e:
+    name: Full in-jail verification (slow, opt-in)
+    runs-on: ubuntu-latest
+    # Both budgets (90 + 30) plus image builds and the solution build. Explicit, because the GitHub
+    # default is 360 minutes and a hung jail should not burn six hours of runner time every night.
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      # VerifyInJail restores a ~1.7 GB package closure and builds the whole solution Release inside
+      # the jail, on top of a ~350 MB interpreter for the Python leg. The hosted runner ships with
+      # several GB of preinstalled toolchains this job never uses, and running out of disk here would
+      # look like a verification failure rather than a capacity one. Reclaim first, and PRINT the
+      # result so a future ENOSPC can be read off the log instead of guessed at.
+      - name: Reclaim runner disk (these legs are the only ones that need it)
+        run: |
+          set -euo pipefail
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+          sudo docker image prune -af || true
+          echo "after:"; df -h / | tail -1
+
+      # Identical to ci.yml's sandbox-security job: RequiresDockerFact skips unless the CI-built,
+      # version-labelled images are present, so building them is what turns these legs on at all
+      # (G-16 — images are never pulled or built at test runtime).
+      - name: Build the agent-base + egress-proxy images (version-labelled)
+        run: |
+          set -euo pipefail
+          AGENT_VER="$(grep -oP 'const string AgentBase = "\K[0-9a-f]{64}' Mainguard.Agents/Agents/Sandbox/SandboxImageVersions.cs)"
+          EGRESS_VER="$(grep -oP 'const string EgressProxy = "\K[0-9a-f]{64}' Mainguard.Agents/Agents/Sandbox/SandboxImageVersions.cs)"
+          test -n "$AGENT_VER" && test -n "$EGRESS_VER"
+          docker build --label "mainguard.image.version=$AGENT_VER"  -t mainguard-agent-base:latest  images/mainguard-agent-base
+          docker build --label "mainguard.image.version=$EGRESS_VER" -t mainguard-egress-proxy:latest images/mainguard-egress-proxy
+
+      - name: Restore (locked)
+        run: dotnet restore --locked-mode
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      # ---------------------------------------------------------------------------------------------
+      # The point of the whole file. MAINGUARD_VERIFY_E2E=1 is set HERE and nowhere else in CI.
+      #
+      # The filter names the two methods explicitly rather than saying `Category=RequiresDocker`,
+      # because the whole RequiresDocker suite already runs on every PR in ci.yml — re-running it here
+      # would add nothing and cost minutes. build/ci/verify-e2e-optin-coverage.sh asserts, on every PR,
+      # that this filter names every opt-in test that exists, so "explicit" cannot decay into "stale".
+      # ---------------------------------------------------------------------------------------------
+      - name: The two opt-in in-jail verification legs
+        env:
+          MAINGUARD_VERIFY_E2E: "1"
+          # Keep the 1.7 GB package cache and the Release build tree off the small mounts; the runner's
+          # home is on the roomy OS disk reclaimed above. (The tests' own default is $HOME anyway —
+          # this is explicit so a runner-image change cannot move it silently.)
+          MAINGUARD_E2E_ROOT: ${{ runner.temp }}/mainguard-verify-e2e
+        run: >
+          dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj
+          --no-build --configuration Release --verbosity normal
+          --logger "trx;LogFileName=e2e.trx" --results-directory ${{ runner.temp }}/trx
+          --filter "FullyQualifiedName~VerifyInJailDockerTests.TheRepositorysVerifyCommand_CompletesInARealJail|FullyQualifiedName~PythonToolchainDockerTests.APythonRepository_VerifiesGreenWhenItsTestsPass_AndRedWhenTheyFail"
+
+      # A `dotnet test` run in which BOTH tests skipped exits 0 — which is exactly how this gate was
+      # able to report success while measuring nothing for its entire existence. Assert that they
+      # actually RAN, from the trx, so a future skip (a missing image, a renamed method, an env var
+      # that stopped being read) fails the job instead of passing it quietly.
+      - name: Assert the legs actually ran (a skipped E2E gate is a failed E2E gate)
+        if: always()
+        run: |
+          set -euo pipefail
+          TRX="${{ runner.temp }}/trx/e2e.trx"
+          if [ ! -f "$TRX" ]; then
+            echo "::error::no .trx produced — cannot prove the opt-in legs executed, so this job must not report success"
+            exit 1
+          fi
+          # <Counters total=".." executed=".." passed=".." failed=".." />
+          EXECUTED="$(grep -oP '<Counters[^>]*executed="\K[0-9]+' "$TRX" | head -1)"
+          echo "trx=$TRX executed=$EXECUTED"
+          if [ -z "$EXECUTED" ] || [ "$EXECUTED" -lt 2 ]; then
+            echo "::error::expected 2 executed tests, got '${EXECUTED:-none}' — the opt-in legs SKIPPED. MAINGUARD_VERIFY_E2E, the CI-built images, or the --filter method names are wrong."
+            exit 1
+          fi
+          echo "Both in-jail verification legs executed."
