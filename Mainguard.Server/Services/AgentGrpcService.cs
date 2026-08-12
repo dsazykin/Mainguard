@@ -37,15 +37,21 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
     private readonly AgentResourceProbe _resources;
     private readonly ILogger _log;
 
+    private readonly AgentResumeService _resumes;
+    private readonly Mainguard.Server.Auth.IApproverIdentityResolver _identity;
+
     public AgentGrpcService(
         AgentSessionStore store, AgentSpawnService spawns, InstalledAdapterCatalog adapters,
-        DaemonInfoProvider info, AgentResourceProbe resources, ILoggerFactory loggerFactory)
+        DaemonInfoProvider info, AgentResourceProbe resources, AgentResumeService resumes,
+        Mainguard.Server.Auth.IApproverIdentityResolver identity, ILoggerFactory loggerFactory)
     {
         _store = store;
         _spawns = spawns;
         _adapters = adapters;
         _info = info;
         _resources = resources;
+        _resumes = resumes ?? throw new System.ArgumentNullException(nameof(resumes));
+        _identity = identity ?? throw new System.ArgumentNullException(nameof(identity));
         _log = (loggerFactory ?? throw new System.ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.Spawn);
     }
@@ -93,58 +99,75 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
                 cliSettings: cliSettings).ConfigureAwait(false);
             return new SpawnAgentResponse { AgentId = agentId };
         }
-        catch (System.ArgumentException ex)
+        catch (RpcException)
         {
-            _log.LogWarning("SpawnAgent rejected (invalid argument): {Message}", ex.Message);
-            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            throw;
         }
-        catch (AgentSpawnRefusedException ex)
+        catch (System.Exception ex)
         {
-            _log.LogWarning("SpawnAgent refused (policy): {Message}", ex.Message);
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+            throw MapLaunchFailure(ex, "SpawnAgent");
         }
-        catch (AgentWorktreeConflictException ex)
+    }
+
+    /// <summary>
+    /// Gives a stranded merge-queue entry a live jail again, standing on its own <c>agent/&lt;id&gt;</c>
+    /// branch. Validation + dispatch only — every decision (does this repo's queue hold the entry, is a
+    /// verification really running, is a merge lease open, does the branch still exist, does the id already
+    /// have a session) is made in <see cref="AgentResumeService"/>, which is where the daemon's state is.
+    ///
+    /// <para><b>A refusal is a successful RPC carrying <c>resumed=false</c>, never a fault.</b> The reasons
+    /// a resume declines are states of the world the human has to read and act on, and collapsing them into
+    /// a status code would leave the surface with nothing to say. A caller must therefore not treat "no
+    /// exception" as evidence anything happened — the client adapter turns <c>resumed=false</c> into a
+    /// throw so that a warning toast carries the daemon's reason verbatim.</para>
+    ///
+    /// <para>The actor is derived here, from the connection (SA-1/F2), for the same reason a discard's is:
+    /// an attribution the client fills in is one any token-holder can forge. <c>ResumeAgentRequest</c> has
+    /// no actor field precisely so no caller can assert one.</para>
+    /// </summary>
+    public override async Task<ResumeAgentResponse> ResumeAgent(ResumeAgentRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
         {
-            _log.LogWarning("SpawnAgent refused (worktree conflict): {Message}", ex.Message);
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
         }
-        catch (RepoProvisioningException ex)
+
+        try
         {
-            _log.LogError(ex, "SpawnAgent failed (repo provisioning)");
-            throw new RpcException(new Status(StatusCode.Internal, ex.Message));
-        }
-        catch (SandboxImageMissingException ex)
-        {
-            // The spawn preflight (both jail images) — actionable regardless of whether the
-            // agent-base or the egress-proxy image is absent; the raw Docker mapping below
-            // remains the belt-and-suspenders path if an image vanishes mid-spawn.
-            _log.LogError("SpawnAgent failed (sandbox image missing): {Message}", ex.Message);
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
-        }
-        catch (ToolchainProvisioningException ex)
-        {
-            // MG-42: the repo declared a verification toolchain and it could not be put in the jail.
-            // FailedPrecondition, named, and never a degraded spawn — a jail without the tools its
-            // repo's verify command needs produces verification failures that read like the agent's
-            // code is broken, which is the one misreading that decides merges.
-            _log.LogError(ex, "SpawnAgent failed (toolchain provisioning): repo={Repo} ids={Ids}",
-                ex.RepoHandle, string.Join(",", ex.ToolchainIds));
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
-        }
-        catch (Docker.DotNet.DockerImageNotFoundException ex)
-        {
-            // Field failure 2026-07-17: the hardened jail image ships via CI/release, and an
-            // installed VM without it answered a bare UNKNOWN. Name the real state and the repair.
-            _log.LogError(ex, "SpawnAgent failed (docker image not found at container-create)");
-            throw new RpcException(new Status(StatusCode.FailedPrecondition,
-                "Mainguard OS is missing the agent sandbox image (mainguard-agent-base) — it is "
-                + "provisioned by setup; re-run Mainguard setup or rebuild the image, then try again."));
-        }
-        catch (Docker.DotNet.DockerApiException ex)
-        {
-            _log.LogError(ex, "SpawnAgent failed (docker api)");
-            throw new RpcException(new Status(StatusCode.Internal,
-                $"The agent sandbox could not start: {ex.Message}"));
+            System.Collections.Generic.Dictionary<string, string>? extraEnv = null;
+            foreach (var entry in request.ExtraEnv)
+            {
+                extraEnv ??= new System.Collections.Generic.Dictionary<string, string>(System.StringComparer.Ordinal);
+                extraEnv[entry.Name] = entry.Value;
+            }
+
+            System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>? cliCredentials = null;
+            foreach (var file in request.CliCredentials)
+            {
+                cliCredentials ??= new System.Collections.Generic.List<Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile>();
+                cliCredentials.Add(new Mainguard.Agents.Agents.Sandbox.SandboxCredentialFile(
+                    file.Path, file.Content.ToByteArray()));
+            }
+
+            var result = await _resumes.ResumeAsync(
+                request.RepoHandle, request.AgentId, _identity.Resolve(context), request.AgentKind,
+                context.CancellationToken, request.ModelApiKey, extraEnv, cliCredentials).ConfigureAwait(false);
+
+            if (!result.Resumed)
+            {
+                _log.LogWarning("ResumeAgent refused repo={Repo} agent={Agent}: {Reason}",
+                    request.RepoHandle, request.AgentId, result.Reason);
+            }
+
+            return new ResumeAgentResponse
+            {
+                Resumed = result.Resumed,
+                Reason = result.Reason,
+                AgentId = result.AgentId,
+                Branch = result.Branch,
+                State = result.State,
+                ClearedStalledVerification = result.ClearedStalledVerification,
+            };
         }
         catch (RpcException)
         {
@@ -152,10 +175,77 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         }
         catch (System.Exception ex)
         {
-            // Last resort: a raw handler exception reaches the client as a bare UNKNOWN with no
-            // detail — always surface the real message instead.
-            _log.LogError(ex, "SpawnAgent failed (unexpected)");
-            throw new RpcException(new Status(StatusCode.Internal, ex.Message));
+            throw MapLaunchFailure(ex, "ResumeAgent");
+        }
+    }
+
+    /// <summary>
+    /// The shared spawn/resume failure mapping. Shared deliberately: a resume runs the identical
+    /// provisioning chain, and the one distinction the operator needs from it — <i>provisioning failed</i>
+    /// versus <i>the agent's work is bad</i> — is exactly what these typed statuses preserve. Two copies
+    /// would drift, and the copy that drifted would be the one answering a bare <c>UNKNOWN</c>.
+    /// </summary>
+    private RpcException MapLaunchFailure(System.Exception exception, string operation)
+    {
+        switch (exception)
+        {
+            case System.ArgumentException ex:
+                _log.LogWarning("{Operation} rejected (invalid argument): {Message}", operation, ex.Message);
+                return new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+
+            case AgentSpawnRefusedException ex:
+                _log.LogWarning("{Operation} refused (policy): {Message}", operation, ex.Message);
+                return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+            case AgentWorktreeConflictException ex:
+                _log.LogWarning("{Operation} refused (worktree conflict): {Message}", operation, ex.Message);
+                return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+            case AgentBranchMissingException ex:
+                // Only reachable when something OTHER than AgentResumeService drives an adoption — it
+                // catches this itself and answers resumed=false with the reason, because "the branch is
+                // gone" is a state the human reads, not a transport fault.
+                _log.LogWarning("{Operation} refused (agent branch missing): {Message}", operation, ex.Message);
+                return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+            case RepoProvisioningException ex:
+                _log.LogError(ex, "{Operation} failed (repo provisioning)", operation);
+                return new RpcException(new Status(StatusCode.Internal, ex.Message));
+
+            case SandboxImageMissingException ex:
+                // The spawn preflight (both jail images) — actionable regardless of whether the
+                // agent-base or the egress-proxy image is absent; the raw Docker mapping below
+                // remains the belt-and-suspenders path if an image vanishes mid-spawn.
+                _log.LogError("{Operation} failed (sandbox image missing): {Message}", operation, ex.Message);
+                return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+            case ToolchainProvisioningException ex:
+                // MG-42: the repo declared a verification toolchain and it could not be put in the jail.
+                // FailedPrecondition, named, and never a degraded spawn — a jail without the tools its
+                // repo's verify command needs produces verification failures that read like the agent's
+                // code is broken, which is the one misreading that decides merges.
+                _log.LogError(ex, "{Operation} failed (toolchain provisioning): repo={Repo} ids={Ids}",
+                    operation, ex.RepoHandle, string.Join(",", ex.ToolchainIds));
+                return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+            case Docker.DotNet.DockerImageNotFoundException ex:
+                // Field failure 2026-07-17: the hardened jail image ships via CI/release, and an
+                // installed VM without it answered a bare UNKNOWN. Name the real state and the repair.
+                _log.LogError(ex, "{Operation} failed (docker image not found at container-create)", operation);
+                return new RpcException(new Status(StatusCode.FailedPrecondition,
+                    "Mainguard OS is missing the agent sandbox image (mainguard-agent-base) — it is "
+                    + "provisioned by setup; re-run Mainguard setup or rebuild the image, then try again."));
+
+            case Docker.DotNet.DockerApiException ex:
+                _log.LogError(ex, "{Operation} failed (docker api)", operation);
+                return new RpcException(new Status(StatusCode.Internal,
+                    $"The agent sandbox could not start: {ex.Message}"));
+
+            default:
+                // Last resort: a raw handler exception reaches the client as a bare UNKNOWN with no
+                // detail — always surface the real message instead.
+                _log.LogError(exception, "{Operation} failed (unexpected)", operation);
+                return new RpcException(new Status(StatusCode.Internal, exception.Message));
         }
     }
 

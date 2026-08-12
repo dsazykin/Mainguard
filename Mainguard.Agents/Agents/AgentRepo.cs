@@ -268,7 +268,24 @@ public sealed class AgentRepoManager
         }
     }
 
-    private static void DropForeignAgentRefs(string agentRepoPath, string agentId)
+    /// <summary>
+    /// Removes every <c>refs/heads/agent/*</c> the clone brought along that is not this agent's own.
+    ///
+    /// <para><b>The delete is CHECKED and a failure is fatal to the create.</b> It used to test the
+    /// <c>for-each-ref</c> exit code and discard <c>update-ref -d</c>'s, which is the wrong way round: the
+    /// listing failing means "there is nothing to reason about", while the delete failing means the ref is
+    /// STILL THERE. The class comment above calls these branches "noise", and they are noise for
+    /// disambiguating <c>for-each-ref</c> — but a ref that survives is also a branch agent A can
+    /// <c>git checkout</c> and read, in its own writable repository, with the whole of agent B's work in
+    /// it. That is the MG-3 isolation boundary, and a boundary that reports success when it did not hold
+    /// is worse than one that is absent.</para>
+    ///
+    /// <para>Throwing is safe here and deliberately chosen over a warning: the only caller is
+    /// <see cref="Create"/>, whose callers already unwind a failed create by removing the half-made
+    /// repository (see <c>WorktreeManager.CreateAgentWorktree</c>), so the agent gets a failed spawn with
+    /// a named reason instead of a jail that can see another agent's branch.</para>
+    /// </summary>
+    internal static void DropForeignAgentRefs(string agentRepoPath, string agentId)
     {
         var mine = AgentRepoLayout.RefFor(agentId);
         if (AgentGitCommand.TryRun(
@@ -282,7 +299,15 @@ public sealed class AgentRepoManager
             var refName = line.Trim();
             if (refName.Length > 0 && !string.Equals(refName, mine, StringComparison.Ordinal))
             {
-                AgentGitCommand.TryRun(agentRepoPath, out _, "update-ref", "-d", refName);
+                var exit = AgentGitCommand.TryRun(agentRepoPath, out var output, "update-ref", "-d", refName);
+                if (exit != 0)
+                {
+                    throw new RepoProvisioningException(
+                        $"could not drop foreign agent branch '{refName}' from agent '{agentId}'s repository "
+                        + $"(git update-ref -d exited {exit}): that branch stays visible and checkout-able to "
+                        + "this agent, which is the MG-3 isolation boundary. The spawn is refused rather than "
+                        + $"completed with the boundary unheld. {output.Trim()}");
+                }
             }
         }
     }

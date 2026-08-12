@@ -27,17 +27,20 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private readonly KillSwitchGate _killGate;
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Mainguard.Server.Auth.IApproverIdentityResolver _identity;
+    private readonly Mainguard.Server.Runtime.AgentSessionStore _sessions;
     private readonly ILogger _log;
 
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
         Mainguard.Server.Auth.IApproverIdentityResolver identity,
+        Mainguard.Server.Runtime.AgentSessionStore sessions,
         ILoggerFactory loggerFactory)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
         _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
         _identity = identity ?? throw new ArgumentNullException(nameof(identity));
+        _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         _log = (loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.Merge);
     }
@@ -56,11 +59,11 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         queue.Changed += OnChanged;
         try
         {
-            await responseStream.WriteAsync(Snapshot(ctx)).ConfigureAwait(false);
+            await responseStream.WriteAsync(Snapshot(request.RepoHandle, ctx)).ConfigureAwait(false);
             while (!context.CancellationToken.IsCancellationRequested)
             {
                 await signal.WaitAsync(context.CancellationToken).ConfigureAwait(false);
-                await responseStream.WriteAsync(Snapshot(ctx)).ConfigureAwait(false);
+                await responseStream.WriteAsync(Snapshot(request.RepoHandle, ctx)).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -94,7 +97,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken)
                 .ConfigureAwait(false);
         }
+        // MalformedVerificationCommandException is already an InvalidOperationException and so is
+        // caught below; it is named explicitly because the whole point of the type is that it must
+        // NEVER become a RunVerificationResponse with Passed=false. A refusal here says "the command
+        // could not be run and why"; a response would say "your tests failed" about a command that
+        // never started.
         catch (Exception ex) when (ex is NoVerificationCommandException
+            or MalformedVerificationCommandException
             or Mainguard.Git.Exceptions.ToolchainProvisioningException
             or InvalidOperationException)
         {
@@ -446,7 +455,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 $"No active merge queue for repo handle '{repoHandle}'."));
     }
 
-    private static QueueUpdate Snapshot(MergeQueueContext ctx)
+    private QueueUpdate Snapshot(string repoHandle, MergeQueueContext ctx)
     {
         var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
@@ -464,6 +473,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 Origin = queue.GetOrigin(agentId).ToString(),
                 // Only the daemon can tell a branch being verified from a row that merely says so.
                 VerificationInFlight = queue.IsVerificationInFlight(agentId),
+                // …and only the daemon holds the session table, so whether this entry still HAS a jail is
+                // a fact no client can derive. Keyed on (repo, agent) — an id is unique per repo and not
+                // globally, and answering from another repo's live `pr-7` would report a stranded entry
+                // as healthy, which is the precise failure that keeps it stranded.
+                HasLiveSandbox = _sessions.Find(
+                    new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
+                    ?.ContainerId is { Length: > 0 },
             };
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));

@@ -95,6 +95,28 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path "$PSScriptRoot/../..").Path
 
+# ---------------------------------------------------------------------------------------------------
+# Never print a secret. -DryRun is documented as the way to "verify the wiring safely", and it was the
+# ONE mode that wrote the release signing key's password to the console — and therefore to any CI log,
+# any Start-Transcript, and any terminal scrollback — because it echoed $publishArgs (which carries
+# /p:MainguardSigningCertPassword=…) and $vpkArgs (whose --signParams blob carries signtool's
+# /p <password>) verbatim. Everything else about the command stays visible; only the secret is masked,
+# so the printed plan is still the plan.
+# ---------------------------------------------------------------------------------------------------
+function Format-CommandForDisplay {
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]] $Arguments)
+
+    $safe = foreach ($a in $Arguments) {
+        $s = [string]$a
+        # MSBuild property form: /p:MainguardSigningCertPassword=<secret>
+        $s = [regex]::Replace($s, '(?i)(/p:MainguardSigningCertPassword=).*', '${1}***REDACTED***')
+        # signtool form inside --signParams: /p "<secret>"  (or unquoted)
+        $s = [regex]::Replace($s, '(?i)(/p\s+)("[^"]*"|\S+)', '${1}***REDACTED***')
+        $s
+    }
+    return ($safe -join ' ')
+}
+
 # ---- Resolve per-channel configuration (project head, main exe, publish/feed dirs, payload policy). ----
 switch ($Channel) {
     'client' {
@@ -169,7 +191,7 @@ if ($PinnedThumbprints) {
     $publishArgs += "/p:MainguardPinnedThumbprints=$PinnedThumbprints"
 }
 if ($DryRun) {
-    Write-Host "    [dry-run] dotnet $($publishArgs -join ' ')"
+    Write-Host "    [dry-run] dotnet $(Format-CommandForDisplay $publishArgs)"
 } else {
     dotnet @publishArgs
 }
@@ -211,7 +233,7 @@ if ($SigningCertPath) {
     $vpkArgs += @("--signParams", "/fd SHA256 /f `"$SigningCertPath`" /p `"$SigningCertPassword`" /tr http://timestamp.digicert.com /td SHA256")
 }
 if ($DryRun) {
-    Write-Host "    [dry-run] vpk $($vpkArgs -join ' ')"
+    Write-Host "    [dry-run] vpk $(Format-CommandForDisplay $vpkArgs)"
     Write-Host "==> [dry-run] Plan resolved for channel '$Channel'. Nothing was executed."
     return
 }

@@ -109,6 +109,22 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         _depsRefreshRunner = depsRefreshRunner ?? DefaultDepsRefreshRunner;
     }
 
+    /// <summary>
+    /// The refusal a stale override earns on a service that was built with nowhere to record it.
+    ///
+    /// <para><b>Why the override is refused rather than merely un-audited.</b> P2-10 step 4 defines this
+    /// path as three things at once — loudly labeled, journaled, and audited (<c>stale_override_used</c>) —
+    /// and only the first two survive a missing sink. An override that merges without leaving the record
+    /// is not a lighter version of the feature; it is the one merge in the product that bypasses the gate,
+    /// performed with no trace that it happened. <c>onStaleOverride</c> was optional and every production
+    /// composition omitted it, so <c>MergeQueue.RecordStaleOverrideUse</c> had no caller anywhere: the
+    /// audit half of the contract was already dead, waiting for the first caller of the other half to make
+    /// it matter. Binding them here means the affordance cannot ship without its record.</para>
+    /// </summary>
+    internal const string UnauditableOverrideRefusal =
+        "the stale-merge override is refused here: this merge service has no audit sink for "
+        + "stale_override_used, and an override that leaves no record is not the documented override";
+
     // The lease store is optional ONLY for the PerformJournaledMerge-only caller (see the ctor doc). Any
     // lease-owning entry point that reaches this on a null store is a composition error, not a merge refusal.
     private IMergeLeaseStore Leases => _leases ?? throw new InvalidOperationException(
@@ -118,6 +134,13 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
 
     public ForegroundMergeResult MergeAgentBranch(ForegroundMergeRequest request)
     {
+        // Refused before the lease is even taken: an override this service cannot record must not hold a
+        // repo's merge lease while it discovers that.
+        if (request.AllowStaleOverride && _onStaleOverride is null)
+        {
+            return new ForegroundMergeResult(false, null, CasLost: false, UnauditableOverrideRefusal);
+        }
+
         var lease = BeginMerge(request);
         if (lease is null)
         {
@@ -177,6 +200,14 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// </summary>
     public ForegroundMergeResult PerformJournaledMerge(ForegroundMergeRequest request, MergeLeaseRow lease)
     {
+        // (0) The same refusal MergeAgentBranch makes, restated on the entry point the Windows GUI drives
+        // directly under a daemon-granted lease. Both legs are reachable independently, so a guard on one
+        // of them is a guard on neither.
+        if (request.AllowStaleOverride && _onStaleOverride is null)
+        {
+            return new ForegroundMergeResult(false, null, CasLost: false, UnauditableOverrideRefusal);
+        }
+
         // (1) A dirty working tree cannot be merged into: `checkout`/`merge` would refuse (or, worse, be
         // refused AFTER we thought we had switched branches). Untracked files are deliberately tolerated —
         // they never block a checkout or a fast-forward, and refusing on them would block honest merges.
@@ -244,23 +275,40 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         if (stale && request.AllowStaleOverride)
         {
             // The loud, separate override path (P2-10 step 4): journaled by the merge below + audited here.
-            _onStaleOverride?.Invoke(request.AgentId, request.OverrideReason ?? "stale override");
+            // Non-conditional: the null case was refused at (0), so this cannot silently skip.
+            //
+            // NOTE what the override does NOT buy, because the wording of its refusal has misled before.
+            // It skips the freshness PRE-CHECK; it does not touch the merge. The merge below is still
+            // `--ff-only`, and a branch that is genuinely stale — verified against a main that has since
+            // moved — is by construction not a descendant of main, so git refuses it here exactly as it
+            // would without the override, and ClassifyFailedFfMerge reports "the branch no longer
+            // fast-forwards onto main". The override is therefore NOT, and never was, an escape from a
+            // co-tenant staled by someone else's merge: only the keep-alive rebase (P2-09, wired into the
+            // stale cascade by MergeQueueProvisioner) makes such a branch mergeable, by making it a
+            // fast-forward again. What the override IS for is the case where main moved but the branch
+            // still fast-forwards — the merge is available and the recorded evidence is simply older than
+            // the ref — and edge row 5, a repo with no verification command to be fresh about.
+            _onStaleOverride!.Invoke(request.AgentId, request.OverrideReason ?? "stale override");
         }
 
         var mergeExit = -1;
+        var mergeError = string.Empty;
         // One journaled operation (T-19) — the merge is undoable and replayable by the RT-D1 reconcile.
         using (_journal.BeginOperation(request.RepoPath, JournalKinds.Merge, $"Merge {branch}"))
         {
-            var (code, _, _) = GitService.RunGit(request.RepoPath, "merge", "--ff-only", mergeSource);
+            // The stderr is CAPTURED, not discarded into `_`. See the classification below for why: a
+            // non-zero exit here used to be reported unconditionally as "verification is stale", which is
+            // actively wrong for index.lock contention, a refusing pre-merge hook, a full disk, or
+            // unrelated histories — and this file's own doc names discarded exit codes as the bug class it
+            // exists to fix.
+            var (code, _, err) = GitService.RunGit(request.RepoPath, "merge", "--ff-only", mergeSource);
             mergeExit = code;
+            mergeError = err;
         }
 
         if (mergeExit != 0)
         {
-            // The CAS lost: agent/<id> is no longer a fast-forward of main (main moved or the branch
-            // was not rebased onto this main). No merge landed.
-            return new ForegroundMergeResult(false, null, CasLost: true,
-                "verification is stale — the branch no longer fast-forwards onto main; re-verifying");
+            return ClassifyFailedFfMerge(request, branch, mergeSource, mergeError);
         }
 
         var newMainSha = RevParse(request.RepoPath, "--verify", request.MainBranch);
@@ -276,6 +324,55 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     {
         Leases.Confirm(repoHash, lease.LeaseId, newMainSha);
         _onMerged?.Invoke(lease.AgentId, newMainSha);
+    }
+
+    /// <summary>
+    /// Says WHY an <c>--ff-only</c> merge refused, instead of assuming.
+    ///
+    /// <para>The old code was <c>var (code, _, _) = RunGit(…)</c> followed by a hardcoded "verification is
+    /// stale — the branch no longer fast-forwards onto main" on any non-zero exit. Staleness is only one
+    /// of the reasons git refuses: <c>index.lock</c> contention (the exact class of bug this application
+    /// exists to prevent), a repository-configured pre-merge hook that refused, a full disk, unrelated
+    /// histories, a corrupt object. Every one of those was reported to the human as staleness, and
+    /// <c>CasLost: true</c> additionally told the queue to throw the verification away and re-run it —
+    /// which for a jammed <c>index.lock</c> is a re-verification loop that can never succeed and never
+    /// names its cause.</para>
+    ///
+    /// <para>So the staleness claim is now MEASURED: <c>merge-base --is-ancestor main &lt;source&gt;</c>
+    /// answers exactly the question <c>--ff-only</c> asked. Still an ancestor ⇒ the branch does
+    /// fast-forward and something else refused, so git's own stderr is reported and <c>CasLost</c> stays
+    /// false (nothing about the verification is invalidated). Not an ancestor ⇒ genuinely stale, which is
+    /// the original message, now earned. A probe that itself fails to answer (git broken, repo
+    /// unreadable — anything but exit 0/1) is reported as unknown rather than guessed.</para>
+    /// </summary>
+    private static ForegroundMergeResult ClassifyFailedFfMerge(
+        ForegroundMergeRequest request, string branch, string mergeSource, string mergeError)
+    {
+        var detail = FirstLine(mergeError);
+        var (probeCode, _, _) = GitService.RunGit(
+            request.RepoPath, "merge-base", "--is-ancestor", request.MainBranch, mergeSource);
+
+        return probeCode switch
+        {
+            // Exit 0: main IS still an ancestor of the branch, i.e. the fast-forward was available and
+            // something other than staleness refused it.
+            0 => new ForegroundMergeResult(false, null, CasLost: false,
+                $"the merge of '{branch}' into '{request.MainBranch}' failed, and NOT because the "
+                + $"verification is stale — '{branch}' still fast-forwards onto '{request.MainBranch}'. "
+                + $"git said: {detail}"),
+
+            // Exit 1: not an ancestor — the CAS genuinely lost (main moved, or the branch was never
+            // rebased onto this main). The verification is stale and re-verification is the right answer.
+            1 => new ForegroundMergeResult(false, null, CasLost: true,
+                $"verification is stale — the branch no longer fast-forwards onto "
+                + $"'{request.MainBranch}'; re-verifying ({detail})"),
+
+            // Anything else: the probe could not answer, so neither can we. Do not invalidate the
+            // verification on a guess.
+            _ => new ForegroundMergeResult(false, null, CasLost: false,
+                $"the merge of '{branch}' into '{request.MainBranch}' failed and the cause could not be "
+                + $"established (the fast-forward probe itself exited {probeCode}). git said: {detail}"),
+        };
     }
 
     /// <summary>

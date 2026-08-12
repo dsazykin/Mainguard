@@ -407,9 +407,14 @@ public class GitService : IGitService
         return new Signature(name, email, now);
     }
 
-    public void Commit(string repoPath, string message)
+    public void Commit(string repoPath, string message, bool amend = false)
     {
-        using var op = _journal.BeginOperation(repoPath, JournalKinds.Commit, Describe("Commit", message));
+        // Refuse the two unsafe amends before anything is journalled or written.
+        if (amend) GuardAmend(repoPath);
+
+        using var op = _journal.BeginOperation(repoPath,
+            amend ? JournalKinds.AmendCommitMessage : JournalKinds.Commit,
+            Describe(amend ? "Amend commit" : "Commit", message));
         // Signing is a git-orchestration concern (gpg/ssh agents, pinentry) that LibGit2Sharp
         // can't drive, so when the preference is on we hand the commit to the git CLI and let it
         // sign from the (locally written) repo config. GIT_TERMINAL_PROMPT=0 is inherited by
@@ -420,7 +425,8 @@ public class GitService : IGitService
             // error as the unsigned path, before we shell out.
             ExecuteWithRepo(repoPath, repo => GetSignature(repo));
             ApplySigningConfig(repoPath);
-            RunGitChecked(repoPath, "commit", "-m", message);
+            if (amend) RunGitChecked(repoPath, "commit", "--amend", "-m", message);
+            else RunGitChecked(repoPath, "commit", "-m", message);
             return;
         }
 
@@ -429,10 +435,43 @@ public class GitService : IGitService
             // Resolve the identity from config, throwing a typed error if unset.
             var signature = GetSignature(repo);
 
+            // An amend keeps the ORIGINAL author and only re-stamps the committer — that is what
+            // `git commit --amend` does, and therefore what the signing path above already does.
+            // Passing `signature` for both would quietly reassign authorship on the unsigned path.
+            var author = amend ? repo.Head.Tip!.Author : signature;
+
             // Commits whatever is currently in the Staging Index
-            repo.Commit(message, signature, signature);
+            repo.Commit(message, author, signature, new CommitOptions { AmendPreviousCommit = amend });
         });
     }
+
+    /// <summary>
+    /// Pre-flight for <c>Commit(..., amend: true)</c>. Amending the <b>root</b> commit is fine
+    /// (a parentless amend simply rewrites the root), but there are two amends we refuse:
+    /// an unborn branch has no commit to amend at all, and a HEAD already contained in the
+    /// branch's upstream is published — rewriting it diverges the branch and the next push is
+    /// rejected, which is exactly the "silently created a diverged branch" outcome the checkbox
+    /// must not produce. The upstream ref is the local view of the remote (it can be stale), so
+    /// this is a best-effort guard against the common case, not a network round-trip.
+    /// </summary>
+    private void GuardAmend(string repoPath) => ExecuteWithRepo(repoPath, repo =>
+    {
+        var tip = repo.Head.Tip;
+        if (tip == null)
+            throw new GitOperationException(
+                "There is nothing to amend — this branch has no commits yet. Clear \"Amend last commit\" and commit normally.");
+
+        var upstream = repo.Head.TrackedBranch;
+        if (upstream?.Tip != null && IsAncestorOrSame(repo, tip, upstream.Tip))
+        {
+            var branchName = repo.Info.IsHeadDetached ? string.Empty : repo.Head.FriendlyName;
+            var upstreamName = upstream.FriendlyName;
+            throw new AmendPushedCommitException(branchName, upstreamName,
+                $"The last commit is already published on '{upstreamName}'. Amending it would rewrite " +
+                $"history that has been pushed and leave '{branchName}' diverged from its upstream. " +
+                "Commit your changes on top instead, or reset and force-push deliberately.");
+        }
+    });
 
     /// <summary>
     /// Writes the signing preferences into the repo's <b>local</b> config (never global) so a
@@ -668,12 +707,12 @@ public class GitService : IGitService
 
     public bool IsMergeInProgress(string repoPath)
     {
-        return System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "MERGE_HEAD"));
+        return System.IO.File.Exists(GitDirPath(repoPath, "MERGE_HEAD"));
     }
 
     public string GetMergeMessage(string repoPath)
     {
-        var msgPath = System.IO.Path.Combine(repoPath, ".git", "MERGE_MSG");
+        var msgPath = GitDirPath(repoPath, "MERGE_MSG");
         if (System.IO.File.Exists(msgPath))
         {
             return System.IO.File.ReadAllText(msgPath).Trim();
@@ -748,13 +787,13 @@ public class GitService : IGitService
 
     public bool IsRebasing(string repoPath)
     {
-        return System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge")) ||
-               System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-apply"));
+        return System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-merge")) ||
+               System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-apply"));
     }
 
     public void ContinueRebase(string repoPath)
     {
-        if (System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "interactive")))
+        if (System.IO.File.Exists(GitDirPath(repoPath, "rebase-merge", "interactive")))
         {
             // `git rebase --continue` can re-invoke GIT_EDITOR for the reword/squash steps
             // that come after the pause, so we must hand it the SAME message queue used at
@@ -770,7 +809,7 @@ public class GitService : IGitService
                 if (ExecuteWithRepo(repoPath, repo => repo.Index.Conflicts.Any()))
                     throw new MergeConflictException("Merge conflicts detected! Resolve the conflicts in the Diff Viewer, save the files to stage them, then click 'Continue Rebase' again.");
 
-                var stoppedShaPath = System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "stopped-sha");
+                var stoppedShaPath = GitDirPath(repoPath, "rebase-merge", "stopped-sha");
                 if (System.IO.File.Exists(stoppedShaPath))
                     throw new GitOperationException($"Rebase paused at {System.IO.File.ReadAllText(stoppedShaPath).Trim()} for editing. Amend your changes, then click 'Continue Rebase'.");
 
@@ -778,7 +817,7 @@ public class GitService : IGitService
             }
 
             // Rebase finished — the queue is no longer needed.
-            if (!System.IO.Directory.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge")))
+            if (!System.IO.Directory.Exists(GitDirPath(repoPath, "rebase-merge")))
             {
                 try { System.IO.Directory.Delete(RebaseMsgQueueDir(repoPath), true); } catch { }
             }
@@ -804,7 +843,7 @@ public class GitService : IGitService
 
     public void AbortRebase(string repoPath)
     {
-        if (System.IO.File.Exists(System.IO.Path.Combine(repoPath, ".git", "rebase-merge", "interactive")))
+        if (System.IO.File.Exists(GitDirPath(repoPath, "rebase-merge", "interactive")))
         {
             var (code, _, errStr) = RunGit(repoPath, "rebase", "--abort");
             // Whether or not abort reports success, the message queue is now stale.
@@ -881,11 +920,71 @@ public class GitService : IGitService
     internal static (int Code, string Out, string Err) RunGit(string repoPath, params string[] args)
         => RunGit(repoPath, null, default, args);
 
-    // Directory (under .git) where the interactive-rebase message queue lives. It is
-    // deliberately inside .git so it survives conflict/edit pauses and is reused by
-    // ContinueRebase — the reword/squash messages are keyed by original commit SHA.
+    /// <summary>
+    /// Resolves the git directory holding <paramref name="repoPath"/>'s <b>per-worktree</b> state.
+    /// <b>Never build one with <c>Path.Combine(repoPath, ".git", …)</c>.</b>
+    /// <para>
+    /// In the main working tree that is <c>&lt;repo&gt;/.git/</c>, but in a <i>linked</i> worktree
+    /// (<c>git worktree add</c> — which both the Worktrees window and the agent platform's
+    /// <c>WorktreeManager</c> create) <c>.git</c> is a FILE holding a <c>gitdir:</c> pointer, and
+    /// the per-worktree state — <c>HEAD</c>, <c>index</c>, <c>MERGE_HEAD</c>, <c>MERGE_MSG</c>,
+    /// <c>rebase-merge/</c>, <c>rebase-apply/</c> — lives under
+    /// <c>&lt;main&gt;/.git/worktrees/&lt;name&gt;/</c>. Combining a path against a file silently
+    /// yields one that can never exist, so every state check answers "no", forever.
+    /// </para>
+    /// <c>Repository.Discover</c> performs exactly git's own resolution, including the
+    /// <c>.git</c>-file indirection and the bare-repository case.
+    /// </summary>
+    internal static string ResolveGitDir(string repoPath)
+    {
+        // Discover returns a trailing-separator path, or null when repoPath is not inside a
+        // repository — in which case fall back to the naive layout, so probing a non-repository
+        // path behaves exactly as it did before.
+        var discovered = Repository.Discover(repoPath);
+        return string.IsNullOrEmpty(discovered)
+            ? System.IO.Path.Combine(repoPath, ".git")
+            : discovered.TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// Resolves the <b>common</b> git directory shared by every worktree — where <c>refs/</c>,
+    /// <c>objects/</c> and <c>packed-refs</c> live. For the main working tree this is the same
+    /// directory <see cref="ResolveGitDir"/> returns; for a linked worktree the per-worktree
+    /// gitdir carries a <c>commondir</c> file pointing back at <c>&lt;main&gt;/.git</c>.
+    /// <para>The distinction matters for anything ref-shaped: a commit made <i>in</i> a worktree
+    /// updates <c>refs/heads/&lt;branch&gt;</c> in the common dir, not in the per-worktree one.</para>
+    /// </summary>
+    internal static string ResolveCommonGitDir(string gitDir)
+    {
+        var pointer = System.IO.Path.Combine(gitDir, "commondir");
+        if (!System.IO.File.Exists(pointer)) return gitDir;
+
+        try
+        {
+            var target = System.IO.File.ReadAllText(pointer).Trim();
+            if (target.Length == 0) return gitDir;
+            return System.IO.Path.GetFullPath(
+                System.IO.Path.IsPathRooted(target) ? target : System.IO.Path.Combine(gitDir, target));
+        }
+        catch
+        {
+            // An unreadable commondir must never take a caller down; the per-worktree dir is
+            // still a usable answer for everything that is not ref-shaped.
+            return gitDir;
+        }
+    }
+
+    /// <summary>Path to a per-worktree state file/dir inside the resolved gitdir
+    /// (see <see cref="ResolveGitDir"/>).</summary>
+    internal static string GitDirPath(string repoPath, params string[] segments)
+        => System.IO.Path.Combine(new[] { ResolveGitDir(repoPath) }.Concat(segments).ToArray());
+
+    // Directory (inside the resolved gitdir) where the interactive-rebase message queue lives.
+    // It is deliberately inside the gitdir so it survives conflict/edit pauses and is reused by
+    // ContinueRebase — the reword/squash messages are keyed by original commit SHA. For a linked
+    // worktree that is <main>/.git/worktrees/<name>/, next to the rebase-merge state it pairs with.
     internal static string RebaseMsgQueueDir(string repoPath)
-        => System.IO.Path.Combine(repoPath, ".git", "mainguard-rebase-msg");
+        => GitDirPath(repoPath, "mainguard-rebase-msg");
 
     // Test seam: when set, this quoted command prefix is used verbatim instead of
     // deriving one from the running process. Integration tests set it to the built
@@ -1047,6 +1146,58 @@ public class GitService : IGitService
     }
 
     /// <summary>
+    /// Turns a refused SSH key exchange into a message the user can act on, by looking at the key
+    /// Mainguard would have used and whether a passphrase for it is in the keyring.
+    ///
+    /// <para>The three cases have three different remedies, and telling them apart is the whole point:
+    /// no key at all (generate or add one), an encrypted key with a stored passphrase (the passphrase is
+    /// stored but the running <c>ssh</c> never asked Mainguard for it — the key must be loaded into the
+    /// agent), and a key with no stored passphrase (it is either locked or not trusted by the host).</para>
+    /// </summary>
+    private static SshAuthenticationException BuildSshAuthenticationException(Exception inner)
+    {
+        string? keyPath = null;
+        var hasStored = false;
+        try
+        {
+            var ssh = new Mainguard.Git.Security.SshKeyService();
+            // Same preference order as CredentialResolver.ResolveDefaultKey — the message must name the
+            // key the operation would actually have used.
+            var keys = ssh.ListKeys();
+            var key = keys.FirstOrDefault(k => k.Name is "id_ed25519")
+                ?? keys.FirstOrDefault(k => k.Name is "id_rsa")
+                ?? keys.FirstOrDefault();
+            if (key is not null)
+            {
+                keyPath = key.PrivateKeyPath;
+                hasStored = !string.IsNullOrEmpty(ssh.GetPassphrase(key.PrivateKeyPath));
+            }
+        }
+        catch
+        {
+            // Unreadable ~/.ssh or no keyring on this box: fall through to the generic message rather
+            // than replacing an auth error with a filesystem one.
+        }
+
+        var message = keyPath is null
+            ? "SSH authentication failed: no usable SSH key was found in ~/.ssh. "
+              + "Open Settings → SSH Keys to generate one and add it to your host."
+            : hasStored
+                ? $"SSH authentication failed for {System.IO.Path.GetFileName(keyPath)}. Its passphrase is "
+                  + "saved in Mainguard, but the system ssh agent was not holding the unlocked key — "
+                  + "run ssh-add for it, or check the key is added to your host in Settings → SSH Keys."
+                : $"SSH authentication failed for {System.IO.Path.GetFileName(keyPath)}. The key is either "
+                  + "passphrase-protected with no saved passphrase, or not accepted by the host. "
+                  + "Open Settings → SSH Keys to save its passphrase or copy the public key to your host.";
+
+        return new SshAuthenticationException(message, inner)
+        {
+            KeyPath = keyPath,
+            HasStoredPassphrase = hasStored,
+        };
+    }
+
+    /// <summary>
     /// Runs a git command against the given remote, injecting a token via git's
     /// credential mechanism when one is available for that remote's host. The
     /// token is passed in the child process ENVIRONMENT and read by an inline
@@ -1069,6 +1220,16 @@ public class GitService : IGitService
             }
             catch (AuthenticationRequiredException ex)
             {
+                // An SSH-form remote that was refused is NOT a "sign in / store a token" problem, and
+                // routing it to the PAT dialog (which is what the generic branch below does) offers a
+                // remedy that cannot work. git's stderr for a locked or untrusted key is
+                // "Permission denied (publickey)", which the classifier in RunGitChecked matches as a
+                // generic auth failure — so every SSH key problem used to arrive at the token dialog.
+                if (Mainguard.Git.Security.SshKeyService.IsSshRemote(url))
+                {
+                    throw BuildSshAuthenticationException(ex);
+                }
+
                 // T-14: an unknown-host-no-token failure carries the host so the UI can
                 // route to the per-host PAT dialog instead of a generic auth notice.
                 throw new AuthenticationRequiredException(ex.Message, string.IsNullOrEmpty(host) ? null : host, ex);
@@ -1313,11 +1474,32 @@ public class GitService : IGitService
         // Pushes the branch to the resolved remote and sets it as upstream (see Push).
         => PushSetUpstream(repoPath, ResolveRemoteName(repoPath), branchName);
 
+    /// <summary>
+    /// Deletes a local or remote branch. <paramref name="force"/> is the <c>git branch -d</c> ⇄
+    /// <c>-D</c> switch: without it an unmerged <b>local</b> branch is refused with a typed
+    /// <see cref="BranchNotMergedException"/> rather than silently orphaning its commits.
+    /// (Remote deletes are a push and have no local merged-check to make.)
+    /// </summary>
     public void DeleteBranch(string repoPath, string branchName, bool force = false)
     {
+        // Both pre-flight questions — is this a remote branch, and is a local one safe to
+        // delete — are answered in one short-lived handle BEFORE the journal scope opens, so a
+        // refused delete never records a journal entry for an operation that did not happen.
+        var (isRemote, notMergedReason) = ExecuteWithRepo(repoPath, repo =>
+        {
+            var branch = repo.Branches[branchName];
+            if (branch == null) return (false, (string?)null);
+            if (branch.IsRemote || force) return (branch.IsRemote, (string?)null);
+            return (false, IsSafeToDelete(repo, branch)
+                ? null
+                : $"Branch '{branchName}' is not fully merged — deleting it would leave its commits " +
+                  "unreachable. Merge it first, or delete it anyway to discard the work.");
+        });
+
+        if (notMergedReason != null) throw new BranchNotMergedException(branchName, notMergedReason);
+
         // A local-branch delete is undoable (the branch ref + upstream config is restored);
         // a remote-branch delete pushes the deletion, which the journal cannot reverse.
-        bool isRemote = ExecuteWithRepo(repoPath, repo => repo.Branches[branchName]?.IsRemote ?? false);
         using var op = _journal.BeginOperation(repoPath, JournalKinds.DeleteBranch, $"Delete branch {branchName}",
             undoBlockedReason: isRemote ? "Deleting a remote branch cannot be undone from the journal." : null);
         ExecuteWithRepo(repoPath, repo =>
@@ -1338,6 +1520,29 @@ public class GitService : IGitService
             }
         });
     }
+
+    /// <summary>
+    /// git's own <c>-d</c> rule: a branch may be deleted without force when its tip is already
+    /// contained in HEAD, or in the upstream it tracks (published work is not orphaned by
+    /// dropping the local ref). An empty branch has nothing to orphan.
+    /// </summary>
+    private static bool IsSafeToDelete(Repository repo, Branch branch)
+    {
+        var tip = branch.Tip;
+        if (tip == null) return true;
+
+        var upstreamTip = branch.TrackedBranch?.Tip;
+        if (upstreamTip != null && IsAncestorOrSame(repo, tip, upstreamTip)) return true;
+
+        var headTip = repo.Head.Tip;
+        return headTip != null && IsAncestorOrSame(repo, tip, headTip);
+    }
+
+    /// <summary>True when <paramref name="candidate"/> is <paramref name="descendant"/> or one of
+    /// its ancestors — i.e. <paramref name="descendant"/> already contains it.</summary>
+    private static bool IsAncestorOrSame(Repository repo, Commit candidate, Commit descendant)
+        => candidate.Id == descendant.Id
+           || repo.ObjectDatabase.FindMergeBase(candidate, descendant)?.Id == candidate.Id;
 
     public bool HasUncommittedChanges(string repoPath)
     {

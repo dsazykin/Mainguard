@@ -102,11 +102,25 @@ public sealed class ExternalPrIntake : IExternalPrIntake
     private readonly Dictionary<string, (DateTimeOffset Until, int Attempt)> _backoff =
         new(StringComparer.Ordinal);
 
-    /// <summary>The configurable bot-author allow-list for sources without their own <c>AuthorFilter</c>.</summary>
-    public IReadOnlyList<string> AuthorFilters { get; set; } = DefaultBotAuthors;
+    /// <summary>
+    /// The daemon's live intake configuration, read from the store on every use.
+    ///
+    /// <para><b>Read, never cached.</b> This used to be two settable properties (<c>AuthorFilters</c> and
+    /// <c>PollInterval</c>) holding compiled-in defaults that nothing in production ever assigned — so
+    /// the feature's cadence and bot list were unconfigurable, and a settings surface could only have
+    /// changed them for the lifetime of one object. Reading the store here is what makes the settings a
+    /// human saves and the loop that obeys them the SAME fact: there is no second copy to drift, and a
+    /// change takes effect on the next poll rather than on the next daemon restart.</para>
+    /// </summary>
+    public PrIntakeSettings Settings => _store.GetSettings();
 
-    /// <summary>The poll cadence for the daemon scheduler loop (<see cref="RunAsync"/>).</summary>
-    public TimeSpan PollInterval { get; set; } = TimeSpan.FromSeconds(60);
+    /// <summary>The configurable bot-author allow-list for sources without their own <c>AuthorFilter</c>
+    /// (the persisted <see cref="Settings"/> value).</summary>
+    public IReadOnlyList<string> AuthorFilters => Settings.BotAuthors;
+
+    /// <summary>The poll cadence for the daemon scheduler loop (<see cref="RunAsync"/>), from the
+    /// persisted <see cref="Settings"/>. Clamped by the store, so it can never be a tight loop.</summary>
+    public TimeSpan PollInterval => Settings.PollInterval;
 
     /// <summary>The first rate-limit backoff delay; each consecutive rate-limit doubles it up to <see cref="MaxBackoff"/>.</summary>
     public TimeSpan BaseBackoff { get; set; } = TimeSpan.FromSeconds(30);
@@ -141,15 +155,34 @@ public sealed class ExternalPrIntake : IExternalPrIntake
 
     public async Task PollOnceAsync(CancellationToken ct)
     {
+        // ONE read per poll, then passed down: the settings are a database round trip and a poll can walk
+        // many pull requests, but more importantly every source in a single cycle must be judged against
+        // the same configuration — re-reading per PR would let a save land mid-poll and filter half the
+        // list by the old bot list and half by the new one.
+        var settings = _store.GetSettings();
+
+        // The off switch. The loop keeps running (so re-enabling needs no daemon restart) but nothing is
+        // listed, fetched or materialized — intake goes quiet without the user having to unsubscribe
+        // every source and re-enter them later.
+        if (!settings.Enabled)
+        {
+            return;
+        }
+
         foreach (var source in _store.Subscriptions())
         {
             ct.ThrowIfCancellationRequested();
-            await PollSourceAsync(source, ct).ConfigureAwait(false);
+            await PollSourceAsync(source, settings, ct).ConfigureAwait(false);
         }
     }
 
     /// <summary>The daemon scheduler loop: poll on <see cref="PollInterval"/> until cancelled. One poll at a
-    /// time; a poll never throws a rate limit (it is caught and backed off), so the loop never crashes.</summary>
+    /// time; a poll never throws a rate limit (it is caught and backed off), so the loop never crashes.
+    ///
+    /// <para>The cadence is re-read from the store on every iteration, not captured once at start: this
+    /// loop is started by the daemon's hosted service and lives for the daemon's whole lifetime, so a
+    /// cadence read once would mean a saved interval could not take effect until the user restarted the
+    /// daemon — the settings page would be right and the poller would be wrong for hours.</para></summary>
     public async Task RunAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -174,7 +207,7 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         }
     }
 
-    private async Task PollSourceAsync(ExternalPrSource source, CancellationToken ct)
+    private async Task PollSourceAsync(ExternalPrSource source, PrIntakeSettings settings, CancellationToken ct)
     {
         // Honour any active rate-limit backoff for this source (edge row 4 — never a tight retry loop).
         lock (_gate)
@@ -220,7 +253,7 @@ public sealed class ExternalPrIntake : IExternalPrIntake
         var openNumbers = prs.Select(p => p.Number).ToHashSet();
 
         // Materialize/refresh each matching open PR.
-        foreach (var pr in prs.Where(p => MatchesAuthor(p, source)))
+        foreach (var pr in prs.Where(p => MatchesAuthor(p, source, settings)))
         {
             ct.ThrowIfCancellationRequested();
             try
@@ -370,11 +403,17 @@ public sealed class ExternalPrIntake : IExternalPrIntake
 
     // ---- Author filter (configurable; per-source override wins over the default bot list) ----
 
-    /// <summary>True iff the PR author matches this source's filter (its own, else the default bot list). Case-insensitive.</summary>
+    /// <summary>True iff the PR author matches this source's filter (its own, else the persisted shared
+    /// bot list). Case-insensitive.</summary>
     public bool MatchesAuthor(PullRequestItem pr, ExternalPrSource source)
+        => MatchesAuthor(pr, source, Settings);
+
+    /// <summary>The same match against an already-read settings snapshot — so one poll judges every
+    /// source and every pull request in it against one configuration.</summary>
+    private static bool MatchesAuthor(PullRequestItem pr, ExternalPrSource source, PrIntakeSettings settings)
     {
         var filters = string.IsNullOrWhiteSpace(source.AuthorFilter)
-            ? AuthorFilters
+            ? settings.BotAuthors
             : new[] { source.AuthorFilter! };
 
         return filters.Any(f => string.Equals(f, pr.Author, StringComparison.OrdinalIgnoreCase));

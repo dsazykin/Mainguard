@@ -104,6 +104,218 @@ public sealed class AgentWorktreeManagerTests
     // MG-3: the quarantine remote is now the agent's OWN repository, not the shared mirror. That is the
     // whole point — `git push origin` has to keep working (LLM CLIs push reflexively) while the mirror
     // stops being something the agent talks to at all.
+    // ================= resume: adopting an existing agent/<id> =================
+
+    /// <summary>
+    /// <b>The point of the whole resume path.</b> A jail dies (daemon restart, VM stop, crash) leaving its
+    /// worktree and per-agent repository on disk and its commits on <c>agent/&lt;id&gt;</c> in the mirror.
+    /// Adopting must put a NEW worktree on that same branch with those commits present — not a fresh
+    /// branch off main under the same name, which is what <c>worktree add -b</c> would produce and what a
+    /// human would have no way to notice.
+    /// </summary>
+    [Fact]
+    public void Adopt_StartsOnTheExistingBranch_WithItsCommitsIntact()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var first = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        // The mirror's own default branch, whatever it is called — the base the worktree was created off.
+        var mainSha = AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "HEAD").Trim();
+        var tip = CommitInWorktree(first, "work.txt", "agent work", "feat: the work being resumed");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/a1").Trim());
+
+        // The dead jail's residue: worktree + per-agent repo still on disk, container gone. This is the
+        // state a crash leaves — NOT the state a clean stop leaves, which deletes the branch too.
+        env.Worktrees.RemoveAgentWorktreeKeepingBranch(hash, "a1");
+        Assert.False(Directory.Exists(first));
+        Assert.Equal("commit", AgentTestGit.RunChecked(bare, "cat-file", "-t", "refs/heads/agent/a1").Trim());
+
+        var adopted = env.Worktrees.AdoptAgentWorktree(hash, "a1");
+
+        // Same branch, same tip, and the file the previous jail committed is on disk in the new worktree.
+        Assert.Equal("agent/a1", AgentTestGit.RunChecked(adopted, "rev-parse", "--abbrev-ref", "HEAD").Trim());
+        Assert.Equal(tip, AgentTestGit.RunChecked(adopted, "rev-parse", "HEAD").Trim());
+        Assert.NotEqual(mainSha, tip); // the fixture must really carry work, or this measures nothing
+        Assert.Equal("agent work", File.ReadAllText(Path.Combine(adopted, "work.txt")));
+
+        // …and it is a normal, fully-configured agent worktree: quarantined to its own repo, and the
+        // mirror still at the same tip (the adoption publishes, and that publish is a no-op).
+        Assert.Equal(env.Worktrees.AgentRepoPathFor(hash, "a1"),
+            AgentTestGit.RunChecked(adopted, "remote", "get-url", "origin").Trim());
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/a1").Trim());
+    }
+
+    /// <summary>
+    /// The honest refusal. With no <c>agent/&lt;id&gt;</c> there is nothing to resume, and the one thing
+    /// adoption must never do is silently create the branch — that would report success for an operation
+    /// that recovered nothing at all.
+    /// </summary>
+    [Fact]
+    public void Adopt_WithNoSuchBranch_RefusesTyped_AndCreatesNothing()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var ex = Assert.Throws<AgentBranchMissingException>(
+            () => env.Worktrees.AdoptAgentWorktree(hash, "ghost"));
+        Assert.Equal("agent/ghost", ex.Branch);
+        Assert.Equal(hash, ex.RepoHash);
+
+        // No branch invented, no worktree left behind, no per-agent repository.
+        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/ghost").Code);
+        Assert.False(Directory.Exists(env.Worktrees.WorktreePathFor(hash, "ghost")));
+        Assert.DoesNotContain(env.Worktrees.List(hash), w => w.Branch == "agent/ghost");
+    }
+
+    /// <summary>
+    /// The adoption's first act is a rescue. The MG-3 watcher publishes on its own clock and the
+    /// last-publish-on-teardown only runs for a clean stop, so a crashed jail can leave commits in its own
+    /// repository that the mirror never saw. The adoption clones the branch FROM the mirror and deletes
+    /// that repository, so anything not carried across first would be destroyed by the very operation
+    /// invoked to save it.
+    /// </summary>
+    [Fact]
+    public void Adopt_CarriesAcrossCommitsTheMirrorNeverSaw()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var first = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var published = CommitInWorktree(first, "one.txt", "1", "feat: published");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
+
+        // …and then a commit the daemon never got to publish, exactly as a crash would leave it.
+        var unpublished = CommitInWorktree(first, "two.txt", "2", "feat: never published");
+        Assert.Equal(published, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+        Assert.NotEqual(published, unpublished);
+
+        var adopted = env.Worktrees.AdoptAgentWorktree(hash, "a1");
+
+        Assert.Equal(unpublished, AgentTestGit.RunChecked(adopted, "rev-parse", "HEAD").Trim());
+        Assert.Equal(unpublished, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/a1").Trim());
+        Assert.Equal("2", File.ReadAllText(Path.Combine(adopted, "two.txt")));
+    }
+
+    /// <summary>
+    /// ...and when that rescue FAILS, the adoption must refuse rather than proceed.
+    ///
+    /// <para>The rescue publish's outcome used to be discarded, three lines before
+    /// <c>ClearWorktreeResidue</c> deletes the only copy of the unpublished commits.
+    /// <c>OnPublishOutcome</c> returns early unless <c>result.Refused</c>, so a <c>Failed</c> outcome —
+    /// defined as "git itself failed (unreadable repo, races, disk)", i.e. exactly the transient case the
+    /// rescue exists for — reached nothing at all: no log line, no audit event, no failed call, and the
+    /// agent's last commits deleted a moment later.</para>
+    ///
+    /// <para>Modelled here with a stale <c>.lock</c> on the mirror's own ref, which is what a crashed or
+    /// concurrent git leaves behind and is the exact failure class this application exists to prevent. The
+    /// unpublished work must still be on disk afterwards, so a retry once the lock clears recovers it.</para>
+    /// </summary>
+    [Fact]
+    public void Adopt_WhenTheRescuePublishFails_RefusesTyped_AndKeepsTheUnpublishedWork()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var first = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        var published = CommitInWorktree(first, "one.txt", "1", "feat: published");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "a1"));
+
+        // The commits the mirror never saw — the asset the rescue exists to save.
+        var unpublished = CommitInWorktree(first, "two.txt", "2", "feat: never published");
+        Assert.NotEqual(published, unpublished);
+
+        // The crash shape, exactly as Adopt_CarriesAcrossCommitsTheMirrorNeverSaw sets it up: the previous
+        // jail's worktree and per-agent repository are still on disk, holding the only copy of `two.txt`.
+        var agentRepo = env.Worktrees.AgentRepoPathFor(hash, "a1");
+
+        // A stale lock on refs/heads/agent/a1 in the mirror: the fetch into quarantine still succeeds, so
+        // the rescue gets as far as the compare-and-swap and then cannot take the ref.
+        var refLock = Path.Combine(bare, "refs", "heads", "agent", "a1.lock");
+        Directory.CreateDirectory(Path.GetDirectoryName(refLock)!);
+        File.WriteAllText(refLock, string.Empty);
+
+        try
+        {
+            var ex = Assert.Throws<AgentBranchRescueFailedException>(
+                () => env.Worktrees.AdoptAgentWorktree(hash, "a1"));
+            Assert.Equal(hash, ex.RepoHash);
+            Assert.Equal("a1", ex.AgentId);
+
+            // THE point: the only copy of the unpublished commit is still there, so a retry recovers it.
+            Assert.True(Directory.Exists(agentRepo), "the rescue failed, so its source must NOT be deleted");
+            Assert.Equal(
+                unpublished,
+                AgentTestGit.RunChecked(agentRepo, "rev-parse", "--verify", "refs/heads/agent/a1").Trim());
+        }
+        finally
+        {
+            File.Delete(refLock);
+        }
+
+        // ...and once the lock clears, the ordinary adoption carries the work across as it always did.
+        var adopted = env.Worktrees.AdoptAgentWorktree(hash, "a1");
+        Assert.Equal(unpublished, AgentTestGit.RunChecked(adopted, "rev-parse", "HEAD").Trim());
+        Assert.Equal("2", File.ReadAllText(Path.Combine(adopted, "two.txt")));
+    }
+
+    /// <summary>
+    /// The two removals differ in exactly one thing, and it is the thing that matters: a teardown ends the
+    /// agent (branch deleted, no residue), while a resume's rollback must leave the branch standing —
+    /// running the teardown there would destroy the only surviving copy of the work being recovered.
+    /// </summary>
+    [Fact]
+    public void RemoveKeepingBranch_LeavesTheBranch_WhereTheOrdinaryRemovalDeletesIt()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var keptPath = env.Worktrees.CreateAgentWorktree(hash, "kept");
+        var keptTip = CommitInWorktree(keptPath, "k.txt", "k", "feat: kept");
+        env.Worktrees.PublishAgentBranch(hash, "kept");
+
+        var gonePath = env.Worktrees.CreateAgentWorktree(hash, "gone");
+        CommitInWorktree(gonePath, "g.txt", "g", "feat: gone");
+        env.Worktrees.PublishAgentBranch(hash, "gone");
+
+        env.Worktrees.RemoveAgentWorktreeKeepingBranch(hash, "kept");
+        env.Worktrees.RemoveAgentWorktree(hash, "gone", force: true);
+
+        // Both worktrees and both per-agent repositories are gone…
+        Assert.False(Directory.Exists(keptPath));
+        Assert.False(Directory.Exists(gonePath));
+        Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "kept")));
+        Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "gone")));
+
+        // …and only the teardown took the branch with it.
+        Assert.Equal(keptTip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/kept").Trim());
+        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/gone").Code);
+
+        // The kept branch is therefore adoptable and the deleted one is not — which is the whole
+        // difference these two methods exist to express.
+        env.Worktrees.AdoptAgentWorktree(hash, "kept");
+        Assert.Throws<AgentBranchMissingException>(() => env.Worktrees.AdoptAgentWorktree(hash, "gone"));
+    }
+
+    /// <summary>Commits a file in an agent worktree the way the agent's CLI would, and returns the tip.</summary>
+    private static string CommitInWorktree(string worktreePath, string relPath, string content, string message)
+    {
+        var full = Path.Combine(worktreePath, relPath.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(full)!);
+        File.WriteAllText(full, content);
+        AgentTestGit.RunChecked(worktreePath, "add", "-A");
+        AgentTestGit.RunChecked(worktreePath,
+            "-c", "user.name=agent", "-c", "user.email=agent@mainguard.local", "-c", "commit.gpgsign=false",
+            "commit", "-m", message);
+        return AgentTestGit.RunChecked(worktreePath, "rev-parse", "HEAD").Trim();
+    }
+
     [Fact]
     public void QuarantineRemote_IsExactlyTheAgentsOwnRepo_NeverTheSharedMirror()
     {

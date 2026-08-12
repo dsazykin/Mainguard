@@ -162,6 +162,57 @@ public class ForegroundMergeServiceTests : IDisposable
         Assert.Equal(movedMain, Rev(repo.RepoPath, "main")); // main untouched
     }
 
+    /// <summary>
+    /// An <c>--ff-only</c> merge that fails for a reason OTHER than staleness must not be reported as
+    /// staleness.
+    ///
+    /// <para>The merge used to be <c>var (code, _, _) = RunGit(…)</c> followed by a hardcoded
+    /// "verification is stale — the branch no longer fast-forwards onto main" on any non-zero exit, with
+    /// <c>CasLost: true</c>. <c>index.lock</c> contention is the case picked here because it is the exact
+    /// bug class this application exists to prevent, and because it is the worst one to mislabel: the
+    /// branch fast-forwards perfectly, the verification is fine, and telling the queue the verification is
+    /// stale sends it into a re-verify loop that can never succeed and never names its cause. A refusing
+    /// pre-merge hook, a full disk and unrelated histories all land the same way.</para>
+    /// </summary>
+    [Fact]
+    public void FfMergeBlockedByIndexLock_IsNotReportedAsAStaleVerification()
+    {
+        var repo = BuildRepo();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _);
+
+        // Exactly what a crashed or concurrent git leaves behind.
+        var indexLock = Path.Combine(repo.RepoPath, ".git", "index.lock");
+        File.WriteAllText(indexLock, string.Empty);
+
+        try
+        {
+            var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+                repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+
+            Assert.False(result.Merged);
+            Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main")); // nothing landed
+
+            // The verification is NOT invalidated: the branch still fast-forwards, so re-verifying it
+            // would burn a jail run to reach the same answer while the real obstacle sits untouched.
+            Assert.False(result.CasLost);
+
+            // ...and the human is told what actually happened, not the old assumption.
+            Assert.DoesNotContain(
+                "no longer fast-forwards", result.Reason ?? "", StringComparison.Ordinal);
+            Assert.Contains("index.lock", result.Reason ?? "", StringComparison.Ordinal);
+        }
+        finally
+        {
+            File.Delete(indexLock);
+        }
+
+        // Control: with the lock gone, the same call merges — so the test above measured the lock and not
+        // a repo that was broken to begin with.
+        var after = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main"));
+        Assert.True(after.Merged);
+    }
+
     // ---- IgnoreScripts canary -------------------------------------------
 
     [Fact]
@@ -315,6 +366,77 @@ public class ForegroundMergeServiceTests : IDisposable
 
         Assert.True(result.Merged);
         Assert.NotEqual(repo.MainSha, Rev(repo.RepoPath, "main"));
+    }
+
+    /// <summary>
+    /// The other half of P2-10 step 4, which had gone missing: the override is loud, journaled AND
+    /// audited, and only the first two survive a service built with nowhere to record it.
+    ///
+    /// <para><c>onStaleOverride</c> was an optional argument that every production composition omitted, so
+    /// <c>MergeQueue.RecordStaleOverrideUse</c> had no caller anywhere in the app — the audit half of the
+    /// contract was already dead, waiting for the first real user of the other half to make it matter. An
+    /// override that merges with no record is the single merge in the product that bypasses the gate,
+    /// performed invisibly; refusing it is what keeps the two halves inseparable when the UI affordance is
+    /// finally wired.</para>
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_StaleOverride_WithNowhereToRecordIt_IsRefused()
+    {
+        var repo = BuildRepo();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out var leases, out _,
+            canMerge: Blocked("verification is stale — re-verifying"),
+            onStaleOverride: null);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main",
+            AllowStaleOverride: true, OverrideReason: "human accepted the risk"));
+
+        Assert.False(result.Merged);
+        Assert.Contains("no audit sink", result.Reason);
+        Assert.Equal(repo.MainSha, Rev(repo.RepoPath, "main"));
+        // Refused before the lease was taken: an override that cannot be recorded must not hold the
+        // repo's merge lease while it works that out.
+        Assert.NotNull(leases.TryBegin(repo.RepoHash, "probe", "x", repo.MainSha, "main"));
+    }
+
+    /// <summary>
+    /// The argument that decides P2-10's "escape hatch" question, MEASURED rather than assumed: the stale
+    /// override is <b>not</b> a way out of a branch staled by someone else's merge, and never was.
+    ///
+    /// <para>The override skips the freshness PRE-CHECK. It does not touch the merge, which is still
+    /// <c>--ff-only</c> — and a co-tenant staled by a merge is by construction not a descendant of the new
+    /// main, so git refuses it exactly as it would without the override. Believing otherwise is how "there
+    /// is an escape hatch" survived as a story about a state that had none. The only thing that makes such
+    /// a branch mergeable is making it a fast-forward again, which is what the keep-alive rebase now does
+    /// in the stale cascade (see <c>MergeQueueProvisionerTests</c>).</para>
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_StaleOverride_CannotRescueABranchThatNoLongerFastForwards()
+    {
+        var repo = BuildRepo();
+        var overrides = new List<(string Agent, string Reason)>();
+        var service = NewService(repo.SyncName, repo.SyncUrl, out _, out _,
+            canMerge: Blocked("verification is stale — re-verifying"),
+            onStaleOverride: (a, r) => overrides.Add((a, r)));
+
+        // Main moves on the user's own repo, exactly as another agent's merge would move it. The branch
+        // `agent/x` was cut from the OLD main and is now behind — the co-tenant's situation precisely.
+        File.WriteAllText(Path.Combine(repo.RepoPath, "human.txt"), "human work\n");
+        Git(repo.RepoPath, "add", "-A");
+        Git(repo.RepoPath, "commit", "-m", "human advances main");
+        var movedMain = Rev(repo.RepoPath, "main");
+        Assert.NotEqual(repo.MainSha, movedMain);
+
+        var result = service.MergeAgentBranch(new ForegroundMergeRequest(
+            repo.RepoPath, repo.RepoHash, "x", repo.MainSha, "main",
+            AllowStaleOverride: true, OverrideReason: "human accepted the risk"));
+
+        // The override WAS honoured — the pre-check was skipped and the use was audited...
+        Assert.Single(overrides);
+        // ...and it bought nothing, because --ff-only is the merge and the branch does not fast-forward.
+        Assert.False(result.Merged);
+        Assert.Contains("fast-forward", result.Reason);
+        Assert.Equal(movedMain, Rev(repo.RepoPath, "main"));
     }
 
     // ---- Preconditions the merge used to merely assume --------------------

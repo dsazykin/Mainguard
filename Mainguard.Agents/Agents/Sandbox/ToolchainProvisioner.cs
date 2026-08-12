@@ -56,6 +56,20 @@ public interface IToolchainImageBuilder
         string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels, CancellationToken ct = default);
 
     /// <summary>
+    /// The same build, with a sink for the engine's own output as it arrives.
+    ///
+    /// <para>The output is not a log here — it is <b>evidence of life</b>. This build runs for minutes
+    /// inside a spawn RPC, and every watchdog upstream decides "alive or wedged?" from what it has heard
+    /// recently; <see cref="ToolchainBuildHeartbeat"/> turns this stream into the lines that answer it.
+    /// A default implementation forwards to the sink-less overload, so an implementation that has no
+    /// output to offer (and every existing test double) is unaffected and simply reports nothing.</para>
+    /// </summary>
+    Task BuildAsync(
+        string imageRef, string dockerfile, IReadOnlyDictionary<string, string> labels,
+        IProgress<string>? engineOutput, CancellationToken ct = default)
+        => BuildAsync(imageRef, dockerfile, labels, ct);
+
+    /// <summary>
     /// Engine and image facts for a FAILURE message only — the daemon version, the storage driver, and
     /// what the engine actually holds for the base image. Never throws; returns empty when unavailable.
     ///
@@ -127,25 +141,82 @@ public sealed class ToolchainProvisioner
              + "and takes several minutes — leave Mainguard running.";
     }
 
+    /// <summary>
+    /// The line a build reports every <see cref="ToolchainBuildHeartbeat.DefaultInterval"/> while it
+    /// runs. <see cref="BuildingMessage"/> says a build started; this says it is STILL going, which is
+    /// the only thing that distinguishes a healthy multi-gigabyte download from a daemon that died
+    /// mid-build. Everything upstream re-arms its stall watchdog on a new line, so a build that keeps
+    /// speaking cannot be declared unresponsive.
+    /// </summary>
+    /// <param name="elapsed">How long the build has been running.</param>
+    /// <param name="engineLine">The engine's last output line, when it has produced any.</param>
+    /// <param name="engineIdle">How long ago that line arrived.</param>
+    public static string StillBuildingMessage(
+        ToolchainDeclaration declaration, TimeSpan elapsed, string? engineLine, TimeSpan? engineIdle)
+    {
+        ArgumentNullException.ThrowIfNull(declaration);
+        var ids = declaration.Normalized.Replace('\n', ',');
+        var text = $"Still building this repository's toolchain image ({ids}) — "
+                 + $"{ToolchainBuildHeartbeat.Describe(elapsed)} so far. Leave Mainguard running.";
+
+        // The engine's own words when it has said anything. A silent stretch is NOT reported as a
+        // problem: the .NET recipe's big step is a `curl -fsSL … | tar` that prints nothing for minutes,
+        // so "quiet" is the normal shape of the slowest, healthiest part of the build.
+        if (!string.IsNullOrWhiteSpace(engineLine))
+        {
+            text += engineIdle is { } idle && idle > TimeSpan.FromSeconds(30)
+                ? $" Last from the engine ({ToolchainBuildHeartbeat.Describe(idle)} ago): {engineLine}"
+                : $" Engine: {engineLine}";
+        }
+
+        return text;
+    }
+
+    /// <summary>
+    /// The line reported while this spawn is WAITING for another spawn's identical build to finish.
+    ///
+    /// <para>It exists because the wait is otherwise indistinguishable from a hang: the second spawn does
+    /// nothing at all for as long as the first one builds, and everything upstream reads "nothing for
+    /// minutes" as a dead daemon. It also tells the truth about the situation — nothing is wrong, and
+    /// there is exactly one build running rather than two.</para>
+    /// </summary>
+    public static string WaitingForBuildMessage(ToolchainDeclaration declaration, TimeSpan waited)
+    {
+        ArgumentNullException.ThrowIfNull(declaration);
+        var ids = declaration.Normalized.Replace('\n', ',');
+        return $"Waiting for this repository's toolchain image ({ids}) — another agent is already "
+             + $"building it ({ToolchainBuildHeartbeat.Describe(waited)} so far). "
+             + "Leave Mainguard running.";
+    }
+
     /// <summary>The progress line reported once the layer is in hand and the jail can be created.</summary>
     public const string BuiltMessage = "Toolchain image ready — starting the sandbox.";
 
     private readonly IToolchainImageBuilder _builder;
     private readonly Action<string>? _log;
     private readonly IProgress<string>? _progress;
-    private readonly SemaphoreSlim _buildGate = new(1, 1);
+    private readonly ToolchainBuildGate _buildGate;
+    private readonly TimeSpan? _heartbeatInterval;
 
     /// <param name="log">The daemon log sink (machine-readable lines: repo, tag, ids).</param>
     /// <param name="progress">The USER-FACING sink. Separate from <paramref name="log"/> on purpose:
     /// the daemon log wants the tag and the base digest, and the person staring at a blank pane wants
     /// to know that a multi-minute download is running and must not be interrupted. Optional, so every
     /// existing caller and every test double is unaffected.</param>
+    /// <param name="buildGate">The gate that makes "one build per image, across every spawn" true.
+    /// Defaults to <see cref="ToolchainBuildGate.Shared"/>, which is what the shipped spawn path uses —
+    /// a per-provisioner gate could not serialise anything, because the launcher builds a new provisioner
+    /// for every spawn. Injectable so a test can contend on an isolated gate.</param>
+    /// <param name="heartbeatInterval">How often a running build reports in (tests shorten it).</param>
     public ToolchainProvisioner(
-        IToolchainImageBuilder builder, Action<string>? log = null, IProgress<string>? progress = null)
+        IToolchainImageBuilder builder, Action<string>? log = null, IProgress<string>? progress = null,
+        ToolchainBuildGate? buildGate = null, TimeSpan? heartbeatInterval = null)
     {
         _builder = builder ?? throw new ArgumentNullException(nameof(builder));
         _log = log;
         _progress = progress;
+        _buildGate = buildGate ?? ToolchainBuildGate.Shared;
+        _heartbeatInterval = heartbeatInterval;
     }
 
     /// <summary>
@@ -197,59 +268,85 @@ public sealed class ToolchainProvisioner
             [SpecLabel] = declaration.Normalized,
         };
 
-        // Serialised: two agents spawning into the same repo at once would otherwise race two identical
-        // multi-minute builds, and Docker would happily run both.
-        await _buildGate.WaitAsync(ct).ConfigureAwait(false);
-        try
-        {
-            var hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false);
-            if (hit is null)
+        // One build per image, PROCESS-WIDE — see ToolchainBuildGate for why this cannot be a field on
+        // this object. The key is the content-addressed tag, so two spawns that would produce the same
+        // layer serialise and two that would not never block each other. The waiting caller keeps
+        // reporting, because a silent wait is what "the coordinator is hung" looks like from outside.
+        return await _buildGate.RunExclusiveAsync(
+            tag,
+            token => BuildOrReuseAsync(repoHandle, declaration, recipes, baseDigest!, tag, expectedLabels, token),
+            onWaiting: waited =>
             {
-                var dockerfile = RenderDockerfile(baseDigest!, recipes);
-                _log?.Invoke($"toolchain build begin: repo={repoHandle} image={tag} ids={declaration.Normalized.Replace('\n', ',')}");
-                // Reported BEFORE the build, not after: the whole point is to be visible during it.
-                _progress?.Report(BuildingMessage(declaration));
-                try
-                {
-                    await _builder.BuildAsync(tag, dockerfile, expectedLabels, ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (ct.IsCancellationRequested)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    // The engine context is gathered ONLY here, on the failure path, and appended to the
-                    // detail — the CI failure this guards against ("pull access denied", one line of
-                    // build log) was undiagnosable precisely because the message said what happened and
-                    // nothing about the engine that did it.
-                    var context = await SafeDescribeAsync(baseDigest!, ct).ConfigureAwait(false);
-                    throw new ToolchainProvisioningException(
-                        repoHandle, declaration.Ids, Describe(ex) + context);
-                }
+                _log?.Invoke($"toolchain build wait: repo={repoHandle} image={tag} waited={waited}");
+                _progress?.Report(WaitingForBuildMessage(declaration, waited));
+            },
+            waitHeartbeat: _heartbeatInterval,
+            ct: ct).ConfigureAwait(false);
+    }
 
-                hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false)
-                      ?? throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
-                          $"the build of '{tag}' reported success but the image is absent or carries the wrong provenance labels."
-                          + await SafeDescribeAsync(baseDigest!, ct).ConfigureAwait(false));
+    /// <summary>The body that runs under the gate: cache hit, or build then re-check. Separated only so
+    /// the gate can own the waiting; every decision it makes is the one it made inline before.</summary>
+    private async Task<ProvisionedToolchain?> BuildOrReuseAsync(
+        string repoHandle, ToolchainDeclaration declaration, IReadOnlyList<ToolchainRecipe> recipes,
+        string baseDigest, string tag, IReadOnlyDictionary<string, string> expectedLabels, CancellationToken ct)
+    {
+        var hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false);
+        if (hit is null)
+        {
+            var dockerfile = RenderDockerfile(baseDigest, recipes);
+            _log?.Invoke($"toolchain build begin: repo={repoHandle} image={tag} ids={declaration.Normalized.Replace('\n', ',')}");
+            // Reported BEFORE the build, not after: the whole point is to be visible during it.
+            _progress?.Report(BuildingMessage(declaration));
 
-                _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
-                _progress?.Report(BuiltMessage);
+            // …and kept audible FOR THE WHOLE BUILD. One announcement dates instantly: five minutes into
+            // a 2.9 GB layer the surface has heard nothing recent and cannot tell healthy from wedged.
+            // The engine's own output feeds this so the line can quote it, but the beat does not depend
+            // on it — the slowest step is silent by construction.
+            var heartbeat = new ToolchainBuildHeartbeat(
+                _progress,
+                (elapsed, line, idle) => StillBuildingMessage(declaration, elapsed, line, idle),
+                _heartbeatInterval);
+            try
+            {
+                await _builder.BuildAsync(tag, dockerfile, expectedLabels, heartbeat, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // The engine context is gathered ONLY here, on the failure path, and appended to the
+                // detail — the CI failure this guards against ("pull access denied", one line of
+                // build log) was undiagnosable precisely because the message said what happened and
+                // nothing about the engine that did it.
+                var context = await SafeDescribeAsync(baseDigest, ct).ConfigureAwait(false);
+                throw new ToolchainProvisioningException(
+                    repoHandle, declaration.Ids, Describe(ex) + context);
+            }
+            finally
+            {
+                // Awaited, so no heartbeat can be reported after the build it describes has ended.
+                await heartbeat.DisposeAsync().ConfigureAwait(false);
             }
 
-            // The pin, PROVEN rather than requested. Everything above only decides which base we ASKED
-            // the engine for; this checks what it actually produced, from the image format itself. It
-            // runs on the cache-hit path too, so every spawn re-confirms the layer sits on the base the
-            // preflight just verified — which also closes the window where the base moved between the
-            // build and now.
-            await VerifyBuiltOnBaseAsync(repoHandle, declaration, hit, baseDigest!, ct).ConfigureAwait(false);
+            hit = await TryUseCachedAsync(tag, expectedLabels, ct).ConfigureAwait(false)
+                  ?? throw new ToolchainProvisioningException(repoHandle, declaration.Ids,
+                      $"the build of '{tag}' reported success but the image is absent or carries the wrong provenance labels."
+                      + await SafeDescribeAsync(baseDigest, ct).ConfigureAwait(false));
 
-            return new ProvisionedToolchain(hit, baseDigest!, declaration.Ids);
+            _log?.Invoke($"toolchain build ok: repo={repoHandle} image={hit}");
+            _progress?.Report(BuiltMessage);
         }
-        finally
-        {
-            _buildGate.Release();
-        }
+
+        // The pin, PROVEN rather than requested. Everything above only decides which base we ASKED
+        // the engine for; this checks what it actually produced, from the image format itself. It
+        // runs on the cache-hit path too, so every spawn re-confirms the layer sits on the base the
+        // preflight just verified — which also closes the window where the base moved between the
+        // build and now.
+        await VerifyBuiltOnBaseAsync(repoHandle, declaration, hit, baseDigest, ct).ConfigureAwait(false);
+
+        return new ProvisionedToolchain(hit, baseDigest, declaration.Ids);
     }
 
     /// <summary>

@@ -61,6 +61,17 @@ public sealed class ProToolsSurface : IProToolsSurface
         return new DaemonLogsViewModel(reader);
     }
 
+    // PR Intake (P2-12): the external-PR-intake configuration — poll cadence, the shared bot-author
+    // list, and the subscribed repositories. Every one of those is DAEMON state, so the page is built
+    // over the daemon gateway seam and never over an App-side store: the daemon is what polls the host
+    // and what gives each intake'd pull request a sandbox, and a copy of these settings on this side
+    // would be a page that saves successfully and changes nothing.
+    //
+    // This is also what makes the surface reachable at all. It shipped as a complete top-level Window
+    // with zero references anywhere in the app — no menu, no button, no test — so external PR intake
+    // was, in practice, unconfigurable.
+    public object CreatePrIntakePage() => new PrIntakeSettingsViewModel(ProComposition.CreatePrIntakeGateway());
+
     // Mainguard OS (PR2 follow-up + Item 1 repair action): the post-setup repo-onboarding engine + the
     // user-triggered sandbox-image rebuild, combined into one page since Rebuild has no dialog of its
     // own. The VM is composed by ProComposition.AddReposToOsFactory (pickers parent to the Settings

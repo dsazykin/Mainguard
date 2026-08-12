@@ -842,6 +842,26 @@ Contract summary (strategy §G-7.5, binding, with the market promotion of plan-a
 
 ## P2-15 — Tamper-evident audit log (H-8.2, pulled forward)
 
+> **STATUS AS OF 2026-08-11: NOT STARTED.** Verified across every branch. The only implementation of
+> `IAuditLog` is `InMemoryAuditLog` — a `List<AuditEvent>` that dies with the process. There is no hash
+> chain, no `PrevHash`, no persistence, no `mainguardd audit verify`, and no SIEM export anywhere in the
+> tree. `IAuditLog.cs`'s own doc comment still describes this task in the future tense.
+>
+> **What that costs today, measured:** 28 `IAuditLog.Append` call sites across 13 production files —
+> `plan_approved` with the approving identity, `egress_denied`, the kill-switch events, seven in
+> `MergeQueue`, eight in `ExternalPrIntake` — and `Read()` has **zero** production callers. No RPC exposes
+> it and no ViewModel renders it. Every audit event this product writes is appended to an object nobody
+> can read and nothing outlives the daemon process.
+>
+> The operative rule until this ships, recorded in `IAuditLog.Read`'s doc comment: **an `Append` is never
+> the user-visible record of anything.** Every destructive path must pair its audit call with a log line
+> or a typed refusal the user actually sees. Three paths added in August 2026 follow that rule; anything
+> new must too.
+>
+> *Recorded because this task was twice believed complete when it was not — once in a deferral note
+> ("until P2-15…") that read as though P2-15 were imminent, and once by the owner directly. The doc now
+> states the code's actual state so the next reader does not have to re-derive it.*
+
 **Milestone:** M7.5 — target **before 2026-08-02** (EU AI Act enforcement window) · **Priority:** P0 for enterprise, P1 overall · **Depends on:** P2-14 approval records exist; start once P2-10 is merged.
 
 > **Scope split (2026-07-07):** ship the **evidence pack** first — hash chain + authorizing identity + `mainguardd audit verify` + the P2-16 SIEM feed; RFC 3161 external anchoring (step 3) may land as a fast-follow. Claims language is "audit-grade / tamper-evident": Article 12 mandates automatic logging and traceability, **not** cryptography — hash-chaining is the differentiator, not a legal checkbox. Standalone audit vendors (Agent Audit, Asqav, Compliora) prove the demand but none can attribute actual code changes — the Git side is unclaimed.
@@ -1775,6 +1795,30 @@ With user-chosen latest, integrity rests on the npm registry's integrity metadat
 ---
 
 **Design decisions (binding) — [`FeatureDesigns.md`](../../design/FeatureDesigns.md) §5.** The polish pack designed as experiences; the T-22 analytics redesign mandates (M-D1/M-D2 secondary encodings + gates G-D1…G-D4, with the computed CVD validator record): [`ProductAndUX.md`](../../design/ProductAndUX.md) Part 4 and `docs/design/assets/AnalyticsRedesign.html`.
+
+## P2-50 — Backlog: additive capabilities, not yet scheduled
+
+**Status: BACKLOG, and strictly additive.** Everything here is a capability the product does not have
+and is not broken without — recorded so it is a decision rather than something we forgot. **Defects do
+not belong in this section**, however small: a known-wrong behaviour parked in a backlog list reads as
+"planned" to the next person who finds it, which is how a real bug acquires the appearance of a
+roadmap item. Those go to the issue tracker and get fixed.
+
+### P2-50a — Node and Go runtime-mount toolchains
+
+`ToolchainCatalog` ships `python-3` as the first `RuntimeMount` toolchain (P2-46 / PR #314). Node and
+Go are self-contained relocatable tarballs with upstream-published checksums, so they are the *same*
+delivery kind with a different payload.
+
+**Cost:** an edit to `toolchains.starter.json` — a pinned version-addressed HTTPS tarball, upstream's
+own published checksum (never one computed from our download, which is circular), and a probe that
+proves the toolchain RUNS rather than that a file arrived. **No C# change, no new delivery kind.**
+`ToolchainManifestTests` parses that file, so a bad edit fails CI rather than a user's install.
+
+**Why deferred rather than done:** doing Python properly and proving it end-to-end beats half-doing
+three. The evidence that the mechanism generalises is the manifest itself.
+
+---
 
 # 6. WAVE 3 — THE VIBE PRODUCT (K-2…K-5, fully specified)
 

@@ -20,6 +20,7 @@ public partial class QueueRailViewModel : ViewModelBase
     private readonly IMergeQueueService _queue;
     private readonly Action<string> _openReview;
     private readonly Action<string, bool>? _report;
+    private readonly Func<string?>? _resumeAgentKind;
 
     public ObservableCollection<QueueEntryViewModel> Entries { get; } = new();
 
@@ -30,12 +31,20 @@ public partial class QueueRailViewModel : ViewModelBase
     /// <param name="report">(message, isWarning) sink for the lifecycle actions' outcomes; null uses the
     /// shell's toast stack. Injected by tests — a discard's refusal is the sentence the human reads, so it
     /// has to be observable somewhere other than a toast.</param>
+    /// <param name="resumeAgentKind">
+    /// Which CLI a resume should run in the new jail, read at press time. It is a callback rather than a
+    /// value because the answer is the human's current choice on the surface that owns the CLI picker, and
+    /// a value captured at rail construction would be whatever was selected when the repo opened. Null (the
+    /// render harness, unit tests) simply resolves to no kind, and the daemon refuses with a reason.
+    /// </param>
     public QueueRailViewModel(
-        IMergeQueueService queue, Action<string> openReview, Action<string, bool>? report = null)
+        IMergeQueueService queue, Action<string> openReview, Action<string, bool>? report = null,
+        Func<string?>? resumeAgentKind = null)
     {
         _queue = queue;
         _openReview = openReview;
         _report = report;
+        _resumeAgentKind = resumeAgentKind;
         Refresh();
     }
 
@@ -55,7 +64,8 @@ public partial class QueueRailViewModel : ViewModelBase
             var existing = Entries.FirstOrDefault(e => e.AgentId == entry.AgentId);
             if (existing is null)
             {
-                existing = new QueueEntryViewModel(entry.AgentId, _openReview, _queue, _report);
+                existing = new QueueEntryViewModel(
+                    entry.AgentId, _openReview, _queue, _report, _resumeAgentKind);
                 Entries.Insert(Math.Min(i, Entries.Count), existing);
             }
             existing.Update(entry, _queue);
@@ -99,10 +109,18 @@ public partial class QueueEntryViewModel : ViewModelBase
     private readonly Action<string> _openReview;
     private readonly IMergeQueueService _queue;
     private readonly Action<string, bool>? _report;
+    private readonly Func<string?>? _resumeAgentKind;
 
     /// <summary>The last state the queue stream reported, so the Verify affordance can be re-armed
     /// without waiting for a stream update that a refused request never produces.</summary>
     private WorkerMergeState _lastState = WorkerMergeState.Working;
+
+    /// <summary>
+    /// The daemon's last word on whether this entry still has a jail — <b>three-valued</b>. Null is "the
+    /// projection did not say", and it must not be read as "no jail": that would offer to resume every
+    /// entry served by a daemon that predates the fact, including the ones that are running.
+    /// </summary>
+    private bool? _hasLiveSandbox;
 
     public string AgentId { get; }
 
@@ -147,6 +165,23 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private bool _isConfirmingDiscard;
 
     /// <summary>
+    /// True for a <b>stranded</b> entry: non-terminal, and the daemon positively reports that it has no
+    /// jail. Both halves matter. Verification runs only in the worker's own sandbox, so an entry without
+    /// one cannot be verified, cannot become <c>Verified</c>, and cannot merge — until now its only
+    /// offered action was to throw the work away. And "positively reports": a projection that cannot
+    /// answer leaves this false, so Resume is never offered on a guess.
+    /// </summary>
+    [ObservableProperty] private bool _canResume;
+
+    /// <summary>True only while this row's own resume is in flight. A resume builds a jail, which takes
+    /// tens of seconds, so the button has to say so or it reads as a control that did nothing.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ResumeButtonText))]
+    private bool _isResumeRequestInFlight;
+
+    public string ResumeButtonText => IsResumeRequestInFlight ? "Resuming…" : "Resume";
+
+    /// <summary>
     /// True while this row's own lifecycle request is in flight — the same latch <see cref="VerifyAsync"/>
     /// keeps, for the same reason. Without it a double-press fires two RPCs, and the second comes back as
     /// "this entry was already discarded": a warning toast reporting a failure for the action the human
@@ -167,16 +202,20 @@ public partial class QueueEntryViewModel : ViewModelBase
     /// added to fix.</param>
     /// <param name="report">(message, isWarning) sink for the entry-lifecycle outcomes; null uses the
     /// shell's toast stack. Optional because it has a real default, unlike the queue.</param>
+    /// <param name="resumeAgentKind">Which CLI a resume runs in the new jail, read at press time. See
+    /// <see cref="QueueRailViewModel"/>'s constructor.</param>
     public QueueEntryViewModel(
         string agentId,
         Action<string> openReview,
         IMergeQueueService queue,
-        Action<string, bool>? report = null)
+        Action<string, bool>? report = null,
+        Func<string?>? resumeAgentKind = null)
     {
         AgentId = agentId;
         _openReview = openReview;
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _report = report;
+        _resumeAgentKind = resumeAgentKind;
         // Decide the affordance up front rather than leaving it on `bool`'s default false: a row that
         // renders before its first Update would otherwise show a dead Verify button.
         RecomputeCanVerify();
@@ -208,6 +247,7 @@ public partial class QueueEntryViewModel : ViewModelBase
         if (entry.State == WorkerMergeState.Verifying) IsVerifyRequestInFlight = false;
 
         _lastState = entry.State;
+        _hasLiveSandbox = entry.HasLiveSandbox;
         RecomputeCanVerify();
 
         CanDiscard = entry.State
@@ -216,6 +256,11 @@ public partial class QueueEntryViewModel : ViewModelBase
         {
             IsConfirmingDiscard = false;
         }
+
+        // Stranded: a non-terminal entry the daemon says has no jail. `== false` rather than `!= true` on
+        // purpose — an unknown answer offers nothing, because offering a resume for a live agent would
+        // spend a minute building a jail only for the daemon to refuse it.
+        CanResume = CanDiscard && _hasLiveSandbox == false;
 
         (BadgeGeometryKey, IsNeutral, IsMutedState, IsInfoState, IsWarningState, IsSuccessState, IsDangerState) = entry.State switch
         {
@@ -287,9 +332,17 @@ public partial class QueueEntryViewModel : ViewModelBase
         // RE-verifying against a moved main is the normal way a stale entry gets fresh again. Withheld
         // while a run is in flight (the daemon refuses a concurrent one) and on the terminal states,
         // where there is nothing left to verify.
-        CanVerify = !IsVerifyRequestInFlight && _lastState is not (
-            WorkerMergeState.Verifying or WorkerMergeState.Merged or WorkerMergeState.Rejected
-            or WorkerMergeState.Discarded);
+        //
+        // …and withheld when the daemon says this entry has NO JAIL. Verification runs in the worker's own
+        // sandbox and never on the host, so pressing Verify there can only ever produce "Agent 'x' has no
+        // live sandbox" — an enabled button whose entire behaviour is an error message. It stays enabled on
+        // an UNKNOWN answer (`!= false`, not `== true`): withholding the one action an entry has on the
+        // strength of a fact the projection never supplied would be the worse mistake.
+        CanVerify = !IsVerifyRequestInFlight
+            && _hasLiveSandbox != false
+            && _lastState is not (
+                WorkerMergeState.Verifying or WorkerMergeState.Merged or WorkerMergeState.Rejected
+                or WorkerMergeState.Discarded);
 
     /// <summary>Arms the destructive action. Nothing has been asked of the daemon yet.</summary>
     [RelayCommand]
@@ -318,6 +371,40 @@ public partial class QueueEntryViewModel : ViewModelBase
         }
         finally
         {
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>
+    /// Asks the daemon to give this stranded entry a live jail again, standing on its own branch.
+    ///
+    /// <para><b>Not confirmed first, unlike Discard.</b> A discard is destructive and asks; a resume adds a
+    /// sandbox and changes nothing that cannot be undone by stopping the agent — an extra step there would
+    /// be ceremony on the recovery action while the destructive one it sits next to is one press away.</para>
+    ///
+    /// <para>It decides nothing. Whether the entry exists in this repo's queue, whether its branch
+    /// survived, whether the id already has a session and whether a merge is open are all the daemon's
+    /// answers; this hands over the repo's active handle and the CLI the human picked.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task ResumeAsync()
+    {
+        if (_lifecycleRequestInFlight || IsResumeRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        IsResumeRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner
+                .ResumeAsync(_queue, AgentId, _resumeAgentKind?.Invoke() ?? string.Empty, _report)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            // Re-armed from here rather than from the next stream update, for the same reason Verify is: a
+            // resume the daemon refused moves no queue state, so it pushes no snapshot, so a button left
+            // latched would stay dead for the session.
+            IsResumeRequestInFlight = false;
             _lifecycleRequestInFlight = false;
         }
     }

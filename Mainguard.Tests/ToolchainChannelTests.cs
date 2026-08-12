@@ -354,21 +354,43 @@ public class ToolchainChannelTests
             argv);
     }
 
+    /// <summary>
+    /// The converse form is now REFUSED at resolve time rather than mangled into a pip usage error.
+    ///
+    /// <para>This test previously asserted the mangling itself — that <c>&amp;&amp;</c>, <c>python</c> and
+    /// <c>-m</c> all became arguments to pip. That was an accurate description of the behaviour and a bad
+    /// thing to leave standing: pip then exits 2, a non-zero exit is the only signal
+    /// <c>VerificationRunner</c> reads, and the merge queue tells a human <b>their tests failed</b> about
+    /// a command that never started. Documenting that in a test made it look intended.</para>
+    /// </summary>
     [Fact]
-    public void ABareAmpersandVerifyCommand_DoesNotSurviveTokenisation()
+    public void ABareAmpersandVerifyCommand_IsRefusedAtResolveTime_NotRunAndReportedAsFailingTests()
     {
-        // The converse, pinned so the limitation is documented by a test rather than by a comment
-        // somebody has to find. `&&` becomes an ARGUMENT TO PIP, which is why it fails at runtime with a
-        // pip usage error rather than anything that mentions a shell.
         const string broken = "pip install -q -r requirements.txt && python -m pytest -q";
 
-        var argv = VerificationCommandResolver.Resolve(broken, broken).Command;
+        var ex = Assert.Throws<MalformedVerificationCommandException>(
+            () => VerificationCommandResolver.Resolve(broken, broken));
 
-        Assert.Contains("&&", argv);
-        Assert.Equal("pip", argv[0]);
-        // Everything after `&&` is handed to pip too — this is the whole defect in one assertion.
-        Assert.Contains("python", argv);
-        Assert.Contains("-m", argv);
+        // The message has to carry the three things a human needs, or the refusal is just a different
+        // kind of unhelpful: what is wrong, that nothing ran, and the exact command that works.
+        Assert.Contains("&&", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("pip", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no verification was recorded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains($"sh -c \"{broken}\"", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal must not fire on operators that are ARGUMENTS rather than shell syntax, or it becomes
+    /// a new way to break working repositories. All of these run correctly today and must keep resolving.
+    /// </summary>
+    [Theory]
+    [InlineData("dotnet test --logger \"console;verbosity=detailed\"")]
+    [InlineData("sh -c \"pip install -r requirements.txt && python -m pytest -q\"")]
+    [InlineData("curl \"https://example.test/?a=1&b=2\"")]
+    public void OperatorsInsideAQuotedArgument_AreNotRefused(string command)
+    {
+        var argv = VerificationCommandResolver.Resolve(command, command).Command;
+        Assert.NotEmpty(argv);
     }
 
     // ---- Fixtures --------------------------------------------------------------------------------

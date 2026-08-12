@@ -4,6 +4,12 @@
 - **`Program.cs`** — thin entry point: parses `DaemonOptions`, runs the `--local-dev --smoke` self-probe or the daemon (`app.Run()`), maps a bind failure to a typed `DaemonStartupException`. `public partial class Program {}` so `WebApplicationFactory<Program>` can host it in-proc.
 - **`DaemonHost.cs`** — the shared host configuration (services, interceptors, gRPC service map,
   loopback-only Kestrel bind, silent logging) used by both the entry point and the in-proc tests;
+  registers the durable `IKillJournal` (`JsonKillJournal` at `ResolveKillJournalPath`, beside the
+  test-isolated session token like the plan store) and states the `KillSwitch`'s **whole** optional tail
+  — `journal`, `audit`, the named `KillSwitchTiming.UnmeasuredRtt` sentinel (there is no
+  control-channel RTT source in this daemon and the record must say so rather than imply a healthy
+  channel) and the `onRttSpike` sink — because it previously passed only `gate`/`target`/`audit` and
+  nothing asserted that composition at all;
   - `StartAsync` (typed port-bound failure) and `RunSmokeAsync` (authenticated loopback self-probe,
     which now goes over the real pinned mTLS transport); **MG-19: `ConfigureServices` runs BEFORE
     `ConfigureKestrel` and returns the `SessionTransportCertificates`, because the listener must present
@@ -15,7 +21,9 @@
     to the isolated session token, `ResolveDataPath`); also registers the P2-09 `SessionLeader` + its
     durable `LeaderRegistry` (path next to the token, `ResolveLeaderRegistryPath`).
 - **`Gateway/GatewayServiceRegistration.cs`** — DI wiring for the P2-08 gateway (`AiGateway`,
-  `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence`); best-effort
+  `BudgetLedger`, `AdmissionController`, `SwarmReconciler`, `DaemonBootSequence` — both boot reconcile
+  steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
+  leaves an artifact); best-effort
   DB-backed stores with an in-memory fallback so the daemon always starts, all resolved from DI so a
   test host can override them; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
@@ -73,7 +81,11 @@
   `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
   (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
   blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
-  branch into the state a re-verification starts from) and the human-only
+  branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
+  strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
+  writable jail to another agent's branch and have the daemon verify what it put there — and because
+  this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
+  `SpawnAgentRequest`) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
   or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
@@ -225,6 +237,31 @@
     until a human decides** and an approval is the only thing that yields the task prompt. Plan ownership
     is checked daemon-side and a foreign plan id answers "no plan '<id>'" — the same answer as a plan
     that does not exist, so the channel is not an existence oracle for other agents' work.
+    A further flag, `adoptExistingBranch`, is the RESUME flag: it
+    routes the launcher to `AdoptAgentWorktree` (start on this id's EXISTING `agent/<id>`) instead of
+    `CreateAgentWorktree`, and switches the post-failure cleanup to the branch-preserving one. It asks no
+    authorization question — that is `AgentResumeService`'s job, and a spawn that could name any id
+    without it would let one agent adopt another's branch.
+    **MG-4 credential release (stop):** takes a REQUIRED `AgentGatewayCredentials` and calls `Revoke` in
+    the stop path. That method previously had **no production callers** — deleting it left both heads
+    compiling — so with the gateway on by default every stopped BYOK agent left a live, replayable
+    gateway token AND the daemon's copy of the user's provider key resident for the rest of the daemon's
+    lifetime. It sits inside the `FindAll(agentId).Count == 0` block beside the leader/IPC/lock releases
+    because the credential store is keyed by agent id ALONE: revoking while another repo's session still
+    answers to that id would break a LIVE agent's next model call. The dependency is required rather than
+    optional (it is registered unconditionally, gateway on or off) so a lost registration is a startup
+    failure instead of a silent return to the defect. Pinned by
+    `Mainguard.Server.Tests/Gateway/GatewayConfinementWiringTests.cs`.
+  - **`Runtime/AgentResumeService.cs`** — the human-only resume for a STRANDED merge-queue entry (jail
+    gone, branch intact), behind `AgentService.ResumeAgent`. Holds ALL of the authorization, keyed on
+    `(RepoHash, AgentId)`: the entry must exist in THIS repo's live queue and be non-terminal, the id must
+    have no live session, the repo must hold no merge lease naming it, and no verification may be in
+    flight. Retracts a stale `Verifying` claim through the queue's own `TryClearStalledVerification` (one
+    implementation of that transition, not two), reads the entry's ORIGIN off the queue so `EnsureEntry`
+    cannot silently re-badge an intake'd PR as `Local`, refuses a resume that produced no sandbox (rolling
+    the session back), and appends the `queue_entry_resumed` audit event. Every refusal is an ordinary
+    result carrying its sentence — never an exception — and a refusal that follows a retraction says so.
+    See `docs/design/resume-stranded-queue-entry.md`.
   - **`Runtime/AgentIpcServer.cs`** (PR3; renamed from `CoordinatorIpcServer.cs` in **phase 2**, because
     it now serves both roles and being named for one of its two clients would mislead about which agents
     have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
@@ -336,9 +373,13 @@
   then a fresh snapshot — preceded by a ring-only update carrying the reflow's scrollback pushes/pops
   so the client ring never desyncs), `GetScrollback` (the lazy-fetch RPC's data source).
 - **`Services/AgentGrpcService.cs`** (**PR3:** validation+mapping only — `SpawnAgent`/`StopAgent`
-  dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes, incl. the v1
+  dispatch to the shared `AgentSpawnService` workflow (typed exceptions → status codes via the shared
+  `MapLaunchFailure`, incl. the v1
   spawn preflight's `SandboxImageMissingException` → actionable `FailedPrecondition` naming the
-  missing jail image + repair; `role` rides the request/`AgentInfo`/snapshot), and the new
+  missing jail image + repair; `role` rides the request/`AgentInfo`/snapshot); **`ResumeAgent`**
+  dispatches to `AgentResumeService` and derives the actor from the connection (there is no actor field
+  on the request), answering a refusal as an ordinary response with `resumed=false` + a verbatim reason
+  rather than a status code — so a caller must not read "no exception" as "it resumed"; and the new
   **`ListInstalledAdapters`** RPC surfaces the `InstalledAdapterCatalog` markers —
   ids/versions/env-var NAMES only, no paths/secrets; **`GetDaemonInfo`** answers the tier-1 skew probe
   from the injected `Runtime/DaemonInfoProvider.cs` — the daemon's assembly informational version +
@@ -367,7 +408,11 @@
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
   list can badge external-PR entries, plus `verification_in_flight` (via
   `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run
-  leaves a persisted `Verifying` row with nothing executing; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  leaves a persisted `Verifying` row with nothing executing — plus `has_live_sandbox` (`optional`, from
+  the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
+  which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
+  enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
+  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the
@@ -389,6 +434,18 @@
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
   - `TerminalGrpcService` writes a read-only banner + defensively rejects input `data` frames for a
     `TerminalLockRegistry`-locked agent.
+  - **`Services/PrIntakeGrpcService.cs`** (P2-12: `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/
+    `SubscribePrIntakeSource` over the daemon's `IPrIntakeStore`, mapped in `DaemonHost.MapServices`
+    beside `MergeQueueGrpcService`. Validation + dispatch only. **`Update` persists, then re-READS and
+    answers with what was stored** — the store clamps the cadence and substitutes the default bot list
+    for an empty one, and echoing the request instead would show a human a cadence the poller is not
+    using. `Subscribe` persists then tells the LIVE `IExternalPrIntake` (idempotent on the store, so the
+    engine and the store cannot disagree and the source is polled without waiting for a restart to
+    re-seed it); an incomplete source is `INVALID_ARGUMENT`, because a row with no repository can never
+    resolve and would be skipped silently forever. Both writes are on `RoleInterceptor`'s
+    coordinator-denied list — subscribing provisions jails. **Why it exists:** the App had a complete
+    intake settings dialog with nowhere real to write, so the feature was unconfigurable; the daemon owns
+    the configuration because the daemon is what polls and provisions.)
   - **`Services/PlanApprovalGrpcService.cs`** (`StreamPlans`/`ApprovePlan`/`RejectPlan` over the
     daemon `PlanApprovalService`; **`ApprovePlan` resolves the approver via `IApproverIdentityResolver`
     from the connection — the request has no identity field**, SA-1/F2. **Phase 2:** the streamed
@@ -399,9 +456,15 @@
     `WorkerPlanGate` and Managed-session population that refuses the coordinator a spawn — a surface that
     re-derived its own number could disagree with the gate it is rendering) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
-  - **`Runtime/SessionStoreKillTarget.cs`** — the interim `IKillTarget` over `AgentSessionStore` (marks
-    live sessions `Paused` on a kill; the real cooperative-yield→`docker pause` target swaps in behind
-    the seam).
+  - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
+    three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
+    in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
+    leave keystrokes reaching a killed agent), then `docker pause` the jail via
+    `ISandboxEngine.PauseAsync` (freezer cgroup — no cooperation needed from the untrusted agent),
+    then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
+    REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
+    kept executing and every terminal stayed typeable — containment that was really just relabelling.
+    Resume deliberately does NOT un-contain; recovery is an explicit per-agent action.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe

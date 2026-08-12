@@ -22,7 +22,16 @@ public enum RebaseCycleKind
     /// <summary>Committed a wip snapshot and/or reparented the branch onto fresh main; agent resumed.</summary>
     Rebased,
 
-    /// <summary>The guard skipped this cycle (agent mid-rebase / detached / mid-merge); agent resumed, retry next.</summary>
+    /// <summary>
+    /// The cycle did NOT reparent the branch and did not mutate anything it could not finish: the guard
+    /// refused (agent mid-rebase / detached / mid-merge), the mirror's main could not be carried across, or
+    /// git refused the rebase without leaving one in progress. The agent is resumed and the next cycle
+    /// retries.
+    ///
+    /// <para>The load-bearing part is the negative: after a <c>Skipped</c> the branch is <b>not</b> known to
+    /// sit on top of main, so a caller must not treat it as re-verifiable. <see cref="CleanNoop"/> and
+    /// <see cref="Rebased"/> are the only two kinds that carry that guarantee.</para>
+    /// </summary>
     Skipped,
 
     /// <summary>The rebase conflicted: status <see cref="AgentRunState.Conflict"/>, worktree parked for T-04, PTY stays paused.</summary>
@@ -30,7 +39,20 @@ public enum RebaseCycleKind
 }
 
 /// <summary>The outcome of one keep-alive cycle.</summary>
-public sealed record RebaseCycleResult(RebaseCycleKind Kind, string? Detail, bool WipCommitCreated);
+public sealed record RebaseCycleResult(RebaseCycleKind Kind, string? Detail, bool WipCommitCreated)
+{
+    /// <summary>
+    /// True only when this cycle ESTABLISHED that the branch now sits on top of the mirror's main — i.e.
+    /// <c>git merge --ff-only agent/&lt;id&gt;</c> would be available to the human merge.
+    ///
+    /// <para>This predicate exists so no caller has to re-derive the rule from the enum, and so the rule is
+    /// stated once, next to the kinds it reads. A <see cref="RebaseCycleKind.Skipped"/> or
+    /// <see cref="RebaseCycleKind.Conflict"/> cycle left the parent exactly where it was; re-verifying on
+    /// the strength of one produces a record pinned to the NEW main for a branch that does not descend from
+    /// it — which is precisely the state whose merge is then refused, forever.</para>
+    /// </summary>
+    public bool BranchIsOnTopOfMain => Kind is RebaseCycleKind.Rebased or RebaseCycleKind.CleanNoop;
+}
 
 /// <summary>The keep-alive rebase driver seam (also P2-10's <c>NotifyMainMoved</c> entry point).</summary>
 public interface IKeepAliveRebaser
@@ -142,16 +164,27 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
                 return new RebaseCycleResult(RebaseCycleKind.Skipped, verdict.Reason, WipCommitCreated: false);
             }
 
-            _setState(agentId, AgentRunState.Rebasing);
-
             // MG-3: the worktree is linked off the agent's OWN repository now, which holds its own copy
             // of main taken when the agent was created. Before this change the worktree shared the
             // mirror's refs, so "the already-fetched mirror main" was current by construction; it no
             // longer is, and rebasing onto a stale main would silently make the keep-alive cycle a no-op
             // — the human's committed work would stop reaching the agent while every state transition
-            // still looked healthy. So carry the mirror's main across first. Best effort: a mirror that
-            // cannot be read leaves the previous main in place and the cycle proceeds as before.
-            RefreshMainFromMirror(loc);
+            // still looked healthy. So carry the mirror's main across first.
+            //
+            // ...and that is exactly why the fetch's exit code is now READ. It used to be discarded into
+            // `out _`, which made this method's own warning come true: a failed fetch left the agent's
+            // stale copy of main in place, `git rebase <main>` then found the branch already on top of it
+            // and exited 0 without moving HEAD, and the cycle returned CleanNoop — "Clean; already on top
+            // of main" — about a main from before the human's merge. Every state transition looked
+            // healthy, the queue re-verified on the strength of it, and the merge refused. A cycle that
+            // cannot establish what main IS must not claim the branch is on top of it.
+            if (!TryRefreshMainFromMirror(loc, out var refreshFailure))
+            {
+                _setState(agentId, AgentRunState.Working);
+                return new RebaseCycleResult(RebaseCycleKind.Skipped, refreshFailure, WipCommitCreated: false);
+            }
+
+            _setState(agentId, AgentRunState.Rebasing);
 
             var wip = false;
             if (IsDirty(loc.WorktreePath))
@@ -188,10 +221,14 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
                         wip);
                 }
 
-                // A non-conflict rebase failure (nothing left mid-rebase): surface it and resume so the agent isn't stuck.
+                // A non-conflict rebase failure (nothing left mid-rebase): surface it and resume so the
+                // agent isn't stuck. Reported as Skipped, not Rebased — nothing was reparented, and the
+                // old kind said the opposite of what happened to the one caller that has to decide
+                // whether the branch may now be re-verified.
                 _setState(agentId, AgentRunState.Working);
-                return new RebaseCycleResult(RebaseCycleKind.Rebased,
-                    $"Rebase returned {rebaseExit} without leaving a rebase in progress.", wip);
+                return new RebaseCycleResult(RebaseCycleKind.Skipped,
+                    $"Rebase returned {rebaseExit} without leaving a rebase in progress; the branch was not reparented.",
+                    wip);
             }
 
             _setState(agentId, AgentRunState.Working);
@@ -228,17 +265,37 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
     /// what "main" means, and the agent's own work lives on <c>agent/&lt;id&gt;</c>, which this never
     /// touches. Fetching main can never be refused as "checked out": the worktree is on the agent
     /// branch.</para>
+    ///
+    /// <para><b>The exit code decides the cycle.</b> False means "we could not establish what main is",
+    /// and the only honest response to that is to skip: the alternative — rebasing onto whatever copy of
+    /// main the agent repo happens to hold — exits 0, moves nothing, and reports the branch as already on
+    /// top of a main that has since moved. A skipped cycle costs the agent one round of staleness; a
+    /// silently-stale one costs the human a branch that reports itself mergeable and is not.</para>
+    ///
+    /// <para>A location with no mirror or no main branch (the substrate-less test doubles) is not a
+    /// failure: there is nothing to carry across, which is the pre-MG-3 shape, and the rebase below is
+    /// then against whatever ref the caller named.</para>
     /// </summary>
-    private static void RefreshMainFromMirror(AgentWorktreeLocation loc)
+    private static bool TryRefreshMainFromMirror(AgentWorktreeLocation loc, out string? failure)
     {
+        failure = null;
         if (string.IsNullOrEmpty(loc.BarePath) || string.IsNullOrEmpty(loc.MainBranch))
         {
-            return;
+            return true;
         }
 
-        AgentGitCommand.TryRun(
+        var exit = AgentGitCommand.TryRun(
             loc.WorktreePath, out _, "fetch", "--no-tags", loc.BarePath,
             $"+refs/heads/{loc.MainBranch}:refs/heads/{loc.MainBranch}");
+        if (exit == 0)
+        {
+            return true;
+        }
+
+        failure =
+            $"Could not carry '{loc.MainBranch}' across from the mirror at '{loc.BarePath}' (git fetch exited "
+            + $"{exit}); refusing to rebase onto a main we cannot establish is current.";
+        return false;
     }
 
     private static string HeadSha(string worktreePath)

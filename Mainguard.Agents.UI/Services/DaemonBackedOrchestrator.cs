@@ -47,7 +47,22 @@ public sealed class DaemonBackedOrchestrator :
     /// this same name, so the two legs of the RT-D1 conversation must agree on it.</summary>
     private const string MainBranchName = "main";
 
-    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(2);
+    /// <summary>Delay between a pump's stream ending/faulting and its re-subscribe.</summary>
+    /// <remarks>Settable so a reconnect test observes a second subscribe in milliseconds rather than
+    /// seconds. It changes the CADENCE only, never whether the re-subscribe happens.</remarks>
+    internal static TimeSpan ReconnectDelay { get; set; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Test seam: the agent-event stream <see cref="AgentPumpAsync"/> subscribes to. Never set in
+    /// production, where it is <c>DaemonClient.StreamAgentEventsAsync</c>.
+    ///
+    /// <para>It exists because the property under test is <b>re-subscription</b>: that the pump opens
+    /// the stream AGAIN after the previous subscription ended. That is unobservable through the real
+    /// client — its own transport loop only ever returns on a terminal
+    /// <c>PermissionDenied</c> or on cancellation, which is exactly the case the missing
+    /// <see cref="ReconnectLoopAsync"/> made permanent.</para>
+    /// </summary>
+    internal Func<CancellationToken, IAsyncEnumerable<Proto.AgentEvent>>? AgentEventStreamOverride { get; set; }
 
     /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
@@ -62,12 +77,35 @@ public sealed class DaemonBackedOrchestrator :
     /// makes the keychain warm enough that losing this one costs at most the last interval.</summary>
     private static readonly TimeSpan ShutdownHarvestBudget = TimeSpan.FromSeconds(5);
 
-    /// <summary>SpawnAgent runs the daemon's whole provision chain (worktree + hardened container +
-    /// CLI bind under a PTY) — on a cold start that is well past the client's 10 s RPC default, whose
-    /// expiry cancelled the server-side spawn mid-provision and tore it down (the "never starts on
-    /// the first try" field bug). Stop still aborts the wait through the cancellation token, and the
-    /// surface's connect watchdog keeps the long wait honest.</summary>
-    private static readonly TimeSpan SpawnDeadline = TimeSpan.FromMinutes(5);
+    /// <summary>
+    /// How long the daemon may say NOTHING about a spawn in flight before the client gives up on it.
+    ///
+    /// <para>This replaces a flat 5-minute gRPC deadline on <c>SpawnAgent</c>, which was measuring the
+    /// wrong thing. SpawnAgent runs the whole provision chain — including, on a first run for a
+    /// repository, the toolchain image build, which for <c>dotnet-10</c> is ~2.9 GB and routinely takes
+    /// longer than five minutes on a fresh machine. The deadline then cancelled the server call, the
+    /// daemon tore the half-made spawn down as a failure, and the next attempt started the same build
+    /// over: a healthy launch reported as a hang, on every fresh environment.</para>
+    ///
+    /// <para>A bigger constant would only move the cliff. Since PR #319/#320 the daemon reports launch
+    /// progress as state deltas on the spawning session, and this client already reads that stream —
+    /// so the budget bounds SILENCE instead of duration (<see cref="SpawnProgressWatchdog"/>). A build
+    /// that keeps reporting runs as long as it needs; a spawn that goes quiet is still reported, with
+    /// what it last said.</para>
+    /// </summary>
+    /// <remarks>Settable so a test can drive the whole event→watchdog wiring in milliseconds instead of
+    /// minutes — the same shape as <c>ControlCenterViewModel.CoordinatorConnectTimeout</c>. It changes the
+    /// budget only, never what is measured.</remarks>
+    internal static TimeSpan SpawnSilenceBudget { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// The outer bound on a spawn, carried as the gRPC deadline, so removing the false timeout does not
+    /// create an unbounded wait. It is deliberately far past any healthy launch (a cold toolchain build
+    /// plus a container start), because it exists to stop a pathological case — a daemon that keeps
+    /// emitting lines while getting nowhere would never trip the silence budget — and not to police a
+    /// slow one.
+    /// </summary>
+    private static readonly TimeSpan SpawnHardCap = TimeSpan.FromMinutes(60);
 
     private readonly DaemonClient _client;
     private readonly bool _ownsClient;
@@ -98,6 +136,10 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>Whether a resource tick has EVER arrived. Before the first one there is nothing to report,
     /// which is not the same as a fleet reading zero.</summary>
     private bool _haveResourceTick;
+    /// <summary>The spawns currently in flight, each watching for the daemon going silent. A list rather
+    /// than a single slot because a coordinator start and a queue-entry resume can overlap, and a launch
+    /// that is making progress must not be cancelled by another one's quiet.</summary>
+    private readonly List<SpawnProgressWatchdog> _spawnWatchdogs = new();
     private string _mainSha = string.Empty;
     private long _totalUsdMicros;
     private long _totalTokens;
@@ -262,6 +304,18 @@ public sealed class DaemonBackedOrchestrator :
     /// sharing this adapter's DaemonClient. The caller (the agent workspace) owns + disposes it per attach.</summary>
     public ITerminalGateway CreateTerminalGateway() => new DaemonTerminalGateway(_client);
 
+    /// <summary>The live egress-allowlist seam over this adapter's DaemonClient — the same factory shape
+    /// as <see cref="CreateTerminalGateway"/>. Without it the allowlist editor had no gateway it could be
+    /// shown with except the hardcoded in-memory seed, so the sandbox egress policy was enforced but
+    /// neither inspectable nor editable.</summary>
+    public IEgressAllowlistGateway CreateEgressAllowlistGateway() => new DaemonEgressAllowlistGateway(_client);
+
+    /// <summary>The live external-PR-intake configuration seam over this adapter's DaemonClient — the
+    /// same factory shape as the two above. Without it the intake settings page had nothing to write to
+    /// except an in-process store the daemon never reads, which is why the page shipped with no way to
+    /// open it at all.</summary>
+    public IPrIntakeGateway CreatePrIntakeGateway() => new DaemonPrIntakeGateway(_client);
+
     /// <summary>Fix 2: raised when a spawned agent's CLI DIED on a host the default-deny proxy refused,
     /// so the operator can unblock it and retry. Fired from the agent-event pump thread (the consumer
     /// marshals to the UI thread).</summary>
@@ -328,18 +382,36 @@ public sealed class DaemonBackedOrchestrator :
 
     // ---- pumps -----------------------------------------------------------
 
+    /// <summary>
+    /// The agent-event pump. Reconnects like every other pump — it did not, and that was the single
+    /// most damaging version of the bug in this class.
+    ///
+    /// <para><b>Why it mattered.</b> This is the stream every other agent surface is derived from: the
+    /// rail, the coordinator card, the spawn watchdogs, the egress-block prompt. It used to run one
+    /// bare <c>await foreach</c> inside <c>catch (Exception) { }</c>, so ANY fault ended the task for
+    /// good — and <see cref="Start"/> guards on <c>_agentPump is not null</c>, so nothing could ever
+    /// restart it for the lifetime of the process. Worse, the fault did not have to come from the
+    /// daemon: <see cref="ApplyAgentEvent"/> raises <see cref="EventReceived"/>, <see cref="Changed"/>
+    /// and <see cref="EgressBlocked"/> synchronously on this thread, so one throwing UI subscriber
+    /// killed the stream. Nothing reported it either — <c>DaemonClient.State</c> stays
+    /// <c>Connected</c> because the connection is fine, so there is no banner. The visible symptom is
+    /// an agent list frozen at its last good snapshot, forever, with the app looking healthy.</para>
+    /// </summary>
     private async Task AgentPumpAsync(CancellationToken ct)
     {
-        try
+        var stream = AgentEventStreamOverride ?? (token => _client.StreamAgentEventsAsync(token));
+        await ReconnectLoopAsync(async token =>
         {
-            await foreach (var e in _client.StreamAgentEventsAsync(ct).ConfigureAwait(false))
+            await foreach (var e in stream(token).ConfigureAwait(false))
             {
                 ApplyAgentEvent(e);
             }
-        }
-        catch (OperationCanceledException) { }
-        catch (Exception) { }
+        }, ct).ConfigureAwait(false);
     }
+
+    /// <summary>Runs the agent-event pump against <paramref name="ct"/> for a test, so the reconnect
+    /// property is asserted without <see cref="Start"/>'s once-per-process guard or the five other pumps.</summary>
+    internal Task RunAgentPumpForTestAsync(CancellationToken ct) => AgentPumpAsync(ct);
 
     private async Task PlanPumpAsync(CancellationToken ct)
     {
@@ -479,7 +551,9 @@ public sealed class DaemonBackedOrchestrator :
 
     // ---- projection appliers --------------------------------------------
 
-    private void ApplyAgentEvent(Proto.AgentEvent e)
+    /// <remarks>Internal rather than private so a test can drive the daemon→watchdog wiring with real
+    /// <c>AgentEvent</c> messages; the live agent-event pump is the only production caller.</remarks>
+    internal void ApplyAgentEvent(Proto.AgentEvent e)
     {
         switch (e.EventCase)
         {
@@ -536,13 +610,24 @@ public sealed class DaemonBackedOrchestrator :
                     _ = ResyncAgentsAsync();
                 }
 
+                // A still-provisioning session that reports a reason is the daemon telling us what a
+                // spawn is DOING (the toolchain build's progress lines). That is the evidence the spawn
+                // watchdogs measure, so it is fed to them here — the only place it arrives. Restricted to
+                // the provisioning state on purpose: a running agent's chatter must not vouch for a
+                // different spawn that is wedged.
+                if (newState == AgentLifecycleState.Provisioning && reason.Length > 0)
+                {
+                    NoteSpawnProgress(reason);
+                }
+
                 // Egress block-notification fallback (Fix 2): a CLI that DIED with a "couldn't reach HOST"
                 // reason was almost certainly refused by the default-deny proxy — surface it so the operator
                 // can unblock the host and retry, instead of a silent exit-1.
                 if (IsTerminal(newState) && reason.Length > 0
                     && Mainguard.Agents.Agents.Sandbox.EgressBlockDetector.TryDetectBlockedHost(reason) is { Length: > 0 } blockedHost)
                 {
-                    EgressBlocked?.Invoke(new EgressBlockInfo(e.AgentId, agentKind ?? e.AgentId, blockedHost));
+                    RaiseIsolated(() => EgressBlocked?.Invoke(
+                        new EgressBlockInfo(e.AgentId, agentKind ?? e.AgentId, blockedHost)));
                 }
 
                 break;
@@ -552,9 +637,93 @@ public sealed class DaemonBackedOrchestrator :
                 break;
         }
 
-        EventReceived?.Invoke(new AgentEvent(
-            Interlocked.Increment(ref _seq), e.EventCase.ToString(), e.AgentId, string.Empty, DateTimeOffset.UtcNow));
-        Changed?.Invoke();
+        RaiseIsolated(() => EventReceived?.Invoke(new AgentEvent(
+            Interlocked.Increment(ref _seq), e.EventCase.ToString(), e.AgentId, string.Empty, DateTimeOffset.UtcNow)));
+        RaiseIsolated(() => Changed?.Invoke());
+    }
+
+    /// <summary>
+    /// Raises one subscriber-facing event without letting a bad subscriber take anything else down.
+    ///
+    /// <para>The projection appliers run ON the pump thread and raise <see cref="EventReceived"/>,
+    /// <see cref="Changed"/> and <see cref="EgressBlocked"/> synchronously, so an exception out of any
+    /// handler used to propagate all the way to the pump. Two things went wrong at once: every later
+    /// raise in the same call was skipped (a throwing <see cref="EventReceived"/> subscriber meant
+    /// <see cref="Changed"/> never fired, so the rail did not redraw even though the projection had
+    /// already been updated under the lock), and the exception ended the stream. Reconnecting alone
+    /// would not have fixed the second half — a handler that throws on every snapshot would simply
+    /// re-throw on the re-subscribe and spin. The projection is authoritative and is already committed
+    /// by the time we get here, so a handler fault is contained to that handler.</para>
+    /// </summary>
+    private static void RaiseIsolated(Action raise)
+    {
+        try
+        {
+            raise();
+        }
+        catch (Exception)
+        {
+            // One subscriber's fault must never stop the stream that feeds every other surface.
+        }
+    }
+
+    /// <summary>
+    /// Feeds one launch-progress line to every spawn currently in flight. Called from the agent-event
+    /// pump thread.
+    ///
+    /// <para>Fanned out rather than routed by agent id, and that is deliberate: the client does not learn
+    /// the id until <c>SpawnAgent</c> RETURNS, which is precisely the moment the wait it is trying to
+    /// survive has already ended. Over-crediting is bounded — only provisioning-state deltas reach here,
+    /// so the only thing that can extend a spawn's budget is another spawn genuinely provisioning — and
+    /// the hard cap bounds it regardless.</para>
+    /// </summary>
+    private void NoteSpawnProgress(string line)
+    {
+        SpawnProgressWatchdog[] watching;
+        lock (_gate)
+        {
+            if (_spawnWatchdogs.Count == 0)
+            {
+                return;
+            }
+
+            watching = _spawnWatchdogs.ToArray();
+        }
+
+        foreach (var watchdog in watching)
+        {
+            watchdog.NoteProgress(line);
+        }
+    }
+
+    /// <summary>
+    /// Runs one spawn RPC under the silence budget: registers a watchdog for the duration, gives the call
+    /// the hard cap as its gRPC deadline, and unregisters at the end.
+    ///
+    /// <para>Both spawn routes go through here — starting a coordinator and resuming a stranded queue
+    /// entry — because both run the identical daemon provision chain, toolchain build included, and the
+    /// resume path inherited exactly the same five-minute cliff.</para>
+    /// </summary>
+    internal async Task<T> SpawnUnderWatchdogAsync<T>(
+        Func<CancellationToken, TimeSpan, Task<T>> call, CancellationToken ct)
+    {
+        var watchdog = new SpawnProgressWatchdog(SpawnSilenceBudget);
+        lock (_gate)
+        {
+            _spawnWatchdogs.Add(watchdog);
+        }
+
+        try
+        {
+            return await watchdog.RunAsync(token => call(token, SpawnHardCap), ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _spawnWatchdogs.Remove(watchdog);
+            }
+        }
     }
 
     private void ApplyQueueUpdate(Proto.QueueUpdate update)
@@ -594,7 +763,16 @@ public sealed class DaemonBackedOrchestrator :
                     // Carried from the daemon rather than inferred from the state: a client that guessed
                     // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
                     // for — the ones a restart left frozen mid-verification.
-                    VerificationInFlight: entry.VerificationInFlight));
+                    VerificationInFlight: entry.VerificationInFlight,
+                    // Three-valued on purpose. `HasHasLiveSandbox` is protobuf's field-presence test: a
+                    // daemon that predates the field leaves it unset, and mapping that to `false` would
+                    // render every one of its entries as stranded and offer to spawn jails for agents that
+                    // are running. Unset means unknown, and unknown changes nothing.
+                    HasLiveSandbox: entry.HasHasLiveSandbox ? entry.HasLiveSandbox : null,
+                    // The daemon has always sent this and the client has always thrown it away, which is
+                    // why the review cockpit's "verified @ <sha>" stamp never rendered: the value existed
+                    // on the wire and stopped here.
+                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -1288,6 +1466,78 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
+    /// Resumes a stranded entry: asks the daemon to spawn a jail onto the id the entry ALREADY has, with
+    /// the worktree standing on its existing <c>agent/&lt;id&gt;</c> branch.
+    ///
+    /// <para><b>This adapter asserts nothing.</b> It supplies the repo handle, the CLI the human picked and
+    /// that CLI's credentials, and the daemon answers. Whether the entry exists, whether its branch
+    /// survives, whether the id already has a session, whether a merge is open — none of those questions
+    /// are asked here, because the answers live in the daemon's own state and a client that guessed at them
+    /// would be building the control in the UI layer again.</para>
+    ///
+    /// <para><b>A refusal is thrown, never swallowed</b>, for the same reason a discard's is: the daemon
+    /// answers a refused resume with <c>resumed=false</c> and a reason on an otherwise successful RPC, so
+    /// "no exception" is not evidence a jail exists. <see cref="MergeActionRunner"/> turns the throw into a
+    /// warning toast carrying the daemon's words.</para>
+    /// </summary>
+    public async Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't resume — no repository is active for agents yet.");
+        }
+
+        if (string.IsNullOrWhiteSpace(agentKind))
+        {
+            // Not a security check (the daemon rejects a blank kind too) — it is the difference between
+            // naming what the human has to choose and reporting gRPC's INVALID_ARGUMENT at them.
+            throw new InvalidOperationException(
+                "Can't resume — pick which agent CLI should take over this branch first.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+
+        // The resumed jail needs the same credentials a fresh spawn of this CLI would get: its BYOK key
+        // under the adapter's DECLARED env-var name, and the saved login state from the host OS keychain
+        // (the jail's $HOME is tmpfs, so without it the human signs in again). The adapter is looked up
+        // rather than assumed — a CLI that declares no key variable authenticates interactively and no key
+        // may travel for it.
+        var installed = await ListInstalledClisAsync(cts.Token).ConfigureAwait(false);
+        var cli = installed.FirstOrDefault(c => string.Equals(c.Id, agentKind, StringComparison.Ordinal));
+        var provider = ApiKeyProviderMap.ProviderForEnvVar(cli?.ApiKeyEnvVar ?? string.Empty);
+        var key = provider is null ? null : _keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider));
+        var savedLogin = CliLoginVault.Parse(_keystoreLookup(CliLoginVault.KeystoreKeyFor(agentKind)));
+
+        // Same provision chain as a fresh spawn (toolchain build included), so the same silence-bounded
+        // wait rather than a flat deadline that a cold first build outruns.
+        var response = await SpawnUnderWatchdogAsync(
+            (token, deadline) => _client.ResumeAgentAsync(
+                repoHandle!, agentId, agentKind, key ?? string.Empty, token,
+                deadline: deadline,
+                extraEnv: CollectCustomEnvKeys(),
+                cliCredentials: savedLogin.Count > 0 ? savedLogin : null),
+            cts.Token).ConfigureAwait(false);
+
+        if (!response.Resumed)
+        {
+            throw new InvalidOperationException($"Can't resume — {response.Reason}.");
+        }
+
+        var state = Enum.TryParse<WorkerMergeState>(response.State, ignoreCase: true, out var s)
+            ? s : WorkerMergeState.Working;
+        Changed?.Invoke();
+        return new QueueEntryResumeOutcome(
+            response.AgentId, response.Branch, state, response.ClearedStalledVerification);
+    }
+
+    /// <summary>
     /// Whether an acknowledgment made right now could actually reach the daemon's gate. There is exactly
     /// one way it cannot: no repo is active, so there is no handle to address the RPC with and
     /// <see cref="AcknowledgeFlaggedChangeReportedAsync"/> has nothing to call. A surface that renders an
@@ -1504,12 +1754,16 @@ public sealed class DaemonBackedOrchestrator :
         // repo handle, so an approval made in another repository is not in this list at all.
         var savedSettings = _cliSettings.Load(repoHandle!, cli.Id);
 
-        var agentId = await _client.SpawnAgentAsync(
-            repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
-            ct, deadline: SpawnDeadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
-            extraEnv: CollectCustomEnvKeys(),
-            cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
-            cliSettings: savedSettings.Count > 0 ? savedSettings : null).ConfigureAwait(false);
+        // The wait is bounded by SILENCE, not by duration: a first start for this repository builds its
+        // toolchain image inside this call and legitimately outruns any fixed budget.
+        var agentId = await SpawnUnderWatchdogAsync(
+            (token, deadline) => _client.SpawnAgentAsync(
+                repoHandle, taskPrompt: string.Empty, agentKind: cli.Id, modelApiKey: key ?? string.Empty,
+                token, deadline: deadline, role: Mainguard.Agents.Agents.AgentRoles.Coordinator,
+                extraEnv: CollectCustomEnvKeys(),
+                cliCredentials: savedLogin.Count > 0 ? savedLogin : null,
+                cliSettings: savedSettings.Count > 0 ? savedSettings : null),
+            ct).ConfigureAwait(false);
 
         lock (_gate)
         {

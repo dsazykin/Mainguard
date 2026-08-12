@@ -9,6 +9,14 @@ namespace Mainguard.Agents.Agents.Sandbox;
 /// here so the user can see exactly what an agent reached. Distinct from the tamper-evident audit log
 /// (G-17): transparency is the human-visible "what happened on the wire" feed; audit is the
 /// security-decision record. A denied request appears in <b>both</b>.
+///
+/// <para><b>Why <see cref="Verdict"/> is an <see cref="EgressVerdict"/> and not a string.</b> It was a
+/// free-form string, and producers and consumers drifted apart in exactly the way an untyped field
+/// invites: <see cref="DaemonGitProxy"/> wrote <c>"refused"</c>/<c>"allowed"</c> while the daemon's log
+/// tee compared against <c>"Denied"</c>. The comparison was therefore ALWAYS false, so every egress
+/// refusal — a jailed agent probing blocked hosts — was logged at Information and an operator filtering
+/// at Warning saw nothing. Neither side was wrong on its own; nothing made them agree. The enum is what
+/// makes them agree, and it makes the next drift a compile error rather than a silent downgrade.</para>
 /// </summary>
 public sealed record TransparencyLine(
     string Kind,
@@ -16,10 +24,11 @@ public sealed record TransparencyLine(
     string Detail,
     string AgentId,
     long Bytes,
-    string Verdict,
+    EgressVerdict Verdict,
     DateTimeOffset When)
 {
-    public static TransparencyLine Now(string kind, string host, string detail, string agentId, long bytes, string verdict)
+    public static TransparencyLine Now(
+        string kind, string host, string detail, string agentId, long bytes, EgressVerdict verdict)
         => new(kind, host, detail, agentId, bytes, verdict, DateTimeOffset.UtcNow);
 
     public override string ToString() =>

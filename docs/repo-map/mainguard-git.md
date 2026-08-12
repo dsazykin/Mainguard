@@ -48,7 +48,10 @@ The all-editions base. Git logic goes here.
   see `IApproverIdentityResolver`. Migrations live in `Migrations/` (P2-10 adds
   `AddMergeQueue`; P2-12 adds `AddPrIntake` — the two intake tables + the `Origin` column; P2-13 adds
   `AddGatewayPerDayBudget` — the two per-day budget columns; `AddMergeQueueDiscardRecord` adds the
-  three discard columns).
+  three discard columns; `AddPrIntakeConfig` adds `PrIntakeConfig`, the intake's **singleton** (`Id = 1`,
+  `ValueGeneratedNever`) daemon-wide configuration row — `Enabled`, `PollIntervalSeconds` and a
+  comma-separated `BotAuthors`, read and written whole, which is why the author list is one column and
+  not a child table).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +
@@ -145,13 +148,23 @@ The all-editions base. Git logic goes here.
     bound to the **SHA-256 of the canonical flagged set** — a new push resets every ack (invariant 2),
     `LastResetCount` for the "N items reset" copy, `acknowledged_flagged_change` audit events for P2-15;
     **no bulk-ack method** so a global checkbox is impossible by construction).
-  - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind)` for
+  - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind,osv,asOf)` for
     package-lock.json/pnpm-lock.yaml/`*.csproj` PackageReference/poetry.lock → per-dep rows with
     major-jump/install-scripts/registry-change + offline OSV CVE ids; script/CVE rows feed the flagged
-    gate).
+    gate. `DependencyDelta.AdvisoriesChecked` is the `RttMeasured`-shaped third state — false means the
+    empty CVE list is a **silence, not an answer**).
+  - `LockfileReview.cs` (the blobs→must-ack policy the daemon's merge path calls:
+    `KindFor(path)` — deliberately narrower than `RiskClassifier`'s lockfile *category*, so a format with
+    no parser is not handed to one — and `Review(path,kind,base,branch,osv,asOf,unreadable)` →
+    `FlaggedChange` rows. **Fail-closed**: unreadable blob, oversize manifest (`MaxManifestBytes` 8 MB) or
+    a snapshot that cannot answer all produce ONE `LockfileAdvisoryUnknown` item per lockfile, never an
+    omission — an omitted item is an acknowledged item. `ItemsFor` is the single definition
+    `FlaggedChangeDetector.FromLockfileDeltas` delegates to).
   - `OsvSnapshot.cs` + `OsvSnapshot.json` (the shipped **offline** OSV database, embedded resource;
-    `Default` reads it once, `FromEntries` injects a test snapshot — a review-time network call is a
-    rejection trigger).
+    `Default` reads it once, `FromEntries(advisories, capturedOn)` injects a test snapshot,
+    `Unavailable(state)` builds the not-loaded value — a review-time network call is a rejection trigger.
+    `OsvSnapshotState` Available/Missing/Malformed/**Stale** + `CanAnswerAt` decide whether an *absence*
+    of hits is evidence; `MaxAge` is 90 days, argued against the bundled-refresh cadence).
   - `TestDeltaParser.cs` (`TestOutcome`/`TestDelta`; `ParseTrx`/`ParsePassFail` +
     `Compute(current, baseline)` → new-fail/new-pass delta for the §6.5 strip; malformed TRX → empty,
     never throws).
@@ -370,13 +383,28 @@ The all-editions base. Git logic goes here.
   `GitOperationException`, `SshAuthenticationException`, `RemoteNotFoundException`,
   `GitIdentityMissingException`, `UndoBlockedException` — T-19 undo/redo refusal: dirty tree,
   non-undoable entry, or truncated redo; `DuplicateProfileNameException` — T-21 profile name already
-  in use; `BootstrapException` — P2-05 bootstrap-step failure, carries the failing `StepName`;
+  in use; `BranchNotMergedException` — carries `BranchName`; the `git branch -d` refusal raised by
+  `DeleteBranch(force: false)` on a branch merged into neither HEAD nor its upstream, so the UI can
+  offer an explicit "delete anyway" instead of orphaning the commits; `AmendPushedCommitException` —
+  carries `BranchName`/`UpstreamName`; refuses an amend of a HEAD the upstream already contains, so
+  the amend checkbox can never silently diverge a branch; `BootstrapException` — P2-05 bootstrap-step failure, carries the failing `StepName`;
   `WslNotInstalledException` — WSL2 absent, actionable (points at the P2-21 installer enablement; the
   bootstrapper never runs `wsl --install`); `WslCommandException` — a non-zero `wsl.exe` exit, carries
   exit code + stderr; `RepoProvisioningException` — P2-06 daemon-side git failure
   (clone/fetch/config/worktree/remote) from `AgentGitCommand`, carries the already-redacted stderr;
   `AgentWorktreeConflictException` — P2-06 typed refusal thrown before any mutation: duplicate
-  `agent/<id>` branch/path, or a non-forced dirty removal; `SandboxSpecException` — P2-07
+  `agent/<id>` branch/path, or a non-forced dirty removal; `AgentBranchMissingException` — its exact
+  mirror image, for the RESUME path: `AdoptAgentWorktree` was asked to start a jail on an existing
+  `agent/<id>` and the mirror has no such branch, so there is nothing to resume. A refusal and never a
+  fallback: creating the branch instead would report success for an operation that recovered no commits
+  at all. Carries `(RepoHash, AgentId, Branch)` — the pair, because an id is unique per repo, not
+  globally; `AgentBranchRescueFailedException` — same file, the OTHER half of that resume: the rescue
+  publish that carries commits out of the dead jail's own repository failed for a transient reason
+  (`AgentRefPublishOutcome.Failed` — unreadable repo, races, disk), and the adoption is refused rather
+  than allowed to proceed into `ClearWorktreeResidue`, which deletes the only copy. Deliberately NOT
+  raised for a *refused* publish (a non-fast-forward is permanent, so refusing there would strand the
+  agent forever rather than once). Carries `(RepoHash, AgentId, Reason)`;
+  `SandboxSpecException` — P2-07
   hardened-spec violation raised at construction (Windows/UNC mount source, a dropped G2 control, or a
   secret in `Env`); `GitProxyRefusedException` — P2-07 A6 daemon-git-proxy refusal (non-fetch service
   or non-allowlisted prefix); `DeclaredDependencyDeniedException` — P2-07 F5 out-of-scope module
@@ -395,14 +423,20 @@ The all-editions base. Git logic goes here.
   MiB tmpfs `$HOME` and dies at `ENOSPC` — which the merge queue would record as an ordinary failed
   verification). Throw these from Core; catch in ViewModels to drive dialogs.
 - **`Migrations/`** — generated EF migrations + `AppDbContextModelSnapshot.cs`. Never hand-edit an applied one.
-- **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture).
+- **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture). **Read the remarks on `IAuditLog.Read` before adding an `Append` call site:** there are 28 `Append` calls across 13 production files and ZERO production readers — no RPC, no ViewModel — and the shipped implementation is in-memory, so an audited event is unreachable during and after the incident it describes. P2-15 is the plan and this interface is the seam it lands behind; until then an `Append` is evidence for a later investigation and never the user-visible record of anything, so any path that destroys work pairs it with a log line, a typed refusal or a UI notice.
 - **`Services/`** — the service layer every ViewModel talks to. Interface-first:
   - `IGitService.cs` / `GitServices.cs` — the core git engine. **All** LibGit2Sharp access goes
     through `GitServices.ExecuteWithRepo(...)`, which owns the **bounded index.lock retry** (4 attempts,
     25/50/100 ms backoff on `LockedFileException` — raised before anything mutates, so the retry is
     safe; exhausted → typed `GitOperationException` naming `index.lock` and the way out; ADR-001, pinned
     by `GitServiceIndexLockTests`). Commit, stage, branch, tag, merge, rebase, stash, cherry-pick,
-    reset, diff, history. Remotes management (T-10): CRUD
+    reset, diff, history. **Git-directory resolution:** `ResolveGitDir` (via `Repository.Discover`,
+    so it follows the `.git`-file indirection of a linked worktree exactly as git does),
+    `ResolveCommonGitDir` (the `commondir` pointer — where `refs/` and `objects/` live) and the
+    `GitDirPath(repoPath, …)` helper every per-worktree state read goes through. `Commit` takes an
+    `amend` flag (keeps the original author, refuses an unborn branch and an already-published HEAD);
+    `DeleteBranch` applies git's `-d` rule and refuses an unmerged branch unless forced.
+    Remotes management (T-10): CRUD
     (`GetRemotes`/`AddRemote`/`RemoveRemote`/`RenameRemote`/`SetRemoteUrl`), the
     `ResolveRemoteName`/`GetDefaultRemoteName` resolver that replaced every hardcoded `"origin"`
     (tracked → origin → sole remote → typed `RemoteNotFoundException`), a remote-named `Fetch` overload,
@@ -495,8 +529,16 @@ The all-editions base. Git logic goes here.
     text-scanned), and feeds the pure `Safety/PreCommitScanEngine`. No network, no CLI. Thresholds come
     from `UserPreferences` (`PreCommitMaxFileMB`, `PreCommitScanEnabled`).
   - `ISettingsService.cs` / `SettingsService.cs` — user preferences + workspace/category persistence via `AppDbContext`.
-  - `RepositoryWatcher.cs` — `FileSystemWatcher` wrapper that raises change events so the UI can refresh.
-  - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence controller.
+  - `RepositoryWatcher.cs` — `FileSystemWatcher` wrapper that raises change events so the UI can
+    refresh. Watches the working tree **plus** any git root outside it: in a linked worktree the
+    per-worktree gitdir and the shared common dir both sit elsewhere, so watching the tree alone
+    saw working-tree edits only and missed every commit/checkout/stage/rebase step. Roots come from
+    `GitService.ResolveGitDir` + `ResolveCommonGitDir` and are matched longest-first, so a
+    per-worktree `HEAD` is not misread as `worktrees/<name>/HEAD` under the common dir. An ordinary
+    repo is unchanged — `.git` is already inside the watched tree, so no extra watcher is created.
+  - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence
+    controller. All rebase-state reads go through `GitService.GitDirPath`, never
+    `Path.Combine(repoPath, ".git", …)`.
   - `IPinnedRefService.cs` / `PinnedRefService.cs` — per-repo pinned branches/tags (T-09), persisted via `AppDbContext`; pinned refs order first into the commit-graph router (left-most lanes).
   - `IProfileService.cs` / `ProfileService.cs` — switchable Git identity profiles (T-21). SQLite
     CRUD via `AppDbContext` (case-insensitive unique name → typed `DuplicateProfileNameException` on

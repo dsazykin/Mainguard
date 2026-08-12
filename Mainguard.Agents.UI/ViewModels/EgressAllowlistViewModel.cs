@@ -1,6 +1,8 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Mainguard.Agents.UI.Services;
@@ -32,21 +34,45 @@ public partial class EgressAllowlistViewModel : ViewModelBase
 
     public Action? CloseAction { get; set; }
 
-    public EgressAllowlistViewModel(IEgressAllowlistGateway gateway)
-    {
-        _gateway = gateway;
-        Reload();
-    }
+    public EgressAllowlistViewModel(IEgressAllowlistGateway gateway) => _gateway = gateway;
 
     /// <summary>True iff any entry re-opens a direct git-host route (A6 defeated) — shows the warning banner.</summary>
     public bool HasGitHostWarning => Entries.Any(e => e.DefeatsA6);
 
-    private void Reload()
+    /// <summary>True while a gateway round trip is in flight; the view disables editing so a second
+    /// click cannot race the first against the daemon's authoritative list.</summary>
+    [ObservableProperty]
+    private bool _isBusy;
+
+    /// <summary>
+    /// Loads the live allowlist. Separate from the constructor because the shipped gateway is a gRPC
+    /// round trip — the load used to run inside the ctor, which is exactly why the only gateway that
+    /// could satisfy this ViewModel was an in-memory list, and therefore why the editor was unreachable
+    /// in the app. Callers <c>await</c> this right after construction.
+    /// </summary>
+    public async Task InitializeAsync(CancellationToken ct = default) => await ReloadAsync(ct);
+
+    private async Task ReloadAsync(CancellationToken ct = default)
     {
-        Entries.Clear();
-        foreach (var item in _gateway.List().OrderBy(i => i.HostPattern, StringComparer.OrdinalIgnoreCase))
-            Entries.Add(new EgressAllowlistRowViewModel(item, this));
-        OnPropertyChanged(nameof(HasGitHostWarning));
+        IsBusy = true;
+        try
+        {
+            var items = await _gateway.ListAsync(ct);
+            Entries.Clear();
+            foreach (var item in items.OrderBy(i => i.HostPattern, StringComparer.OrdinalIgnoreCase))
+                Entries.Add(new EgressAllowlistRowViewModel(item, this));
+            OnPropertyChanged(nameof(HasGitHostWarning));
+        }
+        catch (Exception ex)
+        {
+            // A daemon that is down must say so. An empty grid would read as "nothing is allowed",
+            // which is a very different — and alarming — claim from "we could not ask".
+            ErrorMessage = $"Could not read the allowlist from the agent daemon: {ex.Message}";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
     }
 
     private bool CanAdd => !string.IsNullOrWhiteSpace(NewName) && !string.IsNullOrWhiteSpace(NewHostPattern);
@@ -55,27 +81,29 @@ public partial class EgressAllowlistViewModel : ViewModelBase
     partial void OnNewHostPatternChanged(string value) { ErrorMessage = null; AddCommand.NotifyCanExecuteChanged(); }
 
     [RelayCommand(CanExecute = nameof(CanAdd))]
-    private void Add()
+    private async Task AddAsync()
     {
         try
         {
-            _gateway.Add(NewName.Trim(), NewHostPattern.Trim(), "Custom");
+            await _gateway.AddAsync(NewName.Trim(), NewHostPattern.Trim(), "Custom");
             NewName = string.Empty;
             NewHostPattern = string.Empty;
-            Reload();
+            await ReloadAsync();
         }
         catch (Exception ex)
         {
+            // The daemon refusing a widening of a default-deny control is a legitimate answer, not a
+            // bug — show its reason verbatim rather than a generic failure.
             ErrorMessage = ex.Message;
         }
     }
 
-    internal void RemoveRow(EgressAllowlistRowViewModel row)
+    internal async Task RemoveRowAsync(EgressAllowlistRowViewModel row)
     {
         try
         {
-            _gateway.Remove(row.HostPattern);
-            Reload();
+            await _gateway.RemoveAsync(row.HostPattern);
+            await ReloadAsync();
         }
         catch (Exception ex)
         {
@@ -107,5 +135,5 @@ public partial class EgressAllowlistRowViewModel : ViewModelBase
     }
 
     [RelayCommand]
-    private void Remove() => _parent.RemoveRow(this);
+    private Task RemoveAsync() => _parent.RemoveRowAsync(this);
 }

@@ -32,6 +32,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private readonly IDisposable? _owner;
     private readonly Dictionary<string, AgentDocumentViewModel> _documents = new();
 
+    /// <summary>Where the per-agent-kind dock arrangement is remembered between sessions. Injectable so a
+    /// test writes to a temp directory instead of the user's real data root.</summary>
+    private readonly Services.DockLayoutPersistence _dockLayouts;
+
     // The agent rail (worker list + kill switch) as its own surface (2d): the shell reaches it only as
     // opaque object through AgentRailContent → ViewLocator → AgentRailView, never naming AgentRowViewModel
     // or the kill-switch members. A thin view over this VM — the single owner of the agent projection and
@@ -230,8 +234,24 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>Cancels the installed-CLI retry loop on Dispose.</summary>
     private readonly System.Threading.CancellationTokenSource _cliLoadCts = new();
 
+    /// <summary>The one in-flight installed-CLI retry loop, if any. Guarded by
+    /// <see cref="_cliLoadGate"/>; see <see cref="LoadInstalledClisUntilAvailableAsync"/>.</summary>
+    private Task? _cliLoadLoop;
+    private readonly object _cliLoadGate = new();
+
+    /// <summary>This VM's retry cadence, snapshotted from <see cref="CliLoadRetryDelay"/> at
+    /// construction. Once built, a VM never reads that mutable global again, so changing it can
+    /// never re-time a loop that is already running.</summary>
+    private readonly TimeSpan _cliLoadRetryDelay = CliLoadRetryDelay;
+
     public ControlCenterViewModel(OrchestratorServices services)
+        : this(services, dockLayouts: null) { }
+
+    /// <param name="dockLayouts">Where per-agent-kind pane arrangements are remembered. Injectable so a
+    /// test drives a real save/restore against a temp directory instead of the user's data root.</param>
+    public ControlCenterViewModel(OrchestratorServices services, Services.DockLayoutPersistence? dockLayouts)
     {
+        _dockLayouts = dockLayouts ?? new Services.DockLayoutPersistence();
         _agents = services.Agents;
         _queue = services.Queue;
         _coordinator = services.Coordinator;
@@ -239,7 +259,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         _telemetry = services.Telemetry;
         _owner = services.Owner;
 
-        Queue = new QueueRailViewModel(_queue, OpenReview);
+        // The rail's Resume needs a CLI to run in the jail it asks for, and this surface is where the
+        // human picks one. Passed as a callback rather than a value so it reads the CURRENT selection at
+        // press time — a value captured here would be whatever was selected when the repo was opened, and
+        // an empty one (no CLI installed yet) is answered by the daemon rather than guessed at.
+        Queue = new QueueRailViewModel(_queue, OpenReview, resumeAgentKind: () => SelectedCli?.Id);
         Coordinator = new CoordinatorPanelViewModel(_coordinator);
         Telemetry = new TelemetryPanelViewModel(_telemetry);
         // Vibe is headed for its own app (decision 2026-07-11); the VM stays alive here so
@@ -333,13 +357,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         for (int i = Agents.Count - 1; i >= 0; i--)
             if (snapshot.All(a => a.AgentId != Agents[i].AgentId))
                 Agents.RemoveAt(i);
-        foreach (var info in snapshot.OrderByDescending(a => a.SpawnedAt)) // LIFO (P2-13)
+
+        // Reconcile IN the projection's order, rank by rank (LIFO, P2-13). Existing rows are moved
+        // rather than replaced, so a row's identity — and therefore the rail's selection — survives.
+        //
+        // This used to be a foreach that did `Agents.Insert(0, …)` for every new row, which is only
+        // correct when rows arrive ONE at a time: fed a multi-agent batch it laid them down in reverse,
+        // so the rail rendered oldest-first — the exact opposite of the LIFO it documents. That is not
+        // a rare path. It is every bulk snapshot: opening the surface with agents already running, and
+        // every re-subscribe after the agent stream drops.
+        var ordered = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection.LifoOrder(snapshot);
+        for (var rank = 0; rank < ordered.Count; rank++)
         {
-            var existing = Agents.FirstOrDefault(r => r.AgentId == info.AgentId);
-            if (existing is null) Agents.Insert(0, new AgentRowViewModel(info));
-            else existing.Update(info);
+            var info = ordered[rank];
+            var at = IndexOfAgent(info.AgentId);
+            if (at < 0)
+            {
+                Agents.Insert(rank, new AgentRowViewModel(info));
+            }
+            else
+            {
+                Agents[at].Update(info);
+                if (at != rank) Agents.Move(at, rank);
+            }
         }
+
         RefreshAttention();
+    }
+
+    private int IndexOfAgent(string agentId)
+    {
+        for (var i = 0; i < Agents.Count; i++)
+            if (Agents[i].AgentId == agentId)
+                return i;
+        return -1;
     }
 
     private void RefreshAttention()
@@ -364,7 +415,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     {
         // One prompt at a time; a fresh block supersedes the old (the newest is what the user acts on).
         EgressBlockPrompt = new EgressBlockPromptViewModel(
-            info.Host, info.AgentLabel, UnblockHostAsync, () => EgressBlockPrompt = null);
+            info.Host, info.AgentLabel, UnblockHostAsync, () => EgressBlockPrompt = null,
+            manageAllowlist: () => OpenEgressAllowlistCommand.ExecuteAsync(null));
     });
 
     /// <summary>Unblock: add the refused host to the daemon allowlist (re-renders the proxy live), dismiss the
@@ -389,6 +441,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     [RelayCommand]
     private void CloseEgressBlockPrompt() => EgressBlockPrompt = null;
 
+    /// <summary>
+    /// Opens the egress allowlist editor against the LIVE daemon allowlist.
+    ///
+    /// <para>The view existed and was constructed by nothing but a render harness, which left the
+    /// sandbox egress policy enforced but neither inspectable nor editable. The only affordance an
+    /// operator had was the block prompt's "Unblock and retry", and that can add exactly the one host
+    /// the detector managed to parse out of a dead CLI's exit message — there was no way to see what was
+    /// already allowed, allow a host in advance, or take one back off the list.</para>
+    ///
+    /// <para>Falls back to the in-memory seed when there is no daemon behind the surface (the mock /
+    /// design harness), so the editor still renders its real content rather than an error.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task OpenEgressAllowlistAsync()
+    {
+        var gateway = _agents is Services.DaemonBackedOrchestrator daemon
+            ? daemon.CreateEgressAllowlistGateway()
+            : new Services.InMemoryEgressAllowlistGateway();
+
+        var vm = new EgressAllowlistViewModel(gateway);
+        await vm.InitializeAsync();
+
+        var owner = (Application.Current?.ApplicationLifetime
+            as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?.MainWindow;
+        var window = new Views.EgressAllowlistView { DataContext = vm };
+        if (owner is null)
+        {
+            window.Show();
+            return;
+        }
+
+        await window.ShowDialog(owner);
+    }
+
     /// <summary>Terminal lifecycle states — the same set <see cref="LiveAgentCount"/> excludes.</summary>
     private static bool IsTerminalState(AgentLifecycleState state) =>
         state is AgentLifecycleState.Merged or AgentLifecycleState.Rejected
@@ -404,10 +490,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     private void RefreshCoordinatorCli()
     {
         var host = _agents as Services.ICliAgentHost;
-        var coordinators = _agents.ListAgents()
-            .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)
-            .OrderByDescending(a => a.SpawnedAt)
-            .ToList();
+        var coordinators = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection.LifoOrder(
+            _agents.ListAgents().Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator));
 
         var live = coordinators.FirstOrDefault(a => !IsTerminalState(a.State));
         var startedId = host?.CoordinatorAgentId is { Length: > 0 } id ? id : null;
@@ -624,8 +708,27 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>Retries <see cref="LoadInstalledClisAsync"/> every 5 s until the daemon answers or
     /// the VM is disposed — the ctor's load races the VM cold boot (and the tier-1 daemon
-    /// auto-update's restart) on every launch, so one attempt is never enough.</summary>
-    public async Task LoadInstalledClisUntilAvailableAsync(CancellationToken ct)
+    /// auto-update's restart) on every launch, so one attempt is never enough.
+    /// <para><b>At most one loop runs at a time (#51).</b> The ctor already starts one, so an
+    /// additional caller <i>joins</i> that loop rather than starting a rival against the same
+    /// daemon. Two loops each wrote <see cref="CoordinatorStartError"/> through
+    /// <c>Dispatcher.UIThread.InvokeAsync</c>, so a lagging "could not reach" from one could land
+    /// after the other's success and leave a false error banner on a screen that had loaded — and
+    /// they doubled the list RPCs against a daemon already known to be struggling.</para>
+    /// <para>Consequence of joining: the loop is driven by the token of whoever <i>started</i> it
+    /// (in practice the ctor's, cancelled on Dispose). A later caller's token does not cancel a
+    /// loop it merely joined — it is a cold-boot retry owned by the VM, not by the caller.</para>
+    /// </summary>
+    public Task LoadInstalledClisUntilAvailableAsync(CancellationToken ct)
+    {
+        lock (_cliLoadGate)
+        {
+            if (_cliLoadLoop is { IsCompleted: false }) return _cliLoadLoop;
+            return _cliLoadLoop = RunCliLoadLoopAsync(ct);
+        }
+    }
+
+    private async Task RunCliLoadLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
@@ -636,7 +739,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
             try
             {
-                await Task.Delay(CliLoadRetryDelay, ct).ConfigureAwait(false);
+                await Task.Delay(_cliLoadRetryDelay, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -645,7 +748,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         }
     }
 
-    /// <summary>Retry cadence for the installed-CLI load (shortened by tests).</summary>
+    /// <summary>Default retry cadence for the installed-CLI load. Each VM snapshots this into
+    /// <c>_cliLoadRetryDelay</c> when it is constructed (tests shorten it around a construction),
+    /// so a running loop never re-reads it.</summary>
     internal static TimeSpan CliLoadRetryDelay { get; set; } = TimeSpan.FromSeconds(5);
 
     /// <summary>
@@ -807,9 +912,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// teardown and there is no id to end.</summary>
     private async Task StopCoordinatorCoreAsync()
     {
-        var coordinatorId = _agents.ListAgents()
-            .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)
-            .OrderByDescending(a => a.SpawnedAt)
+        var coordinatorId = Mainguard.Agents.UI.ViewModels.Agents.AgentListProjection
+            .LifoOrder(_agents.ListAgents()
+                .Where(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator))
             .FirstOrDefault(a => !IsTerminalState(a.State))?.AgentId
             ?? (_agents as Services.ICliAgentHost)?.CoordinatorAgentId;
         if (coordinatorId is not { Length: > 0 })
@@ -870,11 +975,26 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // Mount the agent into the ONE reused dock workspace host (leak-free content-swap): a live terminal
         // as the primary pane, the agent document as the diff pane. Opening another agent costs three
         // content swaps, not a fresh dock graph.
-        Workspace ??= new AgentWorkspaceViewModel(agentId, WorkspaceLayoutKind);
+        // Pane arrangement is remembered per agent KIND, not per agent: an agent id is a per-run string,
+        // so keying on it would write a file per agent and restore nothing. DockLayoutPersistence had
+        // round-trip and corruption-tolerance tests and no production caller at all, so rearranging
+        // panes was discarded on every close.
+        Workspace ??= new AgentWorkspaceViewModel(
+            agentId, WorkspaceLayoutKind,
+            persistence: _dockLayouts, layoutKey: LayoutKeyForAgent(agentId));
         var terminal = CreateTerminalFor(agentId);
         Workspace.ShowAgent(agentId, terminal, doc, null);
 
         IsCoordinatorFocus = false;
+    }
+
+    /// <summary>The workspace-layout bucket for an agent: its KIND (e.g. <c>claude-code</c>), falling back
+    /// to a shared default when the projection has not resolved a kind yet. <c>AgentInfo.Name</c> carries
+    /// the kind — <c>MapInfo</c> puts <c>agent_kind</c> there.</summary>
+    private string LayoutKeyForAgent(string agentId)
+    {
+        var kind = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId)?.Name;
+        return string.IsNullOrWhiteSpace(kind) || kind == agentId ? "default" : kind!;
     }
 
     /// <summary>Builds (and attaches) a fresh live terminal for <paramref name="agentId"/>, tearing down the
@@ -959,7 +1079,18 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             if (diff is not null)
             {
                 var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
-                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files);
+                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files)
+                {
+                    // The "verified @ <sha>" stamp. The bare 4-arg ctor left every enrichment property
+                    // unset, so BuildHeader was a no-op and a reviewer was told nothing about what the
+                    // branch's green was measured against. This one is real data: the daemon has always
+                    // sent verified_main_sha; the client dropped it in the queue projection. Null when
+                    // the entry has not been verified, in which case no stamp is drawn — an absent
+                    // stamp is the honest rendering of "not verified", and inventing one would be the
+                    // exact false reassurance this surface exists to prevent.
+                    VerifiedAgainstSha = _queue.GetQueue()
+                        .FirstOrDefault(e => e.AgentId == agentId)?.VerifiedMainSha,
+                };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same
                 // path the agent document uses. It was built with none: `changedGate: null`, `queue: null`

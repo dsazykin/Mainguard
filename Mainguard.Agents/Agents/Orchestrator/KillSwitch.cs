@@ -38,6 +38,26 @@ public static class KillSwitchTiming
     /// <summary>True when <c>50×RTT</c> would have exceeded the ceiling — the A3 <c>Unresponsive</c> trigger.</summary>
     public static bool RttWouldExceedCeiling(TimeSpan rttBudget) => ScaleByRtt(rttBudget) > Ceiling;
 
+    /// <summary>
+    /// The RTT budget of a kill switch that has <b>no control-channel measurement at all</b> — named,
+    /// so that "we never measured it" stops being spelled the same way as "we measured a healthy channel".
+    ///
+    /// <para><b>This is the daemon's real posture today and it is a statement of fact, not a default.</b>
+    /// The RTT this class is about terminates at the in-jail supervisor, and P2-09's
+    /// <c>IAgentControlChannel</c> has no production transport: <c>SandboxKillTarget.RequestYieldAsync</c>
+    /// answers <c>false</c> immediately without a round trip, so there is nothing to time. Feeding
+    /// <see cref="TimeSpan.Zero"/> silently made <see cref="RttWouldExceedCeiling"/> a constant
+    /// <c>false</c>, which reads on a <see cref="KillReport"/> as "the control channel was fine" — the one
+    /// claim nobody was in a position to make. A kill switch built with this reports
+    /// <see cref="KillSwitch.MeasuresControlChannelRtt"/> = false and stamps
+    /// <c>KillReport.RttMeasured</c>/<c>KillSnapshot.RttMeasured</c> = false, so the emergency-stop record
+    /// says <i>unknown</i> instead of <i>fine</i>.</para>
+    ///
+    /// <para>The RT-D4 arm itself is complete and covered in both directions by <c>KillSwitchTests</c>; it
+    /// lights up the moment a transport supplies a real EWMA to pass here instead of this.</para>
+    /// </summary>
+    public static readonly Func<TimeSpan> UnmeasuredRtt = () => TimeSpan.Zero;
+
     private static TimeSpan ScaleByRtt(TimeSpan rttBudget)
     {
         if (rttBudget <= TimeSpan.Zero)
@@ -121,9 +141,15 @@ public interface IKillTarget
 public interface IKillJournal
 {
     void WriteSnapshot(KillSnapshot snapshot);
+
+    /// <summary>Every snapshot this journal holds, oldest first — the record an operator reads AFTER the
+    /// stop. Part of the interface rather than of one implementation: a journal that can only be written
+    /// to is the defect (see <see cref="JsonKillJournal"/>), not a design choice.</summary>
+    IReadOnlyList<KillSnapshot> ReadAll();
 }
 
-/// <summary>An in-memory <see cref="IKillJournal"/> for tests / the pre-persistence path.</summary>
+/// <summary>An in-memory <see cref="IKillJournal"/> for tests. <b>Not a production sink</b> — a kill
+/// snapshot that lives in the killed process's heap is gone by the time anyone comes to read it.</summary>
 public sealed class InMemoryKillJournal : IKillJournal
 {
     private readonly List<KillSnapshot> _snapshots = new();
@@ -141,6 +167,108 @@ public sealed class InMemoryKillJournal : IKillJournal
             _snapshots.Add(snapshot);
         }
     }
+
+    public IReadOnlyList<KillSnapshot> ReadAll() => Snapshots;
+}
+
+/// <summary>
+/// The durable <see cref="IKillJournal"/>: one JSON object per kill epoch, appended to a daemon-owned
+/// file (same posture as <c>JsonPlanApprovalStore</c> next to the session token).
+///
+/// <para><b>Why this type had to exist.</b> The kill switch's step 3 is "journal snapshot written BEFORE
+/// returning" and the daemon passed no journal at all, so the constructor's <c>?? new
+/// InMemoryKillJournal()</c> built a sink nothing held a reference to. The snapshot was written, correctly
+/// and on time, into an object that became garbage on the next collection — and the whole point of writing
+/// it before returning is that it survives what happens next. After an emergency stop and a daemon restart
+/// there was no record of which agents the kill epoch covered or what state each was in.</para>
+///
+/// <para>Append-only JSON Lines, so a torn write costs the last line rather than the file, and
+/// <see cref="ReadAll"/> skips lines it cannot parse for the same reason. Every failure is swallowed:
+/// RT-D3's rule that a kill never blocks on a store applies to this store too — an unwritable journal must
+/// not keep an agent running.</para>
+/// </summary>
+public sealed class JsonKillJournal : IKillJournal
+{
+    private static readonly System.Text.Json.JsonSerializerOptions Json = new() { WriteIndented = false };
+
+    private readonly string _path;
+    private readonly object _gate = new();
+
+    /// <param name="path">The JSONL file kill snapshots are appended to.</param>
+    public JsonKillJournal(string path)
+        => _path = string.IsNullOrWhiteSpace(path) ? throw new ArgumentException("path is required.", nameof(path)) : path;
+
+    /// <summary>The file this journal appends to (surfaced so an operator can be told where to look).</summary>
+    public string Path => _path;
+
+    public void WriteSnapshot(KillSnapshot snapshot)
+    {
+        if (snapshot is null)
+        {
+            return;
+        }
+
+        try
+        {
+            lock (_gate)
+            {
+                var dir = System.IO.Path.GetDirectoryName(_path);
+                if (!string.IsNullOrEmpty(dir))
+                {
+                    System.IO.Directory.CreateDirectory(dir);
+                }
+
+                System.IO.File.AppendAllText(
+                    _path, System.Text.Json.JsonSerializer.Serialize(snapshot, Json) + Environment.NewLine);
+            }
+        }
+        catch (Exception)
+        {
+            // RT-D3 posture: a kill NEVER blocks or fails on a store being unavailable.
+        }
+    }
+
+    public IReadOnlyList<KillSnapshot> ReadAll()
+    {
+        try
+        {
+            lock (_gate)
+            {
+                if (!System.IO.File.Exists(_path))
+                {
+                    return Array.Empty<KillSnapshot>();
+                }
+
+                var snapshots = new List<KillSnapshot>();
+                foreach (var line in System.IO.File.ReadAllLines(_path))
+                {
+                    if (string.IsNullOrWhiteSpace(line))
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        var snapshot = System.Text.Json.JsonSerializer.Deserialize<KillSnapshot>(line, Json);
+                        if (snapshot is not null)
+                        {
+                            snapshots.Add(snapshot);
+                        }
+                    }
+                    catch (System.Text.Json.JsonException)
+                    {
+                        // A torn final line from a process that died mid-append. Skip it; the rest is intact.
+                    }
+                }
+
+                return snapshots;
+            }
+        }
+        catch (Exception)
+        {
+            return Array.Empty<KillSnapshot>();
+        }
+    }
 }
 
 /// <summary>
@@ -155,20 +283,29 @@ public enum KillAgentOutcome { Yielded, Paused, PauseFailed }
 public sealed record KillAgentState(string AgentId, string State, KillAgentOutcome Outcome);
 
 /// <summary>The journal snapshot written before the kill returns: agent list + states + queue-frozen fact.</summary>
+/// <param name="RttMeasured">Whether a control-channel RTT was actually measured for this epoch. False
+/// means <see cref="RttSpikeDetected"/>-style reasoning does not apply to this record at all — see
+/// <see cref="KillSwitchTiming.UnmeasuredRtt"/>.</param>
 public sealed record KillSnapshot(
     string KillEpochId,
     DateTimeOffset At,
     IReadOnlyList<KillAgentState> Agents,
-    bool QueueFrozen);
+    bool QueueFrozen,
+    bool RttMeasured = false);
 
 /// <summary>The kill outcome the caller (and tests) assert against.</summary>
+/// <param name="RttSpikeDetected">True when <c>50×RTT</c> would have blown the RT-D4 ceiling. Only
+/// meaningful when <paramref name="RttMeasured"/> is true — with no measurement it is <c>false</c> because
+/// nothing was observed, NOT because the channel was healthy.</param>
+/// <param name="RttMeasured">Whether the kill switch had a real control-channel RTT to reason about.</param>
 public sealed record KillReport(
     string KillEpochId,
     DateTimeOffset FreezeAt,
     TimeSpan Deadline,
     bool RttSpikeDetected,
     IReadOnlyList<KillAgentState> Agents,
-    bool QueueFrozen);
+    bool QueueFrozen,
+    bool RttMeasured = false);
 
 /// <summary>
 /// P2-14 kill switch (contract §2, SA-1/F4 + RT-D4 + RT-D3). One always-visible emergency stop.
@@ -214,13 +351,60 @@ public sealed class KillSwitch
         _target = target ?? throw new ArgumentNullException(nameof(target));
         _journal = journal ?? new InMemoryKillJournal();
         _audit = audit ?? new InMemoryAuditLog();
-        _rttBudget = rttBudget ?? (() => TimeSpan.Zero);
+        _rttBudget = rttBudget ?? KillSwitchTiming.UnmeasuredRtt;
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
         _onRttSpike = onRttSpike;
+
+        // Reference identity, not "is it zero": a real EWMA that happens to read zero on a fast channel is
+        // a measurement, and the sentinel is the absence of one.
+        MeasuresControlChannelRtt = !ReferenceEquals(_rttBudget, KillSwitchTiming.UnmeasuredRtt);
+
+        // Same discipline as MergeQueueProvisioner.WiredOptionalControls, for the same measured reason: the
+        // daemon passes only gate/target/audit, and deleting `audit:` from DaemonHost left the whole
+        // Kill-filtered suite green (11 passed) because nothing asserted this composition at all.
+        var wired = new SortedSet<string>(StringComparer.Ordinal);
+        if (journal is not null) { wired.Add(nameof(journal)); }
+        if (audit is not null) { wired.Add(nameof(audit)); }
+        if (rttBudget is not null) { wired.Add(nameof(rttBudget)); }
+        if (clock is not null) { wired.Add(nameof(clock)); }
+        if (onRttSpike is not null) { wired.Add(nameof(onRttSpike)); }
+        WiredOptionalControls = wired;
     }
 
     /// <summary>True while the queue is frozen (the kill switch is engaged).</summary>
     public bool IsEngaged => _gate.IsFrozen;
+
+    /// <summary>
+    /// Every optional constructor argument this kill switch was actually given, by parameter name — the
+    /// composition-root assertion surface.
+    ///
+    /// <para>Each default here substitutes a weaker behaviour silently: <c>journal</c> becomes an
+    /// <see cref="InMemoryKillJournal"/> nobody holds a reference to (step 3 writes nowhere durable),
+    /// <c>audit</c> becomes a throwaway <see cref="InMemoryAuditLog"/> that detaches the
+    /// <c>killswitch</c>/<c>killswitch_audit_gap</c> events from the daemon's sink, and <c>rttBudget</c>
+    /// becomes <see cref="KillSwitchTiming.UnmeasuredRtt"/>. So the daemon states its whole tail and a test
+    /// pins it, rather than three of the five being invisible.</para>
+    /// </summary>
+    public IReadOnlySet<string> WiredOptionalControls { get; }
+
+    /// <summary>
+    /// Whether this kill switch has a real control-channel RTT to reason about, as opposed to
+    /// <see cref="KillSwitchTiming.UnmeasuredRtt"/>. False in the shipped daemon — there is no production
+    /// transport behind P2-09's <c>IAgentControlChannel</c> — and reported on every
+    /// <see cref="KillReport"/>/<see cref="KillSnapshot"/> so the record says <i>unknown</i> rather than
+    /// implying a healthy channel.
+    /// </summary>
+    public bool MeasuresControlChannelRtt { get; }
+
+    /// <summary>Whether an RTT spike has anywhere to go (the A3 <c>Unresponsive</c> feed).</summary>
+    public bool ReportsRttSpike => _onRttSpike is not null;
+
+    /// <summary>The journal step 3's snapshot is written to — durable in the daemon, so a kill epoch
+    /// survives the restart that follows an emergency stop.</summary>
+    public IKillJournal Journal => _journal;
+
+    /// <summary>The audit sink the <c>killswitch</c> event lands in (best-effort, RT-D3).</summary>
+    public IAuditLog AuditLog => _audit;
 
     /// <summary>
     /// Engages the kill switch. FREEZE happens synchronously before the first await (SA-1/F4), so any
@@ -254,13 +438,16 @@ public sealed class KillSwitch
             .OrderBy(a => a.AgentId, StringComparer.Ordinal)
             .ToList();
 
-        var snapshot = new KillSnapshot(epochId, _clock(), agentStates, QueueFrozen: _gate.IsFrozen);
+        var snapshot = new KillSnapshot(
+            epochId, _clock(), agentStates, QueueFrozen: _gate.IsFrozen, RttMeasured: MeasuresControlChannelRtt);
         _journal.WriteSnapshot(snapshot);
 
         // ---- RT-D3: audit best-effort — NEVER blocks the kill on audit-store availability ----
         TryAuditKill(epochId, agentStates.Count);
 
-        return new KillReport(epochId, freezeAt, deadline, rttSpike, agentStates, QueueFrozen: _gate.IsFrozen);
+        return new KillReport(
+            epochId, freezeAt, deadline, rttSpike, agentStates,
+            QueueFrozen: _gate.IsFrozen, RttMeasured: MeasuresControlChannelRtt);
     }
 
     /// <summary>Resumes after a kill (the banner action). Clears the freeze; agents are unpaused by their tokens.</summary>

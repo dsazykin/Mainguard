@@ -1,5 +1,10 @@
 # Builds site/ and deploys it to GitHub Pages (https://dsazykin.github.io/Mainguard/).
 # Runs on pushes to main that touch the site, or manually via workflow_dispatch.
+#
+# This is DEPLOY only, and it is not the site's gate: `push` to main is far too late to discover that
+# site/ does not compile. PR validation (#57) is the `site` job in ci.yml — it runs on every PR with no
+# paths filter, does the same `npm ci && npm run build`, and additionally parses the SVGs, which no
+# build step reads (#310 shipped a favicon.svg full of conflict markers through a green CI).
 name: Deploy site
 
 on:

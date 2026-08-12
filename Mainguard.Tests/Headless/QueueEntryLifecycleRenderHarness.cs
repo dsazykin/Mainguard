@@ -188,6 +188,80 @@ public class QueueEntryLifecycleRenderHarness
         }
     }
 
+    /// <summary>
+    /// <b>The stranded row gets a way forward.</b> The entry in the owner's screenshot had commits on its
+    /// branch, no jail, and exactly two controls: a Verify that could only ever answer "has no live
+    /// sandbox", and a Discard that threw the work away. So the row now offers Resume — and it is offered
+    /// to that row and to no other, because a resume for an entry that already has a jail spends a minute
+    /// building one for the daemon to refuse.
+    /// </summary>
+    [AvaloniaFact]
+    public void OnlyTheRowWithNoSandbox_OffersResume_AndItsVerifyIsWithheldRatherThanFailing()
+    {
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        var vm = new QueueRailViewModel(new StubQueue(), _ => { }, resumeAgentKind: () => "claude-code");
+        var view = new QueueRailView { DataContext = vm };
+        var win = HostWindow(view);
+        win.Show();
+        Settle();
+
+        var resume = Button(view, Stranded, "Resume");
+        Assert.True(resume.IsEffectivelyVisible, "the stranded row has no Resume control at all");
+        Assert.True(resume.IsEffectivelyEnabled, "Resume is rendered but disabled");
+        // Not a second accent — the rail's one emphasized action stays the Review CTA.
+        Assert.DoesNotContain("Accent", resume.Classes);
+
+        // Every row that still HAS a jail is not stranded, whatever its merge state. The stalled-verifying
+        // row is the sharpest case: its state is broken but its sandbox is not, so it gets the clear and
+        // not a resume.
+        foreach (var id in new[] { Ready, Frozen, Live })
+        {
+            Assert.False(Button(view, id, "Resume").IsEffectivelyVisible,
+                $"{id} still has a jail — offering to spawn it another is a refusal waiting to happen");
+        }
+
+        // …and the Verify button on the stranded row is WITHHELD rather than left enabled to produce an
+        // error. That enabled-button-that-only-errors is the state the screenshot was taken in.
+        Assert.False(Button(view, Stranded, "Verify").IsEffectivelyEnabled,
+            "Verify is enabled on an entry with no jail, so pressing it can only produce an error");
+        // The positive control that keeps the assertion above from passing for the wrong reason: the row
+        // that HAS a jail keeps its Verify. (Frozen's is withheld too, but for #307's separate reason —
+        // its state is Verifying — so it cannot serve as this control.)
+        Assert.True(Button(view, Ready, "Verify").IsEffectivelyEnabled);
+
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// Pressing Resume reaches the seam with the entry's OWN id and the human's chosen CLI — the two facts
+    /// the daemon keys the adoption on. A resume that sent a different id would attach a jail to the wrong
+    /// branch, which is precisely why the daemon scopes it to (repo, agent) and denies it to agents.
+    /// </summary>
+    [AvaloniaFact]
+    public void PressingResume_SendsThisEntrysOwnIdAndTheSelectedCli()
+    {
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        var stub = new StubQueue();
+        var vm = new QueueRailViewModel(stub, _ => { }, resumeAgentKind: () => "claude-code");
+        var view = new QueueRailView { DataContext = vm };
+        var win = HostWindow(view);
+        win.Show();
+        Settle();
+
+        // Resume is NOT two-step: it adds a sandbox and destroys nothing, so it acts on the first press.
+        Assert.Empty(stub.Resumed);
+        vm.Entries.Single(e => e.AgentId == Stranded).ResumeCommand.Execute(null);
+        Settle();
+
+        var sent = Assert.Single(stub.Resumed);
+        Assert.Equal(Stranded, sent.AgentId);
+        Assert.Equal("claude-code", sent.AgentKind);
+        // Nothing was discarded on the way — the recovery action and the destructive one are distinct.
+        Assert.Empty(stub.Discarded);
+
+        HarnessHygiene.Teardown(win);
+    }
+
     /// <summary>The captures to judge this on: the resting rail and the armed confirmation, in all five
     /// themes. Daylight Loom is LIGHT — the quiet destructive has to read as destructive there too.</summary>
     [AvaloniaFact]
@@ -269,19 +343,28 @@ public class QueueEntryLifecycleRenderHarness
     {
         public List<string> Discarded { get; } = new();
 
+        /// <summary>Every (agentId, agentKind) a resume actually reached the seam with.</summary>
+        public List<(string AgentId, string AgentKind)> Resumed { get; } = new();
+
         public string MainSha => "a1b2c3d4e5";
 
         public IReadOnlyList<QueueEntry> GetQueue() => new[]
         {
             Entry(Ready, WorkerMergeState.Verified, "ready to merge"),
+            // Stalled because a daemon restart lost the in-flight set — the JAIL is still there, so this
+            // row is the other agent's case (clear it and re-verify), NOT a resume. Keeping the two
+            // separate here is what makes the discrimination assertions mean something.
             Entry(Frozen, WorkerMergeState.Verifying, "verification stalled — no run in progress"),
             Entry(Live, WorkerMergeState.Verifying, "verifying", inFlight: true),
-            Entry(Stranded, WorkerMergeState.Working, "not verified yet"),
+            // The owner's screenshot: commits on the branch, jail gone, "not verified yet".
+            Entry(Stranded, WorkerMergeState.Working, "not verified yet", hasSandbox: false),
         };
 
-        private static QueueEntry Entry(string id, WorkerMergeState state, string detail, bool inFlight = false)
+        private static QueueEntry Entry(
+            string id, WorkerMergeState state, string detail, bool inFlight = false, bool hasSandbox = true)
             => new(id, id, "agent/" + id, state, detail, Verification: null,
-                FlaggedItems: Array.Empty<FlaggedItem>(), VerificationInFlight: inFlight);
+                FlaggedItems: Array.Empty<FlaggedItem>(), VerificationInFlight: inFlight,
+                HasLiveSandbox: hasSandbox);
 
         public bool CanMerge(string agentId, out string reason)
         {
@@ -308,5 +391,12 @@ public class QueueEntryLifecycleRenderHarness
         }
 
         public Task ClearStalledVerificationAsync(string agentId) => Task.CompletedTask;
+
+        public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind)
+        {
+            Resumed.Add((agentId, agentKind));
+            return Task.FromResult(new QueueEntryResumeOutcome(
+                agentId, "agent/" + agentId, WorkerMergeState.Working, ClearedStalledVerification: false));
+        }
     }
 }

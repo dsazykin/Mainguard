@@ -24,6 +24,18 @@ public enum FlaggedKind
 
     /// <summary>A lockfile row that introduces a dependency version with a known offline-OSV CVE.</summary>
     LockfileCve,
+
+    /// <summary>
+    /// A lockfile whose introduced dependencies were <b>not established to be advisory-free</b> — the
+    /// offline snapshot was missing, unreadable or aged out, or the manifest itself could not be parsed.
+    ///
+    /// <para>Its own kind rather than an absent item, for the reason <c>ToolchainStatus.CouldNotCheck</c>
+    /// exists: an absent item is an acknowledged item (an empty flagged set is
+    /// <see cref="AcknowledgmentStore.AllAcknowledged"/>), so omitting it would report "we could not check
+    /// this dependency for CVEs" as "this dependency has no known CVEs" — on the one screen where that
+    /// distinction decides a merge.</para>
+    /// </summary>
+    LockfileAdvisoryUnknown,
 }
 
 /// <summary>

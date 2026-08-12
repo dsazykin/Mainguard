@@ -14,7 +14,19 @@
 # See "How to use" at the bottom of this file.
 # =============================================================================
 
-FROM mcr.microsoft.com/dotnet/sdk:10.0 AS dev
+# MG-27: pinned by DIGEST, not by the floating `10.0` tag — the same note the two jail-image
+# Dockerfiles carry, and the same reason. The header above claims this file "pins the .NET 10 SDK";
+# `sdk:10.0` is a MUTABLE pointer to the newest 10.0.x, so it did not: the same Dockerfile built a week
+# apart silently produced a different compiler, different analyzers and different runtime packs — which
+# is precisely what this wrapper exists to prevent, and what global.json's exact 10.0.301 pin (enforced
+# on every CI runner) makes CI immune to while the container was not.
+#
+# This digest is the `10.0` tag as of 2026-08, which is SDK 10.0.302 — same 10.0.3xx feature band as
+# global.json's 10.0.301, so `rollForward: latestPatch` accepts it. That relationship is the constraint:
+# when you refresh the digest, check the SDK version it names is still in global.json's band.
+#   docker pull mcr.microsoft.com/dotnet/sdk:10.0
+#   docker image inspect --format '{{index .RepoDigests 0}}' mcr.microsoft.com/dotnet/sdk:10.0
+FROM mcr.microsoft.com/dotnet/sdk:10.0@sha256:72dd743782f2ae7e5476fd64f6a460045e3998dc862218b80e6944cba79a01b0 AS dev
 
 # --- Native runtime deps -----------------------------------------------------
 # git            : CLI fallback engine used by GitService (ExecuteGitCli et al.)

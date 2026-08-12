@@ -39,7 +39,23 @@ public sealed record ReviewCockpitContext(
     /// <summary>True for a managed worker (F6 scope comparison applies).</summary>
     public bool Managed { get; init; }
 
-    /// <summary>Extra flagged items from the semantic lockfile diff (CVE/script rows).</summary>
+    /// <summary>
+    /// Extra flagged items from the semantic lockfile diff (CVE / install-script / advisory-unknown rows).
+    ///
+    /// <para><b>Local composition only — setting this in the shipped app changes nothing.</b> It is read
+    /// exactly once, on the <c>live is null</c> branch of <see cref="ReviewCockpitViewModel"/>'s
+    /// constructor, and production always supplies <c>live:</c> (see
+    /// <c>ControlCenterViewModel.OpenReviewAsync</c>). So this property reaches the design/render harness
+    /// and the pure-composition tests, and nothing else.</para>
+    ///
+    /// <para><b>The production path is daemon-side and already wired</b>:
+    /// <c>MergeQueueProvisioner.ReviewLockfiles</c> reads both full manifests out of the mirror at
+    /// verification time and folds the rows into the <see cref="AcknowledgmentStore"/> the merge gate
+    /// actually consults; they reach this cockpit through the same daemon projection as every other
+    /// flagged item. That is not an alternative to filling this property in — it is the only version that
+    /// blocks a merge, because a lockfile is not parseable from a truncated diff hunk and an
+    /// acknowledgment addressed to a locally-composed id would clear nothing.</para>
+    /// </summary>
     public IReadOnlyList<FlaggedChange>? LockfileFlags { get; init; }
 
     /// <summary>RT-D2: the branch's resolved test command drifted from the main baseline.</summary>
