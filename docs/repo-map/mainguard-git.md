@@ -145,13 +145,23 @@ The all-editions base. Git logic goes here.
     bound to the **SHA-256 of the canonical flagged set** — a new push resets every ack (invariant 2),
     `LastResetCount` for the "N items reset" copy, `acknowledged_flagged_change` audit events for P2-15;
     **no bulk-ack method** so a global checkbox is impossible by construction).
-  - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind)` for
+  - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind,osv,asOf)` for
     package-lock.json/pnpm-lock.yaml/`*.csproj` PackageReference/poetry.lock → per-dep rows with
     major-jump/install-scripts/registry-change + offline OSV CVE ids; script/CVE rows feed the flagged
-    gate).
+    gate. `DependencyDelta.AdvisoriesChecked` is the `RttMeasured`-shaped third state — false means the
+    empty CVE list is a **silence, not an answer**).
+  - `LockfileReview.cs` (the blobs→must-ack policy the daemon's merge path calls:
+    `KindFor(path)` — deliberately narrower than `RiskClassifier`'s lockfile *category*, so a format with
+    no parser is not handed to one — and `Review(path,kind,base,branch,osv,asOf,unreadable)` →
+    `FlaggedChange` rows. **Fail-closed**: unreadable blob, oversize manifest (`MaxManifestBytes` 8 MB) or
+    a snapshot that cannot answer all produce ONE `LockfileAdvisoryUnknown` item per lockfile, never an
+    omission — an omitted item is an acknowledged item. `ItemsFor` is the single definition
+    `FlaggedChangeDetector.FromLockfileDeltas` delegates to).
   - `OsvSnapshot.cs` + `OsvSnapshot.json` (the shipped **offline** OSV database, embedded resource;
-    `Default` reads it once, `FromEntries` injects a test snapshot — a review-time network call is a
-    rejection trigger).
+    `Default` reads it once, `FromEntries(advisories, capturedOn)` injects a test snapshot,
+    `Unavailable(state)` builds the not-loaded value — a review-time network call is a rejection trigger.
+    `OsvSnapshotState` Available/Missing/Malformed/**Stale** + `CanAnswerAt` decide whether an *absence*
+    of hits is evidence; `MaxAge` is 90 days, argued against the bundled-refresh cadence).
   - `TestDeltaParser.cs` (`TestOutcome`/`TestDelta`; `ParseTrx`/`ParsePassFail` +
     `Compute(current, baseline)` → new-fail/new-pass delta for the §6.5 strip; malformed TRX → empty,
     never throws).

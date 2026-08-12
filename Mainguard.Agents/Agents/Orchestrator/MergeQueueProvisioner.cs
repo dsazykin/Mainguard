@@ -92,6 +92,7 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, string, string?>? _locateAgentWorktree;
     private readonly IAgentSupervisor _agentStates;
     private readonly Func<string, string, bool>? _publishRebasedAgentRef;
+    private readonly OsvSnapshot _osv;
 
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
@@ -178,6 +179,19 @@ public sealed class MergeQueueProvisioner
     /// reaches clients on the agent-event stream; the default no-op supervisor keeps the pure-unit paths
     /// working.
     /// </param>
+    /// <param name="osvSnapshot">
+    /// The offline advisory snapshot the P2-11 §3.6 lockfile review consults. Defaults to the shipped
+    /// <see cref="OsvSnapshot.Default"/>.
+    ///
+    /// <para><b>Absent at the composition root on purpose</b>, like <paramref name="resolveApprovedPlan"/>,
+    /// and for a stated reason rather than by oversight. The snapshot is <b>bundled</b>: a review-time
+    /// network call is a P2-11 rejection trigger, so there is no fetch-and-cache the daemon could pass a
+    /// handle to, and the embedded copy IS the production answer. Refresh happens by shipping a build —
+    /// which is exactly why the snapshot's age is carried to the reviewer instead of assumed
+    /// (<see cref="OsvSnapshot.MaxAge"/>): a bundled database is guaranteed to age, and a reviewer told
+    /// nothing would read an empty CVE column as a clean bill of health. Passing a snapshot here is for
+    /// tests that need the missing/stale states without a hand-edited assembly.</para>
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -196,7 +210,8 @@ public sealed class MergeQueueProvisioner
         Func<string, IYieldProtocol>? yieldProtocolFor = null,
         Func<string, string, string?>? locateAgentWorktree = null,
         IAgentSupervisor? agentStates = null,
-        Func<string, string, bool>? publishRebasedAgentRef = null)
+        Func<string, string, bool>? publishRebasedAgentRef = null,
+        OsvSnapshot? osvSnapshot = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -218,6 +233,7 @@ public sealed class MergeQueueProvisioner
         _locateAgentWorktree = locateAgentWorktree;
         _agentStates = agentStates ?? NullAgentSupervisor.Instance;
         _publishRebasedAgentRef = publishRebasedAgentRef;
+        _osv = osvSnapshot ?? OsvSnapshot.Default;
 
         // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
         // is here rather than only the one that happened to get a test.
@@ -231,6 +247,7 @@ public sealed class MergeQueueProvisioner
         if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
         if (agentStates is not null) { wired.Add(nameof(agentStates)); }
         if (publishRebasedAgentRef is not null) { wired.Add(nameof(publishRebasedAgentRef)); }
+        if (osvSnapshot is not null) { wired.Add(nameof(osvSnapshot)); }
         WiredOptionalControls = wired;
     }
 
@@ -263,10 +280,12 @@ public sealed class MergeQueueProvisioner
     /// exact expected set. Adding a new optional argument, or dropping an existing one, both fail that
     /// assertion until the daemon's intent is restated.</para>
     ///
-    /// <para>The set is deliberately EXACT rather than a minimum: <c>resolveApprovedPlan</c> is absent on
-    /// purpose (there is no agent→approved-plan binding in the daemon to give it — see the NOTE in
-    /// <c>GatewayServiceRegistration</c>), and an absence that is a decision has to be as pinned as a
-    /// presence, or the decision quietly becomes an oversight the first time someone passes a guess.</para>
+    /// <para>The set is deliberately EXACT rather than a minimum. Two names are absent on purpose:
+    /// <c>resolveApprovedPlan</c> (there is no agent→approved-plan binding in the daemon to give it — see
+    /// the NOTE in <c>GatewayServiceRegistration</c>) and <c>osvSnapshot</c> (the advisory snapshot is
+    /// bundled, so the embedded default IS the production answer and a passed one could only be a test
+    /// double). An absence that is a decision has to be as pinned as a presence, or the decision quietly
+    /// becomes an oversight the first time someone passes a guess.</para>
     /// </summary>
     public IReadOnlySet<string> WiredOptionalControls { get; }
 
@@ -796,7 +815,17 @@ public sealed class MergeQueueProvisioner
         // "managed but plan-less" combination could only ever mean "compare against nothing", which is the
         // state this change exists to end.
         var approvedPlan = _resolveApprovedPlan?.Invoke(agentId);
-        var items = FlaggedChangeDetector.DetectFlagged(files, approvedPlan, managed: approvedPlan is not null);
+        var items = new List<FlaggedChange>(
+            FlaggedChangeDetector.DetectFlagged(files, approvedPlan, managed: approvedPlan is not null));
+
+        // P2-11 §3.6, and the second half of this method's job. The detector above classifies by PATH, so a
+        // lockfile change reaches the human as "package-lock.json changed" and nothing more — which cannot
+        // distinguish a patch bump from an added transitive carrying a postinstall script, the supply-chain
+        // case the whole semantic diff exists for. Adding the rows HERE and not in the cockpit is decided by
+        // two facts: the gate that blocks the merge is this store, and the semantic diff needs the WHOLE
+        // manifest on both sides, which only the mirror has (a unified-diff hunk is truncated context — a
+        // package-lock.json cannot be JSON-parsed out of one). See ReviewLockfiles.
+        items.AddRange(ReviewLockfiles(repoHandle, agentId, files));
 
         flaggedGate.StoreFor(agentId).SetFlagged(items);
 
@@ -806,6 +835,86 @@ public sealed class MergeQueueProvisioner
                 $"merge queue repo={repoHandle} agent={agentId} flagged {items.Count} change(s) "
                 + "requiring human acknowledgment before merge");
         }
+    }
+
+    /// <summary>
+    /// The P2-11 §3.6 semantic lockfile review for every dependency manifest the branch's diff touches:
+    /// which packages were added, removed or version-bumped, which of those carry a known advisory in the
+    /// offline <see cref="OsvSnapshot"/>, and which declare install scripts.
+    ///
+    /// <para><b>Why it runs daemon-side, here, rather than in the cockpit.</b> Three reasons, and the first
+    /// is decisive on its own:</para>
+    /// <list type="number">
+    ///   <item><b>This store is the gate.</b> <see cref="FlaggedChangeGate"/> reads
+    ///   <see cref="AcknowledgmentStore"/>, and <c>ReviewCockpitContext.LockfileFlags</c> is consulted only
+    ///   on the cockpit's LOCAL composition branch — the branch the shipped app never takes, because
+    ///   production always supplies <c>live:</c>. Rows added there would render and block nothing; rows
+    ///   added here block the merge and reach the cockpit through the projection the daemon already
+    ///   streams.</item>
+    ///   <item><b>Only the mirror has the inputs.</b> The semantic diff needs both manifests in full;
+    ///   the client's projection is a <see cref="Mainguard.Git.Models.FilePatch"/> list, i.e. hunks with
+    ///   truncated context. A <c>package-lock.json</c> is not parseable from a hunk — a client-side
+    ///   implementation would silently classify a fragment and report the result as the whole file.</item>
+    ///   <item><b>Acks bind to the set's content hash.</b> Items composed client-side would not be in the
+    ///   hash the daemon's gate computed, so a human's acknowledgment would address an id the gate has
+    ///   never heard of — the same "the checkmark cleared a store no merge consults" defect the live
+    ///   flagged-item seam was built to end.</item>
+    /// </list>
+    ///
+    /// <para><b>Cost.</b> Bounded before any parsing: only paths <see cref="LockfileReview.KindFor"/>
+    /// recognises are read at all (two <c>git show</c>s each), and a manifest above
+    /// <see cref="LockfileReview.MaxManifestBytes"/> is refused rather than parsed. Measured on this
+    /// machine, a 5,000-package <c>package-lock.json</c> (~2 MB per side) parses both sides and diffs them
+    /// in ~90 ms — against a verification that runs a full test suite in a container, which is what this
+    /// method is already sitting inside.</para>
+    ///
+    /// <para><b>Fail-closed, like the rest of this review.</b> Every way of not knowing — an unreadable
+    /// blob, an oversize manifest, a missing or stale advisory snapshot — produces a
+    /// <see cref="FlaggedKind.LockfileAdvisoryUnknown"/> must-acknowledge item, never an omission. An
+    /// omitted item is an acknowledged item, so silence here would report "we could not check this for
+    /// CVEs" as "this has no CVEs".</para>
+    /// </summary>
+    private IReadOnlyList<FlaggedChange> ReviewLockfiles(
+        string repoHandle, string agentId, IReadOnlyList<Mainguard.Git.Models.FilePatch> files)
+    {
+        List<FlaggedChange>? items = null;
+        string? barePath = null;
+        string? mainBranch = null;
+
+        foreach (var patch in files)
+        {
+            var path = FilePatchPath.NewPath(patch);
+            if (LockfileReview.KindFor(path) is not { } kind)
+            {
+                continue;
+            }
+
+            // Resolved lazily: the overwhelmingly common branch touches no manifest at all, and this is on
+            // the verification path of every agent in every repo.
+            barePath ??= _repos.BareRepoPathFor(repoHandle);
+            mainBranch ??= ResolveDefaultBranch(barePath);
+
+            // The SAME two committed trees the RT-D2 provenance is read from, so the lockfile verdict and
+            // the verification baseline cannot describe different bytes.
+            var baseText = ShowFile(barePath, mainBranch, path);
+            var branchText = ShowFile(barePath, "agent/" + agentId, path);
+
+            // Neither side readable while the diff insists the file changed means git could not answer, not
+            // that the manifest is empty. The distinction is the caller's to make and it is made here.
+            var unreadable = baseText is null && branchText is null;
+            if (unreadable)
+            {
+                _log?.Invoke(
+                    $"merge queue repo={repoHandle} agent={agentId} lockfile '{path}' changed but neither "
+                    + "tree yielded its contents — flagged as unreviewed");
+            }
+
+            items ??= new List<FlaggedChange>();
+            items.AddRange(LockfileReview.Review(
+                path, kind, baseText, branchText, _osv, DateTimeOffset.UtcNow, unreadable));
+        }
+
+        return (IReadOnlyList<FlaggedChange>?)items ?? Array.Empty<FlaggedChange>();
     }
 
     /// <summary>
