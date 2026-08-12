@@ -57,6 +57,14 @@ public sealed class RoleInterceptor : Interceptor
         // the daemon verify the result under the original entry's identity. It is a human decision about
         // work a human owns, so it joins the list rather than being guarded by a field check inside a
         // shared message (which this interceptor, which dispatches by method, could not see).
+        // Intake configuration is operator policy, and subscribing is a PROVISIONING act rather than a
+        // preference: a subscribed repository makes the daemon fetch pull-request heads and ask the gated
+        // spawn chain for a jail per open bot PR. An agent that could call these could manufacture queue
+        // entries and jails on the user's machine, or widen the bot-author list until its own pull
+        // requests were intake'd — merge power reached from the other end. The reads stay open; only the
+        // two writes are denied, on the same boundary as BeginMerge/DiscardEntry above.
+        "/mainguard.v1.PrIntakeService/UpdatePrIntakeSettings",
+        "/mainguard.v1.PrIntakeService/SubscribePrIntakeSource",
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
