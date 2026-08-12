@@ -55,6 +55,29 @@ public class PrIntakeSettingsPageTests
         Assert.DoesNotContain(BuildSettings(hasAgentPlatform: false).Pages, p => p.Id == "PrIntake");
     }
 
+    /// <summary>
+    /// The last mile of "reachable": the page's ViewModel resolves to a real View through the app's
+    /// <c>ViewLocator</c> name transform, and that View is a <see cref="Avalonia.Controls.UserControl"/>.
+    ///
+    /// <para>Both halves are the bug. A missing type makes the Settings pane render the literal
+    /// <c>"Not Found: …"</c> TextBlock, and a <see cref="Avalonia.Controls.Window"/> — which is what this
+    /// View was — throws when set as <c>ContentControl.Content</c>, so the rail row would fail at the
+    /// moment a human clicked it. Asserted on the TYPE rather than by instantiating, so it needs no
+    /// Avalonia application and can live in the plain unit tier.</para>
+    /// </summary>
+    [Fact]
+    public void ThePageViewModel_ResolvesToARealUserControl()
+    {
+        var viewName = typeof(PrIntakeSettingsViewModel).FullName!.Replace("ViewModel", "View", StringComparison.Ordinal);
+        var view = typeof(PrIntakeSettingsViewModel).Assembly.GetType(viewName);
+
+        Assert.NotNull(view);
+        Assert.True(
+            typeof(Avalonia.Controls.UserControl).IsAssignableFrom(view),
+            $"{viewName} must be a UserControl to be hosted as a Settings page; a Window throws when "
+            + "assigned to ContentControl.Content, which is why this surface could never be a page.");
+    }
+
     /// <summary>The Pro tools surface builds it, which is what the shell's rail row calls through.</summary>
     [Fact]
     public void ProToolsSurface_BuildsThePage_OverTheComposedGateway()
