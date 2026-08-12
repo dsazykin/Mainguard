@@ -85,9 +85,17 @@ public sealed class QueueEntryResumeTests
 
     /// <summary>
     /// The layer BELOW the interceptor. An agent holds no gRPC channel — it reaches the daemon through the
-    /// coordinator's in-jail Unix socket, whose op set is two ops about spawning. Asserted by reflection so
-    /// the set cannot grow a resume by accident, and asserted separately because the interceptor cannot
-    /// see this channel at all.
+    /// in-jail Unix socket, whose op set is asserted here WHOLE, by reflection, so it cannot grow a resume
+    /// by accident. Asserted separately from the interceptor because the interceptor cannot see this
+    /// channel at all.
+    ///
+    /// <para><b>Phase 2 widens this set and the widening is the point of re-reading it.</b> It was two ops
+    /// about spawning; the worker plan shim adds four — <c>brief</c>, <c>present_plan</c>,
+    /// <c>revise_plan</c>, <c>await_decision</c>. None of the four names an agent id or a branch: they
+    /// carry a plan through the human decision and back, and a worker's endpoint is fixed to the plan role
+    /// so it cannot reach <c>spawn</c> at all. Pinning the exact list rather than relaxing to "contains no
+    /// resume" is deliberate — the guarantee this test exists for is that nobody adds an adoption op here
+    /// quietly, and a substring check would pass for one named anything else.</para>
     /// </summary>
     [Fact]
     public void AgentIpcSurface_HasNoResumeOp()
@@ -99,7 +107,9 @@ public sealed class QueueEntryResumeTests
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
-        Assert.Equal(new[] { "list", "spawn" }, ops);
+        Assert.Equal(
+            new[] { "await_decision", "brief", "list", "present_plan", "revise_plan", "spawn" },
+            ops);
 
         // …and the shim request carries no agent id to adopt with, which is the structural half of the
         // same guarantee: the coordinator's spawn always mints.
