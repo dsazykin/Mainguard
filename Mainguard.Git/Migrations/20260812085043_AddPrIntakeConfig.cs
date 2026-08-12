@@ -1,35 +1,34 @@
-﻿using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.EntityFrameworkCore.Migrations;
 
 #nullable disable
 
-namespace Mainguard.Git.Migrations
+namespace Mainguard.Git.Migrations;
+
+/// <inheritdoc />
+public partial class AddPrIntakeConfig : Migration
 {
     /// <inheritdoc />
-    public partial class AddPrIntakeConfig : Migration
+    protected override void Up(MigrationBuilder migrationBuilder)
     {
-        /// <inheritdoc />
-        protected override void Up(MigrationBuilder migrationBuilder)
-        {
-            migrationBuilder.CreateTable(
-                name: "PrIntakeConfig",
-                columns: table => new
-                {
-                    Id = table.Column<long>(type: "INTEGER", nullable: false),
-                    Enabled = table.Column<bool>(type: "INTEGER", nullable: false),
-                    PollIntervalSeconds = table.Column<int>(type: "INTEGER", nullable: false),
-                    BotAuthors = table.Column<string>(type: "TEXT", nullable: false)
-                },
-                constraints: table =>
-                {
-                    table.PrimaryKey("PK_PrIntakeConfig", x => x.Id);
-                });
-        }
+        migrationBuilder.CreateTable(
+            name: "PrIntakeConfig",
+            columns: table => new
+            {
+                Id = table.Column<long>(type: "INTEGER", nullable: false),
+                Enabled = table.Column<bool>(type: "INTEGER", nullable: false),
+                PollIntervalSeconds = table.Column<int>(type: "INTEGER", nullable: false),
+                BotAuthors = table.Column<string>(type: "TEXT", nullable: false)
+            },
+            constraints: table =>
+            {
+                table.PrimaryKey("PK_PrIntakeConfig", x => x.Id);
+            });
+    }
 
-        /// <inheritdoc />
-        protected override void Down(MigrationBuilder migrationBuilder)
-        {
-            migrationBuilder.DropTable(
-                name: "PrIntakeConfig");
-        }
+    /// <inheritdoc />
+    protected override void Down(MigrationBuilder migrationBuilder)
+    {
+        migrationBuilder.DropTable(
+            name: "PrIntakeConfig");
     }
 }
