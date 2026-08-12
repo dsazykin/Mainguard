@@ -1129,9 +1129,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
       that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
       writing one would fail open; the branch is denied by the gate's MG-40 default-DENY instead, and the
-      verification result is left untouched. The optional `resolveApprovedPlan` (agentId → approved
+      verification result is left untouched. `ArmFlaggedChangeReview` then calls **`ReviewLockfiles`**
+      (P2-11 §3.6): for every path `Review.LockfileReview.KindFor` recognises it reads BOTH full blobs out
+      of the mirror with the same `git show` the RT-D2 provenance uses (main vs `agent/<id>`) and folds the
+      semantic rows — package added/removed/bumped, install scripts, offline-OSV CVE — into the same
+      must-ack set. **Daemon-side, not cockpit-side, for three reasons**: this store IS the gate
+      (`ReviewCockpitContext.LockfileFlags` is read only on the local composition branch the shipped app
+      never takes); only the mirror holds whole manifests, and a `package-lock.json` cannot be JSON-parsed
+      out of a truncated diff hunk; and acks bind to the set's content hash, so client-composed items would
+      address ids the gate never had. Neither tree yielding the blob ⇒ an `unreadable` unknown item, not
+      silence. The optional `resolveApprovedPlan` (agentId → approved
       `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
-      agent→approved-plan binding exists yet. **The whole optional tail is now data**:
+      agent→approved-plan binding exists yet. The optional `osvSnapshot` is likewise **absent in the
+      daemon**, and for a stated reason: the advisory database is bundled (a review-time network call is a
+      rejection trigger), so the embedded `OsvSnapshot.Default` IS the production answer and its ageing is
+      surfaced to the reviewer rather than hidden. **The whole optional tail is now data**:
       `WiredOptionalControls` (a set of the argument names actually passed) plus `AuditLog`, asserted
       EXACTLY at the composition root — measured, deleting `audit:`/`log:`/`publishAgentRef:` from
       `GatewayServiceRegistration` left 504 tests green, and each substitutes a weaker behaviour silently
@@ -1152,7 +1164,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       SecuritySensitivePath}); `DetectFlagged(mergeDiff, approvedPlan?, managed)` → the full must-ack
       `FlaggedChange` set incl. the F6 `out-of-approved-scope` item for a managed worker touching a file
       outside its `TaskPlan.Scope` (plan-less runs skip the scope compare); `FromLockfileDeltas` folds
-      §3.6 CVE/script rows in; plus the pure `ScopeMatcher` glob (`**`/`*`/`?`)).
+      §3.6 CVE/script/advisory-unknown rows in by delegating to `Review.LockfileReview.ItemsFor` — one
+      definition, so the cockpit-composed and daemon-armed sets cannot disagree; plus the pure
+      `ScopeMatcher` glob (`**`/`*`/`?`)).
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
       item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has

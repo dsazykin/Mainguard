@@ -104,41 +104,18 @@ public static class FlaggedChangeDetector
 
     /// <summary>
     /// Turns semantic lockfile delta rows into flagged items (P2-11 §3.6): a script-bearing add or a
-    /// CVE-hit row becomes a dedicated must-ack item. Composed in by the cockpit, which owns the lockfile
-    /// old/new text.
+    /// CVE-hit row becomes a dedicated must-ack item, and a row whose advisory status could not be
+    /// established becomes a <see cref="FlaggedKind.LockfileAdvisoryUnknown"/> one.
+    ///
+    /// <para>Delegates to <see cref="LockfileReview.ItemsFor"/> — the definition lives beside the semantic
+    /// diff in <c>Mainguard.Git</c> because the DAEMON is what arms the gate (see
+    /// <c>MergeQueueProvisioner.ArmFlaggedChangeReview</c>), and the daemon's merge path must not have to
+    /// reach up into the orchestrator assembly to classify a blob it already holds. This overload stays as
+    /// the composed-by-the-cockpit entry point it always was, so the two can never disagree.</para>
     /// </summary>
-    public static IReadOnlyList<FlaggedChange> FromLockfileDeltas(string lockfilePath, IReadOnlyList<DependencyDelta> deltas)
-    {
-        var items = new List<FlaggedChange>();
-        if (deltas is null)
-        {
-            return items;
-        }
-
-        foreach (var delta in deltas)
-        {
-            if (delta.CveIds.Count > 0)
-            {
-                items.Add(new FlaggedChange(
-                    lockfilePath,
-                    RiskCategory.Lockfile,
-                    FlaggedKind.LockfileCve,
-                    AcknowledgmentStore.HashContent($"{lockfilePath}|{delta.Name}|{delta.NewVersion}|{string.Join(",", delta.CveIds)}"),
-                    $"{delta.Name} {delta.NewVersion} — known CVE: {string.Join(", ", delta.CveIds)}"));
-            }
-            else if (delta.InstallScripts)
-            {
-                items.Add(new FlaggedChange(
-                    lockfilePath,
-                    RiskCategory.Lockfile,
-                    FlaggedKind.LockfileScript,
-                    AcknowledgmentStore.HashContent($"{lockfilePath}|{delta.Name}|{delta.NewVersion}|install-scripts"),
-                    $"{delta.Name} {delta.NewVersion} declares install scripts (code runs at install)"));
-            }
-        }
-
-        return items;
-    }
+    public static IReadOnlyList<FlaggedChange> FromLockfileDeltas(
+        string lockfilePath, IReadOnlyList<DependencyDelta> deltas, string snapshotReason = "")
+        => LockfileReview.ItemsFor(lockfilePath, deltas, snapshotReason);
 
     // The highest-risk (lowest-rank) category among the file's hunks, and whether it is flag-worthy.
     private static RiskCategory TopCategory(string path, FilePatch patch, out bool isFlagWorthy)

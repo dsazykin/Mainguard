@@ -178,7 +178,17 @@
   `ChangedTestCommand_ShouldBlockCanMergeUntilAcked` RT-D2 panel half, `ScopeMatcher` globs),
   `AcknowledgmentTests` (hash-change invalidation, unrelated-file hash-unchanged, item-by-item gate
   composition + events, global-ack-impossible-by-construction), `LockfileSemanticDiffTests`
-  (per-ecosystem delta + install-scripts + offline OSV CVE), `TestDeltaParserTests` (TRX/pass-fail →
+  (per-ecosystem delta + install-scripts + offline OSV CVE; plus
+  `TheShippedOsvSnapshot_IsLoadable_AndStillWithinItsMaxAge` — a deliberate maintenance alarm, since a
+  BUNDLED advisory database ages silently and the only symptom would be every review quietly reporting
+  "not checked"; and `AnUnusableSnapshot_MarksIntroducedRowsUnchecked_RatherThanClean` — a missing or
+  stale snapshot sets `AdvisoriesChecked=false` instead of an empty CVE list, while a *removal* stays
+  checked because it introduces nothing), `LockfileReviewCostTests` (**what the §3.6 review costs on the
+  MERGE path**, since it runs at every verification: a 5,000-package `package-lock.json` (556 KB/side)
+  parses both sides and diffs them in **~75 ms**, printed to test output; the assertion is a loose ~40x
+  bound — a shape check against an accidental O(n²), not a wall-clock measurement — plus the proof that
+  an over-`MaxManifestBytes` manifest is refused as an **unknown item, not skipped**),
+  `TestDeltaParserTests` (TRX/pass-fail →
   new-fail/new-pass), `ReviewCockpitViewModelTests` (risk-ordering-reorders-never-hides, provenance
   present/absent, `BringBranchLocal` T-29 round-trip, review-sprint deferred→unviewed, flagged-gate
   blocks merge), `Integration/PoisonedBranchGateTests` (`PoisonedBranch_EndToEnd` — poisoned
@@ -1395,7 +1405,20 @@
   the poisoned-executable-config arm (live today; it needs no plan), one-item-acked-leaves-the-other-
   blocking, an unknown item id clears nothing, and the fail-open guard: acknowledging for an agent
   whose review never ran must not CREATE its store, since an empty store reads as fully acknowledged
-  and would bypass the MG-40 default-DENY)**. **`Gateway/`** (TI-P2-08): `Fake429EndpointTests` (invariant #1 end-to-end —
+  and would bypass the MG-40 default-DENY)**, `LockfileAdvisoryCockpitTests` (**P2-11 §3.6 — the
+  *semantic* lockfile review reaches the cockpit.** A lockfile change used to be flagged by PATH only:
+  which package was added, whether it carries an advisory and whether it ships install scripts were
+  computed nowhere in the running product, because the one property that would have carried them —
+  `ReviewCockpitContext.LockfileFlags` — is read solely on the local composition branch the shipped app
+  never takes. Every hop is real (bare mirror → agent branch → production `MergeQueueProvisioner` →
+  in-proc daemon → `DaemonBackedOrchestrator` projection → `ReviewCockpitViewModel`), and the cockpit is
+  handed an **empty** merge diff so any row in its panel provably came from the daemon. Cases: a CVE row
+  and an install-script row both surface and block until the cockpit's own acks reach
+  `MergeQueue.CanMerge`; a **missing** snapshot and a **three-year-old** one each surface a
+  `LockfileAdvisoryUnknown` row rather than silence — the same unknown-as-fine defect `RttMeasured` /
+  `CouldNotCheck` exist to prevent, since an omitted item is an acknowledged one; and the control that a
+  healthy snapshot raises no unknown row, without which an always-unknown gate would pass the other
+  two)**. **`Gateway/`** (TI-P2-08): `Fake429EndpointTests` (invariant #1 end-to-end —
   `FakeModelEndpoint` returns 429-then-200, the `GatewayForwarder` returns exactly one delayed 200,
   PTY paused then resumed, agent `RateLimited` then cleared, lease settled from the usage body),
   `GatewaySpendRpcTests` (budgets get/set round-trip + `StreamSpend`/snapshot totals reconcile, on a
