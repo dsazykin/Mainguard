@@ -863,10 +863,11 @@ public sealed class MergeQueueProvisioner
     ///
     /// <para><b>Cost.</b> Bounded before any parsing: only paths <see cref="LockfileReview.KindFor"/>
     /// recognises are read at all (two <c>git show</c>s each), and a manifest above
-    /// <see cref="LockfileReview.MaxManifestBytes"/> is refused rather than parsed. Measured on this
-    /// machine, a 5,000-package <c>package-lock.json</c> (~2 MB per side) parses both sides and diffs them
-    /// in ~90 ms — against a verification that runs a full test suite in a container, which is what this
-    /// method is already sitting inside.</para>
+    /// <see cref="LockfileReview.MaxManifestBytes"/> is refused rather than parsed. <b>Measured</b>
+    /// (<c>LockfileReviewCostTests</c>): a 5,000-package <c>package-lock.json</c>, 556 KB per side, parses
+    /// both sides and diffs them in ~75 ms — against a verification that runs a full test suite in a
+    /// container, which is what this method is already sitting inside. A branch touching no manifest pays
+    /// nothing beyond the path check.</para>
     ///
     /// <para><b>Fail-closed, like the rest of this review.</b> Every way of not knowing — an unreadable
     /// blob, an oversize manifest, a missing or stale advisory snapshot — produces a

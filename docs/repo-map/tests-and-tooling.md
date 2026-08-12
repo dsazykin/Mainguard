@@ -183,7 +183,12 @@
   BUNDLED advisory database ages silently and the only symptom would be every review quietly reporting
   "not checked"; and `AnUnusableSnapshot_MarksIntroducedRowsUnchecked_RatherThanClean` — a missing or
   stale snapshot sets `AdvisoriesChecked=false` instead of an empty CVE list, while a *removal* stays
-  checked because it introduces nothing), `TestDeltaParserTests` (TRX/pass-fail →
+  checked because it introduces nothing), `LockfileReviewCostTests` (**what the §3.6 review costs on the
+  MERGE path**, since it runs at every verification: a 5,000-package `package-lock.json` (556 KB/side)
+  parses both sides and diffs them in **~75 ms**, printed to test output; the assertion is a loose ~40x
+  bound — a shape check against an accidental O(n²), not a wall-clock measurement — plus the proof that
+  an over-`MaxManifestBytes` manifest is refused as an **unknown item, not skipped**),
+  `TestDeltaParserTests` (TRX/pass-fail →
   new-fail/new-pass), `ReviewCockpitViewModelTests` (risk-ordering-reorders-never-hides, provenance
   present/absent, `BringBranchLocal` T-29 round-trip, review-sprint deferred→unviewed, flagged-gate
   blocks merge), `Integration/PoisonedBranchGateTests` (`PoisonedBranch_EndToEnd` — poisoned
