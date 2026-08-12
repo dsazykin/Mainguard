@@ -404,6 +404,18 @@
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
   - `TerminalGrpcService` writes a read-only banner + defensively rejects input `data` frames for a
     `TerminalLockRegistry`-locked agent.
+  - **`Services/PrIntakeGrpcService.cs`** (P2-12: `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/
+    `SubscribePrIntakeSource` over the daemon's `IPrIntakeStore`, mapped in `DaemonHost.MapServices`
+    beside `MergeQueueGrpcService`. Validation + dispatch only. **`Update` persists, then re-READS and
+    answers with what was stored** — the store clamps the cadence and substitutes the default bot list
+    for an empty one, and echoing the request instead would show a human a cadence the poller is not
+    using. `Subscribe` persists then tells the LIVE `IExternalPrIntake` (idempotent on the store, so the
+    engine and the store cannot disagree and the source is polled without waiting for a restart to
+    re-seed it); an incomplete source is `INVALID_ARGUMENT`, because a row with no repository can never
+    resolve and would be skipped silently forever. Both writes are on `RoleInterceptor`'s
+    coordinator-denied list — subscribing provisions jails. **Why it exists:** the App had a complete
+    intake settings dialog with nowhere real to write, so the feature was unconfigurable; the daemon owns
+    the configuration because the daemon is what polls and provisions.)
   - **`Services/PlanApprovalGrpcService.cs`** (P2-14: `StreamPlans`/`ApprovePlan`/`RejectPlan` over the
     daemon `PlanApprovalService`; **`ApprovePlan` resolves the approver via `IApproverIdentityResolver`
     from the connection — the request has no identity field**, SA-1/F2) and
