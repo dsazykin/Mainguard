@@ -125,8 +125,10 @@ public static class LockfileReview
             };
         }
 
-        var deltas = LockfileSemanticDiff.Parse(oldText, newText, kind, osv, asOf);
+        // Resolved once: the snapshot that answers the CVE column and the snapshot whose refusal is quoted
+        // to the reviewer have to be the same object, or the item could explain a check that never ran.
         var snapshot = osv ?? OsvSnapshot.Default;
+        var deltas = LockfileSemanticDiff.Parse(oldText, newText, kind, snapshot, asOf);
         snapshot.CanAnswerAt(asOf ?? DateTimeOffset.UtcNow, out var snapshotReason);
         return ItemsFor(path, deltas, snapshotReason);
     }
@@ -179,18 +181,21 @@ public static class LockfileReview
         // ONE unknown item per lockfile rather than one per dependency. A snapshot that cannot answer cannot
         // answer for anything, so a row per package would turn a single fact into hundreds of identical
         // must-ack rows — which is how a gate stops being read.
-        var unchecked_ = deltas.Where(d => d.AdvisoryStatusUnknown).ToList();
-        if (unchecked_.Count > 0)
+        var unverified = deltas.Where(d => d.AdvisoryStatusUnknown).ToList();
+        if (unverified.Count > 0)
         {
+            var one = unverified.Count == 1;
             var why = snapshotReason.Length > 0
                 ? snapshotReason
                 : "the offline advisory snapshot could not answer";
+
             items.Add(Unknown(
                 path,
-                $"{unchecked_.Count} added or updated dependenc{(unchecked_.Count == 1 ? "y" : "ies")} "
-                + $"({Sample(unchecked_)}) {(unchecked_.Count == 1 ? "was" : "were")} NOT checked for known "
-                + $"advisories — {why}",
-                "snapshot|" + string.Join(",", unchecked_.Select(d => $"{d.Name}@{d.NewVersion}"))));
+                $"{unverified.Count} added or updated dependenc{(one ? "y" : "ies")} ({Sample(unverified)}) "
+                + $"{(one ? "was" : "were")} NOT checked for known advisories — {why}",
+                // The seed names every unchecked package, so landing a different dependency produces a
+                // different hash and drops the acknowledgment that covered the old set (invariant 2).
+                "snapshot|" + string.Join(",", unverified.Select(d => $"{d.Name}@{d.NewVersion}"))));
         }
 
         return items;
