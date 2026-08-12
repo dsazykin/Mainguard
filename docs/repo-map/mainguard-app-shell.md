@@ -586,7 +586,13 @@
     `FlaggedChangeGate`'s `AcknowledgmentStore` + the RT-D2 `ChangedTestCommandGate` item, the
     test-delta strip, `CanMerge`-gated Merge + T-29 `BringBranchLocal`, and review-sprint mode
     (j/k/a/space + risk budget → `ViewedStateEvent`s, unviewed for deferred hunks for P2-38); the
-    `SeverityVocabulary` glyph map is a rendering-only projection — no rule logic),
+    `SeverityVocabulary` glyph map is a rendering-only projection — no rule logic. Two notes on the
+    LIVE panel: `KindOf` reads the `FlaggedKind` out of the item id (`kind|path|hash`, which is where
+    the daemon's own kind travels) — it used to parse the `Category` string, a `RiskCategory` name, so
+    every daemon-flagged row but one arrived mislabelled `RiskCategory`; and
+    `ReviewCockpitContext.LockfileFlags` is **local-composition only** — production always supplies
+    `live:`, so the §3.6 lockfile rows are armed daemon-side by
+    `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection),
     `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel` (P2-14 conversation + the
     TaskPlan approval card; Approve is the panel's accent — **retained but no longer mounted on the
     coordinator surface, which is the inline terminal now**), `AgentDocumentViewModel` +
