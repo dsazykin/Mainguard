@@ -842,6 +842,26 @@ Contract summary (strategy §G-7.5, binding, with the market promotion of plan-a
 
 ## P2-15 — Tamper-evident audit log (H-8.2, pulled forward)
 
+> **STATUS AS OF 2026-08-11: NOT STARTED.** Verified across every branch. The only implementation of
+> `IAuditLog` is `InMemoryAuditLog` — a `List<AuditEvent>` that dies with the process. There is no hash
+> chain, no `PrevHash`, no persistence, no `mainguardd audit verify`, and no SIEM export anywhere in the
+> tree. `IAuditLog.cs`'s own doc comment still describes this task in the future tense.
+>
+> **What that costs today, measured:** 28 `IAuditLog.Append` call sites across 13 production files —
+> `plan_approved` with the approving identity, `egress_denied`, the kill-switch events, seven in
+> `MergeQueue`, eight in `ExternalPrIntake` — and `Read()` has **zero** production callers. No RPC exposes
+> it and no ViewModel renders it. Every audit event this product writes is appended to an object nobody
+> can read and nothing outlives the daemon process.
+>
+> The operative rule until this ships, recorded in `IAuditLog.Read`'s doc comment: **an `Append` is never
+> the user-visible record of anything.** Every destructive path must pair its audit call with a log line
+> or a typed refusal the user actually sees. Three paths added in August 2026 follow that rule; anything
+> new must too.
+>
+> *Recorded because this task was twice believed complete when it was not — once in a deferral note
+> ("until P2-15…") that read as though P2-15 were imminent, and once by the owner directly. The doc now
+> states the code's actual state so the next reader does not have to re-derive it.*
+
 **Milestone:** M7.5 — target **before 2026-08-02** (EU AI Act enforcement window) · **Priority:** P0 for enterprise, P1 overall · **Depends on:** P2-14 approval records exist; start once P2-10 is merged.
 
 > **Scope split (2026-07-07):** ship the **evidence pack** first — hash chain + authorizing identity + `mainguardd audit verify` + the P2-16 SIEM feed; RFC 3161 external anchoring (step 3) may land as a fast-follow. Claims language is "audit-grade / tamper-evident": Article 12 mandates automatic logging and traceability, **not** cryptography — hash-chaining is the differentiator, not a legal checkbox. Standalone audit vendors (Agent Audit, Asqav, Compliora) prove the demand but none can attribute actual code changes — the Git side is unclaimed.
