@@ -36,6 +36,14 @@ public interface IProToolsSurface
     /// <summary>Settings → Daemon Logs: the read-only recent-daemon-logs page content.</summary>
     object CreateDaemonLogsPage();
 
+    /// <summary>Settings → PR Intake: the external-PR-intake configuration page content — the poll
+    /// cadence, the shared bot-author list and the subscribed repositories.
+    ///
+    /// <para>All of it is DAEMON state, edited over gRPC: the daemon runs the poll loop and provisions a
+    /// sandbox per intake'd pull request, so it owns the configuration and the App is its client. That is
+    /// also why the page shipped unreachable — it had a complete dialog and nowhere real to write.</para></summary>
+    object CreatePrIntakePage();
+
     /// <summary>Settings → Mainguard OS: the repo-onboarding + rebuild-sandbox-images page content,
     /// parented to <paramref name="owner"/> for its folder-picker dialogs. <c>null</c> if the factory
     /// seam isn't wired (mirrors the pre-migration null-tolerant behavior).</summary>

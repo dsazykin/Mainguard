@@ -85,6 +85,12 @@ public partial class SettingsViewModel : ViewModelBase
                 proTools.CreateAgentClisPage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("Toolchains", "Toolchains", "TerminalIcon",
                 proTools.CreateToolchainsPage, ActivateRow));
+            // External-PR intake (P2-12). It sits next to the agent-platform pages because that is what
+            // it configures: an intake'd pull request becomes a jailed worker and a merge-queue entry
+            // exactly like a local agent. Before this row the feature's settings surface existed as an
+            // orphaned Window nothing constructed, so intake was unconfigurable in the shipped app.
+            Pages.Add(new SettingsPageRowViewModel("PrIntake", "PR Intake", "PullRequestIcon",
+                proTools.CreatePrIntakePage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("MainguardOs", "Mainguard OS", "FolderIcon",
                 () => proTools.CreateMainguardOsPage(OwnerWindow!) ?? new object(), ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("DaemonLogs", "Daemon Logs", "TerminalIcon",
