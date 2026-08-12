@@ -43,3 +43,33 @@ public class PrIntakeHeadRow
     /// <summary>The last head SHA materialized as <c>agent/pr-&lt;n&gt;</c>.</summary>
     public string SeenHeadSha { get; set; } = string.Empty;
 }
+
+/// <summary>
+/// The daemon's external-PR-intake configuration — the knobs that are not per-source: whether intake
+/// polls at all, how often, and the shared bot-author allow-list. <b>Exactly one row</b> (Id 1): this is
+/// daemon-wide state, not per-repo, and the store upserts it by that constant.
+///
+/// <para>It lives in the DAEMON database next to the subscriptions and seen heads because the daemon is
+/// the process that acts on it — it runs the poll loop and provisions the jail each intake'd PR needs.
+/// Keeping a second copy in App-local settings would give the settings page somewhere to write that the
+/// poller never reads, which is a settings screen that lies.</para>
+/// </summary>
+public class PrIntakeConfigRow
+{
+    /// <summary>Primary key. Always <c>1</c> — a singleton row.</summary>
+    public long Id { get; set; }
+
+    /// <summary>False parks the poll loop (it keeps running and materializes nothing), so intake can be
+    /// switched off without unsubscribing every source.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>The scheduler cadence in seconds. Clamped on read AND write by
+    /// <c>PrIntakeSettings.Normalized</c> — a persisted row is not a trusted input, and a zero here would
+    /// be a hot loop against a rate-limited host API.</summary>
+    public int PollIntervalSeconds { get; set; } = 60;
+
+    /// <summary>The shared bot-author allow-list, comma-separated (one column rather than a child table:
+    /// it is a short, order-insignificant list of literals that is always read and written whole).
+    /// Empty means "use the intake's compiled-in default bot list".</summary>
+    public string BotAuthors { get; set; } = string.Empty;
+}
