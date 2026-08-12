@@ -104,6 +104,8 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   rework: its methods used to each be `Task ManageXAsync(Window owner)` — open a dialog; the page
   factories now — `CreateAiProvidersPage`, `CreateAgentClisPage`, `CreateToolchainsPage` (the
   user-managed language-toolchain page, added with the toolchain channel), `CreateDaemonLogsPage`,
+  `CreatePrIntakePage` (P2-12 external-PR intake — all daemon state, edited over gRPC; the page it
+  builds had shipped as an orphaned `Window` nothing constructed, so intake was unconfigurable),
   `CreateMainguardOsPage(Window owner)` — just construct and return the page's content ViewModel as
   opaque `object`, the same `object?`-through-`ViewLocator` pattern
   `IAgentPlatformSurface.AgentRailContent`/`CreateResourceMonitor` already used, since

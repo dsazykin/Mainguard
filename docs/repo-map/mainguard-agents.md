@@ -1231,9 +1231,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       host OS keychain and is never copied into the VM. It performs no host call of its own — it delegates
       to the same executor the GUI runs, so there is one answer to "how does an upstream PR merge"; if it
       is ever wired it must contend for the daemon's single `IMergeLeaseStore`.) `PrIntakeStore.cs`
-      (`IPrIntakeStore` — subscriptions + seen head SHAs + tracked-PR set;
+      (`IPrIntakeStore` — subscriptions + seen head SHAs + tracked-PR set **+ the daemon's
+      `PrIntakeSettings`** (`Enabled`, `PollIntervalSeconds`, `BotAuthors`, with `Normalized()` clamping
+      the cadence to [10,3600] and substituting `DefaultBotAuthors` for an empty list — a stored row is
+      not a trusted input and a zero cadence is a hot loop);
       `InMemoryPrIntakeStore`/`DbPrIntakeStore`, the P2-10 daemon-store shape). Models
-      `PrIntakeSubscriptionRow`/`PrIntakeHeadRow` (`Models/PrIntakeRows.cs`).
+      `PrIntakeSubscriptionRow`/`PrIntakeHeadRow`/`PrIntakeConfigRow` (`Models/PrIntakeRows.cs`;
+      the config row is a SINGLETON at `Id = 1` — intake config is daemon-wide, not per-repo).
+      **The engine READS those settings, it does not hold them:** `ExternalPrIntake.Settings` /
+      `AuthorFilters` / `PollInterval` are store reads (once per poll, passed down so one cycle judges
+      every source against one configuration), and `RunAsync` re-reads the cadence each iteration. They
+      were settable properties nothing in production ever assigned, which is what made the feature
+      unconfigurable and what let a settings surface change nothing. `PollOnceAsync` returns immediately
+      when `Enabled` is false — no list call at all, subscriptions untouched.
   - **`Agents/Orchestrator/` (P2-14 plan approval + dual-mode orchestration — the governance spine,
     daemon-side, no UI).**
     - `TaskPlan.cs` (the pure `TaskPlanSchema.Validate(json)` → `TaskPlanValidationResult` with the **full

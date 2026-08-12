@@ -67,7 +67,18 @@
     says whether a run is really executing, which the state alone cannot: state is persisted per
     transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
     with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
-    entries that need unsticking), `orchestrator.proto` (P2-14: `PlanApprovalService`
+    entries that need unsticking. **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
+    external-PR-intake configuration surface, hosted here because the intake is the queue's other feeder:
+    `GetPrIntakeSettings` (settings + persisted `PrIntakeSource` list), `UpdatePrIntakeSettings` and
+    `SubscribePrIntakeSource`. Deliberately NO `repo_handle` on any of them — intake config is
+    daemon-wide, and a subscription names an UPSTREAM `(host, owner, repo)` the daemon matches against
+    the repos it has provisioned at poll time. `UpdatePrIntakeSettings` echoes what was PERSISTED
+    (clamped cadence, defaulted bot list), never the request, so a client that renders the reply shows
+    what the poller actually runs on. Both writes are on the coordinator's denied list at
+    `RoleInterceptor`: subscribing is a provisioning act — it makes the daemon fetch PR heads and ask the
+    gated spawn chain for a jail per open bot PR — so an agent able to call it could manufacture queue
+    entries and jails, or widen the bot-author list until its own PRs were intake'd),
+    `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`

@@ -48,7 +48,10 @@ The all-editions base. Git logic goes here.
   see `IApproverIdentityResolver`. Migrations live in `Migrations/` (P2-10 adds
   `AddMergeQueue`; P2-12 adds `AddPrIntake` — the two intake tables + the `Origin` column; P2-13 adds
   `AddGatewayPerDayBudget` — the two per-day budget columns; `AddMergeQueueDiscardRecord` adds the
-  three discard columns).
+  three discard columns; `AddPrIntakeConfig` adds `PrIntakeConfig`, the intake's **singleton** (`Id = 1`,
+  `ValueGeneratedNever`) daemon-wide configuration row — `Enabled`, `PollIntervalSeconds` and a
+  comma-separated `BotAuthors`, read and written whole, which is why the author list is one column and
+  not a child table).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +

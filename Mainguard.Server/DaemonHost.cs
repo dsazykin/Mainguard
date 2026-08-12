@@ -442,6 +442,7 @@ public static class DaemonHost
         app.MapGrpcService<RepoSyncGrpcService>();
         app.MapGrpcService<GatewayGrpcService>();
         app.MapGrpcService<MergeQueueGrpcService>();
+        app.MapGrpcService<PrIntakeGrpcService>();
         app.MapGrpcService<PlanApprovalGrpcService>();
         app.MapGrpcService<KillSwitchGrpcService>();
         app.MapGrpcService<CoordinatorGrpcService>();

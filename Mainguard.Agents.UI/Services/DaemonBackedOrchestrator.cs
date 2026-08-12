@@ -308,6 +308,12 @@ public sealed class DaemonBackedOrchestrator :
     /// neither inspectable nor editable.</summary>
     public IEgressAllowlistGateway CreateEgressAllowlistGateway() => new DaemonEgressAllowlistGateway(_client);
 
+    /// <summary>The live external-PR-intake configuration seam over this adapter's DaemonClient — the
+    /// same factory shape as the two above. Without it the intake settings page had nothing to write to
+    /// except an in-process store the daemon never reads, which is why the page shipped with no way to
+    /// open it at all.</summary>
+    public IPrIntakeGateway CreatePrIntakeGateway() => new DaemonPrIntakeGateway(_client);
+
     /// <summary>Fix 2: raised when a spawned agent's CLI DIED on a host the default-deny proxy refused,
     /// so the operator can unblock it and retry. Fired from the agent-event pump thread (the consumer
     /// marshals to the UI thread).</summary>

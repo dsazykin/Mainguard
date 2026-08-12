@@ -708,6 +708,38 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.Budget ?? new Budget();
     }
 
+    // ---- P2-12 external-PR intake configuration ----
+
+    /// <summary>Reads the daemon's external-PR-intake configuration and its persisted subscriptions.</summary>
+    public async Task<GetPrIntakeSettingsResponse> GetPrIntakeSettingsAsync(
+        CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        return await client.GetPrIntakeSettingsAsync(new GetPrIntakeSettingsRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Writes the daemon's external-PR-intake configuration. Returns it AS PERSISTED (the daemon
+    /// clamps the interval and substitutes its default bot list for an empty one), so a caller that
+    /// renders the result is showing what the poller will actually run with.</summary>
+    public async Task<PrIntakeSettings> UpdatePrIntakeSettingsAsync(
+        PrIntakeSettings settings, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        var response = await client.UpdatePrIntakeSettingsAsync(
+            new UpdatePrIntakeSettingsRequest { Settings = settings }, CallOptions(ct, deadline));
+        return response.Settings ?? new PrIntakeSettings();
+    }
+
+    /// <summary>Subscribes one source. <c>Added</c> is false for an already-subscribed
+    /// <c>(host, owner, repo, filter)</c> — idempotent, never an error.</summary>
+    public async Task<SubscribePrIntakeSourceResponse> SubscribePrIntakeSourceAsync(
+        PrIntakeSource source, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        return await client.SubscribePrIntakeSourceAsync(
+            new SubscribePrIntakeSourceRequest { Source = source }, CallOptions(ct, deadline));
+    }
+
     // ---- P2-14 / P2-47 #9 coordinator conversation ----
 
     /// <summary>Streams the coordinator conversation snapshot-then-deltas.</summary>

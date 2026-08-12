@@ -118,8 +118,8 @@
     `MainWindowViewModel.RailSections`/`ActivateSection`.
     `SettingsViewModel.ActivatePage(pageId, focusHost)` builds and activates one of ~10 pages —
     **General**, **Keyboard Shortcuts**, **Accounts**, **SSH Keys**, **Git Profiles**, **AI
-    Providers**\[Pro], **Agent CLIs**\[Pro], **Toolchains**\[Pro], **Mainguard OS**\[Pro], **Daemon
-    Logs**\[Pro], **About** —
+    Providers**\[Pro], **Agent CLIs**\[Pro], **Toolchains**\[Pro], **PR Intake**\[Pro], **Mainguard
+    OS**\[Pro], **Daemon Logs**\[Pro], **About** —
     lazily and caches each row's Content; any page whose ViewModel is also `IDisposable` (currently only
     Daemon Logs) has its row's cache discarded on leaving so the next visit rebuilds fresh instead of
     reusing a disposed instance. The old small 440×560 single-screen dialog (pinned-top-menu-icon
@@ -231,9 +231,14 @@
       host list with per-row Remove + a git-host `defeats A6` marker, an A6 warning banner when any entry
       re-opens a git route, and an add-host form; design tokens only — no Docker/engine reference, reaches
       the daemon via the gateway seam).
-    - `PrIntakeSettingsView` (P2-12 External PR Intake settings window: a subscribe-a-repository form, the
-      poll interval + bot-author list, and the subscribed-sources list; design tokens + component classes
-      only, five-theme clean — paired with `PrIntakeSettingsViewModel`).
+    - `PrIntakeSettingsView` (P2-12 Settings **PR Intake** page: the intake on/off switch, poll interval,
+      bot-author list, a subscribe-a-repository form and the daemon's subscribed-sources list, plus a
+      daemon-refusal banner; design tokens + component classes only, five-theme clean — paired with
+      `PrIntakeSettingsViewModel`). **It is a `UserControl`, and that is the fix, not a detail:** it
+      shipped as a top-level `Window` with zero references anywhere in the repo — no menu, no button, no
+      test, no harness — so external PR intake had a complete settings dialog nothing could open, and a
+      `Window` cannot be hosted as `ContentControl.Content` either, so it could not have been dropped into
+      the Settings rail as-is.
   - Control-center integration (Lane E Part 3, revised 2026-07-11 — mock-backed,
     docs/design/ControlCenterDesign.md + VibeModeDesign.md): the coordinator surfaces live **inside
     MainWindow** behind its **section rail** (leftmost column: expandable/collapsible like the repo
@@ -683,9 +688,15 @@
     now it is wrapped by `MainguardOsPageViewModel`, the Settings **Mainguard OS** page, which
     additionally cancels an in-flight copy on `ISettingsPage.OnDeactivated` and adds
     `RebuildSandboxImagesCommand`), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
-    thin external-PR-intake settings surface over `IPrIntakeStore` — subscribe a
-    `(host, owner, repo, author-filter)` source (idempotent add), the configurable bot-author list +
-    poll interval; no daemon/host traffic, config only).
+    Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
+    subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
+    gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from
+    what the daemon PERSISTED (it clamps the cadence and defaults an empty bot list) and a refusal
+    populates `ErrorMessage` instead of claiming success. There is deliberately **no gateway-less
+    constructor**: it used to take the daemon's own `IPrIntakeStore` and default to an in-process one, so
+    the page could only ever have saved into something the daemon never reads. Reached from
+    `SettingsViewModel`'s `"PrIntake"` row via `IProToolsSurface.CreatePrIntakePage`, built over
+    `ProComposition.PrIntakeGatewayFactory`).
 - **`Controls/`** — custom-drawn controls.
   - `CommitGraphCanvas.cs` renders the commit graph (uses `Core/Graph`) and hosts right-click
     hit-testing;
@@ -808,6 +819,20 @@
     factory shape as `CreateTerminalGateway`; reached from `ControlCenterViewModel`'s
     `OpenEgressAllowlistCommand` — the coordinator toolbar's "Network…" button and the egress block
     prompt's "Manage allowlist…").
+  - `IPrIntakeGateway.cs` (P2-12: the App's seam to the **daemon-owned** external-PR-intake
+    configuration — `LoadAsync`/`SaveAsync`/`SubscribeAsync` over `PrIntakeConfiguration` +
+    `PrIntakeSourceItem`. `InMemoryPrIntakeGateway` (which calls `PrIntakeSettings.Normalized` rather
+    than re-typing the clamp) serves the render harness/preview only — deliberately not a default
+    anywhere, because a settings surface silently defaulting to storage the daemon never reads IS the
+    defect this seam exists to remove.)
+  - `DaemonPrIntakeGateway.cs` (the SHIPPED `IPrIntakeGateway`, over `PrIntakeService`'s
+    `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/`SubscribePrIntakeSource`. Stateless — every load is a
+    fresh read, and a save returns the daemon's PERSISTED values (clamped cadence, defaulted bot list),
+    never an echo of the request. Built via `DaemonBackedOrchestrator.CreatePrIntakeGateway()` (the same
+    factory shape as `CreateEgressAllowlistGateway`) or, for the Settings page, via
+    `ProComposition.PrIntakeGatewayFactory` over one lazy process-lifetime loopback `DaemonClient` —
+    Settings pages are cached and never disposed, so a client per page would leak an mTLS channel per
+    window open.)
   - `DockLayoutPersistence.cs` (P2-13: saves/restores a per-agent-kind `DockLayoutState` as versioned
     JSON under `%AppData%/Mainguard/workspace-layouts`; restore is total —
     absence/parse-failure/schema-drift falls back to the default layout, never throws).

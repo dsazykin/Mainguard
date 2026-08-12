@@ -1094,7 +1094,16 @@
   discard releases the worker ONCE and stops the PR being re-materialized** — materializing is re-asked
   on every poll and consulted no queue state, so a dropped-but-still-open PR kept its jail re-provisioned
   and held until it closed upstream, while its moved-head leg threw `Discarded → Working` out of the
-  swallowed per-PR catch and therefore re-threw forever without ever recording the head) and
+  swallowed per-PR catch and therefore re-threw forever without ever recording the head; **plus the
+  settings half:** the poll filters authors by the SAVED bot list rather than `DefaultBotAuthors`, the
+  saved cadence is followed live and clamped at both ends, a disabled intake makes **no list call at
+  all** while leaving subscriptions in place, and `DbPrIntakeStore` round-trips settings through real
+  SQLite as a single upserted row), `PrIntakeSettingsPageTests` (the page is REACHABLE — a `"PrIntake"`
+  row in `SettingsViewModel.Pages` under the agent platform and absent without it, which is the
+  assertion that would have failed for the whole life of the feature — the ViewModel has **no
+  gateway-less constructor** to fall back to, Save/Subscribe go through `IPrIntakeGateway` and re-render
+  from what came BACK, and a daemon refusal leaves `ErrorMessage` set and `StatusMessage` null rather
+  than a silent success) and
   `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
   API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
@@ -1422,7 +1431,17 @@
   `FakeModelEndpoint` returns 429-then-200, the `GatewayForwarder` returns exactly one delayed 200,
   PTY paused then resumed, agent `RateLimited` then cleared, lease settled from the usage body),
   `GatewaySpendRpcTests` (budgets get/set round-trip + `StreamSpend`/snapshot totals reconcile, on a
-  `ConfigureTestServices`-isolated in-memory host), `GatewayKeyCustodyTests` (MG-4/MG-20/MG-38 stage 1
+  `ConfigureTestServices`-isolated in-memory host), `PrIntakeSettingsRpcTests` (P2-12 — the intake
+  settings surface through a real in-proc daemon. **Neither test asserts a property changed:** one puts
+  a `DbPrIntakeStore` over a SQLite file the test names (the same `ConfigureTestServices` idiom, needed
+  because every `DaemonFixture` in a process resolves to ONE daemon DB, so "a second fixture" is not a
+  restart), writes over gRPC, disposes the host, and requires a **brand-new store over the same file**
+  to answer with the values — an implementation that merely held them in a singleton passes a same-host
+  round trip and fails this; a companion pins that the SHIPPED graph resolves `DbPrIntakeStore`, so the
+  durable path is the production one. The other requires the daemon's LIVE `IExternalPrIntake` — the
+  instance `PrIntakeHostedService` polls on — to reflect a write immediately, which is the anti-drift
+  half. Plus: `Update` echoes what was persisted rather than what was requested, subscribe is idempotent,
+  and an incomplete source is `INVALID_ARGUMENT`), `GatewayKeyCustodyTests` (MG-4/MG-20/MG-38 stage 1
   — the gateway credential-custody boundary: `AgentGatewayCredentials` mints an opaque per-agent
   `mg_sess_` token for the jail while the REAL provider key stays daemon-side, tokens are revoked on
   stop and cannot be replayed, `ModelProxyMiddleware` derives the calling agent from that

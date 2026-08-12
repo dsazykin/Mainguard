@@ -6,13 +6,73 @@ using Mainguard.Git.Models;
 namespace Mainguard.Agents.Agents.Orchestrator;
 
 /// <summary>
-/// The P2-12 intake persistence seam (daemon SQLite; in-memory in tests). Holds two durable facts:
-/// the set of <see cref="ExternalPrSource"/> subscriptions, and the last-seen head SHA per intake'd PR.
-/// Follows the same daemon-store shape as the P2-10 queue/verification stores (in-memory + Db behind one
-/// interface, a <c>Func&lt;AppDbContext&gt;</c> factory, a private lock).
+/// The daemon-owned external-PR-intake configuration: the knobs that are not per-source. Whether intake
+/// polls at all, how often it polls, and the shared bot-author allow-list an unfiltered source falls back
+/// to.
+///
+/// <para><b>Daemon-owned on purpose.</b> The daemon is what acts on these — it runs the poll loop, it
+/// provisions the jail an intake'd PR needs, it is the process that must still know the cadence after
+/// the App has been closed and reopened. A copy of this in App-local settings would be a settings screen
+/// that lies: the dialog would look saved and the poller would go on using its compiled-in defaults.
+/// So there is exactly one home for it, <see cref="IPrIntakeStore"/>, and the App reaches it over gRPC.</para>
+/// </summary>
+/// <param name="Enabled">False parks the poll loop: it keeps running but materializes nothing, so intake
+/// can be switched off without unsubscribing every source.</param>
+/// <param name="PollIntervalSeconds">The scheduler cadence. Clamped by <see cref="Normalized"/> — a zero
+/// here is a hot loop against a rate-limited host API, and a persisted row is not a trusted input.</param>
+/// <param name="BotAuthors">The allow-list a source with no <see cref="ExternalPrSource.AuthorFilter"/>
+/// of its own matches against. Empty falls back to <see cref="ExternalPrIntake.DefaultBotAuthors"/>
+/// rather than matching nothing: an empty list is far more likely to be a mis-save than a deliberate
+/// "subscribe to this repo and ignore every pull request on it".</param>
+public sealed record PrIntakeSettings(bool Enabled, int PollIntervalSeconds, IReadOnlyList<string> BotAuthors)
+{
+    /// <summary>The floor on <see cref="PollIntervalSeconds"/> (matches the settings page's minimum).</summary>
+    public const int MinPollIntervalSeconds = 10;
+
+    /// <summary>The ceiling on <see cref="PollIntervalSeconds"/> — one hour.</summary>
+    public const int MaxPollIntervalSeconds = 3600;
+
+    /// <summary>What a daemon that has never been configured runs with. <see cref="Enabled"/> is true
+    /// because that is the pre-settings behaviour: before this record existed, an intake with a
+    /// subscription polled. Making the default false would have switched a working feature off in the
+    /// same change that made it configurable.</summary>
+    public static PrIntakeSettings Default =>
+        new(true, 60, ExternalPrIntake.DefaultBotAuthors);
+
+    /// <summary>This record with out-of-range/empty values pulled back to something the poll loop can
+    /// safely run on. Applied on the way IN and on the way OUT, so neither a hand-edited row nor an old
+    /// client can hand the scheduler a tight loop.</summary>
+    public PrIntakeSettings Normalized() => new(
+        Enabled,
+        Math.Clamp(PollIntervalSeconds, MinPollIntervalSeconds, MaxPollIntervalSeconds),
+        BotAuthors is { Count: > 0 }
+            ? BotAuthors.Where(a => !string.IsNullOrWhiteSpace(a)).Select(a => a.Trim()).ToList() is { Count: > 0 } cleaned
+                ? cleaned
+                : ExternalPrIntake.DefaultBotAuthors
+            : ExternalPrIntake.DefaultBotAuthors);
+
+    /// <summary><see cref="PollIntervalSeconds"/> as the <see cref="TimeSpan"/> the scheduler delays for.</summary>
+    public TimeSpan PollInterval => TimeSpan.FromSeconds(PollIntervalSeconds);
+}
+
+/// <summary>
+/// The P2-12 intake persistence seam (daemon SQLite; in-memory in tests). Holds three durable facts:
+/// the set of <see cref="ExternalPrSource"/> subscriptions, the last-seen head SHA per intake'd PR, and
+/// the daemon's <see cref="PrIntakeSettings"/>. Follows the same daemon-store shape as the P2-10
+/// queue/verification stores (in-memory + Db behind one interface, a <c>Func&lt;AppDbContext&gt;</c>
+/// factory, a private lock).
 /// </summary>
 public interface IPrIntakeStore
 {
+    /// <summary>The daemon's intake configuration, or <see cref="PrIntakeSettings.Default"/> when it has
+    /// never been written. Always normalized.</summary>
+    PrIntakeSettings GetSettings();
+
+    /// <summary>Persists the daemon's intake configuration (normalized first). The ONE write path — the
+    /// settings RPC lands here and the poll loop reads the same row back, so the surface a human edits
+    /// and the loop that obeys it cannot drift.</summary>
+    void SaveSettings(PrIntakeSettings settings);
+
     /// <summary>Persists a subscription. Returns false (and stores nothing new) when the exact
     /// <c>(host, owner, repo, filter)</c> is already subscribed — the idempotent path (edge row 3).</summary>
     bool AddSubscription(ExternalPrSource source);
@@ -39,6 +99,24 @@ public sealed class InMemoryPrIntakeStore : IPrIntakeStore
     private readonly object _gate = new();
     private readonly List<ExternalPrSource> _sources = new();
     private readonly Dictionary<(string SourceKey, int PrNumber), string> _heads = new();
+    private PrIntakeSettings _settings = PrIntakeSettings.Default;
+
+    public PrIntakeSettings GetSettings()
+    {
+        lock (_gate)
+        {
+            return _settings;
+        }
+    }
+
+    public void SaveSettings(PrIntakeSettings settings)
+    {
+        if (settings is null) throw new ArgumentNullException(nameof(settings));
+        lock (_gate)
+        {
+            _settings = settings.Normalized();
+        }
+    }
 
     public bool AddSubscription(ExternalPrSource source)
     {
@@ -107,10 +185,61 @@ public sealed class DbPrIntakeStore : IPrIntakeStore
     private readonly Func<AppDbContext> _contextFactory;
     private readonly object _gate = new();
 
+    /// <summary>The primary key of the one configuration row. Intake settings are daemon-wide, not
+    /// per-repo, so this table holds exactly one row and an upsert targets it by a constant.</summary>
+    private const long ConfigRowId = 1;
+
     public DbPrIntakeStore(Func<AppDbContext> contextFactory)
     {
         _contextFactory = contextFactory ?? throw new ArgumentNullException(nameof(contextFactory));
     }
+
+    public PrIntakeSettings GetSettings()
+    {
+        lock (_gate)
+        {
+            using var db = _contextFactory();
+            var row = db.PrIntakeConfig.FirstOrDefault(c => c.Id == ConfigRowId);
+            if (row is null)
+            {
+                return PrIntakeSettings.Default;
+            }
+
+            return new PrIntakeSettings(
+                row.Enabled,
+                row.PollIntervalSeconds,
+                SplitAuthors(row.BotAuthors)).Normalized();
+        }
+    }
+
+    public void SaveSettings(PrIntakeSettings settings)
+    {
+        if (settings is null) throw new ArgumentNullException(nameof(settings));
+        var normalized = settings.Normalized();
+
+        lock (_gate)
+        {
+            using var db = _contextFactory();
+            var row = db.PrIntakeConfig.FirstOrDefault(c => c.Id == ConfigRowId);
+            if (row is null)
+            {
+                row = new PrIntakeConfigRow { Id = ConfigRowId };
+                db.PrIntakeConfig.Add(row);
+            }
+
+            row.Enabled = normalized.Enabled;
+            row.PollIntervalSeconds = normalized.PollIntervalSeconds;
+            row.BotAuthors = string.Join(",", normalized.BotAuthors);
+            db.SaveChanges();
+        }
+    }
+
+    /// <summary>The stored comma-separated author list back into a list. Empty yields an empty list,
+    /// which <see cref="PrIntakeSettings.Normalized"/> then turns into the default bot list.</summary>
+    private static IReadOnlyList<string> SplitAuthors(string? stored) =>
+        string.IsNullOrWhiteSpace(stored)
+            ? Array.Empty<string>()
+            : stored.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     public bool AddSubscription(ExternalPrSource source)
     {
