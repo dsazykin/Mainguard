@@ -38,6 +38,10 @@ public sealed class ProToolsSurface : IProToolsSurface
     {
         var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
         var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
+        // Same wiring as Wsl2AgentEnvironment's: no payload source, which is how the channel gets the
+        // production HTTPS fetch. This is the page whose Install button reported
+        // "curl: command not found" for the life of the feature — the VM has no curl, so the payload is
+        // fetched here and staged into the VM as verified bytes.
         var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host);
 
         // Second section: the four-step declaration flow, over the repository the shell currently has
