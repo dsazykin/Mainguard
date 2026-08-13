@@ -201,11 +201,13 @@ public partial class ToolchainDeclarationViewModel : ViewModelBase
     /// repository has never committed one.</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CommittedDeclarationDisplay))]
+    [NotifyPropertyChangedFor(nameof(DeclarationExistsNowhere))]
     private string? _committedDeclaration;
 
     /// <summary>The same path as it is ON DISK right now; null when the file does not exist.</summary>
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(WorkingTreeDeclarationDisplay))]
+    [NotifyPropertyChangedFor(nameof(DeclarationExistsNowhere))]
     private string? _workingTreeDeclaration;
 
     public string CommittedDeclarationDisplay =>
@@ -217,6 +219,22 @@ public partial class ToolchainDeclarationViewModel : ViewModelBase
         string.IsNullOrWhiteSpace(WorkingTreeDeclaration)
             ? $"No {DeclarationPath} exists in your working tree."
             : WorkingTreeDeclaration!.Trim();
+
+    /// <summary>
+    /// The declaration exists on NEITHER side: not in the last commit, not on disk. A distinct fact from
+    /// "the two sides agree", and the two must never be reported with the same sentence.
+    ///
+    /// <para>They were. <c>DeclarationHasUncommittedChange</c> is derived from the git-status entry for
+    /// the path, and a file that exists nowhere produces no status entry — so "absent everywhere" arrived
+    /// at the commit step's last clause looking exactly like "identical to the last commit", and the page
+    /// stated, in three consecutive lines, that nothing is committed, that nothing is in the working
+    /// tree, and that the two already match. The first two were true. Deriving this from the CONTENT the
+    /// snapshot already carries, rather than from the absence of a status entry, keeps the three lines
+    /// consistent with each other by construction — it is the same emptiness test the two display strings
+    /// above use, so the page cannot say "no file" and "already matches" at the same time again.</para>
+    /// </summary>
+    public bool DeclarationExistsNowhere =>
+        string.IsNullOrWhiteSpace(CommittedDeclaration) && string.IsNullOrWhiteSpace(WorkingTreeDeclaration);
 
     /// <summary>Uncommitted changes to anything OTHER than the declaration — the tree the commit step
     /// refuses to touch and will not stash.</summary>
@@ -643,11 +661,20 @@ public partial class ToolchainDeclarationViewModel : ViewModelBase
                   + $"and the toolchain declaration is only read from the default branch. Check out "
                   + $"'{DefaultBranch}' yourself — Mainguard will not switch branches for you."
                 : null)
+            // "It does not exist" comes BEFORE "your tree is dirty": when there is no file at all, the
+            // next thing this person has to do is press the first button, and saying anything else sends
+            // them to clean a working tree that was never in the way.
+            ?? (DeclarationExistsNowhere
+                ? $"There is nothing to commit — {DeclarationPath} does not exist yet, neither in the "
+                  + $"last commit on '{CurrentBranch}' nor in your working tree. Write it with the first "
+                  + "button above, then this step will commit exactly that file."
+                : null)
             ?? (OtherChangedPaths.Count > 0
                 ? $"Your working tree has {OtherChangedPaths.Count} other uncommitted "
                   + $"change{(OtherChangedPaths.Count == 1 ? "" : "s")} ({OtherChangedPathsSummary()}). "
                   + "Commit them or set them aside yourself — Mainguard will not stash or discard your work."
                 : null)
+            // Reached only when the file DOES exist on at least one side, so this really is a match.
             ?? (!DeclarationHasUncommittedChange
                 ? $"There is nothing to commit — {DeclarationPath} already matches the last commit on "
                   + $"'{CurrentBranch}'."

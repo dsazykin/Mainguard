@@ -7,12 +7,12 @@
         <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,*,Auto">
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="0,0,0,6">
-                <PathIcon Data="{StaticResource PullRequestIcon}" Width="18" Height="18"
-                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                <TextBlock Text="PR intake" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid Grid.Row="0" Margin="0,0,0,6" ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource PullRequestIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="PR intake" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
             <TextBlock Grid.Row="1" Margin="0,0,0,12" FontSize="12" TextWrapping="Wrap"
                        Foreground="{DynamicResource TextMuted}"
                        Text="Bot-authored pull requests on a subscribed repository enter the same verify → review → merge pipeline as local agents. These settings belong to the Mainguard daemon — it is what polls the host and gives each intake'd pull request its own sandbox — so they are read from and saved to it, and they keep applying with this window closed."/>

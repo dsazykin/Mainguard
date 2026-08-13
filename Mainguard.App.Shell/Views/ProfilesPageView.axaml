@@ -5,10 +5,10 @@
         x:DataType="vm:ProfilesPageViewModel">
     <StackPanel Spacing="15" DataContext="{Binding Inner}" x:DataType="vm:ProfilesViewModel" MaxWidth="640">
 
-        <StackPanel Orientation="Horizontal" Spacing="10">
-            <PathIcon Data="{StaticResource PersonIcon}" Width="18" Height="18" Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-            <TextBlock Text="Git Profiles" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-        </StackPanel>
+        <Grid ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource PersonIcon}" Width="18" Height="18" Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="Git Profiles" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
         <TextBlock Text="Switchable identities — apply one to write this repo's local user.name / user.email."
                    FontSize="12" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
 

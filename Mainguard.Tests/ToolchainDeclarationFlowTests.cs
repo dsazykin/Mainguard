@@ -195,6 +195,76 @@ public class ToolchainDeclarationFlowTests
         Assert.NotEqual(string.Empty, vm.CommitDisabledReason); // nothing left to commit — and it says so
     }
 
+    /// <summary>
+    /// FAILS BEFORE / PASSES AFTER. The owner's screenshot: no <c>.mainguard/toolchain</c> anywhere, and
+    /// the page said all three of these at once —
+    /// <list type="bullet">
+    ///   <item>Committed: "No .mainguard/toolchain is committed on this branch."</item>
+    ///   <item>Working tree: "No .mainguard/toolchain exists in your working tree."</item>
+    ///   <item>Step 2: "There is nothing to commit — .mainguard/toolchain already matches the last
+    ///         commit on 'master'."</item>
+    /// </list>
+    /// The third contradicts the first two. Its cause was that "the two sides are identical" and "there
+    /// is no file on either side" both arrived at the same clause: the flag behind it is derived from the
+    /// git-status entry for the path, and a file that exists nowhere produces no status entry.
+    ///
+    /// <para>So this pins the sentence for the absent-everywhere state AND pins that it does not claim a
+    /// match — the two halves matter separately, because the shipped string already contained the words
+    /// <c>nothing to commit</c> and the existing <see cref="NothingToCommit_ShouldSayExactlyThat"/>
+    /// asserted only those, which is why a false sentence passed a test named after it.</para>
+    /// </summary>
+    [Fact]
+    public async Task DeclarationAbsentEverywhere_ShouldSayItDoesNotExist_NotThatItMatchesTheLastCommit()
+    {
+        using var fx = new TempRepoFixture();
+        fx.CommitFile("a.txt", "seed\n", "seed");
+        RenameCurrentBranch(fx.RepoPath, "master");
+
+        var vm = NewViewModel(fx.RepoPath, out _);
+        await vm.RefreshAsync();
+
+        // The state under test: absent on both sides, and the page's own two lines say so.
+        Assert.Null(vm.CommittedDeclaration);
+        Assert.Null(vm.WorkingTreeDeclaration);
+        Assert.Contains("No " + DeclPath, vm.CommittedDeclarationDisplay, StringComparison.Ordinal);
+        Assert.Contains("No " + DeclPath, vm.WorkingTreeDeclarationDisplay, StringComparison.Ordinal);
+
+        Assert.False(vm.CommitCommand.CanExecute(null));
+
+        // It must not claim the file matches anything — there is no file to match with.
+        Assert.DoesNotContain("already matches", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("matches the last commit", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+
+        // It must say what is actually true, and point at the step that fixes it.
+        Assert.Contains("does not exist", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(DeclPath, vm.CommitDisabledReason, StringComparison.Ordinal);
+        Assert.Contains("first button", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The state the "already matches" wording is actually FOR: the declaration is committed and the disk
+    /// copy is identical. Written alongside the test above so the honest sentence keeps a test of its own
+    /// rather than being deleted with the false one.
+    /// </summary>
+    [Fact]
+    public async Task DeclarationIdenticalToTheLastCommit_ShouldStillSayItAlreadyMatches()
+    {
+        using var fx = new TempRepoFixture();
+        fx.CommitFile("a.txt", "seed\n", "seed");
+        RenameCurrentBranch(fx.RepoPath, "master");
+
+        var vm = NewViewModel(fx.RepoPath, out _);
+        await vm.RefreshAsync();
+        await vm.WriteFileCommand.ExecuteAsync(null);
+        await vm.CommitCommand.ExecuteAsync(null);
+
+        Assert.NotNull(vm.CommittedDeclaration);
+        Assert.NotNull(vm.WorkingTreeDeclaration);
+        Assert.False(vm.CommitCommand.CanExecute(null));
+        Assert.Contains("already matches the last commit", vm.CommitDisabledReason, StringComparison.Ordinal);
+        Assert.Contains("master", vm.CommitDisabledReason, StringComparison.Ordinal);
+    }
+
     [Fact]
     public async Task NothingToCommit_ShouldSayExactlyThat()
     {
