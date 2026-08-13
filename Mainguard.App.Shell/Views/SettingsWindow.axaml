@@ -37,7 +37,8 @@
 
             <!-- Content: resolves the active page's ViewModel through the app-wide ViewLocator, same
                  as MainWindow's own CurrentWorkspace/RailSections content areas. -->
-            <ScrollViewer Grid.Column="1" Padding="28,24">
+            <ScrollViewer Grid.Column="1" x:Name="PageScroller" Padding="28,24"
+                          HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
                 <ContentControl Content="{Binding ActivePageContent}"/>
             </ScrollViewer>
         </Grid>
