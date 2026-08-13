@@ -6,6 +6,7 @@ using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.Agents.Toolchains;
 using Mainguard.Agents.UI.ViewModels;
+using Mainguard.Tests.TestTools;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -77,9 +78,9 @@ public class ToolchainSettingsUiTests
     public async Task InstallFailure_ShouldNameTheCause_AndLeaveTheRowRetryable()
     {
         var fx = new Fixture();
-        // The VM's own sha256sum disagrees with the manifest pin — the corruption/interception case the
-        // pin exists to refuse.
-        fx.Host.CorruptChecksum = true;
+        // The bytes that arrive do not hash to the manifest pin — the corruption/interception case the
+        // pin exists to refuse. Checked on the host, so the refusal happens before the VM sees anything.
+        fx.Payloads.Corrupt = true;
         var vm = new ToolchainSettingsViewModel(fx.CreateChannel());
         await vm.RefreshCommand.ExecuteAsync(null);
 
@@ -91,6 +92,8 @@ public class ToolchainSettingsUiTests
         Assert.Contains("checksum", row.StatusMessage, StringComparison.OrdinalIgnoreCase);
         // Nothing was unpacked — the refusal is upstream of extraction, and the copy says so.
         Assert.Empty(fx.Host.Extracted);
+        // …and upstream of the VM entirely: the bytes never crossed the boundary.
+        Assert.Empty(fx.Host.Staged);
         Assert.True(row.CanInstall); // retryable in place, not a dead row
         Assert.True(vm.InstallCommand.CanExecute(row));
         Assert.False(vm.IsBusy);
@@ -239,8 +242,14 @@ public class ToolchainSettingsUiTests
     /// staged extraction, swap-into-place, version-matched probe, marker-written-last) runs unchanged.</summary>
     private sealed class Fixture
     {
-        public const string PythonSha = "1111111111111111111111111111111111111111111111111111111111111111";
-        public const string NodeSha = "2222222222222222222222222222222222222222222222222222222222222222";
+        public const string PythonUrl = "https://example.invalid/cpython-3.12.13.tar.gz";
+        public const string NodeUrl = "https://example.invalid/node-22.14.0.tar.gz";
+
+        // The REAL hash of the bytes the fake source serves. It has to be real: the channel hashes the
+        // payload it is holding, on the host, before the VM sees anything — so a fixture can no longer
+        // declare an arbitrary hex and have a fake VM agree with it.
+        public static readonly string PythonSha = FakeToolchainPayloadSource.Sha256For(PythonUrl);
+        public static readonly string NodeSha = FakeToolchainPayloadSource.Sha256For(NodeUrl);
 
         public readonly ToolchainManifest Manifest = ToolchainManifest.Parse($$"""
         {
@@ -279,9 +288,11 @@ public class ToolchainSettingsUiTests
 
         public readonly FakeHost Host = new();
 
+        public readonly FakeToolchainPayloadSource Payloads = new();
+
         public Fixture() => Host.Entries = Manifest.Entries;
 
-        public ToolchainChannel CreateChannel() => new(Host, Manifest);
+        public ToolchainChannel CreateChannel() => new(Host, Manifest, payloads: Payloads);
     }
 
     /// <summary>Fake VM: every command the channel issues, scripted by argv. A toolchain probes green at
@@ -296,7 +307,9 @@ public class ToolchainSettingsUiTests
         public readonly List<string> Extracted = new();
         public readonly List<string> WrittenFiles = new();
 
-        public bool CorruptChecksum;
+        /// <summary>Payload file names transferred into this fake VM. Empty means nothing crossed.</summary>
+        public readonly List<string> Staged = new();
+
         public bool FailRemove;
         public Exception? ThrowOnRun;
 
@@ -332,6 +345,11 @@ public class ToolchainSettingsUiTests
                     : new AdapterCommandResult(127, "", $"{argv0}: no such file or directory");
             }
 
+            // A real MainguardEnv has neither, and a fake that answered them is how a `curl`-based
+            // install path passed this whole file while failing every user. See MainguardEnvFacts.
+            if (MainguardEnvFacts.RefuseIfAbsent(argv0) is { } absent)
+                return absent;
+
             var id = IdIn(string.Join(' ', command));
             switch (argv0)
             {
@@ -348,15 +366,6 @@ public class ToolchainSettingsUiTests
                     }
 
                     return new AdapterCommandResult(0, "", "");
-
-                case "curl":
-                    return new AdapterCommandResult(0, "", "");
-
-                case "sha256sum":
-                    var hex = CorruptChecksum
-                        ? "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-                        : Entries.Single(e => e.Id == id).Sha256;
-                    return new AdapterCommandResult(0, $"{hex}  {command[^1]}", "");
 
                 case "tar":
                     Extracted.Add(id);
@@ -378,8 +387,11 @@ public class ToolchainSettingsUiTests
             return Task.CompletedTask;
         }
 
-        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
-            Task.FromResult($"{ToolchainPaths.VmStageDir}/{fileName}");
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+        {
+            Staged.Add(fileName);
+            return Task.FromResult($"{ToolchainPaths.VmStageDir}/{fileName}");
+        }
 
         /// <summary>The curated id named anywhere in a command line (ids are a narrow, unambiguous grammar).</summary>
         private string IdIn(string text) =>
