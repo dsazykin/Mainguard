@@ -10,11 +10,16 @@ namespace Mainguard.Tests.TestTools;
 /// </summary>
 public sealed class LinuxOnlyFactAttribute : FactAttribute
 {
-    public LinuxOnlyFactAttribute()
+    /// <param name="because">Why this one is Linux-only, when it is not the forkpty default — the skip
+    /// reason a human reads in the Windows run has to name the actual dependency, or a permanently
+    /// skipped test looks like a permanently passing one.</param>
+    public LinuxOnlyFactAttribute(string? because = null)
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            Skip = "Linux-only PTY test (forkpty). Runs in the Docker/Linux CI leg; skipped on this platform.";
+            Skip = because is null
+                ? "Linux-only PTY test (forkpty). Runs in the Docker/Linux CI leg; skipped on this platform."
+                : $"Linux-only: {because}. Runs in the Docker/Linux CI leg; skipped on this platform.";
         }
     }
 }
