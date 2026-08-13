@@ -5,10 +5,15 @@
         x:Class="Mainguard.App.Shell.Views.SettingsWindow"
         x:DataType="vm:SettingsViewModel"
         Title="Settings"
-        Width="880" Height="620"
-        MinWidth="720" MinHeight="480"
+        Width="1040" Height="700"
+        MinWidth="640" MinHeight="520"
         WindowStartupLocation="CenterOwner"
         Background="{DynamicResource SurfaceWindow}">
+    <!-- Size: the default is big enough for the widest page (Toolchains — four step cards, each a
+         paragraph beside a button) to read without crowding, and small enough to open whole on a
+         1366×768 display. The MINIMUM is measured, not guessed: SettingsWindowLayoutTests renders
+         every page at exactly this MinWidth and fails on a single clipped pixel. Every page still
+         survives at MinWidth 600; 640 keeps a margin. -->
     <Grid RowDefinitions="Auto,*">
         <CustomTitleBar Grid.Row="0"/>
         <Grid Grid.Row="1" ColumnDefinitions="220,*">
@@ -36,10 +41,17 @@
             </Border>
 
             <!-- Content: resolves the active page's ViewModel through the app-wide ViewLocator, same
-                 as MainWindow's own CurrentWorkspace/RailSections content areas. -->
-            <ScrollViewer Grid.Column="1" x:Name="PageScroller" Padding="28,24"
+                 as MainWindow's own CurrentWorkspace/RailSections content areas.
+
+                 The gutter is a Margin on the content, NOT Padding on the ScrollViewer: a
+                 ScrollContentPresenter measures its child against the full viewport and only then
+                 arranges it inside the padded rectangle, so every page used to be measured 56px wider
+                 than the width it was given and lost that much off its right edge — which is exactly
+                 how the Toolchains buttons ended up cut off at the window boundary. A Margin is
+                 subtracted during measure, so the page is sized for the room it actually has. -->
+            <ScrollViewer Grid.Column="1" x:Name="PageScroller"
                           HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
-                <ContentControl Content="{Binding ActivePageContent}"/>
+                <ContentControl x:Name="PageHost" Margin="28,24" Content="{Binding ActivePageContent}"/>
             </ScrollViewer>
         </Grid>
     </Grid>

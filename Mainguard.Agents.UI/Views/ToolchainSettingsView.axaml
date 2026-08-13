@@ -4,16 +4,16 @@
         xmlns:views="using:Mainguard.Agents.UI.Views"
         x:Class="Mainguard.Agents.UI.Views.ToolchainSettingsView"
         x:DataType="vm:ToolchainSettingsViewModel">
-    <Border Padding="0" MaxWidth="620">
+    <Border Padding="0" MaxWidth="760" HorizontalAlignment="Stretch">
         <Grid RowDefinitions="Auto,Auto,Auto,*,Auto">
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="0,0,0,6">
-                <PathIcon Data="{StaticResource TerminalIcon}" Width="18" Height="18"
-                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                <TextBlock Text="Language toolchains" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid Grid.Row="0" Margin="0,0,0,6" ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource TerminalIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="Language toolchains" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
             <TextBlock Grid.Row="1" Margin="0,0,0,12" FontSize="12" TextWrapping="Wrap"
                        Foreground="{DynamicResource TextMuted}"
                        Text="The languages your repositories can be built and tested in. Each installs at a pinned, checksum-verified version inside the Mainguard environment — never on your own system — and appears read-only in every new agent sandbox. A repository can ask for one by name; only you can put it here."/>
@@ -34,12 +34,12 @@
                     <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8"
                             Padding="14" IsVisible="{Binding HasLoadError}">
                         <StackPanel Spacing="10">
-                            <StackPanel Orientation="Horizontal" Spacing="10">
-                                <PathIcon Data="{StaticResource WarningIcon}" Width="16" Height="16"
+                            <Grid ColumnDefinitions="Auto,*">
+                                <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="16" Height="16" Margin="0,0,10,0"
                                           Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"/>
-                                <TextBlock Text="{Binding LoadError}" FontSize="12" MaxWidth="500"
+                                <TextBlock Grid.Column="1" Text="{Binding LoadError}" FontSize="12"
                                            Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
-                            </StackPanel>
+                            </Grid>
                             <Button Content="Try again" Classes="Primary" Padding="14,6" HorizontalAlignment="Right"
                                     Command="{Binding RefreshCommand}"/>
                         </StackPanel>
@@ -62,29 +62,30 @@
                                         </Panel>
 
                                         <StackPanel Grid.Column="1" Spacing="4" Margin="0,0,12,0">
-                                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                                <!-- MaxWidth bounds the measure so TextTrimming actually engages inside the
-                                                     horizontal StackPanel (unbounded, it would collide with the buttons). -->
-                                                <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
-                                                           Foreground="{DynamicResource TextPrimary}" MaxWidth="260"
+                                            <Grid ColumnDefinitions="*,Auto">
+                                                <!-- A star column, not a horizontal StackPanel: the name gets whatever is left
+                                                     after the version chip and trims there, instead of measuring unbounded and
+                                                     pushing the whole card past the window edge. -->
+                                                <TextBlock Grid.Column="0" Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
+                                                           Foreground="{DynamicResource TextPrimary}" Margin="0,0,8,0"
                                                            TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                                                <Border CornerRadius="999" Background="{DynamicResource AccentSelection}"
+                                                <Border Grid.Column="1" CornerRadius="999" Background="{DynamicResource AccentSelection}"
                                                         Padding="8,1" VerticalAlignment="Center">
                                                     <TextBlock Classes="Mono" Text="{Binding VersionLabel}" FontSize="10"
                                                                Foreground="{DynamicResource AccentBrush}"/>
                                                 </Border>
-                                            </StackPanel>
-                                            <TextBlock Text="{Binding Summary}" FontSize="11" MaxWidth="420"
+                                            </Grid>
+                                            <TextBlock Text="{Binding Summary}" FontSize="11"
                                                        Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
-                                            <TextBlock Text="Installed — it was just run at the pinned version" FontSize="11"
+                                            <TextBlock Text="Installed — it was just run at the pinned version" FontSize="11" TextWrapping="Wrap"
                                                        Foreground="{DynamicResource SuccessBrush}" IsVisible="{Binding IsInstalled}"/>
                                             <!-- What the probe actually printed: the proof behind "Installed". -->
-                                            <TextBlock Classes="Mono" Text="{Binding Detail}" FontSize="10" MaxWidth="420"
+                                            <TextBlock Classes="Mono" Text="{Binding Detail}" FontSize="10"
                                                        Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
                                                        IsVisible="{Binding ShowInstalledDetail}"/>
                                             <!-- Not installed — or installed as some OTHER version, which the channel
                                                  reports here as not installed, in words. -->
-                                            <TextBlock Text="{Binding NotInstalledDetail}" FontSize="11" MaxWidth="420"
+                                            <TextBlock Text="{Binding NotInstalledDetail}" FontSize="11"
                                                        Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
                                                        IsVisible="{Binding CanInstall}"/>
                                             <!-- Progress detail (muted) vs failure cause (icon + danger text). -->
@@ -97,13 +98,13 @@
                                                     </MultiBinding>
                                                 </TextBlock.IsVisible>
                                             </TextBlock>
-                                            <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding IsFailed}">
-                                                <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12"
+                                            <Grid ColumnDefinitions="Auto,*" IsVisible="{Binding IsFailed}">
+                                                <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12"
                                                           Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"
-                                                          Margin="0,2,0,0"/>
-                                                <TextBlock Text="{Binding StatusMessage}" FontSize="12" MaxWidth="420"
+                                                          Margin="0,2,6,0"/>
+                                                <TextBlock Grid.Column="1" Text="{Binding StatusMessage}" FontSize="12"
                                                            Foreground="{DynamicResource DangerBrush}" TextWrapping="Wrap"/>
-                                            </StackPanel>
+                                            </Grid>
                                         </StackPanel>
 
                                         <StackPanel Grid.Column="2" Spacing="6" VerticalAlignment="Center">
@@ -123,7 +124,7 @@
                     </ItemsControl>
 
                     <TextBlock Text="This Mainguard release curates no language toolchains — check for a Mainguard update."
-                               Foreground="{DynamicResource TextMuted}" FontSize="12" Margin="4,8"
+                               Foreground="{DynamicResource TextMuted}" FontSize="12" Margin="4,8" TextWrapping="Wrap"
                                IsVisible="{Binding ShowEmpty}"/>
 
                     <!-- Second section of the same page: declaring a toolchain in the OPEN repository.
@@ -138,7 +139,7 @@
             <Grid Grid.Row="4" ColumnDefinitions="*,Auto" Margin="0,15,0,0">
                 <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center"
                             IsVisible="{Binding IsBusy}">
-                    <TextBlock Text="Working — you can cancel anytime; a finished install stays."
+                    <TextBlock Text="Working — you can cancel anytime; a finished install stays." TextWrapping="Wrap"
                                FontSize="11" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="10">

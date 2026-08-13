@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Headless.XUnit;
 using Avalonia.VisualTree;
 using CommunityToolkit.Mvvm.Input;
@@ -55,6 +56,7 @@ public class SettingsWindowLayoutTests
         window.UpdateLayout();
 
         var scroller = window.GetControl<ScrollViewer>("PageScroller");
+        var host = window.GetControl<ContentControl>("PageHost");
 
         // The headless platform hands every window its own client size and ignores Window.Width, so the
         // minimum is applied to the content area directly: exactly the room the page has when the window
@@ -65,14 +67,14 @@ public class SettingsWindowLayoutTests
         scroller.Width = window.MinWidth - chromeWidth;
         scroller.Height = window.MinHeight - chromeHeight;
 
-        scroller.Content = page;
+        host.Content = page;
 
         // Twice: pass one settles text wrapping and reveals the vertical scrollbar, pass two lays the
         // content out inside the width that scrollbar leaves behind.
         window.UpdateLayout();
         window.UpdateLayout();
 
-        viewport = scroller.Viewport.Width - scroller.Padding.Left - scroller.Padding.Right;
+        viewport = host.Bounds.Width;
 
         var problems = new List<string>();
 
@@ -90,15 +92,27 @@ public class SettingsWindowLayoutTests
         //    fixed-width child inside a star column does: the Grid hands it less than it asked for and
         //    it draws over (or past) whatever is to its right.
         var right = page.Bounds.Width;
-        foreach (var visual in page.GetVisualDescendants().OfType<Visual>())
+        var stack = new Stack<Visual>(page.GetVisualChildren());
+        while (stack.Count > 0)
         {
+            var visual = stack.Pop();
             if (visual is Control { IsVisible: false }) continue;
-            if (visual.Bounds.Width <= 0 || visual.Bounds.Height <= 0) continue;
 
-            var corner = visual.TranslatePoint(new Point(visual.Bounds.Width, 0), page);
-            if (corner is null) continue;
-            if (corner.Value.X > right + Epsilon)
-                problems.Add(Describe(visual) + $" ends at {F(corner.Value.X)}, page is {F(right)} wide");
+            if (visual.Bounds.Width > 0 && visual.Bounds.Height > 0)
+            {
+                var corner = visual.TranslatePoint(new Point(visual.Bounds.Width, 0), page);
+                if (corner is { } c && c.X > right + Epsilon)
+                    problems.Add(Describe(visual) + $" ends at {F(c.X)}, page is {F(right)} wide");
+            }
+
+            // A container that scrolls sideways is the sanctioned way to hold something wide (a log, a
+            // long path): its content is CLIPPED and reachable, not lost off the window edge. So the
+            // container itself must fit, and what is inside it is its own business.
+            if (visual is ScrollViewer { HorizontalScrollBarVisibility: not ScrollBarVisibility.Disabled })
+                continue;
+
+            foreach (var child in visual.GetVisualChildren())
+                stack.Push(child);
         }
 
         window.Close();

@@ -18,18 +18,20 @@
 
         <StackPanel Spacing="10" IsVisible="{Binding HasAgentPlatform}">
             <TextBlock Text="Layout" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
-            <StackPanel Orientation="Horizontal" Spacing="8">
-                <Button Content="Flight Deck" Classes="Secondary" Padding="12,6" Command="{Binding SetLayoutCommand}" CommandParameter="FlightDeck"/>
-                <Button Content="Conversation Deck" Classes="Secondary" Padding="12,6" Command="{Binding SetLayoutCommand}" CommandParameter="ConversationDeck"/>
-            </StackPanel>
+            <!-- WrapPanel, like the Theme row above it: a horizontal StackPanel cannot reflow, so at a
+                 narrow window the second button is simply cut off instead of moving to the next line. -->
+            <WrapPanel>
+                <Button Content="Flight Deck" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetLayoutCommand}" CommandParameter="FlightDeck"/>
+                <Button Content="Conversation Deck" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetLayoutCommand}" CommandParameter="ConversationDeck"/>
+            </WrapPanel>
         </StackPanel>
 
         <StackPanel Spacing="10" IsVisible="{Binding HasAgentPlatform}">
             <TextBlock Text="Agent prompting" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
-            <StackPanel Orientation="Horizontal" Spacing="8">
-                <Button Content="Direct to agents" Classes="Secondary" Padding="12,6" Command="{Binding SetAgentPromptingCommand}" CommandParameter="Direct"/>
-                <Button Content="Through the Coordinator" Classes="Secondary" Padding="12,6" Command="{Binding SetAgentPromptingCommand}" CommandParameter="Coordinator"/>
-            </StackPanel>
+            <WrapPanel>
+                <Button Content="Direct to agents" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetAgentPromptingCommand}" CommandParameter="Direct"/>
+                <Button Content="Through the Coordinator" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetAgentPromptingCommand}" CommandParameter="Coordinator"/>
+            </WrapPanel>
         </StackPanel>
 
         <StackPanel Spacing="10">
