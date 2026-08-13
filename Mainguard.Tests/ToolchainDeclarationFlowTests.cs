@@ -10,6 +10,7 @@ using Mainguard.Agents.Agents.Toolchains;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.Git.Services;
 using Mainguard.Tests.Fixtures;
+using Mainguard.Tests.TestTools;
 using Xunit;
 using Repository = LibGit2Sharp.Repository;
 
@@ -474,7 +475,8 @@ public class ToolchainDeclarationFlowTests
     {
         var manifest = ToolchainManifest.Parse(ManifestJson);
         host.Entries = manifest.Entries;
-        return new ToolchainChannel(host, manifest);
+        // The payload source is what the channel fetches from — never `curl` in the VM, which has none.
+        return new ToolchainChannel(host, manifest, payloads: new FakeToolchainPayloadSource());
     }
 
     private static int CommitCount(string repoPath)
@@ -509,9 +511,16 @@ public class ToolchainDeclarationFlowTests
         repo.Refs.Add($"refs/remotes/{remote}/HEAD", target, allowOverwrite: true);
     }
 
+    private const string PayloadUrl = "https://example.invalid/cpython-3.12.13.tar.gz";
+
+    /// <summary>The REAL hash of the bytes the fake source serves. The channel hashes the payload it
+    /// holds, on the host, before the VM sees anything, so a fixture can no longer declare an arbitrary
+    /// hex and have a fake VM agree with it.</summary>
+    private static readonly string PayloadSha = FakeToolchainPayloadSource.Sha256For(PayloadUrl);
+
     // A one-entry manifest whose id is also in the sandbox catalog, so a declaration naming it parses
     // (the catalog is what ToolchainDeclarationResolver validates against).
-    private const string ManifestJson = """
+    private static readonly string ManifestJson = $$"""
     {
       "toolchains": [
         {
@@ -519,8 +528,8 @@ public class ToolchainDeclarationFlowTests
           "displayName": "Python 3",
           "summary": "CPython 3.12 with pip — runs a repository's Python test suite.",
           "version": "3.12.13",
-          "payloadUrl": "https://example.invalid/cpython-3.12.13.tar.gz",
-          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "payloadUrl": "{{PayloadUrl}}",
+          "sha256": "{{PayloadSha}}",
           "stripComponents": 1,
           "pathEntries": ["{toolchain}/bin"],
           "probe": {
@@ -561,6 +570,11 @@ public class ToolchainDeclarationFlowTests
                     : new AdapterCommandResult(127, "", $"{argv0}: no such file or directory");
             }
 
+            // A real MainguardEnv has neither curl nor wget; a fake that answers them is how the
+            // `curl`-based install path passed CI while failing every user. See MainguardEnvFacts.
+            if (MainguardEnvFacts.RefuseIfAbsent(argv0) is { } absent)
+                return absent;
+
             var id = IdIn(string.Join(' ', command));
             switch (argv0)
             {
@@ -568,9 +582,6 @@ public class ToolchainDeclarationFlowTests
                     if (command.Contains(ToolchainPaths.VmInstallDir(id)))
                         _present.Remove(id);
                     return new AdapterCommandResult(0, "", "");
-
-                case "sha256sum":
-                    return new AdapterCommandResult(0, $"{Entries.Single(e => e.Id == id).Sha256}  {command[^1]}", "");
 
                 case "mv":
                     _present[id] = Entries.Single(e => e.Id == id).Version;

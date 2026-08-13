@@ -34,8 +34,11 @@
     file committed and identical on disk the honest "already matches" wording is still asserted.
   - **`Mainguard.Tests/ToolchainSettingsUiTests.cs`** — the Settings **Toolchains** page (the human
     half of the user-managed toolchain channel) driven over a fake `IAdapterInstallHost` with the REAL
-    `ToolchainChannel`, so the shipped fetch → sha256-verify → unpack → run-it policy executes minus
-    the VM: the list's installed state comes from the PROBE, a toolchain that runs at the WRONG version
+    `ToolchainChannel` and a `FakeToolchainPayloadSource`, so the shipped fetch → sha256-verify →
+    stage → unpack → run-it policy executes minus the VM (the fixture's pinned sha is now the REAL
+    hash of the bytes the fake source serves — the channel hashes what it holds, so a fixture can no
+    longer declare an arbitrary hex and have a fake VM agree with it): the list's installed state
+    comes from the PROBE, a toolchain that runs at the WRONG version
     is reported as NOT installed (with both versions named), install flips the row and writes the
     registry marker LAST, an install refusal names its cause ("checksum") and leaves the row
     retryable + the command enabled, Remove flips the row back and RE-PROBES (a failed remove
@@ -44,6 +47,22 @@
     `AgentCliUiTests.Settings_Row*`: Install/Remove live on the parent but read ROW state, so the
     parent must bridge row `PropertyChanged` → `NotifyCanExecuteChanged()` or the buttons render
     visible and permanently dead.
+  - **`Mainguard.Tests/ToolchainInstallRealToolsTests.cs`** — the toolchain install against **real
+    programs on a real filesystem**, not a scripted host: real `mkdir`/`rm`/`mv`, real `tar` unpacking
+    a real gzipped tarball (with a leading directory, so `stripComponents` is exercised), real `tee` +
+    `base64 -d` doing the staging transfer exactly the way `WslAdapterInstallHost` does, and a real
+    executable answering the probe — the only substitution left is the network. **This is the file that
+    would have caught the `curl` bug:** the shipped install shelled `curl` into a VM that has no `curl`
+    and no `wget`, so every user install died at exit 127 while the suite stayed green, because each
+    fake host answered `curl` with exit 0. Also pins the premise (`packages.pinned.txt` really pins no
+    downloader — if that changes it is a decision to re-take, not a fact to discover from a failed
+    install) and that a payload failing the pin leaves an empty staging directory. `[LinuxOnlyFact]`:
+    the argv is POSIX, as it is inside the VM.
+  - **`Mainguard.Tests/TestTools/ToolchainPayloadFakes.cs`** — `MainguardEnvFacts` (the binaries a live
+    MainguardEnv does **not** have; every fake `IAdapterInstallHost` in the suite now answers them 127
+    the way the real VM does, so an install that shells out to something the environment lacks is a red
+    test rather than a user's exit code) + `FakeToolchainPayloadSource` (URL-derived bytes and the real
+    SHA-256 a manifest fixture must pin, plus `Corrupt`/`Throw` for the refusal paths).
   - **`Mainguard.Tests/Headless/ToolchainSettingsRenderHarness.cs`** — the Toolchains page in all five
     themes × list/declaration/declaration_min/installing/failure/loading/load-error →
     `artifacts_headless/toolchain_settings_<Theme>_<state>.png` (the `list` state deliberately includes
@@ -1844,7 +1863,10 @@
   toolchain end to end: the premise measured rather than assumed — the base image's own `python3` runs
   but CANNOT `import pip`, which is why a bare version probe would report a broken environment as
   healthy — then, gated behind `MAINGUARD_VERIFY_E2E=1`, a full install through the SHIPPED
-  `ToolchainChannel`, the in-jail probe answering at the pinned version, `command -v python3` proving the
+  `ToolchainChannel` **and the shipped `HttpsToolchainPayloadSource`** (its `LocalCommandHost` now
+  really stages the verified bytes through `base64 -d`; the throwing `StagePayloadAsync` it used to
+  carry was an instrument enforcing the in-VM-`curl` design that could not work), the in-jail probe
+  answering at the pinned version, `command -v python3` proving the
   declared toolchain WINS the PATH race against the base image's, and the repo's own
   `.mainguard/verify` running **GREEN when its pytest test passes and RED when it fails** — same jail,
   same toolchain, same command, only the test changed, because a verifier that cannot go red is not a
