@@ -38,6 +38,10 @@ public sealed class ProToolsSurface : IProToolsSurface
     {
         var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
         var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
+        // Same wiring as Wsl2AgentEnvironment's: no payload source, which is how the channel gets the
+        // production HTTPS fetch. This is the page whose Install button reported
+        // "curl: command not found" for the life of the feature — the VM has no curl, so the payload is
+        // fetched here and staged into the VM as verified bytes.
         var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host);
 
         // Second section: the four-step declaration flow, over the repository the shell currently has
@@ -60,6 +64,17 @@ public sealed class ProToolsSurface : IProToolsSurface
             new Mainguard.Agents.Agents.Bootstrap.WslRunner());
         return new DaemonLogsViewModel(reader);
     }
+
+    // PR Intake (P2-12): the external-PR-intake configuration — poll cadence, the shared bot-author
+    // list, and the subscribed repositories. Every one of those is DAEMON state, so the page is built
+    // over the daemon gateway seam and never over an App-side store: the daemon is what polls the host
+    // and what gives each intake'd pull request a sandbox, and a copy of these settings on this side
+    // would be a page that saves successfully and changes nothing.
+    //
+    // This is also what makes the surface reachable at all. It shipped as a complete top-level Window
+    // with zero references anywhere in the app — no menu, no button, no test — so external PR intake
+    // was, in practice, unconfigurable.
+    public object CreatePrIntakePage() => new PrIntakeSettingsViewModel(ProComposition.CreatePrIntakeGateway());
 
     // Mainguard OS (PR2 follow-up + Item 1 repair action): the post-setup repo-onboarding engine + the
     // user-triggered sandbox-image rebuild, combined into one page since Rebuild has no dialog of its

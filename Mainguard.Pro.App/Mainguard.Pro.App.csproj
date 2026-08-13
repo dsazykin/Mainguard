@@ -275,8 +275,16 @@
     <ItemGroup>
       <_ElevatedStageFiles Include="$(_ElevatedStageDir)**\*" />
     </ItemGroup>
-    <Warning Text="Elevated-components stage is empty at '$(_ElevatedStageDir)'; the published app cannot relocate its elevated helper out of the per-user install directory (MG-15) and will fall back to launching the co-located copy."
-             Condition="'@(_ElevatedStageFiles)' == ''" />
+    <!--
+      An EMPTY stage was a <Warning>, i.e. one line in a several-hundred-line publish log that nothing
+      reads and nothing gates. What it actually means is that the packaged app cannot relocate its
+      elevated helper out of the per-user install directory and will silently fall back to launching the
+      co-located copy — which is exactly the MG-15 escalation this stage exists to remove. The Exec above
+      already fails on a non-zero exit, so reaching here with no files means the publish "succeeded" and
+      wrote nothing: never a legitimate outcome. /p:BuildElevatedStage=false remains the deliberate opt-out.
+    -->
+    <Error Text="Elevated-components stage is empty at '$(_ElevatedStageDir)'; the published app cannot relocate its elevated helper out of the per-user install directory (MG-15) and would fall back to launching the co-located copy. Pass /p:BuildElevatedStage=false to skip the stage deliberately."
+           Condition="'@(_ElevatedStageFiles)' == ''" />
     <Copy SourceFiles="@(_ElevatedStageFiles)"
           DestinationFiles="@(_ElevatedStageFiles->'$(PublishDir)elevated-stage\%(RecursiveDir)%(Filename)%(Extension)')"
           SkipUnchangedFiles="true"

@@ -1,17 +1,10 @@
 /**
-<<<<<<< Updated upstream
  * The Mainguard mark: an M drawn as a gatehouse — two watchtowers flanking a
  * gate, with the main branch running safely through the opening beneath the
  * keystone. Drawn with the current theme's accent + lane colors.
  *
  * Interim programmatic version — swap the <svg> body for the crafted asset
  * when it lands, keeping the viewBox and CSS-variable strokes.
-=======
- * The Mainguard mark: an "M" drawn as a gatehouse — two watchtowers flanking a
- * gate, with the main branch running safely through the opening beneath the
- * keystone. The gatehouse strokes the current theme's accent; the branch line
- * strokes lane-3, so the mark re-themes live across all five palettes.
->>>>>>> Stashed changes
  */
 export function Wordmark({ size = 26, withText = true }: { size?: number; withText?: boolean }) {
   return (

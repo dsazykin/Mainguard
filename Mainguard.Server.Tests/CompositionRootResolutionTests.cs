@@ -59,25 +59,133 @@ public sealed class CompositionRootResolutionTests
     }
 
     /// <summary>
-    /// The stranded-branch check is actually wired into the daemon's provisioner.
+    /// The optional constructor tail of <see cref="MergeQueueProvisioner"/> is wired EXACTLY as the daemon
+    /// intends — every argument, not just the one that happened to get a test.
     ///
-    /// <para>It is an optional constructor argument that defaults to null, and null means the old
-    /// behaviour precisely: an agent whose work sits on a branch other than <c>agent/&lt;id&gt;</c> gets
-    /// verified against an empty branch and nothing anywhere says so. Every other test of the detection
-    /// passes its own callback, so dropping the one line in <c>GatewayServiceRegistration</c> would leave
-    /// them all green and the product unfixed — which is the exact failure mode this file exists for.</para>
+    /// <para>Each of those arguments defaults to something that silently substitutes a weaker behaviour, so
+    /// deleting its line from <c>GatewayServiceRegistration</c> leaves the product changed and the suite
+    /// green. That was measured: removing <c>audit</c>, <c>log</c> and <c>publishAgentRef</c> together left
+    /// 504 tests passing. Only <c>checkAgentBranch</c> had a guard, which is why it is the only one that
+    /// could not be deleted quietly — and one guard per control is exactly the pattern that produced four
+    /// unguarded controls. So this asserts the whole tail as a set, once.</para>
+    ///
+    /// <para>The comparison is EXACT in both directions. <c>resolveApprovedPlan</c> must stay absent (the
+    /// daemon has no agent→approved-plan binding to give it, and a guessed one would compare diffs against
+    /// the wrong scope and report that as enforcement); a new optional argument must fail here until
+    /// someone states whether the daemon passes it. What each name buys is documented on
+    /// <see cref="MergeQueueProvisioner.WiredOptionalControls"/>.</para>
     /// </summary>
     [Fact]
-    public void MergeQueueProvisioner_IsWiredToCheckWhichBranchAnAgentIsActuallyOn()
+    public void MergeQueueProvisioner_OptionalControlTail_IsWiredExactly()
+    {
+        using var host = new DaemonFixture();
+        var sp = host.Services;
+
+        var provisioner = sp.GetRequiredService<MergeQueueProvisioner>();
+
+        Assert.Equal(
+            new[]
+            {
+                "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
+                "publishAgentRef", "publishRebasedAgentRef", "yieldProtocolFor",
+            },
+            provisioner.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
+
+        // The four newest names compose ONE capability, and the set above cannot say whether they compose
+        // it correctly — three of four present is the re-verify-only cascade with extra arguments. This is
+        // the capability, asserted directly: does this daemon's stale cascade REPARENT a branch, or only
+        // re-run its tests against a main it no longer descends from? The second is the defect that let
+        // exactly one agent per repository ever merge.
+        Assert.True(provisioner.ReparentsStaleBranches);
+
+        // ...and `audit` must be the DAEMON's sink. A non-null audit log that is not this one is the null
+        // default's behaviour with an extra step: the queue's events go somewhere nothing can reach.
+        Assert.Same(sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>(), provisioner.AuditLog);
+    }
+
+    /// <summary>
+    /// The same assertion for the daemon's <see cref="KillSwitch"/>, which had none at all.
+    ///
+    /// <para>Production passed only <c>gate</c>, <c>target</c> and <c>audit</c>, and deleting even
+    /// <c>audit:</c> left the whole Kill-filtered suite green (11 passed) — so two of the remaining
+    /// defaults were live in the shipped daemon rather than hypothetical. <c>journal</c> defaulted to an
+    /// <c>InMemoryKillJournal</c> nothing held a reference to, which makes step 3's "snapshot written
+    /// BEFORE returning" write nowhere that survives the restart an emergency stop is followed by; and
+    /// <c>rttBudget</c> defaulted to a bare <c>() =&gt; TimeSpan.Zero</c>, which is indistinguishable from a
+    /// measured-healthy channel.</para>
+    /// </summary>
+    [Fact]
+    public void KillSwitch_OptionalControlTail_IsWiredExactly_AndItsJournalIsDurable()
+    {
+        using var host = new DaemonFixture();
+        var sp = host.Services;
+
+        var kill = sp.GetRequiredService<KillSwitch>();
+
+        Assert.Equal(
+            new[] { "audit", "journal", "onRttSpike", "rttBudget" },
+            kill.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
+
+        // The journal must be the durable, registered one — a snapshot in the killed process's heap is
+        // gone exactly when someone comes to read it.
+        Assert.IsType<JsonKillJournal>(kill.Journal);
+        Assert.Same(sp.GetRequiredService<IKillJournal>(), kill.Journal);
+
+        // ...and the audit events must land in the daemon's sink, not a throwaway.
+        Assert.Same(sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>(), kill.AuditLog);
+
+        // The A3 feed has somewhere to go the moment a measurement exists.
+        Assert.True(kill.ReportsRttSpike);
+    }
+
+    /// <summary>
+    /// The daemon's RT-D4 posture, pinned as a decision rather than left as a silent default.
+    ///
+    /// <para>There is no control-channel RTT to measure: P2-09's <c>IAgentControlChannel</c> has no
+    /// production transport and <c>SandboxKillTarget.RequestYieldAsync</c> answers <c>false</c> without a
+    /// round trip. The old default said that with <c>() =&gt; TimeSpan.Zero</c>, which a
+    /// <see cref="KillReport"/> cannot tell apart from a measured-healthy channel; the sentinel says it
+    /// out loud and stamps <c>RttMeasured: false</c> on the report and the journal snapshot.</para>
+    ///
+    /// <para><b>This test is expected to fail the day a real transport lands</b> — at which point the
+    /// person wiring the EWMA flips it deliberately, which is the whole point of pinning it.</para>
+    /// </summary>
+    [Fact]
+    public void KillSwitch_ControlChannelRtt_IsExplicitlyUnmeasured_NotSilentlyZero()
     {
         using var host = new DaemonFixture();
 
-        var provisioner = host.Services.GetRequiredService<MergeQueueProvisioner>();
+        var kill = host.Services.GetRequiredService<KillSwitch>();
 
-        Assert.True(
-            provisioner.ChecksAgentBranchAlignment,
-            "the daemon's MergeQueueProvisioner must be constructed with checkAgentBranch, or work "
-            + "committed off agent/<id> is silently verified as an empty branch again");
+        Assert.False(
+            kill.MeasuresControlChannelRtt,
+            "the daemon has no control-channel RTT source; if one was just wired, update this assertion "
+            + "and KillSwitchTiming.UnmeasuredRtt's remarks rather than leaving the posture undeclared");
+    }
+
+    /// <summary>
+    /// Both boot reconcile steps are built with an audit sink, so a pass that destroys something leaves an
+    /// artifact.
+    ///
+    /// <para>Boot reconcile is the one pass that can declare an agent Dead and force-remove its worktree,
+    /// kill its PTY and drop it from the durable leader registry. Both steps discarded their reports
+    /// entirely, and the sinks that fixed that are optional constructor arguments — the same silent-delete
+    /// exposure as the merge-queue and kill-switch tails, so it is pinned the same way.</para>
+    /// </summary>
+    [Fact]
+    public void BootReconcileSteps_AreWiredToRecordWhatTheyDestroy()
+    {
+        using var host = new DaemonFixture();
+
+        var boot = host.Services.GetRequiredService<DaemonBootSequence>();
+
+        var swarm = Assert.IsType<SwarmReconcileTask>(
+            boot.Tasks.Single(t => t.Name == "swarm-reconcile"));
+        Assert.True(swarm.RecordsOutcome, "a boot pass that prunes agents must leave an audit record");
+
+        var reattach = Assert.IsType<LeaderReattachTask>(
+            boot.Tasks.Single(t => t.Name == "leader-reattach"));
+        Assert.True(reattach.RecordsOutcome, "a boot pass that reaps PTY sessions must leave an audit record");
     }
 
     /// <summary>

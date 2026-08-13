@@ -9,6 +9,7 @@ using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Agents.Agents.Toolchains;
+using Mainguard.Tests.TestTools;
 using Xunit;
 
 namespace Mainguard.Tests;
@@ -89,37 +90,120 @@ public class ToolchainChannelTests
     public async Task AnInstall_VerifiesTheChecksum_ThenUnpacks_ThenProvesItRuns()
     {
         var host = new ScriptedHost();
-        host.Checksum = Sha;
         host.ProbeStdout = "1.2.3 ok";
-        var channel = new ToolchainChannel(host, ToolchainManifest.Parse(ValidManifestJson()));
+        var payloads = new FakeToolchainPayloadSource();
+        var channel = new ToolchainChannel(host, InstallableManifest(), payloads: payloads);
 
         var status = await channel.InstallAsync("tool-x");
 
         Assert.True(status.IsInstalled);
 
-        // Order is the property, not mere presence: a checksum verified AFTER unpacking has already let
-        // unverified bytes onto the filesystem.
-        var sum = host.IndexOfCommand("sha256sum");
-        var tar = host.IndexOfCommand("tar");
-        Assert.True(sum >= 0 && tar >= 0, $"expected both a checksum and an unpack; ran: {host.Describe()}");
-        Assert.True(sum < tar, $"the checksum must be verified BEFORE unpacking; ran: {host.Describe()}");
+        // The payload was fetched from the pinned URL — once — and its bytes reached the VM through the
+        // staging seam rather than through any command the VM had to own.
+        Assert.Equal(new[] { new Uri("https://x/y.tgz") }, payloads.Fetched);
+        var staged = Assert.Single(host.Staged);
+        Assert.Equal("tool-x-1.2.3.tar.gz", staged.FileName);
+        Assert.Equal(FakeToolchainPayloadSource.PayloadFor("https://x/y.tgz").Length, staged.Bytes);
+
+        // Order is the property, not mere presence: bytes that reach the VM before the pin is checked are
+        // unverified bytes on the filesystem, whatever happens next.
+        Assert.True(host.IndexOfCommand("tar") >= 0, $"expected an unpack; ran: {host.Describe()}");
 
         // The marker is written last, and only a green probe earns it.
         Assert.Contains(ToolchainPaths.RegistryMarkerPath("tool-x"), host.WrittenFiles.Keys);
     }
 
+    /// <summary>
+    /// <b>The regression that matters.</b> The install used to fetch its payload by shelling
+    /// <c>curl</c> into the VM, and the VM has no <c>curl</c> and no <c>wget</c> — the pinned package
+    /// list carries neither, and a live MainguardEnv answers <c>command -v</c> for neither. Every user
+    /// install failed at <c>curl: command not found</c>, exit 127, from the day it shipped.
+    ///
+    /// <para>Nothing caught it because the fake host answered <c>curl</c> with exit 0: the suite was
+    /// measuring a VM that does not exist. So this asserts the set of programs an install requires the
+    /// environment to have, which is the fact that was never under test.</para>
+    /// </summary>
     [Fact]
-    public async Task ADownloadThatDoesNotMatchThePin_IsDiscardedWithoutUnpacking()
+    public async Task AnInstall_RunsNoDownloaderInTheVm_AndNeedsOnlyBinariesTheVmReallyHas()
+    {
+        var host = new ScriptedHost { ProbeStdout = "1.2.3 ok" };
+        var channel = new ToolchainChannel(
+            host, InstallableManifest(), payloads: new FakeToolchainPayloadSource());
+
+        await channel.InstallAsync("tool-x");
+
+        // Not just argv[0]: a downloader smuggled in as an argument of `sh -c` would be just as broken.
+        foreach (var absent in MainguardEnvFacts.AbsentBinaries)
+        {
+            Assert.DoesNotContain(
+                host.Commands,
+                c => c.Any(a => a.Split('/')[^1].Equals(absent, StringComparison.Ordinal)));
+        }
+
+        // coreutils (rm/mkdir/mv) and tar are in build/mainguardos/packages.pinned.txt and present on a
+        // live VM; the remaining entry is the toolchain's own probe binary, by absolute path. Anything
+        // NEW appearing here is a new dependency on the environment, and has to be justified against
+        // that pinned list rather than discovered by a user whose install dies at exit 127.
+        Assert.Equal(
+            new[] { $"{ToolchainPaths.VmInstallDir("tool-x")}/bin/toolx", "mkdir", "mv", "rm", "tar" },
+            host.DistinctExecutables.OrderBy(e => e, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
+    public async Task ADownloadThatDoesNotMatchThePin_NeverEntersTheVm()
     {
         var host = new ScriptedHost();
-        host.Checksum = new string('b', 64); // not the pinned hash
-        var channel = new ToolchainChannel(host, ToolchainManifest.Parse(ValidManifestJson()));
+        var payloads = new FakeToolchainPayloadSource { Corrupt = true };
+        var channel = new ToolchainChannel(host, InstallableManifest(), payloads: payloads);
 
         var ex = await Assert.ThrowsAsync<ToolchainChannelException>(() => channel.InstallAsync("tool-x"));
 
         Assert.Equal(ToolchainChannelError.HashMismatch, ex.Error);
-        // The whole point of checking first: nothing was unpacked and nothing was installed.
+
+        // Stronger than the in-VM sha256sum this replaced: there is nothing to discard, because the bytes
+        // never crossed into the environment at all.
+        Assert.Empty(host.Staged);
         Assert.True(host.IndexOfCommand("tar") < 0, $"nothing may be unpacked after a bad checksum; ran: {host.Describe()}");
+        Assert.Empty(host.WrittenFiles);
+
+        // …and the copy must say that, rather than claiming a discard that never happened.
+        Assert.Contains("nothing was transferred", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ADownloadThatCannotBeFetched_IsATypedDownloadFailure_NamingTheUrl()
+    {
+        var host = new ScriptedHost();
+        var payloads = new FakeToolchainPayloadSource
+        {
+            Throw = new System.Net.Http.HttpRequestException("Name or service not known"),
+        };
+        var channel = new ToolchainChannel(host, InstallableManifest(), payloads: payloads);
+
+        var ex = await Assert.ThrowsAsync<ToolchainChannelException>(() => channel.InstallAsync("tool-x"));
+
+        Assert.Equal(ToolchainChannelError.DownloadFailed, ex.Error);
+        Assert.Contains("https://x/y.tgz", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("Name or service not known", ex.Message, StringComparison.Ordinal);
+        Assert.Empty(host.Staged);
+    }
+
+    [Fact]
+    public async Task AVerifiedPayloadThatCannotBeTransferred_IsItsOwnFailure_NotADownloadFailure()
+    {
+        // The two have different remedies and must not be collapsed: the bytes arrived and matched the
+        // pin, so nothing is wrong with the network or the manifest — the environment is unreachable.
+        var host = new ScriptedHost
+        {
+            ThrowOnStage = new InvalidOperationException("Staging the verified payload into the VM failed"),
+        };
+        var channel = new ToolchainChannel(
+            host, InstallableManifest(), payloads: new FakeToolchainPayloadSource());
+
+        var ex = await Assert.ThrowsAsync<ToolchainChannelException>(() => channel.InstallAsync("tool-x"));
+
+        Assert.Equal(ToolchainChannelError.StageFailed, ex.Error);
+        Assert.True(host.IndexOfCommand("tar") < 0, $"nothing may be unpacked; ran: {host.Describe()}");
         Assert.Empty(host.WrittenFiles);
     }
 
@@ -129,10 +213,10 @@ public class ToolchainChannelTests
         // PR #305: an adapter's marker reported healthy for eleven days because a file had arrived
         // while the binary it pointed at was a stub. A file arriving is not an install.
         var host = new ScriptedHost();
-        host.Checksum = Sha;
         host.ProbeExitCode = 127;
         host.ProbeStderr = "cannot execute binary file";
-        var channel = new ToolchainChannel(host, ToolchainManifest.Parse(ValidManifestJson()));
+        var channel = new ToolchainChannel(
+            host, InstallableManifest(), payloads: new FakeToolchainPayloadSource());
 
         var ex = await Assert.ThrowsAsync<ToolchainChannelException>(() => channel.InstallAsync("tool-x"));
 
@@ -147,9 +231,9 @@ public class ToolchainChannelTests
         // Exit code 0 is not evidence of WHICH version landed, and a verification jail quietly running a
         // different interpreter than the developer's machine is the failure mode this pin exists for.
         var host = new ScriptedHost();
-        host.Checksum = Sha;
         host.ProbeStdout = "9.9.9 something else";
-        var channel = new ToolchainChannel(host, ToolchainManifest.Parse(ValidManifestJson()));
+        var channel = new ToolchainChannel(
+            host, InstallableManifest(), payloads: new FakeToolchainPayloadSource());
 
         var ex = await Assert.ThrowsAsync<ToolchainChannelException>(() => channel.InstallAsync("tool-x"));
 
@@ -177,12 +261,15 @@ public class ToolchainChannelTests
     public async Task AnAlreadyHealthyToolchain_IsNotReinstalled()
     {
         var host = new ScriptedHost { PreInstalled = true, ProbeStdout = "1.2.3 ok" };
-        var channel = new ToolchainChannel(host, ToolchainManifest.Parse(ValidManifestJson()));
+        var payloads = new FakeToolchainPayloadSource();
+        var channel = new ToolchainChannel(host, InstallableManifest(), payloads: payloads);
 
         var status = await channel.InstallAsync("tool-x");
 
         Assert.True(status.IsInstalled);
-        Assert.True(host.IndexOfCommand("curl") < 0, $"an idempotent install must not re-download; ran: {host.Describe()}");
+        // Nothing was fetched and nothing crossed into the VM — an idempotent install costs one probe.
+        Assert.Empty(payloads.Fetched);
+        Assert.Empty(host.Staged);
     }
 
     [Fact]
@@ -354,29 +441,59 @@ public class ToolchainChannelTests
             argv);
     }
 
+    /// <summary>
+    /// The converse form is now REFUSED at resolve time rather than mangled into a pip usage error.
+    ///
+    /// <para>This test previously asserted the mangling itself — that <c>&amp;&amp;</c>, <c>python</c> and
+    /// <c>-m</c> all became arguments to pip. That was an accurate description of the behaviour and a bad
+    /// thing to leave standing: pip then exits 2, a non-zero exit is the only signal
+    /// <c>VerificationRunner</c> reads, and the merge queue tells a human <b>their tests failed</b> about
+    /// a command that never started. Documenting that in a test made it look intended.</para>
+    /// </summary>
     [Fact]
-    public void ABareAmpersandVerifyCommand_DoesNotSurviveTokenisation()
+    public void ABareAmpersandVerifyCommand_IsRefusedAtResolveTime_NotRunAndReportedAsFailingTests()
     {
-        // The converse, pinned so the limitation is documented by a test rather than by a comment
-        // somebody has to find. `&&` becomes an ARGUMENT TO PIP, which is why it fails at runtime with a
-        // pip usage error rather than anything that mentions a shell.
         const string broken = "pip install -q -r requirements.txt && python -m pytest -q";
 
-        var argv = VerificationCommandResolver.Resolve(broken, broken).Command;
+        var ex = Assert.Throws<MalformedVerificationCommandException>(
+            () => VerificationCommandResolver.Resolve(broken, broken));
 
-        Assert.Contains("&&", argv);
-        Assert.Equal("pip", argv[0]);
-        // Everything after `&&` is handed to pip too — this is the whole defect in one assertion.
-        Assert.Contains("python", argv);
-        Assert.Contains("-m", argv);
+        // The message has to carry the three things a human needs, or the refusal is just a different
+        // kind of unhelpful: what is wrong, that nothing ran, and the exact command that works.
+        Assert.Contains("&&", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("pip", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no verification was recorded", ex.Message, StringComparison.Ordinal);
+        Assert.Contains($"sh -c \"{broken}\"", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The refusal must not fire on operators that are ARGUMENTS rather than shell syntax, or it becomes
+    /// a new way to break working repositories. All of these run correctly today and must keep resolving.
+    /// </summary>
+    [Theory]
+    [InlineData("dotnet test --logger \"console;verbosity=detailed\"")]
+    [InlineData("sh -c \"pip install -r requirements.txt && python -m pytest -q\"")]
+    [InlineData("curl \"https://example.test/?a=1&b=2\"")]
+    public void OperatorsInsideAQuotedArgument_AreNotRefused(string command)
+    {
+        var argv = VerificationCommandResolver.Resolve(command, command).Command;
+        Assert.NotEmpty(argv);
     }
 
     // ---- Fixtures --------------------------------------------------------------------------------
 
     private const string SixtyFourHex = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    private const string Sha = SixtyFourHex;
 
-    private static string ValidManifestJson() => """
+    private const string PayloadUrl = "https://x/y.tgz";
+
+    /// <summary>The pin the install fixtures use: the REAL SHA-256 of the bytes
+    /// <see cref="FakeToolchainPayloadSource"/> serves for <see cref="PayloadUrl"/>. It has to be real
+    /// now — the channel hashes the bytes it holds, so no fake can be told what to report.</summary>
+    private static string RealSha => FakeToolchainPayloadSource.Sha256For(PayloadUrl);
+
+    /// <param name="sha256">The pin the fixture declares. Defaults to a hash that matches NOTHING, which
+    /// is what the parse-level theories want; install tests pass <see cref="RealSha"/>.</param>
+    private static string ValidManifestJson(string? sha256 = null) => $$"""
         {
           "toolchains": [
             {
@@ -384,8 +501,8 @@ public class ToolchainChannelTests
               "displayName": "Tool X",
               "summary": "A curated toolchain.",
               "version": "1.2.3",
-              "payloadUrl": "https://x/y.tgz",
-              "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "payloadUrl": "{{PayloadUrl}}",
+              "sha256": "{{sha256 ?? SixtyFourHex}}",
               "stripComponents": 1,
               "pathEntries": ["{toolchain}/bin"],
               "environment": { "TOOL_X_HOME": "{toolchain}" },
@@ -397,6 +514,10 @@ public class ToolchainChannelTests
           ]
         }
         """;
+
+    /// <summary>The manifest an install test drives: pinned to what the fake source really serves.</summary>
+    private static ToolchainManifest InstallableManifest() =>
+        ToolchainManifest.Parse(ValidManifestJson(RealSha));
 
     private static ContainerSpecRequest SpecFor(IReadOnlyList<string> toolchainIds) =>
         new(
@@ -422,15 +543,23 @@ public class ToolchainChannelTests
         return Path.Combine(dir!.FullName, relative.Replace('/', Path.DirectorySeparatorChar));
     }
 
-    /// <summary>A VM host that answers the channel's commands from a script and records what ran.</summary>
+    /// <summary>A VM host that answers the channel's commands from a script and records what ran.
+    ///
+    /// <para>It refuses <c>curl</c> and <c>wget</c> the way a real MainguardEnv does (see
+    /// <see cref="MainguardEnvFacts"/>). Its predecessor answered <c>curl</c> with exit 0, which is why
+    /// an install path that could not run in the VM passed every test in this file.</para></summary>
     private sealed class ScriptedHost : IAdapterInstallHost
     {
         public List<IReadOnlyList<string>> Commands { get; } = new();
 
         public Dictionary<string, string> WrittenFiles { get; } = new(StringComparer.Ordinal);
 
-        /// <summary>What <c>sha256sum</c> reports. Defaults to the fixture's pinned hash.</summary>
-        public string Checksum { get; set; } = Sha;
+        /// <summary>Every payload staged into the VM: the file name and its byte count. Empty means
+        /// nothing ever crossed into the environment.</summary>
+        public List<(string FileName, int Bytes)> Staged { get; } = new();
+
+        /// <summary>When set, staging fails — the "bytes are fine, environment is not" case.</summary>
+        public Exception? ThrowOnStage { get; set; }
 
         public int ProbeExitCode { get; set; }
 
@@ -450,9 +579,9 @@ public class ToolchainChannelTests
             Commands.Add(command);
             var exe = command[0];
 
-            if (string.Equals(exe, "sha256sum", StringComparison.Ordinal))
+            if (MainguardEnvFacts.RefuseIfAbsent(exe) is { } absent)
             {
-                return Task.FromResult(new AdapterCommandResult(0, $"{Checksum}  {command[1]}\n", string.Empty));
+                return Task.FromResult(absent);
             }
 
             // The swap into place is what makes the toolchain visible to a probe.
@@ -479,13 +608,24 @@ public class ToolchainChannelTests
             return Task.CompletedTask;
         }
 
-        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
-            throw new InvalidOperationException(
-                "The toolchain channel must never stream a ~350 MB payload through the host; it fetches "
-                + "and verifies in the VM.");
+        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+        {
+            if (ThrowOnStage is not null)
+            {
+                return Task.FromException<string>(ThrowOnStage);
+            }
+
+            Staged.Add((fileName, content.Length));
+            return Task.FromResult($"{ToolchainPaths.VmStageDir}/{fileName}");
+        }
 
         public int IndexOfCommand(string exe) =>
             Commands.FindIndex(c => string.Equals(c[0], exe, StringComparison.Ordinal));
+
+        /// <summary>The distinct programs this host was asked to run, in first-seen order — the set of
+        /// binaries an install therefore requires the VM to have.</summary>
+        public IReadOnlyList<string> DistinctExecutables =>
+            Commands.Select(c => c[0]).Distinct(StringComparer.Ordinal).ToList();
 
         public string Describe() => string.Join(" | ", Commands.Select(c => string.Join(' ', c)));
     }

@@ -50,6 +50,22 @@ public sealed class RoleInterceptor : Interceptor
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.
         "/mainguard.v1.MergeQueueService/ClearStalledVerification",
+        // Resuming a stranded entry ADOPTS an existing agent id: it attaches a fresh, writable jail to
+        // somebody else's `agent/<id>` branch and puts that branch back in front of the daemon's
+        // verification. That is strictly more power than the merge RPCs above — an agent able to invoke it
+        // could take over another agent's entry, rewrite the branch from inside the adopted jail, and have
+        // the daemon verify the result under the original entry's identity. It is a human decision about
+        // work a human owns, so it joins the list rather than being guarded by a field check inside a
+        // shared message (which this interceptor, which dispatches by method, could not see).
+        // Intake configuration is operator policy, and subscribing is a PROVISIONING act rather than a
+        // preference: a subscribed repository makes the daemon fetch pull-request heads and ask the gated
+        // spawn chain for a jail per open bot PR. An agent that could call these could manufacture queue
+        // entries and jails on the user's machine, or widen the bot-author list until its own pull
+        // requests were intake'd — merge power reached from the other end. The reads stay open; only the
+        // two writes are denied, on the same boundary as BeginMerge/DiscardEntry above.
+        "/mainguard.v1.PrIntakeService/UpdatePrIntakeSettings",
+        "/mainguard.v1.PrIntakeService/SubscribePrIntakeSource",
+        "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
         // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per
@@ -126,7 +142,8 @@ public sealed class RoleInterceptor : Interceptor
         if (_roles.Resolve(token, _tokenFile.Token) == ConnectionRole.Coordinator)
         {
             throw new RpcException(new Status(StatusCode.PermissionDenied,
-                "The coordinator role cannot invoke merge or plan-approval RPCs — chat + capped tools only."));
+                "The coordinator role cannot invoke merge, entry-lifecycle or plan-approval RPCs "
+                + "— chat + capped tools only."));
         }
     }
 

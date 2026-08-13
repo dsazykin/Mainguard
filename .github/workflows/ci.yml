@@ -104,7 +104,16 @@ jobs:
               echo "$ALLOWLIST not yet on origin/phase2 (introducing PR); shrink-only guard active from next PR."
               continue
             fi
-            ADDED=$(git diff origin/phase2 -- "$ALLOWLIST" | grep '^+' | grep -v '^+++' || true)
+            # `ADDED=$(git diff … | grep '^+' … || true)` absorbed grep's "no match" (exit 1) and git
+            # diff's FAILURE (exit 128) identically, then printed "did not grow" either way — so a
+            # broken ref, a renamed file or a git error silently retired the shrink-only invariant.
+            # Separate the two: a git failure is fatal, and the filtering is done in awk, which has no
+            # "found nothing" exit code to confuse with an error.
+            if ! DIFF="$(git diff origin/phase2 -- "$ALLOWLIST")"; then
+              echo "::error::git diff against origin/phase2 failed for $ALLOWLIST — the P2-04 shrink-only guard could not run, so it must not report success"
+              exit 1
+            fi
+            ADDED="$(printf '%s\n' "$DIFF" | awk '/^\+\+\+/ { next } /^\+/ { print }')"
             if [ -n "$ADDED" ]; then
               echo "::error::$ALLOWLIST gained lines; the P2-04 allowlist may only shrink:"
               echo "$ADDED"
@@ -112,6 +121,32 @@ jobs:
             fi
             echo "$ALLOWLIST did not grow vs origin/phase2."
           done
+
+      # Ticket #66 — the repo-map backlog obeys the same shrink-only rule, for the same reason. The
+      # completeness guard (installer-guardrails job) fails a NEW unindexed file; without this, the
+      # obvious way to make that guard pass would be to append the file to the backlog list, which
+      # would make the whole thing decorative. Recorded gaps may be deleted (someone wrote the entry);
+      # they may never be added.
+      - name: Ensure the repo-map backlog did not grow vs phase2
+        run: |
+          set -euo pipefail
+          ALLOWLIST=docs/repo-map/known-unindexed.txt
+          if ! git cat-file -e "origin/phase2:$ALLOWLIST" 2>/dev/null; then
+            echo "$ALLOWLIST not yet on origin/phase2 (introducing PR); shrink-only guard active from next PR."
+            exit 0
+          fi
+          if ! DIFF="$(git diff origin/phase2 -- "$ALLOWLIST")"; then
+            echo "::error::git diff against origin/phase2 failed for $ALLOWLIST — the shrink-only guard could not run, so it must not report success"
+            exit 1
+          fi
+          # Comment lines are exempt: the header is prose, and rewording it is not adding a gap.
+          ADDED="$(printf '%s\n' "$DIFF" | awk '/^\+\+\+/ { next } /^\+[[:space:]]*#/ { next } /^\+[[:space:]]*$/ { next } /^\+/ { print }')"
+          if [ -n "$ADDED" ]; then
+            echo "::error::$ALLOWLIST gained entries. A new file must get a docs/repo-map/ entry, not a line here:"
+            echo "$ADDED"
+            exit 1
+          fi
+          echo "$ALLOWLIST did not grow vs origin/phase2."
 
   sandbox-security:
     name: Sandbox security suite (RequiresDocker, Linux)
@@ -220,10 +255,27 @@ jobs:
             echo "::error::MainguardOS.tar.gz is not hash-stable across builds ($A != $B)"
             exit 1
           fi
-          # The versioned release stamp must be present inside the payload.
+          # The versioned release stamp must carry REAL VALUES, not merely exist. `grep -q
+          # '^BUILD_INPUTS_HASH='` accepted the literal `unknown` (the ARG default at Dockerfile:22)
+          # and accepted an empty value — i.e. it asserted the KEY, which is the one thing that cannot
+          # go wrong. Assert the shape of the value, and that both builds agree on it.
           grep -q '^MAINGUARDOS_VERSION=ci-repro' "$RUNNER_TEMP/out-a/mainguardos-release"
-          grep -q '^BUILD_INPUTS_HASH=' "$RUNNER_TEMP/out-a/mainguardos-release"
-          echo "Payload is hash-stable and version-stamped."
+          for side in a b; do
+            HASH=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-$side/mainguardos-release")
+            echo "build $side BUILD_INPUTS_HASH: '${HASH}'"
+            if [ "$HASH" = "unknown" ]; then
+              echo "::error::BUILD_INPUTS_HASH is the literal ARG default 'unknown' — build.sh did not pass --build-arg BUILD_INPUTS_HASH"; exit 1
+            fi
+            if ! printf '%s' "$HASH" | grep -Eq '^[0-9a-f]{64}$'; then
+              echo "::error::BUILD_INPUTS_HASH is not a sha256 ('${HASH}') — an empty or malformed stamp is not evidence of anything"; exit 1
+            fi
+          done
+          HA=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-a/mainguardos-release")
+          HB=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-b/mainguardos-release")
+          if [ "$HA" != "$HB" ]; then
+            echo "::error::the two builds stamped DIFFERENT build-inputs hashes ($HA != $HB) — an input is non-deterministic"; exit 1
+          fi
+          echo "Payload is hash-stable and version-stamped (BUILD_INPUTS_HASH=$HA)."
 
       # Daemon-startup smoke in the SHIPPED TARBALL, as the REAL service identity (uid 1000,
       # HOME=/home/mainguard, CWD=/ — the exact context systemd gives mainguardd in the VM). Three shipped
@@ -243,6 +295,17 @@ jobs:
         run: |
           set -euo pipefail
           docker import "$RUNNER_TEMP/out-a/MainguardOS.tar.gz" mainguardos-shipped:ci-repro
+
+          # The stamp OUTSIDE the payload proves what build.sh computed; the stamp INSIDE the shipped
+          # rootfs proves the --build-arg actually reached the image. They must agree — that is the only
+          # thing that makes /etc/mainguardos-release usable as evidence on a user's machine.
+          OUTSIDE=$(sed -n 's/^BUILD_INPUTS_HASH=//p' "$RUNNER_TEMP/out-a/mainguardos-release")
+          INSIDE=$(docker run --rm mainguardos-shipped:ci-repro sed -n 's/^BUILD_INPUTS_HASH=//p' /etc/mainguardos-release)
+          echo "BUILD_INPUTS_HASH outside=$OUTSIDE inside=$INSIDE"
+          if [ -z "$INSIDE" ] || [ "$INSIDE" != "$OUTSIDE" ]; then
+            echo "::error::/etc/mainguardos-release inside the shipped tarball says '$INSIDE' but the build computed '$OUTSIDE'"; exit 1
+          fi
+
           docker run --rm mainguardos-shipped:ci-repro bash -c '
             set -u
             # Fail fast and precisely: mainguardd cannot create ~/.mainguard if the packaging step handed
@@ -330,18 +393,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # P2-21 §7 reviewer script: RunOnce for resume and G-12 --shutdown must both be absent from the
-      # installer tree and the payload/resume scripts.
-      - name: No RunOnce, no --shutdown in installer/resume paths
-        run: |
-          set -euo pipefail
-          if grep -rniI "RunOnce" installer/ build/mainguardos/ 2>/dev/null; then
-            echo "::error::RunOnce found — resume MUST use the elevated Scheduled Task (P2-21 §7)"; exit 1
-          fi
-          if grep -rnI -- "--shutdown" installer/ build/mainguardos/ 2>/dev/null; then
-            echo "::error::'--shutdown' found — G-12 forbids the VM-wide shutdown verb"; exit 1
-          fi
-          echo "Installer guardrails clean (no RunOnce, no --shutdown)."
+      # P2-21 §7 reviewer script: RunOnce for resume and G-12 --shutdown must both be absent.
+      #
+      # This used to be four lines of inline grep over `installer/ build/mainguardos/`, which is where
+      # the violation CANNOT be — those are thin drivers; the command construction lives in
+      # Mainguard.Agents (InstallerCommands / WslCommands) and Mainguard.Server, both of which the scan
+      # dropped. It also reported "clean" when a scanned path did not exist (`grep` exits 2, the
+      # `2>/dev/null` ate the diagnostic, the `if` saw non-zero), so renaming either directory would
+      # have made the guard pass forever having read nothing.
+      #
+      # The script now owns the scope, asserts each root exists AND yields files, and prints the count.
+      # See its header for why prose mentions are exempt and what the compensating unit test covers.
+      - name: No RunOnce, no --shutdown in the installer/resume command paths
+        run: build/ci/verify-installer-guardrails.sh
+
+      # ------------------------------------------------------------------------------------------
+      # Ticket #65 — an opt-in test that no job opts into is a test that cannot fail.
+      # ------------------------------------------------------------------------------------------
+      # The two `[RequiresDockerAndOptInFact]` in-jail verification tests skip unless
+      # MAINGUARD_VERIFY_E2E=1, and for their whole existence NOTHING set it: they were the constant
+      # "2 skipped" in every sandbox-security run, covering the path that decides whether an agent's
+      # work may merge. They now run in e2e-verification.yml (nightly + on verification-path PRs);
+      # this guard is what keeps that true, by failing any PR that adds an opt-in test without wiring
+      # it in, renames one out from under the filter, or leaves the workflow unable to opt in.
+      #
+      # It lives in an existing every-PR job on purpose. A slow gate can be justified; a gate nobody
+      # notices stopped running cannot — and that is the failure this ticket actually was.
+      - name: Every opt-in E2E test is wired into a job that runs it (#65)
+        run: build/ci/verify-e2e-optin-coverage.sh
+
+      # ------------------------------------------------------------------------------------------
+      # Ticket #66 — "an unindexed file is an incomplete change" was a rule nothing checked.
+      # ------------------------------------------------------------------------------------------
+      # It had drifted: Mainguard.Server.Tests/DataRootIsolationTests.cs had no entry, and a full sweep
+      # found ~110 more. The backlog is recorded in docs/repo-map/known-unindexed.txt and may only
+      # shrink (enforced in allowlist-shrink-guard); this step fails a NEW file that is unindexed and
+      # not on that list, which is what makes the rule real from now on rather than aspirational.
+      - name: Every .cs file has a docs/repo-map entry (#66)
+        run: build/ci/verify-repo-map-complete.sh
 
   client-closure:
     name: Client head closure excludes the agent platform (ADR-0001)
@@ -354,9 +443,12 @@ jobs:
         with:
           global-json-file: global.json
 
-      # verify-client-closure.sh publishes framework-dependent (no RID), so its implicit restore is
-      # the same RID-less graph the lockfiles describe — restore it locked first (MG-35), and the
-      # publish below then finds everything already resolved.
+      # MG-35: this locks the RID-LESS graph, which is what the committed lockfiles describe. The gate
+      # itself now publishes self-contained win-x64 (below), and that RID restore is deliberately NOT
+      # locked — same reasoning as payload-reproducible: a RID restore resolves an ADDITIONAL
+      # `net10.0/win-x64` target that a plain restore strips again, so committing it would churn the
+      # lockfiles on every ordinary restore. The script snapshots and restores them so nothing leaks
+      # into the working tree.
       - name: Restore (locked)
         run: dotnet restore --locked-mode
 
@@ -365,12 +457,82 @@ jobs:
       # platform. This gate publishes the head and fails if its .deps.json / publish dir names any of
       # Mainguard.Agents(.UI) / Mainguard.Protos / Docker.DotNet / Porta.Pty / Grpc — the automated form of
       # the manual deps.json proof. The same script runs LOCALLY (it falls back to dotnet.exe under WSL).
+      #
+      # It publishes SELF-CONTAINED win-x64 — the shape that actually ships. It used to publish
+      # framework-dependent, which resolves a different asset graph, so the closure being gated was not
+      # the closure being distributed.
       - name: Client head closure is FREE of the agent platform
         run: build/ci/verify-client-closure.sh
 
-      # Positive control (bonus): prove the matcher is not vacuous — the Pro head DOES ship the platform.
-      - name: Positive control — Pro head DOES carry the agent platform
+      # Positive control: prove the matcher is not vacuous — the Pro head DOES ship the platform, and
+      # must match EVERY token. It used to pass on a single hit, so one mistyped token could stop
+      # detecting anything forever while this still reported PASS on the strength of its neighbours.
+      - name: Positive control — Pro head DOES carry the agent platform (all tokens)
         run: build/ci/verify-client-closure.sh --head Mainguard.Pro.App --mode present
+
+  # ------------------------------------------------------------------------------------------------
+  # Ticket #57 — the site was never built on a PR.
+  # ------------------------------------------------------------------------------------------------
+  # deploy-site.yml triggers on `push` to main only, so nothing under site/ was compiled or validated
+  # by PR CI. That is how #310 merged 11 lines of `git stash pop` conflict markers into
+  # site/public/favicon.svg (malformed XML — an XML parser fails at line 4) and src/.../Wordmark.tsx,
+  # with every check green: the broken files were only looked at after they reached main.
+  #
+  # Deliberately NO `paths:` filter — this job lives in ci.yml, which runs on every PR. A path filter
+  # is how a guard silently stops running, and this whole job exists because a guard silently was not
+  # running.
+  site:
+    name: Site builds & assets parse (#57)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+
+      - name: Install (locked)
+        working-directory: site
+        run: npm ci
+
+      # `npm run build` is `tsc -b && vite build` — the type check AND the bundle, i.e. the same command
+      # deploy-site.yml runs. A PR that breaks either now fails here instead of on main.
+      - name: Build (tsc -b + vite build)
+        working-directory: site
+        run: npm run build
+
+      # A .tsx with conflict markers fails the build above; an SVG does not — nothing compiles it, so a
+      # malformed favicon ships. Parse every SVG as XML, and assert we actually parsed some.
+      - name: Every SVG is well-formed XML
+        run: python3 build/ci/check-site-svgs.py
+
+      # The general form of the #310 failure: unresolved merge/stash conflict markers committed into a
+      # tree nothing compiles. Cheap, and catches the .md/.json/.svg cases the build cannot.
+      - name: No conflict markers under site/
+        run: |
+          set -euo pipefail
+          FILES=$(git ls-files site/ | wc -l)
+          test "$FILES" -gt 0 || { echo "::error::git ls-files site/ returned nothing — vacuous scan"; exit 1; }
+          echo "scanning $FILES tracked files under site/"
+          # `<<<<<<< ` / `>>>>>>> ` always carry a label (a ref, or stash pop's "Updated upstream").
+          # `=======` is left out on purpose: a 7-character setext underline in Markdown looks identical.
+          #
+          # Exit codes are separated deliberately — `if git grep …; then` would read an ERROR (>1) as
+          # "no match" and print the all-clear, which is the exact defect this PR is fixing elsewhere.
+          set +e
+          git grep -nIE '^(<{7}|>{7}) ' -- site/
+          RC=$?
+          set -e
+          if [ "$RC" -eq 0 ]; then
+            echo "::error::conflict markers committed under site/ (this is exactly how #310 shipped a malformed favicon.svg)"
+            exit 1
+          elif [ "$RC" -ne 1 ]; then
+            echo "::error::git grep failed (exit $RC) — the conflict-marker scan did not complete, so it must not report success"
+            exit 1
+          fi
+          echo "No conflict markers under site/."
 
   daemon-smoke:
     name: Daemon --local-dev smoke (Windows)

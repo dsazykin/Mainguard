@@ -9,6 +9,11 @@
       disabled the reason is what is visible in its place, so a dead control can never appear without an
       explanation next to it (#302). Nothing here is a compound action — Write does not stage, Commit
       does not push.
+
+      Layout: every row is a Grid with a star column, never a horizontal StackPanel. A horizontal
+      StackPanel measures its children with INFINITE width, so a long path or a long refusal sentence
+      pushed this whole page wider than the window and the step buttons were cut off at its right edge.
+      Star columns shrink; MaxWidth on a child of one does not.
     -->
     <StackPanel Spacing="8">
 
@@ -17,7 +22,7 @@
             <PathIcon Data="{StaticResource DocumentAddIcon}" Width="16" Height="16"
                       Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
             <TextBlock Text="Declare a toolchain in this repository" FontSize="14" FontWeight="SemiBold"
-                       Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
+                       TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
         </StackPanel>
         <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
                    Text="A repository opts in by committing a .mainguard/toolchain file naming one catalogued toolchain per line. Mainguard performs each step only when you press its button — it never stages, commits, pushes, stashes or switches branches on your behalf."/>
@@ -25,63 +30,69 @@
         <!-- Current state: where you are, and what the file says on both sides. -->
         <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14">
             <StackPanel Spacing="8">
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="Repository" FontSize="11" FontWeight="SemiBold" Width="120"
+                <Grid ColumnDefinitions="120,*">
+                    <TextBlock Grid.Column="0" Text="Repository" FontSize="11" FontWeight="SemiBold"
+                               Margin="0,0,8,0"
                                Foreground="{DynamicResource TextMuted}"/>
-                    <TextBlock Classes="Mono" Text="{Binding RepositoryName}" FontSize="11" MaxWidth="360"
+                    <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding RepositoryName}" FontSize="11"
                                TextTrimming="CharacterEllipsis" Foreground="{DynamicResource TextPrimary}"/>
-                </StackPanel>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="Branch" FontSize="11" FontWeight="SemiBold" Width="120"
+                </Grid>
+                <Grid ColumnDefinitions="120,*">
+                    <TextBlock Grid.Column="0" Text="Branch" FontSize="11" FontWeight="SemiBold"
+                               Margin="0,0,8,0"
                                Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                    <TextBlock Text="{Binding BranchSummary}" FontSize="11" MaxWidth="360" TextWrapping="Wrap"
+                    <TextBlock Grid.Column="1" Text="{Binding BranchSummary}" FontSize="11" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextPrimary}"/>
-                </StackPanel>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="Committed" FontSize="11" FontWeight="SemiBold" Width="120"
+                </Grid>
+                <Grid ColumnDefinitions="120,*">
+                    <TextBlock Grid.Column="0" Text="Committed" FontSize="11" FontWeight="SemiBold"
+                               Margin="0,0,8,0"
                                Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                    <TextBlock Classes="Mono" Text="{Binding CommittedDeclarationDisplay}" FontSize="11"
-                               MaxWidth="360" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-                </StackPanel>
-                <StackPanel Orientation="Horizontal" Spacing="8">
-                    <TextBlock Text="Working tree" FontSize="11" FontWeight="SemiBold" Width="120"
+                    <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding CommittedDeclarationDisplay}"
+                               FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                </Grid>
+                <Grid ColumnDefinitions="120,*">
+                    <TextBlock Grid.Column="0" Text="Working tree" FontSize="11" FontWeight="SemiBold"
+                               Margin="0,0,8,0"
                                Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                    <TextBlock Classes="Mono" Text="{Binding WorkingTreeDeclarationDisplay}" FontSize="11"
-                               MaxWidth="360" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-                </StackPanel>
-                <StackPanel Orientation="Horizontal" Spacing="8" IsVisible="{Binding HasDeclaredToolchain}">
-                    <TextBlock Text="On this machine" FontSize="11" FontWeight="SemiBold" Width="120"
+                    <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding WorkingTreeDeclarationDisplay}"
+                               FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                </Grid>
+                <Grid ColumnDefinitions="120,*" IsVisible="{Binding HasDeclaredToolchain}">
+                    <TextBlock Grid.Column="0" Text="On this machine" FontSize="11" FontWeight="SemiBold"
+                               Margin="0,0,8,0" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                    <StackPanel Spacing="2">
+                    <StackPanel Grid.Column="1" Spacing="2">
                         <StackPanel Orientation="Horizontal" Spacing="6"
                                     IsVisible="{Binding DeclaredToolchainInstalled}">
                             <PathIcon Data="{StaticResource CheckmarkIcon}" Width="12" Height="12"
                                       Foreground="{DynamicResource SuccessBrush}" VerticalAlignment="Center"/>
                             <TextBlock Text="Installed — it was just run at the pinned version" FontSize="11"
-                                       Foreground="{DynamicResource SuccessBrush}"/>
+                                       TextWrapping="Wrap" Foreground="{DynamicResource SuccessBrush}"/>
                         </StackPanel>
                         <StackPanel Orientation="Horizontal" Spacing="6"
                                     IsVisible="{Binding !DeclaredToolchainInstalled}">
                             <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12"
                                       Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Center"/>
-                            <TextBlock Text="Not installed here yet" FontSize="11"
+                            <TextBlock Text="Not installed here yet" FontSize="11" TextWrapping="Wrap"
                                        Foreground="{DynamicResource WarningBrush}"/>
                         </StackPanel>
                         <TextBlock Classes="Mono" Text="{Binding DeclaredToolchainDetail}" FontSize="10"
-                                   MaxWidth="340" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
+                                   TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
                     </StackPanel>
-                </StackPanel>
+                </Grid>
             </StackPanel>
         </Border>
 
         <!-- Which toolchain to declare -->
         <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14">
-            <StackPanel Orientation="Horizontal" Spacing="10">
-                <TextBlock Text="Declare" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"
-                           Foreground="{DynamicResource TextPrimary}"/>
-                <ComboBox ItemsSource="{Binding AvailableToolchainIds}" MinWidth="180"
+            <Grid ColumnDefinitions="Auto,*">
+                <TextBlock Grid.Column="0" Text="Declare" FontSize="12" FontWeight="SemiBold" Margin="0,0,10,0"
+                           VerticalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
+                <ComboBox Grid.Column="1" ItemsSource="{Binding AvailableToolchainIds}" MaxWidth="260"
+                          HorizontalAlignment="Left" MinWidth="120"
                           SelectedItem="{Binding SelectedToolchainId}"/>
-            </StackPanel>
+            </Grid>
         </Border>
 
         <!-- Step 1 — write the file into the working tree. Nothing else. -->
@@ -89,20 +100,20 @@
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,12,0">
                     <TextBlock Text="1 · Write .mainguard/toolchain" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock FontSize="11" MaxWidth="420" TextWrapping="Wrap"
+                               TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                    <TextBlock FontSize="11" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMuted}"
                                Text="Writes the file into your working tree only. It is not staged and not committed."/>
-                    <TextBlock Classes="Mono" Text="{Binding DesiredContent}" FontSize="10" MaxWidth="420"
+                    <TextBlock Classes="Mono" Text="{Binding DesiredContent}" FontSize="10"
                                Foreground="{DynamicResource AccentBrush}" TextWrapping="Wrap"/>
                     <!-- The reason this step cannot run, right where the button is. -->
-                    <StackPanel Orientation="Horizontal" Spacing="6"
-                                IsVisible="{Binding WriteFileDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-                        <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,0,0"
-                                  Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
-                        <TextBlock Text="{Binding WriteFileDisabledReason}" FontSize="11" MaxWidth="400"
+                    <Grid ColumnDefinitions="Auto,*"
+                          IsVisible="{Binding WriteFileDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12"
+                                  Margin="0,2,6,0" Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
+                        <TextBlock Grid.Column="1" Text="{Binding WriteFileDisabledReason}" FontSize="11"
                                    Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"/>
-                    </StackPanel>
+                    </Grid>
                 </StackPanel>
                 <Button Grid.Column="1" Content="Write file" Classes="Primary" Padding="14,5"
                         VerticalAlignment="Center" Command="{Binding WriteFileCommand}"/>
@@ -114,30 +125,30 @@
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,12,0">
                     <TextBlock Text="2 · Stage &amp; commit that one file" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock FontSize="11" MaxWidth="420" TextWrapping="Wrap"
+                               TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                    <TextBlock FontSize="11" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMuted}"
                                Text="Stages exactly .mainguard/toolchain and commits it. Nothing is pushed."/>
                     <!-- Exactly what will be committed, and where — shown BEFORE the commit. -->
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBlock Text="Message" FontSize="10" Width="60"
+                    <Grid ColumnDefinitions="Auto,*">
+                        <TextBlock Grid.Column="0" Text="Message" FontSize="10" Width="60" Margin="0,0,8,0"
                                    Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                        <TextBlock Classes="Mono" Text="{Binding CommitMessage}" FontSize="10" MaxWidth="360"
+                        <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding CommitMessage}" FontSize="10"
                                    TextWrapping="Wrap" Foreground="{DynamicResource AccentBrush}"/>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <TextBlock Text="Branch" FontSize="10" Width="60"
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,*">
+                        <TextBlock Grid.Column="0" Text="Branch" FontSize="10" Width="60" Margin="0,0,8,0"
                                    Foreground="{DynamicResource TextMuted}" VerticalAlignment="Top"/>
-                        <TextBlock Classes="Mono" Text="{Binding CurrentBranch}" FontSize="10" MaxWidth="360"
+                        <TextBlock Grid.Column="1" Classes="Mono" Text="{Binding CurrentBranch}" FontSize="10"
                                    TextWrapping="Wrap" Foreground="{DynamicResource AccentBrush}"/>
-                    </StackPanel>
-                    <StackPanel Orientation="Horizontal" Spacing="6"
-                                IsVisible="{Binding CommitDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-                        <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,0,0"
-                                  Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
-                        <TextBlock Text="{Binding CommitDisabledReason}" FontSize="11" MaxWidth="400"
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,*"
+                          IsVisible="{Binding CommitDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12"
+                                  Margin="0,2,6,0" Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
+                        <TextBlock Grid.Column="1" Text="{Binding CommitDisabledReason}" FontSize="11"
                                    Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"/>
-                    </StackPanel>
+                    </Grid>
                 </StackPanel>
                 <Button Grid.Column="1" Content="Stage &amp; commit" Classes="Primary" Padding="14,5"
                         VerticalAlignment="Center" Command="{Binding CommitCommand}"/>
@@ -148,18 +159,18 @@
         <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14">
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,12,0">
-                    <TextBlock Text="3 · Push" FontSize="13" FontWeight="SemiBold"
+                    <TextBlock Text="3 · Push" FontSize="13" FontWeight="SemiBold" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock FontSize="11" MaxWidth="420" TextWrapping="Wrap"
+                    <TextBlock FontSize="11" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMuted}"
                                Text="Publishes the commit. Mainguard never pushes as a side effect of committing — this button is the only way."/>
-                    <StackPanel Orientation="Horizontal" Spacing="6"
-                                IsVisible="{Binding PushDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-                        <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,0,0"
-                                  Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
-                        <TextBlock Text="{Binding PushDisabledReason}" FontSize="11" MaxWidth="400"
+                    <Grid ColumnDefinitions="Auto,*"
+                          IsVisible="{Binding PushDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12"
+                                  Margin="0,2,6,0" Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
+                        <TextBlock Grid.Column="1" Text="{Binding PushDisabledReason}" FontSize="11"
                                    Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"/>
-                    </StackPanel>
+                    </Grid>
                 </StackPanel>
                 <Button Grid.Column="1" Content="Push" Classes="Secondary" Padding="14,5"
                         VerticalAlignment="Center" Command="{Binding PushCommand}"/>
@@ -171,17 +182,17 @@
             <Grid ColumnDefinitions="*,Auto">
                 <StackPanel Grid.Column="0" Spacing="4" Margin="0,0,12,0">
                     <TextBlock Text="4 · Install the declared toolchain here" FontSize="13" FontWeight="SemiBold"
-                               Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock FontSize="11" MaxWidth="420" TextWrapping="Wrap"
+                               TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                    <TextBlock FontSize="11" TextWrapping="Wrap"
                                Foreground="{DynamicResource TextMuted}"
                                Text="Declaring a toolchain and having it on this machine are two different facts. This installs the declared one at its pinned, checksum-verified version — it touches nothing in the repository."/>
-                    <StackPanel Orientation="Horizontal" Spacing="6"
-                                IsVisible="{Binding InstallDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
-                        <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,0,0"
-                                  Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
-                        <TextBlock Text="{Binding InstallDisabledReason}" FontSize="11" MaxWidth="400"
+                    <Grid ColumnDefinitions="Auto,*"
+                          IsVisible="{Binding InstallDisabledReason, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                        <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12"
+                                  Margin="0,2,6,0" Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Top"/>
+                        <TextBlock Grid.Column="1" Text="{Binding InstallDisabledReason}" FontSize="11"
                                    Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"/>
-                    </StackPanel>
+                    </Grid>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Spacing="6" VerticalAlignment="Center">
                     <Button Content="Install toolchain" Classes="Primary" Padding="14,5"
@@ -193,7 +204,7 @@
         </Border>
 
         <!-- What the last step did, or why it failed. -->
-        <TextBlock Text="{Binding StatusMessage}" FontSize="12" MaxWidth="560" TextWrapping="Wrap"
+        <TextBlock Text="{Binding StatusMessage}" FontSize="12" TextWrapping="Wrap"
                    Foreground="{DynamicResource TextMuted}">
             <TextBlock.IsVisible>
                 <MultiBinding Converter="{x:Static BoolConverters.And}">
@@ -202,11 +213,11 @@
                 </MultiBinding>
             </TextBlock.IsVisible>
         </TextBlock>
-        <StackPanel Orientation="Horizontal" Spacing="6" IsVisible="{Binding IsFailed}">
-            <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,0,0"
+        <Grid ColumnDefinitions="Auto,*" IsVisible="{Binding IsFailed}">
+            <PathIcon Grid.Column="0" Data="{StaticResource WarningIcon}" Width="12" Height="12" Margin="0,2,6,0"
                       Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"/>
-            <TextBlock Text="{Binding StatusMessage}" FontSize="12" MaxWidth="540" TextWrapping="Wrap"
+            <TextBlock Grid.Column="1" Text="{Binding StatusMessage}" FontSize="12" TextWrapping="Wrap"
                        Foreground="{DynamicResource DangerBrush}"/>
-        </StackPanel>
+        </Grid>
     </StackPanel>
 </UserControl>

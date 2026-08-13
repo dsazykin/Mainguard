@@ -29,6 +29,7 @@ public class AppDbContext : DbContext
     public DbSet<MergeLeaseRow> MergeLeaseRows { get; set; } = null!;
     public DbSet<PrIntakeSubscriptionRow> PrIntakeSubscriptions { get; set; } = null!;
     public DbSet<PrIntakeHeadRow> PrIntakeHeads { get; set; } = null!;
+    public DbSet<PrIntakeConfigRow> PrIntakeConfig { get; set; } = null!;
 
     public AppDbContext()
     {
@@ -142,6 +143,10 @@ public class AppDbContext : DbContext
             .HasIndex(s => new { s.Host, s.Owner, s.Repo, s.AuthorFilter }).IsUnique();
         modelBuilder.Entity<PrIntakeHeadRow>().HasKey(h => h.Id);
         modelBuilder.Entity<PrIntakeHeadRow>().HasIndex(h => new { h.SourceKey, h.PrNumber }).IsUnique();
+        // The intake's daemon-wide configuration — one row, upserted by a constant id. No value
+        // generation on the key: the store names the id, it is never allocated.
+        modelBuilder.Entity<PrIntakeConfigRow>().HasKey(c => c.Id);
+        modelBuilder.Entity<PrIntakeConfigRow>().Property(c => c.Id).ValueGeneratedNever();
 
         // Seed some initial default categories
         modelBuilder.Entity<WorkspaceCategory>().HasData(

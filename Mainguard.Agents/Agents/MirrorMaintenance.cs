@@ -55,7 +55,16 @@ public static class MirrorMaintenance
         AgentGitCommand.Run(barePath, "config", "gc.auto", "0");
         // `git maintenance` is the modern automatic path and reads its own switch; setting only gc.auto
         // would leave a second door open on a newer git.
-        AgentGitCommand.TryRun(barePath, out _, "config", "maintenance.auto", "false");
+        //
+        // CHECKED, exactly like gc.auto above, and for the reason the comment already gives. This was a
+        // TryRun whose exit code went into `_`: on a git new enough for background maintenance — i.e.
+        // precisely the git this line exists for — a failure to pin the switch leaves automatic
+        // maintenance free to prune objects that alternates borrowers still need. Nothing fails at that
+        // moment; the agent repositories break later with missing objects, at a distance from the cause
+        // large enough that nobody would connect the two. Both halves of a two-door policy have to be
+        // checked or it is a one-door policy with a comment. `git config <key> <value>` writes an
+        // arbitrary key and does not require git to know it, so an older git sets it just as happily.
+        AgentGitCommand.Run(barePath, "config", "maintenance.auto", "false");
     }
 
     /// <summary>

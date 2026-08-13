@@ -4,10 +4,10 @@
         x:Class="Mainguard.App.Shell.Views.SshKeysView"
         x:DataType="vm:SshKeysViewModel">
     <StackPanel Spacing="15" MaxWidth="620">
-        <StackPanel Orientation="Horizontal" Spacing="10">
-            <PathIcon Data="{StaticResource KeyIcon}" Width="18" Height="18" Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-            <TextBlock Text="SSH Keys" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-        </StackPanel>
+        <Grid ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource KeyIcon}" Width="18" Height="18" Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="SSH Keys" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
 
         <ItemsControl ItemsSource="{Binding Keys}">
             <ItemsControl.ItemTemplate>

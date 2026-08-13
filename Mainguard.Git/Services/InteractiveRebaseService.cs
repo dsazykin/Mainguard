@@ -74,8 +74,10 @@ public class InteractiveRebaseService : IInteractiveRebaseService
                 throw new GitOperationException("Working tree is dirty. Stash or discard your changes before rebasing.");
             }
 
-            if (Directory.Exists(Path.Combine(repoPath, ".git", "rebase-merge")) ||
-                Directory.Exists(Path.Combine(repoPath, ".git", "rebase-apply")))
+            // Per-worktree state — resolve the gitdir, never <repoPath>/.git (a FILE in a
+            // linked worktree). See GitService.ResolveGitDir.
+            if (Directory.Exists(GitService.GitDirPath(repoPath, "rebase-merge")) ||
+                Directory.Exists(GitService.GitDirPath(repoPath, "rebase-apply")))
             {
                 throw new GitOperationException("A rebase is already in progress.");
             }
@@ -95,7 +97,7 @@ public class InteractiveRebaseService : IInteractiveRebaseService
         // what makes squash chains correct: git invokes the editor once per squash *chain*,
         // so an ordinal queue would desync after the first multi-squash group.
         //
-        // The dir lives under .git so it survives conflict/edit pauses and is reused verbatim
+        // The dir lives inside the resolved gitdir so it survives conflict/edit pauses and is reused verbatim
         // by ContinueRebase — the temp-dir-deleted-on-pause bug is gone.
         var msgDir = GitService.RebaseMsgQueueDir(repoPath);
         try { if (Directory.Exists(msgDir)) Directory.Delete(msgDir, true); } catch { }
@@ -163,7 +165,7 @@ public class InteractiveRebaseService : IInteractiveRebaseService
             }
         }
 
-        var stoppedShaPath = Path.Combine(repoPath, ".git", "rebase-merge", "stopped-sha");
+        var stoppedShaPath = GitService.GitDirPath(repoPath, "rebase-merge", "stopped-sha");
         if (File.Exists(stoppedShaPath))
         {
             var sha = File.ReadAllText(stoppedShaPath).Trim();
@@ -171,7 +173,7 @@ public class InteractiveRebaseService : IInteractiveRebaseService
         }
 
         // Genuine failure that did not leave a resumable rebase — clean the queue up.
-        if (!Directory.Exists(Path.Combine(repoPath, ".git", "rebase-merge")))
+        if (!Directory.Exists(GitService.GitDirPath(repoPath, "rebase-merge")))
         {
             try { Directory.Delete(msgDir, true); } catch { }
         }
@@ -180,8 +182,8 @@ public class InteractiveRebaseService : IInteractiveRebaseService
 
     public (int Step, int Total)? GetRebaseProgress(string repoPath)
     {
-        var msgnumPath = Path.Combine(repoPath, ".git", "rebase-merge", "msgnum");
-        var endPath = Path.Combine(repoPath, ".git", "rebase-merge", "end");
+        var msgnumPath = GitService.GitDirPath(repoPath, "rebase-merge", "msgnum");
+        var endPath = GitService.GitDirPath(repoPath, "rebase-merge", "end");
 
         if (File.Exists(msgnumPath) && File.Exists(endPath)
             && int.TryParse(File.ReadAllText(msgnumPath).Trim(), out var step)

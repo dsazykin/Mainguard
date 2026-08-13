@@ -156,26 +156,43 @@ public class BootstrapStateMachineTests
 
     // Source-grep guard: the literal must be absent from Core and Server entirely (mirrors the
     // reviewer grep in the plan §7; an analyzer-free belt-and-braces of Lifecycle_ShouldNeverEmit).
+    //
+    // This test used to be able to pass having read ZERO files. RepoRoot() fell back to
+    // AppContext.BaseDirectory when the walk found no Mainguard.slnx, each missing project directory was
+    // `continue`d past, and the only assertion was "no offenders" — so run from anywhere outside the
+    // repo tree (a copied bin/, a packaged test run) it reported green on an empty search. The scan
+    // count is now asserted alongside the offender count: not finding the sources is a FAILURE, because
+    // "I scanned nothing" and "I found nothing" must never look the same.
     [Fact]
     public void NoShutdownAnywhere_InCoreOrServer()
     {
         var root = RepoRoot();
         var offenders = new List<string>();
+        var scanned = 0;
         foreach (var project in new[] { "Mainguard.Agents", "Mainguard.Server" })
         {
             var dir = Path.Combine(root, project);
-            if (!Directory.Exists(dir))
-                continue;
+            Assert.True(
+                Directory.Exists(dir),
+                $"G-12 guard cannot scan '{dir}' — the project directory is missing (renamed/moved?). " +
+                "A guard that cannot read its inputs must fail, not pass.");
+
+            var projectScanned = 0;
             foreach (var file in Directory.EnumerateFiles(dir, "*.cs", SearchOption.AllDirectories))
             {
                 if (file.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal) ||
                     file.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
                     continue;
+                projectScanned++;
                 if (File.ReadAllText(file).Contains("--shutdown", StringComparison.Ordinal))
                     offenders.Add(file);
             }
+
+            Assert.True(projectScanned > 0, $"G-12 guard scanned 0 .cs files under '{dir}' — the scan is vacuous.");
+            scanned += projectScanned;
         }
 
+        Assert.True(scanned > 0, "G-12 guard scanned 0 files in total — the scan is vacuous.");
         Assert.True(offenders.Count == 0, "G-12 violation — '--shutdown' found in: " + string.Join(", ", offenders));
     }
 
@@ -359,12 +376,20 @@ public class BootstrapStateMachineTests
 
     private static WslRunResult Ok(string stdout) => new(0, stdout, "");
 
+    /// <summary>
+    /// Walks up from the test binary to the directory holding Mainguard.slnx. It used to fall back to
+    /// <see cref="AppContext.BaseDirectory"/> when the walk ran off the top, which turned "the repo is
+    /// not here" into "the repo is this empty directory" — the source-scanning guard above then found
+    /// no sources and reported green. Not finding the repo is now a hard failure.
+    /// </summary>
     private static string RepoRoot()
     {
         var dir = AppContext.BaseDirectory;
         while (dir != null && !File.Exists(Path.Combine(dir, "Mainguard.slnx")))
             dir = Directory.GetParent(dir)?.FullName;
-        return dir ?? AppContext.BaseDirectory;
+        return dir ?? throw new DirectoryNotFoundException(
+            $"No Mainguard.slnx found walking up from '{AppContext.BaseDirectory}'. The source-scanning " +
+            "guards need the repository working tree; a silent fallback would make them scan nothing.");
     }
 
     private sealed class FakeStep : IBootstrapStep

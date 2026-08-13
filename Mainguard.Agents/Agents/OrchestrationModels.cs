@@ -80,6 +80,30 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// answer this (its in-flight set is memory; the state is persisted), and the two disagree after any
 /// restart mid-run. Defaults to false so a projection that cannot answer never claims a run is
 /// happening — the direction that matters, since claiming one is what makes an entry look busy forever.</param>
+/// <param name="HasLiveSandbox">
+/// Whether this entry's agent still has a jail — <b>three-valued, and null means "not known here"</b>.
+///
+/// <para>It decides whether the entry is workable at all: verification runs in the worker's own sandbox
+/// and never on the host, so an entry whose jail is gone cannot be verified, cannot reach
+/// <see cref="WorkerMergeState.Verified"/>, and therefore cannot merge — its only honest actions are
+/// resume and discard. Only the daemon holds the session table, so no client can derive it.</para>
+///
+/// <para><b>Why not a bool.</b> <c>false</c> is the answer that makes an entry render as stranded and
+/// offers to spawn a jail for it. A projection that simply cannot answer — the mock, a daemon predating
+/// the field — must not give that answer by default, so "no jail" and "no idea" are different values.
+/// Null leaves every surface exactly as it was.</para>
+/// </param>
+/// <param name="VerifiedMainSha">
+/// The <c>main@sha</c> this branch's verification ran against, straight off the daemon's
+/// <c>verified_main_sha</c>. It is what the review cockpit's "verified @ &lt;sha&gt;" stamp reads, and the
+/// only thing that tells a reviewer whether the green they are looking at was measured against today's
+/// main or a week-old one.
+///
+/// <para>Deliberately NOT folded into <see cref="VerificationRecord"/>: that record also carries
+/// <c>Passed</c> and the test counts, and the wire has none of them. Constructing one here would have
+/// meant inventing a pass/fail verdict to carry a sha, which is exactly the kind of fabricated
+/// reassurance this surface exists to prevent. Null means the daemon did not say.</para>
+/// </param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -88,7 +112,9 @@ public sealed record QueueEntry(
     string Detail,
     VerificationRecord? Verification,
     IReadOnlyList<FlaggedItem> FlaggedItems,
-    bool VerificationInFlight = false);
+    bool VerificationInFlight = false,
+    bool? HasLiveSandbox = null,
+    string? VerifiedMainSha = null);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(

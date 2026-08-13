@@ -1,26 +1,63 @@
-<Window xmlns="https://github.com/avaloniaui"
+<UserControl xmlns="https://github.com/avaloniaui"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
         x:Class="Mainguard.Agents.UI.Views.PrIntakeSettingsView"
-        x:DataType="vm:PrIntakeSettingsViewModel"
-        Title="External PR Intake"
-        Width="600" Height="600"
-        WindowStartupLocation="CenterOwner"
-        Background="{DynamicResource SurfaceWindow}">
-    <Border Padding="20">
-        <Grid RowDefinitions="Auto,Auto,Auto,*,Auto,Auto">
+        x:DataType="vm:PrIntakeSettingsViewModel">
+    <Border Padding="0">
+        <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,*,Auto">
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="0,0,0,15">
-                <TextBlock Text="External PR Intake" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid Grid.Row="0" Margin="0,0,0,6" ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource PullRequestIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="PR intake" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
+            <TextBlock Grid.Row="1" Margin="0,0,0,12" FontSize="12" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextMuted}"
+                       Text="Bot-authored pull requests on a subscribed repository enter the same verify → review → merge pipeline as local agents. These settings belong to the Mainguard daemon — it is what polls the host and gives each intake'd pull request its own sandbox — so they are read from and saved to it, and they keep applying with this window closed."/>
 
-            <!-- Subscribe to a source -->
-            <Border Grid.Row="1" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,12">
+            <!-- Daemon refusal / unreachable. Never a silent failure: this page must not look saved
+                 when the daemon did not save it. -->
+            <Border Grid.Row="2" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8"
+                    Padding="12" Margin="0,0,0,12"
+                    IsVisible="{Binding ErrorMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <PathIcon Data="{StaticResource WarningIcon}" Width="14" Height="14"
+                              Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top" Margin="0,2,0,0"/>
+                    <TextBlock Text="{Binding ErrorMessage}" TextWrapping="Wrap" FontSize="12"
+                               Foreground="{DynamicResource DangerBrush}"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Polling: the on/off switch, the cadence and the shared bot list -->
+            <Border Grid.Row="3" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,12">
+                <StackPanel Spacing="10">
+                    <TextBlock Text="Polling" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextPrimary}"/>
+                    <CheckBox IsChecked="{Binding IntakeEnabled}" Foreground="{DynamicResource TextPrimary}"
+                              Content="Poll subscribed repositories for bot pull requests"/>
+                    <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
+                               Text="Turning this off parks the poll loop without unsubscribing anything, so switching it back on does not mean re-entering every repository."/>
+                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                        <TextBlock Text="Interval (seconds)" VerticalAlignment="Center" Foreground="{DynamicResource TextMuted}" FontSize="12"/>
+                        <NumericUpDown Minimum="10" Maximum="3600" Increment="10" Value="{Binding PollIntervalSeconds}" HorizontalAlignment="Left" Width="140"/>
+                    </StackPanel>
+                    <TextBlock Text="Bot authors (comma-separated)" Foreground="{DynamicResource TextMuted}" FontSize="12"/>
+                    <TextBox Text="{Binding BotAuthors, UpdateSourceTrigger=PropertyChanged}" Watermark="codex[bot], google-jules[bot], copilot"/>
+                    <TextBlock FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
+                               Text="Applies to any subscription with no author filter of its own. Leave it blank to fall back to the daemon's built-in list."/>
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <Button Content="Save" Classes="Primary" Padding="14,6" Command="{Binding SaveCommand}"/>
+                        <Button Content="Reload" Classes="Secondary" Padding="14,6" Command="{Binding LoadCommand}"/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <!-- Subscribe a source -->
+            <Border Grid.Row="4" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,12">
                 <StackPanel Spacing="10">
                     <TextBlock Text="Subscribe a repository" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock Text="Bot-authored pull requests on this repo enter the same verify → review → merge pipeline as local agents. Leave the author filter blank to use the shared bot list."
+                    <TextBlock Text="Leave the author filter blank to use the shared bot list above. Subscribing is a provisioning decision: every matching open pull request gets its own sandbox on this machine."
                                FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                     <StackPanel Spacing="8">
                         <TextBox Text="{Binding NewHost, UpdateSourceTrigger=PropertyChanged}" Watermark="Host (github.com)"/>
@@ -34,21 +71,8 @@
                 </StackPanel>
             </Border>
 
-            <!-- Poll cadence + bot list -->
-            <Border Grid.Row="2" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,12">
-                <StackPanel Spacing="10">
-                    <TextBlock Text="Polling" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextPrimary}"/>
-                    <StackPanel Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-                        <TextBlock Text="Interval (seconds)" VerticalAlignment="Center" Foreground="{DynamicResource TextMuted}" FontSize="12"/>
-                        <NumericUpDown Minimum="10" Maximum="3600" Increment="10" Value="{Binding PollIntervalSeconds}" HorizontalAlignment="Left" Width="140"/>
-                    </StackPanel>
-                    <TextBlock Text="Bot authors (comma-separated)" Foreground="{DynamicResource TextMuted}" FontSize="12"/>
-                    <TextBox Text="{Binding BotAuthors, UpdateSourceTrigger=PropertyChanged}" Watermark="codex[bot], google-jules[bot], copilot"/>
-                </StackPanel>
-            </Border>
-
-            <!-- Subscribed sources -->
-            <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto">
+            <!-- Subscribed sources: the DAEMON's list, re-read after every write -->
+            <ScrollViewer Grid.Row="5" VerticalScrollBarVisibility="Auto" MaxHeight="260">
                 <StackPanel Spacing="8">
                     <TextBlock Text="Subscribed repositories" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextMuted}"/>
                     <ItemsControl ItemsSource="{Binding Sources}">
@@ -66,10 +90,12 @@
                 </StackPanel>
             </ScrollViewer>
 
-            <!-- Footer -->
-            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,15,0,0">
-                <Button Content="Close" Classes="Secondary" Padding="15,6" Command="{Binding CloseCommand}"/>
-            </StackPanel>
+            <!-- "Nothing subscribed" only once the daemon has actually answered, so an empty list is
+                 never mistaken for a page that has not loaded. -->
+            <TextBlock Grid.Row="6" Margin="0,4,0,0" FontSize="12" TextWrapping="Wrap"
+                       Foreground="{DynamicResource TextMuted}"
+                       IsVisible="{Binding ShowNoSources}"
+                       Text="No repositories are subscribed yet."/>
         </Grid>
     </Border>
-</Window>
+</UserControl>

@@ -146,7 +146,19 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
         ResetNotice = "";
     }
 
-    /// <summary>Projection only — the daemon owns the classification; this names it for the §9.3 glyph.</summary>
+    /// <summary>
+    /// Projection only — the daemon owns the classification; this names it for the §9.3 glyph.
+    ///
+    /// <para><b>The kind is read out of the item ID, not out of the category.</b>
+    /// <see cref="FlaggedChange.Id"/> is <c>kind|path|contentHash</c>, so the daemon's own
+    /// <see cref="FlaggedKind"/> is on the wire verbatim; <c>Category</c> carries a
+    /// <see cref="RiskCategory"/> name (<c>Lockfile</c>, <c>CiWorkflow</c>, …), which is a different
+    /// enumeration entirely. Parsing THAT as a kind therefore succeeded for exactly one value and fell back
+    /// to <see cref="FlaggedKind.RiskCategory"/> for every other — so a daemon-flagged CVE, install-script
+    /// or unchecked-advisory row all arrived at the surface labelled as an ordinary risk hunk. Nothing
+    /// rendered from it yet, which is why it went unnoticed; a property that quietly answers the wrong
+    /// question is one binding away from being read out loud.</para>
+    /// </summary>
     private static FlaggedKind KindOf(string itemId, string category)
     {
         if (string.Equals(itemId, LiveChangedTestCommandItemId, StringComparison.Ordinal))
@@ -154,6 +166,14 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
             return FlaggedKind.ChangedTestCommand;
         }
 
+        var bar = (itemId ?? string.Empty).IndexOf('|');
+        if (bar > 0 && Enum.TryParse<FlaggedKind>(itemId![..bar], ignoreCase: false, out var fromId))
+        {
+            return fromId;
+        }
+
+        // A category name is not a kind name, but an id that does not carry one leaves nothing better to
+        // try than the historical guess.
         return Enum.TryParse<FlaggedKind>(category, ignoreCase: true, out var parsed)
             ? parsed
             : FlaggedKind.RiskCategory;

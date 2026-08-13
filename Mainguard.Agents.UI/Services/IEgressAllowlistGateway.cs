@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace Mainguard.Agents.UI.Services;
 
@@ -13,12 +15,18 @@ public sealed record EgressAllowlistItem(string Name, string HostPattern, string
 /// <b>only</b> through the daemon (ESC-I2/G-18) — this interface is implemented over
 /// <c>DaemonClient</c> in production, so the App never references the container-control library or the
 /// sandbox/egress engine seams. Every add/remove is change-logged daemon-side.
+///
+/// <para><b>Async because the real implementation is a gRPC round trip.</b> This was declared
+/// synchronous, which is fine for the in-memory seed and impossible for the daemon: the only gateway
+/// that existed was the in-memory one, so the allowlist editor could never be shown against the live
+/// allowlist. Blocking on the RPC instead would have put a network call on the UI thread, inside a
+/// ViewModel constructor.</para>
 /// </summary>
 public interface IEgressAllowlistGateway
 {
-    IReadOnlyList<EgressAllowlistItem> List();
-    void Add(string name, string hostPattern, string kind);
-    void Remove(string hostPattern);
+    Task<IReadOnlyList<EgressAllowlistItem>> ListAsync(CancellationToken ct = default);
+    Task AddAsync(string name, string hostPattern, string kind, CancellationToken ct = default);
+    Task RemoveAsync(string hostPattern, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -44,6 +52,24 @@ public sealed class InMemoryEgressAllowlistGateway : IEgressAllowlistGateway
 
     public void Remove(string hostPattern)
         => _items.RemoveAll(i => string.Equals(i.HostPattern, hostPattern, StringComparison.OrdinalIgnoreCase));
+
+    // The seam is async because the DAEMON implementation is a round trip; this one is a list, so the
+    // async members are the sync ones wrapped. The sync API stays public — it is what the seed tests and
+    // the render harness use, and making them await a completed task would buy nothing.
+    Task<IReadOnlyList<EgressAllowlistItem>> IEgressAllowlistGateway.ListAsync(CancellationToken ct)
+        => Task.FromResult(List());
+
+    Task IEgressAllowlistGateway.AddAsync(string name, string hostPattern, string kind, CancellationToken ct)
+    {
+        Add(name, hostPattern, kind);
+        return Task.CompletedTask;
+    }
+
+    Task IEgressAllowlistGateway.RemoveAsync(string hostPattern, CancellationToken ct)
+    {
+        Remove(hostPattern);
+        return Task.CompletedTask;
+    }
 
     // The daemon's own git-host heuristic, called rather than re-implemented: this used to be a
     // hand-copied mirror that had already drifted (its Azure arm was a substring `Contains`, so

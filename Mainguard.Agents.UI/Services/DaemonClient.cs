@@ -203,6 +203,51 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.AgentId;
     }
 
+    /// <summary>
+    /// Resumes a stranded merge-queue entry: a jail spawned onto the id that entry ALREADY has, with the
+    /// worktree standing on its existing <c>agent/&lt;id&gt;</c> branch.
+    ///
+    /// <para>A refusal comes back as an ordinary response with <c>Resumed == false</c> and a reason, not as
+    /// an exception — so a caller must never read "no throw" as "it resumed". The request carries no actor
+    /// and no role: the identity is daemon-derived, and a resume structurally cannot mint a coordinator.</para>
+    /// </summary>
+    public async Task<ResumeAgentResponse> ResumeAgentAsync(
+        string repoHandle, string agentId, string agentKind, string modelApiKey,
+        CancellationToken ct, TimeSpan? deadline = null,
+        IReadOnlyDictionary<string, string>? extraEnv = null,
+        IReadOnlyList<CliLoginFile>? cliCredentials = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        var request = new ResumeAgentRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            AgentKind = agentKind ?? string.Empty,
+            ModelApiKey = modelApiKey ?? string.Empty,
+        };
+        if (extraEnv is not null)
+        {
+            foreach (var (name, value) in extraEnv)
+            {
+                request.ExtraEnv.Add(new EnvEntry { Name = name, Value = value });
+            }
+        }
+
+        if (cliCredentials is not null)
+        {
+            foreach (var file in cliCredentials)
+            {
+                request.CliCredentials.Add(new CliCredentialFile
+                {
+                    Path = file.Path,
+                    Content = Google.Protobuf.ByteString.CopyFrom(file.Content),
+                });
+            }
+        }
+
+        return await client.ResumeAgentAsync(request, CallOptions(ct, deadline));
+    }
+
     /// <summary>The tier-1 skew probe (authenticated, deadlined): the daemon's own version + the
     /// MainguardOS payload version. A pre-<c>GetDaemonInfo</c> daemon throws <c>Unimplemented</c> —
     /// that IS the skew signal; the caller maps it (see <c>DaemonAutoRefresh</c>), not this method.</summary>
@@ -661,6 +706,38 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         var client = new GatewayService.GatewayServiceClient(Channel());
         var response = await client.SetBudgetsAsync(new SetBudgetsRequest { Budget = budget }, CallOptions(ct, deadline));
         return response.Budget ?? new Budget();
+    }
+
+    // ---- P2-12 external-PR intake configuration ----
+
+    /// <summary>Reads the daemon's external-PR-intake configuration and its persisted subscriptions.</summary>
+    public async Task<GetPrIntakeSettingsResponse> GetPrIntakeSettingsAsync(
+        CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        return await client.GetPrIntakeSettingsAsync(new GetPrIntakeSettingsRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Writes the daemon's external-PR-intake configuration. Returns it AS PERSISTED (the daemon
+    /// clamps the interval and substitutes its default bot list for an empty one), so a caller that
+    /// renders the result is showing what the poller will actually run with.</summary>
+    public async Task<PrIntakeSettings> UpdatePrIntakeSettingsAsync(
+        PrIntakeSettings settings, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        var response = await client.UpdatePrIntakeSettingsAsync(
+            new UpdatePrIntakeSettingsRequest { Settings = settings }, CallOptions(ct, deadline));
+        return response.Settings ?? new PrIntakeSettings();
+    }
+
+    /// <summary>Subscribes one source. <c>Added</c> is false for an already-subscribed
+    /// <c>(host, owner, repo, filter)</c> — idempotent, never an error.</summary>
+    public async Task<SubscribePrIntakeSourceResponse> SubscribePrIntakeSourceAsync(
+        PrIntakeSource source, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PrIntakeService.PrIntakeServiceClient(Channel());
+        return await client.SubscribePrIntakeSourceAsync(
+            new SubscribePrIntakeSourceRequest { Source = source }, CallOptions(ct, deadline));
     }
 
     // ---- P2-14 / P2-47 #9 coordinator conversation ----

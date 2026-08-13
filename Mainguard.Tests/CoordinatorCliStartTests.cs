@@ -422,6 +422,52 @@ public class CoordinatorCliStartTests
         }
     }
 
+    /// <summary>
+    /// #51 regression. The ctor already starts a retry loop, so asking for one again used to run a
+    /// SECOND loop against the same daemon. Both wrote <c>CoordinatorStartError</c> through
+    /// <c>Dispatcher.UIThread.InvokeAsync</c>, so a lagging "could not reach" from one loop could
+    /// land after the other's success and leave a false error banner on a screen that had in fact
+    /// loaded — which is what made the test above fail intermittently, at line "Strings differ".
+    ///
+    /// Asserted as an exact call count rather than a timing race, so it is deterministic in either
+    /// direction: the three failures are shared, and each live loop must then see a success of its
+    /// own before it exits. One loop → 3 + 1 = <b>4</b> calls. Before the fix the ctor's loop plus
+    /// both asks below made three → 3 + 3 = <b>6</b> (measured). The old loose <c>&gt;= 4</c> in the
+    /// test above is precisely what let the extra loops hide.
+    /// </summary>
+    [AvaloniaFact]
+    public async Task LoadClis_AskedWhileAlreadyRetrying_JoinsThatLoop_InsteadOfRacingASecond()
+    {
+        var previousDelay = ControlCenterViewModel.CliLoadRetryDelay;
+        ControlCenterViewModel.CliLoadRetryDelay = TimeSpan.FromMilliseconds(10);
+        try
+        {
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            var host = new FakeCliHost { ListFailuresRemaining = 3 };
+            using var vm = new ControlCenterViewModel(BundleWith(host, mock)); // ctor starts loop #1
+
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var joined = vm.LoadInstalledClisUntilAvailableAsync(cts.Token);
+            var joinedAgain = vm.LoadInstalledClisUntilAvailableAsync(cts.Token);
+
+            Assert.Same(joined, joinedAgain);   // every asker joins the one in-flight loop
+            await joined;
+
+            Assert.Equal(4, host.ListCalls);    // 3 failures + exactly ONE success: a single loop
+            Assert.Equal(2, vm.InstalledClis.Count);
+            Assert.Equal("", vm.CoordinatorStartError);
+
+            // And the loop really is finished — nothing is still retrying behind the screen.
+            var settled = host.ListCalls;
+            await Task.Delay(120);
+            Assert.Equal(settled, host.ListCalls);
+        }
+        finally
+        {
+            ControlCenterViewModel.CliLoadRetryDelay = previousDelay;
+        }
+    }
+
     [AvaloniaFact]
     public async Task LoadClis_HonestEmptyAnswer_StopsRetrying()
     {

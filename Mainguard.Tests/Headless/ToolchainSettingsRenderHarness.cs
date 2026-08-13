@@ -31,6 +31,14 @@ public class ToolchainSettingsRenderHarness
                 Settle();
 
                 Capture(theme.Key, "list", new ToolchainSettingsViewModel(ListMix()));
+
+                // The page as the owner met it: the declaration section included, in the state that
+                // produced the clipping report — nothing declared, nothing on disk, repo on `master`, so
+                // every step shows its longest sentence (its refusal) beside its button. Captured at BOTH
+                // ends of the Settings window's size range, because "it fits" is a claim about the
+                // narrow end and "it reads" is a claim about the wide one.
+                Capture(theme.Key, "declaration", DeclarationVm(), SettingsPageWidth(1040), height: 1500);
+                Capture(theme.Key, "declaration_min", DeclarationVm(), SettingsPageWidth(640), height: 1800);
                 Capture(theme.Key, "installing", InstallingVm());
                 Capture(theme.Key, "failure", new ToolchainSettingsViewModel(FailureMix()));
                 Capture(theme.Key, "loading", new ToolchainSettingsViewModel(
@@ -101,14 +109,26 @@ public class ToolchainSettingsRenderHarness
         },
     };
 
-    private void Capture(string themeKey, string state, ToolchainSettingsViewModel vm)
+    /// <summary>The Toolchains page with its second section — the four-step declaration flow — in the
+    /// state that has no declaration on either side, which is the state every step refuses in.</summary>
+    private static ToolchainSettingsViewModel DeclarationVm() =>
+        new(ListMix(), declaration: new ToolchainDeclarationViewModel(
+            "mainguard-control-center", "master", "master",
+            new[] { "python-3", "node-22", "go-1" }));
+
+    /// <summary>The width a Settings page is given inside a Settings window of <paramref name="windowWidth"/>:
+    /// the window minus the 220px page rail and the content gutter. Derived rather than typed so a change
+    /// to the window's chrome moves these captures with it.</summary>
+    private static int SettingsPageWidth(int windowWidth) => windowWidth - 220 - 56;
+
+    private void Capture(string themeKey, string state, ToolchainSettingsViewModel vm, int width = 620, int height = 560)
     {
         // The page is a UserControl (it embeds in the Settings window) — wrap it in a plain Window for
         // the headless render harness, same as every other migrated page harness.
         var win = new Avalonia.Controls.Window
         {
-            Width = 620,
-            Height = 560,
+            Width = width,
+            Height = height,
             Content = new ToolchainSettingsView { DataContext = vm },
         };
         win.Show();

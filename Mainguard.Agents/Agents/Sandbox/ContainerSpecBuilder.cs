@@ -909,9 +909,14 @@ public static class ContainerSpecBuilder
             throw new SandboxSpecException("G2 control 3: the seccomp denylist is missing from SecurityOpt.");
         if (seccomp.Contains("unconfined", StringComparison.OrdinalIgnoreCase))
             throw new SandboxSpecException("G2 control 3: seccomp=unconfined is forbidden.");
-        foreach (var syscall in SeccompProfile.DeniedSyscalls)
-            if (!seccomp.Contains(syscall, StringComparison.Ordinal))
-                throw new SandboxSpecException($"G2 control 3: the seccomp profile does not deny '{syscall}'.");
+
+        // Read the profile's RULES, never its text. This loop used to be a substring search over the
+        // whole `seccomp=<json>` blob — it only checked that the NAME `ptrace` appeared somewhere — and
+        // stock moby's profile carries all three names in its ALLOW group. The guard for this profile's
+        // sole hardening delta was therefore one the un-hardened upstream profile also passes.
+        var gap = SeccompProfile.DescribeDenialGap(seccomp["seccomp=".Length..]);
+        if (gap is not null)
+            throw new SandboxSpecException(gap);
 
         if (!securityOpt.Contains("no-new-privileges"))
             throw new SandboxSpecException("G-15: no-new-privileges is missing from SecurityOpt.");

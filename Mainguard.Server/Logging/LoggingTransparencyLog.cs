@@ -37,7 +37,12 @@ public sealed class LoggingTransparencyLog : INetworkTransparencyLog
 
         // A denial is the operationally interesting event (an agent tried to reach a blocked host);
         // an allowed fetch is Information. Summary fields only — never the request body.
-        var denied = string.Equals(line.Verdict, "Denied", StringComparison.OrdinalIgnoreCase);
+        //
+        // This was `string.Equals(line.Verdict, "Denied", ...)` against a free-form string field whose
+        // producers wrote "refused"/"allowed" — so it was always false and every refusal was logged at
+        // Information. The verdict is now a typed EgressVerdict, which is why this compares values
+        // rather than spellings: a producer that stops agreeing with this line no longer compiles.
+        var denied = line.Verdict == EgressVerdict.Denied;
         _log.Log(
             denied ? LogLevel.Warning : LogLevel.Information,
             "egress {Verdict} host={Host} kind={Kind} agent={Agent} bytes={Bytes}",

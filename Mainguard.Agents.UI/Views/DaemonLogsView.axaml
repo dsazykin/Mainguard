@@ -7,12 +7,12 @@
         <Grid RowDefinitions="Auto,Auto,Auto,300,Auto">
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="0,0,0,6">
-                <PathIcon Data="{StaticResource TerminalIcon}" Width="18" Height="18"
-                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                <TextBlock Text="Daemon logs" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid Grid.Row="0" Margin="0,0,0,6" ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource TerminalIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="Daemon logs" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
             <TextBlock Grid.Row="1" Margin="0,0,0,12" FontSize="12" TextWrapping="Wrap"
                        Foreground="{DynamicResource TextMuted}"
                        Text="Recent diagnostics from the Mainguard OS daemon (mainguardd) running inside the Mainguard environment. Pick the unified journal or a single subsystem. Read-only, and secret-safe — model keys and other secrets are masked before anything is written."/>

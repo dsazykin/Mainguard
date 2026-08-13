@@ -23,9 +23,12 @@ internal static class Program
     public static void Main(string[] args)
     {
         // Git-editor / credential self-invocation shims run and return FIRST (before the single-instance
-        // guard), so the app's own rebase/credential calls of itself are never blocked.
-        if (ShellEntryPoint.TryHandleShim(args))
+        // guard), so the app's own rebase/credential calls of itself are never blocked. The shim's exit
+        // code is the contract with git: 0 means "the editor wrote your todo", so a failed shim MUST
+        // report non-zero or git rebases with its own default plain-`pick` todo and calls it a success.
+        if (ShellEntryPoint.TryHandleShim(args, out int shimExitCode))
         {
+            Environment.ExitCode = shimExitCode;
             return;
         }
 

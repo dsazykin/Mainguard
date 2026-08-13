@@ -126,10 +126,42 @@ public static class DaemonHost
                 leader: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.SessionLeader>(),
                 locks: sp.GetRequiredService<Auth.TerminalLockRegistry>(),
                 loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
+        // The DURABLE kill journal. Registered (rather than inlined) so something holds the reference: the
+        // previous composition passed no journal at all, and KillSwitch's `?? new InMemoryKillJournal()`
+        // built a sink no one could reach — step 3's "snapshot written BEFORE returning" wrote into an
+        // object that died with the process, which is the one process an emergency stop is followed by
+        // restarting. Lives next to the (test-isolated) session token like the plan store.
+        builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.IKillJournal>(
+            new Mainguard.Agents.Agents.Orchestrator.JsonKillJournal(ResolveKillJournalPath(tokenPath)));
+
+        // Every optional argument stated, because every one of them defaults to something weaker and
+        // silent — `audit:` alone could be deleted here with the whole Kill-filtered suite still green.
+        // KillSwitch.WiredOptionalControls records what was passed and CompositionRootResolutionTests pins
+        // it, so this list cannot shrink unnoticed again.
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.KillSwitch(
             gate: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.KillSwitchGate>(),
             target: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IKillTarget>(),
-            audit: sp.GetRequiredService<IAuditLog>()));
+            journal: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.IKillJournal>(),
+            audit: sp.GetRequiredService<IAuditLog>(),
+            // NO control-channel RTT is measured in this daemon, and saying so is the point. P2-09's
+            // IAgentControlChannel has no production transport — SandboxKillTarget.RequestYieldAsync
+            // answers false without a round trip — so there is no honest EWMA to pass. The previous
+            // silent `() => TimeSpan.Zero` default made RttWouldExceedCeiling a constant false, which
+            // reads on a KillReport as "the control channel was healthy": a claim nothing here could
+            // support. The sentinel stamps RttMeasured=false on the report and the journal snapshot
+            // instead. Replace it with a real EWMA when a transport exists; the RT-D4 arm is already
+            // covered in both directions by KillSwitchTests and KillContainmentTests.
+            rttBudget: Mainguard.Agents.Agents.Orchestrator.KillSwitchTiming.UnmeasuredRtt,
+            // ...and the sink that arm feeds, wired now so lighting up the measurement is a one-line
+            // change rather than two. Dormant while rttBudget is the sentinel, by construction.
+            onRttSpike: epoch => sp.GetRequiredService<IAuditLog>().Append(
+                new Mainguard.Git.Audit.AuditEvent("killswitch_rtt_spike", new System.Collections.Generic.Dictionary<string, string>
+                {
+                    ["kill_epoch_id"] = epoch,
+                    ["ceiling_seconds"] =
+                        Mainguard.Agents.Agents.Orchestrator.KillSwitchTiming.Ceiling.TotalSeconds
+                            .ToString(System.Globalization.CultureInfo.InvariantCulture),
+                }))));
 
         // P2-07: the network-transparency sink (P2-17 supplies the persisted/streamed impl). The
         // egress proxy + daemon git proxy record every fetch/verdict here; the allowlist change log
@@ -178,6 +210,10 @@ public static class DaemonHost
         // One endpoint per agent: the coordinator's spawn shim, and (phase 2) each worker's plan shim.
         builder.Services.AddSingleton(new Runtime.AgentIpcServer(ResolveAgentIpcRoot(tokenPath)));
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
+        // The human-only resume path for a stranded merge-queue entry (AgentService.ResumeAgent). It
+        // depends on the merge-queue registry registered by GatewayServiceRegistration below — DI resolves
+        // at first use, so the ordering here is presentational, not a dependency.
+        builder.Services.AddSingleton<Runtime.AgentResumeService>();
 
         // The Resource Monitor's data source. The tab shipped rendering per-agent CPU/RAM over a sampler
         // that was never written — the client hard-coded both to 0 — so every agent read a convincing 0%.
@@ -390,6 +426,22 @@ public static class DaemonHost
         return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-plans.json");
     }
 
+    /// <summary>Where the durable kill journal lands — beside the (test-isolated) session token, exactly
+    /// like the plan store, so an in-proc test host never appends to the real daemon's record.</summary>
+    private static string ResolveKillJournalPath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-kills.jsonl");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-kills.jsonl");
+    }
+
     /// <summary>Maps the gRPC services. Shared by entry point and tests.</summary>
     public static void MapServices(WebApplication app)
     {
@@ -398,6 +450,7 @@ public static class DaemonHost
         app.MapGrpcService<RepoSyncGrpcService>();
         app.MapGrpcService<GatewayGrpcService>();
         app.MapGrpcService<MergeQueueGrpcService>();
+        app.MapGrpcService<PrIntakeGrpcService>();
         app.MapGrpcService<PlanApprovalGrpcService>();
         app.MapGrpcService<KillSwitchGrpcService>();
         app.MapGrpcService<CoordinatorGrpcService>();

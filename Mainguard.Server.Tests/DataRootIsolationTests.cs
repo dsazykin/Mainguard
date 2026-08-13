@@ -88,6 +88,21 @@ public class DataRootIsolationTests
     /// while asserting nothing about it. Pinning the expected set means a change to
     /// <see cref="DaemonHost"/>'s store paths fails HERE, with the new name in the message, and has to be
     /// looked at.
+    ///
+    /// <para><b>This list is a tripwire, not a manifest, and editing it is the point.</b> Its whole value
+    /// is that it stops someone — and it is supposed to keep stopping people. So when it trips, widen it
+    /// only after satisfying
+    /// <see cref="Every_daemon_store_path_resolver_follows_the_session_token"/> below, which states the
+    /// property this list exists to protect and checks it against the SHIPPED set rather than against the
+    /// literal here. A list that is widened on reflex eventually admits a resolver that does not isolate;
+    /// the assertion below is what catches that one, whatever the literal says.</para>
+    ///
+    /// <para><b>Why the set last grew:</b> <c>ResolveKillJournalPath</c> was added for the durable
+    /// <c>JsonKillJournal</c>. The P2-14 kill switch previously got no journal at all, so its
+    /// constructor's <c>?? new InMemoryKillJournal()</c> built a sink nothing held a reference to and
+    /// step 3's "snapshot written BEFORE returning" wrote into an object that died with the process —
+    /// which is the one process an emergency stop is followed by restarting. Giving it a file made it a
+    /// store, and every daemon store belongs under this test.</para>
     /// </summary>
     [Fact]
     public void Every_daemon_store_path_resolver_is_covered_by_the_fallback_test()
@@ -96,6 +111,7 @@ public class DataRootIsolationTests
         {
             "ResolveAgentIpcRoot",
             "ResolveDataPath",
+            "ResolveKillJournalPath",
             "ResolveLeaderRegistryPath",
             "ResolveLogsDirectory",
             "ResolvePlanStorePath",
@@ -104,31 +120,85 @@ public class DataRootIsolationTests
         Assert.Equal(expected, FallbackResolvers().Select(m => m.Name).OrderBy(n => n, StringComparer.Ordinal));
     }
 
+    /// <summary>
+    /// The property the exact-set list above exists to protect, stated directly and checked against the
+    /// SHIPPED resolvers — so it keeps holding after the next person edits that list.
+    ///
+    /// <para><b>The rule: every daemon store path FOLLOWS THE SESSION TOKEN.</b> Given a token path, the
+    /// store must land beside that token; the data-root fallback
+    /// (<see cref="Daemon_store_path_fallbacks_land_inside_the_isolated_root"/>) is only the second line
+    /// of defence, for when there is no token at all. Following the token is the FIRST line, and it is
+    /// the mechanism the whole in-proc tier rests on: <c>DaemonFixture</c> isolates a host by giving it
+    /// its own temp token directory, and every store has to go there or the isolation is partial.</para>
+    ///
+    /// <para><b>And that is precisely what a widened list would let through.</b> A resolver that ignored
+    /// its <c>tokenPath</c> and always returned the data-root path would satisfy the fallback test (it
+    /// does land inside the isolated root) and satisfy an exact-set list somebody had just extended —
+    /// while making every concurrent in-proc host share one file, and, outside the test module
+    /// initializer's redirect, writing the developer's real store. Two facts are asserted because both
+    /// are ways to fail it: a resolver must TAKE a token path, and it must USE it.</para>
+    /// </summary>
+    [Fact]
+    public void Every_daemon_store_path_resolver_follows_the_session_token()
+    {
+        AssertIsolated(); // never resolve against the real root, not even to fail
+
+        // A plausible per-host token directory. Kept under the isolated root and never created: these
+        // resolvers are pure string composition, so nothing is written, and naming a path outside the
+        // sandbox — even one we only ever print — is the habit this file exists to break.
+        var hostDir = Path.Combine(MainguardPaths.DataRoot(), "host-" + Guid.NewGuid().ToString("N"));
+        var tokenPath = Path.Combine(hostDir, "daemon.token");
+
+        var resolvers = FallbackResolvers().ToList();
+        Assert.NotEmpty(resolvers); // a filter that matched nothing would make every loop here vacuous
+
+        foreach (var method in resolvers)
+        {
+            Assert.True(
+                method.GetParameters().Any(p => p.ParameterType == typeof(string)),
+                $"DaemonHost.{method.Name} takes no token path, so it cannot sit beside the session "
+                + "token and every in-proc host would share whatever it resolves to. Give it a "
+                + "`string? tokenPath` parameter, or it is not a per-host store.");
+
+            var resolved = Resolve(method, tokenPath);
+
+            Assert.True(
+                IsUnder(resolved, hostDir),
+                $"DaemonHost.{method.Name} resolved to '{resolved}' when handed the session token at "
+                + $"'{tokenPath}', instead of a path under '{hostDir}'. Every daemon store sits beside "
+                + "the token: that is what gives each in-proc host its own copy, and what keeps a test "
+                + "run out of the real daemon's stores. A resolver that ignores the token passes the "
+                + "data-root fallback test and still shares one file across every host.");
+        }
+    }
+
     /// <summary>Every private static <c>Resolve*</c> on <see cref="DaemonHost"/> that yields a path.</summary>
     private static IEnumerable<MethodInfo> FallbackResolvers()
         => typeof(DaemonHost)
             .GetMethods(BindingFlags.NonPublic | BindingFlags.Static)
             .Where(m => m.Name.StartsWith("Resolve", StringComparison.Ordinal) && m.ReturnType == typeof(string));
 
-    /// <summary>
-    /// Invokes each resolver on its no-token-path branch. Arguments are supplied by parameter type so the
-    /// differing signatures need no per-method table; a <c>string</c> parameter is the token path (or the
-    /// explicit override) and is deliberately null, which is what selects the fallback.
-    /// </summary>
+    /// <summary>Invokes each resolver on its no-token-path branch — the fallback the damage came from.</summary>
     private static IEnumerable<(string Name, string Resolved)> ResolveEveryFallbackPath()
+        => FallbackResolvers().Select(m => (m.Name, Resolve(m, tokenPath: null)));
+
+    /// <summary>
+    /// Invokes one resolver with <paramref name="tokenPath"/>. Arguments are supplied BY PARAMETER TYPE so
+    /// the differing signatures need no per-method table — which is what lets a newly added resolver be
+    /// covered without anyone remembering to wire it up. A <c>string</c> parameter is the token path (null
+    /// selects the data-root fallback); the explicit-override inputs are left at their empty defaults so
+    /// they never win over the branch under test.
+    /// </summary>
+    private static string Resolve(MethodInfo method, string? tokenPath)
     {
         var emptyConfig = new ConfigurationBuilder().Build();
+        var args = method.GetParameters().Select(p =>
+            p.ParameterType == typeof(DaemonOptions) ? new DaemonOptions()
+            : typeof(IConfiguration).IsAssignableFrom(p.ParameterType) ? emptyConfig
+            : p.ParameterType == typeof(string) ? tokenPath
+            : (object?)null).ToArray();
 
-        foreach (var method in FallbackResolvers())
-        {
-            var args = method.GetParameters().Select(p =>
-                p.ParameterType == typeof(DaemonOptions) ? new DaemonOptions()
-                : typeof(IConfiguration).IsAssignableFrom(p.ParameterType) ? emptyConfig
-                : (object?)null).ToArray();
-
-            var resolved = (string)method.Invoke(null, args)!;
-            yield return (method.Name, resolved);
-        }
+        return (string)method.Invoke(null, args)!;
     }
 
     private static bool PathsEqual(string a, string b)

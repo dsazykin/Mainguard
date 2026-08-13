@@ -39,6 +39,14 @@ public sealed class SandboxAgentLauncher
     private const int AgentUid = 1000;
     private const int SupervisorUid = 1001;
 
+    /// <summary>
+    /// The key variable used when no adapter marker is present at all (unknown kind / dev box without a
+    /// catalog). Named once so <see cref="BuildSecrets"/> and the ticket #52 confinement-refusal warnings
+    /// cannot name different variables — a warning that reports the wrong variable is worse than none,
+    /// since the operator would go looking for a key that is not there.
+    /// </summary>
+    private const string LegacyApiKeyEnvVar = "ANTHROPIC_API_KEY";
+
     private readonly IAgentEnvironment _environment;
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
@@ -79,6 +87,18 @@ public sealed class SandboxAgentLauncher
     /// <see cref="AgentRoles.Coordinator"/> and nothing else; <see cref="ContainerSpecBuilder"/> re-asserts
     /// it fail-closed, so a caller that later passes a repository path alongside this flag gets a typed
     /// spawn failure rather than silently regaining the capability.
+    ///
+    /// <para>Outranks <paramref name="adoptExistingBranch"/>: a coordinator has no branch to resume onto,
+    /// so the two set together is a caller error rather than a third behaviour, and the role lock is the
+    /// safe way to resolve it.</para>
+    /// </param>
+    /// <param name="adoptExistingBranch">
+    /// <b>Resume.</b> When true the worktree is ADOPTED onto this id's existing <c>agent/&lt;id&gt;</c>
+    /// branch rather than created on a new one, so a jail started for a stranded queue entry begins on the
+    /// commits the dead jail left behind. Two things change with it, both of them load-bearing: an absent
+    /// branch is a typed refusal instead of a fresh branch off main, and the post-failure cleanup preserves
+    /// the branch instead of deleting it — a rollback that ran the ordinary teardown would destroy the one
+    /// copy of the work the resume exists to recover.
     /// </param>
     public async Task<SandboxLaunchResult?> TryLaunchAsync(
         string repoHandle, string agentId, string agentKind, string? modelApiKey,
@@ -87,6 +107,7 @@ public sealed class SandboxAgentLauncher
         IReadOnlyList<SandboxCredentialFile>? cliCredentials = null,
         bool withoutRepositoryAccess = false,
         IProgress<string>? progress = null,
+        bool adoptExistingBranch = false,
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
@@ -191,13 +212,27 @@ public sealed class SandboxAgentLauncher
         var adapter = _adapters.TryGet(agentKind);
         var launchCommand = adapter?.Launch;
 
+        // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
+        //
         // Coordinator contract §2: a coordinator has no worktree. Note this skips CREATING one, not just
         // mounting it — provisioning a worktree the jail can never see would leave a branch and a
         // directory per coordinator for no reason, and a later change that started mounting it would find
         // the content already there.
+        //
+        // Then resume: adopting this id's existing agent/<id> vs creating a new one. The two are
+        // deliberately different methods rather than one with a flag deep inside: creating refuses when
+        // the branch exists, adopting refuses when it does not, and each refusal is the other's success.
+        //
+        // Why the role lock outranks the resume flag rather than the reverse: a coordinator is never
+        // resumed onto a branch — it has no branch — so `withoutRepositoryAccess && adoptExistingBranch`
+        // is a caller error, not a third behaviour. Asking the lock first means such a call gets a
+        // repository-less jail (and ContainerSpecBuilder's fail-closed re-assertion) instead of quietly
+        // adopting a worktree the role forbids.
         var worktreePath = withoutRepositoryAccess
             ? string.Empty
-            : _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
+            : adoptExistingBranch
+                ? _environment.Worktrees.AdoptAgentWorktree(repoHandle, agentId)
+                : _environment.Worktrees.CreateAgentWorktree(repoHandle, agentId);
         // MG-3: the per-agent repository the worktree is linked off — the ONE git dir this jail may
         // write. Resolved AFTER creation so an implementation that has no per-agent repo (the test
         // doubles' default) simply reports none and the jail carries no such mount.
@@ -322,8 +357,27 @@ public sealed class SandboxAgentLauncher
         {
             // Leave no residue: remove the worktree we just created before surfacing the failure.
             // A repository-less jail never created one, so there is nothing to remove.
-            _log.LogError(ex, "jail start failed after worktree — cleaning up worktree: repo={Repo}", repoHandle);
-            if (!withoutRepositoryAccess)
+            //
+            // On the RESUME path the cleanup must keep agent/<id>. The ordinary teardown ends in
+            // `branch -D`, which here would delete the only surviving copy of the commits this launch was
+            // invoked to recover — turning a failed resume into data loss. The branch-preserving clear can
+            // leave the worktree behind if it cannot remove it; the next resume clears that residue, and
+            // residue is a strictly better failure than deleted work.
+            //
+            // Mirrors the three-way choice above, in the same order and for the same reason: no worktree
+            // was created for a role-locked coordinator, so neither teardown applies to it.
+            _log.LogError(ex,
+                "jail start failed after worktree — cleaning up worktree: repo={Repo} adopt={Adopt}",
+                repoHandle, adoptExistingBranch);
+            if (withoutRepositoryAccess)
+            {
+                // Nothing was created; nothing to remove.
+            }
+            else if (adoptExistingBranch)
+            {
+                TryRemoveWorktreeKeepingBranch(repoHandle, agentId);
+            }
+            else
             {
                 TryRemoveWorktree(repoHandle, agentId);
             }
@@ -507,6 +561,15 @@ public sealed class SandboxAgentLauncher
         catch { /* best effort */ }
     }
 
+    /// <summary>The resume path's rollback: clear the worktree, keep <c>agent/&lt;id&gt;</c>. A manager
+    /// that cannot do that throws rather than falling back — and this swallows the throw, so the outcome
+    /// is residue, never a deleted branch.</summary>
+    private void TryRemoveWorktreeKeepingBranch(string repoHash, string agentId)
+    {
+        try { _environment.Worktrees.RemoveAgentWorktreeKeepingBranch(repoHash, agentId); }
+        catch { /* best effort — and deliberately NOT falling back to the branch-deleting removal */ }
+    }
+
     /// <summary>
     /// Mints the MG-4 gateway confinement for one spawn, or null to leave the spawn exactly as it was.
     ///
@@ -526,15 +589,44 @@ public sealed class SandboxAgentLauncher
     private async Task<GatewayConfinement?> TryConfineToGatewayAsync(
         string agentId, string? modelApiKey, InstalledAdapterMarker? adapter, CancellationToken ct)
     {
-        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        // No key at all — an interactive-login (OAuth) agent. Nothing is confined and nothing is at
+        // risk, so this is the one refusal that stays quiet: warning here would train the operator to
+        // ignore the warnings that DO mean a key is sitting in a container.
+        if (string.IsNullOrWhiteSpace(modelApiKey))
         {
             return null;
         }
 
-        if (string.IsNullOrWhiteSpace(modelApiKey)
-            || adapter?.BaseUrlEnvVar is not { Length: > 0 }
+        // Ticket #52 — from here down a BYOK key EXISTS, so every remaining refusal ends with
+        // BuildSecrets writing the raw provider key into the jail. That outcome used to be reached in
+        // total silence, which made a confined agent and an unconfined one indistinguishable in the
+        // daemon log: the only loud path was the unreachable-gateway one below. An operator could not
+        // answer "is this agent's key in its container?" from any evidence the daemon produced.
+        //
+        // Each refusal now names ITSELF and its cause, because the two have different remedies: the
+        // gateway being off is an operator setting, while an adapter that cannot be redirected is a
+        // vendor fact no configuration change will fix (see the verified table in adapters.starter.json
+        // — codex, qwen-code and opencode expose no base-URL environment variable at all).
+        if (_credentials is null || _gatewayOptions is not { } gateway || !gateway.CanConfine)
+        {
+            _log.LogWarning(
+                "gateway confinement OFF: agent={Agent} adapter={Adapter} supplied a BYOK provider key, but "
+                + "the model gateway is disabled, so THE RAW KEY IS INJECTED INTO THE JAIL under {KeyVar}. "
+                + "MG-4 is not in effect for this agent and its model spend is not metered.",
+                agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
+            return null;
+        }
+
+        if (adapter?.BaseUrlEnvVar is not { Length: > 0 }
             || adapter.ModelHost is not { Length: > 0 } upstreamHost)
         {
+            _log.LogWarning(
+                "gateway confinement IMPOSSIBLE: agent={Agent} adapter={Adapter} declares no "
+                + "baseUrlEnvVar/modelHost pair, so its CLI cannot be pointed at the gateway and THE RAW "
+                + "KEY IS INJECTED INTO THE JAIL under {KeyVar}. This is a property of the vendor's CLI, "
+                + "not a misconfiguration — MG-4 cannot be applied to this agent, and its model spend is "
+                + "not metered.",
+                agentId, adapter?.Id ?? "<unknown>", adapter?.ApiKeyEnvVar ?? LegacyApiKeyEnvVar);
             return null;
         }
 
@@ -601,7 +693,7 @@ public sealed class SandboxAgentLauncher
 
         if (!string.IsNullOrWhiteSpace(modelApiKey))
         {
-            var envVar = adapter is null ? "ANTHROPIC_API_KEY" : adapter.ApiKeyEnvVar;
+            var envVar = adapter is null ? LegacyApiKeyEnvVar : adapter.ApiKeyEnvVar;
             if (envVar is { Length: > 0 })
             {
                 // MG-4: when the gateway is available AND this CLI declares a base-URL variable, the

@@ -177,16 +177,48 @@ public class MergeQueueStateMachineTests
 
     // ---- Stale cascade + FIFO re-queue ----------------------------------
 
+    /// <summary>
+    /// The stale cascade re-queues by ORIGINAL VERIFICATION TIME, and the entries are deliberately
+    /// inserted in a different order than they are verified in.
+    ///
+    /// <para><b>Why the insertion order is load-bearing.</b> This test used to verify C, A, B into an
+    /// empty queue, so the internal <c>Dictionary</c>'s enumeration order and the expected FIFO order were
+    /// the same sequence — and deleting <c>.OrderBy(kv =&gt; _verifiedAt…)</c> from
+    /// <see cref="MergeQueue.NotifyMainMoved"/> left this and 28 other tests green. (Replacing it with
+    /// <c>OrderByDescending</c> did fail, so the test read order; the asserted order was simply also the
+    /// incidental default.) In the daemon the two are never the same: <c>_states</c> is rehydrated from
+    /// SQLite in whatever order the rows come back and then punched full of holes by <c>Cancel()</c>
+    /// removals, so enumeration order is not insertion order and certainly not verification order.</para>
+    ///
+    /// <para>So: the entries go in A, B, C (with a cancelled decoy to leave a real hole in the dictionary,
+    /// the shape <c>Cancel</c> produces) and are verified C, A, B. Enumeration order and FIFO order now
+    /// disagree, and only the sort can produce the expected answer.</para>
+    /// </summary>
     [Fact]
     public async Task NotifyMainMoved_FlipsAllVerifiedToStale_AndRequeuesFIFO()
     {
         var h = new Harness();
         h.Build();
 
-        // Verify in the order C, A, B → their verification times order C < A < B (not alphabetical).
+        // Insertion order A, B, C — alphabetical, i.e. NOT the order they will be verified in. The decoy
+        // is inserted between them and then cancelled, so the dictionary carries a freed slot exactly as
+        // it does in a daemon that has removed an entry.
+        h.Queue.EnsureEntry("A", MergeEntryOrigin.Local);
+        h.Queue.EnsureEntry("decoy", MergeEntryOrigin.Local);
+        h.Queue.EnsureEntry("B", MergeEntryOrigin.Local);
+        h.Queue.EnsureEntry("C", MergeEntryOrigin.Local);
+        h.Queue.Cancel("decoy");
+
+        // Verify in the order C, A, B → their verification times order C < A < B (not alphabetical, and
+        // not the insertion order above).
         await VerifiedAsync(h, "C");
         await VerifiedAsync(h, "A");
         await VerifiedAsync(h, "B");
+
+        // Guard the guard: the assertion below is only meaningful while the queue's own enumeration
+        // disagrees with the expected FIFO order. If Agents ever starts coming back in verification order
+        // this test has quietly gone back to asserting the incidental default.
+        Assert.NotEqual(new[] { "C", "A", "B" }, h.Queue.Agents.ToArray());
 
         h.Queue.NotifyMainMoved("sha1");
         await h.Queue.LastCascade;

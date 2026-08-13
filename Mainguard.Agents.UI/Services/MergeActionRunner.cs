@@ -112,6 +112,50 @@ public static class MergeActionRunner
     }
 
     /// <summary>
+    /// Drives one human resume to a reported conclusion. Never throws; the daemon's refusal — "the branch
+    /// no longer exists", "this entry already has a live agent", "a merge is in progress" — is the sentence
+    /// the human reads, verbatim.
+    /// </summary>
+    public static async Task ResumeAsync(
+        IMergeQueueService queue, string agentId, string agentKind, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            var outcome = await queue.ResumeEntryAsync(agentId, agentKind ?? string.Empty).ConfigureAwait(false);
+            sink(ResumeConfirmation(outcome), false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
+    /// <summary>
+    /// The one visible sentence a resume produces. It says what actually changed: the entry kept its
+    /// identity and its branch, and it now has a sandbox again — never "restarted the agent", which would
+    /// describe a new agent picking up where none left off.
+    ///
+    /// <para>A cleared stalled verification is stated in the same breath. It is a state change the human did
+    /// not directly ask for, and an entry that silently stopped saying "Verifying" is precisely the kind of
+    /// unexplained transition that makes a queue untrustworthy.</para>
+    /// </summary>
+    internal static string ResumeConfirmation(QueueEntryResumeOutcome outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+        var cleared = outcome.ClearedStalledVerification
+            ? " Its stalled verification was cleared, so it can be verified again."
+            : "";
+        return $"Resumed {outcome.Branch} in a new sandbox — the entry keeps its id and its commits, "
+            + $"and is {outcome.State}.{cleared}";
+    }
+
+    /// <summary>
     /// The one visible sentence a discard produces. It says <b>dropped from the merge queue</b> and
     /// nothing more — the branch and its commits are untouched, and a sentence like "removed the work"
     /// would describe something that did not happen. The attributed actor is included because that is what

@@ -10,6 +10,7 @@ using Mainguard.Agents.Agents.Toolchains;
 using Mainguard.Agents.UI.ViewModels;
 using Mainguard.Git.Services;
 using Mainguard.Tests.Fixtures;
+using Mainguard.Tests.TestTools;
 using Xunit;
 using Repository = LibGit2Sharp.Repository;
 
@@ -192,6 +193,76 @@ public class ToolchainDeclarationFlowTests
         Assert.Equal(remoteTipBefore, RemoteTip(barePath, "master"));
         Assert.False(vm.DeclarationHasUncommittedChange);
         Assert.NotEqual(string.Empty, vm.CommitDisabledReason); // nothing left to commit — and it says so
+    }
+
+    /// <summary>
+    /// FAILS BEFORE / PASSES AFTER. The owner's screenshot: no <c>.mainguard/toolchain</c> anywhere, and
+    /// the page said all three of these at once —
+    /// <list type="bullet">
+    ///   <item>Committed: "No .mainguard/toolchain is committed on this branch."</item>
+    ///   <item>Working tree: "No .mainguard/toolchain exists in your working tree."</item>
+    ///   <item>Step 2: "There is nothing to commit — .mainguard/toolchain already matches the last
+    ///         commit on 'master'."</item>
+    /// </list>
+    /// The third contradicts the first two. Its cause was that "the two sides are identical" and "there
+    /// is no file on either side" both arrived at the same clause: the flag behind it is derived from the
+    /// git-status entry for the path, and a file that exists nowhere produces no status entry.
+    ///
+    /// <para>So this pins the sentence for the absent-everywhere state AND pins that it does not claim a
+    /// match — the two halves matter separately, because the shipped string already contained the words
+    /// <c>nothing to commit</c> and the existing <see cref="NothingToCommit_ShouldSayExactlyThat"/>
+    /// asserted only those, which is why a false sentence passed a test named after it.</para>
+    /// </summary>
+    [Fact]
+    public async Task DeclarationAbsentEverywhere_ShouldSayItDoesNotExist_NotThatItMatchesTheLastCommit()
+    {
+        using var fx = new TempRepoFixture();
+        fx.CommitFile("a.txt", "seed\n", "seed");
+        RenameCurrentBranch(fx.RepoPath, "master");
+
+        var vm = NewViewModel(fx.RepoPath, out _);
+        await vm.RefreshAsync();
+
+        // The state under test: absent on both sides, and the page's own two lines say so.
+        Assert.Null(vm.CommittedDeclaration);
+        Assert.Null(vm.WorkingTreeDeclaration);
+        Assert.Contains("No " + DeclPath, vm.CommittedDeclarationDisplay, StringComparison.Ordinal);
+        Assert.Contains("No " + DeclPath, vm.WorkingTreeDeclarationDisplay, StringComparison.Ordinal);
+
+        Assert.False(vm.CommitCommand.CanExecute(null));
+
+        // It must not claim the file matches anything — there is no file to match with.
+        Assert.DoesNotContain("already matches", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("matches the last commit", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+
+        // It must say what is actually true, and point at the step that fixes it.
+        Assert.Contains("does not exist", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(DeclPath, vm.CommitDisabledReason, StringComparison.Ordinal);
+        Assert.Contains("first button", vm.CommitDisabledReason, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The state the "already matches" wording is actually FOR: the declaration is committed and the disk
+    /// copy is identical. Written alongside the test above so the honest sentence keeps a test of its own
+    /// rather than being deleted with the false one.
+    /// </summary>
+    [Fact]
+    public async Task DeclarationIdenticalToTheLastCommit_ShouldStillSayItAlreadyMatches()
+    {
+        using var fx = new TempRepoFixture();
+        fx.CommitFile("a.txt", "seed\n", "seed");
+        RenameCurrentBranch(fx.RepoPath, "master");
+
+        var vm = NewViewModel(fx.RepoPath, out _);
+        await vm.RefreshAsync();
+        await vm.WriteFileCommand.ExecuteAsync(null);
+        await vm.CommitCommand.ExecuteAsync(null);
+
+        Assert.NotNull(vm.CommittedDeclaration);
+        Assert.NotNull(vm.WorkingTreeDeclaration);
+        Assert.False(vm.CommitCommand.CanExecute(null));
+        Assert.Contains("already matches the last commit", vm.CommitDisabledReason, StringComparison.Ordinal);
+        Assert.Contains("master", vm.CommitDisabledReason, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -404,7 +475,8 @@ public class ToolchainDeclarationFlowTests
     {
         var manifest = ToolchainManifest.Parse(ManifestJson);
         host.Entries = manifest.Entries;
-        return new ToolchainChannel(host, manifest);
+        // The payload source is what the channel fetches from — never `curl` in the VM, which has none.
+        return new ToolchainChannel(host, manifest, payloads: new FakeToolchainPayloadSource());
     }
 
     private static int CommitCount(string repoPath)
@@ -439,9 +511,16 @@ public class ToolchainDeclarationFlowTests
         repo.Refs.Add($"refs/remotes/{remote}/HEAD", target, allowOverwrite: true);
     }
 
+    private const string PayloadUrl = "https://example.invalid/cpython-3.12.13.tar.gz";
+
+    /// <summary>The REAL hash of the bytes the fake source serves. The channel hashes the payload it
+    /// holds, on the host, before the VM sees anything, so a fixture can no longer declare an arbitrary
+    /// hex and have a fake VM agree with it.</summary>
+    private static readonly string PayloadSha = FakeToolchainPayloadSource.Sha256For(PayloadUrl);
+
     // A one-entry manifest whose id is also in the sandbox catalog, so a declaration naming it parses
     // (the catalog is what ToolchainDeclarationResolver validates against).
-    private const string ManifestJson = """
+    private static readonly string ManifestJson = $$"""
     {
       "toolchains": [
         {
@@ -449,8 +528,8 @@ public class ToolchainDeclarationFlowTests
           "displayName": "Python 3",
           "summary": "CPython 3.12 with pip — runs a repository's Python test suite.",
           "version": "3.12.13",
-          "payloadUrl": "https://example.invalid/cpython-3.12.13.tar.gz",
-          "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "payloadUrl": "{{PayloadUrl}}",
+          "sha256": "{{PayloadSha}}",
           "stripComponents": 1,
           "pathEntries": ["{toolchain}/bin"],
           "probe": {
@@ -491,6 +570,11 @@ public class ToolchainDeclarationFlowTests
                     : new AdapterCommandResult(127, "", $"{argv0}: no such file or directory");
             }
 
+            // A real MainguardEnv has neither curl nor wget; a fake that answers them is how the
+            // `curl`-based install path passed CI while failing every user. See MainguardEnvFacts.
+            if (MainguardEnvFacts.RefuseIfAbsent(argv0) is { } absent)
+                return absent;
+
             var id = IdIn(string.Join(' ', command));
             switch (argv0)
             {
@@ -498,9 +582,6 @@ public class ToolchainDeclarationFlowTests
                     if (command.Contains(ToolchainPaths.VmInstallDir(id)))
                         _present.Remove(id);
                     return new AdapterCommandResult(0, "", "");
-
-                case "sha256sum":
-                    return new AdapterCommandResult(0, $"{Entries.Single(e => e.Id == id).Sha256}  {command[^1]}", "");
 
                 case "mv":
                     _present[id] = Entries.Single(e => e.Id == id).Version;

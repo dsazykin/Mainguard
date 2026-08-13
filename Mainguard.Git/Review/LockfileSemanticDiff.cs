@@ -30,6 +30,20 @@ public enum DependencyDeltaKind
 /// rows render instead of a 9,000-line raw lockfile hunk; a script-bearing or CVE-hit row feeds the
 /// flagged gate.
 /// </summary>
+/// <param name="AdvisoriesChecked">
+/// Whether this row's <see cref="CveIds"/> is an <b>answer</b> rather than a silence.
+///
+/// <para>False means the offline <see cref="OsvSnapshot"/> was missing, unreadable or older than
+/// <see cref="OsvSnapshot.MaxAge"/>, so an empty <see cref="CveIds"/> says nothing about this dependency.
+/// It is carried as its own field, in the shape of <c>KillReport.RttMeasured</c> and
+/// <c>ToolchainStatus.CouldNotCheck</c>, because "we checked and it is clean" and "we could not check" are
+/// the two facts a reviewer's decision turns on, and an empty list renders them identically. A removed
+/// dependency is <b>always</b> checked-true: nothing is being introduced, so there is nothing to be unsure
+/// about.</para>
+///
+/// <para>Note that a false here does not empty <see cref="CveIds"/>: a stale snapshot's hits are still
+/// hits. It widens the list to "at least these", never narrows it.</para>
+/// </param>
 public sealed record DependencyDelta(
     string Name,
     string? OldVersion,
@@ -38,10 +52,15 @@ public sealed record DependencyDelta(
     bool MajorJump,
     bool InstallScripts,
     bool RegistryOrMaintainerChange,
-    IReadOnlyList<string> CveIds)
+    IReadOnlyList<string> CveIds,
+    bool AdvisoriesChecked = true)
 {
     /// <summary>True when this row should feed the flagged-changes gate (install scripts or a known CVE).</summary>
     public bool FeedsFlaggedGate => InstallScripts || CveIds.Count > 0;
+
+    /// <summary>True when this row introduces bytes whose advisory status was never established — the row
+    /// a reviewer has to be told about precisely because there is nothing to report on it.</summary>
+    public bool AdvisoryStatusUnknown => !AdvisoriesChecked && Kind != DependencyDeltaKind.Removed;
 }
 
 /// <summary>
@@ -54,9 +73,20 @@ public static class LockfileSemanticDiff
 {
     private sealed record Entry(string Version, bool InstallScripts, string? Registry);
 
-    public static IReadOnlyList<DependencyDelta> Parse(string oldText, string newText, LockfileKind kind, OsvSnapshot? osv = null)
+    /// <param name="oldText">The base side's full manifest text (empty when the file is being added).</param>
+    /// <param name="newText">The branch side's full manifest text (empty when the file is being removed).</param>
+    /// <param name="kind">Which manifest format to parse.</param>
+    /// <param name="osv">The offline advisory snapshot; the shipped <see cref="OsvSnapshot.Default"/> when null.</param>
+    /// <param name="asOf">
+    /// The instant the snapshot's age is judged against (defaults to now). Only the CVE column depends on
+    /// it: a snapshot past <see cref="OsvSnapshot.MaxAge"/> stamps every introduced row
+    /// <see cref="DependencyDelta.AdvisoriesChecked"/> = false rather than reporting it clean.
+    /// </param>
+    public static IReadOnlyList<DependencyDelta> Parse(
+        string oldText, string newText, LockfileKind kind, OsvSnapshot? osv = null, DateTimeOffset? asOf = null)
     {
         var snapshot = osv ?? OsvSnapshot.Default;
+        var checkedAdvisories = snapshot.CanAnswerAt(asOf ?? DateTimeOffset.UtcNow, out _);
         var oldMap = ParseManifest(oldText ?? string.Empty, kind);
         var newMap = ParseManifest(newText ?? string.Empty, kind);
 
@@ -90,7 +120,8 @@ public static class LockfileSemanticDiff
                     IsMajorJump(oldEntry.Version, newEntry.Version),
                     newEntry.InstallScripts,
                     registryChanged,
-                    snapshot.Lookup(name, newEntry.Version)));
+                    snapshot.Lookup(name, newEntry.Version),
+                    checkedAdvisories));
             }
             else if (hasNew)
             {
@@ -102,10 +133,12 @@ public static class LockfileSemanticDiff
                     MajorJump: false,
                     newEntry.InstallScripts,
                     RegistryOrMaintainerChange: false,
-                    snapshot.Lookup(name, newEntry.Version)));
+                    snapshot.Lookup(name, newEntry.Version),
+                    checkedAdvisories));
             }
             else
             {
+                // A removal introduces nothing, so there is nothing whose advisory status could be unknown.
                 rows.Add(new DependencyDelta(
                     name,
                     oldEntry!.Version,
@@ -114,7 +147,8 @@ public static class LockfileSemanticDiff
                     MajorJump: false,
                     InstallScripts: false,
                     RegistryOrMaintainerChange: false,
-                    Array.Empty<string>()));
+                    Array.Empty<string>(),
+                    AdvisoriesChecked: true));
             }
         }
 

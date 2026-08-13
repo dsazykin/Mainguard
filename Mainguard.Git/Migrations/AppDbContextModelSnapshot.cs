@@ -270,6 +270,26 @@ namespace Mainguard.Git.Migrations
                     b.ToTable("PinnedRefs");
                 });
 
+            modelBuilder.Entity("Mainguard.Git.Models.PrIntakeConfigRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("BotAuthors")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<int>("PollIntervalSeconds")
+                        .HasColumnType("INTEGER");
+
+                    b.HasKey("Id");
+
+                    b.ToTable("PrIntakeConfig");
+                });
+
             modelBuilder.Entity("Mainguard.Git.Models.PrIntakeHeadRow", b =>
                 {
                     b.Property<long>("Id")

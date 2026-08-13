@@ -139,7 +139,9 @@ public static class VerificationCommandResolver
     {
         if (!string.IsNullOrWhiteSpace(pinnedCommand))
         {
-            return new Resolution(Tokenize(pinnedCommand!), pinnedCommand!.Trim(), Sha256(pinnedCommand!), ChangedVsMain: false);
+            var pinnedArgv = Tokenize(pinnedCommand!);
+            RejectSurvivingShellOperators(pinnedArgv, pinnedCommand!.Trim());
+            return new Resolution(pinnedArgv, pinnedCommand!.Trim(), Sha256(pinnedCommand!), ChangedVsMain: false);
         }
 
         if (string.IsNullOrWhiteSpace(branchConfigContent))
@@ -148,10 +150,59 @@ public static class VerificationCommandResolver
         }
 
         var command = branchConfigContent.Trim();
+        var argv = Tokenize(command);
+        RejectSurvivingShellOperators(argv, command);
+
         var changed = string.IsNullOrWhiteSpace(mainConfigContent)
             || !string.Equals(Normalize(branchConfigContent), Normalize(mainConfigContent), StringComparison.Ordinal);
 
-        return new Resolution(Tokenize(command), command, Sha256(branchConfigContent), changed);
+        return new Resolution(argv, command, Sha256(branchConfigContent), changed);
+    }
+
+    /// <summary>
+    /// Shell operators that are meaningful ONLY to a shell, matched as whole argv tokens.
+    ///
+    /// <para>Whole tokens rather than substrings, deliberately. A substring match would reject
+    /// <c>--logger "console;verbosity=detailed"</c> and any argument carrying a <c>&amp;</c> in a URL —
+    /// legitimate commands that work today. An operator written the ordinary way (surrounded by spaces)
+    /// always survives tokenisation as a token of its own, which is exactly the case worth catching.</para>
+    /// </summary>
+    private static readonly string[] SurvivingShellOperators =
+        ["&&", "||", "|", ";", ";;", "&", ">", ">>", "<", "<<", "2>", "2>&1"];
+
+    /// <summary>
+    /// Refuses a command whose shell operators survived tokenisation — <b>before any jail is entered</b>.
+    ///
+    /// <para><b>Why this is a refusal and not a failed test.</b> There is no shell on this path: the
+    /// command is split on whitespace (quotes honoured) and exec'd argv-style. So the ecosystem-normal
+    /// <c>pip install -r requirements.txt &amp;&amp; python -m pytest</c> hands <c>&amp;&amp;</c>,
+    /// <c>python</c> and <c>-m</c> to <b>pip</b> as arguments; pip exits 2 with <c>no such option: -m</c>;
+    /// and a non-zero exit is the ONLY thing <see cref="VerificationRunner"/> reads. The merge queue then
+    /// tells a human <i>their tests failed</i> about a command that never ran — a truthful-looking result
+    /// that means something else, which is the one defect class this codebase keeps paying for.</para>
+    ///
+    /// <para>Throwing here rather than recording a result is the whole point: nothing executes, nothing
+    /// enters the verification record, and the human gets the actual problem and its fix. It introduces
+    /// no shell and changes the meaning of no command that works today — the <c>sh -c "…"</c> form keeps
+    /// its operators inside a quoted argument, so they never appear as tokens of their own.</para>
+    /// </summary>
+    private static void RejectSurvivingShellOperators(IReadOnlyList<string> argv, string command)
+    {
+        var offenders = argv.Where(t => SurvivingShellOperators.Contains(t, StringComparer.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        if (offenders.Count == 0)
+        {
+            return;
+        }
+
+        throw new MalformedVerificationCommandException(
+            $"The verification command contains {string.Join(" and ", offenders.Select(o => $"'{o}'"))}, "
+            + "which needs a shell — and this command is run argv-style with no shell, so "
+            + $"'{offenders[0]}' would be passed to '{argv[0]}' as an ordinary argument and the rest of "
+            + "the line would never run. Nothing was executed and no verification was recorded, because a "
+            + "result from this command would say your tests failed when they never started. "
+            + $"Wrap it in a shell instead:  sh -c \"{command}\"");
     }
 
     /// <summary>SHA-256 of a config file's content (RT-D2 <c>ConfigHash</c>), lower-case hex.</summary>

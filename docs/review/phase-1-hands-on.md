@@ -46,11 +46,43 @@ cd .\mg-testrepo
 git init
 "def add(a,b):`n    return a+b" | Set-Content calc.py
 "import calc`ndef test_add(): assert calc.add(2,2)==4" | Set-Content test_calc.py
+"pytest" | Set-Content requirements.txt
 mkdir .mainguard
-"python -m pytest -q" | Set-Content .mainguard\verify
+"python-3" | Set-Content .mainguard\toolchain
+'sh -c "pip install -q -r requirements.txt && python -m pytest -q"' | Set-Content .mainguard\verify
 git add -A
 git commit -m "initial"
 ```
+
+Three things in there are not decoration, and each one was learned by getting it wrong:
+
+**`.mainguard/toolchain` says `python-3`.** Without it the repo gets the default .NET toolchain, the
+jail has an interpreter but **no pip**, and `python -m pytest` fails because pytest was never
+installable. The merge queue recorded that as *failing tests* — a wrong verdict wearing a real one's
+clothes. The file names an id from a closed catalog; it can never supply a URL, a version or a
+command.
+
+**`pytest` is in `requirements.txt`, not preinstalled.** The toolchain gives you the language and its
+package manager; the repository brings its own test framework — same rule as `dotnet-10`, which ships
+the SDK and NuGet but not xunit. A preinstalled pytest would pin a version globally and make
+`python -m pytest` ambiguous against a repo that pins its own.
+
+**`.mainguard/verify` is argv, not a shell — hence the `sh -c "…"` wrapper.** The command is split on
+whitespace (quotes honoured and stripped) and executed directly. There is no shell, so `&&`, `|`, `;`
+and `$VAR` are **not operators** — they are handed to the first program as arguments:
+
+```
+pip install -q -r requirements.txt && python -m pytest -q
+  → argv: [pip, install, -q, -r, requirements.txt, &&, python, -m, pytest, -q]
+  → pip: "no such option: -m"   exit 2      ← recorded as your tests failing
+
+sh -c "pip install -q -r requirements.txt && python -m pytest -q"
+  → argv: [sh, -c, "pip install -q -r requirements.txt && python -m pytest -q"]
+  → 1 passed   exit 0
+```
+
+Single quotes around the whole PowerShell string keep `&&` and the inner `"` intact. A single-program
+verify (`dotnet test`, `python -m pytest -q`) needs no wrapper — only chained ones do.
 
 ### Where the agent's work actually lives — important
 
@@ -61,8 +93,9 @@ means "nothing appeared locally" is *not* evidence of anything on its own.
 ```
 your checkout      C:\Users\yikes\mg-testrepo          ← only changes when YOU merge
 bare mirror        /home/mainguard/mainguard/repos/<repoHash>.git
-per-agent repo     /home/mainguard/mainguard/agents/<repoHash>/<agentId>
+per-agent repo     /home/mainguard/mainguard/agents/<repoHash>/<agentId>.git
 agent branches     refs/heads/agent/*
+toolchains         /home/mainguard/mainguard/toolchains/<id>   ← read-only in every jail
 ```
 
 **Find your repo's hash.** It is the SHA-256 of the normalized Windows path — don't compute it, and
@@ -157,6 +190,29 @@ wsl -d MainguardEnv -u root -- docker inspect <container> --format "{{json .Netw
 segment on the next spawn (`EnsureReadyAsync` / `EnsureAgentSegmentAsync`). Do **not** hand-recreate
 them: the names and subnets are the daemon's to assign, and guessing makes it worse.
 
+### Install the Python toolchain — once, after the app first starts
+
+Do this after step 1 below (it needs the app up), and before starting any agent.
+
+**Settings → Toolchains → Python 3 → Install.** It downloads a pinned, checksum-verified CPython into
+the Mainguard VM — never onto Windows — and appears read-only in every jail created afterwards. The
+row only says *"Installed — it was just run at the pinned version"* after the interpreter has actually
+been executed and reported the pinned version; the page re-probes rather than trusting a marker file,
+because this project already shipped an install marker that read healthy for eleven days while the
+binary behind it was a stub.
+
+Verify from outside if you want a second opinion:
+
+```powershell
+wsl -d MainguardEnv -u root -- ls /home/mainguard/mainguard/toolchains
+wsl -d MainguardEnv -u root -- /home/mainguard/mainguard/toolchains/python-3/bin/python3 -c "import pip, sys; print(sys.version.split()[0], pip.__version__)"
+```
+
+**If you skip it,** starting an agent on the scratch repo fails *before the container is created*,
+naming the missing toolchain and pointing at Settings. That refusal is the correct behaviour and worth
+seeing once: a jail without the toolchain would run the tests, fail, and look like broken code.
+Nothing auto-installs — a repository asking for a toolchain is not permission to install software.
+
 ---
 
 ## 1. The app starts and reaches the daemon
@@ -181,14 +237,17 @@ Start the coordinator.
 
 **Expect:** a terminal draws, with your chosen CLI running in it.
 
-**First run is slow and this is the weak point.** It builds a ~2.9 GB toolchain image. You should
-see a progress line naming the build. **Do not press Stop** — that kills the build and the next
-attempt starts over.
+**First run is slow, and that is now expected rather than fragile.** It builds a ~2.9 GB toolchain
+image. You should see a progress line naming the build, and it should keep updating — a running
+build reports in every 20 seconds with how long it has been going, so a line that stops changing for
+minutes is the signal that something is actually wrong. **Do not press Stop** — that kills the build
+and the next attempt starts over.
 
-**Known issue (#53):** `SpawnDeadline` is 5 minutes and this build often takes longer, so a cold
-first run can still time out even though it's working. If it does, wait for the build to finish
-(`wsl -d MainguardEnv -u root -- docker images | grep toolchain`) and start again — the second
-attempt is fast. That's the ticket, not a new bug.
+There is no fixed time limit on this any more. The client gives up only if the daemon says *nothing*
+for five minutes, so a slow link or a cold cache no longer cuts off a healthy build — and a spawn
+that really is wedged still fails, with a message quoting the last thing the daemon reported. If a
+second agent asks for the same toolchain while it is building, it waits for that build and says so
+instead of starting a second copy of it.
 
 ---
 
@@ -220,10 +279,11 @@ wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/repos/$H.
 **Expect:** an agent directory, and the `agent/<id>` ref **ahead of where it started**.
 
 A ref existing proves nothing — it is created at spawn and always points at *some* commit. What
-matters is that it **moved**. Read the agent id off the directory name, then:
+matters is that it **moved**. The `ls` prints `<agentId>.git`; set `$A` to that name **without** the
+`.git` suffix, since the commands below append it themselves:
 
 ```powershell
-$A = "<the agent id from the ls above>"
+$A = "<the agent id from the ls above, minus .git>"
 wsl -d MainguardEnv -u root -- git --git-dir=/home/mainguard/mainguard/agents/$H/$A.git log --oneline -3 refs/heads/agent/$A
 ```
 
@@ -251,6 +311,19 @@ wsl -d MainguardEnv -u root -- journalctl -u mainguardd -n 40 | Select-String ve
 
 Host execution would be a rejection trigger. If you ever see the verify command run on Windows,
 that's a serious finding.
+
+**If it reports failure, read the output before believing it.** A red verification here has three
+very different causes and only one of them means your code is wrong:
+
+| what you see | what it actually is |
+|---|---|
+| `assert …` / a named test failing | genuinely failing tests |
+| `no such option: -m`, or the first program complaining about a later program's flags | the command was **mis-tokenised** — you need `sh -c "…"` |
+| `pytest: not found`, `No module named pip` | the **toolchain** is missing or wrong for this repo |
+
+The middle and bottom rows are the ones to write down, because the queue records both as *tests
+failed*. That indistinguishability is the defect this repo keeps producing: a truthful-looking result
+that means something else.
 
 ---
 

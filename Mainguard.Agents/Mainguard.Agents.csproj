@@ -13,6 +13,10 @@
   <ItemGroup>
     <!-- Lets the test suite drive internal test seams. Test-only; not for production. -->
     <InternalsVisibleTo Include="Mainguard.Tests" />
+    <!-- Same, for the daemon-side suite (Mainguard.Agents.UI already grants both). Needed so the MG-3
+         isolation boundary in AgentRepoManager.DropForeignAgentRefs can be driven directly: its failure
+         mode is a git ref delete that does not happen, which cannot be provoked through Create(). -->
+    <InternalsVisibleTo Include="Mainguard.Server.Tests" />
   </ItemGroup>
 
   <!--

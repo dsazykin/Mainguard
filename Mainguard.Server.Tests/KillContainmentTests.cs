@@ -114,6 +114,57 @@ public sealed class KillContainmentTests
         Assert.Equal("Paused", rig.Target.CaptureStates()["pr-7"]);
     }
 
+    /// <summary>
+    /// RT-D4 observed in BOTH directions over the real target — the thing the old rig could not do because
+    /// it hardcoded the production default (<c>rttBudget: () =&gt; TimeSpan.Zero</c>), making
+    /// <c>RttSpikeDetected</c> constant false and the A3 <c>Unresponsive</c> feed unreachable.
+    /// </summary>
+    [Theory]
+    [InlineData(0)]        // a measured-fast channel: no spike
+    [InlineData(10)]       // 50 × 10 ms = 500 ms, well inside the 30 s ceiling — no spike
+    [InlineData(1_000)]    // 50 × 1 s = 50 s — blows the ceiling, so a spike
+    public async Task Engage_RttSpikeArm_FiresExactlyWhenFiftyTimesRttBlowsTheCeiling(int rttMilliseconds)
+    {
+        using var rig = new KillRig();
+        rig.Rtt = TimeSpan.FromMilliseconds(rttMilliseconds);
+        rig.AddLiveAgent("ctr-a");
+
+        var report = await rig.KillSwitch.EngageAsync();
+
+        // The expected answer is the formula's, computed here rather than restated as a literal.
+        var expected = KillSwitchTiming.RttWouldExceedCeiling(rig.Rtt);
+        Assert.Equal(expected, report.RttSpikeDetected);
+        Assert.Equal(expected, rig.SpikeEpochs.Contains(report.KillEpochId));
+
+        // Whatever the RTT, the deadline never exceeds the ceiling (the RT-D4 invariant proper).
+        Assert.True(report.Deadline <= KillSwitchTiming.Ceiling);
+
+        // This rig MEASURES the RTT, so the record says so — the daemon's sentinel says the opposite.
+        Assert.True(report.RttMeasured);
+    }
+
+    /// <summary>
+    /// Step 3's snapshot has to survive the process. The default journal is an
+    /// <c>InMemoryKillJournal</c> nothing holds a reference to, so "written BEFORE returning" was written
+    /// into garbage — read it back off disk instead, with a FRESH reader, which is what a daemon that
+    /// restarted after the emergency stop sees.
+    /// </summary>
+    [Fact]
+    public async Task Engage_WritesTheKillEpochToADurableJournal_ReadableAfterTheFact()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+
+        var report = await rig.KillSwitch.EngageAsync();
+
+        var reread = new JsonKillJournal(rig.Journal.Path).ReadAll();
+        var snapshot = Assert.Single(reread);
+        Assert.Equal(report.KillEpochId, snapshot.KillEpochId);
+        Assert.True(snapshot.QueueFrozen);
+        Assert.Equal(agentId, Assert.Single(snapshot.Agents).AgentId);
+        Assert.Equal(KillAgentOutcome.Paused, snapshot.Agents[0].Outcome);
+    }
+
     /// <summary>The wiring half of MG-8: a containing target that is not the one the daemon resolves fixes
     /// nothing, so assert the composition root itself.</summary>
     [Fact]
@@ -141,8 +192,29 @@ public sealed class KillContainmentTests
             Leader = new SessionLeader(new LeaderRegistry(_registryPath));
             Locks = new TerminalLockRegistry();
             Target = new SandboxKillTarget(Store, Engine, Leader, Locks, NullLoggerFactory.Instance);
-            KillSwitch = new KillSwitch(new KillSwitchGate(), Target, rttBudget: () => TimeSpan.Zero);
+            Journal = new JsonKillJournal(
+                Path.Combine(Path.GetDirectoryName(_registryPath)!, "kills.jsonl"));
+            // The rig used to pass `rttBudget: () => TimeSpan.Zero` — byte-for-byte the production default
+            // it was meant to be exercising — so RttSpikeDetected was constant false here for the same
+            // reason it was constant false in the daemon, and no assertion in either direction was
+            // possible. It is settable now, and asserted BOTH ways below. Same for the journal: the
+            // default one is unreachable, so step 3 could not be observed at all.
+            KillSwitch = new KillSwitch(
+                new KillSwitchGate(), Target, journal: Journal, audit: Audit,
+                rttBudget: () => Rtt, onRttSpike: epoch => SpikeEpochs.Add(epoch));
         }
+
+        /// <summary>The control-channel RTT the kill switch reads. Zero here is a MEASUREMENT of zero
+        /// (a real EWMA on a fast channel), not <see cref="KillSwitchTiming.UnmeasuredRtt"/>.</summary>
+        public TimeSpan Rtt { get; set; } = TimeSpan.Zero;
+
+        /// <summary>Kill epochs the A3 <c>Unresponsive</c> feed was told about.</summary>
+        public ConcurrentBag<string> SpikeEpochs { get; } = new();
+
+        public InMemoryAuditLog Audit { get; } = new();
+
+        /// <summary>The durable journal step 3 writes to — read back off disk by the test.</summary>
+        public JsonKillJournal Journal { get; }
 
         public AgentSessionStore Store { get; }
 

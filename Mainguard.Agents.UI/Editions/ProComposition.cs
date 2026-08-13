@@ -39,6 +39,33 @@ public static class ProComposition
     /// <summary>The bundle the control center runs on — the factory's current value.</summary>
     public static OrchestratorServices CreateOrchestratorServices() => OrchestratorServicesFactory();
 
+    // ---- external-PR intake configuration (P2-12) ----
+
+    /// <summary>
+    /// The seam Settings → PR Intake reads its configuration through. Production resolves the LIVE,
+    /// daemon-owned gateway; the headless render harnesses override it with
+    /// <see cref="InMemoryPrIntakeGateway"/> before building the page.
+    ///
+    /// <para>A seam rather than a construction inside the page, for the same reason as the orchestrator
+    /// bundle above: the page's whole contract is that it edits daemon state, so the ONE place that
+    /// decides what "the daemon" means for a given run belongs here, where a harness can replace it,
+    /// and not inside a ViewModel where a fallback would silently become production behaviour.</para>
+    /// </summary>
+    public static Func<IPrIntakeGateway> PrIntakeGatewayFactory { get; set; } =
+        () => new DaemonPrIntakeGateway(SharedIntakeClient.Value);
+
+    /// <summary>The gateway the intake settings page runs on — the factory's current value.</summary>
+    public static IPrIntakeGateway CreatePrIntakeGateway() => PrIntakeGatewayFactory();
+
+    /// <summary>
+    /// One process-lifetime loopback client for the intake page's unary calls. Deliberately shared and
+    /// never disposed: Settings pages are cached per Settings window and nothing disposes them, so a
+    /// client per page would leak an mTLS channel every time the window is opened. The channel is
+    /// created lazily, on the first activation of this page, so a run that never opens it pays nothing.
+    /// </summary>
+    private static readonly Lazy<DaemonClient> SharedIntakeClient =
+        new(() => DaemonClient.ForLoopback(), isThreadSafe: true);
+
     // ---- shell capabilities the shell wires at startup (all inert until then) ----
 
     /// <summary>The app settings service (was <c>App.Settings</c>) — the control center reads/writes its

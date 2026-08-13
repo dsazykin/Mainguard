@@ -569,4 +569,124 @@ public class ExternalPrIntakeTests
 
         Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
     }
+
+    // ---- The settings the poller obeys are the PERSISTED ones ------------
+
+    /// <summary>
+    /// The bot-author allow-list the poll actually filters on comes from the STORE, not from a
+    /// compiled-in default.
+    ///
+    /// <para>This is the poller half of the intake settings surface, and it is the half that decides
+    /// whether that surface is real. The cadence and the bot list used to be settable properties on this
+    /// engine that nothing in production ever assigned — so a settings page could have saved a bot list
+    /// anywhere at all and the poll would still have matched only <c>DefaultBotAuthors</c>. Here a saved
+    /// list is what selects the pull requests: <c>renovate[bot]</c> is materialized because it is in the
+    /// saved list, and <c>codex[bot]</c> is NOT, despite being one of the shipped defaults.</para>
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_ShouldFilterAuthors_ByTheSavedBotList_NotTheCompiledDefault()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Store.SaveSettings(new PrIntakeSettings(true, 60, new[] { "renovate[bot]" }));
+
+        h.Pr.Open.Add(h.Bot(7, "renovate[bot]"));   // in the SAVED list
+        h.Pr.Open.Add(h.Bot(8, "codex[bot]"));      // a shipped default, but NOT in the saved list
+        h.Fetcher.Heads[7] = "sha-7a";
+        h.Fetcher.Heads[8] = "sha-8a";
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
+        Assert.DoesNotContain("pr-8", h.Queue.Agents);
+    }
+
+    /// <summary>
+    /// The saved cadence is the cadence the scheduler delays on, read live — so a change takes effect on
+    /// the next cycle rather than on the next daemon restart. The loop is started once by the daemon's
+    /// hosted service and runs for the daemon's whole lifetime; a cadence captured at start would leave
+    /// the settings page right and the poller wrong for hours.
+    /// </summary>
+    [Fact]
+    public void PollInterval_ShouldFollowTheSavedSetting_Live()
+    {
+        var h = new Harness();
+        Assert.Equal(TimeSpan.FromSeconds(60), h.Intake.PollInterval);   // the shipped default
+
+        h.Store.SaveSettings(new PrIntakeSettings(true, 300, ExternalPrIntake.DefaultBotAuthors));
+        Assert.Equal(TimeSpan.FromSeconds(300), h.Intake.PollInterval);
+
+        // Clamped, both ends — a stored row is not a trusted input, and a zero here is a hot loop
+        // against a rate-limited host API.
+        h.Store.SaveSettings(new PrIntakeSettings(true, 0, ExternalPrIntake.DefaultBotAuthors));
+        Assert.Equal(TimeSpan.FromSeconds(PrIntakeSettings.MinPollIntervalSeconds), h.Intake.PollInterval);
+
+        h.Store.SaveSettings(new PrIntakeSettings(true, 99_999, ExternalPrIntake.DefaultBotAuthors));
+        Assert.Equal(TimeSpan.FromSeconds(PrIntakeSettings.MaxPollIntervalSeconds), h.Intake.PollInterval);
+    }
+
+    /// <summary>
+    /// The off switch is obeyed by the poll itself: a disabled intake lists nothing, fetches nothing and
+    /// materializes nothing, while the subscriptions stay put so switching it back on needs no re-entry.
+    /// Asserted on <c>ListCalls</c> as well as on the queue — "materialized nothing" would also be true
+    /// of an intake that listed the host on every cycle and then discarded the result, which is still
+    /// upstream traffic the user asked it to stop making.
+    /// </summary>
+    [Fact]
+    public async Task PollOnce_WhenIntakeIsDisabled_ShouldNotEvenListTheHost()
+    {
+        var h = new Harness();
+        h.Intake.Subscribe(Harness.Source);
+        h.Pr.Open.Add(h.Bot(7));
+        h.Fetcher.Heads[7] = "sha-7a";
+        h.Store.SaveSettings(new PrIntakeSettings(false, 60, ExternalPrIntake.DefaultBotAuthors));
+
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+
+        Assert.Equal(0, h.Pr.ListCalls);
+        Assert.Empty(h.Queue.Agents);
+        Assert.Single(h.Store.Subscriptions());   // off, not unsubscribed
+
+        // …and re-enabling needs nothing but the setting.
+        h.Store.SaveSettings(new PrIntakeSettings(true, 60, ExternalPrIntake.DefaultBotAuthors));
+        await h.Intake.PollOnceAsync(CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("pr-7"));
+    }
+
+    /// <summary>
+    /// The store round-trips the settings through real SQLite, including the two normalizations the
+    /// daemon relies on. This is the desktop-suite half of the persistence claim; the daemon suite's
+    /// <c>PrIntakeSettingsRpcTests</c> proves the RPC reaches this store and survives the host.
+    /// </summary>
+    [Fact]
+    public void DbPrIntakeStore_ShouldRoundTripSettings_AndNormalizeThem()
+    {
+        var dbPath = System.IO.Path.Combine(
+            System.IO.Path.GetTempPath(), "mainguard-tests", Guid.NewGuid().ToString("N"), "intake.db");
+        System.IO.Directory.CreateDirectory(System.IO.Path.GetDirectoryName(dbPath)!);
+        using (var db = new Mainguard.Git.AppDbContext(dbPath))
+        {
+            Microsoft.EntityFrameworkCore.RelationalDatabaseFacadeExtensions.Migrate(db.Database);
+        }
+
+        var store = new DbPrIntakeStore(() => new Mainguard.Git.AppDbContext(dbPath));
+
+        // Never written: the daemon's shipped default, not a zeroed row.
+        Assert.Equal(PrIntakeSettings.Default, store.GetSettings());
+
+        store.SaveSettings(new PrIntakeSettings(false, 42, new[] { " renovate[bot] ", "" }));
+
+        // A brand-new store object over the same file — the next daemon boot's view.
+        var reread = new DbPrIntakeStore(() => new Mainguard.Git.AppDbContext(dbPath)).GetSettings();
+        Assert.False(reread.Enabled);
+        Assert.Equal(42, reread.PollIntervalSeconds);
+        Assert.Equal(new[] { "renovate[bot]" }, reread.BotAuthors);   // trimmed, blanks dropped
+
+        // The upsert stays a single row: a second save replaces rather than accumulates.
+        store.SaveSettings(new PrIntakeSettings(true, 77, new[] { "copilot" }));
+        var second = new DbPrIntakeStore(() => new Mainguard.Git.AppDbContext(dbPath)).GetSettings();
+        Assert.True(second.Enabled);
+        Assert.Equal(77, second.PollIntervalSeconds);
+        Assert.Equal(new[] { "copilot" }, second.BotAuthors);
+    }
 }

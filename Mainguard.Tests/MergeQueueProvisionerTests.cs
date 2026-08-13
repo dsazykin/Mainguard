@@ -30,8 +30,13 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     private const string AgentId = "loom-rtd2";
     private const string ContainerId = "container-rtd2";
 
+    /// <summary>The two co-tenants of the keep-alive tests: one merges, the other must survive it.</summary>
+    private const string FirstAgent = "loom-first";
+    private const string SecondAgent = "loom-second";
+
     private readonly string _vmRoot = NewDir("mainguard-mqprov-vm-");
     private readonly string _source = NewDir("mainguard-mqprov-src-");
+    private readonly Mainguard.Git.Audit.InMemoryAuditLog _audit = new();
 
     [Fact]
     public async Task BranchThatRewritesItsOwnTestCommand_IsFlagged_AndCannotMerge()
@@ -574,7 +579,320 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             "Add subtract function");
     }
 
+    // ---- P2-09 keep-alive rebase, wired into the stale cascade -----------
+    //
+    // THE defect these cover: `git merge --ff-only` is the merge, so the moment any agent merges, every
+    // co-tenant branch stops being a fast-forward of main. The cascade staled them and then only
+    // RE-VERIFIED them — which passes, against work nothing had rebased — so each entry returned to
+    // Verified and its merge was then refused as stale, forever. Only one agent per repository could ever
+    // merge, and no daemon-side action existed that could change that.
+    //
+    // Both of the first two tests assert mergeability in two independent ways, because the failure is
+    // precisely that the two used to disagree: CanMerge says the queue believes it, and the ancestry probe
+    // says git would actually perform it. A fix that satisfies only the first IS the bug.
+
+    [Fact]
+    public async Task AfterOneAgentMerges_TheCoTenantIsRebasedOntoTheNewMain_AndCanActuallyMerge()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        var provisioner = NewRebasingProvisioner(out var engine, jailFor: _ => ContainerId);
+        Assert.True(provisioner.ReparentsStaleBranches);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+        Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));
+
+        // The human merges the first agent. Main advances to a commit the second agent's branch does not
+        // descend from — which is the whole of the problem, and is true after any --ff-only merge.
+        var newMain = FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent);
+        Assert.False(FastForwardsOntoMain(repoHash, SecondAgent), "precondition: the co-tenant is behind main");
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, newMain);
+        await ctx.Queue.LastCascade;
+
+        // (1) The queue believes it can merge...
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(SecondAgent));
+        Assert.True(ctx.Queue.CanMerge(SecondAgent, out var reason), reason);
+
+        // (2) ...and git agrees, which is the assertion that used to fail. `--ff-only` asks exactly this
+        // question, so a branch that passes here is a branch the foreground merge really lands.
+        Assert.True(FastForwardsOntoMain(repoHash, SecondAgent),
+            "the co-tenant re-verified but was never reparented — its --ff-only merge would still refuse");
+
+        // (3) The rebase went through the P2-09 yield: the jail was frozen for the mutation and thawed
+        // afterwards. Rewriting a worktree that is bind-mounted into a RUNNING jail without that is the
+        // .git/index.lock collision this application exists to prevent, with the daemon as second writer.
+        Assert.Contains("pause:" + ContainerId, engine.FreezeLog);
+        Assert.Contains("unpause:" + ContainerId, engine.FreezeLog);
+    }
+
+    /// <summary>
+    /// The same scenario on the composition this change replaced — re-verify with no rebase — pinned as a
+    /// regression rather than described in a comment.
+    ///
+    /// <para>It is the exact shape of the defect: the entry lands back on <c>Verified</c>,
+    /// <c>CanMerge</c> answers TRUE, and the branch does not fast-forward, so the merge refuses with
+    /// "verification is stale" and the refusal re-queues it into the same cascade. Every observable the
+    /// human has says ready; the one that decides says no.</para>
+    /// </summary>
+    [Fact]
+    public async Task WithoutTheKeepAliveRebase_TheCoTenantLooksMergeableAndIsNot()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        // No yield, no worktree locator — i.e. the pre-fix daemon.
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        Assert.False(provisioner.ReparentsStaleBranches);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));       // the queue says yes
+        Assert.False(FastForwardsOntoMain(repoHash, SecondAgent));  // git says no
+    }
+
+    /// <summary>
+    /// Decision: a staled entry whose agent has been STOPPED must not become a second permanent-stuck
+    /// state.
+    ///
+    /// <para>There is nothing to yield and nothing to rebase, and (§3.2) nothing to verify in either — so
+    /// the entry returns to <c>Working</c> carrying the missing sandbox as its reason, which is what the
+    /// human-only resume path answers. Deliberately NOT routed through <c>RunVerificationAsync</c> to fail
+    /// on the no-jail refusal: that reaches the same state through a "verification failed"-shaped event
+    /// for a verification that never ran.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStaledEntryWhoseAgentIsGone_ReturnsToWorking_NamingTheMissingJail()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        // The second agent's jail disappears after both branches have been verified.
+        var stopped = false;
+        var provisioner = NewRebasingProvisioner(out _,
+            jailFor: agentId => stopped && agentId == SecondAgent ? null : ContainerId);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+        stopped = true;
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        // Not stale-forever, not verifying-forever, and emphatically not falsely Verified: Working, with
+        // the reason attached.
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Contains("no live sandbox", reason);
+        Assert.Contains("resume the agent", reason);
+
+        // ...and the block is in the audit trail, not only in a log line nobody keeps.
+        Assert.Contains(_audit.Read(), e =>
+            e.Type == MergeQueue.RequeueBlockedEvent && e.Fields["agent"] == SecondAgent);
+
+        // The entry is not frozen: once the agent is back, an ordinary verification walks it out of
+        // Working, and the block reason retires with the state rather than outliving it.
+        stopped = false;
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(SecondAgent));
+        Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));
+    }
+
+    /// <summary>
+    /// Decision: a rebase that CONFLICTS must leave the user something to act on, not a parked worktree
+    /// nobody surfaces.
+    ///
+    /// <para>The conflict arm was entirely dead in production — <c>AgentRunState.Conflict</c> had no
+    /// writer, <c>ConflictHandoff</c> was constructed nowhere outside tests, and the T-04 resolver it was
+    /// meant to reach does not exist yet. So the worktree would have been parked mid-rebase with the jail
+    /// paused and <i>nothing anywhere naming it</i>, which is byte-for-byte indistinguishable from an
+    /// agent that quietly stopped making progress.</para>
+    ///
+    /// <para>What this asserts is the three places the conflict now exists outside the background task
+    /// that produced it: the agent's run state (streamed to clients by the daemon's supervisor), the audit
+    /// trail (carrying the T-04 handoff payload for the resolver when it lands), and the queue entry's own
+    /// gate reason. The worktree stays parked — deliberately, no automatic <c>rebase --abort</c> — and the
+    /// jail stays paused, which is what the resolver needs; the change is that all of that is now legible.</para>
+    /// </summary>
+    [Fact]
+    public async Task AConflictingRebase_ParksTheWorktree_AndSaysSoInThreePlaces()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        // Both agents edit the SAME file differently — the rebase cannot replay the second onto the first.
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "shared.cs", "public class Shared { int First; }\n");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
+
+        var states = new List<(string Agent, string State)>();
+        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId, states: states);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        // (1) The agent's run state — the one the daemon's supervisor streams to clients.
+        Assert.Contains(states, s => s.Agent == SecondAgent && s.State == nameof(AgentRunState.Conflict));
+
+        // (2) The audit trail, carrying the T-04 handoff payload (which worktree, which branch).
+        var handoff = Assert.Single(_audit.Read(), e =>
+            e.Type == MergeQueueProvisioner.KeepAliveConflictEvent && e.Fields["agent"] == SecondAgent);
+        Assert.NotEmpty(handoff.Fields["worktree"]);
+
+        // (3) The queue entry itself: not falsely Verified, not stuck at StaleVerified, and its refusal
+        // says what happened rather than "not verified yet".
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Contains("conflict", reason);
+        Assert.Contains("resolve", reason);
+
+        // The rebase is LEFT in progress for the resolver — no automatic abort (a rejection trigger).
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        Assert.True(Directory.Exists(Path.Combine(ResolveGitDir(worktree), "rebase-merge")));
+    }
+
+    /// <summary>A linked worktree's <c>.git</c> is a file pointing at the real gitdir.</summary>
+    private static string ResolveGitDir(string worktreePath)
+    {
+        var dotGit = Path.Combine(worktreePath, ".git");
+        if (Directory.Exists(dotGit))
+        {
+            return dotGit;
+        }
+
+        foreach (var line in File.ReadAllLines(dotGit))
+        {
+            var trimmed = line.Trim();
+            if (trimmed.StartsWith("gitdir:", StringComparison.Ordinal))
+            {
+                var target = trimmed["gitdir:".Length..].Trim();
+                return Path.IsPathRooted(target) ? target : Path.GetFullPath(Path.Combine(worktreePath, target));
+            }
+        }
+
+        return dotGit;
+    }
+
     // ---- harness ---------------------------------------------------------
+
+    /// <summary>
+    /// A provisioner composed the way the daemon composes one: with the P2-09 yield and a real worktree
+    /// locator, so its queues REPARENT a staled branch instead of only re-running its tests.
+    /// </summary>
+    /// <param name="jailFor">agentId → its live jail, or null when the agent has been stopped.</param>
+    private MergeQueueProvisioner NewRebasingProvisioner(
+        out FakeSandboxEngine engine, Func<string, string?> jailFor,
+        List<(string Agent, string State)>? states = null)
+    {
+        var sandbox = new FakeSandboxEngine(exitCode: 0);
+        engine = sandbox;
+        var vmRoot = _vmRoot;
+        return new MergeQueueProvisioner(
+            registry: new MergeQueueRegistry(),
+            repos: new RepoProvisioner(vmRoot),
+            leases: new InMemoryMergeLeaseStore(),
+            resolveContainerId: (_, agentId) => jailFor(agentId),
+            queueStore: _ => new InMemoryMergeQueueStore(),
+            verificationStore: _ => new InMemoryVerificationStore(),
+            sandboxes: sandbox,
+            artifactDirectory: NewDir("mainguard-mqprov-artifacts-"),
+            mergeDiff: new MergeBranchDiffService(
+                new RepoProvisioner(vmRoot),
+                (repoHash, agentId) => new WorktreeManager(vmRoot).PublishAgentBranch(repoHash, agentId)),
+            audit: _audit,
+            publishAgentRef: (repoHash, agentId) => new WorktreeManager(vmRoot).PublishAgentBranch(repoHash, agentId),
+            checkAgentBranch: (repoHash, agentId) => new WorktreeManager(vmRoot).CheckAgentBranch(repoHash, agentId),
+            // The two arguments whose absence WAS the defect. UnboundAgentControlChannel is the daemon's
+            // own channel: no cooperative transport exists, so every yield takes the pause path — which is
+            // the path a test wants exercised anyway, since it is the one production takes.
+            yieldProtocolFor: _ => new YieldProtocol(
+                channelFor: _ => UnboundAgentControlChannel.Instance,
+                sandbox: sandbox,
+                containerIdFor: jailFor),
+            locateAgentWorktree: (repoHash, agentId) => new WorktreeManager(vmRoot).WorktreePathFor(repoHash, agentId),
+            publishRebasedAgentRef: (repoHash, agentId) =>
+                new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId),
+            agentStates: states is null ? null : new RecordingSupervisor(states));
+    }
+
+    /// <summary>Lands the agent's work on the agent branch, exactly as <see cref="CommitOnAgentBranch"/>
+    /// does, for the multi-agent tests that need more than one id.</summary>
+    private void CommitOnAgentBranchFor(string repoHash, string agentId, string fileName, string? content = null)
+    {
+        var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, agentId);
+        WriteAndCommit(worktree, fileName,
+            content ?? $"public class {Path.GetFileNameWithoutExtension(fileName)} {{ }}\n",
+            $"{agentId}'s actual work");
+    }
+
+    /// <summary>Records every run state the keep-alive cycle reflects on an agent.</summary>
+    private sealed class RecordingSupervisor : IAgentSupervisor
+    {
+        private readonly List<(string Agent, string State)> _states;
+
+        public RecordingSupervisor(List<(string Agent, string State)> states) => _states = states;
+
+        public void PauseInput(string agentId) { }
+
+        public void ResumeInput(string agentId) { }
+
+        public void MarkState(string agentId, string state, string? reason)
+        {
+            lock (_states) { _states.Add((agentId, state)); }
+        }
+    }
+
+    /// <summary>
+    /// Advances the mirror's main to <paramref name="reference"/> and returns the new sha — the mirror-side
+    /// result of a human <c>git merge --ff-only agent/&lt;id&gt;</c> on their own checkout.
+    ///
+    /// <para>A ref update rather than a merge commit on purpose: <c>--ff-only</c> produces exactly this,
+    /// and the property under test is what a fast-forward does to everyone ELSE's branch.</para>
+    /// </summary>
+    private string FastForwardMainTo(string repoHash, string reference)
+    {
+        using var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash));
+        var target = mirror.Refs[reference] ?? throw new InvalidOperationException($"missing ref {reference}");
+        var sha = mirror.Lookup<Commit>(target.ResolveToDirectReference().TargetIdentifier).Sha;
+        mirror.Refs.UpdateTarget(mirror.Refs[mirror.Head.CanonicalName], new ObjectId(sha));
+        return sha;
+    }
+
+    /// <summary>
+    /// The question <c>git merge --ff-only</c> asks: is the mirror's main an ancestor of this agent's
+    /// branch — i.e. would the human's merge actually land?
+    ///
+    /// <para>Read off the MIRROR, because that is the ref the merge consumes and the ref the
+    /// pre-verification publish carries the agent's tip into. Asking the agent's own repository instead
+    /// would answer about bytes the merge never sees.</para>
+    /// </summary>
+    private bool FastForwardsOntoMain(string repoHash, string agentId)
+    {
+        new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId);
+        using var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash));
+        var main = mirror.Head.Tip;
+        var branch = mirror.Refs["refs/heads/agent/" + agentId];
+        if (branch is null)
+        {
+            return false;
+        }
+
+        var tip = mirror.Lookup<Commit>(branch.ResolveToDirectReference().TargetIdentifier);
+        return mirror.ObjectDatabase.FindMergeBase(main, tip)?.Sha == main.Sha;
+    }
 
     private MergeQueueProvisioner NewProvisioner(int exitCode, out FakeSandboxEngine engine)
         => NewProvisioner(exitCode, out engine, new MergeQueueRegistry());
@@ -748,9 +1066,25 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             return Task.FromResult(new SandboxExecResult(_exitFor?.Invoke(command) ?? _exitCode, "output", ""));
         }
 
+        /// <summary>Every pause/unpause, in order — the P2-09 yield's fallback path is what makes it safe
+        /// for the daemon to rewrite a worktree that is bind-mounted into a running jail, so a test of the
+        /// keep-alive rebase has to be able to see that it happened.</summary>
+        public List<string> FreezeLog { get; } = new();
+
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task PauseAsync(string containerId, CancellationToken ct = default) => throw new NotSupportedException();
-        public Task UnpauseAsync(string containerId, CancellationToken ct = default) => throw new NotSupportedException();
+
+        public Task PauseAsync(string containerId, CancellationToken ct = default)
+        {
+            FreezeLog.Add("pause:" + containerId);
+            return Task.CompletedTask;
+        }
+
+        public Task UnpauseAsync(string containerId, CancellationToken ct = default)
+        {
+            FreezeLog.Add("unpause:" + containerId);
+            return Task.CompletedTask;
+        }
+
         public Task StopAsync(string containerId, CancellationToken ct = default) => throw new NotSupportedException();
         public Task RemoveAsync(string containerId, CancellationToken ct = default) => throw new NotSupportedException();
     }

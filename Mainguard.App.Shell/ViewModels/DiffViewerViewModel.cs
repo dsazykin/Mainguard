@@ -131,18 +131,51 @@ public partial class DiffViewerViewModel : ViewModelBase
         }
     }
 
+    // Set when the last SaveFile attempt failed; cleared by a successful save. Edit mode
+    // auto-enables whenever conflict markers are present (CheckForConflicts), so the text this
+    // command writes is frequently a merge resolution — swallowing the write meant the resolution
+    // was silently lost while the markers stayed on disk and the UI looked saved.
+    [ObservableProperty]
+    private string? _saveError;
+
+    /// <summary>True after a failed save — drives the error banner over the editor.</summary>
+    public bool HasSaveError => !string.IsNullOrEmpty(SaveError);
+
+    partial void OnSaveErrorChanged(string? value) => OnPropertyChanged(nameof(HasSaveError));
+
+    /// <summary>True only after a save that actually reached disk — lets tests and callers tell
+    /// "saved" from "looked saved".</summary>
+    public bool LastSaveSucceeded { get; private set; }
+
     [RelayCommand]
     private void SaveFile()
     {
-        if (!string.IsNullOrEmpty(FilePath))
+        LastSaveSucceeded = false;
+
+        if (string.IsNullOrEmpty(FilePath))
         {
-            var fullPath = System.IO.Path.Combine(_repoPath, FilePath);
-            try
-            {
-                System.IO.File.WriteAllText(fullPath, RawContent);
-            }
-            catch { }
+            SaveError = "No file is open, so there is nothing to save.";
+            return;
         }
+
+        var fullPath = System.IO.Path.Combine(_repoPath, FilePath);
+        try
+        {
+            System.IO.File.WriteAllText(fullPath, RawContent);
+        }
+        catch (System.Exception ex)
+        {
+            // Never report success here. The buffer may be the only copy of a conflict
+            // resolution; the user has to know it is still unwritten.
+            SaveError = $"Could not save '{FilePath}': {ex.Message}";
+            return;
+        }
+
+        SaveError = null;
+        LastSaveSucceeded = true;
+        // The markers the auto-edit-mode switch keyed off are only really gone once the write
+        // landed, so re-derive the conflict state from what we just persisted.
+        CheckForConflicts();
     }
 
     [ObservableProperty]

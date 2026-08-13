@@ -80,6 +80,18 @@ message QueueEntry {
   // on the wire a client cannot distinguish a branch being verified from one stuck pretending to be, and
   // therefore cannot offer the human the one action that unsticks it.
   bool verification_in_flight = 8;
+  // Whether this entry's agent still HAS a jail in this repo — the fact that decides whether the entry
+  // is workable at all. Verification runs in the worker's own sandbox and never on the host, so an entry
+  // whose jail is gone cannot be verified, cannot become Verified, and therefore cannot merge; its
+  // Verify button is an error message waiting to happen and its only honest actions are Resume and
+  // Discard. Only the daemon holds the session table, so a client cannot derive this.
+  //
+  // `optional` ON PURPOSE, exactly like AgentResourceReading.cpu_percent: proto3 scalars default to
+  // false, and a false that means "this daemon does not report liveness" is indistinguishable from one
+  // that means "this entry's jail is gone" — which would make every entry served by an older daemon
+  // render as stranded. Explicit presence lets "unknown" be a value on the wire, and unknown leaves the
+  // surface exactly as it was.
+  optional bool has_live_sandbox = 9;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the
@@ -214,4 +226,77 @@ message GetMergeDiffResponse {
   string branch = 1;        // agent/<id>
   string main_branch = 2;   // the mirror's default branch the diff was taken against
   string unified_diff = 3;  // raw `git diff main...branch`; the client parses it with PatchParser (T-06)
+}
+
+// The P2-12 external-PR-intake configuration surface — the queue's other feeder. The intake polls a
+// subscribed host repository for bot-authored pull requests and materializes each one as an External
+// MergeQueueService entry, so this lives beside the queue it fills.
+//
+// It is DAEMON-OWNED, and that is the whole reason these RPCs exist. The daemon runs the poll loop and
+// provisions the jail each intake'd PR needs; it must still know the cadence and the bot list with the
+// App closed. Before this the App's intake settings dialog wrote to an in-process store the daemon never
+// read — a settings screen that looked saved and changed nothing. There is now exactly one home for the
+// configuration (the daemon's PrIntakeStore) and the App is a client of it.
+//
+// Unlike every MergeQueueService rpc these carry no repo_handle: intake configuration is daemon-wide.
+// Subscriptions name their repository by (host, owner, repo), which is an UPSTREAM identity, not a
+// provisioned local one — the daemon matches it against the repos it has provisioned at poll time.
+service PrIntakeService {
+  // Read the daemon's intake configuration plus its persisted subscriptions (the settings page's load).
+  rpc GetPrIntakeSettings(GetPrIntakeSettingsRequest) returns (GetPrIntakeSettingsResponse);
+  // Write the daemon's intake configuration. Persisted first, then echoed back AS PERSISTED — clamped
+  // and defaulted — so the page renders what the daemon will actually poll with rather than what the
+  // user typed. Subscriptions are not touched here; they have their own rpc below.
+  rpc UpdatePrIntakeSettings(UpdatePrIntakeSettingsRequest) returns (UpdatePrIntakeSettingsResponse);
+  // Subscribe one source. Idempotent on (host, owner, repo, author_filter) — a repeat adds no row and is
+  // reported as `added = false`, never an error.
+  rpc SubscribePrIntakeSource(SubscribePrIntakeSourceRequest) returns (SubscribePrIntakeSourceResponse);
+}
+
+// The daemon's intake configuration. One message for both directions, like GatewayService's Budget.
+message PrIntakeSettings {
+  // False parks the poll loop: it keeps running and materializes nothing. An off switch that is not
+  // "unsubscribe everything", so turning intake back on does not mean re-entering every repository.
+  bool enabled = 1;
+  // The scheduler cadence. CLAMPED daemon-side to [10, 3600] — a zero here would be a hot loop against a
+  // rate-limited host API, and neither a stored row nor a client is a trusted input.
+  int32 poll_interval_seconds = 2;
+  // The shared bot-author allow-list a source with no author_filter of its own matches against. Empty
+  // means "use the daemon's compiled-in default list" — an empty list is far likelier to be a mis-save
+  // than a deliberate "poll this repo and ignore every pull request on it".
+  repeated string bot_authors = 3;
+}
+
+// One subscribed source: a repository on a host, optionally narrowed to a single author.
+message PrIntakeSource {
+  string host = 1;           // e.g. github.com
+  string owner = 2;
+  string repo = 3;
+  string author_filter = 4;  // empty = fall back to the shared bot_authors list
+}
+
+message GetPrIntakeSettingsRequest {}
+
+message GetPrIntakeSettingsResponse {
+  PrIntakeSettings settings = 1;
+  // The persisted subscriptions, so the settings page's list is the daemon's truth rather than a
+  // client-side echo of whatever this session happened to add.
+  repeated PrIntakeSource sources = 2;
+}
+
+message UpdatePrIntakeSettingsRequest {
+  PrIntakeSettings settings = 1;
+}
+
+message UpdatePrIntakeSettingsResponse {
+  PrIntakeSettings settings = 1; // as persisted (clamped/defaulted), not as requested
+}
+
+message SubscribePrIntakeSourceRequest {
+  PrIntakeSource source = 1;
+}
+
+message SubscribePrIntakeSourceResponse {
+  bool added = 1;                        // false = already subscribed (idempotent, not an error)
+  repeated PrIntakeSource sources = 2;   // the full persisted list after the add
 }

@@ -33,7 +33,7 @@ public class EgressAllowlistRenderHarness
                 ThemeManager.Apply(theme.Key, persist: false);
                 Settle();
 
-                Capture(theme.Key, "default", new EgressAllowlistViewModel(new InMemoryEgressAllowlistGateway()));
+                Capture(theme.Key, "default", Build(new InMemoryEgressAllowlistGateway()));
                 Capture(theme.Key, "a6_warning", BuildWithGitHost());
             }
         }
@@ -47,7 +47,16 @@ public class EgressAllowlistRenderHarness
     {
         var gateway = new InMemoryEgressAllowlistGateway();
         gateway.Add("GitHub", "github.com", "GitHost");
-        return new EgressAllowlistViewModel(gateway);
+        return Build(gateway);
+    }
+
+    // The load moved out of the ctor when the gateway became async (the shipped one is a gRPC round
+    // trip). The in-memory gateway completes synchronously, so the render still has its rows.
+    private static EgressAllowlistViewModel Build(IEgressAllowlistGateway gateway)
+    {
+        var vm = new EgressAllowlistViewModel(gateway);
+        vm.InitializeAsync().GetAwaiter().GetResult();
+        return vm;
     }
 
     private static void Capture(string themeKey, string state, EgressAllowlistViewModel vm)
