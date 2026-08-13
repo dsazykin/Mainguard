@@ -280,6 +280,48 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
     }
 
     /// <summary>
+    /// <b>A spawn always MINTS the worker id; it never accepts one.</b> The request carries an
+    /// <c>AgentId</c> — <c>get_worker_status</c>, <c>send_worker_prompt</c> and
+    /// <c>request_verification</c> all need to name their target — so nothing structural stops a
+    /// coordinator from putting an id on a <c>spawn</c> and seeing what happens.
+    ///
+    /// <para><b>Why this test exists.</b> Until phase 3 the guarantee was proved by the field simply not
+    /// existing (<c>QueueEntryResumeTests.AgentIpcSurface_HasNoResumeOp</c> asserted its absence). Phase 3
+    /// had to add the field, which retired the proof without retiring the requirement. Naming a spawn's id
+    /// is how adoption starts: an id that already belongs to a stranded queue entry would attach a fresh
+    /// writable jail to that entry's <c>agent/&lt;id&gt;</c> branch and let the daemon verify whatever the
+    /// caller then wrote there — the resume path's authorization (<c>AgentResumeService</c>) reached from
+    /// a channel that has none. So the assertion moves from "the field cannot exist" to "the field is
+    /// ignored here", which is what actually has to be true.</para>
+    ///
+    /// <para>Both hostile shapes are tried: an id naming a LIVE agent in the same repo, and a plausible
+    /// free-floating one. Neither may come back as the spawned worker.</para>
+    /// </summary>
+    [Fact]
+    public async Task ShimSpawn_IgnoresAnyAgentIdTheRequestCarries()
+    {
+        var coordinator = await SpawnCoordinatorAsync(RoleLockRig.RepoA);
+        var existing = await ShimSpawnAsync(coordinator, "the worker whose id we will try to reuse");
+
+        foreach (var hostile in new[] { existing, "pr-7" })
+        {
+            var response = await CallAsync(coordinator, new AgentIpcRequest(
+                AgentIpcRequest.SpawnOp,
+                AgentKind: "claude-code",
+                TaskPrompt: "spawn under a name I chose",
+                AgentId: hostile));
+
+            Assert.True(response.Ok, response.Error);
+            _spawned.Add(response.AgentId!);
+
+            Assert.NotEqual(hostile, response.AgentId);
+        }
+
+        // And the reused-id attempt did not disturb the agent that already held it.
+        Assert.NotNull(_rig.Sessions.Find(new AgentSessionKey(RoleLockRig.RepoA, existing)));
+    }
+
+    /// <summary>
     /// §7: "A coordinator must not read, steer, stop, or propose verification for another coordinator's
     /// workers." One test per verb that names an agent — each must refuse.
     /// </summary>
