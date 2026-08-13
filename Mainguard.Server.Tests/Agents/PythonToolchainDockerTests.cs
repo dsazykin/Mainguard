@@ -71,8 +71,10 @@ public class PythonToolchainDockerTests
     /// The whole claim: a human installs the curated Python toolchain, a repository declares it, and its
     /// pytest suite verifies GREEN in a jail — then RED when a test actually fails.
     ///
-    /// <para><b>Opt-in.</b> It downloads a ~350 MB pinned interpreter and installs pytest from PyPI over
-    /// the default-deny egress proxy. <c>MAINGUARD_VERIFY_E2E=1</c> runs it.</para>
+    /// <para><b>Opt-in.</b> It downloads the ~106 MiB pinned interpreter (measured, not remembered — the
+    /// "~350 MB" this comment used to claim was the number used to justify fetching in the VM with
+    /// <c>curl</c>, a program the VM does not have) and installs pytest from PyPI over the default-deny
+    /// egress proxy. <c>MAINGUARD_VERIFY_E2E=1</c> runs it.</para>
     /// </summary>
     [RequiresDockerAndOptInFact]
     public async Task APythonRepository_VerifiesGreenWhenItsTestsPass_AndRedWhenTheyFail()
@@ -88,8 +90,11 @@ public class PythonToolchainDockerTests
         // Not a hand-placed directory: the thing under test includes "does the product's own installer
         // put a working toolchain on disk", and a test that staged the files itself would answer a
         // different question.
+        // No payload source override: this leg deliberately uses the SHIPPED HttpsToolchainPayloadSource,
+        // so the ~106 MiB pinned interpreter is really fetched over HTTPS, really hashed against the
+        // manifest pin, and really transferred through base64 — the exact sequence a user's install runs.
         var channel = new ToolchainChannel(
-            new LocalCommandHost(), log: _out.WriteLine, vmRoot: toolchainRoot);
+            new LocalCommandHost(Path.Combine(root, "stage")), log: _out.WriteLine, vmRoot: toolchainRoot);
 
         var installStopwatch = Stopwatch.StartNew();
         var installed = await channel.InstallAsync(
@@ -288,6 +293,10 @@ public class PythonToolchainDockerTests
     /// </summary>
     private sealed class LocalCommandHost : IAdapterInstallHost
     {
+        private readonly string _stageDir;
+
+        public LocalCommandHost(string stageDir) => _stageDir = stageDir;
+
         public async Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
         {
             var psi = new ProcessStartInfo(command[0])
@@ -331,9 +340,33 @@ public class PythonToolchainDockerTests
             await File.WriteAllTextAsync(path, content, ct);
         }
 
-        public Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct) =>
-            throw new InvalidOperationException(
-                "The toolchain channel fetches and verifies in the VM; it must never stream a payload here.");
+        /// <summary>
+        /// Materialises the hash-verified payload, mirroring <c>WslAdapterInstallHost</c>: base64 over a
+        /// pipe into <c>tee</c>, decoded by the environment's own <c>base64 -d</c>.
+        ///
+        /// <para>This used to throw, on the theory that the channel "fetches and verifies in the VM".
+        /// It did — with <c>curl</c>, which MainguardEnv does not have, so that path never once ran
+        /// against a real environment; the throw was an instrument enforcing a design that could not
+        /// work. Doing the real transfer here is what makes this test cover the shipped install.</para>
+        /// </summary>
+        public async Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+        {
+            var safeName = string.Concat(fileName.Select(c =>
+                char.IsLetterOrDigit(c) || c is '.' or '-' or '_' ? c : '-'));
+            var b64Path = Path.Combine(_stageDir, safeName + ".b64");
+            var finalPath = Path.Combine(_stageDir, safeName);
+
+            Directory.CreateDirectory(_stageDir);
+            await File.WriteAllTextAsync(b64Path, Convert.ToBase64String(content), ct);
+
+            var decode = await RunAsync(
+                new[] { "bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" }, ct);
+            if (!decode.Succeeded)
+                throw new InvalidOperationException(
+                    $"Decoding the staged payload failed (exit {decode.ExitCode}): {decode.Stderr}");
+
+            return finalPath;
+        }
     }
 
     private static string E2ERoot()
