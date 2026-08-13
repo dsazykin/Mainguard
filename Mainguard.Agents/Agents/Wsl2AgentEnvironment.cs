@@ -118,6 +118,11 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // The user-managed toolchain channel installs INTO the VM over the same hardened WSL runner the
         // agent-CLI channel uses — one way to run a command in MainguardEnv, not two. Constructing it
         // needs no live VM (the runner shells out lazily), so this is safe in construction and tests.
+        //
+        // No payload source is passed, and that IS the production wiring: the channel defaults to
+        // HttpsToolchainPayloadSource, so the payload is fetched here on the host rather than by a
+        // `curl` inside a VM that has none. Omitting the argument yields the strong path — it is not a
+        // control that can be silently dropped at a composition root (see the ctor's own note).
         Toolchains = new Toolchains.ToolchainChannel(
             new WslAdapterInstallHost(new Bootstrap.WslRunner()));
     }

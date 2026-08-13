@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,10 +16,15 @@ public enum ToolchainChannelError
 {
     /// <summary>The manifest curates no toolchain with that id.</summary>
     UnknownToolchain,
-    /// <summary>The payload could not be fetched into the VM.</summary>
+    /// <summary>The payload could not be fetched.</summary>
     DownloadFailed,
-    /// <summary>The fetched payload's SHA-256 did not match the manifest pin — install refused.</summary>
+    /// <summary>The fetched payload's SHA-256 did not match the manifest pin — install refused before
+    /// anything was transferred into the VM.</summary>
     HashMismatch,
+    /// <summary>The verified payload could not be transferred into the VM. Distinct from
+    /// <see cref="DownloadFailed"/> because the remedy is different: the bytes arrived and matched the
+    /// pin, so the network is fine and the environment is not.</summary>
+    StageFailed,
     /// <summary>The payload could not be unpacked.</summary>
     ExtractFailed,
     /// <summary>The toolchain landed but does not run.</summary>
@@ -74,12 +80,28 @@ public sealed record ToolchainStatus(
 /// <see cref="IAdapterInstallHost"/> seam so there is one way to run a command in the VM rather than
 /// two.</para>
 ///
-/// <para><b>The pin is verified where the bytes land.</b> The payload is fetched by the VM and hashed by
-/// the VM, and the hex is compared here against the manifest. It is deliberately NOT streamed through
-/// the host the way an adapter payload is: an adapter tarball is tens of megabytes and a toolchain is
-/// ~350 MB, which base64 over a WSL stdin pipe is not a reasonable way to move. Nothing is weakened by
-/// that — the checksum still gates extraction, and it is the same fetch-then-verify-then-execute
-/// discipline <c>images/mainguard-agent-base/Dockerfile</c> holds itself to.</para>
+/// <para><b>The payload is fetched by the HOST and verified before the VM ever sees it.</b> This is the
+/// mechanism <see cref="Adapters.AdapterChannel"/> already proves, and it is here because the previous
+/// design did not work at all. The install used to shell <c>curl</c> into the VM — and the VM has no
+/// <c>curl</c>: <c>build/mainguardos/packages.pinned.txt</c> pins neither <c>curl</c> nor <c>wget</c>,
+/// so every install a user ever attempted died with <c>curl: command not found</c> at exit 127. Nothing
+/// caught it because every test substituted a scripted <see cref="IAdapterInstallHost"/> that answered
+/// <c>curl</c> with exit 0; the thing under test sat one layer away from the thing that mattered. Adding
+/// <c>curl</c> to the image would have changed the MainguardOS payload hash and required a rebuild, and
+/// would still not have helped anyone whose VM is already imported.</para>
+///
+/// <para>So the bytes are fetched over HTTPS by an <see cref="IToolchainPayloadSource"/>, hashed in .NET
+/// while they are still only in this process's memory, and only then handed to
+/// <see cref="IAdapterInstallHost.StagePayloadAsync"/> — which base64s them over the WSL stdin pipe to
+/// <c>tee</c> and decodes them in-VM with <c>base64 -d</c>, both of which the VM really has. That
+/// ordering is <b>stronger</b> than the in-VM <c>sha256sum</c> it replaces: a payload that fails the pin
+/// was never written anywhere the VM can see, so there is no discard step to get wrong. The cost is the
+/// pipe — the pinned interpreter is ~106 MiB, so ~142 MiB of base64 crosses stdin — which is real and is
+/// the price of an install path that runs.</para>
+///
+/// <para>The only in-VM programs an install now needs are <c>mkdir</c>, <c>rm</c>, <c>mv</c> (coreutils),
+/// <c>tar</c>, and <c>base64</c> — every one of them in the pinned package set, and every one of them
+/// verified present on a live MainguardEnv.</para>
 ///
 /// <para><b>An install is only an install once it RUNS.</b> The marker is written last, after a probe
 /// that executes the toolchain and matches the pinned version in its output, and
@@ -91,6 +113,7 @@ public sealed class ToolchainChannel
 {
     private readonly ToolchainManifest _manifest;
     private readonly IAdapterInstallHost _host;
+    private readonly IToolchainPayloadSource _payloads;
     private readonly Action<string>? _log;
     private readonly string _root;
 
@@ -100,14 +123,26 @@ public sealed class ToolchainChannel
     /// <param name="vmRoot">Where toolchains install. Defaults to <see cref="ToolchainPaths.VmRoot"/>;
     /// overridden ONLY by tests, which need a throwaway root they can populate and delete rather than
     /// the one real directory every jail mounts.</param>
+    /// <param name="payloads">
+    /// Where payload bytes come from. <b>Optional on purpose, and deliberately not the #64 defect
+    /// class.</b> That class is an optional argument carrying a CONTROL — a journal, an audit sink, a
+    /// restriction — whose <c>null</c> default is a weaker posture than production wants, so a
+    /// composition root that forgets to pass it silently loses the control and every test stays green.
+    /// This argument is the inverse: its default is <see cref="HttpsToolchainPayloadSource"/>, the real
+    /// production fetch, so <b>omitting it yields the strong behaviour</b> and passing something is
+    /// always a deliberate weakening a test asks for. There is no wiring for a composition root to drop,
+    /// and no posture that can silently differ between the daemon, the Pro settings page and CI.
+    /// Making it required would only force two call sites to name the default.
+    /// </param>
     public ToolchainChannel(
         IAdapterInstallHost host, ToolchainManifest? manifest = null, Action<string>? log = null,
-        string? vmRoot = null)
+        string? vmRoot = null, IToolchainPayloadSource? payloads = null)
     {
         _host = host ?? throw new ArgumentNullException(nameof(host));
         _manifest = manifest ?? ToolchainManifest.Shipped;
         _log = log;
         _root = string.IsNullOrWhiteSpace(vmRoot) ? ToolchainPaths.VmRoot : vmRoot.TrimEnd('/');
+        _payloads = payloads ?? new HttpsToolchainPayloadSource();
     }
 
     /// <summary>Where this channel installs toolchains.</summary>
@@ -188,41 +223,67 @@ public sealed class ToolchainChannel
 
         var installDir = ToolchainPaths.VmInstallDir(entry.Id, _root);
         var incoming = ToolchainPaths.VmStagingInstallDir(entry.Id, _root);
-        var stagedPayload = $"{ToolchainPaths.StageDir(_root)}/{entry.Id}-{entry.Version}.tar.gz";
 
         // Any residue from an interrupted previous attempt. An install that extracts over a half-tree
         // is how a toolchain comes to probe green while being subtly wrong.
         await RunAsync(new[] { "rm", "-rf", incoming }, ct).ConfigureAwait(false);
         await RunAsync(
-            new[] { "mkdir", "-p", ToolchainPaths.StageDir(_root), incoming, ToolchainPaths.RegistryDir(_root) },
+            new[] { "mkdir", "-p", incoming, ToolchainPaths.RegistryDir(_root) },
             ct).ConfigureAwait(false);
 
+        // ---- Fetch, on the HOST -------------------------------------------------------------------
+        // Never `curl` in the VM: MainguardEnv has neither curl nor wget, so that path never once
+        // succeeded against a real environment. See the type doc.
         progress?.Report($"Downloading {entry.DisplayName} {entry.Version}…");
-        var download = await RunAsync(
-            new[]
-            {
-                "curl", "--proto", "=https", "--tlsv1.2", "-fsSL", "--retry", "3", "--retry-delay", "2",
-                "-o", stagedPayload, entry.PayloadUrl,
-            }, ct).ConfigureAwait(false);
-        if (!download.Succeeded)
+        byte[] payload;
+        try
         {
-            await CleanupAsync(incoming, stagedPayload, ct).ConfigureAwait(false);
+            payload = await _payloads.FetchAsync(new Uri(entry.PayloadUrl), ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
             throw new ToolchainChannelException(ToolchainChannelError.DownloadFailed,
-                $"{entry.DisplayName} could not be downloaded (curl exit {download.ExitCode}): "
-                + AdapterChannel.Detail(download));
+                $"{entry.DisplayName} could not be downloaded from {entry.PayloadUrl} — {ex.Message}");
         }
 
+        // ---- Verify the pin, before the VM has seen a single byte ----------------------------------
         progress?.Report("Verifying the checksum…");
-        // sha256sum prints "<hex>  <path>"; the comparison happens HERE rather than through
-        // `sha256sum -c` so no shell pipeline is constructed and the failure is ours to describe.
-        var sum = await RunAsync(new[] { "sha256sum", stagedPayload }, ct).ConfigureAwait(false);
-        var actual = sum.Stdout.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()?.Trim().ToLowerInvariant();
-        if (!sum.Succeeded || actual is null || !string.Equals(actual, entry.Sha256, StringComparison.Ordinal))
+        var actual = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
+        if (!string.Equals(actual, entry.Sha256, StringComparison.Ordinal))
         {
-            await CleanupAsync(incoming, stagedPayload, ct).ConfigureAwait(false);
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
             throw new ToolchainChannelException(ToolchainChannelError.HashMismatch,
-                $"{entry.DisplayName}'s download did not match the pinned checksum, so it was discarded and "
-                + $"nothing was unpacked. Expected sha256 {entry.Sha256}, got {actual ?? "no checksum at all"}.");
+                $"{entry.DisplayName}'s download did not match the pinned checksum, so nothing was "
+                + $"transferred into this Mainguard environment and nothing was unpacked. Expected sha256 "
+                + $"{entry.Sha256}, got {actual} ({payload.Length} bytes).");
+        }
+
+        // ---- Only now does anything enter the VM ---------------------------------------------------
+        progress?.Report("Transferring into the Mainguard environment…");
+        string stagedPayload;
+        try
+        {
+            stagedPayload = await _host
+                .StagePayloadAsync($"{entry.Id}-{entry.Version}.tar.gz", payload, ct)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
+            throw new ToolchainChannelException(ToolchainChannelError.StageFailed,
+                $"{entry.DisplayName} downloaded and matched its pinned checksum, but could not be "
+                + $"transferred into this Mainguard environment — {ex.Message}");
         }
 
         progress?.Report("Unpacking…");
@@ -352,12 +413,22 @@ public sealed class ToolchainChannel
     private Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct) =>
         _host.RunAsync(command, ct);
 
-    private async Task CleanupAsync(string incoming, string stagedPayload, CancellationToken ct)
+    /// <summary>
+    /// Removes an interrupted install's residue. <paramref name="stagedPayload"/> is the path
+    /// <see cref="IAdapterInstallHost.StagePayloadAsync"/> actually returned, and is null on every path
+    /// that failed BEFORE staging — which is the majority of them now that the fetch and the checksum
+    /// both happen on the host. A hand-built guess at the staged path would delete nothing (the host
+    /// chooses where it stages) while reading like it had.
+    /// </summary>
+    private async Task CleanupAsync(string incoming, string? stagedPayload, CancellationToken ct)
     {
         try
         {
             await RunAsync(new[] { "rm", "-rf", incoming }, ct).ConfigureAwait(false);
-            await RunAsync(new[] { "rm", "-f", stagedPayload }, ct).ConfigureAwait(false);
+            if (stagedPayload is { Length: > 0 })
+            {
+                await RunAsync(new[] { "rm", "-f", stagedPayload }, ct).ConfigureAwait(false);
+            }
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

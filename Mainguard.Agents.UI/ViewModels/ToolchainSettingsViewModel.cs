@@ -45,15 +45,19 @@ public partial class ToolchainSettingsViewModel : ViewModelBase, ISettingsPage
         Declaration = declaration;
     }
 
-    /// <summary>Design/render constructor: fixed representative rows, no service behind them.</summary>
+    /// <summary>Design/render constructor: fixed representative rows, no service behind them. Takes the
+    /// declaration section too, so a rendered/measured page can be the WHOLE shipped page rather than its
+    /// top half — the half that was missing is the one the owner's clipping screenshot was of.</summary>
     public ToolchainSettingsViewModel(
-        IEnumerable<ToolchainRowViewModel> rows, bool isLoading = false, string? loadError = null)
+        IEnumerable<ToolchainRowViewModel> rows, bool isLoading = false, string? loadError = null,
+        ToolchainDeclarationViewModel? declaration = null)
     {
         WatchRows();
         foreach (var row in rows)
             Toolchains.Add(row);
         _isLoading = isLoading;
         _loadError = loadError;
+        Declaration = declaration;
     }
 
     public ObservableCollection<ToolchainRowViewModel> Toolchains { get; } = new();

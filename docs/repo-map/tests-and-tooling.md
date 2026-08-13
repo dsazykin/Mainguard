@@ -26,11 +26,19 @@
     that path and does NOT push; a dirty tree and a non-default branch are REFUSED with a reason and
     **nothing is stashed and nothing is checked out**; every disabled button exposes a non-empty reason;
     and `Refresh` RE-MEASURES, so a file deleted behind the app's back is seen. The last two caught the
-    first implementation staging inside step 1 — one violation, two red tests.
+    first implementation staging inside step 1 — one violation, two red tests. Also the two sides of the
+    commit step's "nothing to commit": with the declaration absent on BOTH sides the reason says it does
+    not exist and points at step 1, and it must NOT claim a match (the shipped string said
+    "already matches the last commit", contradicting the page's own two "No .mainguard/toolchain…" lines,
+    because the flag behind it came from a git-status entry a nonexistent file never produces); with the
+    file committed and identical on disk the honest "already matches" wording is still asserted.
   - **`Mainguard.Tests/ToolchainSettingsUiTests.cs`** — the Settings **Toolchains** page (the human
     half of the user-managed toolchain channel) driven over a fake `IAdapterInstallHost` with the REAL
-    `ToolchainChannel`, so the shipped fetch → sha256-verify → unpack → run-it policy executes minus
-    the VM: the list's installed state comes from the PROBE, a toolchain that runs at the WRONG version
+    `ToolchainChannel` and a `FakeToolchainPayloadSource`, so the shipped fetch → sha256-verify →
+    stage → unpack → run-it policy executes minus the VM (the fixture's pinned sha is now the REAL
+    hash of the bytes the fake source serves — the channel hashes what it holds, so a fixture can no
+    longer declare an arbitrary hex and have a fake VM agree with it): the list's installed state
+    comes from the PROBE, a toolchain that runs at the WRONG version
     is reported as NOT installed (with both versions named), install flips the row and writes the
     registry marker LAST, an install refusal names its cause ("checksum") and leaves the row
     retryable + the command enabled, Remove flips the row back and RE-PROBES (a failed remove
@@ -39,10 +47,40 @@
     `AgentCliUiTests.Settings_Row*`: Install/Remove live on the parent but read ROW state, so the
     parent must bridge row `PropertyChanged` → `NotifyCanExecuteChanged()` or the buttons render
     visible and permanently dead.
+  - **`Mainguard.Tests/ToolchainInstallRealToolsTests.cs`** — the toolchain install against **real
+    programs on a real filesystem**, not a scripted host: real `mkdir`/`rm`/`mv`, real `tar` unpacking
+    a real gzipped tarball (with a leading directory, so `stripComponents` is exercised), real `tee` +
+    `base64 -d` doing the staging transfer exactly the way `WslAdapterInstallHost` does, and a real
+    executable answering the probe — the only substitution left is the network. **This is the file that
+    would have caught the `curl` bug:** the shipped install shelled `curl` into a VM that has no `curl`
+    and no `wget`, so every user install died at exit 127 while the suite stayed green, because each
+    fake host answered `curl` with exit 0. Also pins the premise (`packages.pinned.txt` really pins no
+    downloader — if that changes it is a decision to re-take, not a fact to discover from a failed
+    install) and that a payload failing the pin leaves an empty staging directory. `[LinuxOnlyFact]`:
+    the argv is POSIX, as it is inside the VM.
+  - **`Mainguard.Tests/TestTools/ToolchainPayloadFakes.cs`** — `MainguardEnvFacts` (the binaries a live
+    MainguardEnv does **not** have; every fake `IAdapterInstallHost` in the suite now answers them 127
+    the way the real VM does, so an install that shells out to something the environment lacks is a red
+    test rather than a user's exit code) + `FakeToolchainPayloadSource` (URL-derived bytes and the real
+    SHA-256 a manifest fixture must pin, plus `Corrupt`/`Throw` for the refusal paths).
   - **`Mainguard.Tests/Headless/ToolchainSettingsRenderHarness.cs`** — the Toolchains page in all five
-    themes × list/installing/failure/loading/load-error →
+    themes × list/declaration/declaration_min/installing/failure/loading/load-error →
     `artifacts_headless/toolchain_settings_<Theme>_<state>.png` (the `list` state deliberately includes
-    the "a different version is present" row and a long-name truncation row).
+    the "a different version is present" row and a long-name truncation row; the two `declaration`
+    states render the page WITH its four-step declaration section, at the page widths a Settings window
+    gives at its default and at its MinWidth, so "the buttons are not cut off" is reviewable as a
+    picture as well as as an assertion).
+  - **`Mainguard.Tests/SettingsWindowLayoutTests.cs`** — every File → Settings page (General, Keyboard
+    Shortcuts, Accounts, SSH Keys, AI Providers via the harness ctors, Agent CLIs, Toolchains + its
+    declaration flow, PR Intake, Mainguard OS, Daemon Logs, About) hosted in the REAL `SettingsWindow`
+    sized to the window's own declared `MinWidth`/`MinHeight`, then walked: nothing may be arranged past
+    the page's right edge and no page may want more width than it is given. It measures clipping the way
+    the eye does rather than a proxy for it, and it reads the minimum FROM the window, so shrinking the
+    window below what the pages survive fails here instead of in a screenshot. A ScrollViewer that
+    scrolls sideways is a sanctioned overflow boundary (a log, a long path) and is not descended into.
+    This is what caught the actual cause of the owner's clipped Toolchains page: `ScrollViewer.Padding`
+    is subtracted on arrange but not on measure, so every settings page was measured 56px wider than the
+    room it got — fixed by moving the gutter to a `Margin` on the content.
   - **`Mainguard.Tests/AddReposToOsViewModelTests.cs`** — the post-setup Add-Repos-to-Mainguard-OS
     window over the same fake seams as `OobeRepoOnboardingTests`: honest empty scan, per-row failure
     isolation with a live retry, the named daemon-unreachable cause (never a crash), quiet idempotent
@@ -1921,7 +1959,10 @@
   toolchain end to end: the premise measured rather than assumed — the base image's own `python3` runs
   but CANNOT `import pip`, which is why a bare version probe would report a broken environment as
   healthy — then, gated behind `MAINGUARD_VERIFY_E2E=1`, a full install through the SHIPPED
-  `ToolchainChannel`, the in-jail probe answering at the pinned version, `command -v python3` proving the
+  `ToolchainChannel` **and the shipped `HttpsToolchainPayloadSource`** (its `LocalCommandHost` now
+  really stages the verified bytes through `base64 -d`; the throwing `StagePayloadAsync` it used to
+  carry was an instrument enforcing the in-VM-`curl` design that could not work), the in-jail probe
+  answering at the pinned version, `command -v python3` proving the
   declared toolchain WINS the PATH race against the base image's, and the repo's own
   `.mainguard/verify` running **GREEN when its pytest test passes and RED when it fails** — same jail,
   same toolchain, same command, only the test changed, because a verifier that cannot go red is not a

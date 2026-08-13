@@ -3,16 +3,16 @@
         xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
         x:Class="Mainguard.Agents.UI.Views.AgentCliSettingsView"
         x:DataType="vm:AgentCliSettingsViewModel">
-    <Border Padding="0" MaxWidth="620">
+    <Border Padding="0" MaxWidth="760">
         <Grid RowDefinitions="Auto,Auto,Auto,*,Auto">
 
             <!-- Header -->
-            <StackPanel Grid.Row="0" Orientation="Horizontal" Spacing="10" Margin="0,0,0,6">
-                <PathIcon Data="{StaticResource TerminalIcon}" Width="18" Height="18"
-                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                <TextBlock Text="Agent command-line tools" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid Grid.Row="0" Margin="0,0,0,6" ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource TerminalIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="Agent command-line tools" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
             <TextBlock Grid.Row="1" Margin="0,0,0,12" FontSize="12" TextWrapping="Wrap"
                        Foreground="{DynamicResource TextMuted}"
                        Text="The coding agents Mainguard can run in its isolated sandbox. Each installs at a pinned, checksum-verified version inside the Mainguard environment — never on your own system — and is available to every new agent session the moment it's installed."/>
@@ -36,7 +36,7 @@
                             <StackPanel Orientation="Horizontal" Spacing="10">
                                 <PathIcon Data="{StaticResource WarningIcon}" Width="16" Height="16"
                                           Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"/>
-                                <TextBlock Text="{Binding LoadError}" FontSize="12" MaxWidth="500"
+                                <TextBlock Text="{Binding LoadError}" FontSize="12"
                                            Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
                             </StackPanel>
                             <Button Content="Try again" Classes="Primary" Padding="14,6" HorizontalAlignment="Right"
@@ -61,19 +61,20 @@
                                         </Panel>
 
                                         <StackPanel Grid.Column="1" Spacing="4" Margin="0,0,12,0">
-                                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                                <!-- MaxWidth bounds the measure so TextTrimming actually engages inside the
-                                                     horizontal StackPanel (unbounded, it would collide with the Install button). -->
-                                                <TextBlock Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
-                                                           Foreground="{DynamicResource TextPrimary}" MaxWidth="260"
+                                            <Grid ColumnDefinitions="*,Auto">
+                                                <!-- A star column, not a horizontal StackPanel: the name gets whatever is left
+                                                     after the version chip and trims there, instead of measuring unbounded and
+                                                     pushing the card past the window edge. -->
+                                                <TextBlock Grid.Column="0" Text="{Binding DisplayName}" FontWeight="SemiBold" FontSize="13"
+                                                           Foreground="{DynamicResource TextPrimary}" Margin="0,0,8,0"
                                                            TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
-                                                <Border CornerRadius="999" Background="{DynamicResource AccentSelection}"
+                                                <Border Grid.Column="1" CornerRadius="999" Background="{DynamicResource AccentSelection}"
                                                         Padding="8,1" VerticalAlignment="Center">
                                                     <TextBlock Classes="Mono" Text="{Binding VersionLabel}" FontSize="10"
                                                                Foreground="{DynamicResource AccentBrush}"/>
                                                 </Border>
-                                            </StackPanel>
-                                            <TextBlock Text="Installed — verified at the pinned version" FontSize="11"
+                                            </Grid>
+                                            <TextBlock Text="Installed — verified at the pinned version" FontSize="11" TextWrapping="Wrap"
                                                        Foreground="{DynamicResource SuccessBrush}" IsVisible="{Binding IsInstalled}"/>
                                             <TextBlock FontSize="11" Foreground="{DynamicResource AccentBrush}"
                                                        IsVisible="{Binding HasUpdate}" Text="{Binding UpdateHint}"/>
@@ -93,7 +94,7 @@
                                                 <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12"
                                                           Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"
                                                           Margin="0,2,0,0"/>
-                                                <TextBlock Text="{Binding StatusMessage}" FontSize="12" MaxWidth="420"
+                                                <TextBlock Text="{Binding StatusMessage}" FontSize="12"
                                                            Foreground="{DynamicResource DangerBrush}" TextWrapping="Wrap"/>
                                             </StackPanel>
                                         </StackPanel>

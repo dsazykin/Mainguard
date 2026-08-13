@@ -3,7 +3,7 @@
         xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
         x:Class="Mainguard.Agents.UI.Views.MainguardOsPageView"
         x:DataType="vm:MainguardOsPageViewModel">
-    <StackPanel Spacing="24" MaxWidth="640">
+    <StackPanel Spacing="24" MaxWidth="760">
 
         <!-- Rebuild sandbox images (Tools → Rebuild sandbox images…): no dialog of its own, so it
              lives here rather than getting its own sidebar row. -->
@@ -21,12 +21,12 @@
 
         <!-- Add Repos to Mainguard OS: the repo-onboarding engine, DataContext rebound to AddRepos. -->
         <StackPanel Spacing="10" DataContext="{Binding AddRepos}" x:DataType="vm:AddReposToOsViewModel">
-            <StackPanel Orientation="Horizontal" Spacing="10">
-                <PathIcon Data="{StaticResource FolderIcon}" Width="18" Height="18"
-                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                <TextBlock Text="Copy repositories into Mainguard OS" FontSize="18" FontWeight="Bold"
-                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
-            </StackPanel>
+            <Grid ColumnDefinitions="Auto,*">
+                <PathIcon Grid.Column="0" Data="{StaticResource FolderIcon}" Width="18" Height="18"
+                          Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                <TextBlock Grid.Column="1" Text="Copy repositories into Mainguard OS" FontSize="18" FontWeight="Bold"
+                           Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center" TextWrapping="Wrap"/>
+            </Grid>
             <TextBlock FontSize="12" TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"
                        Text="Mainguard agents work on copies of your repositories inside the isolated Mainguard OS — your own working folders are never touched. Point Mainguard at your repos and choose which to copy. A repository that is already in Mainguard OS just succeeds again (nothing is duplicated), and any repository is also copied automatically the first time you open it."/>
 
@@ -35,7 +35,7 @@
                 <StackPanel Orientation="Horizontal" Spacing="10">
                     <PathIcon Data="{StaticResource WarningIcon}" Width="16" Height="16"
                               Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"/>
-                    <TextBlock Text="{Binding RepoNotice}" FontSize="12" MaxWidth="520"
+                    <TextBlock Text="{Binding RepoNotice}" FontSize="12"
                                Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
                 </StackPanel>
             </Border>
@@ -51,30 +51,30 @@
                 <Button Classes="Primary" Padding="14,12" HorizontalAlignment="Stretch"
                         HorizontalContentAlignment="Left"
                         Command="{Binding PickRepoFolderCommand}">
-                    <StackPanel Orientation="Horizontal" Spacing="12">
-                        <PathIcon Data="{StaticResource FolderIcon}" Width="18" Height="18"
+                    <Grid ColumnDefinitions="Auto,*">
+                        <PathIcon Grid.Column="0" Data="{StaticResource FolderIcon}" Width="18" Height="18" Margin="0,0,12,0"
                                   Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                        <StackPanel Spacing="2">
+                        <StackPanel Grid.Column="1" Spacing="2">
                             <TextBlock Text="I keep my repos in one folder" FontWeight="SemiBold" FontSize="13"
                                        Foreground="{DynamicResource TextPrimary}"/>
                             <TextBlock Text="Pick that folder and Mainguard finds every git repository inside it."
                                        FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                         </StackPanel>
-                    </StackPanel>
+                    </Grid>
                 </Button>
                 <Button Classes="Primary" Padding="14,12" HorizontalAlignment="Stretch"
                         HorizontalContentAlignment="Left"
                         Command="{Binding PickIndividualReposCommand}">
-                    <StackPanel Orientation="Horizontal" Spacing="12">
-                        <PathIcon Data="{StaticResource DocumentAddIcon}" Width="18" Height="18"
+                    <Grid ColumnDefinitions="Auto,*">
+                        <PathIcon Grid.Column="0" Data="{StaticResource DocumentAddIcon}" Width="18" Height="18" Margin="0,0,12,0"
                                   Foreground="{DynamicResource AccentBrush}" VerticalAlignment="Center"/>
-                        <StackPanel Spacing="2">
+                        <StackPanel Grid.Column="1" Spacing="2">
                             <TextBlock Text="Pick individual repositories" FontWeight="SemiBold" FontSize="13"
                                        Foreground="{DynamicResource TextPrimary}"/>
                             <TextBlock Text="Select one or more repository folders yourself."
                                        FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                         </StackPanel>
-                    </StackPanel>
+                    </Grid>
                 </Button>
             </StackPanel>
 
@@ -95,13 +95,13 @@
                                 <StackPanel Grid.Column="1" Spacing="4">
                                     <StackPanel Orientation="Horizontal" Spacing="8">
                                         <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="14"
-                                                   Foreground="{DynamicResource TextPrimary}" MaxWidth="320"
+                                                   Foreground="{DynamicResource TextPrimary}"
                                                    TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                                         <TextBlock Text="In Mainguard OS" FontSize="11" FontWeight="SemiBold"
                                                    Foreground="{DynamicResource SuccessBrush}" VerticalAlignment="Center"
                                                    IsVisible="{Binding IsOnboarded}"/>
                                     </StackPanel>
-                                    <TextBlock Classes="Mono" Text="{Binding Path}" FontSize="11" MaxWidth="500"
+                                    <TextBlock Classes="Mono" Text="{Binding Path}" FontSize="11"
                                                Foreground="{DynamicResource TextMuted}" TextTrimming="CharacterEllipsis"
                                                HorizontalAlignment="Left"/>
                                     <TextBlock Text="{Binding StatusMessage}" FontSize="12"
@@ -117,7 +117,7 @@
                                         <PathIcon Data="{StaticResource WarningIcon}" Width="12" Height="12"
                                                   Foreground="{DynamicResource DangerBrush}" VerticalAlignment="Top"
                                                   Margin="0,2,0,0"/>
-                                        <TextBlock Text="{Binding StatusMessage}" FontSize="12" MaxWidth="460"
+                                        <TextBlock Text="{Binding StatusMessage}" FontSize="12"
                                                    Foreground="{DynamicResource DangerBrush}" TextWrapping="Wrap"/>
                                     </StackPanel>
                                 </StackPanel>

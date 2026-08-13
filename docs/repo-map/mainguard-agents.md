@@ -765,10 +765,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
         rather than a user's install. `{toolchain}`/`{cache}` tokens expand against the VM path when an
         install is probed and the in-jail mount path when a container is built).
       - `ToolchainChannel.cs` (install/remove/list into the VM over the SAME `IAdapterInstallHost` seam
-        the agent-CLI channel uses. Fetches and checksums **in the VM** — a ~350 MB payload is not
-        base64-over-stdin — refuses to unpack on a mismatch, and writes the install marker LAST, only
-        after a probe that RUNS the toolchain at the pinned version. `ListAsync` re-probes rather than
-        reading markers: PR #305's marker reported healthy for eleven days).
+        the agent-CLI channel uses. Fetches the payload **host-side over HTTPS** and SHA-256s it in .NET
+        *before* anything crosses into the VM, then transfers the verified bytes through
+        `IAdapterInstallHost.StagePayloadAsync` (base64 → `tee` → `base64 -d`, the adapter path's proven
+        mechanism). **It used to `curl` inside the VM, and the VM has no `curl` and no `wget`** — see
+        `packages.pinned.txt` — so that path never once worked against a real MainguardEnv and every
+        install died at exit 127; it passed CI because every fake host answered `curl` with exit 0. The
+        only in-VM programs an install now needs are `mkdir`/`rm`/`mv`, `tar` and `base64`. Refuses to
+        unpack on a hash mismatch (nothing was transferred, so there is nothing to discard), and writes
+        the install marker LAST, only after a probe that RUNS the toolchain at the pinned version.
+        `ListAsync` re-probes rather than reading markers: PR #305's marker reported healthy for eleven
+        days).
+      - `ToolchainPayloadSource.cs` (`IToolchainPayloadSource` + the production `HttpsToolchainPayloadSource`
+        — where payload bytes come from, behind a seam so a test can drive the whole install policy
+        without a network. **Optional constructor arg on purpose and deliberately NOT the #64
+        optional-control class:** its default IS the production fetch, so omitting it yields the strong
+        behaviour and passing one is always a test asking to weaken. HTTPS is enforced through
+        `Adapters.PinnedPayloadTransport.RequireHttps`, the one rule all three pinned-payload fetchers
+        now share).
       - `ToolchainPaths.cs` (`/home/mainguard/mainguard/toolchains` → `/opt/mainguard/toolchains`,
         bind-mounted **read-only** so one shared tree cannot be rewritten by a jail to change what
         another agent's verification runs).
