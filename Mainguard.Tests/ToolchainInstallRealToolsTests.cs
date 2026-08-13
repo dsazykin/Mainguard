@@ -275,8 +275,12 @@ public class ToolchainInstallRealToolsTests
             Directory.CreateDirectory(_stageDir);
 
             var upload = await ExecAsync(
-                new[] { "tee", b64Path }, Convert.ToBase64String(content), ct);
+                new[] { "bash", "-c", $"tee '{b64Path}' > /dev/null" }, Convert.ToBase64String(content), ct);
             Assert.True(upload.Succeeded, $"tee exited {upload.ExitCode}: {upload.Stderr}");
+
+            // The redirect is the point: `tee` echoes its stdin, and a ~142 MiB echo read back into a
+            // string is ~284 MiB of UTF-16 for nothing. Nothing may come back on stdout.
+            Assert.Equal(string.Empty, upload.Stdout);
 
             var decode = await ExecAsync(
                 new[] { "bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" },

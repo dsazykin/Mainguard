@@ -653,8 +653,15 @@ public sealed class WslAdapterInstallHost : IAdapterInstallHost
 
         await _wsl.RunAsync(WslCommands.InDistro("mkdir", "-p", AdapterPaths.VmStageDir), stdin: null, ct).ConfigureAwait(false);
 
+        // `tee path` ECHOES its stdin to stdout, and WslRunner reads that echo to completion into a
+        // string. For an adapter's tens of megabytes that is merely wasteful; the toolchain channel now
+        // stages a ~106 MiB payload through here, whose base64 is ~142 MiB — so the echo alone would be
+        // ~284 MiB of UTF-16 held for no reason, on top of the bytes and the base64 already in hand.
+        // Discarding it costs one redirect. (The concurrent drain in WslRunner is still load-bearing and
+        // stays: WriteFileAsync's config shims go through a bare `tee`.)
         var upload = await _wsl.RunAsync(
-            WslCommands.InDistro("tee", b64Path), stdin: Convert.ToBase64String(content), ct).ConfigureAwait(false);
+            WslCommands.InDistro("bash", "-c", $"tee '{b64Path}' > /dev/null"),
+            stdin: Convert.ToBase64String(content), ct).ConfigureAwait(false);
         if (!upload.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.InstallFailed,
                 $"Staging the verified payload into the VM failed (tee exit {upload.ExitCode}): {upload.StdErr}".Trim());
