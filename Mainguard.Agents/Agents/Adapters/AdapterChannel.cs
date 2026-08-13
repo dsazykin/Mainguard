@@ -518,6 +518,29 @@ public sealed class AdapterChannel
     }
 }
 
+/// <summary>
+/// The one transport rule every hash-pinned payload obeys, in one place because it is now applied from
+/// three (the hosted adapter channel, the bundled adapter channel, and the toolchain channel).
+///
+/// <para>The pin and the transport protect against different things and neither substitutes for the
+/// other: a sha256 catches a payload that CHANGED after someone wrote the hash down, and does nothing at
+/// all about a plaintext fetch, because a MITM who can rewrite the bytes on the wire is in a position to
+/// have been the source those bytes were hashed from. Stating it once means a fourth caller cannot ship
+/// with a subtly different version of the rule — or with none.</para>
+/// </summary>
+public static class PinnedPayloadTransport
+{
+    /// <summary>Returns <paramref name="url"/> when it is HTTPS, and throws otherwise.</summary>
+    public static Uri RequireHttps(Uri url)
+    {
+        ArgumentNullException.ThrowIfNull(url);
+        return url.Scheme == Uri.UriSchemeHttps
+            ? url
+            : throw new ArgumentException(
+                $"A hash-pinned payload must be fetched over HTTPS; '{url.Scheme}' is not.", nameof(url));
+    }
+}
+
 /// <summary>The real HTTPS channel source. Refuses a non-HTTPS channel URL (a plaintext channel would
 /// let a MITM swap the manifest before the hash pin can protect the payloads).</summary>
 public sealed class HttpsAdapterChannelSource : IAdapterChannelSource
@@ -547,9 +570,7 @@ public sealed class HttpsAdapterChannelSource : IAdapterChannelSource
 
     public async Task<byte[]> FetchPayloadAsync(AdapterSpec spec, CancellationToken ct)
     {
-        var url = _payloadUrl(spec);
-        if (url.Scheme != Uri.UriSchemeHttps)
-            throw new ArgumentException("Adapter payloads must be fetched over HTTPS.");
+        var url = PinnedPayloadTransport.RequireHttps(_payloadUrl(spec));
         return await _http.GetByteArrayAsync(url, ct).ConfigureAwait(false);
     }
 }
@@ -588,9 +609,8 @@ public sealed class BundledAdapterChannelSource : IAdapterChannelSource
 
     public async Task<byte[]> FetchPayloadAsync(AdapterSpec spec, CancellationToken ct)
     {
-        var url = HttpsAdapterChannelSource.SpecDeclaredPayloadUrl(spec);
-        if (url.Scheme != Uri.UriSchemeHttps)
-            throw new ArgumentException("Adapter payloads must be fetched over HTTPS.");
+        var url = PinnedPayloadTransport.RequireHttps(
+            HttpsAdapterChannelSource.SpecDeclaredPayloadUrl(spec));
         return await _http.GetByteArrayAsync(url, ct).ConfigureAwait(false);
     }
 }
