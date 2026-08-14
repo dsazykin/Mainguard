@@ -148,6 +148,32 @@ public sealed record AdapterSpec(
     /// enforced fail-closed by <see cref="NpmProvenancePolicy"/>; the string is the wire form of
     /// <see cref="AdapterProvenanceLevel"/>.</summary>
     [property: JsonPropertyName("provenance")] string? Provenance = null,
+    /// <summary>The <c>$HOME</c>-relative paths where THIS CLI keeps its CONVERSATION state — the
+    /// transcripts of what the operator and the agent actually said (for claude-code,
+    /// <c>.claude/projects</c>). Directories, not files: a CLI writes one transcript per session and
+    /// names them itself, so there is no fixed file to declare.
+    /// <para>Each declared path is bind-mounted into the jail from daemon-owned ext4, so the CLI writes
+    /// its history straight onto disk that OUTLIVES the container. That is the whole design and it is
+    /// not the same as <see cref="CredentialPaths"/>' harvest-on-stop round trip: the event that makes
+    /// you need the conversation back is the jail dying WITHOUT a clean stop, and a harvest never runs
+    /// then. See <see cref="Sandbox.ConversationStorePolicy"/>.</para>
+    /// <para>Must not overlap <see cref="CredentialPaths"/> in either direction —
+    /// <see cref="AdapterManifest.Parse"/> refuses the manifest and the spawn path refuses the marker.
+    /// The store is daemon-owned disk that survives teardown; a credential may only ever live in the
+    /// host OS keychain. Null/empty = this CLI gets no conversation persistence yet, which is an honest
+    /// statement; a WRONG path would silently persist nothing.</para></summary>
+    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null,
+    /// <summary>The extra argv THIS CLI needs to resume its previous conversation, appended to
+    /// <see cref="Launch"/> (for claude-code, <c>--continue</c>).
+    /// <para>Used on the ADOPT path only (a resumed stranded queue entry) and only when the agent's
+    /// conversation store actually holds a transcript. Both conditions matter: an ordinary spawn is a
+    /// new piece of work and must start clean, and a resume flag handed to a CLI with no prior session
+    /// is a worse failure than no flag at all — a dead terminal at spawn, with nothing saying why.</para>
+    /// <para>Null = this CLI declares no resume verb, so a resumed jail simply starts its CLI normally
+    /// with the transcripts present. Absent is a statement, exactly as with
+    /// <see cref="BaseUrlEnvVar"/>: an invented flag would make Mainguard believe a session was resumed
+    /// while the CLI silently started fresh.</para></summary>
+    [property: JsonPropertyName("resumeArgs")] IReadOnlyList<string>? ResumeArgs = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
@@ -318,6 +344,52 @@ public sealed record AdapterManifest(
                             + "ordinary per-repo file. A path cannot be both without leaking the credential.");
                 }
             }
+
+            if (a.ConversationPaths is not null)
+            {
+                foreach (var path in a.ConversationPaths)
+                {
+                    if (!IsHomeRelativeFilePath(path))
+                        throw new AdapterManifestException(AdapterManifestError.Malformed,
+                            $"Adapter '{a.Id}' conversationPaths entry '{path}' must be a $HOME-relative path (no leading '/', '~', '..' segments, backslashes, or control characters).");
+                }
+
+                // THE INVARIANT THAT MAKES CONVERSATION PERSISTENCE SAFE TO SHIP, enforced rather than
+                // documented. A conversation store is daemon-owned ext4 that deliberately OUTLIVES the
+                // jail; a credential may only ever live in the host OS keychain (the owner's standing
+                // rule). One declared path that CONTAINS the other therefore quietly persists a token to
+                // plain disk and remounts it into every later jail for that agent id.
+                //
+                // Containment, not equality: the accident this exists to stop is a manifest that declares
+                // '.claude' — where the transcripts live, and which also contains '.claude/.credentials.json'.
+                // An equality-only check passes that case, which is the only case worth checking.
+                //
+                // Refused, not filtered: dropping the offending path and continuing would leave the
+                // feature looking configured while persisting a subset nobody chose, and would leave the
+                // wrong declaration in the manifest. Sandbox.ConversationStorePolicy owns the rule so the
+                // spawn path (which reads an install MARKER, not this file) asks the same question of the
+                // same implementation.
+                try
+                {
+                    Sandbox.ConversationStorePolicy.AssertNoCredentialOverlap(
+                        a.Id, a.ConversationPaths, a.CredentialPaths);
+                }
+                catch (Git.Exceptions.ConversationStoreOverlapException ex)
+                {
+                    throw new AdapterManifestException(AdapterManifestError.Malformed, ex.Message);
+                }
+            }
+
+            if (a.ResumeArgs is not null && (a.ResumeArgs.Count == 0 || a.ResumeArgs.Any(string.IsNullOrWhiteSpace)))
+                throw new AdapterManifestException(AdapterManifestError.MissingField,
+                    $"Adapter '{a.Id}' has an empty 'resumeArgs' entry. Omit the field entirely to say this CLI "
+                    + "declares no resume verb — absent is a statement, blank is a typo.");
+
+            if (a.ResumeArgs is { Count: > 0 } && a.ConversationPaths is not { Count: > 0 })
+                throw new AdapterManifestException(AdapterManifestError.Malformed,
+                    $"Adapter '{a.Id}' declares 'resumeArgs' but no 'conversationPaths'. There would be nothing "
+                    + "for the CLI to resume FROM — its transcripts would still die with the jail's tmpfs $HOME, "
+                    + "so the flag would resume an empty history on every spawn.");
 
             if (a.EgressHosts is not null)
             {

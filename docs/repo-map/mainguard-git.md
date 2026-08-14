@@ -421,7 +421,16 @@ The all-editions base. Git logic goes here.
   started container cannot write it, or the root is over budget with only live-jail caches left to
   evict. All three stop the spawn rather than falling through to a jail whose restore fills the 256
   MiB tmpfs `$HOME` and dies at `ENOSPC` — which the merge queue would record as an ordinary failed
-  verification). Throw these from Core; catch in ViewModels to drive dialogs.
+  verification); `ConversationStoreException` + `ConversationStoreUnavailableException` /
+  `ConversationStoreOverlapException` — the per-agent conversation store (the transcripts that must
+  outlive a jail that died without a clean stop): it could not be created, the started container cannot
+  write it, or — the overlap one, which is the invariant that makes the feature safe to ship — an adapter
+  declared a conversation path that CONTAINS or is contained by one of its own credential paths, which
+  would persist a token to daemon-owned disk that deliberately outlives the jail. All three stop the
+  spawn; the overlap one is refused rather than filtered, because a filtered path would leave the feature
+  looking configured while persisting a subset nobody chose. See
+  `docs/design/agent-conversation-persistence.md`). Throw these from Core; catch in ViewModels to drive
+  dialogs.
 - **`Migrations/`** — generated EF migrations + `AppDbContextModelSnapshot.cs`. Never hand-edit an applied one.
 - **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture). **Read the remarks on `IAuditLog.Read` before adding an `Append` call site:** there are 28 `Append` calls across 13 production files and ZERO production readers — no RPC, no ViewModel — and the shipped implementation is in-memory, so an audited event is unreachable during and after the incident it describes. P2-15 is the plan and this interface is the seam it lands behind; until then an `Append` is evidence for a later investigation and never the user-visible record of anything, so any path that destroys work pairs it with a log line, a typed refusal or a UI notice.
 - **`Services/`** — the service layer every ViewModel talks to. Interface-first:

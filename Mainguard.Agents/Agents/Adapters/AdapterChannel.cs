@@ -386,7 +386,8 @@ public sealed class AdapterChannel
                 InstalledAdapterMarker.Serialize(
                     new InstalledAdapterMarker(
                         spec.Id, spec.Version, spec.Launch, spec.ApiKeyEnvVar, spec.EgressHosts,
-                        spec.CredentialPaths, spec.BaseUrlEnvVar, spec.ModelHost, spec.SettingsPaths)),
+                        spec.CredentialPaths, spec.BaseUrlEnvVar, spec.ModelHost, spec.SettingsPaths,
+                        spec.ConversationPaths, spec.ResumeArgs)),
                 ct).ConfigureAwait(false);
         }
 

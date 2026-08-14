@@ -542,7 +542,7 @@ public sealed class PackageCacheManager
 
     private PackageCacheGrant ResolveGrant()
     {
-        var gid = ReadGroupId(CacheRootPath);
+        var gid = ReadOwningGroupId(CacheRootPath);
         var grant = PackageCachePolicy.DecideGrant(gid);
         _log?.Invoke(string.Create(CultureInfo.InvariantCulture,
             $"package cache grant for '{CacheRootPath}': {grant} (root gid {gid}, jail gid "
@@ -551,8 +551,13 @@ public sealed class PackageCacheManager
     }
 
     /// <summary>The directory's owning gid, or -1 when it cannot be read (Windows, no <c>stat</c>, an
-    /// error). -1 is a value <see cref="PackageCachePolicy.DecideGrant"/> handles explicitly.</summary>
-    private static int ReadGroupId(string path)
+    /// error). -1 is a value <see cref="PackageCachePolicy.DecideGrant"/> handles explicitly.
+    ///
+    /// <para><c>internal</c> rather than private because <see cref="ConversationStoreManager"/> asks the
+    /// SAME question about ITS root and must not get a different answer: the grant is a property of the
+    /// machine (did the boot step provision the jail group?), so two copies of this could only ever
+    /// disagree by being wrong.</para></summary>
+    internal static int ReadOwningGroupId(string path)
     {
         if (OperatingSystem.IsWindows())
         {
