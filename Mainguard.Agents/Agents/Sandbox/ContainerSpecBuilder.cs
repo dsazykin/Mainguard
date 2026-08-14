@@ -170,6 +170,12 @@ public sealed record CredTmpfsSpec(
 /// Null/empty = no cache mount, and then the cache environment is not set either — the two travel
 /// together by construction, because an environment that names a mount the container has not got is
 /// exactly the silent fall-through this feature must not have.</param>
+/// <param name="ConversationMounts">The per-agent CONVERSATION stores
+/// (<c>&lt;vmRoot&gt;/conversations/&lt;repoHash&gt;/&lt;agentId&gt;/&lt;path&gt;</c>), each bind-mounted
+/// READ-WRITE at the adapter's declared <c>$HOME</c>-relative path so the CLI's transcripts land on
+/// daemon-owned ext4 instead of the tmpfs that dies with the container. Null/empty = this CLI declares
+/// no conversation state and the jail carries no such mount. See
+/// <see cref="ConversationStorePolicy"/> for why this is a mount and not a harvest.</param>
 public sealed record ContainerSpecRequest(
     string RepoHash,
     string AgentId,
@@ -187,7 +193,8 @@ public sealed record ContainerSpecRequest(
     string? AgentRepoPath = null,
     string? PackageCachePath = null,
     string? ToolchainsRootPath = null,
-    IReadOnlyList<string>? ToolchainIds = null);
+    IReadOnlyList<string>? ToolchainIds = null,
+    IReadOnlyList<ConversationMount>? ConversationMounts = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -356,6 +363,58 @@ public static class ContainerSpecBuilder
             });
         }
 
+        foreach (var conversation in request.ConversationMounts ?? Array.Empty<ConversationMount>())
+        {
+            // ============================================================================================
+            // WHY THIS IS A BIND MOUNT AND NOT A HARVEST-ON-STOP ROUND TRIP.
+            //
+            // This repo already has a mechanism for carrying CLI state across a teardown: credentialPaths,
+            // harvested by SandboxAgentLauncher.HarvestCliCredentialsAsync inside StopAgent and restored on
+            // the next spawn. It is deliberately NOT what this uses, and the reason is not weight — it is
+            // that the pattern cannot work for this problem at all.
+            //
+            // The event that makes an operator NEED the conversation back is the jail dying WITHOUT a clean
+            // stop: a VM crash, a `docker rm`, a WSL restart. That is the literal definition of a stranded
+            // queue entry, which is the state AgentResumeService exists to recover. Harvest runs in
+            // StopAsync. In the crash case StopAsync never runs — so a harvest-based conversation store
+            // would pass every test anyone could write for it (all of which stop the agent) and fail in
+            // every situation a user actually hits. That is this codebase's signature defect, and here it
+            // was visible in advance.
+            //
+            // A bind mount has nothing to run at teardown because it has nothing to copy. The CLI writes
+            // its transcripts straight into daemon-owned ext4 as it goes, so a crash loses nothing, and the
+            // next jail for the same (repo, agent) mounts the same directory back at the same path.
+            // ============================================================================================
+            RejectNonExt4Source(conversation.HostPath);
+
+            // The same structural guard the package cache carries, for the same MG-3 reason: this is a
+            // READ-WRITE mount of daemon-side state, so it may only ever name a path inside a
+            // `conversations/` tree. Without it this mount could be edited into a second writable path at
+            // the mirror, the per-agent git dir, or anywhere under the daemon's home.
+            if (!ConversationStorePolicy.IsInsideAConversationTree(conversation.HostPath))
+                throw new SandboxSpecException(
+                    $"Refusing '{conversation.HostPath}' as a conversation store source. A conversation mount "
+                    + "is READ-WRITE, so it may only ever name a path inside a "
+                    + $"'{ConversationStorePolicy.ConversationsDirectoryName}/' tree; any other source would be "
+                    + "a second writable path into daemon-owned state (MG-3).");
+
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = conversation.HostPath,
+                // Unlike the package cache's fixed target, this one is the CLI's OWN path under $HOME. A
+                // package manager is TOLD where its cache is through the environment; a CLI's conversation
+                // directory is not configurable, so the store has to appear exactly where the vendor reads
+                // it. The tmpfs $HOME is mounted first (mounts are applied parent-first), so this deeper
+                // path is real ext4 while everything else under $HOME stays throwaway.
+                Target = conversation.SandboxTarget,
+                // READ-WRITE by definition: the CLI appends to the transcript continuously. A read-only
+                // store would fail mid-session rather than at the start, which is the failure shape this
+                // whole area keeps refusing.
+                ReadOnly = false,
+            });
+        }
+
         return mounts;
     }
 
@@ -497,8 +556,87 @@ public static class ContainerSpecBuilder
         AssertDnsPinned(create, request);
         AssertUsernsRemapped(create);
         AssertPackageCache(create, request);
+        AssertConversationStores(create, request);
 
         return create;
+    }
+
+    /// <summary>
+    /// Re-asserts the conversation stores' shape on the finished request, in the same style as
+    /// <see cref="AssertPackageCache"/>. Each property is individually a way for the feature to be quietly
+    /// wrong, and the two that matter most are about the mount's <b>source</b> rather than its target:
+    ///
+    /// <list type="number">
+    ///   <item><b>The store is not inside the tmpfs <see cref="AgentHome"/>.</b> The target is under
+    ///   <c>$HOME</c> by necessity (that is where the CLI reads it), but a SOURCE under it would mean the
+    ///   store is the very tmpfs whose destruction this exists to survive — the feature would look wired
+    ///   up and change nothing, and the loss would surface only when somebody came back for the history.</item>
+    ///   <item><b>The store is not inside the verified worktree.</b> A source under
+    ///   <see cref="WorkspaceTarget"/> or under this request's own worktree path puts conversation
+    ///   transcripts in the tree an agent commits from — one <c>git add -A</c> away from committing the
+    ///   operator's whole session into the branch under verification and merging it to main. The package
+    ///   cache was moved out of the worktree for exactly this reason.</item>
+    ///   <item><b>The target is the declared path under <c>$HOME</c>, and nowhere else.</b> Any other
+    ///   target is a directory the CLI never looks in, i.e. a mount that persists nothing.</item>
+    ///   <item><b>The mount is read-write, and every declared store produced one.</b> A declaration with
+    ///   no mount behind it is the "looks applied but isn't" shape this file exists to make impossible.</item>
+    /// </list>
+    /// </summary>
+    private static void AssertConversationStores(CreateContainerParameters create, ContainerSpecRequest request)
+    {
+        var mounts = create.HostConfig.Mounts ?? new List<Mount>();
+        var declared = request.ConversationMounts ?? Array.Empty<ConversationMount>();
+
+        if (declared.Count == 0)
+        {
+            // Nothing may claim there is a store when none was requested.
+            var stray = mounts.FirstOrDefault(m =>
+                ConversationStorePolicy.IsInsideAConversationTree(m.Source));
+            if (stray is not null)
+                throw new SandboxSpecException(
+                    $"No conversation store was requested, but a mount names '{stray.Source}' — a path inside "
+                    + $"a '{ConversationStorePolicy.ConversationsDirectoryName}/' tree.");
+            return;
+        }
+
+        foreach (var conversation in declared)
+        {
+            var target = ConversationStorePolicy.SandboxTarget(conversation.HomeRelativePath);
+            var mount = mounts.FirstOrDefault(m => string.Equals(m.Target, target, StringComparison.Ordinal))
+                ?? throw new SandboxSpecException(
+                    $"A conversation store at '{conversation.HostPath}' was requested but no mount targets "
+                    + $"'{target}', so the CLI would write its transcripts to the tmpfs $HOME and lose them "
+                    + "with the container.");
+
+            if (IsWithin(mount.Source, AgentHome))
+                throw new SandboxSpecException(
+                    $"The conversation store's SOURCE is '{mount.Source}', inside the tmpfs $HOME "
+                    + $"'{AgentHome}'. The store must be daemon-owned ext4 that outlives the jail; a source "
+                    + "under the tmpfs is the very thing whose destruction this feature exists to survive.");
+
+            if (IsWithin(mount.Source, WorkspaceTarget)
+                || IsWithin(mount.Source, request.WorktreePath))
+                throw new SandboxSpecException(
+                    $"The conversation store's SOURCE is '{mount.Source}', inside the worktree under "
+                    + "verification. That would put the operator's whole session in the tree the agent "
+                    + "commits from, one `git add -A` away from being merged to main.");
+
+            if (IsWithin(target, WorkspaceTarget))
+                throw new SandboxSpecException(
+                    $"The conversation store is mounted at '{target}', inside the verified worktree "
+                    + $"'{WorkspaceTarget}'.");
+
+            if (!IsWithin(target, AgentHome))
+                throw new SandboxSpecException(
+                    $"The conversation store is mounted at '{target}', which is not under the agent's home "
+                    + $"'{AgentHome}' — the CLI reads its transcripts from $HOME, so any other target is a "
+                    + "mount that persists nothing.");
+
+            if (mount.ReadOnly)
+                throw new SandboxSpecException(
+                    $"The conversation store mounted at '{target}' is read-only; the CLI appends to its "
+                    + "transcript continuously, so it would fail mid-session rather than at the start.");
+        }
     }
 
     /// <summary>

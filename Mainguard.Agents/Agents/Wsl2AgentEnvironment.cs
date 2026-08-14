@@ -74,7 +74,16 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         // teardown path every caller already goes through is RemoveAgentWorktree.
         var packageCaches = new PackageCacheManager(root);
         PackageCaches = packageCaches;
-        Worktrees = new WorktreeManager(root, audit: audit, packageCaches: packageCaches);
+        // The conversation store is a sibling of caches/ under the same vmRoot and inherits the same
+        // MG-17 group-share. It goes to the worktree manager for the same reason the cache does — a
+        // retired agent's store is that agent's — but with the opposite default about WHEN: the cache is
+        // released on the resume-rollback path too (it is expensive and rebuildable), while the store is
+        // released ONLY by the final, branch-deleting teardown, because a preserved branch must keep the
+        // conversation that goes with it.
+        var conversationStores = new ConversationStoreManager(root);
+        ConversationStores = conversationStores;
+        Worktrees = new WorktreeManager(
+            root, audit: audit, packageCaches: packageCaches, conversationStores: conversationStores);
         // Auto-permit on install: the proxy config also permits the hosts each installed agent CLI
         // declared it needs (read fresh per spawn from the registry markers), so an installed CLI
         // reaches its own service hosts (e.g. claude-code → platform.claude.com) with no hand-editing.
@@ -146,6 +155,8 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
     public Toolchains.ToolchainChannel? Toolchains { get; }
 
     public PackageCacheManager? PackageCaches { get; }
+
+    public ConversationStoreManager? ConversationStores { get; }
 
     public SyncRemote ResolveSyncRemote(string repoHash)
         => new(Wsl2SyncRemoteName, $@"{_uncPrefix}\{repoHash}.git");

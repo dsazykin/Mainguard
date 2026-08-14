@@ -44,7 +44,21 @@ public sealed record InstalledAdapterMarker(
     /// harvest from a jail's throwaway trees, so a permission grant survives the next spawn. Client-
     /// supplied entries are filtered against this list exactly as credential paths are. Null on markers
     /// written before this field existed — re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null)
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null,
+    /// <summary>The $HOME-relative directories this CLI keeps its CONVERSATION transcripts in (see
+    /// <see cref="AdapterSpec.ConversationPaths"/>) — the ONLY paths the daemon will bind-mount from the
+    /// per-agent conversation store, so a resumed agent still has the session the dead jail had. Null on
+    /// markers written before this field existed — re-install the CLI to backfill it, and until then that
+    /// CLI simply gets no persistence (never a guessed path).
+    /// <para>The spawn path re-asserts the no-credential-overlap rule against THIS list and
+    /// <see cref="CredentialPaths"/>, because the daemon spawns from this marker rather than from the
+    /// reviewed manifest — a marker is an ordinary file in a VM path, possibly written by an older
+    /// build.</para></summary>
+    [property: JsonPropertyName("conversationPaths")] IReadOnlyList<string>? ConversationPaths = null,
+    /// <summary>The argv appended to <see cref="Launch"/> to resume this CLI's previous conversation
+    /// (see <see cref="AdapterSpec.ResumeArgs"/>). Applied on the resume/adopt path only, and only when
+    /// the store holds a transcript. Null = this CLI declares no resume verb.</summary>
+    [property: JsonPropertyName("resumeArgs")] IReadOnlyList<string>? ResumeArgs = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 

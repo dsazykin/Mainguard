@@ -78,6 +78,20 @@ public interface IAgentEnvironment
     PackageCacheManager? PackageCaches => null;
 
     /// <summary>
+    /// The daemon-owned CONVERSATION store (<see cref="ConversationStoreManager"/>) whose per-agent
+    /// directories are bind-mounted into each jail at the CLI's own <c>$HOME</c>-relative transcript
+    /// paths, so a jail that dies WITHOUT a clean stop — the case a resume exists for — does not take the
+    /// conversation with it.
+    ///
+    /// <para>Defaulted to <c>null</c> for the same reason <see cref="PackageCaches"/> is: a substrate
+    /// with no daemon-side filesystem has no store to hand out, and every hand-rolled test double keeps
+    /// its behaviour exactly (no store mounts — a state <see cref="ContainerSpecBuilder"/> accepts and
+    /// asserts is self-consistent). Null is "this substrate has no store", never "persistence is off";
+    /// the shipped Wsl2 substrate always supplies one.</para>
+    /// </summary>
+    ConversationStoreManager? ConversationStores => null;
+
+    /// <summary>
     /// The user-managed toolchain channel (<see cref="Toolchains.ToolchainChannel"/>): the curated,
     /// pinned toolchains a HUMAN has installed into this environment, which reach every jail as a
     /// read-only bind mount rather than as an image layer.

@@ -175,6 +175,7 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     private readonly Action<string>? _warningSink;
     private readonly IAuditLog? _audit;
     private readonly Sandbox.PackageCacheManager? _packageCaches;
+    private readonly Sandbox.ConversationStoreManager? _conversationStores;
     private readonly AgentRepoManager _agentRepos;
     private readonly AgentRefMediator _refs;
     private readonly Lazy<AgentRefWatcher> _watcher;
@@ -200,18 +201,26 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// here). Without it a cache would only ever be reclaimed by budget eviction, which is the residue
     /// path, not the ordinary one. Null (every existing test double) simply keeps no cache.
     /// </param>
+    /// <param name="conversationStores">
+    /// The daemon-owned conversation store, reclaimed on the ONE FINAL teardown path
+    /// (<see cref="RemoveAgentWorktree"/>) and deliberately NOT on
+    /// <see cref="RemoveAgentWorktreeKeepingBranch"/> — see each of those for the argument. Null (every
+    /// existing test double) simply keeps no store.
+    /// </param>
     public WorktreeManager(
         string? vmRoot = null,
         Func<string, (int ExitCode, string Output)>? pnpmRunner = null,
         Action<string>? warningSink = null,
         IAuditLog? audit = null,
-        Sandbox.PackageCacheManager? packageCaches = null)
+        Sandbox.PackageCacheManager? packageCaches = null,
+        Sandbox.ConversationStoreManager? conversationStores = null)
     {
         _vmRoot = vmRoot ?? DefaultVmRoot();
         _pnpmRunner = pnpmRunner ?? RealPnpmInstall;
         _warningSink = warningSink;
         _audit = audit;
         _packageCaches = packageCaches;
+        _conversationStores = conversationStores;
         _agentRepos = new AgentRepoManager(_vmRoot);
         _refs = new AgentRefMediator(_agentRepos, BareRepoPathFor, OnPublishOutcome);
         // The warning sink is what keeps an eviction from the sweep visible: an agent that silently stops
@@ -621,6 +630,16 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // removal) rather than the routine one.
         _packageCaches?.Release(repoHash, agentId);
 
+        // …and so does its conversation store, keyed on the same (repo, agent) PAIR everything else here
+        // is. This is the ONLY path that drops it, and the reasoning is the `branch -D` three lines up:
+        // a clean teardown deletes the branch, the worktree and the agent's own repository, so the work
+        // the conversation is ABOUT is gone. Keeping the transcript would not preserve continuity, it
+        // would build a trap — agent ids are unique per repo and not globally, and the intake's `pr-<n>`
+        // ids RECUR, so a later `pr-7` for a different pull request would mount, and resume into, the
+        // previous author's session. Wrong answer AND a disclosure. (Contrast
+        // RemoveAgentWorktreeKeepingBranch, which preserves both the branch and the conversation.)
+        _conversationStores?.Release(repoHash, agentId);
+
         // §4 gc policy: this is the natural idle point — if that was the last borrower, unreachable
         // objects in the mirror may finally be pruned.
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
@@ -635,6 +654,11 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // The package cache is deliberately NOT released. It belongs to this same agent, which is either
         // about to be resumed again or has just failed to be — and the cache is the one part of a jail
         // that is expensive to rebuild.
+        //
+        // Neither is the conversation store, and here it is not an optimisation but the whole feature:
+        // this method exists to preserve agent/<id> across a failed or repeated resume, and the
+        // conversation is the other half of what a resume restores. Releasing it here would delete the
+        // one copy of the session on precisely the path that was invoked to keep the work.
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
     }
 

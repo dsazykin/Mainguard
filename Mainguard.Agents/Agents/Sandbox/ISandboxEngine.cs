@@ -77,6 +77,13 @@ public sealed record SandboxSecrets(
 /// the agent's own <c>git add -A</c> would otherwise commit the user's permission allowlist into their
 /// repository. Separate from <see cref="CliSettingsFiles"/> precisely because that case has no
 /// restore payload to derive it from.</param>
+/// <param name="ConversationMounts">This agent's CONVERSATION stores — daemon-owned ext4 directories
+/// bind-mounted READ-WRITE at the CLI's own <c>$HOME</c>-relative transcript paths, so the record of
+/// what the operator and the agent said survives a jail that dies without a clean stop. That is the
+/// whole point and the reason it is a mount rather than a stop-time harvest: the crash IS the case
+/// (<see cref="ConversationStorePolicy"/>). Null/empty = this CLI declares no conversation state.
+/// When supplied, <see cref="DockerSandboxEngine"/> proves in the started container that every store is
+/// really present and writable before handing the jail back.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,
@@ -96,7 +103,8 @@ public sealed record SandboxSpawnRequest(
     IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null,
     IReadOnlyList<string>? WorkspaceIgnorePaths = null,
     string? ToolchainsRootPath = null,
-    IReadOnlyList<string>? ToolchainIds = null);
+    IReadOnlyList<string>? ToolchainIds = null,
+    IReadOnlyList<ConversationMount>? ConversationMounts = null);
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);
