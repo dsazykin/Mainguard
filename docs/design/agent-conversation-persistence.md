@@ -203,6 +203,15 @@ This mirrors the precedent in `AgentSpawnService.StopAsync`, where id-keyed stat
 the IPC endpoint, the terminal lock, the gateway credential) is released only once no session anywhere
 still answers to that id. The store's key is the **pair**, so it is released with that pair's branch.
 
+### Untrusted jails
+
+Unlike `settingsPaths`, the store is **not** gated by `withoutHostCredentials`, and it does not need to
+be. That flag exists because settings and logins flow *between* agents — an external pull request's jail
+must not inherit the user's approvals or tokens. A conversation store is per `(repo, agentId)` and mounted
+into exactly one jail, so an untrusted worker can only ever see the transcripts it wrote itself, and they
+are released with its branch on the clean stop that ends the intake. There is nothing to inherit, so there
+is nothing to gate.
+
 ### Stated gap: no budget, no eviction
 
 Unlike `PackageCacheManager`, there is no size ceiling and no LRU eviction, and that is a decision rather
