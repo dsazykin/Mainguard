@@ -174,7 +174,17 @@
     pre-approved commands anywhere in the home or the checkout — and `HarvestCliSettingsAsync` reads
     them back out (size-checked in the shell, so an oversized file never enters daemon memory),
     resolving each root through `DockerSandboxEngine.SettingsRootPath` so restore and harvest cannot
-    address different directories.
+    address different directories. It owns the **conversation store** too, and that one is deliberately
+    NOT a round trip: it calls `ConversationStoreManager.Prepare` before the container exists (mounts are
+    fixed at create) and hands the resulting bind mounts to `SandboxSpawnRequest`, so the CLI's
+    transcripts land on daemon-owned ext4 as they are written and survive a jail that dies without a
+    clean stop — the case a harvest, which runs in `StopAsync`, can never cover. `Prepare` re-asserts the
+    no-credential-overlap invariant against the MARKER and its failure is typed and un-caught. The same
+    block decides the **resume verb**: the adapter's declared `resumeArgs` are appended to the launch
+    argv on the ADOPT path only, and only when `HasTranscripts` finds a real file from a previous jail —
+    a resume flag with no prior session is a worse failure than no flag. Both outcomes are logged by
+    name, because "the resume worked but the conversation is gone" is exactly the report this answers.
+    See [`docs/design/agent-conversation-persistence.md`](../design/agent-conversation-persistence.md).
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
