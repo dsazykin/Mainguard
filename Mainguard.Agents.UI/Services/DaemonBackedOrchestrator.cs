@@ -1446,6 +1446,31 @@ public sealed class DaemonBackedOrchestrator :
         return new QueueEntryDiscardOutcome(agentId, response.DiscardedBy ?? "", at);
     }
 
+    /// <summary>The cockpit's Bring local: fetch <c>agent/&lt;id&gt;</c> from the sync remote into the
+    /// user's checkout as a local branch (journaled, non-forced — see <see cref="Mainguard.Agents.Services.BringLocalService"/>).
+    /// Refuses when no repo binding exists, in the same wording family as <see cref="ConfirmMergeAsync"/>.</summary>
+    public async Task<Mainguard.Agents.Services.BringLocalResult> BringBranchLocalAsync(
+        string agentId, CancellationToken ct)
+    {
+        string? repoPath;
+        string syncRemote;
+        lock (_gate)
+        {
+            repoPath = _repoLocalPath;
+            syncRemote = _syncRemoteName;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(syncRemote))
+        {
+            return Mainguard.Agents.Services.BringLocalResult.Refused(
+                "this repository isn't bound to a local checkout yet — reopen it so Mainguard can register the sync remote");
+        }
+
+        var service = new Mainguard.Agents.Services.BringLocalService(_journalFactory());
+        return await Task.Run(() => service.BringLocal(repoPath!, syncRemote, agentId), ct)
+            .ConfigureAwait(false);
+    }
+
     /// <summary>Rejects a verified entry in review — same refusal discipline as
     /// <see cref="DiscardEntryAsync"/>: the daemon's "no" is thrown with its reason, never swallowed.</summary>
     public async Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason)

@@ -1142,6 +1142,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 // any checkmark it did draw would have cleared a store the merge gate never reads.
                 ReviewCockpit = new ReviewCockpitViewModel(
                     ctx,
+                    bringLocal: async (id, ct) =>
+                    {
+                        // The outcome is a toast either way — for most of this button's life it was
+                        // bound to nothing and pressing it was a silent no-op.
+                        var result = await daemon.BringBranchLocalAsync(id, ct).ConfigureAwait(true);
+                        Editions.ProComposition.ShowShellToast(
+                            result.Done
+                                ? $"'{result.LocalBranch}' is now a local branch — the agent keeps working"
+                                : $"Can't bring local — {result.Reason}",
+                            !result.Done);
+                    },
                     onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id),
                     live: new Services.DaemonFlaggedChangeSource(_queue),
                     onReject: async (id, reason) =>

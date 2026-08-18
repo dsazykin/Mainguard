@@ -1505,7 +1505,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       JSON, so a hand-written override still bypasses this gate — the UPDATE PATH is provenance-verified,
       adapter installs as a whole are not.)
 
-- **`Services/`** — the three merge services that live in `Mainguard.Agents`, not `Mainguard.Git` (they are agent-platform concerns, and `ForegroundMergeService` is the human-gated one):
+- **`Services/`** — the merge/handoff services that live in `Mainguard.Agents`, not `Mainguard.Git` (they are agent-platform concerns, and `ForegroundMergeService` is the human-gated one):
+  - `BranchHandoffService.cs` — `BringLocalService`, the cockpit's **Bring local**: fetches
+    `agent/<id>` from the SC-2 sync remote (explicit refspec, "couldn't find remote ref" classified
+    as "the agent hasn't published it") then updates `refs/heads/agent/<id>` with a journaled
+    (T-19 `CreateBranch`) NON-forced `git fetch . src:dst` — creates, fast-forwards, and REFUSES a
+    diverged or checked-out branch with git's stderr; HEAD never moves. Every refusal is a phrased
+    `BringLocalResult.Reason` (the button was a silent null-delegate no-op for its whole prior life);
+    driven from `DaemonBackedOrchestrator.BringBranchLocalAsync` with a toast either way. Pinned by
+    `Mainguard.Tests/BringLocalServiceTests`.
   - `IForegroundMergeService.cs` / `ForegroundMergeService.cs` — the P2-10 Windows-side, human-gated
     "Merge to Main" (the only path to `Merged`). Fetches the SC-2-resolved sync remote
     (`IAgentEnvironment.ResolveSyncRemote` — never a hardcoded literal), then merges `agent/<id>` onto
