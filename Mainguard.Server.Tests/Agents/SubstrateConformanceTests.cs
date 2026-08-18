@@ -20,9 +20,14 @@ namespace Mainguard.Server.Tests.Agents;
 // Rows #4/#5/#10 depend on facade members (TeardownAsync/HealthCheckAsync/UpgradeAsync) the
 // interface deliberately does not declare yet — deferred with the interface's own additive-
 // growth rationale.
+//
+// Split in two classes because the two rows have different runtimes: the round-trip needs only
+// git (it runs on the non-Docker legs, macOS CI included), while the live-mount row needs the
+// engine and therefore joins the docker-suite collection + carries the class-level trait the
+// FixtureAcceptance guard cross-checks.
 public class SubstrateConformanceTests
 {
-    private static IAgentEnvironment CreateSubstrate(string vmRoot) =>
+    internal static IAgentEnvironment CreateSubstrate(string vmRoot) =>
         OperatingSystem.IsMacOS()
             ? new MacHostAgentEnvironment(vmRoot: vmRoot)
             : new Wsl2AgentEnvironment(vmRoot: vmRoot);
@@ -83,12 +88,18 @@ public class SubstrateConformanceTests
         }
     }
 
+}
+
+// ESC §4 #2's LIVE leg — see the sibling class's header for the suite map.
+[Collection(DockerSuiteCollection.Name)]
+[Trait("Category", "RequiresDocker")]
+public class SubstrateConformanceDockerTests
+{
     // ---- §4 #2: NoHostPathMount_ShouldHoldForEveryContainer ------------------------------------
     // The LIVE container's bind sources: every one sits under the suite's substrate temp roots,
     // and none is a host-path shape (drvfs, UNC, drive-letter) or anything under the user's home
     // outside the substrate root. The pure-spec half of this row is ContainerSpecMountRootsTests.
     [RequiresDockerFact]
-    [Trait("Category", "RequiresDocker")]
     public async Task NoHostPathMount_ShouldHoldForEveryContainer()
     {
         await using var fx = new SandboxFixture();

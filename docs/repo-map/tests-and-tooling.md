@@ -880,6 +880,12 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Agents/SubstrateConformanceTests.cs`** — the ESC §4 rows run against
+  THIS host's substrate composition: `SubstrateConformanceTests` (#1 git-objects round-trip through
+  the opaque `ResolveSyncRemote` handle, byte-identical; git-only, macOS leg — the WSL2 handle needs
+  a Windows host) and `SubstrateConformanceDockerTests` (#2 live-jail bind-source sweep;
+  docker-suite collection + class trait per the FixtureAcceptance cross-check). The suite header
+  maps every other §4 row to the test that already proves it.
 - **`Mainguard.Server.Tests/Agents/HostCommandRunnerTests.cs`** — the macos-host `IWslRunner`:
   in-distro shapes strip to the inner command (plain and `-u root`), stdin reaches the child, a
   real host echo/cat round-trips (Unix-only), and a VM lifecycle verb is a typed refusal.
