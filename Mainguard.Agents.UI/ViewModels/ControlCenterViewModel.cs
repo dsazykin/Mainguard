@@ -1103,8 +1103,21 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
             if (diff is not null)
             {
-                var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
-                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files)
+                // The rail's Agents list filters coordinator-role sessions out (they drive the
+                // coordinator card instead), so a coordinator's own queue entry used to fall through
+                // to the raw GUID here and the cockpit header read "Review — <guid>". Fall back to the
+                // unfiltered agent list and name the role honestly.
+                var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name;
+                if (name is null)
+                {
+                    var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId);
+                    name = info?.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator
+                        ? $"Coordinator ({info.Name})"
+                        : info?.Name;
+                }
+
+                var entry = _queue.GetQueue().FirstOrDefault(e => e.AgentId == agentId);
+                var ctx = new ReviewCockpitContext(agentId, name ?? agentId, diff.Branch, diff.Files)
                 {
                     // The "verified @ <sha>" stamp. The bare 4-arg ctor left every enrichment property
                     // unset, so BuildHeader was a no-op and a reviewer was told nothing about what the
@@ -1113,8 +1126,14 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     // the entry has not been verified, in which case no stamp is drawn — an absent
                     // stamp is the honest rendering of "not verified", and inventing one would be the
                     // exact false reassurance this surface exists to prevent.
-                    VerifiedAgainstSha = _queue.GetQueue()
-                        .FirstOrDefault(e => e.AgentId == agentId)?.VerifiedMainSha,
+                    VerifiedAgainstSha = entry?.VerifiedMainSha,
+
+                    // The changed-test-command fact is already on the wire as a flagged item — the gate
+                    // arms it daemon-side and streams it with the entry. TraceRanges/TestDelta stay
+                    // null: the wire does not carry them, and inventing either would render provenance
+                    // the daemon never attested.
+                    ChangedTestCommand = entry?.FlaggedItems.Any(
+                        f => f.Id == Services.DaemonFlaggedChangeSource.ChangedTestCommandItemId) == true,
                 };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same

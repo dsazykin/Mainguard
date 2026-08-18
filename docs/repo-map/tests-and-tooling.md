@@ -295,6 +295,9 @@
   `git diff -w` zero-hunks/real-hunks/staged/no-eol; `RequiresGitCli`),
   `DiffViewerViewModelDiffQualityTests` (T-13 VM: partial staging hidden in `-w` mode, syntax-toggle
   persistence, intra-line spans + trailing-whitespace + image-mode detection), `SettingsServiceTests`,
+  `QueueProjectionRenderingTests` (wire-shaped facts render: the verified-against stamp comes from
+  `VerifiedMainSha` — the daemon projection never populates `Verification`, so the old read could
+  never draw it — and the cockpit's changed-test-command warning renders without a run-count delta),
   `RepoProvisioningHonestyTests` (the repo-open provisioning path surfaces failures as reasons and
   detaches the queue projection on repo switch — `ClearActiveRepo` empties + raises `Changed`, the
   cleared adapter refuses to merge, a failed provision on switch leaves no stale queue from the

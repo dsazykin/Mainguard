@@ -206,6 +206,14 @@ public partial class ReviewCockpitViewModel : ViewModelBase
                 : "command unchanged from main";
             TestDeltaSummary = $"{delta.PassedCurrent} green{newPart} · {delta.FailedCurrent} failed · {cmd}";
         }
+        else if (_ctx.ChangedTestCommand)
+        {
+            // The wire carries the changed-command FACT (a flagged item) without the run counts —
+            // render the warning alone rather than hiding it behind an absent delta. This is the one
+            // header line a reviewer must not miss: the branch's green was measured by a command the
+            // branch itself rewrote.
+            TestDeltaSummary = "test command changed on this branch — flagged below";
+        }
     }
 
     private void BuildRows()

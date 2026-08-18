@@ -239,8 +239,14 @@ public partial class QueueEntryViewModel : ViewModelBase
             WorkerMergeState.AwaitingReview => "Awaiting review",
             var s => s.ToString(),
         };
-        VerifiedAgainst = entry.Verification is { } v && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
-            ? $"main@{v.MainSha}" : "";
+        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in a
+        // VerificationRecord, which would fabricate a pass/fail verdict the daemon didn't send. The old
+        // read looked only at Verification, which the daemon projection never populates, so the stamp
+        // could never render in the shipped app.
+        var verifiedSha = entry.VerifiedMainSha is { Length: > 0 } wireSha ? wireSha : entry.Verification?.MainSha;
+        VerifiedAgainst = verifiedSha is { Length: > 0 } sha
+            && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
+            ? $"main@{Shorten(sha)}" : "";
         IsReviewable = entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;
 
         // The daemon now owns this row's progress; drop our optimistic in-flight latch.
@@ -427,4 +433,6 @@ public partial class QueueEntryViewModel : ViewModelBase
             _lifecycleRequestInFlight = false;
         }
     }
+
+    private static string Shorten(string sha) => sha.Length > 10 ? sha[..10] : sha;
 }
