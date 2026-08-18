@@ -707,6 +707,12 @@
     `artifacts_headless/`).
   - `TestTools/PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact` skip-with-reason
     attributes.
+  - `TestTools/SelfInvocation.cs` — the quoted command prefix tests hand to
+    `GitService.SelfInvocationOverride` to spawn the COPIED Mainguard.Client.App head. On macOS it
+    always takes the `dotnet <dll>` form: current macOS pins an executable name to the location it
+    first ran from and SIGKILLs the same-named apphost at any other path (re-sign, fresh inode,
+    identical bytes — all still killed), so the copied apphost in the test output can never be
+    spawned directly. Windows/Linux keep the absolute-path apphost.
   - `NpmProvenanceTests.cs` + `BuildProvenanceTests.cs` (MG-9 build provenance — the npm signature
     scheme against a locally generated P-256 pair, the integrity→bytes binding, every fail-closed policy
     branch, the manifest's refusal of an adapter with no declared rung, the shipped-manifest rung guard,

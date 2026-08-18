@@ -28,11 +28,7 @@ public class OperationJournalCliTests : IDisposable
 
     public OperationJournalCliTests()
     {
-        var apphost = Path.Combine(AppContext.BaseDirectory,
-            OperatingSystem.IsWindows() ? "Mainguard.Client.App.exe" : "Mainguard.Client.App");
-        GitService.SelfInvocationOverride = File.Exists(apphost)
-            ? $"\"{apphost}\""
-            : $"\"dotnet\" \"{Path.Combine(AppContext.BaseDirectory, "Mainguard.Client.App.dll")}\"";
+        GitService.SelfInvocationOverride = TestTools.SelfInvocation.ClientAppPrefix();
 
         _dbPath = Path.Combine(Path.GetTempPath(), "mainguard-journal-cli-" + Guid.NewGuid().ToString("N") + ".db");
         using (var ctx = new AppDbContext(_dbPath)) ctx.Database.Migrate();
