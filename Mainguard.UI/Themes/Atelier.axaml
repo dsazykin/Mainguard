@@ -46,10 +46,10 @@
 
     <!-- Commit-graph lanes -->
     <!-- Lanes decoupled from semantic status tokens (DESIGN.md §2); retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#E4C399"/>
+    <SolidColorBrush x:Key="Lane1" Color="#DBBC93"/>
     <SolidColorBrush x:Key="Lane2" Color="#B06A9E"/>
     <SolidColorBrush x:Key="Lane3" Color="#C7E0BF"/>
-    <SolidColorBrush x:Key="Lane4" Color="#3A698E"/>
+    <SolidColorBrush x:Key="Lane4" Color="#40739C"/>
     <SolidColorBrush x:Key="Lane5" Color="#DA9A91"/>
 
     <!-- Diff line backgrounds -->

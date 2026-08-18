@@ -1114,7 +1114,12 @@
   chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in every
   registered theme), `Headless/ThemeRetirementMigrationTests` (the retired CommandDeck/LoomAurora
   keys migrate through `ThemeManager.LegacyKeyMap` to their surviving relatives and re-persist;
-  an unknown key still falls back to the default unpersisted), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
+  an unknown key still falls back to the default unpersisted), `ThemeContrastGateTests` (the
+  automated palette gate DesignSystem.md §1.3/§3.2 called for — parses `Mainguard.UI/Themes/*.axaml`
+  as text, no Avalonia: identical key set across themes, WCAG AA for TextPrimary/TextMuted/OnAccent
+  incl. the AccentSelection∘SurfaceCard composite, lanes ≥3.2:1 vs the panel + pairwise
+  deuteranopic-lightness gaps ≥0.070 via Viénot 1999, and per-theme terminal legibility — the gate
+  that caught the Daylight dark-ANSI-ramp bug; thresholds are named constants), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
   `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
   must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious

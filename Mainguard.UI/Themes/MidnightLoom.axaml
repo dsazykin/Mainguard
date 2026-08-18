@@ -52,10 +52,10 @@
     <!-- Lanes are deliberately decoupled from the semantic status tokens (DESIGN.md §2): none of
          Lane1-5 is hex-identical to AccentBrush/WarningBrush/InfoBrush/SuccessBrush, so graph
          topology never accidentally implies status. Retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#9A9AF4"/>
+    <SolidColorBrush x:Key="Lane1" Color="#9F9FFC"/>
     <SolidColorBrush x:Key="Lane2" Color="#D0709F"/>
     <SolidColorBrush x:Key="Lane3" Color="#C0EAE3"/>
-    <SolidColorBrush x:Key="Lane4" Color="#E8A217"/>
+    <SolidColorBrush x:Key="Lane4" Color="#F2A918"/>
     <SolidColorBrush x:Key="Lane5" Color="#0B87F5"/>
 
     <!-- Diff line backgrounds -->

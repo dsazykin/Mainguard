@@ -26,8 +26,8 @@
     <SolidColorBrush x:Key="AccentSelection" Color="#266467E8"/>
 
     <!-- Semantic -->
-    <SolidColorBrush x:Key="SuccessBrush" Color="#1F9D55"/>
-    <SolidColorBrush x:Key="SuccessHover" Color="#178246"/>
+    <SolidColorBrush x:Key="SuccessBrush" Color="#187C43"/>
+    <SolidColorBrush x:Key="SuccessHover" Color="#136637"/>
     <SolidColorBrush x:Key="DangerBrush" Color="#C13939"/>
     <SolidColorBrush x:Key="DangerHover" Color="#B02F2F"/>
     <SolidColorBrush x:Key="WarningBrush" Color="#A9770F"/>
@@ -37,7 +37,7 @@
          carries state (E1/E2), brush is the second channel. Daylight Loom is light — never assume dark. -->
     <SolidColorBrush x:Key="AgentStatusWorkingBrush" Color="#0B78CE"/>
     <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#6467E8"/>
-    <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#1F9D55"/>
+    <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#187C43"/>
     <SolidColorBrush x:Key="AgentStatusStaleBrush" Color="#A9770F"/>
     <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#7E5FB5"/>
     <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#C13939"/>
@@ -47,17 +47,17 @@
 
     <!-- Commit-graph lanes -->
     <!-- Lanes decoupled from semantic status tokens (DESIGN.md §2); retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#3232E2"/>
-    <SolidColorBrush x:Key="Lane2" Color="#B0487F"/>
-    <SolidColorBrush x:Key="Lane3" Color="#075B55"/>
-    <SolidColorBrush x:Key="Lane4" Color="#7B420A"/>
+    <SolidColorBrush x:Key="Lane1" Color="#2F2FD6"/>
+    <SolidColorBrush x:Key="Lane2" Color="#AB467B"/>
+    <SolidColorBrush x:Key="Lane3" Color="#054743"/>
+    <SolidColorBrush x:Key="Lane4" Color="#8A4A0B"/>
     <SolidColorBrush x:Key="Lane5" Color="#138BE6"/>
 
     <!-- Diff line backgrounds -->
     <SolidColorBrush x:Key="DiffAddedBg" Color="#DDF3E4"/>
     <SolidColorBrush x:Key="DiffRemovedBg" Color="#FBE2E2"/>
     <!-- Intra-line (word-level) emphasis + trailing-whitespace marker (T-13) -->
-    <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#661F9D55"/>
+    <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#66187C43"/>
     <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66C13939"/>
     <SolidColorBrush x:Key="DiffWhitespaceMarker" Color="#55A9770F"/>
 

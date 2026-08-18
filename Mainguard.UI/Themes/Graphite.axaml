@@ -53,9 +53,9 @@
          Accent/Warning/Info/Success, so graph topology never accidentally implies status. The
          structure mirrors MidnightLoom's deutan-verified set, desaturated to the graphite mood. -->
     <SolidColorBrush x:Key="Lane1" Color="#9D9DE8"/>
-    <SolidColorBrush x:Key="Lane2" Color="#D083A8"/>
-    <SolidColorBrush x:Key="Lane3" Color="#A9D6CD"/>
-    <SolidColorBrush x:Key="Lane4" Color="#D9A21F"/>
+    <SolidColorBrush x:Key="Lane2" Color="#A36784"/>
+    <SolidColorBrush x:Key="Lane3" Color="#ABD9D0"/>
+    <SolidColorBrush x:Key="Lane4" Color="#E6AB21"/>
     <SolidColorBrush x:Key="Lane5" Color="#3E96F2"/>
 
     <!-- Diff line backgrounds -->
