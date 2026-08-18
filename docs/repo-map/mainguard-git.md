@@ -221,7 +221,13 @@ The all-editions base. Git logic goes here.
     "not yet supported for <host>" and report `IsImplemented=false`).
 - **`Security/`** — `SecureKeyring.cs` (OS keyring / DataProtection secret storage; T-14 added a
   storage-directory-override constructor for testability, `Retrieve` returns null on a corrupt/foreign
-  payload), `GitHostDetector.cs` + `Models/HostKind.cs` (classify a remote as GitHub/GitLab/etc.;
+  payload; the key ring is DPAPI-wrapped on Windows and Keychain-wrapped on macOS),
+  `MacKeychainKeyProtection.cs` (the macOS DPAPI analogue: the DataProtection key XML is
+  AES-256-GCM-encrypted with a master key living ONLY in the login Keychain, accessed through
+  `/usr/bin/security` so the item's ACL names the Apple-signed CLI and ad-hoc-rebuilt dev
+  binaries never trigger per-build prompts; fail-open to the previous plaintext posture when the
+  Keychain is unavailable — secrets must survive, hardening is best-effort),
+  `GitHostDetector.cs` + `Models/HostKind.cs` (classify a remote as GitHub/GitLab/etc.;
   `UsernameForToken` is the **single source** for the host→token-username convention; `ParseOwnerRepo`
   extracts the `owner/repo` slug from a remote URL — HTTPS/ssh/scp forms, `.git`-stripped, subgroups
   folded into owner — for the T-23 PR API), `SshKeyService.cs` (T-14 SSH key manager: generate ed25519

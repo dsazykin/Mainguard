@@ -283,6 +283,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       SIGTERM-then-SIGKILL stop.)
     - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
       app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.)
+    - `MacDaemonLaunchAgent.cs` (optional launchd integration — "keep the agent platform running
+      at login": a per-user LaunchAgent starting mainguardd from the app payload with KeepAlive,
+      installed/booted via `launchctl bootstrap gui/<uid>`, nothing elevated; with it installed a
+      refresh degenerates to "stop and let launchd respawn from the same payload dir".)
     - `IBootstrapStep.cs` (the check/act step interface +
       `BootstrapStageState`/`BootstrapProgress`/`BootstrapOptions`, the `IBootstrapFileSystem` and
       `IDaemonHealthProbe` seams, plus `IBootstrapStepDiagnostics` (a step names its own unmet condition
