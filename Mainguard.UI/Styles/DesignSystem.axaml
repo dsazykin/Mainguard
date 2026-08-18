@@ -6,9 +6,12 @@
          the shell and the Pro UI share one component vocabulary. App.axaml
          StyleIncludes this AFTER FluentTheme (+ AvaloniaEdit + Dock) so
          these overrides still win. Color tokens are DynamicResource (follow
-         live theme switches); the four StaticResource lookups below
-         (FontUi/FontMono/ChevronRightIcon/ChevronDownIcon) resolve against
-         the icon dictionary merged into this file's own scope.
+         live theme switches); the StaticResource lookups below
+         (FontMono/ChevronRightIcon/ChevronDownIcon) resolve against the icon
+         dictionary merged into this file's own scope. FontUi is DynamicResource
+         on purpose: the shell overrides it at app level on macOS (SF Pro),
+         and app-resource entries shadow this include's merged value only for
+         dynamic lookups.
          ============================================================ -->
     <Styles.Resources>
         <ResourceDictionary>
@@ -20,7 +23,7 @@
 
     <!-- App-wide typography -->
     <Style Selector="Window">
-        <Setter Property="FontFamily" Value="{StaticResource FontUi}"/>
+        <Setter Property="FontFamily" Value="{DynamicResource FontUi}"/>
     </Style>
     <Style Selector="TextBlock.Mono">
         <Setter Property="FontFamily" Value="{StaticResource FontMono}"/>
@@ -307,7 +310,7 @@
     </Style>
     <Style Selector="ComboBoxItem">
         <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
-        <Setter Property="CornerRadius" Value="4"/>
+        <Setter Property="CornerRadius" Value="6"/>
         <Setter Property="Margin" Value="3,1"/>
     </Style>
     <Style Selector="ComboBoxItem:pointerover /template/ ContentPresenter#PART_ContentPresenter">
@@ -322,7 +325,7 @@
         <Setter Property="Background" Value="{DynamicResource SurfacePanel}"/>
         <Setter Property="BorderBrush" Value="{DynamicResource BorderHairline}"/>
         <Setter Property="BorderThickness" Value="1"/>
-        <Setter Property="CornerRadius" Value="10"/>
+        <Setter Property="CornerRadius" Value="8"/>
     </Style>
     <Style Selector="MenuFlyoutPresenter">
         <Setter Property="Background" Value="{DynamicResource SurfacePanel}"/>
@@ -338,7 +341,7 @@
     </Style>
     <Style Selector="MenuItem:selected /template/ Border#PART_LayoutRoot">
         <Setter Property="Background" Value="{DynamicResource SurfaceHover}"/>
-        <Setter Property="CornerRadius" Value="4"/>
+        <Setter Property="CornerRadius" Value="6"/>
     </Style>
 
     <!-- Checkboxes are sized to match their label text (left-anchored so layout doesn't shift).

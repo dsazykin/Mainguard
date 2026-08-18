@@ -82,6 +82,17 @@ public partial class App : Application
     {
         AvaloniaXamlLoader.Load(this);
 
+        // Native macOS typography: put the system face ahead of the bundled Inter. FontUi is
+        // consumed via DynamicResource and direct app-resource entries shadow merged-dictionary
+        // values, so this one write restyles every window. ".AppleSystemUIFont" is deliberate:
+        // SF Pro ships only as that hidden CoreText family — "SF Pro Text" is NOT installed, and
+        // Skia's matcher silently substitutes Helvetica for unknown names, so the friendly name
+        // would deliver the wrong font, not a graceful skip. The chain ends in Inter so a macOS
+        // build where the dot-name ever stops resolving degrades to the cross-platform look.
+        if (System.OperatingSystem.IsMacOS())
+            Resources["FontUi"] = new Avalonia.Media.FontFamily(
+                ".AppleSystemUIFont, Helvetica Neue, Inter, sans-serif");
+
         // Load environment variables securely from .env file
         DotNetEnv.Env.TraversePath().Load();
 

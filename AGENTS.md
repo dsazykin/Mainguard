@@ -215,7 +215,7 @@ CVD-sensitive color.
 
 - Each theme is one `ResourceDictionary` in **`Mainguard.UI/Themes/<Key>.axaml`** defining the **full token contract** below. `App.axaml` merges `MidnightLoom.axaml` as the startup default.
 - **`Mainguard.UI/Theming/ThemeManager.cs`** swaps the merged dictionary at runtime, sets `RequestedThemeVariant` (so built-in Fluent chrome follows light/dark), persists the key, and raises `ThemeChanged`.
-- **Color tokens are referenced with `{DynamicResource …}` — never `StaticResource`.** StaticResource is resolved once and will not update on a live theme switch. (`StaticResource` remains correct for theme-independent resources: icons and the `FontUi`/`FontMono` families.)
+- **Color tokens are referenced with `{DynamicResource …}` — never `StaticResource`.** StaticResource is resolved once and will not update on a live theme switch. (`StaticResource` remains correct for theme-independent resources: icons and `FontMono`. `FontUi` is the exception among fonts — it is consumed via `DynamicResource` because the shell overrides it at app level on macOS.)
 - **Code-drawn colors** resolve through `Application.Current.TryGetResource(key, app.ActualThemeVariant, …)` with a literal fallback, and long-lived visuals re-resolve on `ThemeManager.ThemeChanged`. `CommitGraphCanvas` is the reference pattern; `DiffViewerView`'s margin renderer and `AnalyticsViewModel.ThemeSkColor` follow it.
 - **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes`, add a File → Theme menu item. Nothing else.
 - **Adding a token** = add it to **all** files in `Themes/` and to the table below. A token missing from one theme is a runtime bug the compiler cannot catch.
@@ -290,7 +290,7 @@ Rules: at most one `Accent` per view; anything destructive is `Danger` (no ad-ho
 
 ### Typography
 
-`FontUi` (Inter → Segoe UI fallback chain) is applied to every `Window` globally. `FontMono` is for SHAs, code, and diff text — use `TextBlock.Mono` or `FontFamily="{StaticResource FontMono}"`. Font sizes: `10–11` metadata/chips, `12–13` body/controls, `14` emphasis, `16–18` titles, `24` hero. Spacing scale: `4 / 5 / 8 / 10 / 15 / 20`.
+`FontUi` (Inter → Segoe UI fallback chain; on macOS the shell overrides it at app level to the system SF Pro face — `.AppleSystemUIFont`, the hidden CoreText family, since "SF Pro Text" is not an installed family and Skia would silently substitute Helvetica — falling back to Inter) is applied to every `Window` globally via `DynamicResource`. `FontMono` is for SHAs, code, and diff text — use `TextBlock.Mono` or `FontFamily="{StaticResource FontMono}"`. Font sizes: `10–11` metadata/chips, `12–13` body/controls, `14` emphasis, `16–18` titles, `24` hero. Spacing scale: `4 / 5 / 8 / 10 / 15 / 20`.
 
 ### Icons
 
