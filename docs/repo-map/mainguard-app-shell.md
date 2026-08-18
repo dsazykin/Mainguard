@@ -692,7 +692,15 @@
     pipeline is idempotent — it used to be hosted directly by the standalone `AddReposToOsView` window,
     now it is wrapped by `MainguardOsPageViewModel`, the Settings **Mainguard OS** page, which
     additionally cancels an in-flight copy on `ISettingsPage.OnDeactivated` and adds
-    `RebuildSandboxImagesCommand`), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
+    `RebuildSandboxImagesCommand`), `MacOobeViewModel` + `Views/MacOobeWindow` (the macos-host
+    first-run: sequential retryable checks — Docker engine via `DockerEndpointResolver` + a live
+    version ping, the ~/mainguard file-sharing canary run in a throwaway container, jail-image
+    probe/build through the shared installer in the background, daemon start + pinned-mTLS
+    answer — then the agent-CLI picker over the container install host and the start-at-login
+    launchd toggle; Continue gates only on engine + daemon, marks `MacOobeState` completed and
+    hands off to the SAME startup-window path the control-center route takes.
+    `ProDesktopHost.DecideLaunchRoute` routes macOS by the completed marker, and the keep-alive /
+    resume-task-sweep Windows machinery no-ops there), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
     Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
     subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
     gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from

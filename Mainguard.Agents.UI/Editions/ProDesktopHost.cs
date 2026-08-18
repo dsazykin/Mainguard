@@ -48,7 +48,13 @@ public static class ProDesktopHost
     /// session (in-memory only; the next launch re-offers).</summary>
     private static bool _vmUpgradeDeclinedThisSession;
 
-    private static void EnsureKeepAlive() => _vmKeepAlive ??= new VmKeepAlive();
+    private static void EnsureKeepAlive()
+    {
+        // macos-host: no MainguardEnv to hold awake — a holder would just spawn a missing
+        // wsl.exe in a backoff loop forever. The daemon's own MacSleepAssertion covers sleep.
+        if (OperatingSystem.IsMacOS()) return;
+        _vmKeepAlive ??= new VmKeepAlive();
+    }
 
     private static void ReleaseKeepAlive()
     {
@@ -85,16 +91,37 @@ public static class ProDesktopHost
         // elevated ONLOGON task just fired us — its purpose is served and we are the elevated instance,
         // the one place its deletion can never be denied.
         var launchedByResumeTask = Environment.GetCommandLineArgs().Contains("--resume");
-        SweepResumeTaskAtStartup(launchedByResumeTask);
+        if (!OperatingSystem.IsMacOS())  // resume tasks are schtasks — Windows machinery only
+            SweepResumeTaskAtStartup(launchedByResumeTask);
 
         var route = DecideLaunchRoute();
 
         // OOBE is its own sequence (the wizard); the control-center route runs the startup sequence behind
         // the loading screen — VM wake, daemon reachable, tier-1 refresh, and the consented tier-2 upgrade
         // all complete (or degrade with a banner) BEFORE the shell opens.
-        desktop.MainWindow = route == LaunchRoute.Oobe
-            ? new OobeWizardView { DataContext = CreateOobeWizardViewModel() }
-            : CreateStartupWindow();
+        desktop.MainWindow = route != LaunchRoute.Oobe
+            ? CreateStartupWindow()
+            : OperatingSystem.IsMacOS()
+                ? CreateMacOobeWindow(desktop)
+                : new OobeWizardView { DataContext = CreateOobeWizardViewModel() };
+    }
+
+    /// <summary>The macos-host first-run window; completion hands off to the same startup-window
+    /// path the ControlCenter route takes, so post-OOBE behavior is one code path.</summary>
+    private static MacOobeWindow CreateMacOobeWindow(IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        MacOobeWindow? window = null;
+        window = new MacOobeWindow
+        {
+            DataContext = new MacOobeViewModel(onCompleted: () =>
+            {
+                var startup = CreateStartupWindow();
+                desktop.MainWindow = startup;
+                startup.Show();
+                window?.Close();
+            }),
+        };
+        return window;
     }
 
     /// <summary>Shows the shutdown window, runs <see cref="AppShutdownSequence"/> (release keep-alive, and —
@@ -199,12 +226,15 @@ public static class ProDesktopHost
 
     private static LaunchRoute DecideLaunchRoute()
     {
-        // macos-host (interim): the OOBE wizard is the WSL2 substrate's provisioning flow (DISM,
-        // UAC, VM import) — nothing in it applies here, so the launch goes straight to the control
-        // center, whose startup sequence diagnoses a missing daemon or engine honestly. The
-        // Docker-engine detection/canary OOBE for this substrate is a follow-up.
+        // macos-host: its own first-run flow (engine detection, file-sharing canary, jail images,
+        // daemon, CLI picker — MacOobeWindow). The completed marker is the whole state machine on
+        // this substrate (no reboot-resume, no elevation); the skip flags below are honored first.
         if (OperatingSystem.IsMacOS())
-            return LaunchRoute.ControlCenter;
+        {
+            var skip = string.Equals(Environment.GetEnvironmentVariable("MAINGUARD_SKIP_OOBE"), "1", StringComparison.Ordinal)
+                || Environment.GetCommandLineArgs().Any(a => a is "--control-center" or "--no-oobe");
+            return skip || MacOobeState.IsCompleted() ? LaunchRoute.ControlCenter : LaunchRoute.Oobe;
+        }
 
         // Phase-4: MAINGUARD_SKIP_OOBE is the current name; MAINGUARD_SKIP_OOBE stays honored as a
         // read-fallback for one release (a CI script / shell profile may still set the old name).

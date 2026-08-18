@@ -39,7 +39,7 @@ public sealed class HostCommandRunner : IWslRunner
     /// <summary>Runs an argv directly on the host (no shell), streaming <paramref name="stdin"/> when
     /// given. Shared with <see cref="Adapters.ContainerAdapterInstallHost"/>, whose commands are
     /// docker argv rather than in-distro shapes.</summary>
-    internal static async Task<WslRunResult> RunProcessAsync(
+    public static async Task<WslRunResult> RunProcessAsync(
         IReadOnlyList<string> command, string? stdin, CancellationToken ct)
     {
         var psi = new ProcessStartInfo(command[0])

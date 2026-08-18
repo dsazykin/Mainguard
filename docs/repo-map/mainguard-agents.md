@@ -287,6 +287,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       at login": a per-user LaunchAgent starting mainguardd from the app payload with KeepAlive,
       installed/booted via `launchctl bootstrap gui/<uid>`, nothing elevated; with it installed a
       refresh degenerates to "stop and let launchd respawn from the same payload dir".)
+    - `MacOobeState.cs` (the macos-host first-run marker — deliberately simpler than the WSL OOBE's
+      staged machine: no reboot-resume, no elevation, no VM import, so "completed once" is the only
+      stage worth persisting; deleting `macos-oobe.json` re-runs the flow.)
     - `IBootstrapStep.cs` (the check/act step interface +
       `BootstrapStageState`/`BootstrapProgress`/`BootstrapOptions`, the `IBootstrapFileSystem` and
       `IDaemonHealthProbe` seams, plus `IBootstrapStepDiagnostics` (a step names its own unmet condition
