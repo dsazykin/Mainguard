@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using Docker.DotNet.Models;
@@ -187,7 +188,10 @@ public sealed record ContainerSpecRequest(
     string? AgentRepoPath = null,
     string? PackageCachePath = null,
     string? ToolchainsRootPath = null,
-    IReadOnlyList<string>? ToolchainIds = null);
+    IReadOnlyList<string>? ToolchainIds = null,
+    // ESC-I1: the substrate's daemon-owned roots; when supplied, every bind-mount source must sit
+    // under one of them (see SandboxEngineOptions.AllowedMountRoots).
+    IReadOnlyList<string>? AllowedMountRoots = null);
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -356,7 +360,38 @@ public static class ContainerSpecBuilder
             });
         }
 
+        // ESC-I1 made structural: when the substrate declared its daemon-owned roots, every bind
+        // source must sit under one of them. The per-source guards above reject known-bad SHAPES
+        // (drvfs/UNC/drive-letter, a cache outside a caches/ tree); this one rejects everything
+        // that is not known-good — a user repo, the host home, any path a future caller bug names.
+        if (request.AllowedMountRoots is { Count: > 0 } roots)
+        {
+            foreach (var mount in mounts)
+            {
+                if (mount.Type == "bind" && !IsUnderAnyRoot(mount.Source, roots))
+                    throw new SandboxSpecException(
+                        $"ESC-I1: refusing bind source '{mount.Source}' — it is outside every daemon-owned "
+                        + $"substrate root ({string.Join(", ", roots)}). Only substrate-owned state may be "
+                        + "mounted into a jail; user repos and the host filesystem never are.");
+            }
+        }
+
         return mounts;
+    }
+
+    /// <summary>True when <paramref name="path"/> equals a root or sits inside one (textual, in the
+    /// daemon's own namespace — mount sources are daemon-produced paths, never user input).</summary>
+    private static bool IsUnderAnyRoot(string path, IReadOnlyList<string> roots)
+    {
+        var full = Path.GetFullPath(path);
+        foreach (var root in roots)
+        {
+            var fullRoot = Path.GetFullPath(root);
+            if (string.Equals(full, fullRoot, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
+            var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
+            if (full.StartsWith(prefix, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
+        }
+        return false;
     }
 
     /// <summary>Builds the hardened create request; throws typed on any invariant violation.</summary>

@@ -32,7 +32,12 @@ public sealed record SandboxEngineOptions(
     string ProxyUrl,
     string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string ProxyContainerName = EgressProxyConfigurator.ProxyContainerName,
-    TimeSpan? SecretWriteTimeout = null);
+    TimeSpan? SecretWriteTimeout = null,
+    // ESC-I1 made structural: when the substrate names its daemon-owned roots, every bind-mount
+    // SOURCE must sit under one of them — user repos and the rest of the host filesystem can never
+    // be mounted into a jail even by a future caller bug. Null = the substrate has not formalized
+    // its roots (WSL2 today), and the builder's existing per-source rejections stand alone.
+    System.Collections.Generic.IReadOnlyList<string>? AllowedMountRoots = null);
 
 /// <summary>
 /// The Docker implementation of <see cref="ISandboxEngine"/> (P2-07). Builds the hardened create
@@ -202,7 +207,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
             request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
-            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds);
+            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds,
+            _options.AllowedMountRoots);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

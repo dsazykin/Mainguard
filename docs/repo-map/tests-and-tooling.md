@@ -1294,6 +1294,10 @@
   — the same locate-binary-then-generate-a-key probe the signing tests themselves use — to decide
   availability once, fixture-free) gate every environment-dependent test in `GitServiceLfsTests` /
   `GitServiceSigningTests` respectively, mirroring `Terminal/RequiresLibvtermFact.cs`.
+- **`Mainguard.Tests/ContainerSpecMountRootsTests.cs`** — ESC-I1 made structural: with
+  `AllowedMountRoots` on the spec, a bind source outside every declared substrate root (a user
+  repo, a prefix-sibling like `<root>-evil`) is a typed refusal at construction; with no roots
+  declared (WSL2 today) behavior is pinned unchanged.
   **`SandboxSecretWriteTimeoutTests.cs`** — the spawn path's secret delivery is TIME-BOUNDED: it
   drives the real `DockerSandboxEngine.WriteSecretFileAsync` against a fake `IDockerClient` whose exec
   create never completes and never observes its cancellation token (the shape of a Docker endpoint

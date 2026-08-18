@@ -43,7 +43,11 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
         // is documented on AgentEnvironmentComposition.Compose. The daemon and the client are the
         // same machine here, so the client-facing sync-remote handle IS the local bare path.
         var parts = AgentEnvironmentComposition.Compose(
-            vmRoot, dockerClient, auditLog, gatewayEndpoint, hash => ResolveSyncRemote(hash).Url);
+            vmRoot, dockerClient, auditLog, gatewayEndpoint, hash => ResolveSyncRemote(hash).Url,
+            // ESC-I1 made structural on this substrate: bind sources may only name the substrate
+            // root (repos/worktrees/agents/caches) or the daemon's data root (IPC socket dir) —
+            // never a user repo or anything else on the host.
+            allowedMountRoots: root => new[] { root, Mainguard.Git.MainguardPaths.DataRoot() });
         _reposRoot = Path.Combine(parts.Root, "repos");
         Repos = parts.Repos;
         PackageCaches = parts.PackageCaches;

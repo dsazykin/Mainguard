@@ -32,7 +32,11 @@ internal static class AgentEnvironmentComposition
         IDockerClient? dockerClient,
         IAuditLog? auditLog,
         string? gatewayEndpoint,
-        Func<string, string> syncRemoteUrlResolver)
+        Func<string, string> syncRemoteUrlResolver,
+        // ESC-I1: pass the substrate's daemon-owned roots to enforce them on every bind-mount
+        // source at spec construction; null keeps the builder's per-source rejections alone
+        // (WSL2 today — its adapter/toolchain roots are per-user VM paths not yet formalized).
+        Func<string, IReadOnlyList<string>>? allowedMountRoots = null)
     {
         // The root, resolved HERE rather than left to each collaborator's own default, because the
         // allowlist store below needs the same directory the mirrors and worktrees live in. Identical to
@@ -96,7 +100,8 @@ internal static class AgentEnvironmentComposition
         // UsernsRemapPolicy.InheritDaemonRemap), but it now names the daemon-level remap it inherits, and
         // ContainerSpecBuilder refuses the "host" opt-out on the way out.
         var sandboxes = new DockerSandboxEngine(docker, new SandboxEngineOptions(
-            egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap));
+            egress.NetworkName, egress.ProxyUrl, UsernsRemapPolicy.InheritDaemonRemap,
+            AllowedMountRoots: allowedMountRoots?.Invoke(root)));
 
         // The per-repo toolchain layer is built through the SAME Docker client, on the VM's network —
         // deliberately not through the jail's default-deny segment, and touching no allowlist.
