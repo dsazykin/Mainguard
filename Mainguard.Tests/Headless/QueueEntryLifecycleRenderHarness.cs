@@ -390,6 +390,9 @@ public class QueueEntryLifecycleRenderHarness
             return Task.FromResult(new QueueEntryDiscardOutcome(agentId, "uid:1000", DateTimeOffset.UnixEpoch));
         }
 
+        public Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason) =>
+            Task.FromResult(new QueueEntryRejectOutcome(agentId, "uid:1000", DateTimeOffset.UnixEpoch));
+
         public Task ClearStalledVerificationAsync(string agentId) => Task.CompletedTask;
 
         public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind)

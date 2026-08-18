@@ -565,8 +565,11 @@
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
     rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
-    actually hosts**: state words, `CanMerge` gate line, the one Review accent on the front-most fresh
-    Verified entry, and the per-row **`VerifyCommand`** — the human verification trigger. The command is
+    actually hosts**: state words, `CanMerge` gate line, the verified-against stamp (from the wire's
+    `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
+    non-accent `ShowSecondaryReview` button on every other reviewable row (the cockpit is the only
+    home of the Merge button, so a verified branch without a Review path is unmergeable), and the
+    per-row **`VerifyCommand`** — the human verification trigger. The command is
     deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
     (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
     daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
@@ -942,8 +945,9 @@
     used to vanish into an unobserved task and the button read as "nothing happened"): awaits
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
     (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
-    now the one place for the entry-lifecycle actions too (`DiscardAsync`,
-    `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
+    now the one place for the entry-lifecycle actions too (`DiscardAsync`, `RejectAsync` — the
+    review verdict "no", driven from the cockpit's two-step DangerQuiet Reject with an optional
+    reason box — `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
     daemon answers a REFUSED discard (or resume) with an ordinary successful RPC carrying
     `discarded=false` / `resumed=false`, so "no
     exception" is not evidence anything was removed. `DaemonBackedOrchestrator.DiscardEntryAsync` turns

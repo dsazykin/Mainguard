@@ -81,9 +81,16 @@ public partial class QueueRailViewModel : ViewModelBase
 
         IsEmpty = Entries.Count == 0;
 
-        // The rail's ONE accent: the front-most fresh Verified entry gets the Review CTA.
+        // The rail's ONE accent: the front-most fresh Verified entry gets the Review CTA. Every OTHER
+        // reviewable row gets the secondary (non-accent) Review affordance — before it existed, a
+        // second Verified branch had no path to the cockpit at all, and the cockpit is the only place
+        // the Merge button lives, so only one branch was ever mergeable no matter how many verified.
         var first = Entries.FirstOrDefault(e => e.IsReviewable);
-        foreach (var e in Entries) e.ShowReviewAccent = ReferenceEquals(e, first);
+        foreach (var e in Entries)
+        {
+            e.ShowReviewAccent = ReferenceEquals(e, first);
+            e.ShowSecondaryReview = e.IsReviewable && !e.ShowReviewAccent;
+        }
 
         // The gate line mirrors the front entry's CanMerge reason (§3.4).
         if (first is not null && !_queue.CanMerge(first.AgentId, out var reason))
@@ -132,6 +139,11 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private string _badgeGeometryKey = "AgentWorkingIcon";
     [ObservableProperty] private bool _isReviewable;
     [ObservableProperty] private bool _showReviewAccent;
+
+    /// <summary>The non-accent Review affordance for reviewable rows BEHIND the front one — the rail's
+    /// one accent stays on the front entry (One Accent Rule), but every verified branch must be able to
+    /// reach the cockpit, because the cockpit is the only place the Merge button exists.</summary>
+    [ObservableProperty] private bool _showSecondaryReview;
 
     /// <summary>Whether the human can ask for a verification run on this entry right now. False while one
     /// is already in flight (the daemon rejects a concurrent run) and on the terminal states.</summary>

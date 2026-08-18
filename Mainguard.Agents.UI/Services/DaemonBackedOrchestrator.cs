@@ -1446,6 +1446,39 @@ public sealed class DaemonBackedOrchestrator :
         return new QueueEntryDiscardOutcome(agentId, response.DiscardedBy ?? "", at);
     }
 
+    /// <summary>Rejects a verified entry in review — same refusal discipline as
+    /// <see cref="DiscardEntryAsync"/>: the daemon's "no" is thrown with its reason, never swallowed.</summary>
+    public async Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't reject — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .RejectEntryAsync(repoHandle!, agentId, reason ?? string.Empty, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Rejected)
+        {
+            throw new InvalidOperationException($"Can't reject — {response.Reason}.");
+        }
+
+        DateTimeOffset? at = DateTimeOffset.TryParse(
+            response.RejectedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
+
+        return new QueueEntryRejectOutcome(agentId, response.RejectedBy ?? "", at);
+    }
+
     /// <summary>
     /// Clears a <c>Verifying</c> entry with no run behind it. Refusals — chiefly "a verification is
     /// running for this entry right now" — are thrown for the same reason as above: they are the answer

@@ -47,6 +47,62 @@ public sealed class QueueProjectionRenderingTests
         Assert.Equal("", row.VerifiedAgainst);
     }
 
+    /// <summary>Every reviewable row must reach the cockpit — it is the only home of the Merge button —
+    /// while the rail keeps exactly ONE accented Review (the front entry; the One Accent Rule).</summary>
+    [Fact]
+    public void EveryReviewableRow_ExposesReview_WithExactlyOneAccent()
+    {
+        var queue = new TwoVerifiedStub();
+        var rail = new QueueRailViewModel(queue, _ => { });
+
+        var reviewable = rail.Entries.Where(e => e.IsReviewable).ToList();
+        Assert.Equal(2, reviewable.Count);
+        Assert.Equal(1, reviewable.Count(e => e.ShowReviewAccent));
+        Assert.All(reviewable, e => Assert.True(e.ShowReviewAccent || e.ShowSecondaryReview,
+            $"{e.AgentId}: a verified branch with no Review affordance cannot be merged at all"));
+        Assert.DoesNotContain(reviewable, e => e.ShowReviewAccent && e.ShowSecondaryReview);
+
+        // Non-reviewable rows get neither.
+        Assert.All(rail.Entries.Where(e => !e.IsReviewable),
+            e => Assert.False(e.ShowReviewAccent || e.ShowSecondaryReview));
+    }
+
+    private sealed class TwoVerifiedStub : IMergeQueueService
+    {
+        public string MainSha => "abc123";
+
+        public IReadOnlyList<QueueEntry> GetQueue() => new[]
+        {
+            WireEntry(WorkerMergeState.Verified, "sha-1") with { AgentId = "front" },
+            WireEntry(WorkerMergeState.Verified, "sha-1") with { AgentId = "second" },
+            WireEntry(WorkerMergeState.Working, null) with { AgentId = "still-working" },
+        };
+
+        public bool CanMerge(string agentId, out string reason)
+        {
+            reason = "";
+            return true;
+        }
+
+        public Task<VerificationOutcome> RunVerificationAsync(string agentId) =>
+            throw new NotSupportedException();
+
+        public Task<MergeOutcome> ConfirmMergeAsync(string agentId) => throw new NotSupportedException();
+
+        public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId) => Task.CompletedTask;
+
+        public Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason) =>
+            throw new NotSupportedException();
+
+        public Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason) =>
+            throw new NotSupportedException();
+
+        public Task ClearStalledVerificationAsync(string agentId) => Task.CompletedTask;
+
+        public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind) =>
+            throw new NotSupportedException();
+    }
+
     [Fact]
     public void ChangedTestCommand_RendersInTheCockpitHeader_EvenWithoutARunCountDelta()
     {

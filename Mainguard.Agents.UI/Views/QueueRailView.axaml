@@ -92,6 +92,11 @@
                   <WrapPanel Orientation="Horizontal" IsVisible="{Binding !IsConfirmingDiscard}">
                     <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3" Margin="0,2,6,0"
                             Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowReviewAccent}"/>
+                    <!-- Reviewable rows behind the front one: same action, non-accent (the rail keeps its
+                         ONE accent on the front entry) — without this a second Verified branch had no
+                         path to the cockpit, and the cockpit is the only home of the Merge button. -->
+                    <Button Classes="Secondary" Content="Review" FontSize="12" Padding="10,3" Margin="0,2,6,0"
+                            Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowSecondaryReview}"/>
                     <Button Classes="Secondary" Content="{Binding VerifyButtonText}" FontSize="12" Padding="10,3"
                             Margin="0,2,6,0" Command="{Binding VerifyCommand}" IsEnabled="{Binding CanVerify}"
                             ToolTip.Tip="Run this repo's verification command in this agent's own jail."/>

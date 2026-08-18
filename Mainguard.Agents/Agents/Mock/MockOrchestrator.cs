@@ -624,6 +624,36 @@ public sealed class MockOrchestrator :
     }
 
     /// <summary>
+    /// Mock reject — the daemon's shape: legal only from <c>Verified</c>/<c>AwaitingReview</c>
+    /// (the review verdict "no"), terminal, refuses everything else with the daemon's wording.
+    /// </summary>
+    public Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason)
+    {
+        var raised = new List<AgentEvent>();
+        QueueEntryRejectOutcome outcome;
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Merge is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview))
+            {
+                throw new InvalidOperationException(
+                    a.Merge is WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded
+                        ? $"Can't reject — this entry is already {a.Merge} — a terminal entry cannot be rejected."
+                        : $"Can't reject — only a verified branch can be rejected in review — this entry is {a.Merge}; discard the entry instead.");
+            }
+
+            SetMerge(a, WorkerMergeState.Rejected, raised);
+            a.InQueue = false;
+            a.Detail = string.IsNullOrWhiteSpace(reason) ? "rejected in review" : "rejected — " + reason;
+            outcome = new QueueEntryRejectOutcome(agentId, "mock:local", DateTimeOffset.Now);
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.FromResult(outcome);
+    }
+
+    /// <summary>
     /// Mock clear-stalled-verification. The mock has no real runs, so every <c>Verifying</c> entry here is
     /// by definition stalled; anything else refuses with the daemon's wording.
     /// </summary>

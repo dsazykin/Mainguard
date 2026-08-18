@@ -52,12 +52,15 @@
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate; **`DiscardEntry`/`ClearStalledVerification`** are the human
+    unmergeable branch rather than a gate; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
     entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
     takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
-    untouched) and, like `ApprovePlanRequest`, carries **no actor field** — the discarding identity is
-    daemon-derived, because an attribution the client fills in is one any token-holder can forge; both
-    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.has_live_sandbox`**
+    untouched); `RejectEntry` is the review verdict "no" — terminal `Rejected`, legal only from
+    `Verified`/`AwaitingReview` (an unverified entry is refused toward Discard), and unlike a discard
+    the rejected row STAYS on the queue stream as its terminal so the verdict is never silently lost;
+    both, like `ApprovePlanRequest`, carry **no actor field** — the acting identity is
+    daemon-derived, because an attribution the client fills in is one any token-holder can forge; all
+    three RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.has_live_sandbox`**
     (`optional`) says whether the entry still HAS a jail — the fact that decides whether it is workable at
     all, since verification runs only in the worker's own sandbox — so the rail can offer Resume on a
     stranded row and withhold Verify instead of leaving an enabled button whose only behaviour is an

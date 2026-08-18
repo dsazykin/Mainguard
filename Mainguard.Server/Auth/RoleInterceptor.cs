@@ -46,6 +46,9 @@ public sealed class RoleInterceptor : Interceptor
         // flagged, refused, or simply never verified — erasing the evidence instead of clearing the gate.
         // It is also the queue's only human-driven terminal besides the merge itself.
         "/mainguard.v1.MergeQueueService/DiscardEntry",
+        // Rejecting is the review verdict "no" — merge power's other terminal. An agent that could
+        // reject a co-tenant's verified branch would hold veto over work it competes with.
+        "/mainguard.v1.MergeQueueService/RejectEntry",
         // Same boundary: clearing a stalled verification puts a branch back to Working, which is the state
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.

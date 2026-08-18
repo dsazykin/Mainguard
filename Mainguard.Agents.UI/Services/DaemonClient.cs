@@ -594,6 +594,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Rejects a VERIFIED entry in review (terminal). Same identity discipline as
+    /// <see cref="DiscardEntryAsync"/>: the request carries no actor field — the daemon derives it.</summary>
+    public async Task<RejectEntryResponse> RejectEntryAsync(
+        string repoHandle, string agentId, string reason, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            Reason = reason ?? string.Empty,
+        }, CallOptions(ct, deadline));
+    }
+
     /// <summary>Clears a <c>Verifying</c> entry with no run behind it, returning it to <c>Working</c>.</summary>
     public async Task<ClearStalledVerificationResponse> ClearStalledVerificationAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)

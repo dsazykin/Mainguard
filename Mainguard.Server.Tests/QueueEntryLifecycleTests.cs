@@ -97,6 +97,66 @@ public sealed class QueueEntryLifecycleTests
         Assert.False(string.IsNullOrWhiteSpace(audited.Fields["when"]));
     }
 
+    // ---- 1b. reject: the review verdict "no", over the real RPC ----------------------------------
+
+    /// <summary>
+    /// A VERIFIED entry rejected over the real RPC lands on the daemon's terminal <c>Rejected</c> (never
+    /// <c>Merged</c>), is attributed to the daemon-derived identity, and the audit event carries the
+    /// reviewer's reason. An entry that was never verified is refused with wording that points at
+    /// Discard — rejecting is a judgment about reviewed work, and there is nothing to review yet.
+    /// </summary>
+    [Fact]
+    public async Task RejectEntry_RejectsAVerifiedEntry_AndRefusesAnUnverifiedOne()
+    {
+        using var host = new DaemonFixture();
+        var audit = host.Services.GetRequiredService<IAuditLog>();
+        var queue = SeedQueue(host, audit);
+        queue.EnsureEntry("reviewed", MergeEntryOrigin.Local);
+        queue.EnsureEntry("unverified", MergeEntryOrigin.Local);
+        await queue.RunVerificationAsync("reviewed", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verified, queue.GetState("reviewed"));
+        var (client, headers) = Client(host);
+
+        var refused = await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = "unverified",
+            Reason = "",
+        }, headers);
+        Assert.False(refused.Rejected);
+        Assert.Contains("only a verified branch", refused.Reason);
+        Assert.Contains("discard", refused.Reason);
+
+        var response = await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = "reviewed",
+            Reason = "wrong approach entirely",
+        }, headers);
+
+        Assert.True(response.Rejected, response.Reason);
+        Assert.False(string.IsNullOrWhiteSpace(response.RejectedBy));
+        Assert.Equal(WorkerMergeState.Rejected, queue.GetState("reviewed"));
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("reviewed"));
+
+        // The request carries no actor field — the attribution is the daemon's, structurally (SA-1/F2).
+        var fields = RejectEntryRequest.Descriptor.Fields.InDeclarationOrder().Select(f => f.Name).ToArray();
+        Assert.DoesNotContain("actor", fields);
+        Assert.DoesNotContain("rejected_by", fields);
+
+        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.RejectedEvent);
+        Assert.Equal("reviewed", audited.Fields["agent"]);
+        Assert.Equal("wrong approach entirely", audited.Fields["reason"]);
+        Assert.Equal(response.RejectedBy, audited.Fields["by"]);
+
+        // Unlike a discard (housekeeping — the row vanishes), a reject is a review VERDICT: the row
+        // stays on the stream as the terminal it reached, so the rail renders "Rejected" rather than
+        // silently losing the record of a branch a human said no to.
+        var after = await SnapshotAsync(client, headers);
+        var row = Assert.Single(after.Entries, e => e.AgentId == "reviewed");
+        Assert.Equal(nameof(WorkerMergeState.Rejected), row.State);
+    }
+
     /// <summary>
     /// The discarding identity is derived from the connection, and there is no way for a caller to assert
     /// one — the request message carries no actor field at all. A record a token-holder can populate is an

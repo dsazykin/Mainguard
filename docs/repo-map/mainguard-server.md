@@ -75,7 +75,7 @@
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
   `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
-  (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
+  (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
   blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
   branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
@@ -396,7 +396,7 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` refuses while this
+  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` (and `RejectEntry`, its clone for the review verdict) refuses while this
   repo's outstanding merge lease names the entry — a terminal transition inside the
   `BeginMerge`→`ConfirmMerge` window would make `ConfirmMerge` refuse to record a merge that really
   landed — derives the actor from `IApproverIdentityResolver` (never the request; there is no such

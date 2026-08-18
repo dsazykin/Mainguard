@@ -70,6 +70,24 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesRejectToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+
+        // Rejecting is the review verdict "no" — merge power's other terminal; an agent that could
+        // reject a co-tenant's verified branch would hold veto over work it competes with.
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.RejectEntryAsync(
+                new RejectEntryRequest { RepoHandle = "repo", AgentId = "a" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesPlanApprovalToCoordinator()
     {
         using var fixture = new DaemonFixture();

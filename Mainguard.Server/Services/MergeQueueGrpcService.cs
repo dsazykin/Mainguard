@@ -381,6 +381,57 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     }
 
     /// <summary>
+    /// The review verdict "no" — the human judged a verified branch's work and rejected it (terminal).
+    /// Mirrors <see cref="DiscardEntry"/> exactly: daemon-derived actor (no actor field on the request),
+    /// refusal-as-response, refused while this entry holds the outstanding merge lease, NOT gated by
+    /// the kill switch (freezing merges is not a reason to forbid a review verdict). The state rules —
+    /// only Verified/AwaitingReview can be rejected — live in <c>MergeQueue.TryReject</c>.
+    /// </summary>
+    public override Task<RejectEntryResponse> RejectEntry(RejectEntryRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        var ctx = Resolve(request.RepoHandle);
+
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is not null && string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            const string held =
+                "a merge is in progress for this entry — finish or abandon it before rejecting";
+            _log.LogWarning("RejectEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, held);
+            return Task.FromResult(new RejectEntryResponse { Rejected = false, Reason = held });
+        }
+
+        // SA-1/F2: the actor comes from the connection, never from the message.
+        var actor = _identity.Resolve(context);
+        var when = DateTimeOffset.UtcNow;
+
+        if (!ctx.Queue.TryReject(request.AgentId, actor, request.Reason ?? string.Empty, out var refusal))
+        {
+            _log.LogWarning("RejectEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, refusal);
+            return Task.FromResult(new RejectEntryResponse { Rejected = false, Reason = refusal });
+        }
+
+        _log.LogInformation(
+            "RejectEntry repo={Repo} agent={Agent} by={By} reason={Reason}",
+            request.RepoHandle, request.AgentId, actor,
+            string.IsNullOrWhiteSpace(request.Reason) ? "(none given)" : request.Reason);
+
+        return Task.FromResult(new RejectEntryResponse
+        {
+            Rejected = true,
+            Reason = "",
+            RejectedBy = actor,
+            RejectedAt = when.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        });
+    }
+
+    /// <summary>
     /// Clears a <c>Verifying</c> state with no run behind it (see the RPC comment in the proto). The
     /// "is anything actually running" question is only answerable here — the in-flight set is daemon
     /// memory — so both the decision and the refusal live daemon-side.

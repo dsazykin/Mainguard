@@ -1143,7 +1143,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 ReviewCockpit = new ReviewCockpitViewModel(
                     ctx,
                     onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id),
-                    live: new Services.DaemonFlaggedChangeSource(_queue));
+                    live: new Services.DaemonFlaggedChangeSource(_queue),
+                    onReject: async (id, reason) =>
+                    {
+                        await Services.MergeActionRunner.RejectAsync(_queue, id, reason).ConfigureAwait(true);
+                        CloseReview();
+                        Queue.Refresh();
+                    });
                 return;
             }
         }

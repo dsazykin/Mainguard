@@ -1118,8 +1118,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       after a restart). **Human entry lifecycle** (also NOT on `IMergeQueue`, for the same reason the
       merge is not — an agent-reachable discard is a way to erase the evidence blocking its own branch):
       `TryDiscard(agentId, by, reason)` walks any non-terminal entry to the new terminal
-      `WorkerMergeState.Discarded` — distinct from `Rejected` (a verdict on the CODE, reachable only
-      from `AwaitingReview`) and from `Merged` — persisting a `QueueEntryDiscard` (`GetDiscard`) on the
+      `WorkerMergeState.Discarded` — distinct from `Rejected` (a verdict on the CODE, now reachable
+      in the product via `TryReject(agentId, by, reason)`: legal only from `Verified`/`AwaitingReview`,
+      the Verified→AwaitingReview→Rejected walk mirrors `MarkMergedLocked` under one lock, appends the
+      `queue_entry_rejected` audit event with by/reason/from_state — the audit log is the durable
+      record, there is no per-row reject column — and the rejected row STAYS in `Agents` as its
+      terminal, unlike a discard) and from `Merged` — persisting a `QueueEntryDiscard` (`GetDiscard`) on the
       entry's own row in the same `Save` and appending the `queue_entry_discarded` audit event; it
       refuses an untracked id (`SetStateLocked` would otherwise invent the entry, since every unknown
       agent defaults to `Working`) and any terminal one. A discarded entry leaves **`Agents`** — the

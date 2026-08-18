@@ -258,6 +258,7 @@ public sealed class MergeQueue : IMergeQueue
 
     /// <summary>Audit event a human discard appends (the durable half is the entry's own persisted row).</summary>
     public const string DiscardedEvent = "queue_entry_discarded";
+    public const string RejectedEvent = "queue_entry_rejected";
 
     /// <summary>
     /// Audit event appended when the stale cascade could not reparent a branch, carrying the
@@ -799,6 +800,72 @@ public sealed class MergeQueue : IMergeQueue
             ["reason"] = record.Reason,
             ["from_state"] = from.ToString(),
             ["when"] = record.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        Changed?.Invoke();
+        refusal = "";
+        return true;
+    }
+
+    /// <summary>
+    /// The review verdict "no" — a human looked at a VERIFIED branch's work and rejected it. Terminal,
+    /// exactly as <see cref="WorkerMergeState.Rejected"/> has always been in the pinned transition table;
+    /// the walk is Verified → AwaitingReview → Rejected under one lock, mirroring
+    /// <c>MarkMergedLocked</c>'s merge walk, so every step is a legal recorded transition.
+    ///
+    /// <para>Refused for anything not Verified/AwaitingReview: rejecting is a judgment about reviewed
+    /// work, and there is nothing to review before a verification ran — un-verified housekeeping is
+    /// <see cref="TryDiscard"/>'s job, and the refusal says so. Refused for unknown ids for the same
+    /// reason TryDiscard refuses them: SetStateLocked would invent the entry.</para>
+    ///
+    /// <para>The by/reason/when facts land in the audit event (and the daemon's log); unlike a discard
+    /// there is no per-row record column, so a daemon restart keeps the terminal <c>Rejected</c> state
+    /// (states persist per transition) but not the prose — the audit log is the durable record.</para>
+    /// </summary>
+    /// <param name="agentId">The entry to reject.</param>
+    /// <param name="rejectedBy">Daemon-derived actor. Never a client-supplied identity (SA-1/F2).</param>
+    /// <param name="reason">The reviewer's verbatim reason; may be empty.</param>
+    /// <param name="refusal">Render-verbatim reason when this returns false.</param>
+    /// <returns>True when the entry moved to <see cref="WorkerMergeState.Rejected"/>.</returns>
+    public bool TryReject(string agentId, string rejectedBy, string reason, out string refusal)
+    {
+        WorkerMergeState from;
+        lock (_gate)
+        {
+            if (!_states.TryGetValue(agentId, out from))
+            {
+                refusal = "this entry is not in the merge queue";
+                return false;
+            }
+
+            if (from is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview))
+            {
+                refusal = IsTerminal(from)
+                    ? $"this entry is already {from} — a terminal entry cannot be rejected"
+                    : $"only a verified branch can be rejected in review — this entry is {from}; discard the entry instead";
+                return false;
+            }
+
+            if (from == WorkerMergeState.Verified)
+            {
+                SetStateLocked(agentId, WorkerMergeState.AwaitingReview);
+            }
+
+            SetStateLocked(agentId, WorkerMergeState.Rejected);
+
+            // A run that was somehow still in flight is no longer this entry's business (same guard
+            // as TryDiscard; the completion path checks for a terminal state before transitioning).
+            _verifying.Remove(agentId);
+        }
+
+        _audit.Append(new AuditEvent(RejectedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["by"] = string.IsNullOrWhiteSpace(rejectedBy) ? "unknown" : rejectedBy,
+            ["reason"] = reason ?? string.Empty,
+            ["from_state"] = from.ToString(),
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
         }));
 
         Changed?.Invoke();
