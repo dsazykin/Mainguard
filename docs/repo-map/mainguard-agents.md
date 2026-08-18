@@ -272,6 +272,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       pure argument-list builders scoped to our `MainguardEnv` distro only — lifecycle is
       `--terminate`→poll→`--unregister`, **never the VM-wide shutdown verb (G-12)**;
       `WslRunner.ParseDistroList` for `--list --quiet`).
+    - `HostCommandRunner.cs` (the macos-host `IWslRunner`: accepts the in-distro shapes the
+      bootstrap layer builds, strips the WSL prefix and runs the inner command DIRECTLY on the
+      host — "the place commands run" IS the host there, so `SandboxImageProvisioner` and friends
+      work unchanged. VM lifecycle verbs throw typed — no VM of ours exists to manage, and a
+      caller reaching for one is a composition bug. `-u root` runs as the current user.)
+    - `MacDaemonController.cs` (lifecycle of the LOCAL mainguardd on macos-host: idempotent start
+      from the app payload through the dotnet muxer — never the payload apphost, which current
+      macOS SIGKILLs outside its first-run location — pgrep-by-payload-dll discovery, and
+      SIGTERM-then-SIGKILL stop.)
+    - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
+      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.)
     - `IBootstrapStep.cs` (the check/act step interface +
       `BootstrapStageState`/`BootstrapProgress`/`BootstrapOptions`, the `IBootstrapFileSystem` and
       `IDaemonHealthProbe` seams, plus `IBootstrapStepDiagnostics` (a step names its own unmet condition

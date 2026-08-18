@@ -880,6 +880,9 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Agents/HostCommandRunnerTests.cs`** — the macos-host `IWslRunner`:
+  in-distro shapes strip to the inner command (plain and `-u root`), stdin reaches the child, a
+  real host echo/cat round-trips (Unix-only), and a VM lifecycle verb is a typed refusal.
 - **`Mainguard.Server.Tests/Fixtures/CanonicalTemp.cs`** — the canonical (symlink-resolved) temp
   root for paths that CROSS the container boundary: macOS serves the temp dir behind `/var →
   /private/var`, host git canonicalizes its gitdir/alternates, and a jail has no `/var` symlink —

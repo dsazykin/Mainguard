@@ -129,6 +129,10 @@ public static class ProDesktopHost
     /// framework Exit backstop both call this without the terminate ever running twice.</summary>
     private static async Task StopVmScopedAsync(CancellationToken ct)
     {
+        // macos-host: there is no MainguardEnv VM — the Docker engine manages its own lifetime.
+        if (OperatingSystem.IsMacOS())
+            return;
+
         if (System.Threading.Interlocked.Exchange(ref _vmStopRan, 1) != 0)
             return;
 
@@ -195,6 +199,13 @@ public static class ProDesktopHost
 
     private static LaunchRoute DecideLaunchRoute()
     {
+        // macos-host (interim): the OOBE wizard is the WSL2 substrate's provisioning flow (DISM,
+        // UAC, VM import) — nothing in it applies here, so the launch goes straight to the control
+        // center, whose startup sequence diagnoses a missing daemon or engine honestly. The
+        // Docker-engine detection/canary OOBE for this substrate is a follow-up.
+        if (OperatingSystem.IsMacOS())
+            return LaunchRoute.ControlCenter;
+
         // Phase-4: MAINGUARD_SKIP_OOBE is the current name; MAINGUARD_SKIP_OOBE stays honored as a
         // read-fallback for one release (a CI script / shell profile may still set the old name).
         if (string.Equals(
@@ -222,11 +233,19 @@ public static class ProDesktopHost
     private static StartupWindow CreateStartupWindow()
     {
         var vm = new StartupWindowViewModel();
-        var env = new ProductionStartupEnvironment(EnsureKeepAlive, ProComposition.LogOobe)
-        {
-            Host = vm,
-            VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
-        };
+        // The per-substrate startup environment: WSL legs on Windows, the host-local daemon +
+        // Docker-engine legs on macOS (MacStartupEnvironment). Same AppStartupSequence over both.
+        IAppStartupEnvironment env = OperatingSystem.IsMacOS()
+            ? new MacStartupEnvironment(ProComposition.LogOobe)
+            {
+                Host = vm,
+                VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
+            }
+            : new ProductionStartupEnvironment(EnsureKeepAlive, ProComposition.LogOobe)
+            {
+                Host = vm,
+                VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
+            };
         var sequence = new AppStartupSequence(env);
         vm.SequenceRunner = (progress, ct) => RunStartupSequenceAsync(sequence, env, progress, ct);
         return new StartupWindow { DataContext = vm };
@@ -234,7 +253,7 @@ public static class ProDesktopHost
 
     private static async Task<StartupResult> RunStartupSequenceAsync(
         AppStartupSequence sequence,
-        ProductionStartupEnvironment env,
+        IAppStartupEnvironment env,
         IProgress<StartupProgress> progress,
         CancellationToken ct)
     {
@@ -258,6 +277,13 @@ public static class ProDesktopHost
     /// </summary>
     private static void KickAgentCliUpdateCheck()
     {
+        // macos-host: agent CLIs are not installable on this substrate yet (the container-backed
+        // install host is the follow-up), so there is nothing to check updates for.
+        if (OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
         if (Interlocked.Exchange(ref _cliUpdateCheckRan, 1) != 0)
         {
             return;

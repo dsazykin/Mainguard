@@ -1052,7 +1052,14 @@
   App-side Pro `Services/` moved here too
   (`ProductionStartupEnvironment`/`ProductionShutdownEnvironment`, `LaunchRouter`,
   `EndToEndDaemonHealthProbe`, `SandboxImageInstaller`, `DaemonUpdateToastPublisher`,
-  `AgentNotificationService`, `DockLayoutPersistence`, `DeepLinkHandler`), reseamed to reach the shell
+  `AgentNotificationService`, `DockLayoutPersistence`, `DeepLinkHandler`, and
+  `MacStartupEnvironment` — the macos-host `IAppStartupEnvironment`: "wake the VM" becomes
+  "ensure the local mainguardd runs from the payload" (`MacDaemonController`), tier-1 refresh
+  restarts that process (`MacDaemonUpdater`), tier-2 never offers (no OS to upgrade), and the
+  image probe/build runs against the host engine through `HostCommandRunner`;
+  `ProDesktopHost.CreateStartupWindow` selects it by platform, `DecideLaunchRoute` goes straight
+  to the control center on macOS — the OOBE wizard is the WSL2 provisioning flow — and the VM
+  stop / agent-CLI update-check paths no-op there), reseamed to reach the shell
   only via `ProComposition` (toasts via `ShowShellToast`, settings via `ProComposition.Settings`,
   version via entry assembly). Grants `Mainguard.Tests` `InternalsVisibleTo` (the moved
   `VtScreen`/terminal grid-readback hooks). Referenced by `Mainguard.Pro.App` (the Pro head — the ONLY

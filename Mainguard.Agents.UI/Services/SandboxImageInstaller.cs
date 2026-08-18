@@ -27,7 +27,10 @@ internal static class SandboxImageInstaller
     /// image regardless of the probe); false for the startup missing/stale auto-repair.</param>
     public static Task RunAsync(Action<string> log, IProgress<string>? progress = null, bool force = false) =>
         SandboxImageAutoProvision.RunAsync(
-            new SandboxImageProvisioner(new WslRunner()),
+            // The runner is the substrate seam: in-distro over WSL on Windows, the host's own
+            // docker CLI on macOS (HostCommandRunner interprets the same in-distro shapes).
+            new SandboxImageProvisioner(
+                OperatingSystem.IsMacOS() ? new HostCommandRunner() : new WslRunner()),
             SandboxImageProvisioner.DefaultBundledImagesDirectory(),
             log,
             CancellationToken.None,
