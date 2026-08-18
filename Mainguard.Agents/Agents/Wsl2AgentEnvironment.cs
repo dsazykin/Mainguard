@@ -61,8 +61,10 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
         Repos = provisioner;
 
         // P2-07: hardened sandbox engine + default-deny egress. The Docker client connects lazily —
-        // building it here does not require a live daemon (safe for construction/tests).
-        var docker = dockerClient ?? new DockerClientConfiguration().CreateClient();
+        // building it here does not require a live daemon (safe for construction/tests). The endpoint
+        // comes from DockerEndpointResolver (DOCKER_HOST → CLI context → engine sockets → default);
+        // on Windows that is always the library default, so the WSL2 path is unchanged.
+        var docker = dockerClient ?? DockerEndpointResolver.CreateClient();
         var audit = auditLog ?? new InMemoryAuditLog();
 
         // MG-3: the worktree manager owns the mediated publish, so it gets the audit sink — a REFUSED

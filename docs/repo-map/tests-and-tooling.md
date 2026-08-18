@@ -705,8 +705,11 @@
     reflection proof that no push/receive method exists), and `Headless/EgressAllowlistRenderHarness`
     (the egress allowlist `Window` in all five themes — default + the A6-warning state — PNGs to
     `artifacts_headless/`).
-  - `TestTools/PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact` skip-with-reason
-    attributes.
+  - `TestTools/PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact`/`UnixOnlyFact`/
+    `MacOnlyFact` skip-with-reason attributes. `UnixOnlyFact` (Linux + macOS) is for any-Unix
+    behavior — forkpty, unix file modes — now that the macos-host substrate means "not Windows"
+    no longer implies Linux; `LinuxOnlyFact` stays for genuinely Linux-bound dependencies
+    (cgroups, /proc, the in-VM daemon).
   - `TestTools/SelfInvocation.cs` — the quoted command prefix tests hand to
     `GitService.SelfInvocationOverride` to spawn the COPIED Mainguard.Client.App head. On macOS it
     always takes the `dotnet <dll>` form: current macOS pins an executable name to the location it
@@ -877,6 +880,10 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Agents/DockerEndpointResolverTests.cs`** — the engine-agnostic Docker
+  endpoint resolution (macos-host): DOCKER_HOST wins, CLI context read from a real on-disk
+  `~/.docker`-shaped fixture, socket-probe order, malformed-config fall-through. Pure logic via
+  `ResolveCore` — no live engine, no environment mutation.
 - **`Mainguard.Server.Tests/Agents/QueueEntryResumeDockerTests.cs`** (`RequiresDocker`) — the decisive
   end-to-end for resume, against a real jail. A real agent spawned by the shipped chain commits in its
   real worktree; the container is then removed through the engine and the daemon's session record

@@ -642,6 +642,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       form: that comparison drives destructive recreate paths (a jail, and the shared proxy whose
       replacement strands every running jail's egress), so a naive `!=` against a digest would recreate
       the world on every spawn). **Docker impls:**
+    - `DockerEndpointResolver.cs` — where the daemon's Docker endpoint comes from, so the sandbox
+      layer works against whichever engine the machine runs (Docker Desktop / OrbStack / Colima).
+      Mirrors the docker CLI's own order: `DOCKER_HOST` → the CLI's current context (read straight
+      from `~/.docker`, no process spawned) → well-known engine sockets → library default. Windows
+      stays on the library default (named pipe) so the WSL2 substrate never changes under a stray
+      `DOCKER_HOST`. Consumed by `Wsl2AgentEnvironment`, `DaemonHost`'s resource-sampler client,
+      and the gateway's container lister.
     - `DockerSandboxEngine.cs` (persistent jail keyed by repo+agent — `docker start` a stopped one,
       recreate on base-image change; **no runtime image-build** — G-16; writes secrets to per-owner 0400
       tmpfs via stdin exec, never argv/env — that stdin rides `ExecStdinTransport.cs` and NOT

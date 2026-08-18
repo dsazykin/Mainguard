@@ -212,7 +212,7 @@ public static class DaemonHost
         // The Docker client is built here and shared rather than per call: this one is consulted on a poll
         // loop, and a fresh client per tick would churn connections to the daemon socket for no reason.
         builder.Services.AddSingleton<Docker.DotNet.IDockerClient>(
-            _ => new Docker.DotNet.DockerClientConfiguration().CreateClient());
+            _ => Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient());
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler>(sp =>
         {
             try

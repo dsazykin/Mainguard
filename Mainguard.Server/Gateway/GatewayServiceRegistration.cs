@@ -583,7 +583,7 @@ public static class GatewayServiceRegistration
         {
             try
             {
-                using var docker = new DockerClientConfiguration().CreateClient();
+                using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
                 return await DockerAgentLister.ListAsync(docker, ct).ConfigureAwait(false);
             }
             catch (Exception)

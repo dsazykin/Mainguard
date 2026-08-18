@@ -38,3 +38,40 @@ public sealed class WindowsOnlyFactAttribute : FactAttribute
         }
     }
 }
+
+/// <summary>
+/// A <see cref="FactAttribute"/> for any-Unix behavior (forkpty, unix file modes, unix sockets):
+/// runs on Linux and macOS, skips (with a reason, never failing) on Windows. Use
+/// <see cref="LinuxOnlyFactAttribute"/> only for genuinely Linux-bound dependencies (cgroups,
+/// /proc, the in-VM daemon) — the macos-host substrate runs the daemon on macOS, so "not
+/// Windows" no longer implies Linux.
+/// </summary>
+public sealed class UnixOnlyFactAttribute : FactAttribute
+{
+    public UnixOnlyFactAttribute(string? because = null)
+    {
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            Skip = because is null
+                ? "Unix-only test. Skipped on Windows."
+                : $"Unix-only: {because}. Skipped on Windows.";
+        }
+    }
+}
+
+/// <summary>
+/// A <see cref="FactAttribute"/> that runs only on macOS (macos-host substrate specifics),
+/// skipping with a reason elsewhere.
+/// </summary>
+public sealed class MacOnlyFactAttribute : FactAttribute
+{
+    public MacOnlyFactAttribute(string? because = null)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            Skip = because is null
+                ? "macOS-only test (macos-host substrate). Skipped on this platform."
+                : $"macOS-only: {because}. Skipped on this platform.";
+        }
+    }
+}
