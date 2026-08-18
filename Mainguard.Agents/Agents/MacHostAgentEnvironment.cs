@@ -16,10 +16,9 @@ namespace Mainguard.Agents.Agents;
 /// <c>"mainguard-local"</c> sync-remote name appears in <see cref="ResolveSyncRemote"/> and
 /// NOWHERE else in the codebase (SC-2), exactly like the WSL2 substrate's "mainguard-vm".
 ///
-/// <para><see cref="IAgentEnvironment.Toolchains"/> is intentionally null for now: toolchains and
-/// agent CLIs execute IN-JAIL (linux-arm64), so installing them on the macOS host would be wrong
-/// by construction — the spawn path already refuses with a typed, substrate-naming error. A
-/// container-backed install host is the follow-up.</para>
+/// <para>Toolchains and agent CLIs execute IN-JAIL (linux), so installs run through
+/// <see cref="Adapters.ContainerAdapterInstallHost"/> — a disposable agent-base container with
+/// the daemon-owned roots mounted at their VM paths — never on the macOS host itself.</para>
 /// </summary>
 public sealed class MacHostAgentEnvironment : IAgentEnvironment
 {
@@ -55,6 +54,13 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
         Egress = parts.Egress;
         Sandboxes = parts.Sandboxes;
         ToolchainImages = parts.ToolchainImages;
+
+        // Same production wiring rationale as the WSL2 substrate's channel (no payload source ⇒ the
+        // strong host-side HTTPS fetch); only the install host differs — commands run in a
+        // disposable agent-base container with the daemon-owned roots mounted at their VM paths.
+        Toolchains = new Toolchains.ToolchainChannel(
+            new Adapters.ContainerAdapterInstallHost(
+                Adapters.AdapterPaths.DaemonSideRoot(), Agents.Toolchains.ToolchainPaths.DaemonSideRoot()));
     }
 
     public string SubstrateId => "macos-host";
@@ -79,6 +85,13 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
     public IToolchainImageBuilder? ToolchainImages { get; }
 
     public PackageCacheManager? PackageCaches { get; }
+
+    public Toolchains.ToolchainChannel? Toolchains { get; }
+
+    /// <summary>The daemon-side toolchains tree the spawn path bind-mounts read-only — the mac
+    /// host directory here, not the VM constant the interface defaults to.</summary>
+    public string? ToolchainsRootPath =>
+        Toolchains is null ? null : Agents.Toolchains.ToolchainPaths.DaemonSideRoot();
 
     public SyncRemote ResolveSyncRemote(string repoHash)
         => new(MacHostSyncRemoteName, Path.Combine(_reposRoot, repoHash + ".git"));

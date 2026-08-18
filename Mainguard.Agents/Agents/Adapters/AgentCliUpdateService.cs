@@ -80,8 +80,11 @@ public sealed class AgentCliUpdateService
     /// <summary>The default composition: the bundled channel + the file-backed override store,
     /// installing into the MainguardEnv VM (mirrors <see cref="AgentCliInstaller.CreateDefault"/>).</summary>
     public static AgentCliUpdateService CreateDefault(IWslRunner wsl)
+        => CreateDefault(new WslAdapterInstallHost(wsl));
+
+    /// <summary>The same composition over any install host (macos-host passes the container-backed one).</summary>
+    public static AgentCliUpdateService CreateDefault(IAdapterInstallHost host)
     {
-        var host = new WslAdapterInstallHost(wsl);
         var pins = new FileAdapterPinOverrideStore();
         var channel = new AdapterChannel(
             new BundledAdapterChannelSource(), host, new FileAdapterManifestCache(), pins: pins);

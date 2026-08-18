@@ -180,8 +180,10 @@ public static class DaemonHost
         // ensure default-deny egress → start hardened jail). Kept out of the gRPC class (validation+dispatch
         // only); degrades to a session-only record when the repo handle is not provisioned.
         // The installed-CLI catalog is shared (launcher + the ListInstalledAdapters RPC); it reads the
-        // VM registry fresh per call, so a singleton carries no staleness.
-        builder.Services.AddSingleton<Mainguard.Agents.Agents.Adapters.InstalledAdapterCatalog>();
+        // daemon-side registry fresh per call, so a singleton carries no staleness. CreateForHost
+        // resolves the registry per substrate (the VM layout in the VM, ~/mainguard/adapters on mac).
+        builder.Services.AddSingleton(
+            _ => Mainguard.Agents.Agents.Adapters.InstalledAdapterCatalog.CreateForHost());
         builder.Services.AddSingleton<Runtime.SandboxAgentLauncher>();
 
         // Tier-1 daemon fast-path: the GetDaemonInfo skew probe's data source (daemon assembly

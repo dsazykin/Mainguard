@@ -71,7 +71,7 @@ internal static class AgentEnvironmentComposition
         // A marker written before the egressHosts field (an existing install) has none, so we backfill
         // by adapter id from the bundled channel manifest — the fix then works after a daemon update
         // ALONE, with no CLI re-install.
-        var adapters = new InstalledAdapterCatalog();
+        var adapters = InstalledAdapterCatalog.CreateForHost();
         var declaredHosts = LoadBundledEgressHosts();
 
         // The user's SAVED allowlist, not a fresh copy of the defaults. This line used to be

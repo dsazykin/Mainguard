@@ -277,8 +277,10 @@ public static class ProDesktopHost
     /// </summary>
     private static void KickAgentCliUpdateCheck()
     {
-        // macos-host: agent CLIs are not installable on this substrate yet (the container-backed
-        // install host is the follow-up), so there is nothing to check updates for.
+        // macos-host: skipped for now — the installed-CLI listing runs a version probe per CLI,
+        // which on this substrate spawns a container each; that is fine behind the Tools page's
+        // explicit click and too heavy for a silent every-launch sweep. Revisit with a cheaper
+        // marker-only listing.
         if (OperatingSystem.IsMacOS())
         {
             return;

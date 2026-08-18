@@ -40,15 +40,17 @@ public class AgentEnvironmentFactoryTests
         Assert.Equal("/tmp/mainguard-test-root/repos/abc123.git", remote.Url);
     }
 
-    [Fact]
-    public void MacHost_Toolchains_ShouldBeNull_TheTypedRefusalSeam()
+    [MacOnlyFact]
+    public void MacHost_Toolchains_ShouldInstallViaContainers_AndMountTheMacRoot()
     {
         var environment = new MacHostAgentEnvironment(vmRoot: "/tmp/mainguard-test-root");
 
-        // In-jail CLIs are linux-arm64; installing them on the macOS host would be wrong by
-        // construction, and SandboxAgentLauncher's null-channel path throws the typed refusal
-        // that names the substrate. Null IS the contract until the container-backed install host.
-        Assert.Null(((IAgentEnvironment)environment).Toolchains);
-        Assert.Null(((IAgentEnvironment)environment).ToolchainsRootPath);
+        // In-jail CLIs and toolchains are linux — installs go through the container-backed host,
+        // and the tree the spawn path bind-mounts is the MAC daemon-side root, never the VM
+        // constant the interface defaults to (which does not exist on this host).
+        Assert.NotNull(((IAgentEnvironment)environment).Toolchains);
+        Assert.Equal(
+            System.IO.Path.Combine(Mainguard.Git.MainguardPaths.HomeDirectory(), "mainguard", "toolchains"),
+            ((IAgentEnvironment)environment).ToolchainsRootPath);
     }
 }

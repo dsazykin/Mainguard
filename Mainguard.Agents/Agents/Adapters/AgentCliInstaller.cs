@@ -55,8 +55,12 @@ public sealed class AgentCliInstaller
     /// sha256-pins it, so a fresh install is never a stale shipped version; the bundled pins remain
     /// the offline fallback and the user's accepted-update overrides are always honored.</summary>
     public static AgentCliInstaller CreateDefault(IWslRunner wsl)
+        => CreateDefault(new WslAdapterInstallHost(wsl));
+
+    /// <summary>The same composition over any install host — the macos-host substrate passes the
+    /// container-backed host, since its CLIs execute in-jail (linux), never on the macOS host.</summary>
+    public static AgentCliInstaller CreateDefault(IAdapterInstallHost host)
     {
-        var host = new WslAdapterInstallHost(wsl);
         var pins = new FileAdapterPinOverrideStore();
         var channel = new AdapterChannel(new BundledAdapterChannelSource(), host, new FileAdapterManifestCache(),
             pins: pins);

@@ -33,6 +33,15 @@ public sealed class HostCommandRunner : IWslRunner
                 $"HostCommandRunner only runs in-distro command shapes; got 'wsl {string.Join(' ', args)}'. "
                 + "VM lifecycle verbs have no meaning on the macos-host substrate.");
 
+        return await RunProcessAsync(command, stdin, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Runs an argv directly on the host (no shell), streaming <paramref name="stdin"/> when
+    /// given. Shared with <see cref="Adapters.ContainerAdapterInstallHost"/>, whose commands are
+    /// docker argv rather than in-distro shapes.</summary>
+    internal static async Task<WslRunResult> RunProcessAsync(
+        IReadOnlyList<string> command, string? stdin, CancellationToken ct)
+    {
         var psi = new ProcessStartInfo(command[0])
         {
             RedirectStandardOutput = true,

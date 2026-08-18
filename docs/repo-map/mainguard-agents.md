@@ -245,10 +245,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `(false,false,"virtiofs","docker")`, daemon natively on the Mac with state under `~/mainguard`,
       sandboxes through the resolved Docker engine — Docker Desktop / OrbStack / Colima. Resolves the
       sync remote to the plain local bare path — **the only place the `mainguard-local` name literal
-      lives**, SC-2. `Toolchains` is intentionally null: in-jail CLIs are linux-arm64, so a host-side
-      install would be wrong by construction and the spawn path's typed refusal names the substrate;
-      the container-backed install host is the follow-up. Deviates from the ESC's deferred B4
-      "macos-vm" topology — recorded in the substrate ADR/B-doc.)
+      lives**, SC-2. `Toolchains` installs through `ContainerAdapterInstallHost` (in-jail CLIs and
+      toolchains are linux — a host-side install would be wrong by construction), and
+      `ToolchainsRootPath` overrides to the mac daemon-side tree. Deviates from the ESC's deferred
+      B4 "macos-vm" topology — recorded in the substrate ADR/B-doc.)
     - `AgentEnvironmentFactory.cs` (the one place the per-platform facade choice is made, ESC §0.3:
       macOS → macos-host, everything else → WSL2 — on Linux that IS the production in-VM daemon.
       `DaemonHost` registers `IAgentEnvironment` through it; pinned by
@@ -1369,7 +1369,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
-      real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`), `IAdapterManifestCache` (+
+      real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`, and
+      `ContainerAdapterInstallHost.cs` — the macos-host implementation: every command runs in a
+      DISPOSABLE agent-base container with the daemon-owned adapters + toolchains roots mounted
+      read-write AT THEIR VM PATHS, so the channels' command shapes, markers and the spawn path's
+      VmRoot→SandboxMount rewrite work verbatim while the bytes land in the host trees the jails
+      later mount read-only; `AdapterPaths.DaemonSideRoot()`/`ToolchainPaths.DaemonSideRoot()` are
+      where the daemon READS those trees per substrate, and the starter manifest's `platformBinary`
+      sources carry both linux-x64 and linux-arm64 entries), `IAdapterManifestCache` (+
       real `FileAdapterManifestCache` under appdata — refresh is explicit, so app + adapter updates move
       independently); typed `AdapterChannelException`/`AdapterChannelError`). **P2-48 wires this from a
       solid-but-uncalled mechanism into the shipped DYNAMIC-CLI feature** (the user picks CLIs at setup
