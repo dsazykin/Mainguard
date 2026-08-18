@@ -233,9 +233,26 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       deferred to a future task — documented on the interface).
     - `Wsl2AgentEnvironment.cs` (the WSL2 impl: `SubstrateId="wsl2"`, capabilities
       `(false,false,"9p","wsl")`, resolves the sync remote to a `\\wsl.localhost\…\repos\<hash>.git` UNC
-      handle — **the only place the `mainguard-vm` name literal lives**, SC-2; now also constructs the
-      P2-07 `DockerSandboxEngine` + `EgressProxyConfigurator` over a lazily-created Docker client —
-      building the client requires no live daemon).
+      handle — **the only place the `mainguard-vm` name literal lives**, SC-2; the substrate-neutral
+      collaborators now come from `AgentEnvironmentComposition`, and what stays here is exactly the
+      WSL2-specific part: the UNC prefix and the `WslAdapterInstallHost`-backed toolchain channel).
+    - `AgentEnvironmentComposition.cs` (the composition every substrate shares — provisioner,
+      worktrees, package caches, egress, hardened sandbox engine, toolchain-image builder — extracted
+      from the WSL2 ctor when the macos-host substrate arrived; the MG-3/MG-43/MG-17 and
+      allowlist-persistence invariants are documented HERE and bind both substrates. The Docker
+      client is lazily created via `DockerEndpointResolver`, so construction needs no live engine).
+    - `MacHostAgentEnvironment.cs` (the macos-host impl: `SubstrateId="macos-host"`, capabilities
+      `(false,false,"virtiofs","docker")`, daemon natively on the Mac with state under `~/mainguard`,
+      sandboxes through the resolved Docker engine — Docker Desktop / OrbStack / Colima. Resolves the
+      sync remote to the plain local bare path — **the only place the `mainguard-local` name literal
+      lives**, SC-2. `Toolchains` is intentionally null: in-jail CLIs are linux-arm64, so a host-side
+      install would be wrong by construction and the spawn path's typed refusal names the substrate;
+      the container-backed install host is the follow-up. Deviates from the ESC's deferred B4
+      "macos-vm" topology — recorded in the substrate ADR/B-doc.)
+    - `AgentEnvironmentFactory.cs` (the one place the per-platform facade choice is made, ESC §0.3:
+      macOS → macos-host, everything else → WSL2 — on Linux that IS the production in-VM daemon.
+      `DaemonHost` registers `IAgentEnvironment` through it; pinned by
+      `AgentEnvironmentFactoryTests`.)
     - `AgentGitCommand.cs` (internal checked wrapper — delegates to the one audited `GitService.RunGit`
       primitive and maps a non-zero exit to a typed exception; NOT a second runner, spawns nothing.
       Carries the **MG-1** hardening on every daemon-side git — `core.hooksPath=/dev/null`,

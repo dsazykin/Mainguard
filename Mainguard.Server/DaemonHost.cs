@@ -164,15 +164,17 @@ public static class DaemonHost
 
         // P2-06/P2-07: one substrate facade resolved per platform; RepoSyncGrpcService obtains the
         // provisioner/worktree manager, and the P2-07 spawn path obtains the hardened sandbox engine +
-        // default-deny egress policy, from it. WSL2 for now. (The A6 DaemonGitProxy is constructed
-        // per-repo from its allowlisted prefixes when the sandbox spawn path wires it in.)
+        // default-deny egress policy, from it. The per-platform choice lives in
+        // AgentEnvironmentFactory (macOS → macos-host, everything else → WSL2 exactly as before).
+        // (The A6 DaemonGitProxy is constructed per-repo from its allowlisted prefixes when the
+        // sandbox spawn path wires it in.)
         // MG-4: the substrate is told the gateway address the daemon actually bound, so the egress proxy
         // PERMITS it. Without that entry a confined jail is pointed at an endpoint Mainguard's own
         // default-deny filter refuses — the confinement would break the agent instead of metering it.
         builder.Services.AddSingleton<IAgentEnvironment>(sp =>
-            new Wsl2AgentEnvironment(
-                auditLog: sp.GetRequiredService<IAuditLog>(),
-                gatewayEndpoint: Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
+            AgentEnvironmentFactory.CreateForHost(
+                sp.GetRequiredService<IAuditLog>(),
+                Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
 
         // P2-47 #8: the real sandboxed-spawn chain behind AgentService.SpawnAgent (provision worktree →
         // ensure default-deny egress → start hardened jail). Kept out of the gRPC class (validation+dispatch

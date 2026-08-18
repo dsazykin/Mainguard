@@ -880,6 +880,10 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Agents/AgentEnvironmentFactoryTests.cs`** — pins the composition-root
+  substrate choice (macOS → `MacHostAgentEnvironment`, elsewhere → `Wsl2AgentEnvironment`), the
+  macos-host sync-remote shape (`mainguard-local` + local bare path, SC-2), and the deliberate
+  null `Toolchains` seam (the typed in-jail-CLIs refusal). No live engine — construction is lazy.
 - **`Mainguard.Server.Tests/Agents/DockerEndpointResolverTests.cs`** — the engine-agnostic Docker
   endpoint resolution (macos-host): DOCKER_HOST wins, CLI context read from a real on-disk
   `~/.docker`-shaped fixture, socket-probe order, malformed-config fall-through. Pure logic via
