@@ -281,6 +281,10 @@ public partial class App : Application
             // The tray icon is shared shell chrome — set up on BOTH paths, before the edition branch.
             SetupTrayIcon(desktop);
 
+            // macOS: the top-of-screen menu bar (no-op elsewhere). Shell-level, edition-agnostic —
+            // it dispatches through the same action registry the shortcuts and palette use.
+            Services.MacMenuBar.Install(this);
+
             // Edition seam (1d, ADR-0001): the Pro/Cloud edition composes the full MainguardOS launch
             // machinery (keep-alive, resume-task sweep, VM-stop-on-exit, the provisioning launch router)
             // through the ProDesktopStarter seam its head wired; the plain Git client takes a deliberately

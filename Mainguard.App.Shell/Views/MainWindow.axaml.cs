@@ -20,6 +20,8 @@ public partial class MainWindow : Window
         // macOS: overlay the system chrome (the axaml asks for NoChrome, which would remove
         // the traffic lights), hide the hand-drawn buttons, clear the traffic-light cluster.
         Mainguard.UI.Views.WindowChromePolicy.Apply(this);
+        // The macOS menu bar follows the key window — attach the shared menu (no-op elsewhere).
+        Services.MacMenuBar.Attach(this);
         WindowButtonsPanel.IsVisible = Mainguard.UI.Views.WindowChromePolicy.CustomButtonsVisible;
         TitleBarBorder.Padding = Mainguard.UI.Views.WindowChromePolicy.TitleBarPadding(TitleBarBorder.Padding);
     }

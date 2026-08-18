@@ -954,6 +954,13 @@
   managed-worker pool leaves the PR with no jail, no worktree and no queue entry, and the same PR
   materializes normally once a slot frees.
 - **`build/libvterm/`** — `build.sh` (the pinned libvterm 0.3.3 source build — URL + sha256 constants, direct `cc` compile, output `out/libvterm.so` consumed by CI tests and bundled into the daemon publish by `Mainguard.Server.csproj`; daemon-side only, never the client) + `README.md`.
+- **`build/macos-bundle/`** — `make-bundle.sh` (the macOS `.app` bundle: dev mode copies the
+  apphost under the bundle name — a renamed copy sidesteps the macOS name-pinning SIGKILL — and
+  symlinks the build output beside it so a plain rebuild updates the running app; `--publish`
+  produces the self-contained Velopack-input shape; writes Info.plist with the `mainguard://`
+  scheme on the Pro head and ad-hoc signs) + `assets/` (the brand `.icns` rendered from the site
+  favicon and its iconset inputs) + `README.md` (the Velopack packaging plan and what still
+  needs an Apple Developer ID).
 - **`.github/workflows/ci.yml`** — CI. The `build-and-test` job builds the pinned libvterm before
   testing and exports `MAINGUARD_LIBVTERM`/`MAINGUARD_REQUIRE_LIBVTERM` so the P2-04 suites gate the
   P2-18 engine; the allowlist shrink-guard covers both per-engine known-failures files. Its

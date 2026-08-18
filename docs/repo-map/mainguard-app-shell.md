@@ -785,6 +785,17 @@
     `BrowserLauncher`: refuses anything that isn't an existing directory, then platform-dispatches
     `explorer.exe`/`open`/`xdg-open`; best-effort, never throws);
   - `PullRequestsViewModel` takes it as its default `_revealInFileExplorer` delegate.
+  - `TerminalLauncher.cs` — the single open-a-folder-in-the-OS-terminal path (same hygiene as the
+    reveal path): macOS `open -a Terminal`, Windows `wt.exe` falling back to `cmd`, Linux
+    `x-terminal-emulator`. Surfaced from the macOS menu bar's Repository menu.
+  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Repository /
+    View / Help built over EXISTING seams — repo actions dispatch through
+    `MainWindowViewModel.InvokeActionByIdCommand` (the same registry the shortcuts and palette
+    use, so availability rules hold), themes through `ThemeManager` keys ("System" included),
+    reveal/terminal through the launchers above. The menu bar follows the KEY window on macOS,
+    so `Attach` is called from MainWindow's ctor and from every `ChromedWindow` via the
+    `ChromedWindow.MenuInstaller` seam; `App.axaml` names the application ("Mainguard") because
+    Avalonia titles the app menu from `Application.Name`, not the bundle.
   - `BrowserOpener.cs` (P2-22 — the App's `IBrowserOpener`, a thin adapter over `BrowserLauncher` so
     `LoopbackOAuthListener` opens the authorize URL through the ONE launcher, no second path).
   - `DeepLinkHandler.cs` (P2-22 — the `mainguard://` entry point: `RegisterProtocolAsync` (per-user
