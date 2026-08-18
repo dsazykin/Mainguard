@@ -941,7 +941,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 public sealed class SandboxExecTimeoutException : TimeoutException
 {
     public SandboxExecTimeoutException(string operation, string containerId, TimeSpan timeout, string detail = "")
-        : base($"The sandbox docker exec '{operation}' did not complete within {timeout.TotalSeconds:0.###}s "
+        : base($"The sandbox docker exec '{operation}' did not complete within {timeout.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture)}s "
              + $"against container '{containerId}'. The exec was created/attached but never finished, which "
              + "means the Docker endpoint is not delivering the exec's streams (a socket proxy that drops "
              + "exec stdin does exactly this) — waiting longer would have hung the spawn forever."

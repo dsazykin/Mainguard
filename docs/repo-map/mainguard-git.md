@@ -536,6 +536,13 @@ The all-editions base. Git logic goes here.
     `GitService.ResolveGitDir` + `ResolveCommonGitDir` and are matched longest-first, so a
     per-worktree `HEAD` is not misread as `worktrees/<name>/HEAD` under the common dir. An ordinary
     repo is unchanged — `.git` is already inside the watched tree, so no extra watcher is created.
+    Metadata classification also has a same-namespace textual `.git/` fallback: the resolved roots
+    are canonical (libgit2 resolves symlinks), but events arrive in the namespace of the path the
+    watcher was given, so a repo reached through a symlink (macOS's `/var` temp dir, any symlinked
+    checkout) would otherwise see `index.lock` churn as a working-tree change and refresh mid-op.
+  - `FileSystemPaths.cs` — the path-comparison policy: `OrdinalIgnoreCase` on Windows **and**
+    macOS (NTFS/APFS are case-insensitive), `Ordinal` on Linux. Purely textual — symlink identity
+    still needs one namespace or canonical paths; used by `RepositoryWatcher` prefix checks.
   - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence
     controller. All rebase-state reads go through `GitService.GitDirPath`, never
     `Path.Combine(repoPath, ".git", …)`.
