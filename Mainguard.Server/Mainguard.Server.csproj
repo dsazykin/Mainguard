@@ -49,6 +49,14 @@
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- The same pinned build under its macOS name — build.sh emits .dylib on Darwin for the
+       macos-host substrate's native daemon; the resolver probes both names beside the binary. -->
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.dylib')">
+    <None Include="$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.dylib"
+          Link="libvterm.dylib"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Mainguard.Git\Mainguard.Git.csproj" />
