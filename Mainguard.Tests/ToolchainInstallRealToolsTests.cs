@@ -152,6 +152,8 @@ public class ToolchainInstallRealToolsTests
                   "version": "1.2.3",
                   "payloadUrl": "{{PayloadUrl}}",
                   "sha256": "{{sha}}",
+                  "payloadUrlArm64": "{{PayloadUrl}}",
+                  "sha256Arm64": "{{sha}}",
                   "stripComponents": 1,
                   "pathEntries": ["{toolchain}/bin"],
                   "probe": {
