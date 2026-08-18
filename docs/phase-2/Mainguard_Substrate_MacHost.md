@@ -94,16 +94,22 @@ stopped with credential harvest through the daemon RPCs on-device.
 
 # 5. Known limits and follow-ups
 
-- **No macOS OOBE.** The launch routes straight to the control center; a Docker-engine
-  detection + file-sharing canary + engine-sysctl bootstrap chain (the mac analogue of P2-05's
-  steps) is the follow-up. Until then a missing engine surfaces through the startup sequence's
-  daemon diagnosis, not a guided flow.
+Resolved since the first cut (the mac-experience pass): the **macOS OOBE** ships
+(`MacOobeWindow` — engine detection, file-sharing canary, jail-image build, daemon start, CLI
+picker, start-at-login), the keyring is **Keychain-wrapped** (`MacKeychainKeyProtection`), the
+**daemon-logs page reads the host files** (timestamp-merged unified view), discards go to the
+**Finder Trash**, agent attention raises **Notification Center banners** and the **Dock badge**,
+the app ships as a **.app bundle** with the native **menu bar**, `mainguard://` activation, a
+launchd **LaunchAgent** option, and a **sleep assertion** while agents run.
+
+Still open:
+
 - **Gateway LAN bind.** MG-4's `auto` bind picks a LAN-reachable address so jails reach it
   through the engine NAT; follow-up: bind the engine bridge specifically (ADR-008).
-- **Keyring.** The DataProtection master key is not DPAPI-wrapped off Windows; the Keychain
-  (`ISecureKeyStore`) backend remains the planned hardening (`docs/planning` spec). Interim
-  posture: 0600 files under the hardened data root.
-- **Tools → Daemon logs page** still assumes journalctl; mac daemon logs live under
-  `~/.mainguard/logs` and need a file-reader path.
-- **Trash on discard, native toasts, tray polish, .dmg/notarized packaging** — deferred UI/
-  distribution work, unchanged from the port plan.
+- **.dmg / notarized packaging.** The Velopack lane is written and the bundle is its input shape
+  (`build/macos-bundle/README.md`); blocked only on an Apple Developer ID.
+- **UNUserNotificationCenter upgrade.** Banners use the delegate-free legacy API; action buttons
+  ("Review" / "Merge") need the modern center + a delegate object.
+- **Pinch-to-zoom on the commit graph — deliberately not done.** The graph has no zoom model and
+  the design system mandates fixed spacing scales; free zoom is an owner-level design decision,
+  not a port task.
