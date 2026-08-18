@@ -151,7 +151,7 @@ Commit the generated migration + snapshot together. Never hand-edit an applied m
 
 ## UI / Design System
 
-Mainguard ships **one design system with switchable color themes**. The shape language, spacing, typography, and component classes are fixed; only the color palette changes per theme. **Midnight Loom** (layered charcoal + violet accent) is the default; **Daylight Loom** (light), **Command Deck**, **Atelier**, and **Loom Aurora** ship alongside it. The user switches themes via **File → Theme**; the choice persists in `UserPreferences.Theme`.
+Mainguard ships **one design system with switchable color themes**. The shape language, spacing, typography, and component classes are fixed; only the color palette changes per theme. **Midnight Loom** (layered charcoal + violet accent) is the default; **Daylight Loom** (light), **Graphite** (macOS-native neutral graphite, Apple-semantic-derived colors), and **Atelier** ship alongside it. (Command Deck and Loom Aurora were retired in the 2026-08 restyle; `ThemeManager.LegacyKeyMap` migrates their persisted keys.) The user switches themes in Settings → General (a data-driven picker over `ThemeManager.Themes`) or the macOS menu bar; the choice persists in `UserPreferences.Theme`, and `Mainguard.Tests/ThemeContrastGateTests.cs` machine-checks every palette (AA contrast, lane separability incl. deuteranopia, terminal legibility).
 
 **Design & voice references.** [`DESIGN.md`](DESIGN.md) is the full design system (colors as roles,
 typography, elevation, components, do's/don'ts); [`PRODUCT.md`](PRODUCT.md) is the register, users,
@@ -204,7 +204,7 @@ criteria, each cited against these rules — ending in a prioritized premium-fee
 punch-list; consult it before working a polish item.
 [`docs/creative/ThemeRefinement.md`](docs/creative/ThemeRefinement.md) is a **color-retune design
 spec (proposed values, no live edits)** that audits `Lane1`–`Lane5` and the diff add/remove tokens
-for color-vision-deficiency separability and lane/lightness overlap across all five themes (computed
+for color-vision-deficiency separability and lane/lightness overlap across all themes (computed
 WCAG contrast + deuteranopia-lightness figures), proposes retuned hexes built on a lightness
 staircase plus an optional sixth theme (**Loom Meridian**, proposed/not wired, full 32-token
 contract + draft `.axaml`), and defines the render-harness + contrast-gate verification any retune
@@ -217,7 +217,7 @@ CVD-sensitive color.
 - **`Mainguard.UI/Theming/ThemeManager.cs`** swaps the merged dictionary at runtime, sets `RequestedThemeVariant` (so built-in Fluent chrome follows light/dark), persists the key, and raises `ThemeChanged`.
 - **Color tokens are referenced with `{DynamicResource …}` — never `StaticResource`.** StaticResource is resolved once and will not update on a live theme switch. (`StaticResource` remains correct for theme-independent resources: icons and `FontMono`. `FontUi` is the exception among fonts — it is consumed via `DynamicResource` because the shell overrides it at app level on macOS.)
 - **Code-drawn colors** resolve through `Application.Current.TryGetResource(key, app.ActualThemeVariant, …)` with a literal fallback, and long-lived visuals re-resolve on `ThemeManager.ThemeChanged`. `CommitGraphCanvas` is the reference pattern; `DiffViewerView`'s margin renderer and `AnalyticsViewModel.ThemeSkColor` follow it.
-- **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes`, add a File → Theme menu item. Nothing else.
+- **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes` — the Settings picker and macOS menu build themselves from that list; the theme sweep harness arrays in `Mainguard.Tests/Headless/` list keys explicitly, add it there too. `ThemeContrastGateTests` will hold the new palette to the contrast/CVD gates.
 - **Adding a token** = add it to **all** files in `Themes/` and to the table below. A token missing from one theme is a runtime bug the compiler cannot catch.
 - **macOS vibrancy (opt-in) routes through indirection tokens, never through the Surface tokens.** The main window's outer chrome (window background, title bar, section rail) binds `ChromeWindowBackground`/`ChromePanelBackground` — per-theme opaque duplicates of `SurfaceWindow`/`SurfacePanel` that `Mainguard.UI/Theming/VibrancyManager.cs` shadows with the `SurfaceWindowVibrant`/`SurfacePanelVibrant` translucent variants while the "Translucent window chrome" preference is on AND the platform granted the blur. Content surfaces (cards, diff, terminal) always paint the opaque Surface tokens — never bind the Chrome tokens on a reading surface. See DESIGN.md §4 "The Vibrancy Exception".
 
@@ -249,10 +249,10 @@ Reference values are Midnight Loom's.
 | `BorderHairline` | 1px borders, dividers | `#262B33` |
 | `TextPrimary` / `TextMuted` | body & titles / metadata, hints | `#E6E9EF` / `#8A93A6` |
 | `OnAccent` | text/icons on Accent, Success, Danger fills | `#0B0D10` |
-| `AccentBrush` / `AccentHover` | signature accent, links, current branch / its hover | `#8B8BF5` / `#A5A5F8` |
+| `AccentBrush` / `AccentHover` | signature accent, links, current branch / its hover | `#8487F0` / `#9EA1F5` |
 | `AccentSelection` | translucent accent tint for selected rows/chips | `#268B8BF5` |
 | `SuccessBrush` / `SuccessHover` | success, added | `#42B968` / `#5BCB7F` |
-| `DangerBrush` / `DangerHover` | destructive, removed | `#F87171` / `#FA8C8C` |
+| `DangerBrush` / `DangerHover` | destructive, removed | `#E5484D` / `#EC5D62` |
 | `WarningBrush` | warnings | `#E3B341` |
 | `InfoBrush` | informational accent (T-30 Info-severity findings) | `#58A6FF` |
 | `Lane1`–`Lane5` | commit-graph lanes (decoupled from semantics) | violet · rose · teal · amber · sky |
@@ -260,7 +260,7 @@ Reference values are Midnight Loom's.
 | `DiffAddedEmphasis` / `DiffRemovedEmphasis` | intra-line (word-level) emphasis over an added/removed line (T-13) | `#6642B968` / `#66F87171` |
 | `DiffWhitespaceMarker` | trailing-whitespace tint (T-13) | `#55E3B341` |
 
-Semantics rule: use tokens **by meaning, not by hue** — the same view must look right in all five themes. Never assume the accent is violet or the background is dark (Daylight Loom is light).
+Semantics rule: use tokens **by meaning, not by hue** — the same view must look right in all themes. Never assume the accent is violet or the background is dark (Daylight Loom is light).
 
 ### Shape system — nothing is a bare rectangle
 

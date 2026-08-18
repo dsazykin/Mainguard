@@ -42,11 +42,11 @@ public static class ChartTheme
     /// </summary>
     public static SKColor[] CategoricalPalette() => new[]
     {
-        Color("Lane1", "#8B8BF5"),
-        Color("Lane2", "#F472B6"),
-        Color("Lane4", "#E3B341"),
-        Color("Lane3", "#2DD4BF"),
-        Color("Lane5", "#58A6FF"),
+        Color("Lane1", "#9F9FFC"),
+        Color("Lane2", "#D0709F"),
+        Color("Lane4", "#F2A918"),
+        Color("Lane3", "#C0EAE3"),
+        Color("Lane5", "#0B87F5"),
     };
 
     /// <summary>The neutral "Other" bucket colour (muted text token).</summary>
@@ -59,7 +59,7 @@ public static class ChartTheme
     /// </summary>
     public static LvcColor[] HeatRamp()
     {
-        var accent = Color("AccentBrush", "#8B8BF5");
+        var accent = Color("AccentBrush", "#8487F0");
         var surface = Color("SurfaceCard", "#1A1E24");
         return new[]
         {
