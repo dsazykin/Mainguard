@@ -754,7 +754,11 @@
     monospace cell renderer over it (dirty-flag invalidation, key→VT byte mapping incl. Ctrl+C→0x03,
     host-clipboard bridge: OSC 52 → clipboard, Ctrl(+Shift)+V / Shift+Insert paste → CR-normalized,
     bracket-wrapped bytes toward the PTY, terminal palette from
-    `TerminalBackground`/`TerminalForeground`/`TerminalCursor`/`TerminalAnsi0-15` theme tokens). The
+    `TerminalBackground`/`TerminalForeground`/`TerminalCursor`/`TerminalAnsi0-15` theme tokens, and
+    **wheel-scroll through the scrollback ring** — the 10k-line buffer always existed but the control
+    never rendered it, so the terminal looked unscrollable (user-reported in the live cycle test):
+    3 lines/notch via `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
+    "you are viewing history" signal), any keystroke snaps back to live). The
     renderer is the fallback for the planned vendored `Iciclecreek.Avalonia.Terminal` (see note below).
     **Known field gaps (2026-07-22), deferred to P2-18 by decision — do NOT grow `VtScreen` toward
     conformance:** Ink/Yoga TUIs (claude-code) mis-render — no scroll regions (DECSTBM), insert/delete

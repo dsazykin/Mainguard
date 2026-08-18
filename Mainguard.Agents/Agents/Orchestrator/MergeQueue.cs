@@ -1138,6 +1138,22 @@ public sealed class MergeQueue : IMergeQueue
             }
         }
 
+        // The restart's OTHER stranded shape (observed live): a rebuilt queue reads the mirror's
+        // CURRENT main while its rehydrated Verified entries carry records pinned to an older one —
+        // main moved while no queue was alive to see it (the post-merge window, a daemon update, an
+        // offline fetch). CanMerge then answers "stale — re-verifying" forever, because the promise
+        // in that sentence is the cascade's and no cascade fired: NotifyMainMoved only runs on a
+        // LIVE queue's transitions. Fire it now with the sha we already hold — its own walk finds
+        // exactly the stale Verified/AwaitingReview entries and routes them through the ordinary
+        // yield → rebase → re-verify path; with nothing stale it moves nothing.
+        string currentMain;
+        lock (_gate)
+        {
+            currentMain = _currentMainSha;
+        }
+
+        NotifyMainMoved(currentMain);
+
         return new RestartResumeReport(reRun, stranded);
     }
 

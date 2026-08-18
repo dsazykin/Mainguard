@@ -197,19 +197,63 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
     }
 
+    /// <summary>How many lines above the live screen the view is scrolled (0 = live). Clamped to
+    /// the scrollback the VtScreen actually holds; any keystroke snaps back to live.</summary>
+    private int _scrollOffset;
+
+    /// <summary>Wheel-scroll through the VtScreen's scrollback ring. The buffer always existed
+    /// (10k lines, unit-tested) — the control just never rendered it, so the terminal LOOKED
+    /// unscrollable. Three lines per notch, the terminal-emulator convention.</summary>
+    protected override void OnPointerWheelChanged(Avalonia.Input.PointerWheelEventArgs e)
+    {
+        base.OnPointerWheelChanged(e);
+        var delta = (int)Math.Round(e.Delta.Y * 3);
+        if (delta == 0)
+        {
+            delta = e.Delta.Y > 0 ? 1 : e.Delta.Y < 0 ? -1 : 0;
+        }
+
+        var next = Math.Clamp(_scrollOffset + delta, 0, _screen.ScrollbackCount);
+        if (next != _scrollOffset)
+        {
+            _scrollOffset = next;
+            InvalidateVisual();
+            e.Handled = true;
+        }
+    }
+
     public override void Render(DrawingContext context)
     {
         var background = ResolveBrush("TerminalBackground", 0xFF0B0D10);
         var foreground = ResolveBrush("TerminalForeground", 0xFFE6E9EF);
         context.FillRectangle(background, new Rect(Bounds.Size));
 
+        // Scrolled view: the viewport ends `_scrollOffset` lines above the live bottom. History is
+        // scrollback lines followed by the live screen rows; render the window that ends there.
+        var offset = Math.Min(_scrollOffset, _screen.ScrollbackCount);
         var rows = _screen.VisibleRows;
         for (var r = 0; r < _screen.Rows; r++)
         {
-            RenderRow(context, rows[r], r, foreground, background);
+            // The absolute index of the line shown at viewport row r, counted from the oldest
+            // scrollback line: total = ScrollbackCount + Rows; the window ends at total - offset.
+            var absolute = _screen.ScrollbackCount + r - offset;
+            if (absolute < 0)
+            {
+                continue; // scrolled past the oldest retained line — leave the row blank
+            }
+
+            var line = absolute < _screen.ScrollbackCount
+                ? _screen.ScrollbackLine(absolute)
+                : rows[absolute - _screen.ScrollbackCount];
+            RenderRow(context, line, r, foreground, background);
         }
 
-        RenderCursor(context);
+        // The cursor only exists in the live view — drawing it over history would claim the
+        // terminal is somewhere it is not. Its absence is also the "you are scrolled" signal.
+        if (offset == 0)
+        {
+            RenderCursor(context);
+        }
     }
 
     private void RenderRow(DrawingContext context, TerminalCell[] row, int rowIndex, IBrush defaultFg, IBrush defaultBg)
@@ -303,6 +347,14 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
 
     protected override void OnKeyDown(KeyEventArgs e)
     {
+        // Typing means "back to live" — every terminal emulator's convention. The snap happens
+        // before the key is even mapped, so input never lands invisibly below a scrolled view.
+        if (_scrollOffset != 0)
+        {
+            _scrollOffset = 0;
+            InvalidateVisual();
+        }
+
         // Paste chords are handled BEFORE MapKey (which would otherwise turn Ctrl+V into a raw 0x16).
         // Ctrl+C stays SIGINT — copy OUT of the terminal is the application's job (OSC 52 above).
         if (IsPasteChord(e.Key, e.KeyModifiers))

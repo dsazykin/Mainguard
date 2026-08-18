@@ -96,6 +96,25 @@ internal sealed class VtScreen
     /// <summary>Number of lines currently held in scrollback (capped at <see cref="MaxScrollback"/>).</summary>
     public int ScrollbackCount => _scrollback.Count;
 
+    /// <summary>One scrollback line's cells (0 = oldest retained) — the renderer's window into
+    /// history when the user wheels up. O(n) walk of the linked list; the renderer touches at most
+    /// one viewport of lines per frame, so this stays cheap at the 10k cap.</summary>
+    public TerminalCell[] ScrollbackLine(int index)
+    {
+        if (index < 0 || index >= _scrollback.Count)
+        {
+            throw new ArgumentOutOfRangeException(nameof(index));
+        }
+
+        var node = _scrollback.First!;
+        for (var i = 0; i < index; i++)
+        {
+            node = node.Next!;
+        }
+
+        return node.Value;
+    }
+
     /// <summary>The text of a scrollback line (0 = oldest retained). Test seam.</summary>
     public string ScrollbackLineText(int index)
     {
