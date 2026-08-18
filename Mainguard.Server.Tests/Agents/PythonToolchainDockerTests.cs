@@ -93,8 +93,14 @@ public class PythonToolchainDockerTests
         // No payload source override: this leg deliberately uses the SHIPPED HttpsToolchainPayloadSource,
         // so the ~106 MiB pinned interpreter is really fetched over HTTPS, really hashed against the
         // manifest pin, and really transferred through base64 — the exact sequence a user's install runs.
-        var channel = new ToolchainChannel(
-            new LocalCommandHost(Path.Combine(root, "stage")), log: _out.WriteLine, vmRoot: toolchainRoot);
+        // "Run this argv where toolchains live": on Linux CI that is this machine; on a Mac the
+        // toolchain is a LINUX build destined for the jail, so the commands (extract, chmod, the
+        // health probe) run in a disposable agent-base container with the E2E root mounted at its
+        // own path — the same Target==Source trick the jail's worktree mount uses.
+        IAdapterInstallHost host = OperatingSystem.IsMacOS()
+            ? new ContainerCommandHost(root)
+            : new LocalCommandHost(Path.Combine(root, "stage"));
+        var channel = new ToolchainChannel(host, log: _out.WriteLine, vmRoot: toolchainRoot);
 
         var installStopwatch = Stopwatch.StartNew();
         var installed = await channel.InstallAsync(
@@ -286,6 +292,50 @@ public class PythonToolchainDockerTests
     }
 
     /// <summary>
+    /// The macOS counterpart of <see cref="LocalCommandHost"/>: the toolchain payload is a LINUX
+    /// build, so its extract/chmod/probe commands run inside a disposable agent-base container with
+    /// the E2E root bind-mounted at its own path — every path in the channel's argv stays valid on
+    /// both sides of the boundary. File writes and payload staging land on the host directly (the
+    /// mount makes them the same bytes the container sees); the base64-over-stdin transport
+    /// discipline itself is covered by the adapter-channel suites.
+    /// </summary>
+    private sealed class ContainerCommandHost : IAdapterInstallHost
+    {
+        private readonly string _root;
+
+        public ContainerCommandHost(string root) => _root = root;
+
+        public async Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
+        {
+            Directory.CreateDirectory(_root);
+            var docker = new List<string>
+            {
+                "docker", "run", "--rm", "-v", $"{_root}:{_root}",
+                Mainguard.Agents.Agents.Sandbox.SandboxImageVersions.AgentBaseRef(),
+            };
+            docker.AddRange(command);
+            var result = await Mainguard.Agents.Agents.Bootstrap.HostCommandRunner
+                .RunProcessAsync(docker, stdin: null, ct);
+            return new AdapterCommandResult(result.ExitCode, result.StdOut, result.StdErr);
+        }
+
+        public async Task WriteFileAsync(string path, string content, CancellationToken ct)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            await File.WriteAllTextAsync(path, content, ct);
+        }
+
+        public async Task<string> StagePayloadAsync(string fileName, byte[] content, CancellationToken ct)
+        {
+            var stageDir = Path.Combine(_root, "stage");
+            Directory.CreateDirectory(stageDir);
+            var finalPath = Path.Combine(stageDir, fileName);
+            await File.WriteAllBytesAsync(finalPath, content, ct);
+            return finalPath;
+        }
+    }
+
+    /// <summary>
     /// Runs the toolchain channel's commands on THIS machine. The channel's contract is
     /// <see cref="IAdapterInstallHost"/> — "run this argv where toolchains live" — and in production that
     /// is <c>wsl -d MainguardEnv --</c>. Here the toolchains live on the test box, so the same argv runs
@@ -360,7 +410,7 @@ public class PythonToolchainDockerTests
             await File.WriteAllTextAsync(b64Path, Convert.ToBase64String(content), ct);
 
             var decode = await RunAsync(
-                new[] { "bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" }, ct);
+                new[] { "bash", "-c", $"base64 -d < '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" }, ct);
             if (!decode.Succeeded)
                 throw new InvalidOperationException(
                     $"Decoding the staged payload failed (exit {decode.ExitCode}): {decode.Stderr}");

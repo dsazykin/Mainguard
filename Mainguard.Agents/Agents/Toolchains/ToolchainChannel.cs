@@ -234,11 +234,23 @@ public sealed class ToolchainChannel
         // ---- Fetch, on the HOST -------------------------------------------------------------------
         // Never `curl` in the VM: MainguardEnv has neither curl nor wget, so that path never once
         // succeeded against a real environment. See the type doc.
+        //
+        // The pin is arch-selected (jails run the daemon's arch — linux-arm64 on an Apple Silicon
+        // macos-host); an arch with no pinned pair is a typed refusal, never an unverified fetch.
+        if (entry.PayloadForCurrentArch() is not var (payloadUrl, payloadSha))
+        {
+            await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
+            throw new ToolchainChannelException(ToolchainChannelError.DownloadFailed,
+                $"{entry.DisplayName} has no pinned payload for this machine's architecture "
+                + $"({System.Runtime.InteropServices.RuntimeInformation.OSArchitecture}); the manifest "
+                + "must carry payloadUrlArm64/sha256Arm64 before it can install here.");
+        }
+
         progress?.Report($"Downloading {entry.DisplayName} {entry.Version}…");
         byte[] payload;
         try
         {
-            payload = await _payloads.FetchAsync(new Uri(entry.PayloadUrl), ct).ConfigureAwait(false);
+            payload = await _payloads.FetchAsync(new Uri(payloadUrl), ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -249,19 +261,19 @@ public sealed class ToolchainChannel
         {
             await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
             throw new ToolchainChannelException(ToolchainChannelError.DownloadFailed,
-                $"{entry.DisplayName} could not be downloaded from {entry.PayloadUrl} — {ex.Message}");
+                $"{entry.DisplayName} could not be downloaded from {payloadUrl} — {ex.Message}");
         }
 
         // ---- Verify the pin, before the VM has seen a single byte ----------------------------------
         progress?.Report("Verifying the checksum…");
         var actual = Convert.ToHexString(SHA256.HashData(payload)).ToLowerInvariant();
-        if (!string.Equals(actual, entry.Sha256, StringComparison.Ordinal))
+        if (!string.Equals(actual, payloadSha, StringComparison.Ordinal))
         {
             await CleanupAsync(incoming, null, ct).ConfigureAwait(false);
             throw new ToolchainChannelException(ToolchainChannelError.HashMismatch,
                 $"{entry.DisplayName}'s download did not match the pinned checksum, so nothing was "
                 + $"transferred into this Mainguard environment and nothing was unpacked. Expected sha256 "
-                + $"{entry.Sha256}, got {actual} ({payload.Length} bytes).");
+                + $"{payloadSha}, got {actual} ({payload.Length} bytes).");
         }
 
         // ---- Only now does anything enter the VM ---------------------------------------------------

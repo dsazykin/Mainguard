@@ -71,7 +71,7 @@ public sealed class ContainerAdapterInstallHost : IAdapterInstallHost
                 $"Staging the verified payload failed (tee exit {upload.ExitCode}): {upload.StdErr}".Trim());
 
         var decode = await RunInContainerAsync(
-            new[] { "bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" },
+            new[] { "bash", "-c", $"base64 -d < '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'" },
             stdin: null, ct).ConfigureAwait(false);
         if (!decode.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.InstallFailed,

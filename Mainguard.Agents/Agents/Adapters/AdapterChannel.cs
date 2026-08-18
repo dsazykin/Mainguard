@@ -683,7 +683,7 @@ public sealed class WslAdapterInstallHost : IAdapterInstallHost
                 $"Staging the verified payload into the VM failed (tee exit {upload.ExitCode}): {upload.StdErr}".Trim());
 
         var decode = await _wsl.RunAsync(
-            WslCommands.InDistro("bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'"),
+            WslCommands.InDistro("bash", "-c", $"base64 -d < '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'"),
             stdin: null, ct).ConfigureAwait(false);
         if (!decode.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.InstallFailed,
