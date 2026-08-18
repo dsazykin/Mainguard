@@ -10,7 +10,7 @@
             Title="Mainguard"
             MinWidth="800" MinHeight="600"
             WindowStartupLocation="CenterScreen"
-            Background="{DynamicResource SurfaceWindow}"
+            Background="{DynamicResource ChromeWindowBackground}"
             ExtendClientAreaToDecorationsHint="True"
             ExtendClientAreaChromeHints="NoChrome"
             ExtendClientAreaTitleBarHeightHint="-1">
@@ -189,7 +189,7 @@
     <Grid Margin="{Binding #Root.OffScreenMargin}">
         <Grid RowDefinitions="Auto, *">
         <!-- UNIFIED CUSTOM TITLE BAR (client-area chrome; whole bar drags the window) -->
-        <Border x:Name="TitleBarBorder" Grid.Row="0" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
+        <Border x:Name="TitleBarBorder" Grid.Row="0" Background="{DynamicResource ChromePanelBackground}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
                 PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
             <Grid ColumnDefinitions="Auto, *, Auto, Auto">
 
@@ -412,7 +412,7 @@
 
             <!-- SECTION RAIL -->
             <Border Grid.Column="0" Classes="sectionRail" Classes.expanded="{Binding IsRailExpanded}"
-                    Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}"
+                    Background="{DynamicResource ChromePanelBackground}" BorderBrush="{DynamicResource BorderHairline}"
                     BorderThickness="1" CornerRadius="12" Margin="8,8,0,8">
                 <Grid RowDefinitions="Auto,*" Margin="4,8">
 

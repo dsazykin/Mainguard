@@ -84,6 +84,15 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `Action<string>?` seam (the shell wires it to `App.Settings.Update(p => p.Theme = key)` in
   `App.OnFrameworkInitializationCompleted`) — the base layer never reaches up into `App.Settings`.
   Left null (headless harnesses, which always `Apply(…, persist: false)`) it's a no-op.
+- **`Theming/VibrancyManager.cs`** — the opt-in macOS translucent-chrome switch: `Attach(mainWindow)`
+  + `SetEnabled(bool)`. Sets the window's `TransparencyLevelHint` to AcrylicBlur and, only while the
+  platform actually granted it (tracked via `ActualTransparencyLevel` — the grant is async and
+  Reduce-Transparency can refuse), shadows the `ChromeWindowBackground`/`ChromePanelBackground`
+  indirection tokens at app level with the active theme's `SurfaceWindowVibrant`/`SurfacePanelVibrant`
+  variants (direct app-resource entries survive `ThemeManager`'s "/Themes/" sweep; re-resolves on
+  `ThemeChanged`). Hard no-op off macOS/headless — the opaque defaults are the canonical
+  harness-verified look. Driven by `UserPreferences.MacTranslucentChrome` from the MainWindow ctor
+  and the Settings → General checkbox.
 - **`Charts/ChartTheme.cs`** (T-22) — resolves LiveChartsCore paint colors from the theme tokens so every analytics chart follows the active theme instead of hardcoding hex (categorical graph-lane palette, Success/Danger churn pair, surface→Accent heat ramp). Consumed by the App's `AnalyticsViewModel`.
 - **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly). Applies `WindowChromePolicy` after its own `NoChrome` hints.
 - **`Platform/MacNative.cs`** — the one place managed code talks to AppKit directly (raw

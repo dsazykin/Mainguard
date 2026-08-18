@@ -15,6 +15,13 @@
     <SolidColorBrush x:Key="ButtonBg" Color="#E9EBF1"/>
     <SolidColorBrush x:Key="BorderHairline" Color="#D8DBE4"/>
 
+    <!-- Outer-chrome indirection (macOS vibrancy, opt-in) — see MidnightLoom for the contract.
+         Light vibrancy needs more transparency than dark to read as material at all. -->
+    <SolidColorBrush x:Key="ChromeWindowBackground" Color="#EDEFF4"/>
+    <SolidColorBrush x:Key="ChromePanelBackground" Color="#F7F8FB"/>
+    <SolidColorBrush x:Key="SurfaceWindowVibrant" Color="#BFEDEFF4"/>
+    <SolidColorBrush x:Key="SurfacePanelVibrant" Color="#CCF7F8FB"/>
+
     <!-- Text -->
     <SolidColorBrush x:Key="TextPrimary" Color="#1D2130"/>
     <SolidColorBrush x:Key="TextMuted" Color="#5C6470"/>

@@ -24,6 +24,15 @@ public partial class MainWindow : Window
         Services.MacMenuBar.Attach(this);
         WindowButtonsPanel.IsVisible = Mainguard.UI.Views.WindowChromePolicy.CustomButtonsVisible;
         TitleBarBorder.Padding = Mainguard.UI.Views.WindowChromePolicy.TitleBarPadding(TitleBarBorder.Padding);
+        // Opt-in macOS vibrancy: attach in the ctor so EVERY construction path (client shell,
+        // client first-run handoff, Pro startup handoff) applies the persisted preference.
+        // VibrancyManager tracks the window's ACTUAL transparency level, so the token overrides
+        // land only once the platform grants the blur (post-show, asynchronously). No-op off
+        // macOS and in headless runs (Settings may not exist there — harnesses construct
+        // windows directly).
+        Mainguard.UI.Theming.VibrancyManager.Attach(this);
+        if (System.OperatingSystem.IsMacOS() && App.Settings is not null)
+            Mainguard.UI.Theming.VibrancyManager.SetEnabled(App.Settings.Current.MacTranslucentChrome);
     }
 
     /// <summary>Close-to-tray: the X hides the window (the app — and any running agents — keep

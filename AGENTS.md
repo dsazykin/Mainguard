@@ -219,6 +219,7 @@ CVD-sensitive color.
 - **Code-drawn colors** resolve through `Application.Current.TryGetResource(key, app.ActualThemeVariant, …)` with a literal fallback, and long-lived visuals re-resolve on `ThemeManager.ThemeChanged`. `CommitGraphCanvas` is the reference pattern; `DiffViewerView`'s margin renderer and `AnalyticsViewModel.ThemeSkColor` follow it.
 - **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes`, add a File → Theme menu item. Nothing else.
 - **Adding a token** = add it to **all** files in `Themes/` and to the table below. A token missing from one theme is a runtime bug the compiler cannot catch.
+- **macOS vibrancy (opt-in) routes through indirection tokens, never through the Surface tokens.** The main window's outer chrome (window background, title bar, section rail) binds `ChromeWindowBackground`/`ChromePanelBackground` — per-theme opaque duplicates of `SurfaceWindow`/`SurfacePanel` that `Mainguard.UI/Theming/VibrancyManager.cs` shadows with the `SurfaceWindowVibrant`/`SurfacePanelVibrant` translucent variants while the "Translucent window chrome" preference is on AND the platform granted the blur. Content surfaces (cards, diff, terminal) always paint the opaque Surface tokens — never bind the Chrome tokens on a reading surface. See DESIGN.md §4 "The Vibrancy Exception".
 
 ### The golden rule: no raw colors
 
@@ -243,6 +244,8 @@ Reference values are Midnight Loom's.
 | `SurfaceHover` | hover / neutral selection | `#252B34` |
 | `SurfaceHoverGhost` | `SurfaceHover` at 0 alpha — rest background for **ghost** buttons (transparent-looking, hover to `SurfaceHover`) so the fade never flashes white; see Depth & motion | `#00252B34` |
 | `ButtonBg` | neutral button fill | `#1E232B` |
+| `ChromeWindowBackground` / `ChromePanelBackground` | outer-chrome indirection (main-window background / title bar + section rail) — opaque duplicates of `SurfaceWindow`/`SurfacePanel` that `VibrancyManager` shadows on macOS while vibrancy is on; never bind on content surfaces | `#0F1115` / `#14171C` |
+| `SurfaceWindowVibrant` / `SurfacePanelVibrant` | the translucent chrome variants vibrancy swaps in (dark themes ≈ 80/85% alpha, Daylight more transparent) | `#CC0F1115` / `#D914171C` |
 | `BorderHairline` | 1px borders, dividers | `#262B33` |
 | `TextPrimary` / `TextMuted` | body & titles / metadata, hints | `#E6E9EF` / `#8A93A6` |
 | `OnAccent` | text/icons on Accent, Success, Danger fills | `#0B0D10` |

@@ -17,6 +17,17 @@
     <SolidColorBrush x:Key="ButtonBg" Color="#1E232B"/>
     <SolidColorBrush x:Key="BorderHairline" Color="#262B33"/>
 
+    <!-- Outer-chrome indirection (macOS vibrancy, opt-in). The main window binds its window
+         background / title bar / section rail to Chrome* instead of Surface* so VibrancyManager
+         can swap ONLY the outer chrome to the *Vibrant translucent variants — SurfacePanel also
+         paints floating cards, which always stay opaque. Defaults are exact opaque duplicates
+         of SurfaceWindow/SurfacePanel: with vibrancy off (and everywhere the harness renders)
+         these are pixel-identical to the flat look. -->
+    <SolidColorBrush x:Key="ChromeWindowBackground" Color="#0F1115"/>
+    <SolidColorBrush x:Key="ChromePanelBackground" Color="#14171C"/>
+    <SolidColorBrush x:Key="SurfaceWindowVibrant" Color="#CC0F1115"/>
+    <SolidColorBrush x:Key="SurfacePanelVibrant" Color="#D914171C"/>
+
     <!-- Text -->
     <SolidColorBrush x:Key="TextPrimary" Color="#E6E9EF"/>
     <SolidColorBrush x:Key="TextMuted" Color="#8A93A6"/>

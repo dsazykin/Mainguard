@@ -83,6 +83,21 @@ public partial class GeneralSettingsViewModel : ViewModelBase
             row.IsSelected = row.Key == selected;
     }
 
+    /// <summary>Gates the macOS-only rows (the vibrancy toggle) in the General page.</summary>
+    public bool IsMacOS { get; } = System.OperatingSystem.IsMacOS();
+
+    public bool MacTranslucentChrome
+    {
+        get => _settingsService.Current.MacTranslucentChrome;
+        set
+        {
+            if (_settingsService.Current.MacTranslucentChrome == value) return;
+            _settingsService.Update(p => p.MacTranslucentChrome = value);
+            Mainguard.UI.Theming.VibrancyManager.SetEnabled(value);
+            OnPropertyChanged();
+        }
+    }
+
     public bool CloseToTray
     {
         get => _settingsService.Current.CloseToTray;

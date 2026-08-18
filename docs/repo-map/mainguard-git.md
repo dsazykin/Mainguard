@@ -122,6 +122,10 @@ The all-editions base. Git logic goes here.
     `UseStructuredCommitComposer` flag (plain ⇄ structured commit-composer mode; JSON, no migration),
     and the T-18 `ShortcutBindings` (id → gesture overrides layered on the `ShortcutMap` defaults; empty
     string clears a default; JSON-persisted, no migration).
+  - `UserPreferences.MacTranslucentChrome` (default false) drives the macOS vibrancy chrome via
+    `Mainguard.UI/Theming/VibrancyManager`; it replaced the never-read `EnableGlassmorphism` key
+    (deliberately not reused — it defaulted to true, and a stale persisted `true` would silently
+    switch existing installs to translucent chrome; unknown JSON keys are ignored on load).
   - `GitDiffLine` carries the T-13 intra-line `HighlightSpans` (changed-word char ranges into `Content`)
     + `TrailingWhitespaceSpan` + `EmphasisKey`.
   - `TosAcknowledgment` (P2-01: a recorded provider-ToS acknowledgment — `Provider` + `AcknowledgedAt` —

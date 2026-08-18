@@ -94,7 +94,7 @@ components:
 
 **Creative North Star: "The Quiet Gatehouse"**
 
-Mainguard is a native instrument for engineers doing high-stakes git work — staging, rebasing, resolving conflicts — and, in its next phase, standing watch over a fleet of autonomous coding agents from a single desk, where nothing lands on `main` unguarded. The system is deliberately quiet: layered charcoal surfaces, hairline dividers, and exactly one signature accent (indigo-violet) that appears only where the eye should land — the current branch, the primary action, the active selection. Everything else recedes into a controlled, engineered calm. Motion is fast and functional (120–150ms fades, no bounce), never decorative; depth comes from stacked flat surfaces and a soft shadow on floating overlays, not from glassmorphism or gradients.
+Mainguard is a native instrument for engineers doing high-stakes git work — staging, rebasing, resolving conflicts — and, in its next phase, standing watch over a fleet of autonomous coding agents from a single desk, where nothing lands on `main` unguarded. The system is deliberately quiet: layered charcoal surfaces, hairline dividers, and exactly one signature accent (indigo-violet) that appears only where the eye should land — the current branch, the primary action, the active selection. Everything else recedes into a controlled, engineered calm. Motion is fast and functional (120–150ms fades, no bounce), never decorative; depth comes from stacked flat surfaces and a soft shadow on floating overlays, not from gradients — and not from glassmorphism as decoration; the one sanctioned translucency is the opt-in macOS vibrancy chrome defined in §4.
 
 This system explicitly rejects the templated "VS Code extension" look — generic web-view chrome bolted onto Electron — and the bland blue-and-gray enterprise SaaS dashboard. It equally rejects security-vendor iconography — no shields, padlocks, or fortress imagery; the guard reads as calm discipline, not armor. Mainguard is rendered natively at 60fps; its surfaces are tuned per pixel, not inherited from a component library default.
 
@@ -154,6 +154,8 @@ Mainguard is flat by default and layered, not shadowed: depth comes from steppin
 
 ### Named Rules
 **The Flat-By-Default Rule.** Panels, cards, and buttons at rest carry no shadow — separation comes from surface-tone stepping and hairline borders. Shadows appear only on transient overlay chrome, never on persistent layout.
+
+**The Vibrancy Exception (macOS, opt-in).** Flat and opaque remains the default — and the canonical, harness-verified rendering on every platform. On macOS only, a user preference ("Translucent window chrome", off by default) may render the main window's OUTER chrome — the window background, title bar, and section rail — over the system vibrancy blur (`NSVisualEffectView` via Avalonia's AcrylicBlur transparency hint). The mechanics: those three paints bind the `ChromeWindowBackground`/`ChromePanelBackground` indirection tokens (opaque duplicates of `SurfaceWindow`/`SurfacePanel` in every theme), which `VibrancyManager` shadows with the theme's `SurfaceWindowVibrant`/`SurfacePanelVibrant` translucent variants only while the platform has actually granted the blur. Content surfaces — cards, diff, terminal, every reading surface — never route through the chrome tokens and are always opaque; contrast gates are evaluated against the opaque values. This is material, not decoration: no translucency anywhere else, and never as a substitute for surface-tone stepping.
 
 ## 5. Components
 
