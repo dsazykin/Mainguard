@@ -47,6 +47,7 @@ Its output is one interface (`IAgentEnvironment`, §1.1), one invariants matrix 
 | **B3** (future) | native Linux host / dev container | `"native-linux"` | deferred |
 | **B4** (future) | macOS-hosted Linux VM | `"macos-vm"` | deferred |
 | **B5** (future) | cloud pod (P3-06) | `"cloud-pod"` | deferred (guardrails now via P2-25) |
+| **B6** — `docs/phase-2/Mainguard_Substrate_MacHost.md` | macOS host (daemon native on the Mac; sandboxes via the machine's own Docker engine — Docker Desktop / OrbStack / Colima) | `"macos-host"` | shipped with the phase2 macOS port (ADR-008; a deliberate sibling to — not a claim on — B4) |
 
 Anything WSL-specific (9P, `drvfs`, `\\wsl.localhost\MainguardEnv\...`, `.wslconfig`, `wsl --terminate MainguardEnv`), macOS-specific, or cloud-specific (mTLS, per-tenant encryption, `mainguard-cloud` HTTPS transport) is **out of scope here** and belongs in the relevant B-doc. Where this document must illustrate the variability surface (§3) it names such mechanics only as *examples of what varies*, not as specifications.
 

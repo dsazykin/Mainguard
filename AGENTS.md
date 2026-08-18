@@ -13,7 +13,7 @@ All planning/design/analysis docs live under `docs/`, grouped by purpose. **Put 
 | Folder | What goes here |
 |---|---|
 | **`docs/repo-map/`** | **The per-file index of the whole repo, split by project — start at its `README.md` routing table.** This is where a Repository Map entry goes when you add, move, or delete a file. |
-| `docs/phase-2/` | The active phase-2 agent-platform corpus: **`implementation_plans/Mainguard_Master_Implementation_Document_v2.md` — the binding spec** (where any subordinate doc disagrees, the master doc wins; since the 2026-07-12 consolidation its UI task sections carry **Design decisions (binding)** blocks linking the design hub, and its baseline/invariants reference the Lane-H pass + ADRs), plus `implementation_plans/Mainguard_Test_Implementation_Strategy_v2.md`, plus the Orchestration Protocol Spec, Environment Substrate Contract, WSL2 substrate, Uplift Study, RedTeam plan, Cloud/Vibe companion, Performance Hotspot Register, Risk Register, the Phase-2 Test Implementation Strategy, and **`ADRs.md`** — the client/non-security Architecture Decision Records (Context → Decision → Consequences; ADR-001 handle discipline + index.lock retry, ADR-002 per-HEAD analytics cache, ADR-003 router optimization, ADR-004 diff theme/emphasis policy, ADR-005 property-testing approach, ADR-006 merge blank-line conservation + known limit, ADR-007 bench-vs-test split). |
+| `docs/phase-2/` | The active phase-2 agent-platform corpus: **`implementation_plans/Mainguard_Master_Implementation_Document_v2.md` — the binding spec** (where any subordinate doc disagrees, the master doc wins; since the 2026-07-12 consolidation its UI task sections carry **Design decisions (binding)** blocks linking the design hub, and its baseline/invariants reference the Lane-H pass + ADRs), plus `implementation_plans/Mainguard_Test_Implementation_Strategy_v2.md`, plus the Orchestration Protocol Spec, Environment Substrate Contract, WSL2 substrate, Uplift Study, RedTeam plan, Cloud/Vibe companion, Performance Hotspot Register, Risk Register, the Phase-2 Test Implementation Strategy, and **`ADRs.md`** — the client/non-security Architecture Decision Records (Context → Decision → Consequences; ADR-001 handle discipline + index.lock retry, ADR-002 per-HEAD analytics cache, ADR-003 router optimization, ADR-004 diff theme/emphasis policy, ADR-005 property-testing approach, ADR-006 merge blank-line conservation + known limit, ADR-007 bench-vs-test split, ADR-008 the macos-host substrate). |
 | `docs/planning/` | Roadmaps and older plans: `Mainguard_Roadmap.md`, `Implementation_Plan.md`, `Mainguard_Backlog.md`, the v1 Master Implementation Document, feature-plan triage, git audit, implementation strategy (aspirational — the destination, not the current code). `Agent_Image_Provisioning_And_Daemon_Logging_Backlog.md` — the two structural gaps left open by the 2026-07-17 update-mechanism work (#193–#202): shipping `mainguard-agent-base` to installed VMs, and giving `mainguardd` real journal logging (field evidence, candidate approaches, acceptance criteria). **`Product_Editions_And_Structural_Sequencing.md`** — the plan to separate the three products (free Client / Pro / Cloud) by **edition composition on one trunk** (an `IEditionManifest` seam + per-edition packaging lanes), not by branch; §7 sequences it against the rename and argues the project rename (rebrand Phase 3) and the assembly split should be **one fused merge-freeze operation**. |
 | `docs/adr/` | Repo-wide **Architecture Decision Records** — cross-cutting product/structure/release decisions, standard Status → Context → Decision → Consequences → References headings. **`0001-product-editions.md`** — separate the free **Client** / **Pro** / **Cloud** products by *edition composition on one trunk* (a static `IEditionManifest`/`App.Edition` seam mirroring `App.Settings`, Pro UI moved to a `Mainguard.Agents.UI` assembly behind two thin exe heads, per-edition Velopack lanes, CI reference-graph/twin-harness/manifest gates), never by branch or `#if`; fuses the `Mainguard → Mainguard` rename with the assembly split into one merge-freeze op and retires `phase2` for trunk-based dev. Distinct register from `docs/phase-2/ADRs.md`, which is the client/non-security **Lane-H code-quality** ADR log. |
 | `docs/test_implementation_plan/` | Test strategy (v1) and the manual `Mainguard_User_Testing_Guide.md`. |
@@ -105,6 +105,28 @@ dotnet run --project Mainguard.Pro.App   # launch the app (Pro head; use Maingua
 ```
 
 **Always run `dotnet build` after making changes**, and `dotnet test` when you touch Core.
+
+### Developing on macOS (the macos-host substrate)
+
+The whole platform runs on a Mac — daemon natively (`osx-arm64`), sandboxes through whichever
+Docker engine the machine has (Docker Desktop / OrbStack / Colima; `DockerEndpointResolver`
+finds it). See `docs/phase-2/Mainguard_Substrate_MacHost.md` + ADR-008. Mac-specific working
+knowledge:
+
+- **Never spawn a copied apphost.** Current macOS pins an executable name to its first-run
+  location and SIGKILLs a same-named apphost anywhere else ("died of signal 9"); re-signing does
+  not help. Run copied heads through the muxer — `dotnet <app>.dll` — as
+  `Mainguard.Tests/TestTools/SelfInvocation.cs` and `MacDaemonController` do.
+- **`/var` is a symlink to `/private/var`.** Host git canonicalizes paths; a jail has no such
+  symlink. Test fixtures that cross either boundary start from the canonical temp root
+  (`TempRepoFixture.CanonicalTempRoot`, `Server.Tests/Fixtures/CanonicalTemp`).
+- **Lockfiles carry `osx-arm64` sections** (committed, like the linux/win ones). A PARTIAL-graph
+  restore drops sections the subgraph doesn't need — `git checkout -- '**/packages.lock.json'`,
+  and prefer whole-solution restores or `--no-restore` partial builds.
+- Jail images build **native arm64** (TARGETARCH-parametrized, per-arch pins); libvterm builds as
+  a `.dylib` via the same pinned `build/libvterm/build.sh`.
+- Platform traits: `UnixOnlyFact` (Linux + macOS) vs `LinuxOnlyFact` (genuinely Linux-bound) vs
+  `MacOnlyFact` — a "not Windows" assumption no longer implies Linux.
 
 ### EF Core migrations
 
@@ -359,7 +381,12 @@ CI restores with `--locked-mode`, so this either fails somebody's build or gets 
   (P2-25); it realizes ESC-I1…ESC-I9 on WSL2, carries the exhaustive WSL stress matrix and the
   filled cold-start/mount-latency budgets, and runs the ESC §4 `SubstrateConformance` suite plus
   the WSL-specific `RequiresWsl` manual-matrix tests; subordinate to the master doc and to the
-  ESC umbrella). The de-jargoned explainer for the cloud + Vibe roadmap is
+  ESC umbrella). The second is `docs/phase-2/Mainguard_Substrate_MacHost.md` (B6 — the
+  `SubstrateId = "macos-host"` realization shipped with the phase2 macOS port: the
+  `MacHostAgentEnvironment` facade, daemon native on the Mac, engine-agnostic Docker endpoint
+  resolution, container-backed CLI/toolchain installs, structural `AllowedMountRoots`, its ESC §4
+  results and §5 measurements; the deviation from the deferred B4 "macos-vm" sketch is ADR-008).
+  The de-jargoned explainer for the cloud + Vibe roadmap is
   `docs/phase-2/Mainguard_Cloud_Vibe_Companion.md` (a companion for a founder/reader without a
   cloud-infrastructure background: a plain-language concepts glossary — mTLS, OIDC, KMS, tenant
   isolation, per-tenant encryption/crypto-shred, pod eviction, metering, egress, PKCE/loopback
