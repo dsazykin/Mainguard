@@ -1160,30 +1160,41 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// (the daemon only ever hands back opaque handles — G-14 — so the path has to be remembered here).</summary>
     private (string RepoHandle, string RepoPath, string SyncRemoteName)? _lastProvisioned;
 
-    /// <summary>Provision the just-opened repo into the daemon (P2-06) and return its sync-remote binding
-    /// for the shell to register with its own IGitService (step 2f seam). Gated on the real
-    /// DaemonBackedOrchestrator like <see cref="SetActiveRepo"/>, so the mock/design harness returns null
-    /// (no daemon); any transport failure is swallowed to null — agents are simply unavailable until the
-    /// daemon is up, and the Git client is unaffected.</summary>
-    public async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoSyncBinding?> ProvisionRepoAsync(string repoPath)
+    /// <summary>Provision the just-opened repo into the daemon (P2-06) and return the outcome for the
+    /// shell to act on (register the sync remote on success; toast + retry card on failure — step 2f
+    /// seam). Gated on the real DaemonBackedOrchestrator like <see cref="SetActiveRepo"/>, so the
+    /// mock/design harness returns null ("no agent platform", never an error). The previously active
+    /// repo is cleared FIRST: a failed or slow provision must leave the queue rail empty, not showing —
+    /// and a Merge not fast-forwarding — the repo opened before this one. Runs on the adapter's shared
+    /// channel with the same 5-minute deadline as the OOBE path; the old per-call client's swallowed
+    /// 5-second budget is what made agents silently unavailable on any repo with a non-trivial clone.</summary>
+    public async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoProvisionOutcome?> ProvisionRepoAsync(string repoPath)
     {
-        if (_agents is not Services.DaemonBackedOrchestrator)
+        if (_agents is not Services.DaemonBackedOrchestrator daemon)
         {
             return null;
         }
 
+        _lastProvisioned = null;
+        daemon.ClearActiveRepo();
+        Queue.Refresh();
+
         try
         {
-            using var daemon = Services.DaemonClient.ForLoopback();
-            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var provisioned = await daemon.ProvisionRepoAsync(repoPath, cts.Token).ConfigureAwait(false);
+            var provisioned = await daemon.ProvisionRepoAsync(repoPath, System.Threading.CancellationToken.None)
+                .ConfigureAwait(false);
             _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName);
-            return new Mainguard.UI.Editions.RepoSyncBinding(
-                provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl);
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Success(new Mainguard.UI.Editions.RepoSyncBinding(
+                provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl));
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            var reason = ex is Grpc.Core.RpcException rpc
+                ? (rpc.StatusCode == Grpc.Core.StatusCode.Unavailable
+                    ? "the agent daemon isn't reachable"
+                    : rpc.Status.Detail is { Length: > 0 } detail ? detail : rpc.StatusCode.ToString())
+                : ex.Message;
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Failure(reason);
         }
     }
 

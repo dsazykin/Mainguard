@@ -1016,9 +1016,14 @@
   here, it is injected at runtime by `ProDesktopHost.InjectProChrome`); `ShellEntryPoint` (the shared
   arg-shim + single-instance guard + `BuildAvaloniaApp` both heads call — the git-editor
   `--rebase-editor` / `--rebase-msg` self-invocation shims); `MainWindow`+`MainWindowViewModel`
-  (repo-provisioning on open reached via the new `IAgentPlatformSurface.ProvisionRepoAsync` seam so
-  the shell never names `DaemonClient`; the ctor takes only the degraded-banner STRING, never the Pro
-  `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
+  (repo-provisioning on open reached via the `IAgentPlatformSurface.ProvisionRepoAsync` seam so
+  the shell never names `DaemonClient` — the seam now returns a `RepoProvisionOutcome` and a FAILED
+  provision is surfaced with an error toast + a bottom-left retry card
+  (`IsAgentProvisionRetryVisible`/`RetryAgentProvisioningCommand`) instead of being swallowed; the
+  Pro implementation clears the previously active repo before provisioning, so a failed/slow
+  provision leaves the merge rail empty rather than pointed at the previously opened repo — pinned
+  by `Mainguard.Tests/RepoProvisioningHonestyTests`; the ctor takes only the degraded-banner STRING,
+  never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
   `Controls/`, `Converters/`; `Editions/ClientManifest`; the Client
   `ClientFirstRunWindow`/`ClientFirstRunViewModel`; `VersionsViewModel` (the daemon/OS-version rows
   come from the `Editions/ShellVersionProbe` Mainguard.UI seam — `null` under Client → honest

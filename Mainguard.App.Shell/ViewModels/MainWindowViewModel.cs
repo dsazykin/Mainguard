@@ -780,32 +780,78 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
         }
     }
 
+    /// <summary>The repo whose agent provisioning failed, kept for the retry card. Cleared when a
+    /// retry succeeds, another repo opens, or the user dismisses the card.</summary>
+    private string? _agentProvisionRetryPath;
+
+    [ObservableProperty]
+    private bool _isAgentProvisionRetryVisible;
+
+    [ObservableProperty]
+    private string _agentProvisionFailureReason = string.Empty;
+
+    [RelayCommand]
+    private void DismissAgentProvisionRetry()
+    {
+        IsAgentProvisionRetryVisible = false;
+        _agentProvisionRetryPath = null;
+    }
+
+    [RelayCommand]
+    private async System.Threading.Tasks.Task RetryAgentProvisioningAsync()
+    {
+        if (_agentProvisionRetryPath is { } path)
+        {
+            IsAgentProvisionRetryVisible = false;
+            await TryRegisterSyncRemoteAsync(path).ConfigureAwait(true);
+        }
+    }
+
     private async System.Threading.Tasks.Task TryRegisterSyncRemoteAsync(string repoPath)
     {
         // Provisioning the repo into the daemon is a Pro concern reached through the edition seam (2f):
         // the reference-clean shell never names DaemonClient. Under the plain Git client ControlCenter is
-        // null → no-op. The returned sync-remote binding is registered on the host repo with the shell's
-        // own IGitService (P2-06 Windows side); then the live merge-queue projection is pointed at the
-        // daemon's repo handle (P2-47 #1) so the merge rail + review cockpit reflect this repo's queue.
+        // null → no-op. On success the sync-remote binding is registered on the host repo with the shell's
+        // own IGitService (P2-06, host side) and the live merge-queue projection is pointed at the daemon's
+        // repo handle (P2-47 #1). On FAILURE the reason is surfaced (toast + retry card) — for most of
+        // this feature's life a failed provision was swallowed and the agent platform simply looked dead.
         if (ControlCenter is not { } controlCenter)
         {
             return;
         }
 
+        IsAgentProvisionRetryVisible = false;
+        _agentProvisionRetryPath = null;
+
         try
         {
-            if (await controlCenter.ProvisionRepoAsync(repoPath).ConfigureAwait(true) is { } binding)
+            switch (await controlCenter.ProvisionRepoAsync(repoPath).ConfigureAwait(true))
             {
-                new Services.SyncRemoteRegistrar(new Mainguard.Git.Services.GitService())
-                    .Register(repoPath, binding.SyncRemoteName, binding.SyncRemoteUrl);
-                controlCenter.SetActiveRepo(binding.RepoHandle);
+                case { Binding: { } binding }:
+                    new Services.SyncRemoteRegistrar(new Mainguard.Git.Services.GitService())
+                        .Register(repoPath, binding.SyncRemoteName, binding.SyncRemoteUrl);
+                    controlCenter.SetActiveRepo(binding.RepoHandle);
+                    break;
+                case { FailureReason: { } reason }:
+                    SurfaceAgentProvisionFailure(repoPath, reason);
+                    break;
+                    // null = no daemon behind this surface (mock/design harness): not an error.
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Daemon not running / not yet bootstrapped / provision failed: agents are simply
-            // unavailable for this repo until the daemon is up. The Git client is unaffected.
+            // A fault in the seam itself (not a daemon refusal) still must not block opening the
+            // repo — but it is surfaced the same way rather than swallowed.
+            SurfaceAgentProvisionFailure(repoPath, ex.Message);
         }
+    }
+
+    private void SurfaceAgentProvisionFailure(string repoPath, string reason)
+    {
+        _agentProvisionRetryPath = repoPath;
+        AgentProvisionFailureReason = reason;
+        IsAgentProvisionRetryVisible = true;
+        ShowToast($"Agents are unavailable for this repo — {reason}", isError: true);
     }
 
     [RelayCommand]

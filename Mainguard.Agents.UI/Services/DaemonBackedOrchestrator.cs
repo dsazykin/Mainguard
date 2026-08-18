@@ -343,6 +343,39 @@ public sealed class DaemonBackedOrchestrator :
     /// staging), fetching the agent branch over the SC-2-resolved sync remote registered on it. Without
     /// them the queue is observable but not mergeable, and <see cref="ConfirmMergeAsync"/> says so rather
     /// than recording a merge it never performed.</para></summary>
+    /// <summary>Provision <paramref name="repoPath"/> into the daemon over THIS adapter's shared
+    /// mTLS channel, with the same 5-minute deadline the OOBE/Add-Repos path uses — a cold bare
+    /// clone of a real repository routinely outlives the 5-second budget the old per-call client
+    /// gave it, and that timeout was swallowed, which made the whole agent platform look dead on
+    /// any non-trivial repo. Throws on failure; the caller owns surfacing the reason.</summary>
+    public Task<ProvisionedRepo> ProvisionRepoAsync(string repoPath, CancellationToken ct) =>
+        _client.ProvisionRepoAsync(repoPath, ct, deadline: TimeSpan.FromMinutes(5));
+
+    /// <summary>Detach the merge-queue projection from its repo: stop the queue pump and empty the
+    /// queue/gate/origin state so the rail reflects NOTHING rather than the previously opened repo.
+    /// Called before provisioning a newly opened repo — without it, a failed or slow provision left
+    /// this adapter pointed at the old repo while the user looked at the new one, and a Merge would
+    /// have fast-forwarded the OLD checkout.</summary>
+    public void ClearActiveRepo()
+    {
+        lock (_gate)
+        {
+            _queuePumpCts?.Cancel();
+            _queuePumpCts?.Dispose();
+            _queuePumpCts = null;
+            _queuePump = null;
+            _repoHandle = null;
+            _repoLocalPath = null;
+            _syncRemoteName = string.Empty;
+            _queue.Clear();
+            _gate_.Clear();
+            _origins.Clear();
+            _mainSha = string.Empty;
+        }
+
+        RaiseIsolated(() => Changed?.Invoke());
+    }
+
     public void SetActiveRepo(string repoHandle, string? localRepoPath = null, string? syncRemoteName = null)
     {
         if (string.IsNullOrWhiteSpace(repoHandle))
@@ -724,7 +757,7 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
-    private void ApplyQueueUpdate(Proto.QueueUpdate update)
+    internal void ApplyQueueUpdate(Proto.QueueUpdate update)
     {
         lock (_gate)
         {

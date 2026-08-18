@@ -295,6 +295,10 @@
   `git diff -w` zero-hunks/real-hunks/staged/no-eol; `RequiresGitCli`),
   `DiffViewerViewModelDiffQualityTests` (T-13 VM: partial staging hidden in `-w` mode, syntax-toggle
   persistence, intra-line spans + trailing-whitespace + image-mode detection), `SettingsServiceTests`,
+  `RepoProvisioningHonestyTests` (the repo-open provisioning path surfaces failures as reasons and
+  detaches the queue projection on repo switch — `ClearActiveRepo` empties + raises `Changed`, the
+  cleared adapter refuses to merge, a failed provision on switch leaves no stale queue from the
+  previous repo),
   `AppDbContextTests`, `GitHostDetectorTests`, `HostProviderRegistryTests` (T-14 provider resolution
   by host+kind + single-source `TokenUsername` + PAT-prompt acquire/throw-with-host),
   `SshKeyServiceTests` (T-14 ArgumentList argv construction + a REAL local ssh-keygen round trip —
