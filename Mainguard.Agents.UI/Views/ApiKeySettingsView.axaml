@@ -45,7 +45,7 @@
             <Border Grid.Row="2" Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,12">
                 <StackPanel Spacing="8">
                     <TextBlock Text="Use your Claude subscription (CLI OAuth)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextPrimary}"/>
-                    <TextBlock Text="Not the supported path — Anthropic restricted subscription OAuth in third-party tools (April 2026). A BYOK API key above is recommended."
+                    <TextBlock Text="Not the supported path — Anthropic restricted subscription OAuth in third-party tools (April 2026). A BYOK API key above is recommended. This button records the required terms acknowledgment; the sign-in itself happens in the CLI's own terminal after you start a coordinator (when no API key is stored, the CLI asks you to log in there), and a completed login is restored into new jails automatically."
                                FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                     <StackPanel Orientation="Horizontal" Spacing="10">
                         <Button Content="Use CLI OAuth…" Classes="Secondary" Padding="12,5" Command="{Binding UseClaudeSubscriptionCommand}"/>

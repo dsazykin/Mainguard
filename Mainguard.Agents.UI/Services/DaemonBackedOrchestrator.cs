@@ -175,7 +175,7 @@ public sealed class DaemonBackedOrchestrator :
     /// at a temp database; it redirects only where the journal is written, never what the merge does.</param>
     /// <param name="hostPullRequests">
     /// The host PR seam an <see cref="MergeEntryOrigin.External"/> merge drives (P2-12). Defaults to the
-    /// audited T-23 transport reading this Windows host's keyring.
+    /// audited T-23 transport reading this host's keyring.
     /// <para><b>Why the client and not the daemon:</b> the host token lives only in the host OS keychain —
     /// nothing copies <c>token_&lt;host&gt;</c> into the VM — so the daemon simply has no credential to
     /// merge a pull request with. The lease and the gate stay daemon-side regardless; only the transport
@@ -340,7 +340,7 @@ public sealed class DaemonBackedOrchestrator :
     ///
     /// <para><paramref name="localRepoPath"/> and <paramref name="syncRemoteName"/> are the OTHER half of
     /// the same <c>ProvisionRepo</c> answer, and they are what makes the merge button able to merge: the
-    /// human foreground merge lands on the user's own Windows checkout (never the VM mirror, which is
+    /// human foreground merge lands on the user's own host checkout (never the daemon mirror, which is
     /// staging), fetching the agent branch over the SC-2-resolved sync remote registered on it. Without
     /// them the queue is observable but not mergeable, and <see cref="ConfirmMergeAsync"/> says so rather
     /// than recording a merge it never performed.</para></summary>
@@ -1117,6 +1117,26 @@ public sealed class DaemonBackedOrchestrator :
         _cliSettings.Save(outcome.RepoHandle, outcome.AgentKind, outcome.CliSettings);
     }
 
+    /// <summary>Whether ANY credential is stored for this CLI — a BYOK key for its provider, a custom
+    /// llm_env_* key, or a harvested interactive login. False means the CLI will ask the human to sign
+    /// in inside its terminal after the spawn; the start surface says so up front rather than leaving
+    /// the first-run coordinator looking stuck at a login prompt nobody mentioned.</summary>
+    public bool HasStoredCredentialFor(InstalledCliOption cli)
+    {
+        if (ApiKeyProviderMap.ProviderForEnvVar(cli.ApiKeyEnvVar) is { } provider
+            && !string.IsNullOrEmpty(_keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider))))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrEmpty(_keystoreLookup(CliLoginVault.KeystoreKeyPrefix + cli.Id)))
+        {
+            return true;
+        }
+
+        return _keystoreList(ApiKeyProviderMap.CustomEnvKeyPrefix).Count > 0;
+    }
+
     /// <summary>Human per-agent pause over the PauseAgent RPC (docker pause on the jail). A refusal —
     /// no live jail, kill switch engaged — is thrown with the daemon's reason; an old daemon that
     /// predates the RPC answers Unimplemented, mapped to an honest sentence (the GetDaemonInfo
@@ -1325,7 +1345,7 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>
     /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
     /// button: <c>BeginMerge</c> (the daemon takes the repo's one lease and enforces <c>CanMerge</c> under
-    /// it) → <b>the real Windows-side <c>git merge --ff-only</c> on the user's own checkout</b> →
+    /// it) → <b>the real host-side <c>git merge --ff-only</c> on the user's own checkout</b> →
     /// <c>ConfirmMerge</c> with the sha main ACTUALLY moved to, or <c>AbandonMerge</c> when nothing landed.
     ///
     /// <para><b>The middle leg used to be missing.</b> This method took the lease and then went straight to
@@ -1456,7 +1476,7 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
-    /// The Windows-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
+    /// The host-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
     /// Built per merge because the sync-remote binding is per active repo.
     /// </summary>
     private Mainguard.Agents.Services.IJournaledMergeExecutor CreateMergeExecutor(string syncRemoteName)

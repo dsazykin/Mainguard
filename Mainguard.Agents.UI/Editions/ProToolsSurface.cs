@@ -65,8 +65,11 @@ public sealed class ProToolsSurface : IProToolsSurface
     }
 
     // Daemon logs (in-depth per-subsystem logging): the read-only "recent daemon logs" surface over
-    // Core's DaemonLogReader (journalctl / tail over the same WSL seam the OOBE health card uses). A
-    // fresh reader every time this page is (re)activated — the page wrapper disposes the previous one.
+    // Core's DaemonLogReader. On WSL it reads journalctl / tail over the same WSL seam the OOBE
+    // health card uses; on macOS the reader branches internally to the daemon's rolling host files
+    // and NEVER touches the runner — the WslRunner below is constructed unconditionally because the
+    // reader requires the seam, but on macOS it is inert by construction, not by luck. A fresh
+    // reader every time this page is (re)activated — the page wrapper disposes the previous one.
     public object CreateDaemonLogsPage()
     {
         var reader = new Mainguard.Agents.Agents.Bootstrap.DaemonLogReader(

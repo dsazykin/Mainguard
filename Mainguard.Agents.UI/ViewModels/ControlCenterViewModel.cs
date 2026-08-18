@@ -897,6 +897,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         CoordinatorStartError = "";
         IsCoordinatorFocus = true; // the coordinator's terminal is this surface's center content
+
+        // No key, no saved login: say up front that the CLI will ask for a sign-in in its terminal —
+        // otherwise the first-run coordinator just looks stuck at a prompt nobody mentioned.
+        if (_agents is Services.DaemonBackedOrchestrator credentialProbe
+            && !credentialProbe.HasStoredCredentialFor(SelectedCli))
+        {
+            SetCoordinatorStartDetail(
+                "No API key or saved login is stored — the CLI will ask you to sign in inside its terminal.");
+        }
+
         try
         {
             await host.StartCoordinatorAsync(SelectedCli, ct);
