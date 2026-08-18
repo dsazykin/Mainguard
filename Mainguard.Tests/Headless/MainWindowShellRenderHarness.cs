@@ -69,6 +69,10 @@ public class MainWindowShellRenderHarness
 
         try
         {
+            // Park the wall-clock auto-dismiss: on a loaded CI runner the open+pump sequence
+            // below can outlive the 6 s timer and dismiss a toast mid-capture, turning the
+            // stacked-count assertion into a race (observed on the shared macOS runner).
+            ToastViewModel.AutoDismissOverrideMs = 600_000;
             ThemeManager.Apply("MidnightLoom", persist: false);
 
             var vm = new MainWindowViewModel();
@@ -113,6 +117,7 @@ public class MainWindowShellRenderHarness
         }
         finally
         {
+            ToastViewModel.AutoDismissOverrideMs = null;
             ThemeManager.Apply("MidnightLoom", persist: false);
         }
     }
