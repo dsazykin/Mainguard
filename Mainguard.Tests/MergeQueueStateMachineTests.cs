@@ -814,13 +814,13 @@ public class MergeQueueStateMachineTests
     }
 
     [Fact]
-    public void TryReject_Working_IsRefused_PointingAtDiscard()
+    public async Task TryReject_Working_IsRefused_PointingAtDiscard()
     {
         var h = new Harness();
         h.Build();
         // Track the entry without verifying it (a run that fails leaves it Working).
         h.FailFor("a");
-        h.Queue.RunVerificationAsync("a", CancellationToken.None).GetAwaiter().GetResult();
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
 
         Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var refusal));
         Assert.Contains("only a verified branch", refusal);
