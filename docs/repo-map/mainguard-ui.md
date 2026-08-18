@@ -82,6 +82,11 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   Left null (headless harnesses, which always `Apply(…, persist: false)`) it's a no-op.
 - **`Charts/ChartTheme.cs`** (T-22) — resolves LiveChartsCore paint colors from the theme tokens so every analytics chart follows the active theme instead of hardcoding hex (categorical graph-lane palette, Success/Danger churn pair, surface→Accent heat ramp). Consumed by the App's `AnalyticsViewModel`.
 - **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly). Applies `WindowChromePolicy` after its own `NoChrome` hints.
+- **`Platform/MacNative.cs`** — the one place managed code talks to AppKit directly (raw
+  `objc_msgSend`, no binding package in the supply chain; every member is a safe no-op off macOS
+  and never throws): `TryPostNotification` (Notification Center banner — real attribution only
+  inside the .app bundle; reports false so callers keep their fallback) and `SetDockBadge` (the
+  Dock icon's badge label; UI-thread-sensitive).
 - **`Views/WindowChromePolicy.cs`** — the per-platform chrome policy for client-area-extended
   windows: Windows/Linux keep the hand-drawn `NoChrome` title bar; macOS overlays the system
   chrome instead (`NoChrome` would remove the traffic lights — the only close control there),

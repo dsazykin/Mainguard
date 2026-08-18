@@ -244,6 +244,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// never re-time a loop that is already running.</summary>
     private readonly TimeSpan _cliLoadRetryDelay = CliLoadRetryDelay;
 
+    /// <summary>P2-13 §6 — the waiting/blocked-transition notifier, fed from RefreshAgents.</summary>
+    private readonly Services.AgentNotificationService _attentionNotifications;
+
     public ControlCenterViewModel(OrchestratorServices services)
         : this(services, dockLayouts: null) { }
 
@@ -273,6 +276,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         // The rail is a thin view over this VM; the shell hosts it as AgentRailContent (2d).
         _agentRail = new AgentRailViewModel(this);
+
+        // P2-13 §6, finally wired: a transition INTO a waiting/blocked state raises an OS-level
+        // notification (Notification Center on macOS, shell toast elsewhere), suppressed only when
+        // the app is foregrounded ON that agent. Fed from RefreshAgents — the one reconcile loop.
+        _attentionNotifications = new Services.AgentNotificationService(
+            new Services.OsAgentNotifier(),
+            isAppForegrounded: static () =>
+                (Application.Current?.ApplicationLifetime
+                    as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?
+                    .MainWindow?.IsActive == true,
+            foregroundedAgentId: () => SelectedAgentId);
 
         _agents.EventReceived += OnAgentEvent;
         // Fix 2: a CLI that dies on a blocked host raises this — show the unblock/keep prompt.
@@ -356,7 +370,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             .ToList();
         for (int i = Agents.Count - 1; i >= 0; i--)
             if (snapshot.All(a => a.AgentId != Agents[i].AgentId))
+            {
+                _attentionNotifications.Forget(Agents[i].AgentId);
                 Agents.RemoveAt(i);
+            }
 
         // Reconcile IN the projection's order, rank by rank (LIFO, P2-13). Existing rows are moved
         // rather than replaced, so a row's identity — and therefore the rail's selection — survives.
@@ -380,6 +397,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 Agents[at].Update(info);
                 if (at != rank) Agents.Move(at, rank);
             }
+
+            _attentionNotifications.OnStatusChanged(
+                info.AgentId, info.Name,
+                Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromLifecycle(info.State));
         }
 
         RefreshAttention();
@@ -400,6 +421,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         AttentionCount = _coordinator.GetPendingPlans().Count
                        + _agents.ListAgents().Count(a => AttentionPolicy.IsAttentionRequired(a.State));
         HasAttention = AttentionCount > 0;
+
+        // The Dock badge mirrors the SAME count (no-op off macOS). Cleared when nothing waits.
+        Mainguard.UI.Platform.MacNative.SetDockBadge(
+            AttentionCount > 0 ? AttentionCount.ToString(System.Globalization.CultureInfo.InvariantCulture) : null);
     }
 
     // Live theme switch: the badge converter resolves against the active theme variant, so nudge

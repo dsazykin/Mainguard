@@ -217,6 +217,13 @@ public static class DaemonHost
         // loop, and a fresh client per tick would churn connections to the daemon socket for no reason.
         builder.Services.AddSingleton<Docker.DotNet.IDockerClient>(
             _ => Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient());
+
+        // macos-host: hold a sleep assertion while any jail runs (App Nap / idle sleep must not
+        // stall a verification); tied to the daemon's own lifetime via caffeinate -w.
+        if (OperatingSystem.IsMacOS())
+        {
+            builder.Services.AddHostedService<Runtime.MacSleepAssertion>();
+        }
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler>(sp =>
         {
             try

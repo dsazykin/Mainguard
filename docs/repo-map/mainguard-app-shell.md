@@ -862,7 +862,10 @@
   - `AgentNotificationService.cs` (P2-13: OS/in-window toast on an agent transition INTO waiting/blocked
     (AwaitingReview/Conflict), suppressed when the app is foregrounded on that agent; first observation
     baselines silently; `IAgentNotifier` seam with the `WindowNotificationManager`-backed default + a
-    fake for tests).
+    fake for tests. NOW WIRED: `ControlCenterViewModel.RefreshAgents` feeds it per reconciled row and
+    `Forget`s removed agents; the shipped notifier is `OsAgentNotifier.cs` — a Notification Center
+    banner via `MacNative` on macOS, the shell toast elsewhere/on failure. `RefreshAttention` also
+    mirrors the attention count onto the macOS Dock badge.)
   - `SpawnProgressWatchdog.cs` (the spawn RPC's deadline, measured from the daemon's **last sign of
     life** rather than from the start of the call. `SpawnAgent` carried a flat 5-minute gRPC deadline; a
     first run builds the repo's ~2.9 GB toolchain image inside that call, so the client hung up on a

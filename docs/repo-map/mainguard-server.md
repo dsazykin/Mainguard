@@ -43,6 +43,11 @@
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
+  - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
+    `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
+    `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
+    `-w` ties the assertion to the daemon's own lifetime (a killed daemon never leaks a machine
+    that refuses to sleep) and the child is killed the moment the last agent stops.
   - **`Runtime/PrIntakeHostedService.cs`** (P2-13 carried-in from P2-12) — the daemon scheduler slot
     that drives `IExternalPrIntake.RunAsync` (the external-PR poll loop); **P2-47 registered the intake
     dependency chain (`RegisterPrIntake` in `GatewayServiceRegistration`) so this now RUNS the poll loop
