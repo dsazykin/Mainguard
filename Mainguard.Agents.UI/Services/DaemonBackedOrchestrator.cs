@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Grpc.Core;
 using Mainguard.Agents.Agents;
 using Proto = Mainguard.Protos.V1;
 
@@ -1160,9 +1161,68 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
-    // No prompt-queue/plan-tree RPCs exist on the daemon contract yet — these steer nothing. They stay
-    // no-ops/empty (never fabricated); the terminal attach stream carries the live PTY instead.
-    public Task SendPromptAsync(string agentId, string prompt) => Task.CompletedTask;
+    /// <summary>How long a one-shot prompt delivery may take end to end (attach + write + close).</summary>
+    internal static TimeSpan SendPromptBudget { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>Test seam: replaces the attach call the prompt delivery writes through.</summary>
+    internal Func<CancellationToken, Grpc.Core.AsyncDuplexStreamingCall<Proto.TerminalInput, Proto.TerminalOutput>>?
+        AttachTerminalOverride
+    { get; set; }
+
+    /// <summary>
+    /// Delivers the agent document's composer prompt into the agent's LIVE PTY — a short-lived attach
+    /// on the same <c>TerminalService.Attach</c> bidi stream the terminal pane uses (a bound session
+    /// multiplexes subscribers, so this never steals the pane's attach): frame 1 selects the agent
+    /// (raw mode), frame 2 writes the prompt + CR, then the write side completes and the call closes.
+    /// A managed worker's daemon-side input lock arrives as <c>PermissionDenied</c> and is PROPAGATED —
+    /// the caller renders the refusal; for most of this method's life it was a hardcoded no-op that
+    /// reported success and typed nothing.
+    /// </summary>
+    public async Task SendPromptAsync(string agentId, string prompt)
+    {
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrEmpty(prompt))
+        {
+            return;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        cts.CancelAfter(SendPromptBudget);
+
+        var attach = AttachTerminalOverride ?? (token => _client.AttachTerminal(token));
+        using var call = attach(cts.Token);
+
+        // Drain responses in the background so a server that pushes scrollback before our write can't
+        // fill the window and stall the request stream.
+        var drain = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in call.ResponseStream.ReadAllAsync(cts.Token).ConfigureAwait(false)) { }
+            }
+            catch { /* the drain ends when the call does; its errors surface on the write below */ }
+        });
+
+        try
+        {
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput { AgentId = agentId })
+                .ConfigureAwait(false);
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput
+            {
+                Data = Google.Protobuf.ByteString.CopyFromUtf8(prompt + "\r"),
+            }).ConfigureAwait(false);
+            await call.RequestStream.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.PermissionDenied)
+        {
+            throw new InvalidOperationException(
+                "Can't send — the daemon has this terminal locked (a managed worker's input is read-only).");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await drain.ConfigureAwait(false); } catch { /* drained */ }
+        }
+    }
     public IReadOnlyList<string> GetQueuedPrompts(string agentId) => Array.Empty<string>();
     public Task CancelQueuedPromptAsync(string agentId, int index) => Task.CompletedTask;
     public IReadOnlyList<string> GetTerminalTail(string agentId) => Array.Empty<string>();

@@ -127,6 +127,11 @@ public partial class AgentDocumentViewModel : ViewModelBase
         Refresh();
     }
 
+    /// <summary>The composer's outcome line: the daemon's refusal verbatim (a locked managed-worker
+    /// terminal, transport down), cleared on a delivered send. Empty = nothing to report.</summary>
+    [ObservableProperty]
+    private string _promptStatus = "";
+
     [RelayCommand]
     private async Task SendPromptAsync()
     {
@@ -134,7 +139,19 @@ public partial class AgentDocumentViewModel : ViewModelBase
         var text = ComposerText.Trim();
         if (text.Length == 0) return;
         ComposerText = "";
-        await _agents.SendPromptAsync(AgentId, text);
+        try
+        {
+            await _agents.SendPromptAsync(AgentId, text);
+            PromptStatus = "";
+        }
+        catch (Exception ex)
+        {
+            // The refusal is the answer the human asked for by pressing Send — and the composer keeps
+            // the text so a transient failure doesn't eat the prompt.
+            ComposerText = text;
+            PromptStatus = ex.Message;
+        }
+
         Refresh();
     }
 

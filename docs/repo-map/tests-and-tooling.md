@@ -298,6 +298,9 @@
   `QueueProjectionRenderingTests` (wire-shaped facts render: the verified-against stamp comes from
   `VerifiedMainSha` — the daemon projection never populates `Verification`, so the old read could
   never draw it — and the cockpit's changed-test-command warning renders without a run-count delta),
+  `SendPromptDeliveryTests` (the agent document's Send writes the raw-mode selector then prompt+CR
+  over a short-lived terminal attach and propagates the locked-terminal PermissionDenied — it was a
+  no-op reporting success),
   `RepoProvisioningHonestyTests` (the repo-open provisioning path surfaces failures as reasons and
   detaches the queue projection on repo switch — `ClearActiveRepo` empties + raises `Changed`, the
   cleared adapter refuses to merge, a failed provision on switch leaves no stale queue from the
