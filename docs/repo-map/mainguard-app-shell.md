@@ -8,6 +8,11 @@
   supplies the reword/squash message keyed by original SHA — `TryHandleShim` runs + returns *before*
   Avalonia starts, don't reorder), the single-instance guard, and `BuildAvaloniaApp`.
   `TryHandleShim` hands back an **exit code** the head must assign to `Environment.ExitCode`.
+- **`SingleInstanceGuard.cs`** (shell) — the cross-platform single-instance guard behind
+  `RunDesktop`: the named mutex on Windows, an exclusive flock on `<data root>/app.lock` on Unix
+  (a named mutex does not exclude across processes on macOS — two instances both "won"
+  on-device). Either form is released by the kernel when the holder dies, so a crash never
+  wedges the next launch.
 - **`RebaseEditorShim.cs`** (shell) — the shim's actual work, split out so it is testable.
   **The exit code is the contract with git**: git reads 0 from `GIT_SEQUENCE_EDITOR` as "the editor
   wrote your todo" and otherwise proceeds with its own default todo — a plain `pick` of every commit —

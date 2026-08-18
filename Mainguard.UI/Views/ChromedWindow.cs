@@ -17,6 +17,8 @@ public class ChromedWindow : Window
         ExtendClientAreaToDecorationsHint = true;
         ExtendClientAreaChromeHints = Avalonia.Platform.ExtendClientAreaChromeHints.NoChrome;
         ExtendClientAreaTitleBarHeightHint = -1;
+        // macOS: NoChrome would remove the traffic lights — the only close control there.
+        WindowChromePolicy.Apply(this);
     }
 
     /// <summary>Wired by CustomTitleBar's PointerPressed so any window using it gets window-drag for free.</summary>

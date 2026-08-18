@@ -78,8 +78,14 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `App.OnFrameworkInitializationCompleted`) — the base layer never reaches up into `App.Settings`.
   Left null (headless harnesses, which always `Apply(…, persist: false)`) it's a no-op.
 - **`Charts/ChartTheme.cs`** (T-22) — resolves LiveChartsCore paint colors from the theme tokens so every analytics chart follows the active theme instead of hardcoding hex (categorical graph-lane palette, Success/Danger churn pair, surface→Accent heat ramp). Consumed by the App's `AnalyticsViewModel`.
-- **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly).
-- **`Controls/CustomTitleBar.axaml`(+`.cs`)** — the reusable hand-drawn title bar (drag/minimize/maximize/close) placed in row 0 of every `ChromedWindow`, reading `Title`/state off its ancestor window.
+- **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly). Applies `WindowChromePolicy` after its own `NoChrome` hints.
+- **`Views/WindowChromePolicy.cs`** — the per-platform chrome policy for client-area-extended
+  windows: Windows/Linux keep the hand-drawn `NoChrome` title bar; macOS overlays the system
+  chrome instead (`NoChrome` would remove the traffic lights — the only close control there),
+  hides the hand-drawn buttons (`CustomButtonsVisible`) and shifts title-bar content past the
+  traffic-light cluster (`TitleBarPadding`). Consumed by `ChromedWindow`, `CustomTitleBar`, and
+  MainWindow's code-behind.
+- **`Controls/CustomTitleBar.axaml`(+`.cs`)** — the reusable hand-drawn title bar (drag/minimize/maximize/close) placed in row 0 of every `ChromedWindow`, reading `Title`/state off its ancestor window; on macOS its buttons hide and its padding insets per `WindowChromePolicy`.
 - **`Converters/`** — the two git-free `IValueConverter`s: `BoolToOpacityConverter` and `ResourceKeyToGeometryConverter` (icon-key → `Icons.axaml`/theme `StreamGeometry`, the control-center badge lookup). Git-model converters (`AgentStatusBrushConverter`, `DiffLineKindToClassConverter`, `FileExtensionToIconConverter`) stayed in `Mainguard.App.Shell/Converters/`.
 - **`Properties/XmlnsDefinitions.cs`** — assembly `XmlnsDefinition`s mapping `Mainguard.UI.Controls`/`.Views`/`.Converters` (+ the `Mainguard.UI` root) onto the standard Avalonia XML namespace, so the moved chrome/converters resolve prefix-free under the default `xmlns` in the shell/Pro-UI XAML (Avalonia's compiled `using:`/`clr-namespace:` otherwise searches only the compiling assembly).
 

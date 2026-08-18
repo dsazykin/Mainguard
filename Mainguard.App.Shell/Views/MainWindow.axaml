@@ -189,7 +189,7 @@
     <Grid Margin="{Binding #Root.OffScreenMargin}">
         <Grid RowDefinitions="Auto, *">
         <!-- UNIFIED CUSTOM TITLE BAR (client-area chrome; whole bar drags the window) -->
-        <Border Grid.Row="0" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
+        <Border x:Name="TitleBarBorder" Grid.Row="0" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
                 PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
             <Grid ColumnDefinitions="Auto, *, Auto, Auto">
 
@@ -387,8 +387,9 @@
                     </StackPanel>
                 </StackPanel>
 
-                <!-- Window controls (custom chrome) -->
-                <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Stretch">
+                <!-- Window controls (custom chrome; hidden on macOS, where WindowChromePolicy
+                     overlays the native traffic lights instead) -->
+                <StackPanel x:Name="WindowButtonsPanel" Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Stretch">
                     <Button Classes="WindowButton" ToolTip.Tip="Minimize" Click="MinimizeButton_Click">
                         <PathIcon Data="{StaticResource WindowMinimizeIcon}" Width="11" Height="11" Foreground="{DynamicResource TextMuted}"/>
                     </Button>
