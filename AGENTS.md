@@ -120,9 +120,9 @@ knowledge:
 - **`/var` is a symlink to `/private/var`.** Host git canonicalizes paths; a jail has no such
   symlink. Test fixtures that cross either boundary start from the canonical temp root
   (`TempRepoFixture.CanonicalTempRoot`, `Server.Tests/Fixtures/CanonicalTemp`).
-- **Lockfiles carry `osx-arm64` sections** (committed, like the linux/win ones). A PARTIAL-graph
-  restore drops sections the subgraph doesn't need — `git checkout -- '**/packages.lock.json'`,
-  and prefer whole-solution restores or `--no-restore` partial builds.
+- **Lockfiles are RID-stable**: the daemon-graph projects declare
+  `<RuntimeIdentifiers>linux-x64;win-x64;osx-arm64</RuntimeIdentifiers>`, so every restore on any
+  platform evaluates identically and a lockfile diff means a real dependency change.
 - Jail images build **native arm64** (TARGETARCH-parametrized, per-arch pins); libvterm builds as
   a `.dylib` via the same pinned `build/libvterm/build.sh`.
 - Platform traits: `UnixOnlyFact` (Linux + macOS) vs `LinuxOnlyFact` (genuinely Linux-bound) vs

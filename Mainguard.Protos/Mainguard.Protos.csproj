@@ -4,6 +4,12 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- Declared to match Mainguard.Server's set: this project sits in the daemon's publish graph,
+         and a RID'd restore of that graph evaluates it under the RID — with no declaration here the
+         lockfile's recorded runtimes flapped per machine (WSL added linux-x64, a Mac adds osx-arm64)
+         and a RID-less locked-mode restore then failed NU1004. Declaring the full set makes every
+         restore evaluate identically, so the committed lockfile is stable on all three platforms. -->
+    <RuntimeIdentifiers>linux-x64;win-x64;osx-arm64</RuntimeIdentifiers>
     <AssemblyName>Mainguard.Protos</AssemblyName>
     <RootNamespace>Mainguard.Protos</RootNamespace>
   </PropertyGroup>
