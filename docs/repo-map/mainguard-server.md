@@ -406,7 +406,12 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` (and `RejectEntry`, its clone for the review verdict) refuses while this
+  record and bypass the gate's default-DENY. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
+  between a merge and the next repo-open based its worktree on the stale mirror main and
+  `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving
+  coherent-but-unmergeable Verified entries (observed live; the E2E suite verifies before merging so
+  it never walks that window). **Entry lifecycle:** `DiscardEntry` (and `RejectEntry`, its clone for the review verdict) refuses while this
   repo's outstanding merge lease names the entry — a terminal transition inside the
   `BeginMerge`→`ConfirmMerge` window would make `ConfirmMerge` refuse to record a merge that really
   landed — derives the actor from `IApproverIdentityResolver` (never the request; there is no such

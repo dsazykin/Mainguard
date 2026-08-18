@@ -28,14 +28,20 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Mainguard.Server.Auth.IApproverIdentityResolver _identity;
     private readonly Mainguard.Server.Runtime.AgentSessionStore _sessions;
+
+    /// <summary>The queue provisioner, for the post-confirm mirror-main refresh. Optional (null in
+    /// the slimmest unit fixtures): without one the mirror simply catches up at the next provision.</summary>
+    private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? _queues;
     private readonly ILogger _log;
 
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
         Mainguard.Server.Auth.IApproverIdentityResolver identity,
         Mainguard.Server.Runtime.AgentSessionStore sessions,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? queues = null)
     {
+        _queues = queues;
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
         _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
@@ -261,6 +267,18 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
         _log.LogInformation("ConfirmMerge repo={Repo} agent={Agent} newMainSha={Sha}",
             request.RepoHandle, request.AgentId, request.NewMainSha);
+
+        // Pull the mirror's main forward NOW rather than at the next repo-open: a spawn in the gap
+        // would base its worktree on the pre-merge main, and EnsureQueue's reconcile — which trusts
+        // the mirror — would walk the queue's authoritative main BACKWARDS to it, making every later
+        // verification coherent-but-unmergeable (observed live; the E2E suite never walks this window
+        // because it verifies before merging). Best-effort by design: the merge has landed either way.
+        if (_queues is not null && !_queues.TryRefreshMirrorMainAfterMerge(request.RepoHandle, out var refresh))
+        {
+            _log.LogWarning("ConfirmMerge: mirror main refresh failed repo={Repo}: {Reason}",
+                request.RepoHandle, refresh);
+        }
+
         return Task.FromResult(new ConfirmMergeResponse { Confirmed = true });
     }
 

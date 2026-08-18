@@ -973,6 +973,42 @@ public sealed class MergeQueueProvisioner
     private static string? ShowFile(string barePath, string reference, string path)
         => TryGit(barePath, out var output, "show", $"{reference}:{path}") ? output : null;
 
+    /// <summary>
+    /// Pulls the origin checkout's main forward into the bare mirror, called on a CONFIRMED human
+    /// merge. Without it the mirror's main stays wherever the last provision-fetch left it, and the
+    /// window between a merge and the next repo-open is a trap the E2E suite never walks (it verifies
+    /// every agent before merging): a spawn in that window bases its worktree on the stale mirror
+    /// main AND — worse — <see cref="EnsureQueue"/>'s reconcile trusts the mirror, so it walked the
+    /// queue's authoritative main BACKWARDS to the pre-merge sha. Verifications then ran coherently
+    /// against the old main, CanMerge said yes, and the client-side <c>--ff-only</c> refused every
+    /// one of them with "main moved" — a permanently unmergeable Verified entry, observed live.
+    ///
+    /// <para>Forced single-refspec fetch (origin's main is authoritative the moment a human merge is
+    /// confirmed — that is what "confirmed" means), narrow on purpose: agent refs stay mediated by
+    /// MG-3, and tags/other branches are not this path's business. Failure is reported, not thrown —
+    /// the merge has already landed; the mirror catches up at the next provision either way.</para>
+    /// </summary>
+    public bool TryRefreshMirrorMainAfterMerge(string repoHandle, out string reason)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        var mainBranch = ResolveDefaultBranch(barePath);
+        if (string.IsNullOrEmpty(RevParse(barePath, mainBranch)))
+        {
+            reason = $"no mirror main at '{barePath}'";
+            return false;
+        }
+
+        if (!TryGit(barePath, out var output,
+                "fetch", "--no-tags", "origin", $"+refs/heads/{mainBranch}:refs/heads/{mainBranch}"))
+        {
+            reason = $"git fetch origin {mainBranch} failed: {output.Trim()}";
+            return false;
+        }
+
+        reason = "";
+        return true;
+    }
+
     private static string RevParse(string barePath, string reference)
         => TryGit(barePath, out var output, "rev-parse", "--verify", reference) ? output.Trim() : string.Empty;
 
