@@ -880,6 +880,11 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/Fixtures/CanonicalTemp.cs`** — the canonical (symlink-resolved) temp
+  root for paths that CROSS the container boundary: macOS serves the temp dir behind `/var →
+  /private/var`, host git canonicalizes its gitdir/alternates, and a jail has no `/var` symlink —
+  so a fixture root in the raw spelling hands in-jail git a dangling pointer. Used by
+  `SandboxFixture` and the MG-3 mirror test; production roots (`~/mainguard`) are symlink-free.
 - **`Mainguard.Server.Tests/Agents/AgentEnvironmentFactoryTests.cs`** — pins the composition-root
   substrate choice (macOS → `MacHostAgentEnvironment`, elsewhere → `Wsl2AgentEnvironment`), the
   macos-host sync-remote shape (`mainguard-local` + local bare path, SC-2), and the deliberate

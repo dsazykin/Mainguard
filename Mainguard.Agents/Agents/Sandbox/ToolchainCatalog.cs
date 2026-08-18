@@ -131,16 +131,32 @@ public static class ToolchainCatalog
     // run this repo's tests at all. The official SDK tarball is version-addressed and Microsoft
     // publishes a sha512 next to it, so pinning it gives the exact band AND the same
     // fetch-then-verify-then-execute discipline the base image applies to the Nix and Devbox binaries.
-    // Refresh: bump the version and paste the published `.sha512`.
+    // Refresh: bump the version and paste the published `.sha512` for BOTH arches.
     private const string DotnetSdkVersion = "10.0.301";
 
-    private const string DotnetSdkSha512 =
+    private const string DotnetSdkSha512X64 =
         "cfbeec3a3a1d3ad3e168e37a77c4cc26c23125acd84a86d014047da3ecffce4c3"
         + "68a9acac4d7c950a047fa3d98989ce8aea69f8e5842cb6d330e8911e1c335a7";
 
+    private const string DotnetSdkSha512Arm64 =
+        "4ee438b363cb8468930d50b6bdc738a375e2f33b25bfd0c8dcb55853dda7f0fb1"
+        + "87693e0f49dfc31556e68320b961a50dcf3b74c1f25abe3a5bd916db607db99";
+
+    // The jail's architecture is the daemon's: the layer is docker-built against the local engine,
+    // which is linux-x64 inside the WSL2 VM and linux-arm64 on an Apple Silicon macos-host. Each
+    // arch carries its own publisher-issued sha512 (fetch-verify-execute, same as the base image).
+    private static readonly string DotnetSdkPlatform =
+        System.Runtime.InteropServices.RuntimeInformation.OSArchitecture
+            == System.Runtime.InteropServices.Architecture.Arm64
+        ? "linux-arm64"
+        : "linux-x64";
+
+    private static readonly string DotnetSdkSha512 =
+        DotnetSdkPlatform == "linux-arm64" ? DotnetSdkSha512Arm64 : DotnetSdkSha512X64;
+
     private static readonly ToolchainRecipe Dotnet10 = new(
         Id: "dotnet-10",
-        Summary: $".NET SDK {DotnetSdkVersion} (linux-x64, official build, sha512-pinned)",
+        Summary: $".NET SDK {DotnetSdkVersion} ({DotnetSdkPlatform}, official build, sha512-pinned)",
         InstallSteps: ImmutableArray.Create(
             // libicu is NOT optional and its absence is not a warning. The hardened base is
             // debian-bookworm-slim, which ships no ICU, and .NET's globalization initialiser calls
@@ -168,7 +184,7 @@ public static class ToolchainCatalog
             "apt-get update && apt-get install -y --no-install-recommends libicu72 libfontconfig1 "
             + "&& rm -rf /var/lib/apt/lists/*",
             "curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/dotnet-sdk.tar.gz "
-            + $"\"https://builds.dotnet.microsoft.com/dotnet/Sdk/{DotnetSdkVersion}/dotnet-sdk-{DotnetSdkVersion}-linux-x64.tar.gz\""
+            + $"\"https://builds.dotnet.microsoft.com/dotnet/Sdk/{DotnetSdkVersion}/dotnet-sdk-{DotnetSdkVersion}-{DotnetSdkPlatform}.tar.gz\""
             + $" && echo \"{DotnetSdkSha512}  /tmp/dotnet-sdk.tar.gz\" | sha512sum -c -"
             + $" && mkdir -p {InstallRoot}/dotnet-10"
             + $" && tar -xzf /tmp/dotnet-sdk.tar.gz -C {InstallRoot}/dotnet-10"

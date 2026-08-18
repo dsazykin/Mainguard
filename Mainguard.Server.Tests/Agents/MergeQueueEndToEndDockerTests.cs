@@ -831,7 +831,7 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         {
             var containerId = SessionFor(agentId)?.ContainerId;
             Assert.False(string.IsNullOrEmpty(containerId), $"'{agentId}' has no jail");
-            using var docker = new DockerClientConfiguration().CreateClient();
+            using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
             var inspected = await docker.Containers.InspectContainerAsync(containerId);
             return inspected.Image;
         }
@@ -1101,7 +1101,7 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         foreach (var id in _containers)
         {
             try { await docker.Containers.RemoveContainerAsync(id, new ContainerRemoveParameters { Force = true }); }
