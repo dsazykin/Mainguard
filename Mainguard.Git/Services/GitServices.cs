@@ -318,9 +318,9 @@ public class GitService : IGitService
     }
 
     /// <summary>
-    /// Removes a single working-tree file. On Windows the file is sent to the
-    /// Recycle Bin so a mis-clicked discard is recoverable; on other platforms
-    /// (no standard trash API) it falls back to a hard delete.
+    /// Removes a single working-tree file. On Windows it goes to the Recycle Bin and on macOS to
+    /// the Finder Trash (with Put Back), so a mis-clicked discard is recoverable; Linux (no
+    /// standard trash API) falls back to a hard delete.
     /// </summary>
     private static void SafeDeleteFile(string fullPath)
     {
@@ -331,9 +331,42 @@ public class GitService : IGitService
                 Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
                 Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
         }
+        else if (OperatingSystem.IsMacOS() && TryTrashOnMac(fullPath))
+        {
+            // Sent to the Trash — nothing else to do.
+        }
         else
         {
             System.IO.File.Delete(fullPath);
+        }
+    }
+
+    /// <summary>
+    /// macOS ships <c>/usr/bin/trash</c> (Finder-integrated; "Put Back" works). False on any
+    /// failure so the caller's hard delete keeps the discard's contract — the file must be gone
+    /// either way; the Trash is a courtesy, never a silent no-op.
+    /// </summary>
+    private static bool TryTrashOnMac(string fullPath)
+    {
+        try
+        {
+            if (!System.IO.File.Exists("/usr/bin/trash")) return false;
+
+            var psi = new System.Diagnostics.ProcessStartInfo("/usr/bin/trash")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add(fullPath);
+            using var trash = System.Diagnostics.Process.Start(psi);
+            if (trash is null) return false;
+            trash.WaitForExit(10_000);
+            return trash.HasExited && trash.ExitCode == 0 && !System.IO.File.Exists(fullPath);
+        }
+        catch
+        {
+            return false;
         }
     }
 
