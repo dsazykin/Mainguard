@@ -51,8 +51,11 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
 
 - **`Themes/`** — one `ResourceDictionary` per color theme (`MidnightLoom` default, `DaylightLoom`,
   `Graphite` — the macOS-native neutral-graphite dark with Apple-semantic-derived colors —
-  `CommandDeck`, `Atelier`, `LoomAurora`), each defining the full token contract (incl. the P2-13
-  `AgentStatus*Brush` micro-badge tokens resolved by the App's `AgentStatusBrushConverter`).
+  `Atelier`), each defining the full token contract (incl. the P2-13 `AgentStatus*Brush`
+  micro-badge tokens resolved by the App's `AgentStatusBrushConverter`). `CommandDeck` and
+  `LoomAurora` were retired in the 4-theme restyle; `ThemeManager`'s `LegacyKeyMap` migrates their
+  persisted keys (→ `Graphite` / `MidnightLoom`) and self-heals the store on first launch
+  (pinned by `Headless/ThemeRetirementMigrationTests`).
   - `App.axaml` seeds `MidnightLoom` and `ThemeManager` swaps it at runtime via
     `avares://Mainguard.UI/Themes/{key}.axaml`. `ThemeManager.SystemKey` ("System") is a follow-
     the-OS MODE, never a `Themes` entry (the render harnesses sweep that list): it persists as its
@@ -101,7 +104,7 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
 ## Role in the solution
 
 - **`Mainguard.UI`** (step 2c) — the edition-agnostic **design-system base layer** both the shell
-  and (later) the Pro UI render on: `Themes/*.axaml` (the five theme dictionaries + full token
+  and (later) the Pro UI render on: `Themes/*.axaml` (the theme dictionaries + full token
   contract), `Styles/Icons.axaml` (theme-independent fonts + icon `StreamGeometry`s) and
   `Styles/DesignSystem.axaml` (the `Button.*`/`Border.*`/ComboBox/… component-class styles) that
   `App.axaml` `ResourceInclude`s/`StyleInclude`s via `avares://Mainguard.UI/…`, `Theming/ThemeManager`

@@ -108,7 +108,7 @@
     position tests exist because the shell host lost its `Grid.Row="1"` and rendered top-right out of
     the title-bar row; they fail with the measured y-offset rather than a bare boolean.
   - `StartupShutdownRenderHarness` (owner design 2026-07-17) renders `StartupWindow` + `ShutdownWindow`
-    in all five themes across the key states (`loading_early`, `upgrade_consent`, `upgrade_running`,
+    in all themes across the key states (`loading_early`, `upgrade_consent`, `upgrade_running`,
     `degraded`, and the shutdown `stopping_vm`/`releasing`), plus the `MainWindow` degraded banner —
     PNGs `startup_<Theme>_<state>.png` / `shutdown_<Theme>_<state>.png` /
     `mainwindow_banner_<Theme>.png`;
@@ -127,7 +127,7 @@
 - **`Mainguard.Tests/`** — xUnit tests for Core (`MockOrchestratorTests` — the Lane E mock daemon's
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
-  coordinator surface rendered in all five themes + both layouts + Vibe/triage + post-cascade/frozen
+  coordinator surface rendered in all themes + both layouts + Vibe/triage + post-cascade/frozen
   states, PNGs to `artifacts_headless/`;
   **`Headless/ControlCenterPanelSizingRenderHarness.cs`** — the Control Center's panel *sizing*, which
   the harness above cannot see because `MockOrchestrator`'s fixtures are short friendly strings
@@ -187,7 +187,7 @@
   EBUSY retry, and the RT-D1 `DaemonCrashMidMerge` committed-but-unconfirmed exactly-once +
   never-committed release), `Integration/StaleCascadeTests` (two/three-worker cascade → re-verify →
   merge blocked until fresh; fail-after-rebase → Working), `Headless/MergeQueueRenderHarness` (the
-  real-`MergeQueue` rail in all five themes → `merge_queue_<Theme>.png`; note this renders
+  real-`MergeQueue` rail in every theme → `merge_queue_<Theme>.png`; note this renders
   `MergeQueueView`, which is **harness-only** — the shipped Control Center hosts `QueueRailView`),
   **`Headless/QueueEntryLifecycleRenderHarness.cs`** — the rail's entry-lifecycle actions at production
   id lengths: every non-terminal row has a Discard that is both visible **and enabled** (a
@@ -231,7 +231,7 @@
   present/absent, `BringBranchLocal` T-29 round-trip, review-sprint deferred→unviewed, flagged-gate
   blocks merge), `Integration/PoisonedBranchGateTests` (`PoisonedBranch_EndToEnd` — poisoned
   postinstall → Verified-but-blocked → item-by-item ack → CanMerge, + new-push re-arm),
-  `Headless/ReviewCockpitRenderHarness` (the real cockpit in all five themes →
+  `Headless/ReviewCockpitRenderHarness` (the real cockpit in every theme →
   `review_cockpit_<Theme>.png`); `Headless/MainWindowRailRenderHarness` — the integrated MainWindow
   with the section rail (repo section, coordinator section, collapsed rail) + the task-manager
   resource monitor (rows + end-confirm) + the repo picker; `GitServicesTests`, `GitServiceTagTests`,
@@ -591,7 +591,7 @@
     Apply/Edit/Delete — and the Clone Dashboard's clone-progress overlay at a mid-fill percentage, via
     canned services), `CloneDashboardRenderHarness.cs` (P2-48: the multi-provider Clone Dashboard — the
     GitHub/GitLab segmented selector + a populated repo grid — rendered with GitHub selected and GitLab
-    selected across all five themes, over a canned `IHostRepositoryService`; PNGs to
+    selected across all themes, over a canned `IHostRepositoryService`; PNGs to
     `artifacts_headless/`), and `Headless/AnalyticsRenderHarness.cs` (T-22: the full analytics view —
     language donut, weekly-churn time series, punch-card heatmap, contributor bars — against a
     multi-author/multi-week/multi-language fixture, captured in **both** MidnightLoom and DaylightLoom
@@ -622,7 +622,7 @@
     output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table), and
     `Headless/TerminalRenderHarness` (a coloured TUI frame through the interim engine captured in
     MidnightLoom + DaylightLoom, `terminal_frame_*.png`), and `Headless/BootstrapProgressRenderHarness`
-    (P2-05 staged checklist — a running mix + a failed run — in all five themes,
+    (P2-05 staged checklist — a running mix + a failed run — in every theme,
     `bootstrap_progress_*.png`). P2-05 units: `WslConfigMergerTests` (the six `.wslconfig` fixtures
     under `Fixtures/WslConfig/` — empty / no-`[wsl2]` / existing-`[wsl2]` / user-keys-preserved /
     comments+unknown-sections / CRLF — plus idempotency, purity, and the `memory=` min(50% RAM,8GB)
@@ -703,7 +703,7 @@
     typed denial), `DaemonGitProxyTests` (A6: allowlisted fetch succeeds + transparency line,
     non-allowlisted refused + audited, `git-receive-pack` push refused structurally + audited, and a
     reflection proof that no push/receive method exists), and `Headless/EgressAllowlistRenderHarness`
-    (the egress allowlist `Window` in all five themes — default + the A6-warning state — PNGs to
+    (the egress allowlist `Window` in every registered theme — default + the A6-warning state — PNGs to
     `artifacts_headless/`).
   - `TestTools/PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact`/`UnixOnlyFact`/
     `MacOnlyFact` skip-with-reason attributes. `UnixOnlyFact` (Linux + macOS) is for any-Unix
@@ -1111,8 +1111,10 @@
   coordinator projected as alive forever, wedging the startup loader and making Stop look like a
   no-op)**, **`TerminalClipboardTests` (terminal ↔ host clipboard: OSC 52 decode/raise incl.
   query-never-answered + split-feed, DECSET 2004 tracking, paste-byte building + the three paste
-  chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in all five
-  themes), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
+  chords)**, plus the headless `Headless/AgentStatusBrushTests` (every `AgentStatus`→token in every
+  registered theme), `Headless/ThemeRetirementMigrationTests` (the retired CommandDeck/LoomAurora
+  keys migrate through `ThemeManager.LegacyKeyMap` to their surviving relatives and re-persist;
+  an unknown key still falls back to the default unpersisted), `Headless/DockTeardownMemoryTests` (the blocking 50× open/close heap-stability +
   zero-floating-windows harness via the reused-host content-swap path),
   `DockerResourceSamplerMathTests` (the CPU/memory arithmetic without a daemon — chiefly the cases that
   must return **null**: zero system delta, negative delta, unknown CPU count, each of which the obvious
@@ -1127,9 +1129,9 @@
   renders "0%" — the tab previously hard-coded 0 for everything, which is indistinguishable from an
   idle fleet — and the cost UI appears only where spend is actually metered, with the unmetered row
   refusing to draw `$0.00` even on a mixed fleet), `Headless/ResourceMonitorRenderHarness` (the tab in
-  all five themes × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
+  every theme × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
   `artifacts_headless/`; the VM truths are asserted beside each capture so a blank surface cannot pass
-  as green), and the `Headless/ActivityBarRenderHarness` (the five-theme
+  as green), and the `Headless/ActivityBarRenderHarness` (the per-theme
   rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`). **`Terminal/`** is
   the P2-04 VT conformance & replay harness: `ITerminalEngineHarness.cs` (the engine-agnostic "feed
   bytes → read grid" seam + `GridSnapshot`/`GridCell`/`CellColor`/`CellAttrs` with a deterministic

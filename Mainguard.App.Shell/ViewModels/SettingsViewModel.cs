@@ -24,6 +24,19 @@ public partial class SettingsPinRowViewModel : ViewModelBase
     private bool _isPinned;
 }
 
+/// <summary>One theme choice in Settings → General: a ThemeManager key (or the "System" pseudo-key)
+/// plus the selected marker. Rows are built from <c>ThemeManager.Themes</c> so the picker follows
+/// the registered lineup instead of restating it. Lives on <see cref="GeneralSettingsViewModel"/>.</summary>
+public partial class SettingsThemeRowViewModel : ViewModelBase
+{
+    public string Key { get; init; } = string.Empty;
+    public string DisplayName { get; init; } = string.Empty;
+    public string? Tooltip { get; init; }
+
+    [ObservableProperty]
+    private bool _isSelected;
+}
+
 /// <summary>
 /// File → Settings…: the page-rail host, restructured from a single small dialog into a sidebar of
 /// pages + a content panel — the same <c>RailSectionViewModel</c>/<c>ActivateSection</c> pattern

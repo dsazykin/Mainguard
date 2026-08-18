@@ -8,7 +8,7 @@ namespace Mainguard.UI.Charts;
 /// <summary>
 /// Resolves LiveChartsCore paint colors from the app's theme tokens so every chart follows the active
 /// theme instead of hardcoding hex (the golden rule). Charts are rebuilt per analytics load, so they
-/// pick up whichever of the five themes is active at open time. Nothing here invents a hue: the
+/// pick up whichever registered theme is active at open time. Nothing here invents a hue: the
 /// categorical palette is the semantics-free graph-lane tokens (ordered for max colour-vision
 /// separation — validated with the dataviz palette checker), churn add/remove reuse the Success/Danger
 /// tokens by meaning, and the heatmap ramp blends the surface token toward the Accent token.

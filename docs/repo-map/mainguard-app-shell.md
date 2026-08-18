@@ -418,7 +418,9 @@
   so unpinning a host destination removes it from the sidebar immediately), `GeneralSettingsViewModel`
   (new Settings **General** page — Theme / Layout / Agent-prompting / Close-to-tray / Stop-VM-on-exit
   / the pinned-sidebar-icon rows above, all absorbed from the old File-menu dropdown submenus into one
-  page), `ISettingsPage` (`Mainguard.UI.ViewModels` — the minimal `OnActivated()`/`OnDeactivated()`
+  page; the theme picker is data-driven off `ThemeManager.Themes` + the System pseudo-row via
+  `SettingsThemeRowViewModel` — key/display-name/`IsSelected`, refreshed against the persisted choice
+  on every pick, so the lineup lives only in `ThemeManager` and the active choice is marked), `ISettingsPage` (`Mainguard.UI.ViewModels` — the minimal `OnActivated()`/`OnDeactivated()`
   interface, same weight class as `IShellRailHost`, that every Settings page's ViewModel implements so
   `SettingsViewModel`'s page-switch logic can notify it), `VersionsViewModel` (promoted from the old
   small Settings dialog's read-only About/versions footer card into its own Settings **About** page
@@ -587,7 +589,7 @@
     `MergeQueueViewModel`/`MergeQueueRowViewModel` (P2-10: the rail bound to the **real** `MergeQueue`
     state machine — subscribes to its `Changed` event, per-row state word + `main@sha` label +
     `CanMerge`-gated Merge button with the reason as tooltip + the loud stale-override behind a confirm;
-    design tokens/five themes; render-harness-driven, not yet mounted on MainWindow),
+    design tokens/registered themes; render-harness-driven, not yet mounted on MainWindow),
     `ReviewCockpitViewModel` +
     `ReviewFileRowViewModel`/`ReviewHunkRowViewModel`/`FlaggedChangesPanelViewModel`/`FlaggedItemRowViewModel`
     (P2-11: composes the pure-Core rules into the cockpit — `ReviewCockpitContext` inputs → risk-ordered
@@ -741,7 +743,7 @@
   - `CheckerboardBackdrop.cs` — the token-drawn transparency checkerboard behind both image stages
     (alternating `SurfaceDeep`/`SurfaceCard`, resolved at render time + re-resolved on
     `ThemeManager.ThemeChanged`), so transparent pixels are distinguishable from surface-coloured ones
-    in all five themes.
+    in every theme.
   - `TerminalControl.cs` + `VtScreen.cs` (P2-03) — the interim terminal engine behind `ITerminalView`:
     `VtScreen` is a pure, Avalonia-free VT parser + cell grid (SGR colour, cursor motion, erase,
     10k-line circular scrollback, OSC 52 clipboard-copy decode → `ClipboardCopyRequested` — queries

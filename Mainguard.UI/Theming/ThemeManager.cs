@@ -35,9 +35,18 @@ public static class ThemeManager
         new ThemeInfo("MidnightLoom", "Midnight Loom", ThemeVariant.Dark),
         new ThemeInfo("DaylightLoom", "Daylight Loom", ThemeVariant.Light),
         new ThemeInfo("Graphite", "Graphite", ThemeVariant.Dark),
-        new ThemeInfo("CommandDeck", "Command Deck", ThemeVariant.Dark),
         new ThemeInfo("Atelier", "Atelier", ThemeVariant.Dark),
-        new ThemeInfo("LoomAurora", "Loom Aurora", ThemeVariant.Dark),
+    };
+
+    /// <summary>
+    /// Retired themes → their nearest surviving relative. A persisted key from before the retirement
+    /// still resolves to a deliberate choice (not the silent default fallback), and
+    /// <see cref="Initialize"/> re-persists the mapped key so the store self-heals on first launch.
+    /// </summary>
+    private static readonly Dictionary<string, string> LegacyKeyMap = new()
+    {
+        ["CommandDeck"] = "Graphite",
+        ["LoomAurora"] = "MidnightLoom",
     };
 
     /// <summary>
@@ -59,9 +68,18 @@ public static class ThemeManager
     /// (e.g. CommitGraphCanvas) re-resolve their brushes on this.</summary>
     public static event Action? ThemeChanged;
 
-    /// <summary>Apply the persisted (or default) theme at startup, before the main window opens.</summary>
+    /// <summary>Apply the persisted (or default) theme at startup, before the main window opens.
+    /// A retired key maps through <see cref="LegacyKeyMap"/> and persists its replacement (the shell
+    /// wires <see cref="PersistKey"/> before calling this); an unknown key falls back to the default
+    /// without persisting, so a newer build's key survives a downgrade round-trip.</summary>
     public static void Initialize(string? savedKey)
     {
+        if (savedKey is not null && LegacyKeyMap.TryGetValue(savedKey, out var replacement))
+        {
+            Apply(replacement, persist: true);
+            return;
+        }
+
         var key = savedKey == SystemKey || Themes.Any(t => t.Key == savedKey) ? savedKey! : DefaultKey;
         Apply(key, persist: false);
     }

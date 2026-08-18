@@ -128,7 +128,7 @@ public class MainWindowShellRenderHarness
     // ItemsControl carried no Grid.Row and so landed in row 0 — the 44px custom title bar — where
     // VerticalAlignment="Bottom" anchors to the bottom of the TITLE BAR, i.e. the top of the window
     // (and grew that Auto row to fit). Geometry is asserted, not eyeballed; the PNGs are for the
-    // design-system pass across all five themes.
+    // design-system pass across all themes.
     [AvaloniaFact]
     public void ShellToasts_ShouldSitInTheBottomRightCorner_InEveryTheme()
     {

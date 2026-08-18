@@ -24,11 +24,11 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class ResourceMonitorRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     /// <summary>A metered (BYOK) fleet with live readings: the full cost UI must be present.</summary>
     [AvaloniaFact]
-    public void Capture_LiveAgents_Byok_AllFiveThemes()
+    public void Capture_LiveAgents_Byok_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {
@@ -59,7 +59,7 @@ public class ResourceMonitorRenderHarness
 
     /// <summary>An OAuth fleet: no cap editor, no Save, no spend figure — an honest statement instead.</summary>
     [AvaloniaFact]
-    public void Capture_LiveAgents_Oauth_AllFiveThemes()
+    public void Capture_LiveAgents_Oauth_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {
@@ -90,7 +90,7 @@ public class ResourceMonitorRenderHarness
 
     /// <summary>A failed sample next to a genuinely idle agent — the capture that shows "—" is not "0%".</summary>
     [AvaloniaFact]
-    public void Capture_FailedSample_NextToIdle_AllFiveThemes()
+    public void Capture_FailedSample_NextToIdle_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {

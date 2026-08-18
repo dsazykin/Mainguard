@@ -21,14 +21,14 @@ using Xunit;
 namespace Mainguard.Tests.Headless;
 
 // P2-13 test 5 (§5) / TI-P2-13.6: render the section rail — the "activity bar" — with its four
-// scripted agents in EVERY one of the five themes (Daylight Loom included) for human visual review
+// scripted agents in EVERY registered theme (Daylight Loom included) for human visual review
 // against ControlCenterDesign §0/§2/§4 (badge legibility, spacing, kill-switch prominence). Also
 // captures the per-agent Dock.Avalonia workspace so the dock chrome gets a visual pass. PNGs land in
 // artifacts_headless/.
 public class ActivityBarRenderHarness
 {
     private static readonly string[] ThemeKeys =
-        { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
+        { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     [AvaloniaFact]
     public void ActivityBar_HeadlessPng_AllThemes()

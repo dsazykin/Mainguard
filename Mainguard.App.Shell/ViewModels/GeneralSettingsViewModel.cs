@@ -32,6 +32,16 @@ public partial class GeneralSettingsViewModel : ViewModelBase
         SetAgentPromptingCommand = setAgentPromptingCommand;
         _onPinsChanged = onPinsChanged;
 
+        ThemeRows.Add(new SettingsThemeRowViewModel
+        {
+            Key = ThemeManager.SystemKey,
+            DisplayName = "System",
+            Tooltip = "Follow the OS appearance: dark → Midnight Loom, light → Daylight Loom",
+        });
+        foreach (var theme in ThemeManager.Themes)
+            ThemeRows.Add(new SettingsThemeRowViewModel { Key = theme.Key, DisplayName = theme.DisplayName });
+        RefreshThemeSelection();
+
         var pinned = _settingsService.Current.PinnedMenuIds;
         foreach (var def in PinnableMenus.All)
         {
@@ -53,8 +63,25 @@ public partial class GeneralSettingsViewModel : ViewModelBase
 
     public ObservableCollection<SettingsPinRowViewModel> PinRows { get; } = new();
 
+    public ObservableCollection<SettingsThemeRowViewModel> ThemeRows { get; } = new();
+
     [RelayCommand]
-    private void SetTheme(string themeKey) => ThemeManager.Apply(themeKey);
+    private void SetTheme(string themeKey)
+    {
+        ThemeManager.Apply(themeKey);
+        RefreshThemeSelection();
+    }
+
+    /// <summary>Marks the row matching the PERSISTED choice — the "System" pseudo-row while the OS
+    /// drives the theme, else the applied key. Refreshed here rather than via the static
+    /// <c>ThemeManager.ThemeChanged</c> event: this VM is rebuilt per Settings visit, and a static
+    /// subscription would pin every past instance alive.</summary>
+    private void RefreshThemeSelection()
+    {
+        var selected = ThemeManager.IsFollowingSystem ? ThemeManager.SystemKey : ThemeManager.CurrentKey;
+        foreach (var row in ThemeRows)
+            row.IsSelected = row.Key == selected;
+    }
 
     public bool CloseToTray
     {

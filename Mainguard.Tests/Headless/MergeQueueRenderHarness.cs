@@ -26,10 +26,10 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class MergeQueueRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     [AvaloniaFact]
-    public void Capture_MergeQueueRail_AllFiveThemes()
+    public void Capture_MergeQueueRail_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {
