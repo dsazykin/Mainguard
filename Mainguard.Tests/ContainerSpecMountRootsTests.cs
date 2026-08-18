@@ -72,5 +72,6 @@ public class ContainerSpecMountRootsTests
         // have not opted in.
         => Assert.NotNull(ContainerSpecBuilder.Build(
             Request(worktree: "/home/other/wt", bareRepo: null, ipcDir: null, roots: Array.Empty<string>())
-                with { AllowedMountRoots = null }));
+                with
+            { AllowedMountRoots = null }));
 }
