@@ -53,7 +53,10 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `CommandDeck`, `Atelier`, `LoomAurora`), each defining the full token contract (incl. the P2-13
   `AgentStatus*Brush` micro-badge tokens resolved by the App's `AgentStatusBrushConverter`).
   - `App.axaml` seeds `MidnightLoom` and `ThemeManager` swaps it at runtime via
-    `avares://Mainguard.UI/Themes/{key}.axaml`.
+    `avares://Mainguard.UI/Themes/{key}.axaml`. `ThemeManager.SystemKey` ("System") is a follow-
+    the-OS MODE, never a `Themes` entry (the render harnesses sweep that list): it persists as its
+    own key, resolves dark→Midnight Loom / light→Daylight Loom, and re-resolves live on the
+    platform's `ColorValuesChanged`. Pinned by `Headless/SystemThemeModeTests`.
 - **`Styles/Icons.axaml`** — the theme-INDEPENDENT resources: the `FontUi`/`FontMono` families +
   every icon `StreamGeometry` (window-control glyphs, rail/section icons, agent-lifecycle
   micro-badges, severity/signing glyphs). Deliberately NOT under `Themes/` — `ThemeManager.Apply`

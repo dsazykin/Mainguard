@@ -8,6 +8,7 @@
         <StackPanel Spacing="10">
             <TextBlock Text="Theme" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
             <WrapPanel>
+                <Button Content="System" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="System" ToolTip.Tip="Follow the OS appearance: dark → Midnight Loom, light → Daylight Loom"/>
                 <Button Content="Midnight Loom" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="MidnightLoom"/>
                 <Button Content="Daylight Loom" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="DaylightLoom"/>
                 <Button Content="Command Deck" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="CommandDeck"/>
