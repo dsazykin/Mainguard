@@ -35,10 +35,11 @@ public static class DockerEndpointResolver
     public static (Uri? Uri, string Source) Resolve() =>
         OperatingSystem.IsWindows()
             ? (null, "library default")
+            // MainguardPaths.HomeDirectory, not GetFolderPath: the repo-wide guard bans direct
+            // GetFolderPath calls (it returns "" for a not-yet-materialized Unix home).
             : ResolveCore(
                 Environment.GetEnvironmentVariable,
-                Path.Combine(Environment.GetFolderPath(
-                    Environment.SpecialFolder.UserProfile, Environment.SpecialFolderOption.DoNotVerify), ".docker"),
+                Path.Combine(Mainguard.Git.MainguardPaths.HomeDirectory(), ".docker"),
                 File.Exists,
                 Mainguard.Git.MainguardPaths.HomeDirectory());
 
