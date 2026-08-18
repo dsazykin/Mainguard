@@ -26,6 +26,14 @@ service AgentService {
   // As with DiscardEntry there is also no actor field: the resuming identity is derived daemon-side.
   rpc ResumeAgent(ResumeAgentRequest) returns (ResumeAgentResponse);
   rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+  // Human per-agent pause/resume (docker pause/unpause on the agent's jail). Distinct from the kill
+  // switch: not containment — no terminal lock, one agent, recoverable in place. "Unpause" rather
+  // than "Resume" because ResumeAgent is the stranded-entry adoption above. A human pause is STICKY:
+  // the stale cascade's keep-alive yield may run through a paused jail (a frozen jail is already
+  // quiescent for the rebase) but never wakes it; a human unpause defers to an in-flight machine
+  // hold with a self-clearing refusal. Refusal-as-response; no actor field (daemon-derived identity).
+  rpc PauseAgent(PauseAgentRequest) returns (PauseAgentResponse);
+  rpc UnpauseAgent(UnpauseAgentRequest) returns (UnpauseAgentResponse);
   // Harvest a LIVE agent's CLI login-state WITHOUT stopping it. The jail's $HOME is tmpfs and the
   // durable store is the host OS keychain, but harvest previously ran only inside StopAgent — so a
   // daemon shutdown, VM stop, or crash lost the login and the user had to sign in again on every
@@ -141,6 +149,28 @@ message ResumeAgentResponse {
   // asked for a different reason, and a stale "verifying" claim must not be left standing for a jail
   // that no longer existed.
   bool cleared_stalled_verification = 6;
+}
+
+message PauseAgentRequest {
+  string agent_id = 1;
+}
+
+message PauseAgentResponse {
+  // False for a refusal (unknown agent, no jail, kill switch engaged) — an ordinary successful RPC
+  // carrying the reason, same contract as ResumeAgentResponse.
+  bool paused = 1;
+  string reason = 2; // rendered verbatim when paused is false
+}
+
+message UnpauseAgentRequest {
+  string agent_id = 1;
+}
+
+message UnpauseAgentResponse {
+  // False while a machine hold is outstanding (the keep-alive rebase's yield — seconds; try again)
+  // or the kill freeze is engaged, and for unknown/not-paused agents. Reason rendered verbatim.
+  bool unpaused = 1;
+  string reason = 2;
 }
 
 message StopAgentRequest {

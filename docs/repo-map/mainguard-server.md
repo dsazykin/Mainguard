@@ -247,6 +247,16 @@
     the session back), and appends the `queue_entry_resumed` audit event. Every refusal is an ordinary
     result carrying its sentence — never an exception — and a refusal that follows a retraction says so.
     See `docs/design/resume-stranded-queue-entry.md`.
+  - **`Runtime/AgentPauseService.cs`** — the human per-agent Pause/Resume bodies behind
+    `AgentService.PauseAgent`/`UnpauseAgent`, plus **`HumanPauseLedger`** (the `IPauseArbiter`
+    singleton every repo's `YieldProtocol` consults). Not containment: no terminal lock, one agent.
+    Fans over EVERY session behind the id (`pr-<n>` exists per-repo); tolerates "already paused" BY
+    `ISandboxEngine.IsPausedAsync` inspect state, never by error-message substring (engine wordings
+    differ per version). The arbitration rules: a human pause is sticky — the cascade's yield runs
+    through a frozen jail and never wakes it (checked at RESUME time in `YieldProtocol`) — and a
+    human unpause is refused while a machine hold is outstanding (self-clearing, seconds). Refusals
+    are answers, not exceptions. Pinned by `Mainguard.Server.Tests/AgentPauseTests` (incl. a real
+    docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
   - **`Runtime/CoordinatorIpcServer.cs`** (PR3) — the coordinator→daemon spawn channel: one Unix-domain
     socket per coordinator served from a daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un
     limit) that also carries the executable `mainguard-agent` shim; the dir is created BEFORE the jail

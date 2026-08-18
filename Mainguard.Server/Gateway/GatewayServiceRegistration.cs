@@ -149,7 +149,11 @@ public static class GatewayServiceRegistration
                 // "does this agent have a live sandbox" has one rule in the daemon rather than three.
                 containerIdFor: agentId =>
                     ResolveVerificationJail(sp.GetRequiredService<AgentSessionStore>(), repoHash, agentId),
-                supervisor: sp.GetRequiredService<IAgentSupervisor>()),
+                supervisor: sp.GetRequiredService<IAgentSupervisor>(),
+                // The human-pause arbiter: the cascade's yield runs THROUGH a human-paused jail
+                // (already quiescent) but never wakes it, and its own critical section refuses a
+                // human unpause for its few seconds (see HumanPauseLedger).
+                arbiter: sp.GetRequiredService<Mainguard.Server.Runtime.HumanPauseLedger>()),
             // Where the rebase happens. Only the worktree comes from here — the provisioner resolves the
             // mirror and the main branch from the same two calls that key the queue's own main@sha, so
             // the ref a branch is rebased ONTO and the ref its verification is pinned AGAINST cannot

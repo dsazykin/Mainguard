@@ -49,6 +49,10 @@ public sealed class RoleInterceptor : Interceptor
         // Rejecting is the review verdict "no" — merge power's other terminal. An agent that could
         // reject a co-tenant's verified branch would hold veto over work it competes with.
         "/mainguard.v1.MergeQueueService/RejectEntry",
+        // An agent that could freeze a co-tenant's jail could rig the queue (a paused co-tenant
+        // never re-verifies), and one that could unpause could break the cascade's critical section.
+        "/mainguard.v1.AgentService/PauseAgent",
+        "/mainguard.v1.AgentService/UnpauseAgent",
         // Same boundary: clearing a stalled verification puts a branch back to Working, which is the state
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.

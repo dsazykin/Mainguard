@@ -103,6 +103,11 @@ public static class DaemonHost
         builder.Services.AddSingleton(_ => new Mainguard.Agents.Agents.Orchestrator.CoordinatorConversationService());
 
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.KillSwitchGate>();
+
+        // Human per-agent Pause/Resume (PauseAgent/UnpauseAgent) + the arbiter every repo's
+        // YieldProtocol consults so the human's pause and the cascade's pause never fight.
+        builder.Services.AddSingleton<Runtime.HumanPauseLedger>();
+        builder.Services.AddSingleton<Runtime.AgentPauseService>();
         // MG-8: the wired kill target must CONTAIN, not relabel. SandboxKillTarget severs terminal input
         // (TerminalLockRegistry + SessionLeader) and docker-pauses the jail through the substrate's sandbox
         // engine, then marks the state — the state mark alone (the old SessionStoreKillTarget) left every

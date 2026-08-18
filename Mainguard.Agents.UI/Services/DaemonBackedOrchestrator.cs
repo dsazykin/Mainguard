@@ -1116,10 +1116,52 @@ public sealed class DaemonBackedOrchestrator :
         _cliSettings.Save(outcome.RepoHandle, outcome.AgentKind, outcome.CliSettings);
     }
 
-    // No per-agent pause/prompt/plan-tree RPCs exist on the daemon contract yet — these steer nothing.
-    // They stay no-ops/empty (never fabricated); the terminal attach stream carries the live PTY instead.
-    public Task PauseAgentAsync(string agentId) => Task.CompletedTask;
-    public Task ResumeAgentAsync(string agentId) => Task.CompletedTask;
+    /// <summary>Human per-agent pause over the PauseAgent RPC (docker pause on the jail). A refusal —
+    /// no live jail, kill switch engaged — is thrown with the daemon's reason; an old daemon that
+    /// predates the RPC answers Unimplemented, mapped to an honest sentence (the GetDaemonInfo
+    /// convention). The state flip arrives back on the agent-event stream; nothing is set optimistically.</summary>
+    public async Task PauseAgentAsync(string agentId)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        Proto.PauseAgentResponse response;
+        try
+        {
+            response = await _client.PauseAgentAsync(agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            throw new InvalidOperationException("Can't pause — this daemon predates per-agent pause; update it.");
+        }
+
+        if (!response.Paused)
+        {
+            throw new InvalidOperationException($"Can't pause — {response.Reason}.");
+        }
+    }
+
+    /// <summary>Human per-agent resume over the UnpauseAgent RPC. The daemon refuses (self-clearingly)
+    /// while the keep-alive rebase briefly holds the jail — the reason says to try again in a moment.</summary>
+    public async Task ResumeAgentAsync(string agentId)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        Proto.UnpauseAgentResponse response;
+        try
+        {
+            response = await _client.UnpauseAgentAsync(agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            throw new InvalidOperationException("Can't resume — this daemon predates per-agent pause; update it.");
+        }
+
+        if (!response.Unpaused)
+        {
+            throw new InvalidOperationException($"Can't resume — {response.Reason}.");
+        }
+    }
+
+    // No prompt-queue/plan-tree RPCs exist on the daemon contract yet — these steer nothing. They stay
+    // no-ops/empty (never fabricated); the terminal attach stream carries the live PTY instead.
     public Task SendPromptAsync(string agentId, string prompt) => Task.CompletedTask;
     public IReadOnlyList<string> GetQueuedPrompts(string agentId) => Array.Empty<string>();
     public Task CancelQueuedPromptAsync(string agentId, int index) => Task.CompletedTask;

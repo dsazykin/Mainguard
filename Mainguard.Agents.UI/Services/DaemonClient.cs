@@ -284,6 +284,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new ProvisionedRepo(response.RepoHandle, response.SyncRemoteName, response.SyncRemoteUrl);
     }
 
+    /// <summary>Human per-agent pause (docker pause on the jail; refusal-as-response).</summary>
+    public async Task<PauseAgentResponse> PauseAgentAsync(string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.PauseAgentAsync(new PauseAgentRequest { AgentId = agentId }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Human per-agent resume ("unpause" — ResumeAgent is the stranded-entry adoption).</summary>
+    public async Task<UnpauseAgentResponse> UnpauseAgentAsync(string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.UnpauseAgentAsync(new UnpauseAgentRequest { AgentId = agentId }, CallOptions(ct, deadline));
+    }
+
     /// <summary>Stops an agent (authenticated, deadlined). The result carries the CLI login-state
     /// files the daemon harvested from the jail's tmpfs $HOME just before teardown (SECRET contents)
     /// — the caller persists them into the host OS keychain so the login survives the relaunch.</summary>

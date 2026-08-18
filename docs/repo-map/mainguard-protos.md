@@ -11,7 +11,12 @@
     shared message cannot be put on the coordinator's denied list), and `ResumeAgentRequest` carries no
     `role`, so a resume structurally cannot mint a coordinator. Like `DiscardEntryRequest` it carries no
     actor either. A refusal is `resumed=false` + a verbatim reason on a successful RPC, never a status
-    code, so "no exception" is not evidence a jail exists; + the PR3 **`ListInstalledAdapters`** —
+    code, so "no exception" is not evidence a jail exists; **`PauseAgent`/`UnpauseAgent`** — the human
+    per-agent pause (docker pause on the jail; NOT containment — no terminal lock, one agent,
+    recoverable): "Unpause" because `ResumeAgent` is the adoption above; a human pause is STICKY (the
+    cascade's yield runs through a frozen jail but never wakes it) and a human unpause DEFERS to an
+    in-flight machine hold with a self-clearing refusal (`HumanPauseLedger`); refusal-as-response, no
+    actor field, both on the coordinator's denied list; + the PR3 **`ListInstalledAdapters`** —
     the installed agent CLIs as `InstalledAdapterInfo{id,version,api_key_env_var}`, env-var NAMES only,
     never values; plus **`GetDaemonInfo`** — the tier-1 skew probe returning `daemon_version` (the
     Mainguard.Server assembly informational version) + `payload_version` (the `/etc/mainguardos-release`

@@ -339,6 +339,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     public Task UnpauseAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.UnpauseContainerAsync(containerId, ct);
 
+    public async Task<bool> IsPausedAsync(string containerId, CancellationToken ct = default)
+    {
+        var inspect = await RunBoundedAsync(
+            token => _docker.Containers.InspectContainerAsync(containerId, token),
+            ControlPlaneTimeout, "inspect (paused?)", containerId, ct).ConfigureAwait(false);
+        return inspect.State?.Paused ?? false;
+    }
+
     public Task StopAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.StopContainerAsync(containerId, new ContainerStopParameters(), ct);
 

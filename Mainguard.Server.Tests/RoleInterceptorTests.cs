@@ -88,6 +88,28 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesPauseAndUnpauseToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var agents = new AgentService.AgentServiceClient(fixture.CreateChannel());
+        var headers = fixture.AuthHeaders(CoordinatorToken);
+
+        // An agent that could freeze a co-tenant's jail could rig the queue; one that could unpause
+        // could break the cascade's critical section open mid-write.
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            agents.PauseAgentAsync(new PauseAgentRequest { AgentId = "a" }, headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+
+        var ex2 = await Assert.ThrowsAsync<RpcException>(() =>
+            agents.UnpauseAgentAsync(new UnpauseAgentRequest { AgentId = "a" }, headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, ex2.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex2.Status.Detail);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesPlanApprovalToCoordinator()
     {
         using var fixture = new DaemonFixture();
