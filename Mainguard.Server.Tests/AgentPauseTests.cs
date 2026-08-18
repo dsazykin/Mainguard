@@ -22,6 +22,8 @@ namespace Mainguard.Server.Tests;
 /// (the machine never wakes it), and a human unpause DEFERS to an in-flight machine hold (an
 /// honest, self-clearing refusal — a click must never break the rebase's pause open mid-write).
 /// </summary>
+[Trait("Category", "RequiresDocker")]
+[Collection(DockerSuiteCollection.Name)]
 public sealed class AgentPauseTests
 {
     // ---- HumanPauseLedger ------------------------------------------------
