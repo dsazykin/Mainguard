@@ -37,7 +37,7 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class ControlCenterPanelSizingRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     // The owner's own live container id + the branch the daemon derives from it.
     private const string RealAgentId = "1deb19131adb-ef9fe0bd3390433193896eca5e46145e";

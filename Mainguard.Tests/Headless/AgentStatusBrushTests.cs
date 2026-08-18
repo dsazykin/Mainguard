@@ -17,7 +17,7 @@ namespace Mainguard.Tests.Headless;
 public class AgentStatusBrushTests
 {
     private static readonly string[] ThemeKeys =
-        { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+        { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     [AvaloniaFact]
     public void StatusBrush_MappingComplete()

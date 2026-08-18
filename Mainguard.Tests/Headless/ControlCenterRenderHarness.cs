@@ -27,7 +27,7 @@ namespace Mainguard.Tests.Headless;
 // the load-bearing VM truths (gate reasons, cascade, freeze) are asserted along the way.
 public class ControlCenterRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     [AvaloniaFact]
     public void Capture_CoordinatorSurface_AllFiveThemes()

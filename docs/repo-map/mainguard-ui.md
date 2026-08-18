@@ -50,6 +50,7 @@ seams over `ProComposition` so the render harnesses' mock-injection is unchanged
 Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
 
 - **`Themes/`** — one `ResourceDictionary` per color theme (`MidnightLoom` default, `DaylightLoom`,
+  `Graphite` — the macOS-native neutral-graphite dark with Apple-semantic-derived colors —
   `CommandDeck`, `Atelier`, `LoomAurora`), each defining the full token contract (incl. the P2-13
   `AgentStatus*Brush` micro-badge tokens resolved by the App's `AgentStatusBrushConverter`).
   - `App.axaml` seeds `MidnightLoom` and `ThemeManager` swaps it at runtime via

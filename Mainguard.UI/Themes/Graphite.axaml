@@ -1,0 +1,95 @@
+<!-- GRAPHITE — the macOS-native dark theme.
+     Neutral graphite surfaces with no color cast, Apple-semantic-derived
+     accent and status colors (systemBlue/systemGreen/systemRed families,
+     tuned to pass the contrast gates on our surface stack). The most
+     restrained theme in the lineup — nothing neon, nothing tinted.
+     Every theme file must define the FULL token contract documented in
+     AGENTS.md (UI / Design System). -->
+<ResourceDictionary xmlns="https://github.com/avaloniaui"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <!-- Surfaces (darkest window → raised card) -->
+    <SolidColorBrush x:Key="SurfaceWindow" Color="#1D1D1F"/>
+    <SolidColorBrush x:Key="SurfacePanel" Color="#232326"/>   <!-- floating panel / sidebar card -->
+    <SolidColorBrush x:Key="SurfaceDeep" Color="#161618"/>    <!-- code/diff editor -->
+    <SolidColorBrush x:Key="SurfaceCard" Color="#2A2A2E"/>    <!-- inputs, raised cards, segment tracks -->
+    <SolidColorBrush x:Key="SurfaceHover" Color="#36363B"/>   <!-- hover / neutral selection -->
+    <SolidColorBrush x:Key="SurfaceHoverGhost" Color="#0036363B"/> <!-- SurfaceHover at 0 alpha: rest state for ghost buttons so the hover fade never passes through white -->
+    <SolidColorBrush x:Key="ButtonBg" Color="#2E2E33"/>
+    <SolidColorBrush x:Key="BorderHairline" Color="#3A3A3F"/>
+
+    <!-- Text -->
+    <SolidColorBrush x:Key="TextPrimary" Color="#E8E8EA"/>
+    <SolidColorBrush x:Key="TextMuted" Color="#9A9AA2"/>
+    <SolidColorBrush x:Key="OnAccent" Color="#131316"/>       <!-- text on Accent/Success/Danger fills -->
+
+    <!-- Signature accent: systemBlue's light tint (pure #0A84FF fails AA against either text pole) -->
+    <SolidColorBrush x:Key="AccentBrush" Color="#409CFF"/>
+    <SolidColorBrush x:Key="AccentHover" Color="#66AFFF"/>
+    <SolidColorBrush x:Key="AccentSelection" Color="#26409CFF"/> <!-- translucent selection tint -->
+
+    <!-- Semantic -->
+    <SolidColorBrush x:Key="SuccessBrush" Color="#30B158"/>
+    <SolidColorBrush x:Key="SuccessHover" Color="#4CC26D"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#FF453A"/>
+    <SolidColorBrush x:Key="DangerHover" Color="#FF6B60"/>
+    <SolidColorBrush x:Key="WarningBrush" Color="#E5993B"/>
+    <SolidColorBrush x:Key="InfoBrush" Color="#5AC8F5"/>
+
+    <!-- Agent status micro-badge tokens (P2-13): resolved by AgentStatusBrushConverter; glyph
+         carries state (E1/E2), brush is the second channel. New token = add here in every Themes/*.axaml. -->
+    <SolidColorBrush x:Key="AgentStatusWorkingBrush" Color="#5AC8F5"/>
+    <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#409CFF"/>
+    <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#30B158"/>
+    <SolidColorBrush x:Key="AgentStatusStaleBrush" Color="#E5993B"/>
+    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#A18FD9"/>
+    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#FF453A"/>
+    <SolidColorBrush x:Key="AgentStatusRateLimitedBrush" Color="#E5993B"/>
+    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#FF453A"/>
+    <SolidColorBrush x:Key="AgentStatusPausedBrush" Color="#9A9AA2"/>
+
+    <!-- Commit-graph lanes -->
+    <!-- Lanes decoupled from semantic status tokens (DESIGN.md §2): none is hex-identical to
+         Accent/Warning/Info/Success, so graph topology never accidentally implies status. The
+         structure mirrors MidnightLoom's deutan-verified set, desaturated to the graphite mood. -->
+    <SolidColorBrush x:Key="Lane1" Color="#9D9DE8"/>
+    <SolidColorBrush x:Key="Lane2" Color="#D083A8"/>
+    <SolidColorBrush x:Key="Lane3" Color="#A9D6CD"/>
+    <SolidColorBrush x:Key="Lane4" Color="#D9A21F"/>
+    <SolidColorBrush x:Key="Lane5" Color="#3E96F2"/>
+
+    <!-- Diff line backgrounds -->
+    <SolidColorBrush x:Key="DiffAddedBg" Color="#15281C"/>
+    <SolidColorBrush x:Key="DiffRemovedBg" Color="#321B1D"/>
+    <!-- Intra-line (word-level) emphasis + trailing-whitespace marker (T-13) -->
+    <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#6630B158"/>
+    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66FF453A"/>
+    <SolidColorBrush x:Key="DiffWhitespaceMarker" Color="#55E5993B"/>
+
+    <!-- Blame age-heat gutter (T-11): recent → BlameAgeNew, old → BlameAgeOld. -->
+    <SolidColorBrush x:Key="BlameAgeNew" Color="#DFA32E"/>
+    <SolidColorBrush x:Key="BlameAgeOld" Color="#3E3E45"/>
+
+    <!-- Terminal cell palette (P2-03 interim engine). Default surface + the 16 ANSI
+         colours as tokens so the cell renderer follows the active theme; the
+         256-colour cube (16-255) is computed in code. -->
+    <SolidColorBrush x:Key="TerminalBackground" Color="#161618"/>
+    <SolidColorBrush x:Key="TerminalForeground" Color="#E8E8EA"/>
+    <SolidColorBrush x:Key="TerminalCursor" Color="#409CFF"/>
+    <SolidColorBrush x:Key="TerminalAnsi0" Color="#000000"/>
+    <SolidColorBrush x:Key="TerminalAnsi1" Color="#CD3131"/>
+    <SolidColorBrush x:Key="TerminalAnsi2" Color="#2AA745"/>
+    <SolidColorBrush x:Key="TerminalAnsi3" Color="#C7C43B"/>
+    <SolidColorBrush x:Key="TerminalAnsi4" Color="#3B6FD6"/>
+    <SolidColorBrush x:Key="TerminalAnsi5" Color="#B454C9"/>
+    <SolidColorBrush x:Key="TerminalAnsi6" Color="#2EC5CE"/>
+    <SolidColorBrush x:Key="TerminalAnsi7" Color="#D0D0D0"/>
+    <SolidColorBrush x:Key="TerminalAnsi8" Color="#6A737D"/>
+    <SolidColorBrush x:Key="TerminalAnsi9" Color="#F14C4C"/>
+    <SolidColorBrush x:Key="TerminalAnsi10" Color="#3FC56B"/>
+    <SolidColorBrush x:Key="TerminalAnsi11" Color="#EAE05B"/>
+    <SolidColorBrush x:Key="TerminalAnsi12" Color="#5C8DF0"/>
+    <SolidColorBrush x:Key="TerminalAnsi13" Color="#D67BEA"/>
+    <SolidColorBrush x:Key="TerminalAnsi14" Color="#4FE0E8"/>
+    <SolidColorBrush x:Key="TerminalAnsi15" Color="#FFFFFF"/>
+</ResourceDictionary>

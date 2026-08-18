@@ -24,7 +24,7 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class ResourceMonitorRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     /// <summary>A metered (BYOK) fleet with live readings: the full cost UI must be present.</summary>
     [AvaloniaFact]

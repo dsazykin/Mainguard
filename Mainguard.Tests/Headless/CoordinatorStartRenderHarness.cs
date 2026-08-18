@@ -32,7 +32,7 @@ namespace Mainguard.Tests.Headless;
 public class CoordinatorStartRenderHarness
 {
     private static readonly string[] ThemeKeys =
-        { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+        { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     [AvaloniaFact]
     public async Task CoordinatorStartCard_HeadlessPng_AllThemes()

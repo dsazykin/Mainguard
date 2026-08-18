@@ -34,6 +34,7 @@ public static class ThemeManager
     {
         new ThemeInfo("MidnightLoom", "Midnight Loom", ThemeVariant.Dark),
         new ThemeInfo("DaylightLoom", "Daylight Loom", ThemeVariant.Light),
+        new ThemeInfo("Graphite", "Graphite", ThemeVariant.Dark),
         new ThemeInfo("CommandDeck", "Command Deck", ThemeVariant.Dark),
         new ThemeInfo("Atelier", "Atelier", ThemeVariant.Dark),
         new ThemeInfo("LoomAurora", "Loom Aurora", ThemeVariant.Dark),

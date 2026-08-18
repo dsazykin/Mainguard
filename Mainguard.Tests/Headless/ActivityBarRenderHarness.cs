@@ -28,7 +28,7 @@ namespace Mainguard.Tests.Headless;
 public class ActivityBarRenderHarness
 {
     private static readonly string[] ThemeKeys =
-        { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+        { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     [AvaloniaFact]
     public void ActivityBar_HeadlessPng_AllThemes()

@@ -33,7 +33,7 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class QueueEntryLifecycleRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "CommandDeck", "Atelier", "LoomAurora" };
 
     // Production-length ids: DaemonBackedOrchestrator projects Name = AgentId and Branch = agent/<id>,
     // and the owner's own entries look like this.
