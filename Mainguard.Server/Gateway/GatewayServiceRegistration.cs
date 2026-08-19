@@ -456,6 +456,9 @@ public static class GatewayServiceRegistration
                     new AuditFileMirror(dbPath + ".audit-mirror"));
                 services.AddSingleton<IAuditLog>(chained);
                 services.AddSingleton<IChainedAuditLog>(chained);
+                // The RFC 3161 anchor queue rides the same DB (heads enqueued by policy, tokens
+                // stored beside the chain); the hosted sweep is a no-op until a TSA URL is set.
+                services.AddSingleton(new AuditAnchorQueue(dbFactory));
                 log?.Invoke("audit chain ready (db-backed, mirror recovered)");
                 return;
             }

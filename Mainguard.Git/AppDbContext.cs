@@ -31,6 +31,7 @@ public class AppDbContext : DbContext
     public DbSet<PrIntakeHeadRow> PrIntakeHeads { get; set; } = null!;
     public DbSet<PrIntakeConfigRow> PrIntakeConfig { get; set; } = null!;
     public DbSet<AuditRecordRow> AuditRecords { get; set; } = null!;
+    public DbSet<AuditAnchorRow> AuditAnchors { get; set; } = null!;
 
     public AppDbContext()
     {
@@ -154,6 +155,11 @@ public class AppDbContext : DbContext
         // any DELETE and any UPDATE other than the redaction tombstone transition RAISE(ABORT).
         modelBuilder.Entity<AuditRecordRow>().HasKey(a => a.Seq);
         modelBuilder.Entity<AuditRecordRow>().Property(a => a.Seq).ValueGeneratedNever();
+
+        // P2-15 RFC 3161 anchors: one row per timestamped chain head; pending rows have no token
+        // yet and are retried best-effort (never blocking the chain). Queried by head seq.
+        modelBuilder.Entity<AuditAnchorRow>().HasKey(a => a.Id);
+        modelBuilder.Entity<AuditAnchorRow>().HasIndex(a => a.HeadSeq).IsUnique();
 
         // Seed some initial default categories
         modelBuilder.Entity<WorkspaceCategory>().HasData(

@@ -75,3 +75,24 @@ public sealed class MacOnlyFactAttribute : FactAttribute
         }
     }
 }
+
+/// <summary>
+/// A <see cref="FactAttribute"/> for tests that need REAL network egress (P2-15: the RFC 3161
+/// round-trip against a live TSA). Opt-in via <c>MAINGUARD_NETWORK_TESTS=1</c> — the nightly
+/// network leg sets it; PR CI and local runs skip with the reason visible, so an offline machine
+/// (or a TSA outage) can never fail a build the spec calls deterministic.
+/// </summary>
+public sealed class RequiresNetworkFactAttribute : FactAttribute
+{
+    public const string EnableVariable = "MAINGUARD_NETWORK_TESTS";
+
+    public RequiresNetworkFactAttribute(string? because = null)
+    {
+        if (System.Environment.GetEnvironmentVariable(EnableVariable) != "1")
+        {
+            Skip = because is null
+                ? $"Network-gated test — set {EnableVariable}=1 to run (nightly leg)."
+                : $"Network-gated: {because} — set {EnableVariable}=1 to run (nightly leg).";
+        }
+    }
+}

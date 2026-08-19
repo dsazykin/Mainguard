@@ -69,13 +69,26 @@ public static class AuditCommands
                 ? $"chain: empty · head: {HashChain.GenesisHash}"
                 : $"chain: {head.Value.Seq} record(s) · head: {head.Value.Hash}");
 
-            if (valid)
+            // Anchor tokens, when present, are validated structurally (spec step 5: the walk
+            // "+ validates anchor tokens"). A stored token that no longer matches its recorded
+            // head hash is verification failure, same exit as chain tamper.
+            var badAnchors = new AuditAnchorQueue(() => new AppDbContext(dbPath)).ValidateStoredAnchors();
+            if (badAnchors.Count > 0)
+            {
+                Console.WriteLine($"ANCHOR INVALID — id(s): {string.Join(", ", badAnchors)}");
+            }
+
+            if (valid && badAnchors.Count == 0)
             {
                 Console.WriteLine("OK");
                 return 0;
             }
 
-            Console.WriteLine($"TAMPERED — first bad seq: {firstBadSeq}");
+            if (!valid)
+            {
+                Console.WriteLine($"TAMPERED — first bad seq: {firstBadSeq}");
+            }
+
             return 2;
         }
         catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("no such table", StringComparison.OrdinalIgnoreCase))

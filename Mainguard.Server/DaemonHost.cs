@@ -295,6 +295,9 @@ public static class DaemonHost
         // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the
         // in-memory fallback journal.
         builder.Services.AddHostedService<Runtime.AuditRetentionService>();
+        // P2-15 anchoring: hourly best-effort RFC 3161 sweep — heads queue by policy; nothing is
+        // sent unless MAINGUARD_TSA_URL names an endpoint (no default third-party traffic).
+        builder.Services.AddHostedService<Runtime.AuditAnchorService>();
 
         builder.Services.AddGrpc(o =>
         {

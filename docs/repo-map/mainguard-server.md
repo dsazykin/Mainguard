@@ -54,6 +54,11 @@
     unchanged, chain verifiable — the schema's triggers would refuse a delete anyway); a no-op on
     the in-memory fallback journal, and a failed sweep logs + retries next round, never taking the
     daemon down.
+  - **`Runtime/AuditAnchorService.cs`** (P2-15) — hourly best-effort RFC 3161 sweep: heads queue by
+    the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
+    `MAINGUARD_TSA_URL` names an endpoint — no default install silently talks to a third party, and
+    an operator who configures a TSA later gets the queued backlog anchored on the next sweep. A
+    TSA failure leaves rows pending (anchoring is best-effort, chaining is not).
   - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
     `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
     `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
@@ -461,9 +466,10 @@
     prompts/outputs).
   - **`Cli/AuditCommands.cs`** (P2-15) — the offline `mainguardd audit verify [--data <db>]` verb
     (dispatched in `Program.cs` before daemon options, so it can never bind a port): walks the
-    chain + mirror via `ChainedAuditLog`, prints head seq/hash; exit contract 0 intact (missing
-    store / pre-chain DB = intact by definition) / 2 tampered with first-bad-seq printed /
-    64 usage / 1 cannot-verify.
+    chain + mirror via `ChainedAuditLog` and validates stored RFC 3161 anchor tokens structurally
+    (an anchor that no longer matches its recorded head hash exits 2 like chain tamper), prints
+    head seq/hash; exit contract 0 intact (missing store / pre-chain DB = intact by definition) /
+    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify.
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never

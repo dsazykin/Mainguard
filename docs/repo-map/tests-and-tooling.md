@@ -2006,7 +2006,9 @@
   against a local bare "host": allowlisted-prefix fetch succeeds + transparency-logged, push refused +
   audited + no ref moved, non-allowlisted prefix refused, and the F5 declared-dependency scope).
   `PlatformFacts.cs` supplies the `LinuxOnlyFact`/`WindowsOnlyFact` skip-with-reason attributes for
-  the platform-split PTY probes. `ResizeClampTests.cs` (MG-22 — resize dimensions are clamped to
+  the platform-split PTY probes (plus `UnixOnlyFact`/`MacOnlyFact`, and P2-15's
+  `RequiresNetworkFact` — network-gated tests skip unless `MAINGUARD_NETWORK_TESTS=1`, the nightly
+  leg; a TSA outage can never fail a PR build). `ResizeClampTests.cs` (MG-22 — resize dimensions are clamped to
   `VtermSession.MaxDimension` BEFORE the native call: the proto carries `uint32` and only `<=0` was
   rejected, so anything in `[1, 2^31-1]` reached `vterm_set_size`, whose upstream `alloc_buffer`
   multiplies `rows*cols` with no overflow or upper-bound check; clamping is applied in
@@ -2057,6 +2059,12 @@
   sequence with one event per operation, then REOPENED — the story outlives the writer, chain
   verified. Plus the RT-D3 leg end-to-end: a kill during a (simulated) store outage lands its
   chained `killswitch_audit_gap` in the persisted chain on recovery and survives a reopen.
+- **`Mainguard.Tests/Rfc3161AnchorTests.cs`** (P2-15, TI-P2-15 items 8–9) — anchoring is
+  best-effort, chaining is not: TSA down → the anchor stays queued while the chain keeps appending,
+  TSA back → the SAME head hash is retried and the token stored; the enqueue policy (first head /
+  1000 records / 24 h, idempotent per head); garbage tokens rejected by the offline validation the
+  verify CLI runs; and `AnchorRoundTrip_ShouldValidateAgainstRealTsa` (`RequiresNetworkFact`,
+  nightly — verified once against freetsa.org on 2026-08-19: real token stored and validated).
 - **`Mainguard.Server.Tests/AuditRpcTests.cs`** (P2-15) — the chain's first production READERS over
   the real in-proc daemon: `VerifyAudit` (valid + persistent + head), `ReadAudit` (decrypted
   envelope round-trip, marker-scoped since the in-proc hosts share the run-scoped daemon DB), the
