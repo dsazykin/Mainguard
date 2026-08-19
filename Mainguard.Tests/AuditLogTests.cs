@@ -235,6 +235,98 @@ public sealed class AuditLogTests : IDisposable
         Assert.Equal(2, firstBad);
     }
 
+    [Fact]
+    public void Redact_ShouldReplacePayload_KeepChainValid_AndReferenceOriginalHash()
+    {
+        const string sentinel = "SENTINEL-REDACT-1a2b3c";
+        var log = OpenLog();
+        log.Append("inference", new { prompt = "before" }, "tester");
+        log.Append("inference", new { prompt = sentinel }, "tester");
+        log.Append("inference", new { prompt = "after" }, "tester");
+        var originalHash = log.Read(2, 1).Single().Hash;
+
+        var redactionSeq = log.Redact(2, "user requested erasure", "daniel");
+
+        Assert.Equal(4, redactionSeq);
+        var (valid, firstBad) = log.VerifyAll();
+        Assert.True(valid);
+        Assert.Null(firstBad);
+
+        // The tombstoned record surfaces as such; the redaction event vouches for the original hash.
+        var records = log.Read(1, 10);
+        Assert.Equal(ChainedAuditLog.RedactedTombstone, records[1].PayloadJson);
+        Assert.Contains(originalHash, records[3].PayloadJson);
+        Assert.Contains("user requested erasure", records[3].PayloadJson);
+
+        // Unrecoverable: the ciphertext (the only payload copy — the mirror carries none) is gone.
+        SqliteConnection.ClearAllPools();
+        using var conn = new SqliteConnection($"Data Source={_dbPath}");
+        conn.Open();
+        using var query = conn.CreateCommand();
+        query.CommandText = "SELECT PayloadCiphertext IS NULL, KeyId IS NULL FROM AuditRecords WHERE Seq = 2";
+        using var reader = query.ExecuteReader();
+        Assert.True(reader.Read());
+        Assert.Equal(1, reader.GetInt64(0));
+        Assert.Equal(1, reader.GetInt64(1));
+    }
+
+    [Fact]
+    public void Redact_ShouldSurviveReopen_AndStillVerify()
+    {
+        var log = OpenLog();
+        AppendSample(log, 3);
+        log.Redact(1, "test", "tester");
+
+        var reopened = OpenLog();
+        Assert.True(reopened.VerifyAll().Valid);
+        reopened.Append("post_redaction", new { ok = true }, "tester");
+        Assert.True(reopened.VerifyAll().Valid);
+    }
+
+    [Fact]
+    public void Redact_ShouldRefuse_MissingAlreadyRedactedAndRedactionEvents()
+    {
+        var log = OpenLog();
+        AppendSample(log, 2);
+        var redactionSeq = log.Redact(1, "first", "tester");
+
+        Assert.Throws<ArgumentException>(() => log.Redact(99, "missing", "tester"));
+        Assert.Throws<InvalidOperationException>(() => log.Redact(1, "again", "tester"));
+        // Redacting the redaction event would orphan the tombstone it vouches for.
+        Assert.Throws<InvalidOperationException>(() => log.Redact(redactionSeq, "meta", "tester"));
+        Assert.True(log.VerifyAll().Valid);
+    }
+
+    [Fact]
+    public void Retention_RedactsNotDeletes()
+    {
+        var now = new DateTimeOffset(2026, 8, 19, 12, 0, 0, TimeSpan.Zero);
+        var log = new ChainedAuditLog(
+            () => new AppDbContext(_dbPath),
+            new AuditCrypto(_keys),
+            new AuditFileMirror(_mirrorPath),
+            clock: () => now);
+
+        AppendSample(log, 3, "old_event");
+        now = now.AddDays(120);
+        AppendSample(log, 2, "recent_event");
+
+        var redacted = log.ApplyRetention(TimeSpan.FromDays(90));
+
+        Assert.Equal(3, redacted);
+        var records = log.Read(1, 100);
+        // Count unchanged + grown by the redaction events — never shrunk.
+        Assert.Equal(5 + 3, records.Count);
+        Assert.All(records.Take(3), r => Assert.Equal(ChainedAuditLog.RedactedTombstone, r.PayloadJson));
+        Assert.All(records.Skip(3).Take(2), r => Assert.NotEqual(ChainedAuditLog.RedactedTombstone, r.PayloadJson));
+        Assert.True(log.VerifyAll().Valid);
+
+        // Idempotent: nothing left to expire (redaction events themselves are exempt).
+        now = now.AddDays(1);
+        Assert.Equal(0, log.ApplyRetention(TimeSpan.FromDays(91)));
+        Assert.True(log.VerifyAll().Valid);
+    }
+
     private void TamperRow(long seq, string column, string forgedValue)
     {
         using var conn = new SqliteConnection($"Data Source={_dbPath}");
