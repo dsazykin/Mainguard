@@ -2050,6 +2050,13 @@
   voucher on the redaction event, ciphertext/key nulled at the row (the mirror never had a copy),
   refusals (missing seq / double-redact / redacting a redaction event), reopen survival, and
   `Retention_RedactsNotDeletes` (count grows by the redaction events, idempotent second sweep).
+- **`Mainguard.Tests/AuditTouchpointCoverageTests.cs`** (P2-15, TI-P2-15 item 7) — touchpoint
+  coverage over the REAL chained store: a scripted governance session (plan approve/reject → verify
+  → stale override → merge reject → egress change → kill switch) drives the actual G-17 services
+  against `ChainedAuditLog` on a migrated SQLite file, asserted as an EXACT ordered event-type
+  sequence with one event per operation, then REOPENED — the story outlives the writer, chain
+  verified. Plus the RT-D3 leg end-to-end: a kill during a (simulated) store outage lands its
+  chained `killswitch_audit_gap` in the persisted chain on recovery and survives a reopen.
 - **`Mainguard.Server.Tests/AuditRpcTests.cs`** (P2-15) — the chain's first production READERS over
   the real in-proc daemon: `VerifyAudit` (valid + persistent + head), `ReadAudit` (decrypted
   envelope round-trip, marker-scoped since the in-proc hosts share the run-scoped daemon DB), the
