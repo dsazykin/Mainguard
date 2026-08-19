@@ -2031,6 +2031,13 @@
   `TwoWorkers_StaleCascade_WithRealContainerVerification` (two real jails: A,B verify green, A merges
   → B `StaleVerified`/blocked → re-verifies in its container against the new sha →
   `Verified`/mergeable).
+- **`Mainguard.Tests/HashChainTests.cs` + `Mainguard.Tests/CanonicalJsonTests.cs`** (P2-15, TI-P2-15
+  items 1–2) — the pure audit chain, property-style over seeded randomness: the 100-record tamper
+  sweep (`Verify_TamperSweep_ShouldFailAtExactSeq` mutates payload/prevHash/hash at every position and
+  pins `FirstBadSeq` to the exact record), reorder/drop detection, mid-chain-slice anchoring vs the
+  seq-1 genesis pin; and canonical-JSON stability — ordinal key sort (nested too), the tr-TR culture
+  test, equivalent-number-spelling collapse (`1.0` ≡ `1`), input-shape independence
+  (anonymous/dictionary/sorted → identical bytes), no BOM.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---
