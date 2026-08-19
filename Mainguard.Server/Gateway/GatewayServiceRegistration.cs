@@ -59,6 +59,12 @@ public static class GatewayServiceRegistration
             mergeLeaseStore = new InMemoryMergeLeaseStore();
         }
 
+        // P2-15: the tamper-evident audit chain, riding the same posture decision. Constructed
+        // EAGERLY (it needs no DI) so a store problem surfaces here in migration.log rather than as
+        // a mid-flight RPC failure; on any failure the daemon still starts, on the in-memory
+        // journal — which is exactly the pre-P2-15 behavior, now with the loss stated out loud.
+        RegisterAuditLog(services, dbFactory, dbPath, log);
+
         // The P2-10 queue-state + immutable-verification stores follow the same posture as the gateway
         // stores above: SQLite when the daemon DB opened, in-memory otherwise so the daemon always starts.
         // Bound to locals here (rather than inline in the provisioner registration) because the null check
@@ -423,6 +429,47 @@ public static class GatewayServiceRegistration
         return string.IsNullOrEmpty(dir)
             ? Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "verify-artifacts")
             : Path.Combine(dir, "verify-artifacts");
+    }
+
+    /// <summary>
+    /// P2-15: registers <see cref="IAuditLog"/> — the <see cref="ChainedAuditLog"/> over the daemon
+    /// DB when it opened (with <see cref="IChainedAuditLog"/> alongside for the verify RPC/CLI and
+    /// the retention job), the in-memory journal otherwise. The mirror sits beside the DB file and
+    /// the AES-GCM master key lives in a <see cref="Mainguard.Git.Security.SecureKeyring"/> rooted
+    /// beside it too — production puts both under the data root, in-proc test hosts under their
+    /// isolated token directory, with no extra knob to drift.
+    /// </summary>
+    private static void RegisterAuditLog(
+        IServiceCollection services, Func<AppDbContext>? dbFactory, string dbPath, Action<string>? log)
+    {
+        if (dbFactory is not null)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(dbPath);
+                var keyringDir = string.IsNullOrEmpty(directory)
+                    ? "audit-keyring"
+                    : Path.Combine(directory, "audit-keyring");
+                var chained = new ChainedAuditLog(
+                    dbFactory,
+                    new AuditCrypto(new Mainguard.Git.Security.SecureKeyring(keyringDir)),
+                    new AuditFileMirror(dbPath + ".audit-mirror"));
+                services.AddSingleton<IAuditLog>(chained);
+                services.AddSingleton<IChainedAuditLog>(chained);
+                log?.Invoke("audit chain ready (db-backed, mirror recovered)");
+                return;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}");
+            }
+        }
+        else
+        {
+            log?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART");
+        }
+
+        services.AddSingleton<IAuditLog, InMemoryAuditLog>();
     }
 
     /// <summary>How long <see cref="TryPrepareDatabase"/> lets a migration run before falling back

@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
 
@@ -36,15 +37,18 @@ public sealed class AuditFileMirror
     /// <summary>The mirror file's absolute path (diagnostics + the CLI verifier).</summary>
     public string FilePath => _path;
 
-    /// <summary>Appends one record and fsyncs — called AFTER the DB transaction commits (DB is truth).</summary>
+    /// <summary>Appends one record and fsyncs — called AFTER the DB transaction commits (DB is
+    /// truth). One buffer, one write: append-mode writes land whole, so a concurrent writer (the
+    /// in-proc test tier runs several hosts over one store) can interleave records but not tear one.</summary>
     public void Append(MirrorRecord record)
     {
         var payload = Encode(record);
-        using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read);
-        Span<byte> prefix = stackalloc byte[4];
-        BinaryPrimitives.WriteInt32LittleEndian(prefix, payload.Length);
-        stream.Write(prefix);
-        stream.Write(payload);
+        var frame = new byte[4 + payload.Length];
+        BinaryPrimitives.WriteInt32LittleEndian(frame, payload.Length);
+        payload.CopyTo(frame.AsSpan(4));
+
+        using var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+        stream.Write(frame);
         stream.Flush(flushToDisk: true);
     }
 
@@ -111,32 +115,53 @@ public sealed class AuditFileMirror
     {
         ArgumentNullException.ThrowIfNull(dbRecords);
 
+        // Seq-keyed: concurrent writers (the in-proc test tier) interleave appends out of order,
+        // and a prior recovery can leave an identical duplicate. Differing duplicates are tamper.
         var mirrored = ReadAll();
-        var overlap = Math.Min(mirrored.Count, dbRecords.Count);
-        for (var i = 0; i < overlap; i++)
+        var mirrorBySeq = new Dictionary<long, MirrorRecord>();
+        foreach (var record in mirrored)
         {
-            if (mirrored[i] != dbRecords[i])
+            if (mirrorBySeq.TryGetValue(record.Seq, out var existing))
             {
-                return new RecoveryResult(0, mirrored[i].Seq);
+                if (existing != record)
+                {
+                    return new RecoveryResult(0, record.Seq);
+                }
+            }
+            else
+            {
+                mirrorBySeq[record.Seq] = record;
             }
         }
 
-        if (mirrored.Count > dbRecords.Count)
+        var dbBySeq = dbRecords.ToDictionary(r => r.Seq);
+        foreach (var (seq, record) in mirrorBySeq)
         {
-            return new RecoveryResult(0, mirrored[dbRecords.Count].Seq);
+            if (!dbBySeq.TryGetValue(seq, out var truth))
+            {
+                return new RecoveryResult(0, seq); // mirror ahead of / disjoint from DB truth
+            }
+
+            if (truth != record)
+            {
+                return new RecoveryResult(0, seq);
+            }
         }
 
         if (FileHasTornTail(mirrored))
         {
             RewriteAll(dbRecords);
-            return new RecoveryResult(dbRecords.Count - mirrored.Count, null);
+            return new RecoveryResult(dbRecords.Count - mirrorBySeq.Count, null);
         }
 
         var appended = 0;
-        for (var i = mirrored.Count; i < dbRecords.Count; i++)
+        foreach (var record in dbRecords)
         {
-            Append(dbRecords[i]);
-            appended++;
+            if (!mirrorBySeq.ContainsKey(record.Seq))
+            {
+                Append(record);
+                appended++;
+            }
         }
 
         return new RecoveryResult(appended, null);

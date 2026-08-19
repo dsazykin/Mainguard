@@ -41,8 +41,6 @@ public sealed class ChainedAuditLog : IChainedAuditLog
     private readonly Func<DateTimeOffset> _clock;
     private readonly object _gate = new();
 
-    private long _headSeq;
-    private string _headHash = HashChain.GenesisHash;
     private long? _mirrorConflictSeq;
 
     /// <summary>Test-only fault seam (TI-P2-15 item 3): runs between the DB commit and the mirror
@@ -64,11 +62,6 @@ public sealed class ChainedAuditLog : IChainedAuditLog
         var rows = db.AuditRecords.OrderBy(r => r.Seq)
             .Select(r => new AuditFileMirror.MirrorRecord(r.Seq, r.TimestampText, r.Type, r.PrevHash, r.Hash))
             .ToList();
-        if (rows.Count > 0)
-        {
-            _headSeq = rows[^1].Seq;
-            _headHash = rows[^1].Hash;
-        }
 
         var recovery = _mirror.Recover(rows);
         _mirrorConflictSeq = recovery.ConflictSeq;
@@ -142,6 +135,17 @@ public sealed class ChainedAuditLog : IChainedAuditLog
                 .AsEnumerable()
                 .Select(Materialize)
                 .ToList();
+        }
+    }
+
+    /// <inheritdoc />
+    public (long Seq, string Hash)? Head()
+    {
+        lock (_gate)
+        {
+            using var db = _dbFactory();
+            var head = db.AuditRecords.OrderByDescending(r => r.Seq).FirstOrDefault();
+            return head is null ? null : (head.Seq, head.Hash);
         }
     }
 
@@ -221,28 +225,56 @@ public sealed class ChainedAuditLog : IChainedAuditLog
                 Flag(openConflict);
             }
 
-            var mirrored = _mirror.ReadAll();
-            for (var i = 0; i < rows.Count; i++)
+            // Seq-keyed, not positional: concurrent in-proc hosts (the test tier) interleave mirror
+            // appends out of order, and a crash-recovery backfill can duplicate one — an IDENTICAL
+            // duplicate is benign, a DIFFERING one is tamper.
+            var mirrorBySeq = new Dictionary<long, AuditFileMirror.MirrorRecord>();
+            long mirrorHead = 0;
+            foreach (var m in _mirror.ReadAll())
             {
-                if (i >= mirrored.Count)
+                if (mirrorBySeq.TryGetValue(m.Seq, out var existing))
                 {
-                    Flag(rows[i].Seq); // mirror lost records it was recovered to contain
-                    break;
+                    if (existing != m)
+                    {
+                        Flag(m.Seq);
+                    }
                 }
-
-                var m = mirrored[i];
-                var r = rows[i];
-                if (m.Seq != r.Seq || m.TimestampText != r.TimestampText || m.Type != r.Type
-                    || m.PrevHash != r.PrevHash || m.Hash != r.Hash)
+                else
                 {
-                    Flag(r.Seq);
-                    break;
+                    mirrorBySeq[m.Seq] = m;
+                    mirrorHead = Math.Max(mirrorHead, m.Seq);
                 }
             }
 
-            if (mirrored.Count > rows.Count && rows.Count >= 0)
+            var rowSeqs = new HashSet<long>();
+            foreach (var r in rows)
             {
-                Flag(mirrored[rows.Count].Seq); // mirror claims records the DB does not have
+                rowSeqs.Add(r.Seq);
+                if (!mirrorBySeq.TryGetValue(r.Seq, out var m))
+                {
+                    // Missing at the TAIL is a not-yet-flushed append (crash lag / in-flight writer)
+                    // — recovery backfills it at next open. A HOLE below the mirror head is not.
+                    if (r.Seq < mirrorHead)
+                    {
+                        Flag(r.Seq);
+                    }
+
+                    continue;
+                }
+
+                if (m.TimestampText != r.TimestampText || m.Type != r.Type
+                    || m.PrevHash != r.PrevHash || m.Hash != r.Hash)
+                {
+                    Flag(r.Seq);
+                }
+            }
+
+            foreach (var seq in mirrorBySeq.Keys)
+            {
+                if (!rowSeqs.Contains(seq))
+                {
+                    Flag(seq); // mirror claims a record the DB does not have
+                }
             }
 
             return (firstBad is null, firstBad);
@@ -257,42 +289,54 @@ public sealed class ChainedAuditLog : IChainedAuditLog
 
         lock (_gate)
         {
-            using var db = _dbFactory();
-            var row = db.AuditRecords.SingleOrDefault(r => r.Seq == seq)
-                ?? throw new ArgumentException($"No audit record with seq {seq}.", nameof(seq));
-            if (row.Redacted)
+            for (var attempt = 0; ; attempt++)
             {
-                throw new InvalidOperationException($"Audit record {seq} is already redacted.");
+                using var db = _dbFactory();
+                var row = db.AuditRecords.SingleOrDefault(r => r.Seq == seq)
+                    ?? throw new ArgumentException($"No audit record with seq {seq}.", nameof(seq));
+                if (row.Redacted)
+                {
+                    throw new InvalidOperationException($"Audit record {seq} is already redacted.");
+                }
+
+                if (row.Type == RedactionEventType)
+                {
+                    // A redaction event is the only thing vouching for its target's hash — redacting
+                    // it would orphan that record and fail the whole chain. Its payload carries no
+                    // prompt content, so retention exempts it too.
+                    throw new InvalidOperationException("Redaction events cannot themselves be redacted.");
+                }
+
+                // The redaction event is appended FIRST, then the original is tombstoned — one SQLite
+                // transaction, so a crash leaves either both or neither (the append-only trigger
+                // allows exactly this tombstone transition and nothing else).
+                AuditFileMirror.MirrorRecord mirrorRecord;
+                long redactionSeq;
+                try
+                {
+                    using var transaction = db.Database.BeginTransaction();
+                    redactionSeq = AppendRowWithin(db, RedactionEventType, new Dictionary<string, object>
+                    {
+                        ["original_hash"] = row.Hash,
+                        ["original_seq"] = row.Seq,
+                        ["reason"] = reason,
+                    }, osIdentity, out mirrorRecord);
+
+                    row.PayloadCiphertext = null;
+                    row.KeyId = null;
+                    row.Redacted = true;
+                    db.SaveChanges();
+                    transaction.Commit();
+                }
+                catch (Exception ex) when (IsHeadRace(ex) && attempt < AppendRetries)
+                {
+                    continue;
+                }
+
+                FaultBetweenDbAndMirror?.Invoke();
+                _mirror.Append(mirrorRecord);
+                return redactionSeq;
             }
-
-            if (row.Type == RedactionEventType)
-            {
-                // A redaction event is the only thing vouching for its target's hash — redacting it
-                // would orphan that record and fail the whole chain. Its payload carries no prompt
-                // content, so retention exempts it too.
-                throw new InvalidOperationException("Redaction events cannot themselves be redacted.");
-            }
-
-            // The redaction event is appended FIRST, then the original is tombstoned — one SQLite
-            // transaction, so a crash leaves either both or neither (the append-only trigger allows
-            // exactly this tombstone transition and nothing else).
-            using var transaction = db.Database.BeginTransaction();
-            var redactionSeq = AppendRowWithin(db, RedactionEventType, new Dictionary<string, object>
-            {
-                ["original_hash"] = row.Hash,
-                ["original_seq"] = row.Seq,
-                ["reason"] = reason,
-            }, osIdentity, out var mirrorRecord);
-
-            row.PayloadCiphertext = null;
-            row.KeyId = null;
-            row.Redacted = true;
-            db.SaveChanges();
-            transaction.Commit();
-
-            FaultBetweenDbAndMirror?.Invoke();
-            _mirror.Append(mirrorRecord);
-            return redactionSeq;
         }
     }
 
@@ -327,24 +371,49 @@ public sealed class ChainedAuditLog : IChainedAuditLog
 
     // ---- internals ----
 
+    /// <summary>
+    /// How often an append retries after losing a head race. The daemon proper is this store's only
+    /// writer, but the in-proc test tier runs several daemon hosts over ONE run-scoped DB in
+    /// parallel — the head is therefore re-read inside every attempt (never cached across appends)
+    /// and a primary-key collision means another writer chained a record first: re-read, re-hash,
+    /// re-insert.
+    /// </summary>
+    private const int AppendRetries = 8;
+
     private long AppendLocked(string type, object payload, string osIdentity)
     {
-        using var db = _dbFactory();
-        var seq = AppendRowWithin(db, type, payload, osIdentity, out var mirrorRecord);
-        db.SaveChanges();
+        for (var attempt = 0; ; attempt++)
+        {
+            using var db = _dbFactory();
+            AuditFileMirror.MirrorRecord mirrorRecord;
+            long seq;
+            try
+            {
+                seq = AppendRowWithin(db, type, payload, osIdentity, out mirrorRecord);
+                db.SaveChanges();
+            }
+            catch (Exception ex) when (IsHeadRace(ex) && attempt < AppendRetries)
+            {
+                continue;
+            }
 
-        FaultBetweenDbAndMirror?.Invoke();
-        _mirror.Append(mirrorRecord);
-        return seq;
+            FaultBetweenDbAndMirror?.Invoke();
+            _mirror.Append(mirrorRecord);
+            return seq;
+        }
     }
 
-    /// <summary>Stages one chained row on <paramref name="db"/> (caller saves/commits) and advances
-    /// the in-memory head. The mirror record is returned for the caller to append AFTER commit.</summary>
+    /// <summary>Stages one chained row on <paramref name="db"/>, reading the CURRENT head from that
+    /// context (caller saves/commits). The mirror record is returned to append AFTER commit.</summary>
     private long AppendRowWithin(
         AppDbContext db, string type, object payload, string osIdentity,
         out AuditFileMirror.MirrorRecord mirrorRecord)
     {
-        var seq = _headSeq + 1;
+        var head = db.AuditRecords.OrderByDescending(r => r.Seq).FirstOrDefault();
+        var headSeq = head?.Seq ?? 0;
+        var headHash = head?.Hash ?? HashChain.GenesisHash;
+
+        var seq = headSeq + 1;
         var timestamp = _clock().ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
         var envelope = CanonicalJson.Serialize(new Dictionary<string, object?>
         {
@@ -354,7 +423,7 @@ public sealed class ChainedAuditLog : IChainedAuditLog
             ["timestamp"] = timestamp,
             ["type"] = type,
         });
-        var hash = HashChain.ComputeHash(_headHash, envelope);
+        var hash = HashChain.ComputeHash(headHash, envelope);
 
         db.AuditRecords.Add(new AuditRecordRow
         {
@@ -363,15 +432,31 @@ public sealed class ChainedAuditLog : IChainedAuditLog
             Type = type,
             PayloadCiphertext = _crypto.Encrypt(envelope),
             KeyId = AuditCrypto.CurrentKeyId,
-            PrevHash = _headHash,
+            PrevHash = headHash,
             Hash = hash,
             Redacted = false,
         });
 
-        mirrorRecord = new AuditFileMirror.MirrorRecord(seq, timestamp, type, _headHash, hash);
-        _headSeq = seq;
-        _headHash = hash;
+        mirrorRecord = new AuditFileMirror.MirrorRecord(seq, timestamp, type, headHash, hash);
         return seq;
+    }
+
+    /// <summary>A lost append race: another writer took our seq (PK constraint) or holds the write
+    /// lock (SQLITE_BUSY/LOCKED). Anything else — including the append-only trigger's ABORT — is a
+    /// real failure and propagates.</summary>
+    private static bool IsHeadRace(Exception ex)
+    {
+        var sqlite = ex as Microsoft.Data.Sqlite.SqliteException
+            ?? ex.InnerException as Microsoft.Data.Sqlite.SqliteException;
+        if (sqlite is null)
+        {
+            return false;
+        }
+
+        // 19 = SQLITE_CONSTRAINT — but the trigger's RAISE(ABORT) surfaces as a constraint error
+        // too, so only a PRIMARY KEY violation counts as a race.
+        return sqlite.SqliteErrorCode is 5 or 6
+            || (sqlite.SqliteErrorCode == 19 && sqlite.Message.Contains("PRIMARY KEY", StringComparison.OrdinalIgnoreCase));
     }
 
     private AuditRecord Materialize(AuditRecordRow row)

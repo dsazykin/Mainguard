@@ -83,7 +83,10 @@ public static class DaemonHost
         builder.Services.AddSingleton(transportCertificates);
         lifecycle.LogInformation("session transport credentials ready (mutual TLS, pinned)");
 
-        builder.Services.AddSingleton<IAuditLog, InMemoryAuditLog>();
+        // P2-15: IAuditLog is registered by GatewayServiceRegistration.Register below — the audit
+        // chain rides the same daemon-DB posture decision as the gateway stores (ChainedAuditLog
+        // when the DB opens, InMemoryAuditLog fallback so the daemon always starts). Everything
+        // here resolves it lazily through DI, so the later registration point changes nothing.
         builder.Services.AddSingleton<AgentSessionStore>();
 
         // P2-14 governance spine: role registry + terminal-lock registry (the RoleInterceptor enforces
@@ -289,6 +292,10 @@ public static class DaemonHost
             log: message => migration.LogInformation("{Milestone}", message),
             options: options);
 
+        // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the
+        // in-memory fallback journal.
+        builder.Services.AddHostedService<Runtime.AuditRetentionService>();
+
         builder.Services.AddGrpc(o =>
         {
             // EVERY RPC is authenticated (no public-method allowlist), then role/terminal-lock enforced
@@ -463,6 +470,7 @@ public static class DaemonHost
         app.MapGrpcService<KillSwitchGrpcService>();
         app.MapGrpcService<CoordinatorGrpcService>();
         app.MapGrpcService<EgressGrpcService>();
+        app.MapGrpcService<AuditGrpcService>();
     }
 
     /// <summary>

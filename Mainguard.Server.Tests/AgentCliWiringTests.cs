@@ -158,9 +158,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // …and the audit carries the exit code AND the cleaned output tail — the diagnosis the
         // field never had (a bare "CLI exited (N)" names no cause).
-        var audit = (Mainguard.Git.Audit.InMemoryAuditLog)rig.Host.Services
-            .GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
-        await WaitForAsync(() => audit.Read().Any(ev => ev.Type == "cli_exited"));
+        // The seam, not the class: since P2-15 the daemon registers the chained log when the DB
+        // opens, and that DB is run-shared across in-proc hosts — so the wait is agent-scoped too.
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId));
         var exited = audit.Read().Single(ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId);
         Assert.Equal("137", exited.Fields["exit_code"]);
         // VT color sequences stripped, text intact — a human-readable diagnosis, character-exact.
@@ -203,9 +205,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var store = rig.Host.Services.GetRequiredService<AgentSessionStore>();
         await WaitForAsync(() => store.Find(spawn.AgentId)?.State == "Dead");
 
-        var audit = (Mainguard.Git.Audit.InMemoryAuditLog)rig.Host.Services
-            .GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
-        await WaitForAsync(() => audit.Read().Any(ev => ev.Type == "cli_exited"));
+        // The seam, not the class: since P2-15 the daemon registers the chained log when the DB
+        // opens, and that DB is run-shared across in-proc hosts — so the wait is agent-scoped too.
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId));
         var exited = audit.Read().Single(ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId);
 
         // Cursor-column moves read as word separators; the sentence survives human-readable…

@@ -91,9 +91,12 @@ public sealed class QueueEntryLifecycleTests
         Assert.Equal("its agent was stopped weeks ago", record!.Reason);
         Assert.Equal(WorkerMergeState.Working, record.FromState);
 
-        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.DiscardedEvent);
+        // Scoped by repo handle, like every other daemon-DB assertion here: since P2-15 the audit
+        // log is PERSISTED, and the in-proc hosts share one run-scoped daemon DB — an unscoped
+        // Single() would see other tests' discards (the very isolation note on _repoHandle above).
+        var audited = Assert.Single(audit.Read(),
+            e => e.Type == MergeQueue.DiscardedEvent && e.Fields["repo"] == _repoHandle);
         Assert.Equal("stranded", audited.Fields["agent"]);
-        Assert.Equal(_repoHandle, audited.Fields["repo"]);
         Assert.False(string.IsNullOrWhiteSpace(audited.Fields["when"]));
     }
 
@@ -144,7 +147,9 @@ public sealed class QueueEntryLifecycleTests
         Assert.DoesNotContain("actor", fields);
         Assert.DoesNotContain("rejected_by", fields);
 
-        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.RejectedEvent);
+        // Repo-scoped for the same shared-daemon-DB reason as the discard test above.
+        var audited = Assert.Single(audit.Read(),
+            e => e.Type == MergeQueue.RejectedEvent && e.Fields["repo"] == _repoHandle);
         Assert.Equal("reviewed", audited.Fields["agent"]);
         Assert.Equal("wrong approach entirely", audited.Fields["reason"]);
         Assert.Equal(response.RejectedBy, audited.Fields["by"]);

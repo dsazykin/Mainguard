@@ -284,7 +284,10 @@ public sealed class QueueEntryResumeTests
         Assert.False(response.Resumed);
         Assert.Equal(before, sessions.List().Count);
         Assert.Equal(WorkerMergeState.Working, queue.GetState("running"));
-        Assert.DoesNotContain(audit.Read(), e => e.Type == AgentResumeService.ResumedEvent);
+        // Repo-scoped: since P2-15 the audit log persists in the run-shared daemon DB, so an
+        // unscoped DoesNotContain would trip on OTHER tests' (legitimate) resume events.
+        Assert.DoesNotContain(audit.Read(),
+            e => e.Type == AgentResumeService.ResumedEvent && e.Fields["repo"] == _repoHandle);
     }
 
     /// <summary>

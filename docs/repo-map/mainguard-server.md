@@ -25,7 +25,13 @@
   steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
   leaves an artifact); best-effort
   DB-backed stores with an in-memory fallback so the daemon always starts, all resolved from DI so a
-  test host can override them; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  test host can override them; **P2-15 adds `RegisterAuditLog`** — `IAuditLog` rides the same DB
+  posture decision: the `ChainedAuditLog` (+ `IChainedAuditLog` for the verify surface + retention)
+  over the daemon DB when it opened, with the mirror at `<db>.audit-mirror` and the AES-GCM key in a
+  `SecureKeyring` rooted beside it, constructed EAGERLY so a store problem lands in migration.log;
+  `InMemoryAuditLog` fallback otherwise, with the will-not-survive-restart loss logged out loud
+  (note: the in-proc test tier's hosts share one run-scoped daemon DB, so Server.Tests audit
+  assertions are repo/agent-scoped, and the chain itself re-reads its head per append); **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
@@ -43,6 +49,11 @@
     `ModelProxyMiddleware` fronting model hosts with per-agent-port attribution (`IAgentPortMap`).
   - **`Runtime/GatewayHostedService.cs`** — runs the RT-D1 boot sequence + the token-bucket pump loop on
     host start.
+  - **`Runtime/AuditRetentionService.cs`** (P2-15) — hosted retention sweep: once at boot and every
+    24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
+    unchanged, chain verifiable — the schema's triggers would refuse a delete anyway); a no-op on
+    the in-memory fallback journal, and a failed sweep logs + retries next round, never taking the
+    daemon down.
   - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
     `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
     `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
@@ -83,7 +94,9 @@
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
   `SpawnAgentRequest`) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
-  or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
+  or approve its own plans), and the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` —
+  the chain carries other agents' prompts/outputs and the human's decisions, none of it a
+  coordinator's to read). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
   rejected server-side while the read/output stream flows — never UI-only.
 - **`Auth/ConnectionRoleRegistry.cs`** (P2-14) — maps a bearer token → `ConnectionRole` (primary
@@ -440,6 +453,17 @@
     daemon `PlanApprovalService`; **`ApprovePlan` resolves the approver via `IApproverIdentityResolver`
     from the connection — the request has no identity field**, SA-1/F2) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
+  - **`Services/AuditGrpcService.cs`** (P2-15) — transport for `AuditService` (`VerifyAudit`/
+    `ReadAudit`): the audit store's first production readers. Verification/decryption live in
+    `IChainedAuditLog`; on the in-memory fallback journal both RPCs still answer with
+    `persistent=false` (a heap verify must never read as tamper-evidence). Coordinator-denied at
+    the `RoleInterceptor`; `ReadAudit` pages are capped at 500 records (payloads carry full
+    prompts/outputs).
+  - **`Cli/AuditCommands.cs`** (P2-15) — the offline `mainguardd audit verify [--data <db>]` verb
+    (dispatched in `Program.cs` before daemon options, so it can never bind a port): walks the
+    chain + mirror via `ChainedAuditLog`, prints head seq/hash; exit contract 0 intact (missing
+    store / pre-chain DB = intact by definition) / 2 tampered with first-bad-seq printed /
+    64 usage / 1 cannot-verify.
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
