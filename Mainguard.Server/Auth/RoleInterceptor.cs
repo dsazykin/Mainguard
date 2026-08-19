@@ -53,6 +53,11 @@ public sealed class RoleInterceptor : Interceptor
         // never re-verifies), and one that could unpause could break the cascade's critical section.
         "/mainguard.v1.AgentService/PauseAgent",
         "/mainguard.v1.AgentService/UnpauseAgent",
+        // P2-15: the audit chain carries other agents' prompts/outputs and every plan/merge
+        // decision. A coordinator that could read it would hold a transcript of work it competes
+        // with (and of the human's decisions about it); verify is read power's sibling here.
+        "/mainguard.v1.AuditService/VerifyAudit",
+        "/mainguard.v1.AuditService/ReadAudit",
         // Same boundary: clearing a stalled verification puts a branch back to Working, which is the state
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.

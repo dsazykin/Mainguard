@@ -6,6 +6,14 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
+// P2-15: `mainguardd audit verify` — an offline CLI verb, dispatched before daemon options so it
+// can never bind a port or touch the token. WebApplicationFactory hosts pass no args, so the
+// in-proc test tier never lands here.
+if (args.Length > 0 && string.Equals(args[0], "audit", StringComparison.Ordinal))
+{
+    return Mainguard.Server.Cli.AuditCommands.Run(args);
+}
+
 var options = DaemonOptions.Parse(args);
 
 // --local-dev --smoke: start, self-probe, exit 0 (prints nothing on success).

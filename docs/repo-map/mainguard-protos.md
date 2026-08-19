@@ -41,6 +41,11 @@
     (alt-screen/bracketed-paste/DECCKM/mouse+SGR); `ClipboardCopy` — daemon-decoded OSC 52 SETs (queries
     never answered); and the `GetScrollback` RPC — lazy absolute-indexed scrollback pages for
     reattach/recovery/thin clients).
+  - `audit.proto` (P2-15: `AuditService` — `VerifyAudit` (chain + mirror walked daemon-side; head
+    seq/hash; `persistent=false` flags the in-memory fallback journal so a heap verify can never
+    pass as tamper-evidence) and `ReadAudit` (paged decrypted canonical envelopes) — the audit
+    store's first production readers; both RPCs coordinator-denied at the RoleInterceptor, and
+    redaction/retention deliberately have NO RPC).
   - `egress.proto` (`EgressService`: List/Add/RemoveAllowlistHost — the App's only path to the
     daemon-owned default-deny allowlist (ESC-I2); Add re-renders the running proxy live, powering the
     Fix-2 unblock. `agent.proto`'s `StateChange` carries a `reason` (a Dead CLI's exit tail) so the App

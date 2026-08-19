@@ -2046,7 +2046,15 @@
   `EncryptionAtRest` (sentinel prompt absent from raw DB + mirror bytes, decryptable via `Read`),
   crash-mid-append via the fault seam (DB committed, mirror lags → reopen recovers, chain resumes)
   + a physically torn mirror tail, and `MirrorContentMismatch_ShouldFailVerify_NeverAutoRepair` —
-  the witness posture.
+  the witness posture. Redaction/retention: tombstone + chain-still-verifies + original-hash
+  voucher on the redaction event, ciphertext/key nulled at the row (the mirror never had a copy),
+  refusals (missing seq / double-redact / redacting a redaction event), reopen survival, and
+  `Retention_RedactsNotDeletes` (count grows by the redaction events, idempotent second sweep).
+- **`Mainguard.Server.Tests/AuditRpcTests.cs`** (P2-15) — the chain's first production READERS over
+  the real in-proc daemon: `VerifyAudit` (valid + persistent + head), `ReadAudit` (decrypted
+  envelope round-trip, marker-scoped since the in-proc hosts share the run-scoped daemon DB), the
+  coordinator-role denial of both RPCs, and the offline `mainguardd audit verify` CLI exit contract
+  (0 intact / 2 after a drop-trigger-and-forge tamper / 0 on a missing store / 64 usage).
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---
