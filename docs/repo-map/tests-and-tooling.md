@@ -2038,6 +2038,15 @@
   seq-1 genesis pin; and canonical-JSON stability — ordinal key sort (nested too), the tr-TR culture
   test, equivalent-number-spelling collapse (`1.0` ≡ `1`), input-shape independence
   (anonymous/dictionary/sorted → identical bytes), no BOM.
+- **`Mainguard.Tests/AuditLogTests.cs`** (P2-15, TI-P2-15 items 3–6) — the persisted chain against a
+  real migrated SQLite file + file mirror: chain-from-head + reopen resume, the schema-level
+  append-only triggers (raw `UPDATE`/`DELETE` → `SqliteException` naming the rule), the
+  column-tamper theory (attacker drops the trigger, forges
+  timestamp/type/hash/prevHash/ciphertext → `VerifyAll` fails at exactly that seq),
+  `EncryptionAtRest` (sentinel prompt absent from raw DB + mirror bytes, decryptable via `Read`),
+  crash-mid-append via the fault seam (DB committed, mirror lags → reopen recovers, chain resumes)
+  + a physically torn mirror tail, and `MirrorContentMismatch_ShouldFailVerify_NeverAutoRepair` —
+  the witness posture.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---

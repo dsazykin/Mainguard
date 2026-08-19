@@ -30,6 +30,7 @@ public class AppDbContext : DbContext
     public DbSet<PrIntakeSubscriptionRow> PrIntakeSubscriptions { get; set; } = null!;
     public DbSet<PrIntakeHeadRow> PrIntakeHeads { get; set; } = null!;
     public DbSet<PrIntakeConfigRow> PrIntakeConfig { get; set; } = null!;
+    public DbSet<AuditRecordRow> AuditRecords { get; set; } = null!;
 
     public AppDbContext()
     {
@@ -147,6 +148,12 @@ public class AppDbContext : DbContext
         // generation on the key: the store names the id, it is never allocated.
         modelBuilder.Entity<PrIntakeConfigRow>().HasKey(c => c.Id);
         modelBuilder.Entity<PrIntakeConfigRow>().Property(c => c.Id).ValueGeneratedNever();
+
+        // P2-15 audit chain: Seq is the chain-assigned key (contiguous from 1, never DB-generated).
+        // Append-only is enforced IN THE SCHEMA by the AddAuditChain migration's SQLite triggers —
+        // any DELETE and any UPDATE other than the redaction tombstone transition RAISE(ABORT).
+        modelBuilder.Entity<AuditRecordRow>().HasKey(a => a.Seq);
+        modelBuilder.Entity<AuditRecordRow>().Property(a => a.Seq).ValueGeneratedNever();
 
         // Seed some initial default categories
         modelBuilder.Entity<WorkspaceCategory>().HasData(
