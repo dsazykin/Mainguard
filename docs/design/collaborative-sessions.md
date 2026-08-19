@@ -4,6 +4,11 @@ Status: **design / planning** (no code) · Edition: **Cloud** · Supersedes the 
 concrete design · Depends on P3-06 (cloud worktrees), P3-05 (Mainguard Web), and pulls in P2-41
 (remote dashboard), P2-45 (flight recorder), P2-15 (tamper-evident audit).
 
+> **This doc is the locked product decisions.** The full end-to-end **system architecture** — how the
+> desktop app, the browser client, and the cloud backend are built, wired together, hosted, and paid
+> for (written for someone new to cloud backends) — is in
+> [`collaborative-sessions-architecture.md`](collaborative-sessions-architecture.md).
+
 ## 1. Thesis — why this fits Mainguard specifically
 
 "All LLMs have share-chat; none is collaborative." The insight is that the thing worth sharing in
