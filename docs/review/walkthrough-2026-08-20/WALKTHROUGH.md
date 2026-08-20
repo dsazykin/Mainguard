@@ -121,3 +121,39 @@ revealed all 11 entries, including the fresh spawn `ac0a1c56...` correctly showi
 verified yet` with Verify/Resume/Discard (`042`). Logged as ISSUES-LOG #4 — a real, medium-high severity
 UX defect (stale-entry clutter burying new work below an easy-to-miss fold), just not a data bug.
 **Screenshots:** `025`-`042`.
+
+## Step 009 — D1/E1/E3: Verify the fresh entry, confirm the verified-against stamp
+
+**Action:** clicked **Verify** on `ac0a1c56...` (screenshots `043`-`045`, committed before the pause).
+**Observed:** ✅ PASS. Entry transitioned `Working` → `Verified`, footer text "ready to merge".
+**Screenshot:** `046` (post-pause resume check) confirms the state held: row shows a green check, state
+`Verified`, and **`main@58a86d28e2`** rendered directly under the row — E3's verified-against stamp,
+confirmed live for the first time (previously only unit-tested).
+
+## Step 010 — E2/E3/H3: Review cockpit from the queue, verified-@ stamp, coordinator titling
+
+**Action:** scrolled the Merge Queue panel (revealed the `Review` button, which only renders once an
+entry is `Verified` — the 3 `Working` rows above it correctly show no Review affordance).
+**Screenshot:** `048`. Clicked **Review**.
+**Observed:** cockpit opens with a real diff (`src/calc.js`, the coordinator's own comment-add commit),
+header shows `verified @ 58a86d2` (E3 confirmed a second way, in the cockpit itself, not just the
+rail), Reject/Bring local/Merge all present and enabled. **Bug found:** the title reads
+`Review — ac0a1c56b4b94d9b8e6a98c6dc625ef2 · agent/ac0a1c56... → main` — the raw GUID, not
+`Coordinator (claude-code)` as H3 expects and as the prior session's fix intended. Root-caused (not
+fixed — non-blocking, needs a small design decision, not a one-liner): the label is computed from a
+live lookup in `_agents.ListAgents()` at review-open time, and that coordinator had already been torn
+down (see step 008's "No coordinator running"). Since queue entries persist indefinitely (by design —
+E4/E5), this means the friendly label is only ever correct while the coordinator is still running, and
+reverts to a bare GUID for the rest of the entry's life. Logged as **ISSUES-LOG #7**. Also reconfirmed
+**ISSUES-LOG #8**: a hovered tooltip on a stranded row's id clips mid-character with no `…`.
+**Screenshot:** `049`.
+
+## Step 011 — F1: Merge via a real UI click
+
+**Action:** clicked **Merge** in the cockpit.
+**Observed:** ✅ PASS. Toast *"Merged agent/ac0a1c56b4b94d9b8e6a98c6dc625ef2..."* (clipped, same
+family as ISSUES-LOG #3), footer flips to `already merged`, Reject/Bring-local/Merge all disable.
+Confirmed on the real checkout: `git -C ~/mg-work/e2e-fixture log --oneline -1` → `33c2f7c` (the
+coordinator's own commit) — main genuinely advanced via the real three-step, not just a UI-side
+optimistic flip. This is the first time F1 (merge execution) has been exercised end-to-end via actual
+clicks rather than the RPC harness. Closed the cockpit (**Screenshot:** `050`-`051`).

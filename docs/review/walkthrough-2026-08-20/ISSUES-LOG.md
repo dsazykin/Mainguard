@@ -50,6 +50,35 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - Not deeply root-caused (didn't chase into `VtScreen`/the ANSI parser this pass), but it is a real, user-visible rendering defect on a LIVE (not ghost) coordinator, distinct from the previously-known ghost-coordinator garbled-terminal finding — this is a second, independent data point that the terminal renderer has redraw/reflow bugs with claude-code's real multi-column TUI output, not just with stale/replayed scrollback.
 - Severity: medium — cosmetic but genuinely impairs reading what the agent is doing during onboarding; did not block interaction (the agent still received input and worked correctly underneath the garbled display).
 
+### 7. [OPEN, real bug — H3] "Coordinator (<cli>)" review title only works while the coordinator is still alive
+- **Steps:** 048-049
+- Opened Review on the `ac0a1c56...` queue entry (the real claude-code coordinator from step 008,
+  which had since ended — "No coordinator running" showing in the Coordinator panel). The cockpit
+  title read `Review — ac0a1c56b4b94d9b8e6a98c6dc625ef2 · agent/ac0a1c56... → main` — the raw GUID,
+  not `Coordinator (claude-code)` as the earlier session's fix intended and as H3 explicitly asserts.
+- **Root cause** (`Mainguard.Agents.UI/ViewModels/ControlCenterViewModel.cs:1122-1131`,
+  `OpenReviewAsync`): the "Coordinator (name)" label is only synthesized by looking the agent up in
+  `_agents.ListAgents()` (confirmed empty via a diagnostic RPC call — the coordinator process had
+  already torn down, so it no longer appears in the live agent list at all). The label is never
+  persisted onto the queue entry itself, only computed on-the-fly from the currently-live agent
+  roster. Since **queue entries are long-lived by design** (E4/E5's whole point — Merged/Rejected
+  entries stay on the stream permanently, confirmed in step 004), this means: the friendly coordinator
+  label is only ever correct for the brief window the coordinator is still running, and permanently
+  reverts to a bare GUID for the rest of that entry's (indefinite) life — which is the common case,
+  since most coordinators finish and get torn down.
+- Severity: low-medium — cosmetic, not a correctness/data bug (the GUID is still accurate and
+  clickable), but it directly contradicts H3's tested assertion and defeats the point of the earlier
+  fix for anyone reviewing history after the fact.
+- Not fixed this pass (non-blocking): the real fix is a persisted field (store the role/name on the
+  queue entry at spawn time, daemon-side, instead of a live-lookup join at review-open time) — a small
+  design decision, not a one-line patch, so logged rather than rushed.
+
+### 8. [OPEN, testing-methodology note] Tooltip/label clipping mid-word, no ellipsis, confirmed again
+- **Step:** 048
+- Hovering the `506a60e6...` row's id showed a tooltip that clipped mid-character with no `…` marker
+  at all (`506a60e6e700471aa945fc`) — same family as ISSUES-LOG #3, just a second data point that it's
+  not truncation-with-ellipsis, it's a hard pixel/width cutoff with nothing signaling more text exists.
+
 ### 6. [OPEN, testing-methodology note, not a Mainguard bug] `System Events keystroke` drops characters on fast/long strings
 - **Step:** 008
 - Typing a full sentence via `osascript -e 'tell application "System Events" to keystroke "..."'` into the terminal dropped several characters/words (rendered as "a on-line comment... top o.js" instead of "a one-line comment... top of src/calc.js"). This is very likely an AppleScript/Accessibility-API typing-speed limitation, not a Mainguard input-handling bug — the terminal reliably received and rendered whatever it was actually sent, and the agent's own excellent handling of the corrupted prompt (asking for disambiguation rather than guessing wrong) is itself a positive data point.
