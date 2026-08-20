@@ -61,6 +61,10 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     private readonly Func<string> _tokenProvider;
     private readonly BackoffPolicy _backoff;
     private GrpcChannel? _channel;
+    // A SEPARATE HTTP/2 connection for StreamQueueAsync — see its doc comment. Its own field/factory
+    // call (not Channel()'s) so it never shares a connection, and therefore a flow-control window, with
+    // the terminal's continuous PTY stream or anything else on the shared channel.
+    private GrpcChannel? _streamChannel;
     private ConnectionState _state = ConnectionState.Down;
 
     public DaemonClient(Func<GrpcChannel> channelFactory, Func<string> tokenProvider, BackoffPolicy? backoff = null)
@@ -498,11 +502,21 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     // ---- P2-10 merge queue (P2-47 #1) ----
 
     /// <summary>Streams the P2-10 merge-queue snapshot-then-deltas for a repo handle (one attach; the
-    /// caller re-subscribes to reconnect). No wall-clock deadline — long-lived, ended by cancellation.</summary>
+    /// caller re-subscribes to reconnect). No wall-clock deadline — long-lived, ended by cancellation.
+    ///
+    /// <para><b>On its own HTTP/2 connection</b> (<see cref="StreamChannel"/>), not the shared
+    /// <see cref="Channel"/> — field bug, found live 2026-08-20: with a coordinator's terminal attached
+    /// (<c>TerminalService/Attach</c>, a continuous PTY byte stream), a fresh queue entry's push could sit
+    /// unsent for minutes on the shared connection's flow-control window, which the chatty terminal
+    /// stream keeps saturated. The rail's data was correct the entire time — <c>GetQueue()</c> answered
+    /// right away over a fresh connection — only THIS delivery was starved. Reproduced with the terminal
+    /// idling, not even actively printing, so it is the open stream's flow-control reservation, not its
+    /// throughput, that was the problem.</para>
+    /// </summary>
     public async IAsyncEnumerable<QueueUpdate> StreamQueueAsync(
         string repoHandle, [EnumeratorCancellation] CancellationToken ct)
     {
-        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        var client = new MergeQueueService.MergeQueueServiceClient(StreamChannel());
         using var call = client.StreamQueue(new StreamQueueRequest { RepoHandle = repoHandle }, AuthOnly(ct));
         await foreach (var update in call.ResponseStream.ReadAllAsync(ct).ConfigureAwait(false))
         {
@@ -795,11 +809,17 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
 
     private GrpcChannel Channel() => _channel ??= _channelFactory();
 
+    private GrpcChannel StreamChannel() => _streamChannel ??= _channelFactory();
+
     private void ResetChannel()
     {
         var old = _channel;
         _channel = null;
         old?.Dispose();
+
+        var oldStream = _streamChannel;
+        _streamChannel = null;
+        oldStream?.Dispose();
     }
 
     private Metadata AuthHeaders() => new() { { "authorization", $"bearer {_tokenProvider()}" } };

@@ -1096,8 +1096,14 @@
   fell into, where the kernel never repeated and the assertion passed with the fix disabled): the
   probe is pinned in BOTH directions, an occupied candidate is injected and must be rejected, the
   search is bounded, a port is stolen mid-body on cue and must be retried on a different one, and the
-  control proves a failure on a still-dead port surfaces on the first attempt)**. **P2-13
-  activity-bar/docking tests:** `AttentionDerivationTests`, `ActivityBarOrderingTests` (+
+  control proves a failure on a still-dead port surfaces on the first attempt)**.
+  **`DaemonClientChannelIsolationTests`** (a live-UI bug found 2026-08-20: `StreamQueueAsync` shared
+  one HTTP/2 connection with `AttachTerminal`'s continuous PTY stream, so an attached terminal's open
+  flow-control window could starve a fresh queue push for minutes even while idling; `DaemonClient` now
+  gives `StreamQueueAsync` its own connection via `StreamChannel()`, and this proves the isolation —
+  and that every other RPC still shares and reuses the one cached `Channel()` — without a live server,
+  since channel creation is a synchronous factory call that a pre-cancelled token reaches before any
+  real I/O). **P2-13 activity-bar/docking tests:** `AttentionDerivationTests`, `ActivityBarOrderingTests` (+
   `ActivityBarRailUsesProjectionTests` — the rail really ROUTES through `AgentListProjection.LifoOrder`
   rather than re-spelling it inline, proved through a same-spawn-instant tie only the helper breaks;
   plus the bulk-snapshot ordering, which the old per-row `Insert(0, …)` reversed),
