@@ -341,6 +341,8 @@ public class QueueEntryLifecycleRenderHarness
     /// </summary>
     private sealed class StubQueue : IMergeQueueService
     {
+        public event Action? Changed;
+
         public List<string> Discarded { get; } = new();
 
         /// <summary>Every (agentId, agentKind) a resume actually reached the seam with.</summary>

@@ -298,6 +298,11 @@
   `QueueProjectionRenderingTests` (wire-shaped facts render: the verified-against stamp comes from
   `VerifiedMainSha` — the daemon projection never populates `Verification`, so the old read could
   never draw it — and the cockpit's changed-test-command warning renders without a run-count delta),
+  `QueueChangedRefreshesRailTests.cs` (field bug found 2026-08-20 in a live click-through: the rail
+  never subscribed to `IMergeQueueService.Changed`, only to the coordinator's/kill switch's — so a
+  queue-only change, e.g. a fresh spawn's `EnsureEntry`, sat correctly in `GetQueue()`'s answer but
+  unrendered until an unrelated AgentEvent happened to re-pull it; a proxy `IMergeQueueService` fires
+  `Changed` alone, with no other signal, and asserts the rail still picks it up),
   `SendPromptDeliveryTests` (the agent document's Send writes the raw-mode selector then prompt+CR
   over a short-lived terminal attach and propagates the locked-terminal PermissionDenied — it was a
   no-op reporting success),

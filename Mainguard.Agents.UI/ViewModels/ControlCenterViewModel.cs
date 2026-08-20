@@ -291,9 +291,14 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         _agents.EventReceived += OnAgentEvent;
         // Fix 2: a CLI that dies on a blocked host raises this — show the unblock/keep prompt.
         if (_agents is Services.DaemonBackedOrchestrator dbo) dbo.EgressBlocked += OnEgressBlocked;
-        // Changed is raised by both the coordinator and the kill switch (same requery pattern).
+        // Changed is raised by the coordinator, the kill switch, AND the merge queue (same requery
+        // pattern). Field bug (2026-08-20): the queue leg was missing entirely — EnsureEntry's push
+        // landed in GetQueue()'s answer correctly but nothing ever re-pulled it, so a fresh spawn's
+        // entry sat unrendered until an unrelated AgentEvent/coordinator/kill change refreshed the
+        // rail. "The spawned agent never appeared in the queue" was this.
         _coordinator.Changed += OnChanged;
         _kill.Changed += OnChanged;
+        _queue.Changed += OnChanged;
         _telemetry.Sampled += OnSampled;
         ThemeManager.ThemeChanged += OnThemeChanged;
 

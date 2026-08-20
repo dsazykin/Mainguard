@@ -69,6 +69,8 @@ public sealed class QueueProjectionRenderingTests
 
     private sealed class TwoVerifiedStub : IMergeQueueService
     {
+        public event Action? Changed;
+
         public string MainSha => "abc123";
 
         public IReadOnlyList<QueueEntry> GetQueue() => new[]

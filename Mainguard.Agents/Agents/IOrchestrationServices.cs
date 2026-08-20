@@ -46,6 +46,12 @@ public sealed record VerificationOutcome(bool Ran, bool Passed, string Reason);
 public interface IMergeQueueService
 {
     string MainSha { get; }
+    /// <summary>Fires whenever the daemon's queue projection changes — a spawn's <c>EnsureEntry</c>,
+    /// a state transition, a stale cascade. Field bug (found live 2026-08-20): nothing subscribed a
+    /// rail refresh to this signal, so a fresh spawn's entry sat in <see cref="GetQueue"/>'s answer
+    /// correctly but unrendered until an UNRELATED event (an AgentEvent, a coordinator/kill-switch
+    /// change) happened to trigger one — "the spawned agent never appeared in the queue."</summary>
+    event Action? Changed;
     IReadOnlyList<QueueEntry> GetQueue();
     bool CanMerge(string agentId, out string reason);
     /// <summary>
