@@ -246,3 +246,52 @@ bug is still present (`main | mainguard-local/agent/ac0a1c56b...` overlapping th
 text). Navigated to Coordinator: **queue populated correctly, 7 `Working` entries at the top**,
 actionable-first ordering fix (`7497202`) still holding on a fresh session. **Screenshot:**
 `087-coordinator-fresh.png`. Testing resumes from here with a known-good app instance.
+
+## Step 015 — Resumed leg: root-caused a contributing cause of ISSUES-LOG #11, fixed and verified
+
+**Action:** re-read `WALKTHROUGH.md`/`ISSUES-LOG.md` to resume from step 14's paused/interrupted
+state (the app had since been closed for a device handoff), then read `DaemonBackedOrchestrator`'s
+`ReconnectLoopAsync`/`QueuePumpAsync`/`SetActiveRepo`/`ClearActiveRepo` and
+`ControlCenterViewModel.ProvisionRepoAsync` end to end to chase ISSUES-LOG #11 (the queue stream
+dying silently and never retrying) further, per the standing instruction to timebox the
+investigation and move on if it didn't resolve quickly.
+
+**Found:** `ControlCenterViewModel.ProvisionRepoAsync` unconditionally calls
+`daemon.ClearActiveRepo()` (which synchronously tears down the queue pump and blanks the
+projection — `Queue.Refresh()` runs immediately after) on **every** call, including a redundant
+re-open of the repo that's already active. Every repo-open entry point (`OpenRepositoryAsync`,
+called from the repo picker, `ReopenLastRepo`, the command palette's "Open &lt;repo&gt;" entry, and
+`ChangeInvalidRepoPathAsync`/`CreateGitRepositoryAsync`) reaches this same unconditional path — none
+of them check whether the repo is already the one that's open and bound. After the clear, the code
+awaits a real `ProvisionRepo` RPC with a 5-minute deadline before it calls `SetActiveRepo` again to
+restart the pump — and in between, the rail shows a genuinely-empty projection with **zero** UI
+indication a background reprovision is in flight (the `IsOpeningRepo` spinner only covers the
+synchronous dashboard-build step; `TryRegisterSyncRemoteAsync` runs fire-and-forget after it). This
+does not 100%-prove-identical to the exact timing evidence gathered for #11 (that trace showed no
+provision-failure toast, which a slow/failed RPC here would eventually produce), but it is a real,
+independently-confirmed structural gap in the same family, is very plausibly a contributing/related
+cause, and is exactly the class of thing that produces "the merge queue looks empty and dead with no
+explanation."
+
+**Fixed** (`978db19`): `DaemonBackedOrchestrator.IsBoundTo(repoHandle)` reports whether the adapter
+is already bound to that handle with a live pump; `ControlCenterViewModel.ProvisionRepoAsync` now
+short-circuits to the last-known binding (`_lastProvisioned`, extended to carry the sync-remote URL)
+when the repo path and handle both still match, skipping the clear+reprovision round trip entirely.
+Regression test `IsBoundTo_TrueOnlyWhileThatHandlesQueuePumpIsAlive` added to
+`RepoProvisioningHonestyTests.cs` (5/5 pass). Full solution rebuild clean. Committed and pushed.
+
+**Verified live:** killed and relaunched the app + daemon fresh (`open .../Mainguard.app`).
+**Screenshot `088-fresh-launch-after-fix-978db19.png`:** Merge Queue panel populated correctly and
+immediately on a cold launch — 5 `Working` entries, correct actionable-first order, no "Nothing
+queued" flash, no coordinator-panel error. Confirms the fix builds and runs cleanly and doesn't
+regress the normal cold-open path.
+
+**Not pursued further this leg** (explicit timebox, per instruction not to burn the whole leg on
+one investigation): reproducing a REDUNDANT re-open specifically (e.g. via the command palette
+while the repo is already open) to directly confirm this was the exact #11 trigger end-to-end, and
+finding the kill switch's exact on-screen control to click it live for G3/G2 (a coordinate-probe
+click at the sidebar's bottom red icon landed on an unlabeled nested group with no visible effect —
+not chased further to avoid burning budget on pixel-hunting). Both are legitimate follow-ups for the
+next leg. ISSUES-LOG #11 itself is left OPEN rather than marked fixed, since the exact original
+trigger for that specific incident is still not proven — only a strong, independently-real
+contributing-cause candidate is fixed.
