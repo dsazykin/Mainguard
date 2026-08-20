@@ -309,7 +309,10 @@
   `RepoProvisioningHonestyTests` (the repo-open provisioning path surfaces failures as reasons and
   detaches the queue projection on repo switch — `ClearActiveRepo` empties + raises `Changed`, the
   cleared adapter refuses to merge, a failed provision on switch leaves no stale queue from the
-  previous repo),
+  previous repo, `IsBoundTo` is true only while that handle's pump is alive — and the two ISSUES-LOG #11
+  liveness invariants: concurrent repo-opens are SERIALIZED so the second one sees the first's finished
+  binding instead of both clearing, and a failed RE-provision of the already-open repo restores the
+  binding rather than stranding the queue pump nothing else ever restarts),
   `AppDbContextTests`, `GitHostDetectorTests`, `HostProviderRegistryTests` (T-14 provider resolution
   by host+kind + single-source `TokenUsername` + PAT-prompt acquire/throw-with-host),
   `SshKeyServiceTests` (T-14 ArgumentList argv construction + a REAL local ssh-keygen round trip —
@@ -1120,6 +1123,13 @@
   one pump with no `ReconnectLoopAsync`, so any fault froze the rail for the process lifetime with
   `ConnectionState` still `Connected` and no banner — and one throwing UI subscriber no longer skips
   the `Changed` redraw or kills the stream)**,
+  **`QueuePumpResilienceTests` (the same property for the OTHER stream the control center is derived
+  from — the merge-queue pump re-subscribes after its stream ends cleanly AND after it faults, always
+  against the same repo handle, and `ApplyQueueUpdate` survives a throwing `Changed` subscriber the way
+  `ApplyAgentEvent` already did. ISSUES-LOG #11, 2026-08-20: a session's Merge Queue panel went to
+  "Nothing queued" mid-session with every daemon row intact and every other RPC still succeeding; the
+  agent pump's reconnect had a regression test and the queue pump's did not. These pin it via the
+  `QueueStreamOverride` seam — the exact analogue of `AgentEventStreamOverride`)**,
   **`EgressAllowlistReachabilityTests` (the allowlist editor reads/writes the live gateway, reports an
   unreachable daemon instead of rendering an empty policy, and is reachable both at rest — the
   coordinator toolbar — and from the block prompt)**,

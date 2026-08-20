@@ -66,6 +66,19 @@ public sealed class DaemonBackedOrchestrator :
     internal Func<CancellationToken, IAsyncEnumerable<Proto.AgentEvent>>? AgentEventStreamOverride { get; set; }
 
     /// <summary>
+    /// Test seam: the merge-queue stream <see cref="QueuePumpAsync"/> subscribes to — the exact analogue
+    /// of <see cref="AgentEventStreamOverride"/>, and it exists for the same reason. Never set in
+    /// production, where it is <c>DaemonClient.StreamQueueAsync</c>.
+    ///
+    /// <para>The property under test is <b>re-subscription of the QUEUE stream specifically</b>. ISSUES-LOG
+    /// #11 (found live 2026-08-20) was a merge-queue rail that went to "Nothing queued" mid-session and
+    /// stayed there: the daemon's log recorded exactly ONE <c>StreamQueue</c> call, ended after 32 ms, and
+    /// not one retry over the next 5m45s while every other RPC on the same daemon kept succeeding. The
+    /// agent pump's reconnect property had a regression test; this one did not, so nothing pinned it.</para>
+    /// </summary>
+    internal Func<string, CancellationToken, IAsyncEnumerable<Proto.QueueUpdate>>? QueueStreamOverride { get; set; }
+
+    /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
     /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
     /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
@@ -549,14 +562,20 @@ public sealed class DaemonBackedOrchestrator :
 
     private async Task QueuePumpAsync(string repoHandle, CancellationToken ct)
     {
+        var stream = QueueStreamOverride ?? ((handle, token) => _client.StreamQueueAsync(handle, token));
         await ReconnectLoopAsync(async token =>
         {
-            await foreach (var update in _client.StreamQueueAsync(repoHandle, token).ConfigureAwait(false))
+            await foreach (var update in stream(repoHandle, token).ConfigureAwait(false))
             {
                 ApplyQueueUpdate(update);
             }
         }, ct).ConfigureAwait(false);
     }
+
+    /// <summary>Runs the merge-queue pump against <paramref name="ct"/> for a test, so its reconnect
+    /// property is asserted without going through <see cref="SetActiveRepo"/>'s binding bookkeeping.</summary>
+    internal Task RunQueuePumpForTestAsync(string repoHandle, CancellationToken ct)
+        => QueuePumpAsync(repoHandle, ct);
 
     /// <summary>Runs a single-shot stream body, reconnecting with a fixed delay on any fault (an
     /// unreachable daemon, a NOT_FOUND queue, a dropped stream) until cancelled. This is what makes an
@@ -822,7 +841,12 @@ public sealed class DaemonBackedOrchestrator :
             }
         }
 
-        Changed?.Invoke();
+        // Isolated for the same reason ApplyAgentEvent's raises are (see RaiseIsolated): this runs ON the
+        // queue pump thread, so a throwing subscriber propagated straight out of the `await foreach` and
+        // tore the queue stream down. The reconnect loop caught it and re-subscribed, which meant the rail
+        // silently lost every push in the gap and re-threw on the next one — a stream cycling every
+        // ReconnectDelay for as long as the handler kept faulting, with no banner and no log line.
+        RaiseIsolated(() => Changed?.Invoke());
     }
 
     private void ApplyPlanUpdate(Proto.PlanUpdate update)

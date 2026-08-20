@@ -828,9 +828,17 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
             switch (await controlCenter.ProvisionRepoAsync(repoPath).ConfigureAwait(true))
             {
                 case { Binding: { } binding }:
+                    // Bind the live queue projection FIRST. Registering the sync remote is host-side git
+                    // work on the user's own checkout and can genuinely throw (a held .git/index.lock, a
+                    // read-only or malformed config); it used to run first, so any such throw fell to the
+                    // catch below, surfaced a toast, and left the queue pump — which ProvisionRepoAsync
+                    // had already torn down — dead for the rest of the session with the rail reading
+                    // "Nothing queued" (ISSUES-LOG #11). Order matters and only in this direction:
+                    // observing the queue never needed the remote, only MERGING does, and the merge path
+                    // refuses honestly on its own when the fetch can't resolve.
+                    controlCenter.SetActiveRepo(binding.RepoHandle);
                     new Services.SyncRemoteRegistrar(new Mainguard.Git.Services.GitService())
                         .Register(repoPath, binding.SyncRemoteName, binding.SyncRemoteUrl);
-                    controlCenter.SetActiveRepo(binding.RepoHandle);
                     break;
                 case { FailureReason: { } reason }:
                     SurfaceAgentProvisionFailure(repoPath, reason);

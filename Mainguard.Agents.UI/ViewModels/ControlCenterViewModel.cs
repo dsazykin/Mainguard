@@ -1211,6 +1211,12 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// (the daemon only ever hands back opaque handles — G-14 — so the path has to be remembered here).</summary>
     private (string RepoHandle, string RepoPath, string SyncRemoteName, string SyncRemoteUrl)? _lastProvisioned;
 
+    /// <summary>Test seam: plants the "this repo is already open" state a mid-session re-open finds,
+    /// which production only reaches through a real ProvisionRepo RPC. Never called by the app.</summary>
+    internal void SeedLastProvisionedForTest(
+        string repoHandle, string repoPath, string syncRemoteName, string syncRemoteUrl)
+        => _lastProvisioned = (repoHandle, repoPath, syncRemoteName, syncRemoteUrl);
+
     /// <summary>Provision the just-opened repo into the daemon (P2-06) and return the outcome for the
     /// shell to act on (register the sync remote on success; toast + retry card on failure — step 2f
     /// seam). Gated on the real DaemonBackedOrchestrator like <see cref="SetActiveRepo"/>, so the
@@ -1226,6 +1232,34 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             return null;
         }
 
+        // SERIALIZED, and that is the load-bearing half of the ISSUES-LOG #11 fix. The shell starts this
+        // fire-and-forget (`_ = TryRegisterSyncRemoteAsync(...)` on every repo open), so two opens a few
+        // hundred milliseconds apart — a picker double-click, "Reopen Last Repository?" landing on top of
+        // a palette open — ran two of these CONCURRENTLY. Both then read `_lastProvisioned` before either
+        // wrote it, so the same-repo short-circuit below could not fire for either, and the two bodies
+        // interleaved as: A clears → B clears → A provisions → A binds (pump starts) → B's provision
+        // returns/fails → B either rebinds much later or, on ANY failure, never rebinds at all. The
+        // observed signature was exactly that: a StreamQueue opened and cancelled 32 ms later, then never
+        // reattempted, because the surviving caller had already given up on the binding. One at a time
+        // makes the loser see the winner's finished binding and take the no-op path.
+        await _provisionGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            return await ProvisionRepoCoreAsync(daemon, repoPath).ConfigureAwait(false);
+        }
+        finally
+        {
+            _provisionGate.Release();
+        }
+    }
+
+    /// <summary>One at a time through <see cref="ProvisionRepoAsync"/> — see its comment; overlapping
+    /// repo-opens are what let a clear land after another call's bind and strand the queue pump.</summary>
+    private readonly System.Threading.SemaphoreSlim _provisionGate = new(1, 1);
+
+    private async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoProvisionOutcome?> ProvisionRepoCoreAsync(
+        Services.DaemonBackedOrchestrator daemon, string repoPath)
+    {
         // Re-opening the repo that's already active and pumping is a real, common trigger (the repo
         // picker, the command palette's "Open <repo>" entry, and "Reopen Last Repository?" all fire
         // unconditionally, even when that repo is already the one on screen) — found live 2026-08-20
@@ -1233,7 +1267,8 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // ProvisionRepo RPC, up to its 5-minute deadline, with zero UI feedback that a background
         // reprovision was even in flight, looking exactly like a dead/empty queue). Skip the
         // clear+reprovision round trip entirely when nothing has actually changed.
-        if (_lastProvisioned is { } current
+        var previous = _lastProvisioned;
+        if (previous is { } current
             && string.Equals(current.RepoPath, repoPath, StringComparison.Ordinal)
             && daemon.IsBoundTo(current.RepoHandle))
         {
@@ -1255,6 +1290,19 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         }
         catch (Exception ex)
         {
+            // A failed RE-provision of the repo we were already bound to must not be worse than doing
+            // nothing at all. The clear above has already torn the pump down, and on this path nothing
+            // downstream ever calls SetActiveRepo again — which is how a transient daemon hiccup turned a
+            // working merge queue into a permanently blank rail that only an app restart recovered. The
+            // handle is the repo's content hash and does not change between provisions, so re-arming it
+            // hands the pump back to its own reconnect-forever loop. Deliberately NOT done when the path
+            // differs: a failed switch to repo B must never resurrect repo A's queue (the B4 regression).
+            if (previous is { } prior && string.Equals(prior.RepoPath, repoPath, StringComparison.Ordinal))
+            {
+                _lastProvisioned = prior;
+                daemon.SetActiveRepo(prior.RepoHandle, prior.RepoPath, prior.SyncRemoteName);
+            }
+
             var reason = ex is Grpc.Core.RpcException rpc
                 ? (rpc.StatusCode == Grpc.Core.StatusCode.Unavailable
                     ? "the agent daemon isn't reachable"
@@ -1306,8 +1354,15 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         if (_agents is Services.DaemonBackedOrchestrator dbo) dbo.EgressBlocked -= OnEgressBlocked;
         _coordinator.Changed -= OnChanged;
         _kill.Changed -= OnChanged;
+        // Paired with the `_queue.Changed += OnChanged` in the constructor. It was the one subscription
+        // with no matching detach, so a disposed VM stayed wired to the live queue stream and kept
+        // Dispatcher-posting into its own torn-down surfaces on every push.
+        _queue.Changed -= OnChanged;
         _telemetry.Sampled -= OnSampled;
         ThemeManager.ThemeChanged -= OnThemeChanged;
+        // (_provisionGate is deliberately NOT disposed: a provision can still be in flight here, and a
+        // disposed SemaphoreSlim would turn its Release into an ObjectDisposedException on the way out.
+        // It allocates no wait handle, so there is nothing to leak.)
 
         // Abort an in-flight coordinator launch + its connect watchdog so nothing dangles past disposal.
         try { _startupCts?.Cancel(); } catch { /* already disposed */ }
