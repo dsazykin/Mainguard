@@ -82,6 +82,27 @@ public sealed class RepoProvisioningHonestyTests
         Assert.False(string.IsNullOrWhiteSpace(outcome.FailureReason));
     }
 
+    /// <summary>The primitive a redundant re-open (repo picker double-click, command palette's "Open
+    /// &lt;repo&gt;", "Reopen Last Repository?") skips a needless clear+reprovision round trip on top of
+    /// — found live 2026-08-20 (ISSUES-LOG #11): re-opening the already-active repo unconditionally tore
+    /// down a working queue pump and re-provisioned from scratch, with no UI indication a background
+    /// reprovision was in flight, blanking the rail to "Nothing queued" for as long as that RPC took
+    /// (up to its 5-minute deadline).</summary>
+    [Fact]
+    public void IsBoundTo_TrueOnlyWhileThatHandlesQueuePumpIsAlive()
+    {
+        using var orchestrator = new DaemonBackedOrchestrator(UnreachableClient());
+
+        Assert.False(orchestrator.IsBoundTo("handle-a"), "nothing bound yet");
+
+        orchestrator.SetActiveRepo("handle-a", localRepoPath: "/tmp/repo-a", syncRemoteName: "mainguard-local");
+        Assert.True(orchestrator.IsBoundTo("handle-a"));
+        Assert.False(orchestrator.IsBoundTo("handle-b"), "a different handle must never read as bound");
+
+        orchestrator.ClearActiveRepo();
+        Assert.False(orchestrator.IsBoundTo("handle-a"), "a cleared adapter is bound to nothing");
+    }
+
     /// <summary>Switching to a repo whose provision fails leaves the queue EMPTY — not repo A's rows
     /// under repo B's window. This is the B4 regression.</summary>
     [Fact]

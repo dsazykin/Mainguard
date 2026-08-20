@@ -377,6 +377,19 @@ public sealed class DaemonBackedOrchestrator :
         RaiseIsolated(() => Changed?.Invoke());
     }
 
+    /// <summary>True when this adapter is already bound to <paramref name="repoHandle"/> with its queue
+    /// pump alive — lets a caller skip a redundant <see cref="ClearActiveRepo"/>+re-provision round trip
+    /// for a repo that's already open and working (see <see cref="SetActiveRepo"/>'s same-handle no-op,
+    /// which this mirrors for callers that sit above it and don't have a live handle to compare against
+    /// without asking first).</summary>
+    public bool IsBoundTo(string repoHandle)
+    {
+        lock (_gate)
+        {
+            return _repoHandle == repoHandle && _queuePump is not null;
+        }
+    }
+
     public void SetActiveRepo(string repoHandle, string? localRepoPath = null, string? syncRemoteName = null)
     {
         if (string.IsNullOrWhiteSpace(repoHandle))

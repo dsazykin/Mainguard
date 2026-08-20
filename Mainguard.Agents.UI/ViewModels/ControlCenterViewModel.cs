@@ -1209,7 +1209,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>The most recent ProvisionRepo answer paired with the Windows path it was provisioned FROM
     /// (the daemon only ever hands back opaque handles — G-14 — so the path has to be remembered here).</summary>
-    private (string RepoHandle, string RepoPath, string SyncRemoteName)? _lastProvisioned;
+    private (string RepoHandle, string RepoPath, string SyncRemoteName, string SyncRemoteUrl)? _lastProvisioned;
 
     /// <summary>Provision the just-opened repo into the daemon (P2-06) and return the outcome for the
     /// shell to act on (register the sync remote on success; toast + retry card on failure — step 2f
@@ -1226,6 +1226,21 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             return null;
         }
 
+        // Re-opening the repo that's already active and pumping is a real, common trigger (the repo
+        // picker, the command palette's "Open <repo>" entry, and "Reopen Last Repository?" all fire
+        // unconditionally, even when that repo is already the one on screen) — found live 2026-08-20
+        // (ISSUES-LOG #11: a redundant re-open blanked a working queue rail for the duration of a real
+        // ProvisionRepo RPC, up to its 5-minute deadline, with zero UI feedback that a background
+        // reprovision was even in flight, looking exactly like a dead/empty queue). Skip the
+        // clear+reprovision round trip entirely when nothing has actually changed.
+        if (_lastProvisioned is { } current
+            && string.Equals(current.RepoPath, repoPath, StringComparison.Ordinal)
+            && daemon.IsBoundTo(current.RepoHandle))
+        {
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Success(new Mainguard.UI.Editions.RepoSyncBinding(
+                current.RepoHandle, current.SyncRemoteName, current.SyncRemoteUrl));
+        }
+
         _lastProvisioned = null;
         daemon.ClearActiveRepo();
         Queue.Refresh();
@@ -1234,7 +1249,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         {
             var provisioned = await daemon.ProvisionRepoAsync(repoPath, System.Threading.CancellationToken.None)
                 .ConfigureAwait(false);
-            _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName);
+            _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl);
             return Mainguard.UI.Editions.RepoProvisionOutcome.Success(new Mainguard.UI.Editions.RepoSyncBinding(
                 provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl));
         }
