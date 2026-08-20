@@ -503,6 +503,18 @@ public sealed class AgentSpawnService
             await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
         }
 
+        // MG-10 corollary: a stopped session's jail is gone, but nothing about that touches MergeQueue
+        // state (Stop isn't a queue transition), so the queue's own `Changed` event — the only thing
+        // that makes StreamQueue re-push — never fires here. An already-open rail keeps rendering this
+        // agent's LAST-KNOWN HasLiveSandbox (true, from while it was running) until some unrelated queue
+        // event elsewhere happens to force a fresh snapshot — which means the "Resume" affordance for a
+        // now-genuinely-stranded entry can silently fail to appear for the rest of the session. Republish
+        // (no state moves) so the rail's next paint reflects the sandbox that just went away.
+        if (session?.RepoHash is { Length: > 0 } repoHashForQueue)
+        {
+            _mergeQueues.EnsureQueue(repoHashForQueue)?.Queue.NotifyGateChanged();
+        }
+
         _spawnLog.LogInformation(
             "stop: agent={Agent} stopped={Stopped} credentialFiles={Files} settingsFiles={Settings}",
             agentId, stopped, credentials.Count, settings.Count);
