@@ -166,7 +166,7 @@ per ISSUES-LOG #3). **Unexpected:** a new red-dot icon appeared in the left rail
 before. **Screenshot:** `052`.
 
 **Action (after a coordinate-math slip sent one click to the wrong app entirely — corrected and
-logged as ISSUES-LOG #10, not a Mainguard defect — screenshots `053`-`054`):** clicked the red-dot
+logged as ISSUES-LOG #10, not a Mainguard defect — screenshot `054`):** clicked the red-dot
 icon with corrected coordinates.
 **Observed:** it opens a full **Agent Document** view (Terminal / Agent diff / Plan / Staging panels,
 a "Send a follow-up prompt" composer, a "Merge to main" button) for the stranded agent — **this

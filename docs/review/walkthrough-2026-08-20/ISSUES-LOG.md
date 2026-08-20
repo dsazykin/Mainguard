@@ -112,6 +112,8 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   surfacing this very session's own transcript. Caught immediately (the "finding" was obviously not a
   Mainguard surface), refocused Mainguard via `System Events … set frontmost`, recalibrated, continued.
   Not logged as a product defect; noted only so this walkthrough's provenance is honest about the slip.
+  (The intermediate screenshot showing the Claude app's own transcript was removed rather than
+  committed — not useful evidence and not something to publish.)
 
 ### 6. [OPEN, testing-methodology note, not a Mainguard bug] `System Events keystroke` drops characters on fast/long strings
 - **Step:** 008
