@@ -215,3 +215,34 @@ Full solution rebuild clean. Committed (`7497202`) and pushed. Repo-map updated 
 
 **Also methodology note:** one click landed on the Claude desktop app again mid-detour (same class of
 coordinate-conversion slip as ISSUES-LOG #10) — caught immediately, refocused, no product impact.
+
+## Step 014 — Resumed session: a real, HIGH-severity queue-stream death found live
+
+**Action:** recalibrated (a region capture had drifted onto a different window — corrected via
+`System Events … set frontmost` + a fresh `screencapture -R216,196,1296,759`), then captured the
+live app's current state fresh. **Observed:** Merge Queue panel reads **"Nothing queued."** — no
+coordinator running, no error banner. **Screenshot:** `085-current-state.png`.
+
+**Investigated before assuming it was the already-known ISSUES-LOG #4 clutter/scroll issue** (it
+wasn't): confirmed the running daemon payload actually contains today's `OrderForDisplay` fix
+(`grep -a` on the DLL bytes, not just a timestamp — ruling out the Step-013 stale-binary trap a
+second time), then went to the SQLite store directly: `~/.mainguard/mainguard-daemon.db` has **26**
+`MergeQueueRows`, 17 of them for the exact repo hash the daemon's `rpc.log` confirms is currently
+bound. **Not a data bug.** Traced it to the client: `rpc.log` shows one `StreamQueue` call ending
+cleanly after 32ms and **zero retries in the following 5m45s**, while `ListAgents` polling kept
+succeeding every 60s the whole time — the daemon connection was healthy, only the queue pump had
+silently died, contradicting its own documented "reconnect forever" contract
+(`DaemonBackedOrchestrator.QueuePumpAsync`/`ReconnectLoopAsync`). Full evidence chain and analysis
+in **ISSUES-LOG #11** (HIGH, not fully root-caused to one line — ran out of budget on the exact
+cancellation trigger) and **#12** (a separate, confirmed client-side `SIGABRT` crash earlier in the
+session, `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-20-173042.ips`, almost certainly
+unrelated given the ~15-minute gap and an intervening restart).
+
+**Action taken (this was blocking — could not test any further queue-dependent row without a live
+queue):** killed and relaunched the app + daemon fresh via `open .../Mainguard.app`. **Observed:**
+clean "Reopen Last Repository?" prompt (`086-fresh-reopened.png`), reopened into the Repository
+(commit-graph) view — incidentally reconfirming the known commit-graph branch-pill/label-overlap
+bug is still present (`main | mainguard-local/agent/ac0a1c56b...` overlapping the author/date
+text). Navigated to Coordinator: **queue populated correctly, 7 `Working` entries at the top**,
+actionable-first ordering fix (`7497202`) still holding on a fresh session. **Screenshot:**
+`087-coordinator-fresh.png`. Testing resumes from here with a known-good app instance.
