@@ -157,3 +157,24 @@ Confirmed on the real checkout: `git -C ~/mg-work/e2e-fixture log --oneline -1` 
 coordinator's own commit) — main genuinely advanced via the real three-step, not just a UI-side
 optimistic flip. This is the first time F1 (merge execution) has been exercised end-to-end via actual
 clicks rather than the RPC harness. Closed the cockpit (**Screenshot:** `050`-`051`).
+
+## Step 012 — E7 adversarial (second stranded entry) + a new surface discovered: the agent document
+
+**Action:** clicked **Resume** on stranded entry `2664ef9b52...` (branch also deleted).
+**Observed:** ✅ PASS on the refusal itself (toast "Can't resume — Branch 'agent/2664ef9b...'", clipped
+per ISSUES-LOG #3). **Unexpected:** a new red-dot icon appeared in the left rail that wasn't there
+before. **Screenshot:** `052`.
+
+**Action (after a coordinate-math slip sent one click to the wrong app entirely — corrected and
+logged as ISSUES-LOG #10, not a Mainguard defect — screenshots `053`-`054`):** clicked the red-dot
+icon with corrected coordinates.
+**Observed:** it opens a full **Agent Document** view (Terminal / Agent diff / Plan / Staging panels,
+a "Send a follow-up prompt" composer, a "Merge to main" button) for the stranded agent — **this
+surface DOES render in phase-1**, correcting the prior session's belief that it never does.
+**Screenshot:** `055`.
+
+**Action:** typed a real prompt into the composer and clicked **Send** (C4).
+**Observed:** 🔴 **BUG, HIGH severity.** The field silently cleared — no toast, no inline error, no
+terminal echo, nothing. A jailless agent's Send is a complete silent no-op, worse than the
+already-known `SendPromptAsync` race (which at least sometimes reaches a live jail). Logged as
+**ISSUES-LOG #9**. Not fixed this pass (non-blocking). **Screenshots:** `056`-`057`.

@@ -79,6 +79,40 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   at all (`506a60e6e700471aa945fc`) — same family as ISSUES-LOG #3, just a second data point that it's
   not truncation-with-ellipsis, it's a hard pixel/width cutoff with nothing signaling more text exists.
 
+### 9. [OPEN, HIGH — real bug, C4] Composer Send on a jailless/stranded agent silently swallows the prompt
+- **Steps:** 052-057
+- A failed **Resume** click (branch already gone, adversarial E7 case) unexpectedly opened an Agent
+  Document surface for that agent in the left rail (a new red-dot icon that wasn't there before —
+  clicking it opens `Terminal`/`Agent diff`/`Plan`/`Staging` panels for `2664ef9b52...`, a stranded
+  entry with no live sandbox). **Correction to prior-session belief:** the composer/document surface
+  does render in phase-1 — the earlier finding that it "never renders" was specific to a different
+  code path, not universal.
+- **Action:** typed a real prompt ("test prompt for stranded agent") into the "Send a follow-up
+  prompt" composer and clicked **Send**.
+- **Expected** (per matrix C4): either it works (unlikely — no jail exists), or it refuses visibly —
+  "the daemon input-lock surfaces as a `PermissionDenied` rendered under the composer."
+- **Observed:** neither. The text field silently cleared, no toast, no inline error, no message in the
+  Terminal panel, nothing in the Agent diff panel — a complete, silent no-op. This is exactly the
+  failure mode the matrix's own design philosophy explicitly forbids ("never a silent nothing, a typed
+  refusal") and it's a worse instance than the previously-known `SendPromptAsync` cancel-race (which at
+  least sometimes reaches a real jail) — this is a UI affordance that is fully rendered, fully
+  interactive, and fully inert with zero feedback for an agent with no sandbox at all.
+- Severity: HIGH — a user has no way to know their prompt was dropped rather than received; on a
+  stranded entry (which, per ISSUES-LOG #4, are common/easy to accumulate) this is a real trap.
+- Not fixed this pass (non-blocking — did not prevent continuing other rows). Likely the same
+  underlying composer/`SendPromptAsync` code path as the already-known cancel-race bug, but the
+  complete absence of ANY error surfacing (not even a delayed one) suggests the jailless case may not
+  be handled/guarded at all client-side, distinct from the race condition on a live jail.
+
+### 10. [methodology note, not a Mainguard bug] A screen-point click landed on the Claude desktop app, not Mainguard
+- **Step:** between 052 and 054
+- A coordinate-conversion mistake (passed raw screenshot-pixel numbers directly as screen points,
+  skipping the `/2 + origin` conversion `click_at.sh` normally applies) sent a click miles outside the
+  Mainguard window, which happened to land on and focus the Claude desktop app instead, briefly
+  surfacing this very session's own transcript. Caught immediately (the "finding" was obviously not a
+  Mainguard surface), refocused Mainguard via `System Events … set frontmost`, recalibrated, continued.
+  Not logged as a product defect; noted only so this walkthrough's provenance is honest about the slip.
+
 ### 6. [OPEN, testing-methodology note, not a Mainguard bug] `System Events keystroke` drops characters on fast/long strings
 - **Step:** 008
 - Typing a full sentence via `osascript -e 'tell application "System Events" to keystroke "..."'` into the terminal dropped several characters/words (rendered as "a on-line comment... top o.js" instead of "a one-line comment... top of src/calc.js"). This is very likely an AppleScript/Accessibility-API typing-speed limitation, not a Mainguard input-handling bug — the terminal reliably received and rendered whatever it was actually sent, and the agent's own excellent handling of the corrupted prompt (asking for disambiguation rather than guessing wrong) is itself a positive data point.
