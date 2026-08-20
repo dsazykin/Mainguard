@@ -178,3 +178,40 @@ surface DOES render in phase-1**, correcting the prior session's belief that it 
 terminal echo, nothing. A jailless agent's Send is a complete silent no-op, worse than the
 already-known `SendPromptAsync` race (which at least sometimes reaches a live jail). Logged as
 **ISSUES-LOG #9**. Not fixed this pass (non-blocking). **Screenshots:** `056`-`057`.
+
+## Step 013 — G1 detour: root-causing why a fresh spawn "disappears" from the queue
+
+Navigated to **Resources** (`058`) — only the one `TornDown` agent shows; needed a LIVE jail for G1
+(Pause via the Resources right-click menu). Expanded the rail via the hamburger (`059`), which
+revealed the full nav (Repo viewer/Coordinator/Resources/Pull requests/Issues/Notifications/Releases
++ an **AGENTS** section listing live sessions) — the earlier "red-dot icon" from Step 012 turns out to
+be exactly this AGENTS list, not a special affordance. Selected `scripted 1.0.0` and started a fresh
+coordinator (`060`-`065`, one coordinate-math slip along the way, corrected).
+
+**The new entry did not appear in the Merge Queue panel after 5+ seconds** — reproducing the
+"spawned agent isn't in the queue" complaint a second time, this pass. Cross-checked via a diagnostic
+RPC call (`ListAgentsAsync`): the daemon already had the entry, `state=Working` — **not a data bug**.
+Suspected the running app might predate the `StreamChannel` fix (9baefdf) built earlier this pass;
+confirmed via `stat` that `Mainguard.Agents.UI.dll` was rebuilt at 14:17:38 while the running process
+had started at 14:13:20 — **the live app was stale, older than the fix.** Rebuilt (`dotnet build`,
+clean), killed both the app and daemon processes, cleaned orphan jails, and relaunched fresh
+(`066`-`076`).
+
+**On the confirmed-fresh binary, the symptom reproduced identically.** Waited, scrolled — the fresh
+entry (`07ccc99c...`) WAS there, correctly rendered with live data, just at the very **bottom** of a
+long list of accumulated historical entries (`077`-`079`). This proves the `StreamChannel` fix holds
+(data arrives promptly) and isolates the true root cause to **ISSUES-LOG #4**: `MergeQueue.Agents`
+returns entries in stable dictionary-insertion order, and since Merged/Rejected rows are kept forever
+by design, they permanently occupy the front of that order — every fresh, actionable spawn lands at
+the bottom of the visible list. This is very likely the actual mechanism behind the user's original
+complaint, more so than any single rendering bug.
+
+**Fixed** (this was worth fixing immediately, not just logging, given how directly it matches the
+user's own repeated complaint): extracted `MergeQueueGrpcService.OrderForDisplay` — a stable partition
+putting actionable states ahead of the permanent terminal (Merged/Rejected) record — and wired it into
+`Snapshot()`. Added 3 unit tests (`QueueDisplayOrderTests.cs`, no daemon/Docker needed) covering the
+partition, order-preservation within each group, and the no-terminal-entries no-op case — all pass.
+Full solution rebuild clean. Committed (`7497202`) and pushed. Repo-map updated in the same commit.
+
+**Also methodology note:** one click landed on the Claude desktop app again mid-detour (same class of
+coordinate-conversion slip as ISSUES-LOG #10) — caught immediately, refocused, no product impact.
