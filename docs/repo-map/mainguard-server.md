@@ -415,7 +415,12 @@
   the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
   which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
   enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
-  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded;
+  `Snapshot`'s entry order runs through `OrderForDisplay` (`internal static`, unit-tested in
+  `Mainguard.Server.Tests/QueueDisplayOrderTests.cs`) — a stable partition putting actionable states
+  ahead of the permanent Merged/Rejected record, since `MergeQueue.Agents`' raw dictionary-insertion
+  order buries a fresh spawn behind however much terminal history a repo has accumulated (found live
+  2026-08-20, reproduced the "spawned agent isn't in the queue" symptom exactly); `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the

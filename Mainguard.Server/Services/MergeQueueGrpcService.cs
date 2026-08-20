@@ -528,7 +528,8 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     {
         var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
-        foreach (var agentId in queue.Agents)
+        var orderedAgentIds = OrderForDisplay(queue.Agents, queue.GetState);
+        foreach (var agentId in orderedAgentIds)
         {
             var can = queue.CanMerge(agentId, out var reason);
             var entry = new QueueEntry
@@ -557,6 +558,22 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
 
         return update;
     }
+
+    /// <summary>
+    /// The rail's display order. <c>MergeQueue.Agents</c> is stable dictionary-insertion order — oldest
+    /// entry first, forever. Merged/Rejected rows are kept as a permanent record (by design — see
+    /// <c>MergeQueue.Agents</c>' own doc comment on Discard), so on a repo with any testing/iteration
+    /// history they accumulate at the FRONT of that order and bury every new, actionable entry at the
+    /// bottom of the rail behind a thin scrollbar with no "N more" cue. Live-clicking this (2026-08-20)
+    /// reproduced exactly the "my spawned agent isn't in the queue" symptom — the entry was there, just
+    /// scrolled out of view. A stable partition (actionable first, terminal last, relative order
+    /// preserved within each) fixes discoverability without changing queue membership or any state
+    /// semantics. <c>internal</c> so it's independently unit-testable without a live queue.
+    /// </summary>
+    internal static IEnumerable<string> OrderForDisplay(
+        IEnumerable<string> agentIds, Func<string, Mainguard.Agents.Agents.WorkerMergeState> stateOf)
+        => agentIds.OrderBy(id => stateOf(id) is Mainguard.Agents.Agents.WorkerMergeState.Merged
+            or Mainguard.Agents.Agents.WorkerMergeState.Rejected ? 1 : 0);
 
     /// <summary>
     /// The must-acknowledge items blocking <paramref name="agentId"/>, as the review surface has to render
