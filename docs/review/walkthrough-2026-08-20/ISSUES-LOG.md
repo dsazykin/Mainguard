@@ -255,3 +255,73 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   correctly. Restored Midnight Loom. No visual defects observed in the two swaps performed.
 - Atelier and a full System-theme (OS-follow) check were not exercised this leg — minor remaining gap,
   low risk given the two swaps tested were clean.
+
+## 17. [CONFIRMED, HIGH — real UI click, zero-orphan-confound] Kill-switch Resume does NOT un-pause a real, currently-tracked agent's jail
+
+This closes entry #15's "follow-up still needed" — reproduced end-to-end via real clicks, no RPC, no
+orphan-jail ambiguity.
+
+- **Setup honesty first:** before this test, the two live docker jails already running in this session
+  (`...aab43299...`, `...506a60e6...`) were checked and confirmed to be **orphans from earlier daemon
+  restarts** — `docker inspect .Created` on both predates the current daemon process's start time
+  (`ps -o lstart`) by several minutes. That's why the Resource Monitor legitimately showed **"0 agents"**
+  and the kill switch legitimately paused **"0 agents"** against them (screenshots
+  `148-killswitch-engage-orphan-fixture-0-paused.png`, `149-resource-monitor-zero-agents-despite-2-orphan-jails.png`)
+  — not a bug, just daemon restarts leaking untracked containers with no reconciliation on startup. Logged
+  as its own minor finding below (#18); not conflated with the real bug this entry is about.
+- **To get a clean, tracked jail:** selected `claude-code 2.1.234` in the real CLI dropdown and clicked
+  **Start coordinator** for real. It spawned successfully, authenticated as the already-logged-in account
+  ("Welcome back Daniel!", Opus 5 / Claude Max / `daniel.sazykin@gmail.com`'s Organization), and the
+  Merge queue header incremented `6 in play` → `7 in play` live (screenshot
+  `151-real-claude-code-coordinator-spawned-live-ui.png`). Resource Monitor correctly showed
+  **"1 agents"**, `claude-code` / `Working` / `2% CPU` / `0.5 GB RAM` (`152-resource-monitor-1-agent-tracked-correctly.png`)
+  — confirms Resource Monitor itself is NOT broken; it was correctly reporting zero for zero tracked
+  agents earlier.
+- **Engage, via the real sidebar icon, against this real tracked jail:** `docker inspect` before the
+  click: `Paused=false`. Clicked Engage. `docker inspect` immediately after: **`Paused=true`**
+  (`153-killswitch-engage-real-tracked-jail.png`). Engage half confirmed working correctly for a real
+  agent.
+- **Resume, via the same real sidebar icon:** clicked it a second time. The Coordinator panel's freeze
+  banner cleared (queue-level freeze lifted — `155-coordinator-banner-cleared-jail-still-paused.png`).
+  But `docker inspect` immediately after, and again 3+ seconds later, both still read **`Paused=true`**.
+  The Resource Monitor row itself shows this too, not just Docker: state = **`Paused`**, `0% CPU`, task
+  column reading **"Kill switch engaged — jail paused, terminal input severed (recoverable)."**
+  (`154-killswitch-resume-ui-shows-paused-recoverable.png`) — the UI's own copy claims "(recoverable)"
+  while the click that's supposed to recover it silently does nothing to the container.
+- **Net result:** the queue-level freeze is lifted (Engage/Resume toggles that correctly), but the actual
+  agent is left **permanently paused** — Working became Paused and never came back, confirmed by both
+  Docker ground truth and the app's own Resource Monitor row agreeing with each other. This is the exact
+  structural gap already root-caused via RPC in an earlier leg (`KillSwitch.cs`/`IKillTarget` has no
+  unpause path — `Resume()` only clears the merge-queue freeze flag, nothing fans out an unpause to the
+  paused containers), now proven through the real UI end to end with no possible orphan-jail confound.
+- **No in-app recovery** — same as previously found: the per-agent `Unpause` RPC path refuses ("this
+  agent isn't human-paused", since kill-switch pause and human pause are correctly modeled as distinct
+  by design) and there is no other exposed control. Only a raw `docker unpause` from outside the app (or
+  a daemon restart, which then orphans it per #18) recovers a killed agent today.
+- **Still needs a dedicated fix pass** (per the model-tier instruction — this is architectural: adding a
+  real unpause fan-out to `IKillTarget`/`KillSwitch.cs`, plus deciding how that interacts with the
+  human-pause arbiter so Engage/Resume and per-agent Pause/Resume don't fight each other). Not attempted
+  this leg.
+- **Environment left in this state:** the real jail spawned this leg
+  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`) is left genuinely paused by this test —
+  `docker ps` shows it `Up ... (Paused)`. Needs a manual `docker unpause` or `docker rm -f` before the
+  next leg if a clean slate is wanted.
+
+## 18. [Confirmed, minor/environmental] Daemon restarts orphan any jails they had spawned — no reconciliation on startup
+
+- Both live docker jails found at the start of this leg predate the current daemon process by several
+  minutes (`docker inspect .Created` vs. `ps -o lstart` for the daemon PID) — they're leftovers from a
+  daemon instance that existed before this leg's session (most likely from the `pkill`+`open` recovery in
+  entry #14, or an earlier restart). The current daemon has zero record of them: `ListAgents`-backed
+  surfaces (Resource Monitor, kill switch) correctly show/act on "0 agents" for them, which is *honest*
+  given the daemon's own bookkeeping — but the underlying gap is real: **nothing reconciles Docker's
+  actual state against the daemon's tracked-agent state on startup**, so a restart silently leaks any
+  jails the previous process had running. They keep consuming CPU/RAM/disk indefinitely with no UI
+  visibility and no automatic cleanup.
+- This is the same pattern noted as an environmental aside in the original `findings.md` from an earlier
+  session ("Two orphan mainguard-agent docker jails found... not tracked by the live daemon's agent
+  list") — now precisely root-caused (daemon-restart-without-reconciliation) rather than just observed.
+- Not fixed this leg (architectural — daemon startup would need to enumerate `docker ps --filter
+  label=mainguard.role=agent` and either adopt or reap anything it doesn't recognize). Flagged for a
+  dedicated pass alongside #17, since a real unpause fan-out (#17's fix) and orphan reconciliation (this
+  one) touch the same `KillSwitch`/sandbox-lifecycle code and are worth doing together.

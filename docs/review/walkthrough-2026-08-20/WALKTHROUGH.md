@@ -361,3 +361,51 @@ Loom. Atelier and OS-follow (System) not exercised this leg. Logged as ISSUES-LO
 2 of 4 themes + System swap) now UI-click-verified. Still gapped: E6, D2/D4/D5, C2/C3, G1 (context-menu),
 G4, H2/H4/H6, I1/I2, B1-B3, plus H7's remaining Atelier/System-follow check. Stopping here at a clean
 commit boundary.
+
+## Step 019 (this leg) — real coordinator spawn, G3 kill switch closed for real, orphan-jail root cause pinned
+
+Resumed after `e6b812e`. Recalibrated window capture to `screencapture -x -o -l <windowID>` (via a small
+`CGWindowListCopyWindowInfo` Swift probe) instead of `-R<region>` — the region-based capture was quietly
+picking up the wrong bounds and bleeding the background Terminal window into prior screenshots; window-ID
+capture is clean and should be preferred going forward. Also wrote a small `scanline.swift` pixel-brightness
+probe to calibrate sidebar-icon and button click targets precisely instead of eyeballing crops — several
+early clicks this leg missed their targets (dropdown, Start coordinator, sidebar icons) before this was in
+place; screenshots `149`-`159` include some of those misses for the record, only `148`+`150`-`155` (renumbered
+into this doc's sequence) are the meaningful ones.
+
+**Kill switch, G3, CLOSED with a clean repro (see ISSUES-LOG #17):** first confirmed the 2 pre-existing live
+jails were untracked orphans from an earlier daemon restart (predate the current daemon process's start
+time), which correctly explained the "0 agents" / "0 agents paused" readings as honest, not broken
+(ISSUES-LOG #18, its own minor finding). Then selected `claude-code 2.1.234` and clicked **Start
+coordinator** for real — it spawned, authenticated as the logged-in account ("Welcome back Daniel!"),
+Merge queue count went `6 in play` → `7 in play` live, Resource Monitor correctly tracked it as `1 agents`.
+Engaged the kill switch against this real tracked jail: `docker inspect` confirmed `Paused=true`
+immediately. Clicked Resume: the Coordinator panel's freeze banner cleared correctly, but `docker inspect`
+still read `Paused=true` 3+ seconds later, and the Resource Monitor row itself agreed — state `Paused`,
+task column reading "Kill switch engaged — jail paused, terminal input severed (recoverable)." The agent
+never came back. This is the same structural gap found via RPC in an earlier leg (`KillSwitch.cs` has no
+unpause fan-out), now proven through real UI clicks with zero possible orphan-jail ambiguity.
+
+**Screenshots** (renumbered into this doc's sequence): `148-killswitch-engage-orphan-fixture-0-paused.png`,
+`149-resource-monitor-zero-agents-despite-2-orphan-jails.png`, `150-killswitch-resume-banner-cleared.png`,
+`151-real-claude-code-coordinator-spawned-live-ui.png`, `152-resource-monitor-1-agent-tracked-correctly.png`,
+`153-killswitch-engage-real-tracked-jail.png`, `154-killswitch-resume-ui-shows-paused-recoverable.png`,
+`155-coordinator-banner-cleared-jail-still-paused.png`.
+
+**Matrix coverage after this leg:** G3 now fully UI-click-verified (both halves — Engage works, Resume's
+bug is real and reproduced live, not just via RPC). Still gapped: E6, D2/D4/D5, C2/C3, G1 (context-menu),
+G4, H2/H4/H6, I1/I2, B1 (BYOK isolation specifically — the login-flow itself is now incidentally covered
+by this leg's real spawn), H7's remaining Atelier/System-follow check.
+
+**Environment note for the next leg:** the real jail spawned this leg
+(`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`) is left genuinely paused by the Resume-bug
+test — needs `docker unpause` or `docker rm -f` for a clean slate. The two pre-existing orphans
+(`...aab43299...`, `...506a60e6...`) are still running and still untracked; also worth a manual
+`docker rm -f` before the next leg if a clean slate is wanted (ISSUES-LOG #18).
+
+Stopping here at a clean, fully-committed boundary — this leg's investigation (calibration rework +
+closing G3 properly) consumed the available budget; no attempt was made at the remaining gapped rows.
+
+**Post-leg cleanup performed:** `docker unpause` on the killed jail and `docker rm -f` on the two
+confirmed orphans, so the next leg starts from a genuinely clean slate rather than the state described
+above.
