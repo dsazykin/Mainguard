@@ -211,3 +211,47 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   actionable rows a fresh verdict can still start below the fold. The count line now tells the user rows
   exist down there; an explicit "jump to history" or a sticky section header would tell them where. Not
   required for correctness.
+
+## 14. [Not a bug — resolved by relaunch] App's own window had closed with the process still running
+
+- **Symptom:** resuming this leg, `com.mainguard.app` (PID 18046) was alive and reported as the frontmost
+  process, but `System Events` returned "Can't get window 1 of process Mainguard — Invalid index" —
+  zero AX windows. `CGWindowListCopyWindowInfo` still listed stale window entries for it, all
+  `onscreen=false`. Cost real time to diagnose: the visible screen content (a Terminal window running
+  this very `claude --continue` session) was mistaken at first for the app's own embedded terminal panel,
+  since Mainguard being "frontmost" with literally nothing to draw let whatever was behind it show through.
+- **Root cause, as far as it's knowable from outside:** the app's main window had been closed (or crashed
+  its window without killing the process) sometime after the prior leg's live-verification pass — not
+  reproduced deliberately, so the exact trigger is unknown. Clicking its Dock icon (the standard macOS
+  "reopen main window" request) did **not** bring a window back, which is a real, if minor, gap: a
+  single-window app should normally respond to the Dock-click reopen event.
+- **Not investigated further** (out of scope for this pass — no crash log correlated, no repro attempt):
+  logged here so the "Dock-click doesn't reopen the window" behavior is on record as worth checking
+  separately, but NOT counted as a confirmed bug — could equally be expected behavior for this app's
+  window-management model, which wasn't verified either way.
+- **Fixed forward by:** `pkill` + `open` (clean relaunch). Confirmed clean recovery — repo picker
+  appeared with a working "Reopen Last Repository?" prompt, reopened the `e2e-fixture` repo correctly,
+  Coordinator panel loaded with the `6 in play · 7 in history` header from `c1e4c3e` rendering correctly.
+
+## 15. [Confirmed via real UI click] Kill-switch freeze/unfreeze button itself works correctly (with 0 live jails)
+
+- Clicked the sidebar kill-switch icon directly (previously only exercised via RPC). Engage: banner
+  reads "All agents paused. The merge queue is frozen. Nothing was lost — resume when ready." /
+  "queue frozen · 0 agents paused" (0 because the 5 stale `Working` rows in this fixture are jailless
+  leftovers with no live container — expected, not a bug). Clicking the same icon again cleanly cleared
+  the banner and returned the icon to its normal state.
+- **This does NOT re-test the already-confirmed HIGH bug** (kill-switch Resume never un-pausing a jail
+  that was actually paused — see the earlier entry in this log) — that needs a live jail, which this
+  fixture's stranded entries don't have. Confirming the button's own freeze/unfreeze UX is correct with
+  zero paused jails is a real, separate, positive result — logged as such, not conflated with the open bug.
+- **Follow-up still needed:** reproduce the actual jail-never-resumes case through the real UI button
+  (not RPC) with a genuinely live jail, to fully close that row.
+
+## 16. [Confirmed via real UI click] Theme switching (H7)
+
+- `View > Theme` menu correctly lists System / Midnight Loom / Daylight Loom / Graphite / Atelier.
+  Selected Daylight Loom: entire app switched to its light palette immediately (background, sidebar,
+  text all correct, no stale-dark-token bleed observed). Selected Graphite: dark palette applied
+  correctly. Restored Midnight Loom. No visual defects observed in the two swaps performed.
+- Atelier and a full System-theme (OS-follow) check were not exercised this leg — minor remaining gap,
+  low risk given the two swaps tested were clean.

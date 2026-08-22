@@ -331,3 +331,33 @@ Traced (without finding the exact drop point) through `MergeQueue.Agents`, `Orde
 `ApplyQueueUpdate`, and `QueueRailViewModel.Refresh()` — none of the four explicitly filter Rejected.
 Logged in full in ISSUES-LOG #13, flagged for a dedicated follow-up investigation rather than a rushed
 fix, per this leg's standing instruction on complex/unclear bugs.
+
+## Step 018 (this leg) — resume-from-headless-app recovery, kill-switch UI button, theme toggling
+
+Resumed after ISSUES-LOG #13 was CLOSED (`c1e4c3e`/`13284e2`) by a dedicated deeper-model pass. Found the
+Mainguard app process alive but with **zero open windows** (see ISSUES-LOG #14 — not counted as a
+confirmed product bug, since the trigger wasn't reproduced; logged as a "Dock-click reopen didn't work"
+observation worth a separate look). The initial raw screenshot (`136b-state-check-terminal-occlusion`)
+misleadingly showed the Terminal window behind it, which cost real diagnostic time before the AX-window
+check (`Can't get window 1...`) revealed Mainguard had no window at all. Recovered with a clean
+`pkill`+`open` relaunch (`137-fresh-launch-repo-picker`), confirmed the repo-picker's "Reopen Last
+Repository?" flow still works (`138-reopen-clicked`), and landed back on the Coordinator panel showing
+**`6 in play · 7 in history (merged/rejected, below)`** — the `c1e4c3e` fix rendering correctly on a
+genuinely fresh app launch, not just the deeper-model pass's own verification (`139-nav-coordinator`).
+
+**Kill switch, via the real sidebar icon, not RPC** (`140-killswitch-click`/`141-killswitch-resume`): Engage → "All agents paused. The merge
+queue is frozen. Nothing was lost — resume when ready." / "queue frozen · 0 agents paused" (0 because
+this fixture's 5 stranded `Working` rows are jailless leftovers, not because anything's broken). Click
+again → banner clears, icon returns to normal. **The button's own freeze/unfreeze UX is confirmed
+correct** — logged as ISSUES-LOG #15, explicitly NOT closing the separate already-confirmed HIGH bug
+(kill-switch Resume never un-pausing an actually-paused jail), since this fixture had no live jail to
+prove that specific case through the UI.
+
+**Theme toggling** (`142`-`147`): `View > Theme` menu lists all 4 themes + System. Daylight Loom applied
+correctly (full light palette, no stale-dark bleed). Graphite applied correctly (dark). Restored Midnight
+Loom. Atelier and OS-follow (System) not exercised this leg. Logged as ISSUES-LOG #16.
+
+**Matrix coverage after this leg:** E1-E5, E7, G3 (button UX only, not the jail-resume bug), H7 (partial —
+2 of 4 themes + System swap) now UI-click-verified. Still gapped: E6, D2/D4/D5, C2/C3, G1 (context-menu),
+G4, H2/H4/H6, I1/I2, B1-B3, plus H7's remaining Atelier/System-follow check. Stopping here at a clean
+commit boundary.
