@@ -156,6 +156,17 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-20-173042.ips`: `Mainguard` (the UI client, not the daemon) crashed with `EXC_CRASH`/`SIGABRT` at 2026-08-20 17:30:42 local time — the crash trace shows `IL_Throw` → `DispatchManagedException` → `abort()`, i.e. an **unhandled .NET managed exception** reached the top of the stack and crashed the process, not a native fault. This was the only Mainguard-attributed crash report from today (a separate `dotnet_...plist` crash-reporter entry from 13:37 is very likely an unrelated `dotnet test` process crash, not the product).
 - The daemon's own `lifecycle.log` shows a normal "shutdown requested — draining" / "stopped" pair at 15:30:28 UTC (matching local 17:30:28, 14s before the crash timestamp) followed by a relaunch at 15:38:50 UTC — consistent with the client crashing and something (the OS or a supervising script) relaunching both processes ~8 minutes later, though this pass did not confirm whether that gap was manual or automatic.
 - **Not root-caused** — the release build strips managed exception type/message from the native crash report, so the actual exception (`NullReferenceException`? something UI-thread-specific?) is not recoverable from this artifact alone without a debug build or attached debugger at the time. Flagging as a real, confirmed crash for follow-up; possibly related to finding #11 above (a crash mid-stream could plausibly be *what* orphaned the queue pump in the first place, though the timestamps don't overlap — the crash was at 17:30:42, the dead-stream `StreamQueue` call was at 17:45:13, ~15 minutes later, i.e. after a full app restart already happened in between — so they are almost certainly independent incidents, not cause-and-effect).
+- **Still open. Re-checked on the 2026-08-22 #18/#19/#20 leg and nothing new surfaced** (a look, not a
+  hunt — the reconciliation work was the priority): `~/Library/Logs/DiagnosticReports/` holds **no**
+  Mainguard-attributed crash report at all since the 08-20 one, so neither the 08-22 disappearance in
+  #19's leg nor anything since produced an artifact. The daemon's `rpc.log` exceptions around the client
+  restarts are all `IOException: The client reset the request stream` / `The request stream was aborted`
+  out of `TerminalGrpcService.PumpBoundAsync` — ordinary client-disconnect teardown of an attach stream,
+  the *consequence* of an app going away rather than a cause, plus one `Input/output error` from reading
+  a PTY whose process was already gone. Worth noting for whoever picks this up: a `SIGABRT` with no crash
+  report and a clean process disappearance are different symptoms, and #19's leg saw the latter — that
+  pattern is more consistent with the process being terminated from outside (or exiting a main loop) than
+  with an unhandled managed exception, which is what produced the 08-20 report.
 
 ### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
 - **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
@@ -355,7 +366,7 @@ lived in; the only link above it is the `KillSwitchService.Resume` RPC and the s
 which were already observed working for the freeze half in this walkthrough. Worth one live re-click on
 the next leg for completeness, but not a gap in the fix.
 
-## 18. [Confirmed, minor/environmental] Daemon restarts orphan any jails they had spawned — no reconciliation on startup
+## 18. [CLOSED — commit `67b9cc1`] Daemon restarts orphan any jails they had spawned — no reconciliation on startup
 
 - Both live docker jails found at the start of this leg predate the current daemon process by several
   minutes (`docker inspect .Created` vs. `ps -o lstart` for the daemon PID) — they're leftovers from a
@@ -379,7 +390,47 @@ the next leg for completeness, but not a gap in the fix.
   neither adopts nor releases them. Orphan reconciliation on startup is what closes that last hole; it is
   a smaller job now that the release path itself exists.
 
-## 19. [Confirmed, HIGH — needs a dedicated pass] Coordinator panel shows "No coordinator running" after an app relaunch, despite a live, correctly-tagged coordinator agent
+### FIXED — commit `67b9cc1`, and the diagnosis above was half right in a misleading way
+
+- **"No reconciliation on startup" was not true — there were two, and neither wrote anywhere the UI
+  reads.** `SwarmReconciler` (P2-08) has always run at boot, listed `mainguard.agent`-labelled containers
+  and *adopted* orphans; `LeaderReattachTask` has always reconciled the durable PTY leader registry. But
+  `SwarmReconciler` writes to the SQLite **`ExpectedAgents`** table and the leader task to
+  `leader.json` — while `ListAgents`, `StreamAgentEvents`, the Resource Monitor and the kill switch are
+  all projections of **`AgentSessionStore`**, which is a plain in-memory `Dictionary` that nothing has
+  ever repopulated. The orphans were being adopted the whole time, into a book nobody reads. That is why
+  the surfaces were "honest" about zero agents and why the jails still leaked.
+- **The fix** is `Mainguard.Server/Runtime/AgentSessionReconciler.cs` + its `BackgroundService`: at
+  startup and every 30 s it adopts live jails the session store has no record of, corrects state toward
+  Docker, and marks a session whose container is gone `Unresponsive`. It **destroys nothing** — no
+  container is stopped or removed. Reaping was considered and rejected: the labels identify every jail's
+  repo and agent, so adoption is always possible, and this area has already paid once for a boot pass
+  that swept user work silently (see `SwarmReconcileTask`'s own remarks). A stopped-but-present jail is
+  also left alone, because the engine re-starts those by name and removing one destroys a resumable
+  session. Adoption is gated on this daemon hosting the repository's bare mirror, since the container
+  engine is machine-wide.
+- **A second, worse defect found on the way in.** Docker reports a *paused* container as `State ==
+  "paused"`, not `"running"` — and `DockerAgentLister` set `Running = (State == "running")`, which both
+  older reconcilers read as "still here". So a daemon restart while **any** agent was paused declared it
+  dead, force-removed its worktree and reaped its PTY. A restart during an engaged kill switch destroyed
+  exactly the work the emergency stop exists to preserve. `AgentContainerState` now carries `Paused` and
+  a computed `Live`, and both reconcilers read `Live`.
+- **Adoption also needed the jail to say what it is.** Containers carried only repo/agent/`role=agent`,
+  so an adopted coordinator came back anonymous. `mainguard.kind` and `mainguard.agent.role` are now
+  stamped at create. **Known limit:** a jail created *before* this change has neither label and adopts as
+  a role-less `unknown` worker — visible, monitorable and stoppable (which is this issue), but not
+  re-bound as the coordinator. New jails do not have that gap.
+- **Verified live, on the real thing.** The orphan `mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`
+  from #19/#20 was still up and still invisible (`ListAgentsResponse { agents=[] }` in `rpc.log` while
+  the container had been running 51 minutes). A production daemon built from this commit, started against
+  the real data root, logged on boot:
+  `agent-session reconcile: adopted=f1574a0ba9b443ffa2a5b2f9345df622 corrected=none lost=none` — while
+  the OLD boot pass in the same startup still said `swarm reconcile: … adopted=none`, which is the
+  "adopted into the wrong book" diagnosis printed side by side. Also covered by
+  `AgentSessionReconcileDockerTests` (RequiresDocker, real containers) and
+  `AgentSessionReconcileTests` (19 unit cases incl. the engine-unreachable case).
+
+## 19. [CLOSED — commit `67b9cc1`] Coordinator panel shows "No coordinator running" after an app relaunch, despite a live, correctly-tagged coordinator agent
 
 - Repro: the app process was found to have exited between two `ps aux` checks a few seconds apart (no
   crash report generated in `~/Library/Logs/DiagnosticReports/` — this is a *different* symptom from #14's
@@ -410,7 +461,43 @@ the next leg for completeness, but not a gap in the fix.
   gapped, and is exactly the shape of bug (`CoordinatorAgentId`/snapshot rehydration path) that the #11
   investigation turned out to live in — worth the same depth of tracing rather than a guess.
 
-## 20. [Confirmed, MEDIUM — same theme as #18, needs a dedicated pass] The daemon's tracked agent state can drift from Docker's actual state and nothing brings it back in sync
+### FIXED — commit `67b9cc1`. The panel's binding was innocent; the projection under it had lost a field
+
+- **The suspicions above were both wrong, and usefully so.** `CoordinatorAgentId` is not what gates the
+  panel — `ShowCoordinatorTerminal` is derived from `_agents.ListAgents().Where(a => a.Role ==
+  "coordinator")`, and `CoordinatorAgentId` only backstops the just-spawned-not-yet-projected window.
+  There is also **no `Paused` exclusion**: `IsTerminalState` is `Merged|Rejected|Dead|TornDown` only, and
+  `MapState("Paused")` parses cleanly. The panel goes to its empty card for exactly one reason — the
+  client's projection holds **zero coordinator-role records**.
+- **Why it held none.** The projection is fed only by `StreamAgentEvents`: one destructive snapshot at
+  subscribe time, then deltas — and **a delta carries neither kind nor role**. `ApplyAgentEvent`'s
+  `State` branch therefore fabricates a **role-less placeholder** for any agent it has not seen, and the
+  one `ListAgents` call meant to repair it (`ResyncAgentsAsync`) `return`ed silently on a single failure
+  and was never retried by anything. A live coordinator stranded that way is invisible to a panel
+  filtering on `Role == "coordinator"` **forever**, while the worker rail shows the same agent happily and
+  the daemon keeps answering correctly. That is the whole discrepancy — and it explains why the rail
+  rehydrated on the same launch: the merge queue is a per-repo, **disk-backed** `StreamQueue`
+  re-subscribed at repo-open, whereas the agent snapshot is process-memory truth taken once at app start.
+- **The `rpc.log` evidence was the fix.** Those once-a-minute `ListAgents` calls returning
+  `role=coordinator` came from the client's OWN login-harvest sweep — which kept only the agent ids and
+  threw the rest away. It now folds the answer into the projection first, so a stranded coordinator is a
+  coordinator again within the sweep interval at **no extra RPC cost**, off the very call that was
+  demonstrably correct throughout the outage. A snapshot is additionally confirmed against `ListAgents`
+  rather than trusted (it is a positional `id:kind:state:role` string split on `,`/`:`, not a second
+  opinion). The merge corrects **role and kind only** — state and `Detail` flow on deltas, which are
+  newer than any poll — and it never deletes.
+- **The other leg closes with #18.** If the daemon really has restarted, its session store is empty and
+  no amount of client-side repair invents a coordinator; `AgentSessionReconciler` re-registering the
+  surviving jail (with its `mainguard.agent.role` label) is what makes the snapshot carry one at all.
+  Matrix row **I1 (restart resume)** needs both halves and now has them.
+- **Pinned by** `Mainguard.Tests/CoordinatorProjectionRepairTests` (5 cases, through the new
+  `AgentListOverride` seam). **Not re-verified through live UI clicks:** the running `Mainguard.app`
+  bundle predates this commit, and the one surviving jail on this machine has no
+  `mainguard.agent.role` label (it was created before the label existed), so it correctly adopts as a
+  role-less worker and could not exercise the coordinator binding either way. Worth one live re-click on
+  the next leg after a bundle rebuild, on a freshly spawned coordinator.
+
+## 20. [CLOSED — commit `67b9cc1`] The daemon's tracked agent state can drift from Docker's actual state and nothing brings it back in sync
 
 - The `state=Paused` reading in #19's `ListAgents` output is not a fresh kill-switch pause — `docker
   inspect mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622` reports `Paused=false Status=running`
@@ -437,3 +524,27 @@ the next leg for completeness, but not a gap in the fix.
   cause not diagnosed, flagged as its own small methodology note rather than a product bug) and budget
   ran out before recalibrating. Worth a look bundled with #18 and #19 — all three are "daemon state vs.
   live Docker/process reality can silently diverge, with no reconciliation path" in different clothes.
+
+### FIXED — commit `67b9cc1`
+
+- `AgentSession.State` was **push-only**: something called `MarkState`, or the word never changed. There
+  was no poller, no next-touch check, nothing. The same
+  `Mainguard.Server/Runtime/AgentSessionReconciler.cs` that closes #18 re-reads Docker every 30 s and
+  moves the word, so drift a human (or the engine, or the OOM killer) caused self-heals within half a
+  minute instead of standing indefinitely.
+- **Only the pause axis is corrected**, deliberately. A live session's state word carries orchestration
+  meaning the container cannot know — `RateLimited`, `Yielding`, `AwaitingReview` — and flattening all of
+  it to `Working` because the process tree happens to be scheduled would destroy more information than
+  the drift did. Docker-says-paused/store-says-not and the reverse are the only two transitions this pass
+  makes to a live session.
+- **The failure mode that would have made this worse than the bug** is guarded explicitly: the container
+  lister is allowed to THROW, and a throwing pass changes nothing. An empty list from a Docker that is
+  merely slow to answer would otherwise read as "every jail vanished" and mark the whole swarm lost.
+  `Reconcile_ShouldChangeNothing_WhenTheContainerEngineCannotBeReached` pins it.
+- **Verified live against the exact agent from this entry.** With a production daemon from this commit
+  running and the jail adopted, `docker pause` was run directly from a shell — bypassing every RPC, the
+  same way the original drift was created — and the next pass logged
+  `agent-session reconcile: adopted=none corrected=f1574a0ba9b443ffa2a5b2f9345df622 lost=none`. A raw
+  `docker unpause` (the #20 repro itself) produced the same correction in the other direction, with
+  `docker inspect` confirming `Status=running Paused=false`. Also covered end to end by
+  `AgentSessionReconcileDockerTests.Reconcile_ShouldFollowAnOutOfBandPauseAndUnpause`.
