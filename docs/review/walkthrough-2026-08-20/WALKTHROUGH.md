@@ -409,3 +409,40 @@ closing G3 properly) consumed the available budget; no attempt was made at the r
 **Post-leg cleanup performed:** `docker unpause` on the killed jail and `docker rm -f` on the two
 confirmed orphans, so the next leg starts from a genuinely clean slate rather than the state described
 above.
+
+## Step 020 (this leg) — app exited again mid-session, coordinator-panel restart-resume gap found and root-caused to the log level
+
+Found the app process gone entirely between two `ps aux` checks seconds apart (no window this time, not
+even the process — a different symptom from #14's "alive, zero windows"; no crash report generated).
+Recovered with a clean `open .../Mainguard.app` (`156-relaunch-after-headless-exit.png`).
+
+Clicked "Reopen" on the last-repository prompt (`157-reopen-clicked-branch-overlap-visible.png` —
+reconfirms the already-known commit-graph branch-pill/author-name overlap live again) and landed on the
+Coordinator panel: **"No coordinator running"**
+(`158-no-coordinator-despite-live-role-coordinator-agent.png`), even though the header confirms the rail
+itself rehydrated correctly (`7 in play · 7 in history`, `c1e4c3e` still correct on a fresh process) and
+`~/.mainguard/logs/rpc.log` shows the daemon's own `ListAgents` continuously reporting
+`agent_id=f1574a0ba9b443ffa2a5b2f9345df622 role=coordinator` — the daemon never stopped believing this
+agent is the coordinator; only the panel's own binding disagrees. Logged as **ISSUES-LOG #19 (HIGH,
+matrix row I1, not fixed — flagged for a dedicated pass)**, with the reconnect-safe code path it should be
+going through identified but not fully traced.
+
+While investigating, found the same agent's `state` reads `Paused` in every `ListAgents` response for
+20+ minutes straight, while `docker inspect` on its real container shows `Paused=false Status=running` —
+traced to the previous leg's own cleanup step (see above: `docker unpause` run out-of-band on this exact
+jail after the #17 repro), which by construction never told the daemon anything changed. Logged as
+**ISSUES-LOG #20 (MEDIUM, not fixed)**: the daemon has no reconciliation between its tracked agent state
+and Docker's live state, a gap in the same family as #18's orphan-jail problem, and plausibly the actual
+reason #19's panel refuses to reattach.
+
+Attempted to test whether the new `ee9be50` Resume path would self-heal this specific stuck agent (which
+would also have been the live-click confirmation of that fix the last leg deliberately skipped) —
+sidebar-icon clicks and a merge-queue-panel scroll stopped producing any visible change partway through,
+despite the window ID/bounds being confirmed unchanged via a fresh probe. Not diagnosed further;
+documented honestly in #20 rather than claimed as tested. Screenshot `159-nav-click-did-not-register.png`
+kept as the record of the miss.
+
+**Matrix coverage after this leg:** no additional matrix rows newly click-verified (I1 attempted, not
+completed — still gapped). Two new confirmed findings (#19, #20) instead. Stopping here at a clean
+commit boundary — the click-registration issue needs fresh eyes/recalibration before more live-UI rows
+can be attempted reliably.

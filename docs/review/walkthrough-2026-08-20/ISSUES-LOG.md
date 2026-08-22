@@ -378,3 +378,62 @@ the next leg for completeness, but not a gap in the fix.
   loses the record of what it froze along with the record of the jails themselves — the restarted daemon
   neither adopts nor releases them. Orphan reconciliation on startup is what closes that last hole; it is
   a smaller job now that the release path itself exists.
+
+## 19. [Confirmed, HIGH — needs a dedicated pass] Coordinator panel shows "No coordinator running" after an app relaunch, despite a live, correctly-tagged coordinator agent
+
+- Repro: the app process was found to have exited between two `ps aux` checks a few seconds apart (no
+  crash report generated in `~/Library/Logs/DiagnosticReports/` — this is a *different* symptom from #14's
+  "alive but zero windows"; here the process was simply gone). Recovered with `open
+  .../Mainguard.app`. On the fresh launch, clicked "Reopen" on the "Reopen Last Repository?" prompt
+  (`157-reopen-clicked-branch-overlap-visible.png` — also reconfirms the already-known commit-graph
+  branch-pill/author-text overlap bug, still present), then navigated to the Coordinator panel
+  (`158-no-coordinator-despite-live-role-coordinator-agent.png`).
+- The panel reads **"No coordinator running"** — but `~/.mainguard/logs/rpc.log` shows the daemon's own
+  `ListAgents` RPC continuously returning `AgentInfo { agent_id=f1574a0ba9b443ffa2a5b2f9345df622,
+  agent_kind=claude-code, state=Paused, role=coordinator }` for this exact repo, once a minute, for the
+  entire 20+ minutes surrounding this check — the daemon has never stopped believing this agent is the
+  live coordinator. The header line above it independently confirms the rail *did* rehydrate correctly on
+  this same launch (`7 in play · 7 in history (merged/rejected, below)`, the `c1e4c3e` fix rendering right
+  on a genuinely fresh process) — so this is not a blanket "nothing rehydrates after restart" failure,
+  it's specific to the Coordinator terminal-panel's own binding.
+- `DaemonBackedOrchestrator.CoordinatorAgentId`'s doc comment claims exactly the reconnect-safe behavior
+  that should make this work ("The coordinator is whichever live session carries the role
+  (reconnect-safe); a snapshot without one clears it") and the code backing it
+  (`ApplyAgentEvent`'s `Snapshot` case) does scan `_agents.Values` for `Role ==
+  AgentRoles.Coordinator` on every snapshot — so the mechanism *looks* correct by inspection. Not
+  root-caused past that: did not trace whether the `StreamAgentEvents` snapshot this fresh connection
+  received actually included this agent (vs. `ListAgents`, which is polled by a different subsystem —
+  `LoginHarvestPumpAsync` — and could easily disagree with what the event stream sent), and did not check
+  whether the panel additionally excludes a `Paused`-state agent from being treated as "the" coordinator
+  even when its role matches (see #20 below for why this agent reads `Paused` at all).
+- **Not fixed this leg** — flagged for a dedicated pass. This is matrix row **I1 (restart resume)**, still
+  gapped, and is exactly the shape of bug (`CoordinatorAgentId`/snapshot rehydration path) that the #11
+  investigation turned out to live in — worth the same depth of tracing rather than a guess.
+
+## 20. [Confirmed, MEDIUM — same theme as #18, needs a dedicated pass] The daemon's tracked agent state can drift from Docker's actual state and nothing brings it back in sync
+
+- The `state=Paused` reading in #19's `ListAgents` output is not a fresh kill-switch pause — `docker
+  inspect mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622` reports `Paused=false Status=running`
+  right now, confirmed twice. This exact agent was the one kill-switch-paused during the previous leg's
+  #17 repro (**before** today's real fix, `ee9be50`, existed) and then manually recovered via a raw
+  `docker unpause` as out-of-band cleanup — which by construction bypasses any app-mediated RPC that would
+  tell the daemon the physical state changed. `docker events --since 6h` for this container shows no
+  pause/unpause events at all in that window, consistent with the pause having happened slightly earlier
+  and the unpause being an external command Docker doesn't surface the same way through the events API.
+- The result: the daemon has been reporting this agent as `Paused` for 20+ minutes after it was actually
+  made to run again. This is expected in the narrow sense that no software can see a change nobody told it
+  about — but it exposes a real, reasonable-to-hit gap: **there is no reconciliation between the daemon's
+  tracked per-agent state and Docker's live state**, ever, for any reason (a developer's manual
+  intervention, OrbStack/Docker Desktop itself restarting, or any other out-of-band drift). Once tracked
+  state and reality disagree, nothing — not a poll, not a next-touch check — brings them back together;
+  the stale reading can persist indefinitely and, per #19, may be exactly what makes the Coordinator panel
+  refuse to reattach to a perfectly healthy live jail.
+- Did not attempt a live click-through of the *new* `ee9be50` Resume path against this specific stuck
+  agent to see whether pressing Resume today would self-heal it (would have proven whether the fix's
+  causation ledger, or a plain `IsPausedAsync` probe, is enough to correct drift it didn't itself cause) —
+  sidebar navigation and merge-queue-panel scroll clicks stopped registering visible changes partway
+  through this leg (`159-nav-click-did-not-register.png`; the window ID and bounds were confirmed
+  unchanged via a fresh `CGWindowListCopyWindowInfo` probe, so this wasn't a stale-window-reference issue —
+  cause not diagnosed, flagged as its own small methodology note rather than a product bug) and budget
+  ran out before recalibrating. Worth a look bundled with #18 and #19 — all three are "daemon state vs.
+  live Docker/process reality can silently diverge, with no reconciliation path" in different clothes.
