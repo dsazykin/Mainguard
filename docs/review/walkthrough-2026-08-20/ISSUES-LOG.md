@@ -256,7 +256,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - Atelier and a full System-theme (OS-follow) check were not exercised this leg — minor remaining gap,
   low risk given the two swaps tested were clean.
 
-## 17. [CONFIRMED, HIGH — real UI click, zero-orphan-confound] Kill-switch Resume does NOT un-pause a real, currently-tracked agent's jail
+## 17. [CLOSED — commit `ee9be50`] Kill-switch Resume does NOT un-pause a real, currently-tracked agent's jail
 
 This closes entry #15's "follow-up still needed" — reproduced end-to-end via real clicks, no RPC, no
 orphan-jail ambiguity.
@@ -298,14 +298,62 @@ orphan-jail ambiguity.
   agent isn't human-paused", since kill-switch pause and human pause are correctly modeled as distinct
   by design) and there is no other exposed control. Only a raw `docker unpause` from outside the app (or
   a daemon restart, which then orphans it per #18) recovers a killed agent today.
-- **Still needs a dedicated fix pass** (per the model-tier instruction — this is architectural: adding a
-  real unpause fan-out to `IKillTarget`/`KillSwitch.cs`, plus deciding how that interacts with the
-  human-pause arbiter so Engage/Resume and per-agent Pause/Resume don't fight each other). Not attempted
-  this leg.
-- **Environment left in this state:** the real jail spawned this leg
-  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`) is left genuinely paused by this test —
-  `docker ps` shows it `Up ... (Paused)`. Needs a manual `docker unpause` or `docker rm -f` before the
-  next leg if a clean slate is wanted.
+- **Environment left in this state (at the time of the finding):** the real jail spawned this leg
+  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`) was left genuinely paused by this test —
+  `docker ps` showed it `Up ... (Paused)`, recoverable only by a manual `docker unpause`/`docker rm -f`.
+  That sentence is the bug, written down.
+
+### FIXED — commit `ee9be50`
+
+`IKillTarget` gained `UnpauseAsync`, and `KillSwitch.ResumeAsync` is now the real mirror of
+`EngageAsync`: it remembers the kill epoch's fan-out set, releases exactly those agents under the same
+RT-D4 deadline the stop uses, then clears the freeze flag in a `finally` — an engine that refuses to wake
+one jail must never *also* leave the operator behind a permanently frozen queue. An agent whose release
+could not be confirmed comes back `ResumeFailed` and stays in the ledger, so pressing Resume again retries
+exactly it. The release is audited (`killswitch_resume`), with the same RT-D3 never-block-on-the-store
+posture as the kill.
+
+**The human-pause distinction was preserved, not weakened** — this entry's own observation that the
+per-agent `Unpause` RPC refusal is BY DESIGN drove the shape of the fix. The pause stays unconditional
+(MG-39(a): containment is never negotiable); only the *release* is conditional. `SandboxKillTarget` keeps
+a per-agent **causation ledger** of what it actually transitioned — which containers it paused, whether it
+was the party that took the terminal lock / closed the leader's input gate — and reverses only those
+entries. Causation is decided by engine STATE, never by matching Docker's error text: a jail already
+frozen when the stop fires answers 409 to the second pause and the probe that follows confirms it is
+contained, so it is now reported as `Paused` (it used to be mislabelled `Unresponsive`/`PauseFailed`) and
+is deliberately *not* recorded as the kill switch's. The `HumanPauseLedger` is re-consulted at release
+time as well, which wins the race where a human pause lands while the kill's own pause call is in flight.
+Net effect: a human-paused agent goes through a whole Engage/Resume cycle and comes out still paused, and
+the ledger still says human-paused.
+
+The terminal sever had the identical asymmetry and got the identical treatment. The original
+"deliberately no un-containment" note in `SandboxKillTarget` was protecting a real case — a managed
+worker's terminal is locked at *spawn* as a role property, and a blanket unlock would hand an
+operator-locked worker a typeable terminal — so the ledger records the lock/gate only when the kill switch
+was the party that took them. That case is now honoured precisely instead of by refusing to recover at all.
+
+The misleading UI copy is gone with it: the Resource Monitor row now reads "jail paused, terminal input
+severed. Resume to recover." on a jail the kill switch owns, "this jail was already paused; it stays
+paused after Resume." on one it does not, and "Resume FAILED (…) — the jail is STILL paused. Press Resume
+again." when a release genuinely did not land. `ResumeKillResponse` carries per-agent counts, so `resumed`
+now means the whole release succeeded, jails included.
+
+**Evidence.** `Mainguard.Server.Tests/KillSwitchResumeDockerTests.cs` (RequiresDocker) is the end-to-end
+claim that was false before, with Docker as the only witness: a real jail, real `SandboxKillTarget`, real
+`DockerSandboxEngine`; engage → `.State.Paused=true`, resume → `.State.Paused=false`, terminal lock
+released, row back to `Working`. A second Docker leg pins the arbitration (human-paused jail still paused
+after the cycle, while the killed one comes back). Both green against a real OrbStack daemon. Every other
+kill-switch test ran over a fake engine — which is exactly why this survived. Unit coverage added for the
+release fan-out, idempotence, retry-after-failure, the spawn-time lock surviving the cycle, a vanished
+container, and the double-Engage ledger merge. Full non-Docker `Mainguard.Server.Tests`: 568 passed,
+0 failed.
+
+**Not re-verified through live UI clicks this pass** — the running daemon at the time of the fix was an
+older Release payload actively driving a live coordinator jail, and restarting the app to test would have
+destroyed that session (and orphaned the jail per #18). The Docker-tier test exercises every layer the bug
+lived in; the only link above it is the `KillSwitchService.Resume` RPC and the sidebar toggle, both of
+which were already observed working for the freeze half in this walkthrough. Worth one live re-click on
+the next leg for completeness, but not a gap in the fix.
 
 ## 18. [Confirmed, minor/environmental] Daemon restarts orphan any jails they had spawned — no reconciliation on startup
 
@@ -325,3 +373,8 @@ orphan-jail ambiguity.
   label=mainguard.role=agent` and either adopt or reap anything it doesn't recognize). Flagged for a
   dedicated pass alongside #17, since a real unpause fan-out (#17's fix) and orphan reconciliation (this
   one) touch the same `KillSwitch`/sandbox-lifecycle code and are worth doing together.
+- **Still open after #17's fix (`ee9be50`), and now the *only* way a killed jail stays stuck.** #17's
+  causation ledger lives in the daemon's memory, so a daemon that dies while the kill switch is engaged
+  loses the record of what it froze along with the record of the jails themselves — the restarted daemon
+  neither adopts nor releases them. Orphan reconciliation on startup is what closes that last hole; it is
+  a smaller job now that the release path itself exists.
