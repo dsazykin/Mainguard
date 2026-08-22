@@ -280,7 +280,11 @@ public sealed class AgentSpawnService
                 cliCredentials: launchCredentials,
                 progress: new InlineProgress(m => _store.MarkState(key, session.State, m)),
                 adoptExistingBranch: adoptExistingBranch,
-                cliSettings: launchSettings).ConfigureAwait(false);
+                cliSettings: launchSettings,
+                // The role goes onto the jail's own labels. The session record that carries it here is
+                // in-memory and dies with the daemon; the container outlives both, so the label is what
+                // lets the next daemon adopt a surviving coordinator back AS a coordinator.
+                agentRole: role).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {

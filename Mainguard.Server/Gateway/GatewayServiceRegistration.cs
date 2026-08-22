@@ -309,6 +309,27 @@ public static class GatewayServiceRegistration
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();
+
+        // ISSUES-LOG #18/#20 — the live session store's reconcile against Docker. The two boot
+        // reconcilers above make Docker the truth for the expected-agents table and the PTY leader
+        // registry; NEITHER ever wrote to AgentSessionStore, which is what every surface actually
+        // renders, so a restarted daemon showed zero agents while their jails kept running. This is
+        // that missing half, and it keeps running afterwards to catch out-of-band drift.
+        //
+        // NOTE the lister: it lets a Docker failure PROPAGATE, unlike BuildContainerLister's
+        // empty-on-error. An empty list here would read as "every jail vanished" and mark the whole
+        // swarm Unresponsive the first time the engine was slow to answer.
+        services.AddSingleton(sp => new Runtime.AgentSessionReconciler(
+            sp.GetRequiredService<Runtime.AgentSessionStore>(),
+            listContainers: async ct =>
+            {
+                using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
+                return await DockerAgentLister.ListAsync(docker, ct).ConfigureAwait(false);
+            },
+            audit: sp.GetRequiredService<IAuditLog>(),
+            log: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
+                .CreateLogger<Runtime.AgentSessionReconciler>()));
+        services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 
     /// <summary>

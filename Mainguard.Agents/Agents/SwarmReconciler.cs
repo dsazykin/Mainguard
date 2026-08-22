@@ -13,7 +13,33 @@ namespace Mainguard.Agents.Agents;
 /// set by P2-07). This is the <b>only</b> liveness signal the reconciler consumes — there are no
 /// PID/lock-file reads (rejection trigger).
 /// </summary>
-public sealed record AgentContainerState(string AgentId, string RepoHash, string ContainerId, bool Running);
+/// <param name="Running">Docker's <c>State == "running"</c>, verbatim. A <b>paused</b> container does not
+/// satisfy this: Docker reports it as <c>"paused"</c>, which is a different word for a container that very
+/// much still exists. Use <see cref="Live"/> for "this jail is still here".</param>
+/// <param name="Paused">Docker's <c>State == "paused"</c> — the jail is frozen, not gone (ISSUES-LOG #20:
+/// the daemon's tracked state has to be able to learn this from Docker, because a <c>docker pause</c>/
+/// <c>unpause</c> run outside the app never reaches any RPC).</param>
+/// <param name="Kind">The agent CLI this jail runs, from the <c>mainguard.kind</c> label. Empty for a jail
+/// created before that label existed — an adopter then has to say so rather than guess.</param>
+/// <param name="Role">The orchestration role (<see cref="AgentRoles"/>) from the
+/// <c>mainguard.agent.role</c> label: <c>""</c>, <c>coordinator</c> or <c>managed</c>. Distinct from the
+/// <c>mainguard.role</c> label, which says what KIND of container this is (<c>agent</c> vs
+/// <c>egress-proxy</c>) and is always <c>agent</c> here.</param>
+public sealed record AgentContainerState(
+    string AgentId, string RepoHash, string ContainerId, bool Running,
+    bool Paused = false, string Kind = "", string Role = "")
+{
+    /// <summary>
+    /// The jail still exists and is holding the agent's process tree — <see cref="Running"/> <b>or</b>
+    /// <see cref="Paused"/>.
+    ///
+    /// <para>This is the predicate every reconcile wants, and reading <see cref="Running"/> for it was a
+    /// live defect: a kill-switch-frozen or human-paused jail reports <c>State == "paused"</c>, so a daemon
+    /// restart while any agent was paused declared it dead, <b>force-removed its worktree</b> and reaped its
+    /// PTY — destroying exactly the work an emergency stop exists to preserve.</para>
+    /// </summary>
+    public bool Live => Running || Paused;
+}
 
 /// <summary>What to do with a live container the daemon did not expect (an orphan).</summary>
 public enum OrphanPolicy
@@ -105,7 +131,8 @@ public sealed class SwarmReconciler
         var live = new Dictionary<(string RepoHash, string AgentId), AgentContainerState>();
         foreach (var container in containers)
         {
-            if (container.Running)
+            // Live, not Running: a paused jail is present. See AgentContainerState.Live.
+            if (container.Live)
             {
                 live[(container.RepoHash, container.AgentId)] = container;
             }

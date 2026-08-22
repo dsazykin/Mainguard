@@ -208,7 +208,10 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
             request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
             request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds,
-            _options.AllowedMountRoots);
+            _options.AllowedMountRoots,
+            // Carried onto the jail's labels: what this agent IS, so a restarted daemon can adopt it back
+            // as itself rather than as an anonymous worker.
+            request.AgentKind, request.AgentRole);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

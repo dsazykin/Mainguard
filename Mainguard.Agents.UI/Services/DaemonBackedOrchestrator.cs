@@ -635,6 +635,14 @@ public sealed class DaemonBackedOrchestrator :
                     _coordinatorAgentId = _agents.Values
                         .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId;
                 }
+
+                // ISSUES-LOG #19: confirm the snapshot against ListAgents. The snapshot is not the same
+                // data by another route — the daemon builds it as a positional `id:kind:state:role`
+                // string split on ',' and ':', while ListAgents sends typed fields — and it is the ONLY
+                // thing that ever repopulates this projection wholesale. When the two disagree the RPC
+                // wins, and it is newer besides (it is issued after the snapshot was taken). One extra
+                // unary call per stream connect, which happens on connect and reconnect, not per event.
+                _ = ResyncAgentsAsync();
                 break;
 
             case Proto.AgentEvent.EventOneofCase.State:
@@ -976,11 +984,15 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
-    /// Fetches the authoritative agent list (kind + role) after a state delta arrived for an agent
-    /// the projection had never seen — the delta carries neither, and the coordinator's role must
-    /// never be dropped on the floor. Merges by agent id (a merge never deletes: removal is the
-    /// snapshot's job) and recomputes the live-coordinator pointer. Best-effort: a daemon hiccup
-    /// leaves the placeholder until the next snapshot corrects it.
+    /// Fetches the authoritative agent list (kind + role) and folds it into the projection.
+    ///
+    /// <para>Driven from three places, and each is load-bearing: after a state delta for an agent the
+    /// projection had never seen (the delta carries neither kind nor role), after every stream
+    /// <b>snapshot</b>, and once a minute from <see cref="PersistLiveAgentLoginsAsync"/> — see
+    /// <see cref="MergeAgentListing"/> for why the projection needs a standing repair path at all.</para>
+    ///
+    /// <para>Best-effort: a daemon hiccup simply leaves the projection as it was, and the next caller
+    /// tries again within the minute.</para>
     /// </summary>
     private async Task ResyncAgentsAsync()
     {
@@ -991,22 +1003,81 @@ public sealed class DaemonBackedOrchestrator :
         }
         catch (Exception)
         {
-            return; // next snapshot resyncs
+            return; // the periodic repair pass retries
         }
 
+        if (MergeAgentListing(listed))
+        {
+            RaiseIsolated(() => Changed?.Invoke());
+        }
+    }
+
+    /// <summary>
+    /// ISSUES-LOG #19 — folds an authoritative <c>ListAgents</c> answer into the projection, and is the
+    /// projection's only way back from being wrong.
+    ///
+    /// <para><b>Why this exists.</b> The projection is fed by <c>StreamAgentEvents</c>, whose snapshot is
+    /// one destructive replacement taken at subscribe time; after that only deltas arrive, and a delta
+    /// carries <b>neither kind nor role</b>. A delta for an unseen agent therefore fabricates a
+    /// <b>role-less</b> placeholder, and the single <c>ListAgents</c> call that was supposed to repair it
+    /// gave up permanently on one failure. That is enough to strand a live coordinator in the projection
+    /// as an anonymous worker: the Coordinator panel filters on <c>Role == "coordinator"</c> and finds
+    /// nothing, so it reports "No coordinator running" — for 20+ minutes, while the daemon's own
+    /// <c>ListAgents</c> answered <c>role=coordinator</c> for that agent once a minute the whole time, to
+    /// this same client, on a call whose answer was thrown away except for the ids.</para>
+    ///
+    /// <para><b>What it will and will not overwrite.</b> Kind and role are identity — the listing is
+    /// authoritative for them and they are always corrected. <see cref="AgentInfo.State"/> and the live
+    /// <c>Detail</c> are NOT: those flow on deltas, which are newer than any poll, and a listing taken a
+    /// moment ago would otherwise walk a just-Dead agent back to Working and wipe the exit tail the
+    /// surface is showing. An agent the projection has never seen is added whole.</para>
+    ///
+    /// <para>A merge never deletes — removal stays the snapshot's job (and a stop's own delta), so a
+    /// listing that raced a spawn cannot make a live agent disappear.</para>
+    /// </summary>
+    /// <returns>True when something changed, so the caller can raise <see cref="Changed"/>.</returns>
+    private bool MergeAgentListing(IReadOnlyList<Proto.AgentInfo> listed)
+    {
+        var changed = false;
         lock (_gate)
         {
             foreach (var a in listed)
             {
-                _agents[a.AgentId] = MapInfo(a);
+                if (string.IsNullOrEmpty(a.AgentId))
+                {
+                    continue;
+                }
+
+                var kind = string.IsNullOrEmpty(a.AgentKind) ? a.AgentId : a.AgentKind;
+                var role = a.Role ?? string.Empty;
+
+                if (!_agents.TryGetValue(a.AgentId, out var existing))
+                {
+                    _agents[a.AgentId] = MapInfo(a);
+                    changed = true;
+                    continue;
+                }
+
+                if (string.Equals(existing.Name, kind, StringComparison.Ordinal)
+                    && string.Equals(existing.Role, role, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                _agents[a.AgentId] = existing with { Name = kind, Role = role };
+                changed = true;
             }
 
-            _coordinatorAgentId = _agents.Values
-                .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId
-                ?? _coordinatorAgentId;
+            var coordinator = _agents.Values
+                .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId;
+            if (coordinator is not null && !string.Equals(coordinator, _coordinatorAgentId, StringComparison.Ordinal))
+            {
+                _coordinatorAgentId = coordinator;
+                changed = true;
+            }
         }
 
-        Changed?.Invoke();
+        return changed;
     }
 
     private static AgentInfo MapInfo(Proto.AgentInfo a) =>
@@ -1083,18 +1154,30 @@ public sealed class DaemonBackedOrchestrator :
     /// </summary>
     public async Task PersistLiveAgentLoginsAsync(CancellationToken ct = default)
     {
-        List<string> agentIds;
+        IReadOnlyList<Proto.AgentInfo> listed;
         try
         {
-            agentIds = (await _client.ListAgentsAsync(ct).ConfigureAwait(false))
-                .Select(a => a.AgentId)
-                .Where(id => !string.IsNullOrWhiteSpace(id))
-                .ToList();
+            listed = await _client.ListAgentsAsync(ct).ConfigureAwait(false);
         }
         catch (Exception)
         {
             return; // daemon unreachable — surfaced via ConnectionState, never an app crash.
         }
+
+        // ISSUES-LOG #19: this sweep already holds the authoritative kind/role for every live agent and
+        // used to keep only the ids. Folding it into the projection first makes this the projection's
+        // standing repair pass — a coordinator that lost its role on a fabricated placeholder is a
+        // coordinator again within the sweep interval, with no extra RPC, off the very answer that was
+        // demonstrably correct throughout the outage.
+        if (MergeAgentListing(listed))
+        {
+            RaiseIsolated(() => Changed?.Invoke());
+        }
+
+        var agentIds = listed
+            .Select(a => a.AgentId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToList();
 
         foreach (var agentId in agentIds)
         {

@@ -191,7 +191,12 @@ public sealed record ContainerSpecRequest(
     IReadOnlyList<string>? ToolchainIds = null,
     // ESC-I1: the substrate's daemon-owned roots; when supplied, every bind-mount source must sit
     // under one of them (see SandboxEngineOptions.AllowedMountRoots).
-    IReadOnlyList<string>? AllowedMountRoots = null);
+    IReadOnlyList<string>? AllowedMountRoots = null,
+    // Stamped onto the container as mainguard.kind / mainguard.agent.role so a daemon that restarts can
+    // adopt this jail back as the agent it actually is. Default "" keeps every existing caller (and the
+    // ad-hoc harnesses) compiling and simply yields an unlabelled jail, which adopts as a role-less worker.
+    string AgentKind = "",
+    string AgentRole = "");
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -514,11 +519,18 @@ public static class ContainerSpecBuilder
             User = request.Credentials.AgentUid.ToString(System.Globalization.CultureInfo.InvariantCulture),
             WorkingDir = WorkspaceTarget,
             Env = env,
+            // The jail's own identity card. It is the ONLY thing that survives a daemon restart — the live
+            // session store is in-memory — so everything the daemon needs to adopt this jail back into a
+            // real, correctly-typed session has to be on it. Before the kind/role pair was stamped here, a
+            // restart could recover THAT a jail existed but not WHAT it was, and a surviving coordinator
+            // came back as an anonymous worker.
             Labels = new Dictionary<string, string>
             {
                 ["mainguard.repo"] = request.RepoHash,
                 ["mainguard.agent"] = request.AgentId,
                 ["mainguard.role"] = "agent",
+                [DockerAgentLister.KindLabel] = request.AgentKind,
+                [DockerAgentLister.AgentRoleLabel] = request.AgentRole,
             },
             HostConfig = hostConfig,
         };

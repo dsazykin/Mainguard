@@ -104,10 +104,12 @@ public sealed class SessionLeader
     {
         ArgumentNullException.ThrowIfNull(liveContainers);
 
+        // Live, not Running: a PAUSED jail is present, and reaping its leader session kills the PTY of an
+        // agent the user (or the kill switch) deliberately froze. See AgentContainerState.Live.
         var liveContainerIds = new HashSet<string>(
-            liveContainers.Where(c => c.Running).Select(c => c.ContainerId), StringComparer.Ordinal);
+            liveContainers.Where(c => c.Live).Select(c => c.ContainerId), StringComparer.Ordinal);
         var liveAgentIds = new HashSet<string>(
-            liveContainers.Where(c => c.Running).Select(c => c.AgentId), StringComparer.Ordinal);
+            liveContainers.Where(c => c.Live).Select(c => c.AgentId), StringComparer.Ordinal);
 
         var reattached = new List<string>();
         var reaped = new List<string>();
