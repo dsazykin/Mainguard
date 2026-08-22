@@ -252,6 +252,7 @@ public sealed class MergeQueue : IMergeQueue
     private readonly Dictionary<string, DateTimeOffset?> _verifiedAt = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MergeEntryOrigin> _origins = new(StringComparer.Ordinal);
     private readonly Dictionary<string, QueueEntryDiscard> _discards = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> _lastChangedAt = new(StringComparer.Ordinal);
     private readonly HashSet<string> _verifying = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _requeueBlocks = new(StringComparer.Ordinal);
     private string _currentMainSha;
@@ -396,6 +397,26 @@ public sealed class MergeQueue : IMergeQueue
         lock (_gate)
         {
             return _states.TryGetValue(agentId, out var s) ? s : WorkerMergeState.Working;
+        }
+    }
+
+    /// <summary>
+    /// When this entry's row last moved — the same instant that is persisted as
+    /// <c>MergeQueueRow.UpdatedUtc</c>, kept in memory and rehydrated on restart so it survives a daemon
+    /// bounce. Null for an id the queue has never written a row for.
+    ///
+    /// <para>This exists because <b>insertion order is not decision order</b>. A terminal entry keeps the
+    /// position it was spawned into, so the rail's permanent Merged/Rejected history renders oldest-spawn
+    /// first and a brand-new rejection can land at the very bottom of a list of a dozen — which reads, to
+    /// the human who just clicked Reject, as the entry having vanished (walkthrough 2026-08-20, ISSUES-LOG
+    /// #13, logged as a HIGH data-loss regression when nothing was lost at all). The display order needs a
+    /// "when was this decided" to put the newest decision at the top of the history it belongs to.</para>
+    /// </summary>
+    public DateTimeOffset? LastChangedAt(string agentId)
+    {
+        lock (_gate)
+        {
+            return _lastChangedAt.TryGetValue(agentId, out var t) ? t : null;
         }
     }
 
@@ -1337,13 +1358,17 @@ public sealed class MergeQueue : IMergeQueue
     // to stamp a first-seen origin, and by SetStateLocked after every legal transition.
     private void SaveRowLocked(string agentId, DateTimeOffset? verifiedAt = null)
     {
+        var updatedUtc = _clock().UtcDateTime;
+        // Mirrored in memory so LastChangedAt can answer without a store round-trip — the rail's history
+        // order is read on every snapshot.
+        _lastChangedAt[agentId] = new DateTimeOffset(updatedUtc, TimeSpan.Zero);
         var row = new Mainguard.Git.Models.MergeQueueRow
         {
             RepoHash = _repoHash,
             AgentId = agentId,
             State = GetStateLocked(agentId).ToString(),
             LastVerificationId = _verifications.LastId(_repoHash, agentId),
-            UpdatedUtc = _clock().UtcDateTime,
+            UpdatedUtc = updatedUtc,
             VerifiedAtUtc = verifiedAt?.UtcDateTime
                 ?? (_verifiedAt.TryGetValue(agentId, out var t) ? t?.UtcDateTime : null),
             Origin = (_origins.TryGetValue(agentId, out var o) ? o : MergeEntryOrigin.Local).ToString(),
@@ -1380,6 +1405,11 @@ public sealed class MergeQueue : IMergeQueue
             {
                 _verifiedAt[row.AgentId] = new DateTimeOffset(row.VerifiedAtUtc.Value, TimeSpan.Zero);
             }
+
+            // Rehydrated, not recomputed: a restart must not restamp every row with "now" and thereby
+            // flatten the history order the rail sorts by.
+            _lastChangedAt[row.AgentId] = new DateTimeOffset(
+                DateTime.SpecifyKind(row.UpdatedUtc, DateTimeKind.Utc), TimeSpan.Zero);
 
             // A discarded entry is rehydrated INTO _states even though it never reaches the live queue
             // again. That is what makes the discard survive a restart as a decision rather than as a

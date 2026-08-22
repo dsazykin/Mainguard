@@ -420,7 +420,11 @@
   `Mainguard.Server.Tests/QueueDisplayOrderTests.cs`) — a stable partition putting actionable states
   ahead of the permanent Merged/Rejected record, since `MergeQueue.Agents`' raw dictionary-insertion
   order buries a fresh spawn behind however much terminal history a repo has accumulated (found live
-  2026-08-20, reproduced the "spawned agent isn't in the queue" symptom exactly); `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  2026-08-20, reproduced the "spawned agent isn't in the queue" symptom exactly), and **within** the
+  terminal group ordering newest-decision-first by `MergeQueue.LastChangedAt` — insertion order is
+  SPAWN order, so the partition alone put a just-rejected branch dead last on the rail and the human
+  who clicked Reject saw the entry leave the panel (ISSUES-LOG #13, filed HIGH against a row that was
+  rendering below the fold the whole time); `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the

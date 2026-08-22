@@ -528,7 +528,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     {
         var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
-        var orderedAgentIds = OrderForDisplay(queue.Agents, queue.GetState);
+        var orderedAgentIds = OrderForDisplay(queue.Agents, queue.GetState, queue.LastChangedAt);
         foreach (var agentId in orderedAgentIds)
         {
             var can = queue.CanMerge(agentId, out var reason);
@@ -569,11 +569,44 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// scrolled out of view. A stable partition (actionable first, terminal last, relative order
     /// preserved within each) fixes discoverability without changing queue membership or any state
     /// semantics. <c>internal</c> so it's independently unit-testable without a live queue.
+    ///
+    /// <para><b>Within the terminal group the order is newest decision first</b>, by
+    /// <c>MergeQueue.LastChangedAt</c> — because insertion order is SPAWN order, not decision order. With
+    /// the partition alone, a branch rejected thirty seconds ago renders behind every Merged/Rejected row
+    /// spawned before it, i.e. at the very bottom of a list several viewports tall — and the human who
+    /// just clicked Reject sees the entry disappear off the end of the rail instead of taking its place in
+    /// the history. That was filed as a HIGH "rejected entries vanish from the queue" regression
+    /// (walkthrough 2026-08-20, ISSUES-LOG #13) when nothing had vanished: the row was rendering, 13th of
+    /// 13, below the fold. The actionable group is deliberately NOT re-sorted — it is a work queue, and
+    /// oldest-first is the order work should be picked up in.</para>
     /// </summary>
+    /// <param name="decidedAt">
+    /// When an entry last transitioned. Optional: <c>null</c> (and a null answer for any single id) keeps
+    /// that entry in its insertion position within its group, so a caller with no clock — and a row
+    /// written by a daemon that predates the field — degrades to the plain stable partition.
+    /// </param>
     internal static IEnumerable<string> OrderForDisplay(
-        IEnumerable<string> agentIds, Func<string, Mainguard.Agents.Agents.WorkerMergeState> stateOf)
-        => agentIds.OrderBy(id => stateOf(id) is Mainguard.Agents.Agents.WorkerMergeState.Merged
-            or Mainguard.Agents.Agents.WorkerMergeState.Rejected ? 1 : 0);
+        IEnumerable<string> agentIds,
+        Func<string, Mainguard.Agents.Agents.WorkerMergeState> stateOf,
+        Func<string, DateTimeOffset?>? decidedAt = null)
+    {
+        var ordered = agentIds.ToList();
+        var actionable = ordered.Where(id => !IsTerminalForDisplay(stateOf(id)));
+        var terminal = ordered.Where(id => IsTerminalForDisplay(stateOf(id)));
+
+        if (decidedAt is not null)
+        {
+            // Descending by decision time; OrderByDescending is stable, so entries with no timestamp
+            // (all equal at DateTimeOffset.MinValue) keep their relative insertion order at the back.
+            terminal = terminal.OrderByDescending(id => decidedAt(id) ?? DateTimeOffset.MinValue);
+        }
+
+        return actionable.Concat(terminal);
+    }
+
+    private static bool IsTerminalForDisplay(Mainguard.Agents.Agents.WorkerMergeState state)
+        => state is Mainguard.Agents.Agents.WorkerMergeState.Merged
+            or Mainguard.Agents.Agents.WorkerMergeState.Rejected;
 
     /// <summary>
     /// The must-acknowledge items blocking <paramref name="agentId"/>, as the review surface has to render

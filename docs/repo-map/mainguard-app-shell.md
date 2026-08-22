@@ -565,7 +565,9 @@
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
     rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
-    actually hosts**: state words, `CanMerge` gate line, the verified-against stamp (from the wire's
+    actually hosts**: state words, `CanMerge` gate line, the header `CountText` ("N in play · N in
+    history") that keeps a row scrolled below the fold from reading as a row that vanished (ISSUES-LOG
+    #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
     `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
     non-accent `ShowSecondaryReview` button on every other reviewable row (the cockpit is the only
     home of the Merge button, so a verified branch without a Review path is unmergeable), and the

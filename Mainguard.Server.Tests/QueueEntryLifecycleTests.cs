@@ -163,6 +163,49 @@ public sealed class QueueEntryLifecycleTests
     }
 
     /// <summary>
+    /// ISSUES-LOG #13. A rejection the human just made must be the FIRST row of the rail's permanent
+    /// history, not the last.
+    ///
+    /// <para>Terminal rows are kept forever and, before this, rendered in <b>spawn</b> order behind the
+    /// actionable ones — so on a repo with any testing history a branch rejected ten seconds ago came off
+    /// the stream dead last, below the fold of a scrolling panel. Live-clicking that produced a HIGH
+    /// "rejected entries vanish from the merge queue" report against a row that was on screen the whole
+    /// time. The row being merely PRESENT (asserted above) is not enough: the human has to be able to see
+    /// the verdict they just gave, so position is the assertion.</para>
+    /// </summary>
+    [Fact]
+    public async Task RejectEntry_PutsTheFreshVerdictAtTheHeadOfTheRailsHistory_NotBehindOlderTerminalRows()
+    {
+        using var host = new DaemonFixture();
+        var queue = SeedQueue(host, host.Services.GetRequiredService<IAuditLog>());
+        var (client, headers) = Client(host);
+
+        // Spawn order is old → new; the fresh rejection is deliberately the LAST entry created, which is
+        // exactly the position the old ordering buried it in.
+        foreach (var id in new[] { "old-verdict", "newer-verdict" })
+        {
+            queue.EnsureEntry(id, MergeEntryOrigin.Local);
+            await queue.RunVerificationAsync(id, CancellationToken.None);
+            var rejected = await client.RejectEntryAsync(new RejectEntryRequest
+            {
+                RepoHandle = _repoHandle,
+                AgentId = id,
+                Reason = "no",
+            }, headers);
+            Assert.True(rejected.Rejected, rejected.Reason);
+        }
+
+        var after = await SnapshotAsync(client, headers);
+        var order = after.Entries.Select(e => e.AgentId).ToArray();
+
+        // Nothing is dropped: the still-working entry and both verdicts are all on the stream.
+        Assert.Equal(new[] { "merging", "newer-verdict", "old-verdict" }, order);
+        Assert.All(
+            after.Entries.Where(e => e.AgentId.EndsWith("-verdict", StringComparison.Ordinal)),
+            e => Assert.Equal(nameof(WorkerMergeState.Rejected), e.State));
+    }
+
+    /// <summary>
     /// The discarding identity is derived from the connection, and there is no way for a caller to assert
     /// one — the request message carries no actor field at all. A record a token-holder can populate is an
     /// attribution anyone can forge, which is the same reasoning SA-1/F2 applies to plan approvals.

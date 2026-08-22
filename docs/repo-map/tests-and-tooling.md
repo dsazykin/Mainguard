@@ -889,7 +889,11 @@
   `MergeQueueGrpcService.OrderForDisplay`, the rail's stable actionable-before-terminal display
   partition. Found live 2026-08-20: `MergeQueue.Agents`' raw dictionary-insertion order put a repo's
   accumulated Merged/Rejected history ahead of a fresh spawn, burying it at the bottom of the visible
-  list — the exact "spawned agent isn't in the queue" symptom.
+  list — the exact "spawned agent isn't in the queue" symptom. Extended 2026-08-22 for the mirror-image
+  defect (ISSUES-LOG #13): the terminal group is ordered newest-decision-first, so a branch just
+  rejected heads the history instead of sorting behind every older verdict; a terminal row with no
+  decision timestamp keeps its insertion position at the back and is never dropped. The end-to-end
+  positional assertion lives in `QueueEntryLifecycleTests.RejectEntry_PutsTheFreshVerdictAtTheHeadOf…`.
 - **`Mainguard.Server.Tests/ExternalPrMergePathTests.cs`** — the same composition for a P2-12
   `External` entry, plus a **real bare "upstream" repository** the fake `IHostPullRequestGateway`
   performs real git merges in (no live GitHub — that stays in the manual matrix). The guard test is

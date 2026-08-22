@@ -25,6 +25,13 @@
       <!-- "main <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
       <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" TextWrapping="Wrap"
                  Foreground="{DynamicResource TextMuted}"/>
+      <!-- The list scrolls behind a thin, low-contrast thumb, and terminal history sorts to the bottom:
+           without a count, a row rendering below the fold reads as an entry that vanished (ISSUES-LOG
+           #4, #13 — the second of those was filed as a HIGH data-loss regression against a row that was
+           on screen the whole time, four scroll-lines down). -->
+      <TextBlock Text="{Binding CountText}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource TextMuted}"
+                 IsVisible="{Binding CountText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
     </StackPanel>
 
     <!-- Horizontal scrolling is DELIBERATELY off. The rail's two long strings are identifiers (a 32-hex

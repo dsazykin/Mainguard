@@ -28,6 +28,15 @@ public partial class QueueRailViewModel : ViewModelBase
     [ObservableProperty] private string _gateText = "";
     [ObservableProperty] private bool _isEmpty;
 
+    /// <summary>
+    /// How many rows the rail is holding, split the way its display order splits them. The rail scrolls,
+    /// and its scrollbar is a thin low-contrast thumb inside a dense list — twice during the 2026-08-20
+    /// walkthrough a row that WAS rendering, below the fold, was reported as a missing entry (ISSUES-LOG
+    /// #4, then #13 as a HIGH "rejected entries vanish" regression). A count is the cheapest honest cue
+    /// that the list is taller than the viewport, and it says which half the rest of it is in.
+    /// </summary>
+    [ObservableProperty] private string _countText = "";
+
     /// <param name="report">(message, isWarning) sink for the lifecycle actions' outcomes; null uses the
     /// shell's toast stack. Injected by tests — a discard's refusal is the sentence the human reads, so it
     /// has to be observable somewhere other than a toast.</param>
@@ -80,6 +89,14 @@ public partial class QueueRailViewModel : ViewModelBase
         }
 
         IsEmpty = Entries.Count == 0;
+
+        var history = Entries.Count(e => e.IsTerminalRecord);
+        var active = Entries.Count - history;
+        CountText = IsEmpty
+            ? ""
+            : history == 0
+                ? $"{active} in play"
+                : $"{active} in play · {history} in history (merged/rejected, below)";
 
         // The rail's ONE accent: the front-most fresh Verified entry gets the Review CTA. Every OTHER
         // reviewable row gets the secondary (non-accent) Review affordance — before it existed, a
@@ -138,6 +155,11 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private string _verifiedAgainst = "";
     [ObservableProperty] private string _badgeGeometryKey = "AgentWorkingIcon";
     [ObservableProperty] private bool _isReviewable;
+
+    /// <summary>True for a <c>Merged</c>/<c>Rejected</c> row — the permanent record half of the rail,
+    /// which the header counts separately from the work still in play.</summary>
+    [ObservableProperty] private bool _isTerminalRecord;
+
     [ObservableProperty] private bool _showReviewAccent;
 
     /// <summary>The non-accent Review affordance for reviewable rows BEHIND the front one — the rail's
@@ -267,6 +289,8 @@ public partial class QueueEntryViewModel : ViewModelBase
         _lastState = entry.State;
         _hasLiveSandbox = entry.HasLiveSandbox;
         RecomputeCanVerify();
+
+        IsTerminalRecord = entry.State is WorkerMergeState.Merged or WorkerMergeState.Rejected;
 
         CanDiscard = entry.State
             is not (WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded);

@@ -1099,7 +1099,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Orchestrator/` (P2-10 merge queue + verification runs + stale invalidation — the
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
-      `GetState`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`; every legal transition enumerated,
+      `GetState`/`LastChangedAt`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      `LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory (rehydrated on restart, never
+      restamped) so the rail can order its permanent history by when a verdict was GIVEN rather than by
+      spawn order — ISSUES-LOG #13; every legal transition enumerated,
       every illegal one throws typed `InvalidMergeStateTransitionException`; each transition persisted in
       the same transaction (restart resumes; `ResumeAfterRestartAsync(hasLiveJail)` + its background
       `BeginResumeAfterRestart`/`LastResume` pair re-drive an interrupted `Verifying` — see the
