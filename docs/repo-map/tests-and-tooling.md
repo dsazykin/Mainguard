@@ -1471,14 +1471,19 @@
   unpinned/stale client certificate refused, the client's server-pin refuses an impostor, credential
   files are 0600, and a missing credential throws instead of downgrading; plus a pinned-mTLS positive
   control that keeps the refusals honest)**, `TerminalStreamRpcTests` (bidi echo — the no-PTY-bound
-  fallback), `TerminalStreamerTests` (TI-P2-03: the streamer's batch-as-one-frame, 4 KB holdback-cap
+  fallback, which now applies only to ids the daemon holds no session for),
+  **`TerminalDetachedAttachTests` (ISSUES-LOG #23 — an attach to a KNOWN agent with no bound CLI
+  answers with `TerminalGrpcService.DetachedNotice` unprompted instead of falling silently into the
+  echo, and discards input rather than reflecting it; the echo is still what an unknown id gets. The
+  silent echo is what left a coordinator adopted across a daemon restart reading as "Still starting"
+  forever — the client's only "the CLI is up" signal is the first output frame)**, `TerminalStreamerTests` (TI-P2-03: the streamer's batch-as-one-frame, 4 KB holdback-cap
   flush, never-split-across-frames, and the `Slow` 100 MB firehose memory-flat proof, plus the
   `RunAsync` stream pump), `TerminalPtyAttachTests` (TI-P2-03: `Attach` wired to a real PTY through
   the streamer — `/bin/cat` echo round-trip `LinuxOnly`, a ConPTY probe `WindowsOnly` — via a
   `TerminalSessionManager` override), **`AgentCliWiringTests` (PR3: the spawn→PTY→attach walking
   skeleton over a fake substrate + fake `ITerminalSession`s — spawn with an installed-CLI marker binds
   a long-lived session, Attach streams the REAL CLI (replay-then-live, detach never kills it,
-  StopAgent does), an unprovisioned handle stays session-only+echo, `ListInstalledAdapters` lists the
+  StopAgent does), an unprovisioned handle stays session-only and its attach SAYS there is no terminal (it used to echo), `ListInstalledAdapters` lists the
   registry markers, roles ride ListAgents + the snapshot stream, the frozen-gate shim refusal; **MG-37
   — `mainguard-agent list` is scoped to the CALLER's own workers (it returned every session on the
   daemon, so a coordinator could enumerate other coordinators' workers and other repos' agents through

@@ -312,6 +312,145 @@ public class CoordinatorCliStartTests
         Assert.NotEqual(firstId, host.CoordinatorAgentId);    // a new session id
     }
 
+    // ---- ISSUES-LOG #23: "has it started?" off the current state, not off a transition -------------
+
+    /// <summary>
+    /// <b>The #23 repro, at the level it actually broke.</b> A coordinator that was already
+    /// <see cref="AgentLifecycleState.Working"/> the first time this projection ever saw it — the shape a
+    /// daemon restart leaves behind, adopted back into the session store with its role intact — must read
+    /// as STARTED immediately. Every "is it up yet?" signal on this surface used to be the terminal's
+    /// first drawn frame, an event that can only fire while we are watching; a session we did not watch
+    /// start has no such event left to give, and the surface sat on "Still starting the coordinator" for
+    /// six hours over an agent the daemon was continuously reporting as Working.
+    /// </summary>
+    [AvaloniaFact]
+    public void ACoordinatorAlreadyWorking_WhenFirstProjected_ReadsAsStarted()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost
+        {
+            Agents = { Agent("c1", AgentLifecycleState.Working, AgentRoles.Coordinator) },
+        };
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+
+        Assert.True(vm.IsCoordinatorLive);
+        Assert.True(vm.CoordinatorHasStarted); // no transition was observed, and none is needed
+    }
+
+    /// <summary>The other half, and what keeps the property from being "always true for a live
+    /// coordinator": a session the daemon still reports as coming up reads as NOT started, so the
+    /// toolchain-build copy — which is right for that case and only that case — still shows.</summary>
+    [AvaloniaFact]
+    public void ACoordinatorStillProvisioning_ReadsAsNotStarted()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost
+        {
+            Agents = { Agent("c1", AgentLifecycleState.Provisioning, AgentRoles.Coordinator) },
+        };
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+
+        Assert.True(vm.IsCoordinatorLive);
+        Assert.False(vm.CoordinatorHasStarted);
+    }
+
+    /// <summary>
+    /// A running session's <c>Detail</c> is not launch progress. The daemon's own adoption line
+    /// ("Adopted after a daemon restart — this jail was already running.") arrives in exactly the field
+    /// the loader reads as "what the daemon is doing while it starts", so on the stuck screen it was
+    /// rendered as progress AND bought the stall watchdog the 20-minute working budget — for a session
+    /// that had finished starting days earlier.
+    /// </summary>
+    [AvaloniaFact]
+    public void AnAdoptedCoordinatorsDetail_IsNotShownAsLaunchProgress()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost
+        {
+            Agents =
+            {
+                new AgentInfo("c1", "claude-code", "agent/c1", AgentLifecycleState.Working,
+                    "Adopted after a daemon restart — this jail was already running.",
+                    DateTimeOffset.UtcNow, AgentRoles.Coordinator),
+            },
+        };
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+
+        Assert.True(vm.CoordinatorHasStarted);
+        Assert.False(vm.HasCoordinatorStartDetail);
+        Assert.Equal("", vm.CoordinatorStartDetail);
+    }
+
+    /// <summary>A launch-progress line from a session that IS still starting keeps working — the
+    /// suppression above is scoped to sessions that have finished starting, not a blanket mute.</summary>
+    [AvaloniaFact]
+    public void AStartingCoordinatorsDetail_IsStillShownAsLaunchProgress()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost
+        {
+            Agents =
+            {
+                new AgentInfo("c1", "claude-code", "agent/c1", AgentLifecycleState.Provisioning,
+                    "Building the toolchain image (dotnet-10)…", DateTimeOffset.UtcNow, AgentRoles.Coordinator),
+            },
+        };
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+
+        Assert.False(vm.CoordinatorHasStarted);
+        Assert.True(vm.HasCoordinatorStartDetail);
+        Assert.Contains("dotnet-10", vm.CoordinatorStartDetail, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Restart is the only recovery from a detached coordinator, and it must not turn into a silent Stop.
+    /// The CLI picker is HIDDEN while a coordinator is live, so nothing on screen could set
+    /// <c>SelectedCli</c> — and the start leg used to <c>return</c> on a null pick, after the stop leg had
+    /// already torn the coordinator down.
+    /// </summary>
+    [AvaloniaFact]
+    public async Task Restart_WithNoCliPicked_FallsBackToTheInstalledOne_RatherThanStoppingSilently()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+        var firstId = host.CoordinatorAgentId!;
+
+        vm.SelectedCli = null; // the picker is not on screen while a coordinator is live
+
+        await vm.RestartCoordinatorCommand.ExecuteAsync(null);
+
+        Assert.Contains(firstId, host.EndedAgentIds);
+        Assert.Equal(2, host.StartCalls);     // and a replacement really was started
+        Assert.True(vm.IsCoordinatorLive);
+        Assert.Equal("", vm.CoordinatorStartError);
+    }
+
+    /// <summary>…and when there genuinely is nothing to start, Restart says why instead of leaving a
+    /// surface that reverted to the start card with no explanation.</summary>
+    [AvaloniaFact]
+    public async Task Restart_WithNoCliInstalledAtAll_ExplainsItself()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost
+        {
+            Agents = { Agent("c1", AgentLifecycleState.Working, AgentRoles.Coordinator) },
+        };
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        Assert.True(vm.IsCoordinatorLive);
+
+        host.Installed = Array.Empty<InstalledCliOption>();
+        vm.InstalledClis.Clear();
+        vm.SelectedCli = null;
+
+        await vm.RestartCoordinatorCommand.ExecuteAsync(null);
+
+        Assert.Contains("No agent CLI is installed", vm.CoordinatorStartError, StringComparison.Ordinal);
+        Assert.Equal(0, host.StartCalls);
+    }
+
     [AvaloniaFact]
     public async Task StartCoordinator_Refusal_RendersTheHonestMessage_AndStaysStartable()
     {

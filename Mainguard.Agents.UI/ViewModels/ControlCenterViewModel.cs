@@ -200,6 +200,26 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// working on, silence is not the diagnosis, so this stays false.</para></summary>
     [ObservableProperty] private bool _coordinatorConnectTimedOut;
 
+    /// <summary>
+    /// The daemon already reports the live coordinator as <b>past its startup</b> — it is running, whatever
+    /// its terminal is or isn't doing.
+    ///
+    /// <para><b>ISSUES-LOG #23.</b> Every "has the coordinator come up yet?" signal on this surface used to
+    /// be the terminal's first drawn frame (<see cref="TerminalViewModel.HasReceivedOutput"/>) — an EVENT,
+    /// and one that only ever fires while we are watching. A coordinator that was already running before
+    /// this app process attached has no first frame left to give: the daemon that owned its PTY is gone
+    /// (a daemon restart detaches a live CLI permanently — the jail keeps running, but the
+    /// <c>docker exec</c>-under-forkpty terminal behind it cannot be re-bound), so the attach produces
+    /// nothing at all, forever. The surface then sat on "Still starting the coordinator" for six hours
+    /// against an agent the daemon was continuously reporting as <c>state=Working, role=coordinator</c>.</para>
+    ///
+    /// <para>The cure is the one #19 needed, applied to a different field: derive the answer from the
+    /// CURRENT polled state as well as from the live event, so a session we did not watch start still reads
+    /// as started. A started coordinator whose terminal never draws is reported as what it is — running,
+    /// with a detached terminal — instead of as a launch that is still going.</para>
+    /// </summary>
+    [ObservableProperty] private bool _coordinatorHasStarted;
+
     /// <summary>What the daemon says it is doing while the coordinator starts (currently: the per-repo
     /// toolchain image build, which is the only step that runs for minutes). Empty when it has said
     /// nothing. Fed by the launch-progress state deltas, which carry a new <c>reason</c> while the
@@ -510,6 +530,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         state is AgentLifecycleState.Merged or AgentLifecycleState.Rejected
             or AgentLifecycleState.Dead or AgentLifecycleState.TornDown;
 
+    /// <summary>The lifecycle words that mean "this session has not finished coming up yet". Everything
+    /// else — <c>Working</c>, <c>Paused</c>, <c>RateLimited</c>, <c>AwaitingReview</c> … — is a session
+    /// that HAS started, however it is behaving now. See <see cref="CoordinatorHasStarted"/>.</summary>
+    private static bool IsStartupState(AgentLifecycleState state) =>
+        state is AgentLifecycleState.Requested or AgentLifecycleState.PlanPending
+            or AgentLifecycleState.Provisioning;
+
     /// <summary>
     /// Coordinator-CLI card state, derived from the coordinator-role sessions in the projection:
     /// LIVE when one is in a non-terminal state; DEAD (honestly, with the start card un-gated) when
@@ -531,6 +558,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         IsCoordinatorLive = live is not null || startedUnprojected;
         IsCoordinatorDead = !IsCoordinatorLive && coordinators.Count > 0;
+        // #23: "has it started?" read off the CURRENT state, not only off a first terminal frame. A
+        // coordinator adopted from a previous daemon (already Working when we first see it) never
+        // transitions while we watch, so an event-only signal can never come true for it.
+        CoordinatorHasStarted = live is not null && !IsStartupState(live.State);
         CanStartCoordinator = host is not null && !IsCoordinatorLive;
         ShowCoordinatorTerminal = IsCoordinatorLive || IsCoordinatorDead;
 
@@ -548,8 +579,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         // The live coordinator's Detail while it is still starting: the daemon's launch-progress line
         // (currently the toolchain image build). Taken only from a LIVE, not-yet-drawn coordinator, so a
-        // dead one's exit reason can never leak into the loader as if it were progress.
-        SetCoordinatorStartDetail(live is not null && !IsCoordinatorDead ? live.Detail ?? "" : "");
+        // dead one's exit reason can never leak into the loader as if it were progress — and (#23) only
+        // while the session really IS still starting: a running session's Detail is not launch progress.
+        // The reconciler's adoption line ("Adopted after a daemon restart — this jail was already
+        // running.") is a Detail, and shown here it read as progress AND bought the stall watchdog the
+        // 20-minute working budget, on a session that had finished starting days earlier.
+        SetCoordinatorStartDetail(
+            live is not null && !IsCoordinatorDead && IsStartupState(live.State) ? live.Detail ?? "" : "");
         UpdateConnecting();
     }
 
@@ -895,8 +931,22 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// A cancel (Stop pressed mid-launch, or the daemon dropped the call) unwinds quietly.</summary>
     private async Task StartCoordinatorCoreAsync(CancellationToken ct)
     {
-        if (_agents is not Services.ICliAgentHost host || SelectedCli is null)
+        if (_agents is not Services.ICliAgentHost host)
         {
+            return;
+        }
+
+        // #23: never return silently on a missing pick. Restart is stop-then-start, so a null SelectedCli
+        // turned Restart into a Stop that said nothing — the coordinator went away and the surface gave no
+        // reason. Fall back to the one installed CLI we know about (the picker is HIDDEN while a
+        // coordinator is live, so nothing on screen would have let the user set it), and when there is
+        // genuinely nothing to start, say so.
+        var cli = SelectedCli ??= InstalledClis.FirstOrDefault();
+        if (cli is null)
+        {
+            CoordinatorStartError = InstalledClis.Count == 0
+                ? "No agent CLI is installed for Mainguard to run — install one, then start a coordinator."
+                : "Pick which agent CLI to run, then start the coordinator.";
             return;
         }
 
@@ -906,7 +956,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // No key, no saved login: say up front that the CLI will ask for a sign-in in its terminal —
         // otherwise the first-run coordinator just looks stuck at a prompt nobody mentioned.
         if (_agents is Services.DaemonBackedOrchestrator credentialProbe
-            && !credentialProbe.HasStoredCredentialFor(SelectedCli))
+            && !credentialProbe.HasStoredCredentialFor(cli))
         {
             SetCoordinatorStartDetail(
                 "No API key or saved login is stored — the CLI will ask you to sign in inside its terminal.");
@@ -914,7 +964,7 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         try
         {
-            await host.StartCoordinatorAsync(SelectedCli, ct);
+            await host.StartCoordinatorAsync(cli, ct);
             RefreshAgents();
             RefreshCoordinatorCli(); // attaches the coordinator's inline interactive terminal
         }

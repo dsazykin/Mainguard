@@ -415,7 +415,10 @@
   **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
   (managed) attach gets the banner + output but `PERMISSION_DENIED` on input; otherwise the per-attach
-  `PtySession` factory path through `TerminalStreamer`, else the P2-02 echo. P2-18: an
+  `PtySession` factory path through `TerminalStreamer`, else — for an agent the session store KNOWS
+  but that has no bound CLI — the `DetachedNotice` attach (ISSUES-LOG #23: says so in one unprompted
+  frame and discards input, instead of a silent echo that emitted nothing until the user typed and so
+  read, client-side, as a CLI still starting up forever), else the P2-02 echo for an unknown id. P2-18: an
   `AttachOptions(grid:true)` first frame on a libvterm-engine session takes the grid pump instead —
   atomic snapshot then live `GridUpdate`/`ClipboardCopy` frames, same input/lock semantics — and the
   new `GetScrollback` RPC pages the session's daemon-side ring), **`RepoSyncGrpcService.cs`** (P2-06:

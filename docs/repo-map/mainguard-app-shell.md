@@ -286,7 +286,17 @@
       the live session (full CLI + sandbox teardown). A **connect watchdog** (`CoordinatorConnectTimeout`,
       45 s, test-shortenable) flips `CoordinatorConnectTimedOut` when connecting overstays with no first
       frame and no death — the loader stops pretending and points at Stop instead of spinning forever (it
-      never auto-kills — a real first-launch sandbox build can be slow). And the honest dead-coordinator
+      never auto-kills — a real first-launch sandbox build can be slow). **ISSUES-LOG #23** splits that
+      stalled card in two on `CoordinatorHasStarted`, which is read off the coordinator's CURRENT
+      lifecycle state rather than off a first-frame EVENT: a coordinator adopted across a daemon restart
+      is already `Working` the first time the projection sees it, has no transition left to fire, and its
+      terminal can never draw again (its PTY died with the daemon that owned it) — so it used to sit on
+      "Still starting the coordinator" forever. A started coordinator now gets the honest
+      "running — its terminal isn't attached" card with **Restart** on it, and a running session's
+      `Detail` (e.g. the reconciler's adoption line) is no longer rendered as launch progress nor allowed
+      to buy the watchdog's 20-minute working budget. Restart itself no longer degrades into a silent
+      Stop when nothing is picked in the (hidden-while-live) CLI picker: it falls back to the installed
+      CLI, and says why when there is none. And the honest dead-coordinator
       card (`IsCoordinatorDead` — the newest coordinator-role session reached a terminal state: says it
       ended, keeps its terminal open for the replay — `ShowCoordinatorTerminal` stays true (the daemon
       retains the bound session's replay — the CLI's final output is the why), and un-gates the start card
