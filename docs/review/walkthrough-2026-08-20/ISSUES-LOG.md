@@ -595,7 +595,7 @@ the next leg for completeness, but not a gap in the fix.
   coordinator jail with the fix built in — the terminal pane now renders real content instead of a blank
   cursor. Screenshot `165-terminal-buffering-fix-content-renders-but-garbled.png`.
 
-## 22. [OPEN — needs a dedicated pass, likely Opus] Replayed scrollback renders with corrupted line-wrapping once #21's fix makes it visible at all
+## 22. [CLOSED — commit `d49dcece`] Replayed scrollback renders with corrupted line-wrapping once #21's fix makes it visible at all
 
 - Fixing #21 above makes the replay actually reach the screen — but what reaches it is visibly garbled:
   words split mid-token onto the next line (`"yourl" / "imit,"` for what should read `"your limit,"`),
@@ -628,3 +628,61 @@ the next leg for completeness, but not a gap in the fix.
   capture's implied width from its cursor-position escapes), then decide between "defer flush until
   after first resize" vs. "resize to a sane default before flush, then re-resize" — the former is
   probably correct but needs verifying it doesn't reintroduce a blank-pane window of its own.
+
+### CLOSED — commit `d49dcece`. The column-width hypothesis was CORRECT; the fix went into the engine, not the ViewModel
+
+- **Root cause confirmed — it is a geometry race, not an output race.** `TerminalControl` constructs its
+  `VtScreen` at a hardcoded **80×24 placeholder** and never sizes it itself: the real (cols, rows) only
+  reaches the engine via `ArrangeOverride` → `UserResized` → `TerminalViewModel.OnUserResize` → a **~50 ms
+  debounce** → `ITerminalView.Resize`. The daemon replays its whole ring (`BoundTerminalSession.ReplayCapBytes`
+  = 512 KB, raw PTY bytes, verbatim) within milliseconds of attach, so on a restart-resume the entire
+  recording — made at the previous session's real width — is parsed at 80 columns before layout has happened
+  at all. `VtScreen.Resize` copies the top-left region and does **not reflow**, so that wrap is permanent:
+  every later frame renders around wrongly wrapped rows and misplaced absolute-cursor writes.
+- **Independent confirmation from the existing evidence.** Re-measuring screenshot
+  `165-terminal-buffering-fix-content-renders-but-garbled.png` (and its scratchpad twin
+  `shots/008-coordinator-terminal-after-fix.png`): the text wraps at **~78–80 characters** while the terminal
+  pane is physically wide enough for **~104 columns** — there is visible dead space to the right of every
+  wrapped line, and the overflow characters (`y c c R / a s`) stack in a single vertical column at exactly the
+  80th cell. That is the unmistakable signature of "screen narrower than pane", not of corrupt bytes. The raw
+  `checkterm.fsx` capture had already proved the daemon's bytes are clean.
+- **Fix — deferral in the engine, where bytes and geometry actually meet** (`VtScreen.cs`, `TerminalControl.cs`):
+  `VtScreen` gained an opt-in `awaitGeometry` mode; `Feed()` HOLDS chunks (in arrival order, original
+  boundaries, so the incremental UTF-8 decoder is unaffected) until the first `Resize` establishes real
+  geometry, then parses them against it. `TerminalControl` constructs with `awaitGeometry: true` and now sizes
+  the engine from its **own** `ArrangeOverride` instead of waiting for the ViewModel round trip — the debounce
+  still does its actual job (not spamming the daemon with SIGWINCH during a drag) and `SendResizeAsync` is
+  untouched; the ViewModel's later `Resize` is simply a no-op.
+- **Why not "defer the ViewModel's flush until the first resize"** (the other option named above): that adds a
+  cross-layer ordering dependency in which a missing `UserResized` silently reinstates #21's blank pane — a
+  pane that happens to lay out at exactly 80×24 (the control's dedupe suppresses the event), a control that is
+  never arranged, or the P2-18 `TerminalGridControl`, which has no client-side geometry at all. Putting it in
+  the engine keeps the one object that owns both the bytes and the width owning the ordering, leaves the P2-18
+  path untouched, and leaves #21's ViewModel buffer exactly as it was.
+- **Guards against re-breaking #21.** Three explicit ones: a same-size `Resize` still releases the buffer (the
+  exact-80×24 layout can't strand it); the hold is bounded at 2 MB (4× the daemon ring) and past the cap the
+  engine **parses rather than drops** — wrapped-wrong beats lost; and every new test asserts BOTH failure modes
+  as a pair, content present (#21) *and* content correctly laid out (#22), so neither can be traded for the other.
+- **Tests** — new `Mainguard.Tests/TerminalReplayGeometryTests.cs`, 7 cases: real-width parse equals a native
+  parse at that width; the pre-fix parse-then-resize ordering kept as an explicit **garbled witness**; hold-then-
+  release never loses content; same-size resize releases; chunk boundaries + UTF-8 decoder survive the hold; the
+  2 MB cap parses rather than drops; and an `[AvaloniaFact]` that drives the **whole ordering end to end through a
+  real `TerminalControl` and a real arrange pass** with the replay fed before any layout. That last one was
+  **confirmed to FAIL on pre-fix code** (fix temporarily reverted, rebuilt, re-run) and passes with the fix. All
+  132 `~Terminal` tests green, all 139 headless render harnesses green, `dotnet build` clean.
+- **Live GUI re-verification was NOT possible this leg and is not claimed**: GUI automation input (CGEvent
+  clicks, System Events keystrokes, AX queries) did not reach the app from this agent's process — System Events
+  could not even enumerate the app's windows — so the repo could not be reopened after the relaunch. The
+  pre-existing coordinator (`3cd48ab2…`) had also already ended, so its daemon replay ring came back empty. The
+  evidence above (the re-measured screenshot + the end-to-end `[AvaloniaFact]`) is what closes this. The app was
+  rebuilt in Release and relaunched with the fix in it; it is sitting on the "Reopen Last Repository?" prompt.
+- **Residual, documented not fixed**: the raw attach contract carries no *recording* width, so a replay recorded
+  at a different window size than the one it is rendered into still mis-wraps — including the ~120-column prefix
+  every recording starts with (`AgentCliBinder.DefaultCols` = 120 until the first client resize lands). Same
+  window size ⇒ correct, which is the normal restart-resume case. P2-18's grid engine removes the whole class by
+  construction: the daemon owns the authoritative grid and sends a snapshot on attach.
+- Note this also plausibly explains ISSUES-LOG **#5** (the live onboarding banner garbling) for the window
+  between a pane's first layout and the debounced resize, and the older "ghost coordinator garbled terminal"
+  finding — but #5 was observed on a LIVE coordinator over ~40 s, which the interim engine's known Ink/Yoga gaps
+  (no DECSTBM scroll regions, no insert/delete line, no alt screen — see `docs/repo-map/mainguard-app-shell.md`)
+  can produce on their own. #5 is left OPEN deliberately; it needs its own look, not a claimed fix.
