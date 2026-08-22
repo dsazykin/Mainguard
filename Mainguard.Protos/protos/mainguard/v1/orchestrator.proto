@@ -122,5 +122,11 @@ message EngageKillResponse {
 message ResumeKillRequest {}
 
 message ResumeKillResponse {
+  // True only when the WHOLE release succeeded — the freeze cleared AND every jail this kill switch
+  // paused was un-paused. It used to mean "the freeze flag was cleared" while every jail stayed frozen
+  // forever (ISSUES-LOG #17).
   bool resumed = 1;
+  bool queue_unfrozen = 2;      // always true: the freeze clears whatever the unpause fan-out did
+  int32 agents_resumed = 3;
+  int32 agents_resume_failed = 4; // > 0 means those jails are STILL paused; pressing Resume again retries them
 }

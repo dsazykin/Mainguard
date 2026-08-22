@@ -697,12 +697,15 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return await client.EngageAsync(new EngageKillRequest(), CallOptions(ct, deadline));
     }
 
-    /// <summary>Resumes from a kill: clears the freeze, unpauses agents.</summary>
-    public async Task<bool> ResumeKillAsync(CancellationToken ct, TimeSpan? deadline = null)
+    /// <summary>
+    /// Resumes from a kill: un-pauses every jail the kill switch itself froze, then clears the freeze.
+    /// Returns the whole report — <c>AgentsResumeFailed &gt; 0</c> means those jails are still paused, which
+    /// the caller must not paper over (ISSUES-LOG #17: the release used to clear a flag and nothing else).
+    /// </summary>
+    public async Task<ResumeKillResponse> ResumeKillAsync(CancellationToken ct, TimeSpan? deadline = null)
     {
         var client = new KillSwitchService.KillSwitchServiceClient(Channel());
-        var response = await client.ResumeAsync(new ResumeKillRequest(), CallOptions(ct, deadline));
-        return response.Resumed;
+        return await client.ResumeAsync(new ResumeKillRequest(), CallOptions(ct, deadline));
     }
 
     // ---- P2-08 gateway / telemetry (P2-47 #4) ----

@@ -945,6 +945,19 @@
   rather than copied: the verify command and marker are what the assertions compare against, so two
   copies would drift and the stale one would assert provenance against a command the repo no longer
   declares).
+- **`Mainguard.Server.Tests/KillSwitchResumeDockerTests.cs`** (`RequiresDocker`) — **the emergency stop,
+  proved reversible against a real container engine** (ISSUES-LOG #17). Every other kill-switch test runs
+  over a fake `ISandboxEngine`, which is why the defect survived: Engage really did `docker pause` every
+  jail and Resume really did clear the merge/spawn freeze flag and nothing else, so a killed agent stayed
+  frozen for the life of the daemon while the Resource Monitor's row called the state "(recoverable)".
+  These two drive the real `KillSwitch` over the real `SandboxKillTarget` and a real
+  `DockerSandboxEngine`, with Docker's own `.State.Paused` as the only witness: engage → paused, resume →
+  **unpaused**, plus the terminal lock and leader input gate released and the row back to `Working`. The
+  second case is the arbitration that must NOT be blurred — a jail a human paused before the stop is
+  still paused after a whole kill/resume cycle (and is not reported as a failed pause when the stop finds
+  it already frozen), because the kill switch reverses only the pauses it caused. Trivial `busybox` jails
+  (`[RequiresDockerDaemonFact]` — no agent image needed); the assertions are about pause state, not about
+  what runs inside.
 - **`Mainguard.Server.Tests/Agents/MergeQueueEndToEndDockerTests.cs`** (`RequiresDocker`) — **the
   merge queue driven as ONE loop instead of as a pile of parts.** Every other merge-queue test
   substitutes something load-bearing (a `runVerification` lambda that returns `Passed:true`, a

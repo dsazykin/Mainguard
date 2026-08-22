@@ -151,6 +151,7 @@ public sealed class AuditTouchpointCoverageTests : IDisposable
         public IReadOnlyList<string> ActiveAgentIds => Array.Empty<string>();
         public Task<bool> RequestYieldAsync(string agentId, TimeSpan timeout, CancellationToken ct) => Task.FromResult(false);
         public Task PauseAsync(string agentId, CancellationToken ct) => Task.CompletedTask;
+        public Task UnpauseAsync(string agentId, CancellationToken ct) => Task.CompletedTask;
         public IReadOnlyDictionary<string, string> CaptureStates() => new Dictionary<string, string>();
     }
 

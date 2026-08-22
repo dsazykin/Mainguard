@@ -123,6 +123,10 @@ public static class DaemonHost
                 sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
                 leader: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.SessionLeader>(),
                 locks: sp.GetRequiredService<Auth.TerminalLockRegistry>(),
+                // ISSUES-LOG #17: the release path consults the human-pause ledger, so a jail the human
+                // holds paused stays paused through a whole kill/resume cycle. The two pause reasons stay
+                // distinct — the kill switch reverses only its own.
+                arbiter: sp.GetRequiredService<Runtime.HumanPauseLedger>(),
                 loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
         // The DURABLE kill journal. Registered (rather than inlined) so something holds the reference: the
         // previous composition passed no journal at all, and KillSwitch's `?? new InMemoryKillJournal()`

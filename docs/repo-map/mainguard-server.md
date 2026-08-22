@@ -487,7 +487,17 @@
     then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
     REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
     kept executing and every terminal stayed typeable — containment that was really just relabelling.
-    Resume deliberately does NOT un-contain; recovery is an explicit per-agent action.
+    Also the **release** half (`UnpauseAsync`, ISSUES-LOG #17): it keeps a per-agent **causation ledger**
+    of what it actually transitioned — which containers *it* paused, and whether *it* took the terminal
+    lock / closed the leader's input gate — and `KillSwitch.ResumeAsync` reverses exactly those entries.
+    A jail already frozen when the stop fired (a human pause, or the keep-alive rebase's yield hold —
+    detected by engine STATE, never by error text) is reported as contained but is NOT recorded as ours,
+    so Resume leaves it paused; the injected `IPauseArbiter` (the `HumanPauseLedger`) is re-checked at
+    release time so a human pause that lands DURING the freeze also wins. A terminal lock taken at spawn
+    (a role property) survives the cycle — that was the concern behind the original "Resume deliberately
+    does NOT un-contain", honoured precisely instead of by refusing to recover at all. A container that
+    no longer exists is released by definition (logged, skipped); an unpause the engine refuses marks the
+    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `PlanApprovalService` over a restart-safe `JsonPlanApprovalStore`, the

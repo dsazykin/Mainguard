@@ -1339,6 +1339,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `KillSwitchGate` (SA-1/F4 — before any await, so no `BeginMerge`/spawn slips the fan-out window;
       `QueueFrozenException`), then yield-all fan-out over an `IKillTarget` (timeout →
       `PauseAsync`/`docker pause`), then a journal snapshot via `IKillJournal` before returning;
+      **`ResumeAsync` is the real mirror** (ISSUES-LOG #17 — it used to be `_gate.Resume()` and nothing
+      else, leaving every paused jail frozen for the life of the daemon): the epoch's fan-out set is
+      remembered, `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
+      the freeze flag then clears in a `finally` so a wedged engine can never also trap the queue, and an
+      agent whose release could not be confirmed comes back `ResumeFailed` and STAYS in the ledger so a
+      second press retries exactly it (`KillResumeOutcome`/`KillAgentResume`/`KillResumeReport`, audited
+      as `killswitch_resume` under the same RT-D3 never-block posture);
       `KillSwitchTiming` holds the **RT-D4 fixed absolute `Ceiling`** —
       `FanOutDeadline = min(ceiling, max(5 s, 50×RTT))`, the ceiling a compile-time constant INDEPENDENT
       of the measured RTT, and `RttWouldExceedCeiling` feeds the P2-08 A3 `Unresponsive` signal; RT-D3:

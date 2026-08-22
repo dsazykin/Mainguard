@@ -2010,12 +2010,19 @@ public sealed class DaemonBackedOrchestrator :
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         try
         {
-            await _client.ResumeKillAsync(cts.Token).ConfigureAwait(false);
+            var report = await _client.ResumeKillAsync(cts.Token).ConfigureAwait(false);
             lock (_gate)
             {
+                // The queue freeze is always lifted (the daemon clears it whatever the unpause fan-out
+                // did), so the banner state follows the queue. A jail that refused to wake is NOT hidden:
+                // the daemon marks that session Unresponsive with "the jail is STILL paused. Press Resume
+                // again", which is what the Resource Monitor row renders — the surface that carried the
+                // false "(recoverable)" claim in ISSUES-LOG #17.
                 _frozen = false;
                 _phase = KillSwitchPhase.Armed;
-                _phaseText = string.Empty;
+                _phaseText = report.AgentsResumeFailed > 0
+                    ? $"{report.AgentsResumeFailed} jail(s) did not resume — press again to retry"
+                    : string.Empty;
             }
         }
         catch (Exception)
