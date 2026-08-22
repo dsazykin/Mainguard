@@ -1114,7 +1114,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       every illegal one throws typed `InvalidMergeStateTransitionException`; each transition persisted in
       the same transaction (restart resumes; `ResumeAfterRestartAsync(hasLiveJail)` + its background
       `BeginResumeAfterRestart`/`LastResume` pair re-drive an interrupted `Verifying` — see the
-      restart-resume note below); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
+      restart-resume note below); **`ReconcileJails(hasLiveJail)` + `HasLiveJail(agentId)` +
+      `MergeQueueJailReport` (ISSUES-LOG #24 — the jail-liveness axis)**: queue state is push-only exactly
+      as `AgentSession.State` was, so an entry kept saying `Working` about an agent whose jail had been
+      gone for days, with Verify offered on it. A pass marks/unmarks entries whose sandbox is gone, swaps
+      `CanMerge`'s wording to `StrandedReason` for `Working`/`StaleVerified` (both of the old sentences
+      promise something that cannot happen without a sandbox), audits each move as `JailReconciledEvent`
+      by `ReconcilerActor` (`system:reconciler`, never a person), and republishes via `NotifyGateChanged`
+      — the stream re-pushes only on `Changed`, so without it the rail keeps serving the liveness the
+      client last heard. **It moves no merge state, deliberately**: `AgentResumeService` exists to give a
+      stranded entry a live jail again on its own branch with its commits intact, and `Discarded` is
+      terminal with no path back, so an automatic discard would convert every recoverable entry into an
+      unrecoverable one. Liveness is **not persisted** (it is a measurement of the engine, not a decision
+      — a row asserting "stranded" would outlive its own truth), so `HasLiveJail` is three-valued and
+      answers `null` per-entry until a pass has actually looked; a probe that throws means "no answer",
+      never "no jail". Driven from `AgentSessionReconciler`; `MergeQueueGrpcService` prefers its answer
+      for the wire's `HasLiveSandbox`. `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
       `StaleVerified` and auto re-queues FIFO by original verification time; `CanMerge` false unless
       `Verified`/fresh AND every composable `IMergeGate` allows; the human merge (`ConfirmHumanMerge` →
       `Merged`) + `RequestReview`/`Reject`/`NotifyNewCommits` are **not** on `IMergeQueue`
@@ -1181,7 +1196,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `NotifyMainMoved` for a committed-but-unrecorded merge, else releases the lease + surfaces the
       interrupted attempt — exactly once or none). `MergeQueueRegistry.cs`
       (`IMergeQueueRegistry`/`MergeQueueRegistry` + `MergeQueueContext` — the per-repo queue+leases the
-      gRPC service resolves through). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
+      gRPC service resolves through; `Handles()` snapshots the active handles on the READ interface, so
+      the ISSUES-LOG #24 jail sweep can enumerate every live queue without being handed the concrete
+      registry and thereby the ability to Register/Remove queues it has no business creating). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
       `Models/`). **`MergeBranchDiffService.cs`** (P2-47 #7 — `IMergeBranchDiffService`: the daemon-side
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`

@@ -292,8 +292,17 @@
     the pass instead of reading as "every jail vanished". `MAINGUARD_DISABLE_SESSION_RECONCILE=1` turns
     it off (the `Mainguard.Server.Tests` module initializer sets it — the Mac mirror root `~/mainguard`
     is not under `MAINGUARD_DATA_ROOT`, so an in-proc test daemon would otherwise adopt a developer's
-    real jails). Pinned by `Mainguard.Server.Tests/AgentSessionReconcileTests` +
-    `AgentSessionReconcileDockerTests`.
+    real jails). **ISSUES-LOG #24 — the pass now also sweeps every registered `IMergeQueueRegistry` queue
+    through `MergeQueue.ReconcileJails`, off the listing it already took** (a second Docker timer would
+    poll the engine twice for one fact and then have to decide which copy wins). Merge-queue rows had the
+    identical push-only defect: stopping an agent is not a queue transition and a jail dying out of band
+    is not one either, so entries kept reporting `Working` — with Verify enabled — about agents that had
+    not existed for days (found live: 15 such rows against ONE real container). The sweep moves **no merge
+    state**; it corrects the *jail-liveness axis* only, and its liveness rule is two-sided (Docker settles
+    what the engine can see; the session store settles the starting-container window the spawn path has
+    just written). Reported as `QueueStranded`/`QueueRecovered` on the report and in the `queue_stranded`/
+    `queue_recovered` audit fields. Pinned by `Mainguard.Server.Tests/AgentSessionReconcileTests` +
+    `AgentSessionReconcileDockerTests` + `MergeQueueJailReconcileDockerTests`.
   - **`Runtime/CoordinatorIpcServer.cs`** (PR3) — the coordinator→daemon spawn channel: one Unix-domain
     socket per coordinator served from a daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un
     limit) that also carries the executable `mainguard-agent` shim; the dir is created BEFORE the jail

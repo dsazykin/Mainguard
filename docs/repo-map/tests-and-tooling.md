@@ -969,6 +969,24 @@
   `Unresponsive` rather than leaving it claiming to work. Trivial `busybox` jails carrying the P2-07
   label set, scoped to the test's own minted agent id so a developer box with live jails on it is
   neither read nor written.
+- **`Mainguard.Tests/MergeQueueJailReconcileTests.cs`** — the unit tier of the merge queue's **jail-liveness
+  reconcile** (ISSUES-LOG #24): a `Working` entry whose jail is gone is stranded and its `CanMerge` wording
+  replaced (`StaleVerified`'s "re-verifying" promise too — the cascade needs a jail to keep it), a live
+  entry is untouched, a returning jail un-strands, only *transitions* are reported/audited/published (a
+  repeat pass over an unchanged world does nothing), a probe that throws means "no answer" not "no jail",
+  terminal entries and genuinely in-flight runs are skipped, a `Cancel`led id leaves no mark behind, and
+  the human Discard path stays intact. Two assertions carry the design decision itself: **merge state never
+  moves** (an automatic discard would make every stranded-but-recoverable entry permanently unrecoverable,
+  since `Discarded` is terminal and `EnsureEntry` cannot resurrect an id — `AgentResumeService` is the real
+  remedy), and liveness **is not persisted**, so a queue rebuilt over the same store comes back unmeasured.
+- **`Mainguard.Server.Tests/MergeQueueJailReconcileDockerTests.cs`** (`RequiresDocker`) — the same claim
+  with **Docker as the only witness**, driving the real `AgentSessionReconciler` over a real
+  `MergeQueueRegistry`: two real jails, one removed **out of band** (the way the field case happened, no
+  RPC in the loop) — within one pass the killed entry is stranded, the survivor is untouched, and the
+  stranded entry keeps its state, its persisted row and its place in `Agents`. Plus the recovery direction
+  (a real jail under the same identity un-strands it, so the pass is safe on a loop forever) and the
+  paused-jail case (Docker reports `"paused"` not `"running"`; reading liveness as `Running` would strand
+  every entry the kill switch had frozen).
 - **`Mainguard.Server.Tests/KillSwitchResumeDockerTests.cs`** (`RequiresDocker`) — **the emergency stop,
   proved reversible against a real container engine** (ISSUES-LOG #17). Every other kill-switch test runs
   over a fake `ISandboxEngine`, which is why the defect survived: Engage really did `docker pause` every

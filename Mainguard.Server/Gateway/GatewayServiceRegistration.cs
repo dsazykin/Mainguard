@@ -335,7 +335,12 @@ public static class GatewayServiceRegistration
                     sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)),
             audit: sp.GetRequiredService<IAuditLog>(),
             log: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
-                .CreateLogger<Runtime.AgentSessionReconciler>()));
+                .CreateLogger<Runtime.AgentSessionReconciler>(),
+            // ISSUES-LOG #24: the same pass also corrects merge-queue entries' jail-liveness, off the SAME
+            // listing. Passed here rather than given its own hosted service because the answer is the same
+            // answer — a second Docker timer would poll the engine twice for one fact and then have to
+            // decide which copy wins.
+            queues: sp.GetRequiredService<IMergeQueueRegistry>()));
         services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 

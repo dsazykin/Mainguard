@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -36,6 +38,17 @@ public interface IMergeQueueRegistry
 {
     /// <summary>The context for a repo handle, or null when no queue is active for it.</summary>
     MergeQueueContext? Resolve(string repoHandle);
+
+    /// <summary>
+    /// Every repo handle that currently has a live queue, as a snapshot.
+    ///
+    /// <para>On the READ interface deliberately. A sweep across every active queue — the ISSUES-LOG #24
+    /// jail reconcile is the first — is a reader, not a writer, and the alternative was to hand it the
+    /// concrete <see cref="MergeQueueRegistry"/> and thereby the ability to Register/Remove queues it has
+    /// no business creating. Nothing here can be resolved that <see cref="Resolve"/> would not also
+    /// resolve; this only says which handles those are.</para>
+    /// </summary>
+    IReadOnlyList<string> Handles();
 }
 
 /// <summary>A concurrent in-memory <see cref="IMergeQueueRegistry"/>. The daemon lifecycle registers a
@@ -46,6 +59,10 @@ public sealed class MergeQueueRegistry : IMergeQueueRegistry
 
     public MergeQueueContext? Resolve(string repoHandle) =>
         _byHandle.TryGetValue(repoHandle, out var ctx) ? ctx : null;
+
+    /// <summary>A point-in-time copy of the active handles — a sweep must not enumerate a dictionary a
+    /// concurrent provision is registering into.</summary>
+    public IReadOnlyList<string> Handles() => _byHandle.Keys.ToList();
 
     /// <summary>Registers (or replaces) the context for a repo handle.</summary>
     public void Register(string repoHandle, MergeQueueContext context) => _byHandle[repoHandle] = context;

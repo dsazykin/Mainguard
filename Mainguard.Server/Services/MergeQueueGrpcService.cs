@@ -547,9 +547,17 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 // a fact no client can derive. Keyed on (repo, agent) — an id is unique per repo and not
                 // globally, and answering from another repo's live `pr-7` would report a stranded entry
                 // as healthy, which is the precise failure that keeps it stranded.
-                HasLiveSandbox = _sessions.Find(
-                    new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
-                    ?.ContainerId is { Length: > 0 },
+                //
+                // ISSUES-LOG #24: the RECONCILED answer wins when there is one. The session store alone was
+                // wrong in both directions and stayed wrong — it is memory-only, so after a daemon restart
+                // every surviving entry read as jail-less until something re-spawned it; and a session the
+                // reconciler has marked Unresponsive keeps its container id, so a dead agent went on
+                // reporting a live sandbox and went on offering Verify. MergeQueue.ReconcileJails measures
+                // this against Docker every 30s and answers null only until its first pass, which is what
+                // the store is still consulted for.
+                HasLiveSandbox = queue.HasLiveJail(agentId)
+                    ?? (_sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
+                        ?.ContainerId is { Length: > 0 }),
             };
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));

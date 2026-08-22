@@ -4,6 +4,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Agents.Orchestrator;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -15,18 +16,30 @@ namespace Mainguard.Server.Runtime;
 /// <param name="Lost">Sessions whose jail is no longer running; marked so rather than left looking alive.</param>
 /// <param name="Skipped">True when Docker could not be read at all, so the pass changed nothing. This is
 /// NOT the same as "nothing to do", and conflating the two is how a reconcile turns into a mass reaping.</param>
+/// <param name="QueueStranded">ISSUES-LOG #24 — merge-queue entries whose sandbox this pass found gone,
+/// as <c>repo/agent</c>. No merge state moved; their liveness did.</param>
+/// <param name="QueueRecovered">Merge-queue entries whose sandbox came back, as <c>repo/agent</c>.</param>
 public sealed record AgentSessionReconcileReport(
     IReadOnlyList<string> Adopted,
     IReadOnlyList<string> Corrected,
     IReadOnlyList<string> Lost,
-    bool Skipped = false)
+    bool Skipped = false,
+    IReadOnlyList<string>? QueueStranded = null,
+    IReadOnlyList<string>? QueueRecovered = null)
 {
+    /// <summary>Merge-queue entries this pass marked stranded (never null).</summary>
+    public IReadOnlyList<string> QueueStranded { get; init; } = QueueStranded ?? Array.Empty<string>();
+
+    /// <summary>Merge-queue entries this pass un-stranded (never null).</summary>
+    public IReadOnlyList<string> QueueRecovered { get; init; } = QueueRecovered ?? Array.Empty<string>();
+
     /// <summary>The pass that could not run.</summary>
     public static AgentSessionReconcileReport Unavailable { get; } =
         new(Array.Empty<string>(), Array.Empty<string>(), Array.Empty<string>(), Skipped: true);
 
     /// <summary>True when the pass moved something (the log/audit threshold).</summary>
-    public bool Changed => Adopted.Count + Corrected.Count + Lost.Count > 0;
+    public bool Changed =>
+        Adopted.Count + Corrected.Count + Lost.Count + QueueStranded.Count + QueueRecovered.Count > 0;
 }
 
 /// <summary>
@@ -55,6 +68,15 @@ public sealed record AgentSessionReconcileReport(
 /// area already paid for once (see <see cref="SwarmReconcileTask"/>'s remarks). Stopped-but-present jails
 /// are also left alone on purpose: <c>DockerSandboxEngine</c> re-starts a persistent jail by name, so
 /// removing one would destroy a session that is designed to be resumable.</para>
+///
+/// <para><b>ISSUES-LOG #24 — the same gap, one component over.</b> <c>MergeQueueRow</c> state is push-only
+/// in exactly the way <c>AgentSession.State</c> was: stopping an agent is not a queue transition, and a jail
+/// dying out of band is not one either, so an entry keeps reporting <c>Working</c> — with Verify offered on
+/// it — about an agent that has not existed for days. Found live with 15 such rows against ONE real
+/// container. This pass now also sweeps every registered <see cref="IMergeQueueRegistry"/> queue through
+/// <see cref="MergeQueue.ReconcileJails"/>, <b>off the listing it already took</b>: a second timer polling
+/// Docker for the same answer would double the load on the engine to disagree with itself half the time.
+/// The queue sweep moves no merge state — see that method for why an automatic discard was rejected.</para>
 /// </summary>
 public sealed class AgentSessionReconciler
 {
@@ -66,6 +88,7 @@ public sealed class AgentSessionReconciler
     private readonly Func<string, bool> _ownsRepo;
     private readonly Mainguard.Git.Audit.IAuditLog? _audit;
     private readonly ILogger _log;
+    private readonly Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? _queues;
 
     /// <param name="store">The live session store this pass corrects.</param>
     /// <param name="listContainers">Lists the <c>mainguard.agent</c>-labelled containers. It is allowed —
@@ -81,18 +104,26 @@ public sealed class AgentSessionReconciler
     /// </param>
     /// <param name="audit">G-17 sink; optional so unit tests can drive the reconciler bare.</param>
     /// <param name="log">Milestone sink.</param>
+    /// <param name="queues">
+    /// ISSUES-LOG #24 — the merge queues whose entries' jail-liveness this pass also corrects, off the same
+    /// listing. Optional: null simply means the pass does only what it did before, which is what every unit
+    /// test that predates the queue sweep expects. Only queues this daemon has registered are visited, so
+    /// the ownership question <paramref name="ownsRepo"/> answers for adoption is already settled here.
+    /// </param>
     public AgentSessionReconciler(
         AgentSessionStore store,
         Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> listContainers,
         Func<string, bool>? ownsRepo = null,
         Mainguard.Git.Audit.IAuditLog? audit = null,
-        ILogger? log = null)
+        ILogger? log = null,
+        Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? queues = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _listContainers = listContainers ?? throw new ArgumentNullException(nameof(listContainers));
         _ownsRepo = ownsRepo ?? (_ => true);
         _audit = audit;
         _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
+        _queues = queues;
     }
 
     /// <summary>Runs one pass. Never throws: a reconcile that takes the daemon down is worse than a
@@ -210,24 +241,111 @@ public sealed class AgentSessionReconciler
             }
         }
 
-        var report = new AgentSessionReconcileReport(adopted, corrected, lost);
+        // ---- 3. Merge-queue entries whose jail is gone (ISSUES-LOG #24) -----------------------------
+        //
+        // Runs AFTER the session pass on purpose: step 2 has just moved every drifted session onto Docker's
+        // answer, so the liveness this reads is the corrected one rather than the stale word that made the
+        // queue wrong in the first place.
+        var (queueStranded, queueRecovered) = ReconcileQueues(byKey);
+
+        var report = new AgentSessionReconcileReport(adopted, corrected, lost)
+        {
+            QueueStranded = queueStranded,
+            QueueRecovered = queueRecovered,
+        };
+
         if (report.Changed)
         {
             _log.LogInformation(
-                "agent-session reconcile: adopted={Adopted} corrected={Corrected} lost={Lost}",
-                Describe(adopted), Describe(corrected), Describe(lost));
+                "agent-session reconcile: adopted={Adopted} corrected={Corrected} lost={Lost} "
+                + "queueStranded={Stranded} queueRecovered={Recovered}",
+                Describe(adopted), Describe(corrected), Describe(lost),
+                Describe(queueStranded), Describe(queueRecovered));
             _audit?.Append(new Mainguard.Git.Audit.AuditEvent(
                 ReconciledEvent, new Dictionary<string, string>
                 {
                     ["adopted"] = string.Join(",", adopted),
                     ["corrected"] = string.Join(",", corrected),
                     ["lost"] = string.Join(",", lost),
+                    ["queue_stranded"] = string.Join(",", queueStranded),
+                    ["queue_recovered"] = string.Join(",", queueRecovered),
                     ["when"] = DateTimeOffset.UtcNow.ToString(
                         "O", System.Globalization.CultureInfo.InvariantCulture),
                 }));
         }
 
         return report;
+    }
+
+    /// <summary>
+    /// ISSUES-LOG #24 — corrects the jail-liveness of every registered queue's entries against the listing
+    /// this pass already took. Returns the moves in each direction, as <c>repo/agent</c>.
+    ///
+    /// <para>The liveness rule is deliberately <b>two-sided</b>. Docker's own answer settles it for anything
+    /// the engine can see; the session store settles the one case it cannot, a container that exists but has
+    /// not reached Running yet. The spawn path writes the session synchronously and only THEN calls
+    /// <c>EnsureEntry</c>, so without that second arm a pass landing in the second after a spawn would
+    /// strand a brand-new entry and withhold Verify from it for the next thirty seconds. Non-destructive
+    /// either way — nothing here moves merge state — but wrong, and a reconcile that is briefly wrong about
+    /// fresh work is how people learn to distrust one.</para>
+    /// </summary>
+    private (IReadOnlyList<string> Stranded, IReadOnlyList<string> Recovered) ReconcileQueues(
+        IReadOnlyDictionary<AgentSessionKey, AgentContainerState> live)
+    {
+        if (_queues is null)
+        {
+            return (Array.Empty<string>(), Array.Empty<string>());
+        }
+
+        var stranded = new List<string>();
+        var recovered = new List<string>();
+
+        foreach (var handle in _queues.Handles())
+        {
+            var queue = _queues.Resolve(handle)?.Queue;
+            if (queue is null)
+            {
+                continue;
+            }
+
+            MergeQueueJailReport moved;
+            try
+            {
+                moved = queue.ReconcileJails(agentId =>
+                {
+                    var key = new AgentSessionKey(handle, agentId);
+                    if (live.TryGetValue(key, out var container) && container.Live)
+                    {
+                        return true;
+                    }
+
+                    // The starting-container window. A session carrying a container id whose state word is
+                    // not one of the lost/dead ones is the spawn path's own assertion, written a moment ago
+                    // and newer than any listing.
+                    var session = _store.Find(key);
+                    return session?.ContainerId is { Length: > 0 } && !IsAlreadyLost(session.State);
+                });
+            }
+            catch (Exception ex)
+            {
+                // A queue that threw is one queue; the rest of the sweep — and the session pass that
+                // already succeeded — must not be lost with it.
+                _log.LogDebug(ex, "merge-queue jail reconcile failed for repo {Repo}", handle);
+                continue;
+            }
+
+            foreach (var agentId in moved.Stranded)
+            {
+                stranded.Add($"{handle}/{agentId}");
+            }
+
+            foreach (var agentId in moved.Recovered)
+            {
+                recovered.Add($"{handle}/{agentId}");
+            }
+        }
+
+        return (stranded, recovered);
     }
 
     /// <summary>The state word for a jail Docker reports as scheduled.</summary>
