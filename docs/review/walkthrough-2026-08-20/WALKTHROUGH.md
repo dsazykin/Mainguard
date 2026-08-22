@@ -295,3 +295,39 @@ not chased further to avoid burning budget on pixel-hunting). Both are legitimat
 next leg. ISSUES-LOG #11 itself is left OPEN rather than marked fixed, since the exact original
 trigger for that specific incident is still not proven — only a strong, independently-real
 contributing-cause candidate is fixed.
+
+## Step 017 (this leg) — E7 happy path, D7-adjacent Verify-disabled discovery, E1/E3/E2 re-confirmed, E5 Reject via real clicks — new regression found
+
+Resumed into the fixed app (via a fresh `9bc9dfb`+`a972b02` build), then a follow-up `9baefdf`-generation
+runtime confirmed clean via `506a60e6...`'s full lifecycle. **Discovery, not a bug:** clicking **Verify**
+on a stranded queue entry (no live jail — all agent jails had been `docker rm -f`'d for a clean slate)
+is a correct, silent **disabled-button** no-op, not a broken click — confirmed by zooming into the
+button's rendering (visibly dimmer than Resume/Discard) and a 1.5s hover producing no tooltip at all.
+**Minor UX gap logged, not fixed:** the disabled state offers zero explanation on hover — a user who
+doesn't already know "Resume first" has no way to learn it from the UI itself.
+
+**Real click sequence performed successfully, screenshots 111-131:**
+- **Resume** (`115`) on `506a60e6...` (a queue entry whose branch still exists in the mirror,
+  confirmed via `git branch --list agent/*`) — `ResumeAgentAsync` RPC returns `resumed=True`, a live
+  jail spins up, Verify becomes enabled. **E7 happy path confirmed live for the first time** (only the
+  adversarial branch-deleted refusal had been UI-tested before this leg).
+- **Verify** (`118`) — `RunVerification` RPC returns `passed=True, state=Verified`. Row shows the
+  green check + `main@33c2f7cf64` / `verified against main@33c2f7cf` stamp (**E3 reconfirmed**).
+- **Review** (`123`) — cockpit opens with the real diff (`src/note-506a60e6.js`), `verified @ 33c2f7c`
+  in the header (E3 confirmed a SECOND way). Title still reads the raw GUID, not `Coordinator (...)`
+  — reconfirms **ISSUES-LOG #7**, unchanged, as expected (no coordinator was running for this agent).
+- **Reject** (`127`-`131`) — clicked Reject, got the two-step confirm UI ("Reject this branch?" +
+  optional reason field + Cancel, matching the spec exactly), typed a real reason via synthetic
+  keystrokes ("E5 live-UI test reject"), clicked the confirming Reject button. `RejectEntry` RPC
+  succeeds: `rejected=True, rejected_by=os:danielsazykin, rejected_at=...`. **E5 confirmed via real UI
+  clicks for the first time** (previously RPC-only).
+
+**New regression found and investigated (not fixed — see ISSUES-LOG #13):** after the successful
+Reject, the entry did not reappear as a `Rejected` row anywhere in the Merge Queue panel — it simply
+vanished. Confirmed this is NOT a stale-push issue: fully quit and relaunched the app+daemon (screenshots
+`133`-`136`, maximized the window to rule out any scroll/fold hiding) and the panel still shows zero
+Rejected rows on a cold snapshot, even though `sqlite3` confirms 2 Rejected rows persisted for this repo.
+Traced (without finding the exact drop point) through `MergeQueue.Agents`, `OrderForDisplay`,
+`ApplyQueueUpdate`, and `QueueRailViewModel.Refresh()` — none of the four explicitly filter Rejected.
+Logged in full in ISSUES-LOG #13, flagged for a dedicated follow-up investigation rather than a rushed
+fix, per this leg's standing instruction on complex/unclear bugs.
