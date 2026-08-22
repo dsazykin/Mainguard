@@ -63,6 +63,7 @@ public sealed class AgentSessionReconciler
 
     private readonly AgentSessionStore _store;
     private readonly Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> _listContainers;
+    private readonly Func<string, bool> _ownsRepo;
     private readonly Mainguard.Git.Audit.IAuditLog? _audit;
     private readonly ILogger _log;
 
@@ -70,16 +71,26 @@ public sealed class AgentSessionReconciler
     /// <param name="listContainers">Lists the <c>mainguard.agent</c>-labelled containers. It is allowed —
     /// required, even — to THROW when the engine is unreachable: an empty list from a down Docker would
     /// otherwise read as "every agent's jail vanished" and mark the whole swarm lost.</param>
+    /// <param name="ownsRepo">
+    /// Whether a jail's <c>mainguard.repo</c> hash names a repository <b>this</b> daemon hosts — i.e. one
+    /// whose bare mirror is under its own data root. Adoption is gated on it, and that gate is not
+    /// cosmetic: the container engine is machine-wide, so without it every daemon on the box would claim
+    /// every other daemon's jails. The in-proc test daemons run on isolated data roots and hoovered up a
+    /// developer's real running agent the moment this pass existed. The default owns everything, for the
+    /// unit tests that supply their own container list anyway.
+    /// </param>
     /// <param name="audit">G-17 sink; optional so unit tests can drive the reconciler bare.</param>
     /// <param name="log">Milestone sink.</param>
     public AgentSessionReconciler(
         AgentSessionStore store,
         Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> listContainers,
+        Func<string, bool>? ownsRepo = null,
         Mainguard.Git.Audit.IAuditLog? audit = null,
         ILogger? log = null)
     {
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _listContainers = listContainers ?? throw new ArgumentNullException(nameof(listContainers));
+        _ownsRepo = ownsRepo ?? (_ => true);
         _audit = audit;
         _log = log ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
     }
@@ -121,6 +132,13 @@ public sealed class AgentSessionReconciler
         foreach (var (key, container) in byKey)
         {
             if (!container.Live || _store.Find(key) is not null)
+            {
+                continue;
+            }
+
+            // Not this daemon's jail. Docker is machine-wide and the labels carry no daemon identity, so
+            // the only honest ownership test is whether we host the repository it belongs to.
+            if (!OwnsRepo(key.RepoHash))
             {
                 continue;
             }
@@ -241,6 +259,20 @@ public sealed class AgentSessionReconciler
     internal const string LostReason =
         "The jail is no longer running — Docker has no live container for this agent.";
 
+    /// <summary>Never lets an ownership probe (a filesystem stat, in production) fail the pass.</summary>
+    private bool OwnsRepo(string repoHash)
+    {
+        try
+        {
+            return _ownsRepo(repoHash);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(ex, "agent-session reconcile: ownership probe failed for repo {Repo}", repoHash);
+            return false;
+        }
+    }
+
     private static bool IsPaused(string state) =>
         string.Equals(state, PausedState, StringComparison.Ordinal);
 
@@ -270,6 +302,23 @@ public sealed class AgentSessionReconcilerService : BackgroundService
     /// the engine is not being polled for its own sake — the resource sampler already runs hotter.</summary>
     public static readonly TimeSpan Interval = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Set to <c>1</c> to keep this pass from running at all.
+    ///
+    /// <para><b>Why it exists.</b> The container engine is machine-wide, and the Mac substrate's mirror
+    /// root (<c>~/mainguard</c>) is NOT governed by <c>MAINGUARD_DATA_ROOT</c> — so an in-proc daemon on
+    /// an isolated data root still answers "yes, I host that repository" for a developer's real jails,
+    /// and adopts them into its own store. The <c>Mainguard.Server.Tests</c> module initializer sets this
+    /// alongside the data-root redirect for the same reason that one exists: a test daemon must not reach
+    /// into the machine's live state. Production coverage of this pass is the RequiresDocker tier, which
+    /// drives the reconciler directly against containers it created itself.</para>
+    /// </summary>
+    public const string DisableVariable = "MAINGUARD_DISABLE_SESSION_RECONCILE";
+
+    /// <summary>Whether the pass is switched off for this process.</summary>
+    public static bool Disabled =>
+        Environment.GetEnvironmentVariable(DisableVariable) == "1";
+
     private readonly AgentSessionReconciler _reconciler;
     private readonly ILogger<AgentSessionReconcilerService> _log;
 
@@ -285,6 +334,13 @@ public sealed class AgentSessionReconcilerService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        if (Disabled)
+        {
+            _log.LogInformation(
+                "agent-session reconcile disabled by {Variable}", DisableVariable);
+            return;
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

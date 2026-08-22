@@ -765,7 +765,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       completes on both, so the `AttachStdin` hang that forced `ExecStdinTransport.cs` onto a raw socket
       does not affect this endpoint)
     - `DockerAgentLister.cs` (P2-08: lists `mainguard.agent`-labelled containers → `AgentContainerState`
-      for the swarm reconciler — Docker as the sole liveness truth). Seccomp/proxy images live under
+      for the swarm reconciler — Docker as the sole liveness truth. It also owns the label-name constants
+      the jail is stamped with: `mainguard.kind` and `mainguard.agent.role` were added for ISSUES-LOG #18
+      because the daemon's live session store is in-memory, so after a restart the labels are the ONLY
+      record of what an agent IS and a surviving coordinator was otherwise adopted back as an anonymous,
+      role-less worker. `mainguard.agent.role` is deliberately not `mainguard.role`, which already means
+      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. The record now also
+      carries `Paused` and a computed `Live` (`Running || Paused`): Docker reports a frozen container as
+      `"paused"`, not `"running"`, so reading `Running` as "still here" made a daemon restart during an
+      engaged kill switch declare the agent dead and force-remove its worktree). Seccomp/proxy images live under
       `images/` (built in CI, never at runtime). **MG-42 — per-repo verification toolchain** (the curated
       base image has no .NET/Rust/JDK/Ruby/PHP, so the merge queue could not verify Mainguard's own repo,
       nor most languages the product targets): `ToolchainCatalog.cs` (the **closed, product-owned** set of

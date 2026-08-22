@@ -275,6 +275,25 @@
     human unpause is refused while a machine hold is outstanding (self-clearing, seconds). Refusals
     are answers, not exceptions. Pinned by `Mainguard.Server.Tests/AgentPauseTests` (incl. a real
     docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
+  - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
+    (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
+    startup and every 30 s. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
+    what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
+    restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
+    run outside the app left a stale state word standing indefinitely. This pass: adopts a live jail with
+    no session record (kind + orchestration role read off its own `mainguard.kind` /
+    `mainguard.agent.role` labels), corrects the **pause axis only** toward Docker (never flattening
+    `RateLimited`/`Yielding`/`AwaitingReview` to `Working`), and marks a session whose container is gone
+    `Unresponsive` with the reason. It destroys nothing — no container is ever stopped or removed, and a
+    stopped-but-present persistent jail is left alone because the engine re-starts those by name.
+    Adoption is gated on `ownsRepo` (this daemon hosts the repository's bare mirror), since the container
+    engine is machine-wide; the lister is deliberately allowed to THROW so an unreachable engine skips
+    the pass instead of reading as "every jail vanished". `MAINGUARD_DISABLE_SESSION_RECONCILE=1` turns
+    it off (the `Mainguard.Server.Tests` module initializer sets it — the Mac mirror root `~/mainguard`
+    is not under `MAINGUARD_DATA_ROOT`, so an in-proc test daemon would otherwise adopt a developer's
+    real jails). Pinned by `Mainguard.Server.Tests/AgentSessionReconcileTests` +
+    `AgentSessionReconcileDockerTests`.
   - **`Runtime/CoordinatorIpcServer.cs`** (PR3) — the coordinator→daemon spawn channel: one Unix-domain
     socket per coordinator served from a daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un
     limit) that also carries the executable `mainguard-agent` shim; the dir is created BEFORE the jail

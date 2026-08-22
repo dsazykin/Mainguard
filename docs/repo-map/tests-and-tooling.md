@@ -945,6 +945,23 @@
   rather than copied: the verify command and marker are what the assertions compare against, so two
   copies would drift and the stale one would assert provenance against a command the repo no longer
   declares).
+- **`Mainguard.Server.Tests/AgentSessionReconcileTests.cs`** — the unit tier of the live session store's
+  reconcile against Docker (ISSUES-LOG #18/#20): adoption with the jail's kind/role, the pause-axis-only
+  correction (a `RateLimited` agent stays `RateLimited`), `Unresponsive` when the container is gone, the
+  `(repo, agent)` keying that keeps two repos' `pr-7` apart, idempotence, the ownership gate, and the one
+  that matters most — an unreachable container engine must change **nothing**, never read as "every jail
+  vanished". Also pins the sibling half in the two older reconcilers: a *paused* container is `Live`, so
+  a daemon restart during an engaged kill switch no longer declares the agent dead, force-removes its
+  worktree and reaps its PTY.
+- **`Mainguard.Server.Tests/AgentSessionReconcileDockerTests.cs`** (`RequiresDocker`) — the same claims
+  with **Docker as the only witness**, from an empty store (what a daemon restart really leaves behind):
+  a live labelled jail is adopted with its kind/role/container id; an out-of-band `docker pause` then
+  `docker unpause` is followed in both directions (#20's exact repro — the daemon called an agent
+  `Paused` for 20+ minutes after a raw unpause had made it run again); a jail that was frozen when the
+  daemon died is adopted **as paused** rather than lost; and a removed container turns its session
+  `Unresponsive` rather than leaving it claiming to work. Trivial `busybox` jails carrying the P2-07
+  label set, scoped to the test's own minted agent id so a developer box with live jails on it is
+  neither read nor written.
 - **`Mainguard.Server.Tests/KillSwitchResumeDockerTests.cs`** (`RequiresDocker`) — **the emergency stop,
   proved reversible against a real container engine** (ISSUES-LOG #17). Every other kill-switch test runs
   over a fake `ISandboxEngine`, which is why the defect survived: Engage really did `docker pause` every
@@ -1147,6 +1164,16 @@
   "Nothing queued" mid-session with every daemon row intact and every other RPC still succeeding; the
   agent pump's reconnect had a regression test and the queue pump's did not. These pin it via the
   `QueueStreamOverride` seam — the exact analogue of `AgentEventStreamOverride`)**,
+  **`CoordinatorProjectionRepairTests` (ISSUES-LOG #19: the Coordinator panel read "No coordinator
+  running" while the daemon's own `ListAgents` answered `role=coordinator` for that agent once a minute
+  for 20+ minutes — to this same client, on a call whose answer was thrown away except for the ids. The
+  projection is fed only by `StreamAgentEvents`, whose deltas carry neither kind nor role, so a delta for
+  an unseen agent fabricates a ROLE-LESS placeholder and the one repair call gave up permanently on a
+  single failure. These pin the repair through the new `AgentListOverride` seam: a role-less placeholder
+  is healed from the listing, an empty snapshot is confirmed against it rather than trusted, the listing
+  fixes role/kind but never rewinds state or wipes a Dead agent's exit tail, the minute-ly login-harvest
+  sweep repairs the projection with no agent event at all, and a merge never removes an agent it does not
+  mention)**,
   **`EgressAllowlistReachabilityTests` (the allowlist editor reads/writes the live gateway, reports an
   unreachable daemon instead of rendering an empty policy, and is reachable both at rest — the
   coordinator toolbar — and from the block prompt)**,

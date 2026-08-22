@@ -79,6 +79,16 @@ public sealed class DaemonBackedOrchestrator :
     internal Func<string, CancellationToken, IAsyncEnumerable<Proto.QueueUpdate>>? QueueStreamOverride { get; set; }
 
     /// <summary>
+    /// Test seam: the authoritative <c>ListAgents</c> answer <see cref="MergeAgentListing"/> folds in.
+    /// Never set in production, where it is <c>DaemonClient.ListAgentsAsync</c>.
+    ///
+    /// <para>It exists because the property under test is the ISSUES-LOG #19 repair itself: that a
+    /// projection which has lost an agent's ROLE — the one field no delta ever carries — gets it back
+    /// from the listing, rather than stranding a live coordinator as an anonymous worker forever.</para>
+    /// </summary>
+    internal Func<CancellationToken, Task<IReadOnlyList<Proto.AgentInfo>>>? AgentListOverride { get; set; }
+
+    /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
     /// keychain. A minute is a compromise: each sweep is one <c>ListAgents</c> plus one read-only
     /// <c>HarvestAgentCredentials</c> per agent (a <c>base64</c> of a few small files inside the jail),
@@ -999,7 +1009,7 @@ public sealed class DaemonBackedOrchestrator :
         IReadOnlyList<Proto.AgentInfo> listed;
         try
         {
-            listed = await _client.ListAgentsAsync(_cts.Token).ConfigureAwait(false);
+            listed = await ListAgentsFromDaemonAsync(_cts.Token).ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -1035,6 +1045,10 @@ public sealed class DaemonBackedOrchestrator :
     /// <para>A merge never deletes — removal stays the snapshot's job (and a stop's own delta), so a
     /// listing that raced a spawn cannot make a live agent disappear.</para>
     /// </summary>
+    /// <summary>The authoritative listing, through the test seam when one is set.</summary>
+    private Task<IReadOnlyList<Proto.AgentInfo>> ListAgentsFromDaemonAsync(CancellationToken ct) =>
+        AgentListOverride is { } listing ? listing(ct) : _client.ListAgentsAsync(ct);
+
     /// <returns>True when something changed, so the caller can raise <see cref="Changed"/>.</returns>
     private bool MergeAgentListing(IReadOnlyList<Proto.AgentInfo> listed)
     {
@@ -1157,7 +1171,7 @@ public sealed class DaemonBackedOrchestrator :
         IReadOnlyList<Proto.AgentInfo> listed;
         try
         {
-            listed = await _client.ListAgentsAsync(ct).ConfigureAwait(false);
+            listed = await ListAgentsFromDaemonAsync(ct).ConfigureAwait(false);
         }
         catch (Exception)
         {

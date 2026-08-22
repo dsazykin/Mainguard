@@ -326,6 +326,13 @@ public static class GatewayServiceRegistration
                 using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
                 return await DockerAgentLister.ListAsync(docker, ct).ConfigureAwait(false);
             },
+            // Ownership: a jail belongs to this daemon iff this daemon hosts its repository's bare
+            // mirror. The container engine is machine-wide and the labels carry no daemon identity, so
+            // without this every daemon on the box would adopt every other one's jails — which the
+            // in-proc test daemons demonstrated immediately by claiming a developer's live agent.
+            ownsRepo: repoHash => !string.IsNullOrEmpty(repoHash)
+                && System.IO.Directory.Exists(
+                    sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)),
             audit: sp.GetRequiredService<IAuditLog>(),
             log: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
                 .CreateLogger<Runtime.AgentSessionReconciler>()));
