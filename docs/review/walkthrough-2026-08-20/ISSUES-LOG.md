@@ -687,7 +687,7 @@ the next leg for completeness, but not a gap in the fix.
   (no DECSTBM scroll regions, no insert/delete line, no alt screen — see `docs/repo-map/mainguard-app-shell.md`)
   can produce on their own. #5 is left OPEN deliberately; it needs its own look, not a claimed fix.
 
-### 23. [OPEN, HIGH] A coordinator "left running" from a prior session gets permanently stuck on "Still starting the coordinator"
+### 23. [CLOSED — commit `ce3eb056`] A coordinator "left running" from a prior session gets permanently stuck on "Still starting the coordinator"
 - **Step:** 022 (2026-08-23 leg, screen-unlock resume)
 - **Repro:** reopened the app after several real days idle (app/daemon processes survived, PID 59432/59441
   unchanged since 2026-08-20 18:52). Navigated to the Coordinator panel for `e2e-fixture` and it showed:
@@ -728,3 +728,77 @@ the next leg for completeness, but not a gap in the fix.
   coordinator to continue the walkthrough, rather than force-tearing-down what might be a real, intentionally-
   preserved OAuth session.
 - Screenshot: `007-coordinator-attempt2.png`, `008-restart-clicked.png` (identical, confirming Restart's no-op).
+
+
+### CLOSED — commit `ce3eb056`. The hypothesis above was RIGHT about the shape and wrong about where the data stops: the panel's signal is an EVENT, and the event is gone because the terminal really is unrecoverable
+
+- **Not the same bug as #19, but the same family.** #19 was a client projection missing a *field* (role).
+  Here the projection is perfect — `IsCoordinatorLive` is true, the agent id renders, Stop/Restart are
+  enabled. What is stuck is one derived boolean:
+  `ControlCenterViewModel.UpdateConnecting()` computed
+  `IsCoordinatorConnecting = IsStartingCoordinator || (IsCoordinatorLive && CoordinatorTerminal is
+  { HasReceivedOutput: false })` — i.e. **"has the coordinator come up?" was answered solely by the
+  terminal's first drawn PTY frame.** That is an event, and an event only fires while you are watching.
+- **And the event genuinely never comes for this agent — the daemon side is not innocent after all.**
+  The `ListAgents`/`spawn.log` evidence in the original entry is correct but was read one step short. The
+  app process and the DAEMON both restarted together at 16:52 UTC (PIDs 59432/59441, the Pro head owns
+  its daemon child) — `agentsessionreconciler.log` records the restart precisely:
+  `16:52:30 agent-session reconcile: adopted=3cd48ab2…,f1574a0b…`. #18's reconciler adopts the surviving
+  jails back into the session store, which is exactly why `ListAgents` kept answering correctly. **The
+  terminal cannot be adopted with them.** The CLI runs under `docker exec -it` beneath a daemon-side
+  forkpty; that PTY died with the old daemon, the in-jail `claude` keeps running with its output going
+  nowhere, and the Docker API has no re-attach for a running exec. So the ring in `BoundTerminalSession`
+  is gone too — there is nothing left to replay.
+- **What the attach then did was the actual defect.** `TerminalGrpcService.Attach` found no bound
+  session, no pending bind, and fell through to the P2-02 **echo**, which writes *nothing at all* until
+  the user types. `rpc.log` shows it exactly: **one** `TerminalService/Attach` from the app at
+  `16:52:30.86` (0.3 s after the reconcile), still open six hours later, having emitted zero frames —
+  and terminal.log's "never bound again" is the same fact from the other side. Silence forever ⇒
+  `HasReceivedOutput` false forever ⇒ connecting forever ⇒ the 45 s watchdog's stall banner, forever.
+  The adoption reason the reconciler writes ("Adopted after a daemon restart — this jail was already
+  running.") made it worse: it lands in `AgentInfo.Detail`, which the loader renders as *launch
+  progress* and which re-arms the watchdog on the **20-minute** working budget.
+- **Fixed in both halves, because either alone leaves a lie on screen:**
+  1. *Daemon* — an attach for an agent the session store KNOWS, with no CLI bound and none coming, now
+     writes `TerminalGrpcService.DetachedNotice` in one unprompted frame and **discards** input instead
+     of echoing it (a terminal that types back looks like it is talking to a CLI while reaching
+     nothing). Ids the daemon has never heard of keep the P2-02 echo — this is a statement about a
+     session we hold, not a catch-all.
+  2. *Client* — `CoordinatorHasStarted` is derived from the coordinator's **current polled state**
+     (live and past `Requested`/`PlanPending`/`Provisioning`), alongside — not instead of — the live
+     first-frame event, so a session we did not watch start still reads as started. The stalled card
+     splits on it: the toolchain-build copy stays for a coordinator that really is still coming up, and
+     a started one gets an honest *"The coordinator is running — its terminal isn't attached"* card
+     **with Restart on it**. A running session's `Detail` is no longer rendered as launch progress nor
+     allowed to buy the 20-minute budget.
+- **Restart's "no-op" was two different things, and only one of them was real.** The real one: `Restart`
+  is stop-then-start, and the start leg `return`ed silently when `SelectedCli` was null — *after* the
+  stop leg had already torn the coordinator down — and the CLI picker is HIDDEN while a coordinator is
+  live, so nothing on screen could set it. That is fixed (falls back to the installed CLI; says why when
+  there is none) and pinned by two tests. The observed one is **not reproducible**: this leg clicked
+  Restart on the very same stuck agent and it worked first time — `rpc.log` shows
+  `StopAgent{agent_id=3cd48ab2…}` → OK → `SpawnAgent` → OK, 1.9 s apart. The original click produced
+  **zero RPCs of any kind**, which no code path explains (the stop leg fires before any CLI lookup), so
+  the most likely explanation is that the click missed the button — note the original entry cites
+  screenshots `007`/`008`, which are unrelated files; the real capture is
+  `168-restart-clicked-no-effect-issue23.png`.
+- **Verified live against the original stuck coordinator, not just by test.** Rebuilt the Release output
+  the bundle symlinks, killed app + daemon (jails left running — the exact repro), relaunched, reopened
+  the repo, opened the Coordinator panel: the panel binds `agent 3cd48ab2bc1b4678b475749f8e9521dc` and
+  its terminal renders the notice immediately, with **no spinner and no stall banner**
+  (`169-issue23-fixed-detached-terminal-notice.png`). Then clicked **Restart** in the header: the old
+  jail was stopped, a fresh coordinator (`1302d3c0feeb40db8e321729eb0fbabb`) spawned, and its terminal
+  drew the real Claude Code banner — **already signed in** ("Welcome back Daniel!"), so the preserved
+  OAuth login survived the teardown intact via the login-harvest sweep
+  (`170-issue23-restart-recovers-fresh-coordinator.png`). The fresh-spawn loader path is unchanged.
+- **Pinned by** `Mainguard.Server.Tests/TerminalDetachedAttachTests` (notice on a known unbound agent,
+  input discarded not echoed, unknown id still echoes), the rewritten
+  `AgentCliWiringTests.UnprovisionedRepo_StaysSessionOnly_AttachSaysThereIsNoTerminal`, and six new
+  cases in `Mainguard.Tests/CoordinatorCliStartTests` — including the exact repro shape (*a coordinator
+  already `Working` the first time the projection sees it reads as started*), its non-vacuous inverse
+  (a `Provisioning` one still reads as not-started), and both Restart legs.
+- **The durable fix this does NOT do:** re-attachable agent terminals. As long as the CLI is a bare
+  `docker exec -it` under a daemon-owned PTY, a daemon restart destroys that terminal permanently and
+  the only honest answer is to say so. Running the in-jail CLI under a multiplexer inside the sandbox
+  (dtach/tmux, or the socket the `SessionLeader`'s unused `SocketPath` field already anticipates) would
+  make a restart survivable end-to-end. Worth its own item; it is an architecture change, not a bug fix.
