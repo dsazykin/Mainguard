@@ -802,3 +802,91 @@ the next leg for completeness, but not a gap in the fix.
   the only honest answer is to say so. Running the in-jail CLI under a multiplexer inside the sandbox
   (dtach/tmux, or the socket the `SessionLeader`'s unused `SocketPath` field already anticipates) would
   make a restart survivable end-to-end. Worth its own item; it is an architecture change, not a bug fix.
+
+## 24. [OPEN, HIGH — architectural, same shape as #18/#20 but in a different component] MergeQueueRows persist stale "Working" state indefinitely with no reconciliation against real Docker jails
+
+- **Repro**: on this live, days-old daemon (system clock 2026-08-20 → 2026-08-23 idle survival), the
+  Merge Queue rail read **"10 in play"** with 5+ distinct agent ids all shown `Working`
+  (`d20687c6714c4818965c9c7fe7a28828`, `757e46572db6442f9a22319f4d3e085b`,
+  `2664ef9b52e14e1d9af67fc9e6d3c09a`, `fa6cfcba128c40a38c276436d9258a9b`,
+  `ba2809387bae47b4a332c0f4fe951156`, plus more below the fold) — screenshots
+  `171-app-activated-state.png` through `185-stop-coordinator-confirmed.png` all show this panel.
+- **Ground truth, checked directly, not inferred**: `docker ps -a --filter label=mainguard.role=agent`
+  shows exactly **one** real agent container on the whole machine
+  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`, up 9h) — none of the five ids above. The
+  daemon's own `~/.mainguard/mainguard-daemon.db`, table `MergeQueueRows`, confirms this is not a UI
+  cache problem: querying those five ids directly returns `State='Working'` for every one of them, with
+  `UpdatedUtc` timestamps all dated **2026-08-20** — i.e. three real days stale, never touched since.
+  A full tally of the table: `15 Working · 7 Merged · 4 Discarded · 3 Rejected · 1 Verified` — **15 of
+  30 total rows are `Working` with, at most, one live container to back any of them.**
+- **This is the same architectural gap as #18/#20 (daemon state drifts from Docker reality, nothing
+  brings it back), but in a different component.** `67b9cc1f`'s `AgentSessionReconciler` fixed exactly
+  this problem for `AgentSessionStore` (what `ListAgents`/Resource Monitor/kill switch read from) — and
+  it visibly works: the Resource Monitor for this same session correctly shows only **4 agents**, 3
+  correctly `TornDown` and 1 correctly `Working` (the real container, labeled `unknown` per the
+  already-documented role-label gap). **`MergeQueueRows` was never wired into that reconciler or given
+  one of its own.** The merge queue's "is this really still running" belief is apparently permanent
+  once written, unless something explicitly transitions it (Verify/Merge/Reject/Discard) — a vanished
+  container has no such path back to a terminal state.
+- **Likely real-world impact, not just a stale-count cosmetic issue**: every one of these 15 phantom
+  `Working` rows renders live `Verify`/`Resume`/`Discard` buttons in the UI (see the same screenshots) —
+  a user could click `Verify` on an entry with zero backing jail and get an unexplained failure, or
+  `Resume` and get whatever `BringLocal`/resume path does against a branch ref that may or may not still
+  exist. This plausibly explains user-visible confusion of exactly the "the queue doesn't match reality"
+  shape that started this whole testing pass, independent of the specific bugs (#11, #13, #18-20)
+  already found and fixed.
+- **Not fixed this leg** — per the model-tier instruction, this needs the same class of careful,
+  ground-truth-driven work as #18/#20 (decide the reconciliation policy: does a vanished container mean
+  the entry should transition to some new terminal/error state, get re-queued, or something else — this
+  is a real product decision, not just plumbing) and should not be improvised quickly. **Flagged for a
+  dedicated Opus/Fable pass**, with this entry's exact evidence (the 5 ids, the DB query, the docker
+  ground truth) as its starting point. Concrete next step: find whichever component owns `MergeQueueRows`
+  writes (`Mainguard.Agents/Agents/Orchestrator/MergeQueue.cs` and its provisioner) and give it the same
+  treatment `AgentSessionReconciler` gave `AgentSessionStore` — reconcile against Docker on a timer,
+  decide and implement what a vanished-container `Working` row should become.
+
+## 25. [OPEN, minor — matrix row G1] Right-clicking a Merge Queue row produces no context menu
+
+- Right-clicked a live queue row (`swift rclick.swift`, real `rightMouseDown`/`rightMouseUp` CGEvents at
+  the row's real screen coordinates, confirmed by cross-checking the window's accessibility-reported
+  position) — no context menu appeared, no visible change at all (`186-rightclick-queue-row.png`).
+- Not chased further this leg (time budget) to determine whether: (a) queue rows simply have no
+  right-click menu by design (all actions are the visible Verify/Resume/Discard buttons, which would
+  make this a non-issue and G1's "the actual right-click context-menu pause" refers to a different
+  surface entirely — e.g. a coordinator/agent row elsewhere, not the merge-queue rail), or (b) a context
+  menu exists but wasn't hit due to a coordinate or hit-testing problem. Needs a deliberate look at
+  wherever pause is actually meant to be triggered by right-click, if that surface exists at all — grep
+  for `ContextMenu`/`ContextFlyout` in the Agents.UI views before assuming this is a real gap.
+
+## 26. [Confirmed via real UI click] G4 — Stop coordinator, full flow
+
+- Clicked the real "Stop coordinator" button (after first miscalculating the click point as an absolute
+  screen coordinate instead of window-relative + window-origin — corrected via `System Events`'s
+  reported window position, a reusable lesson for future legs: **always re-derive `window origin +
+  relative point` fresh, never assume a screen position holds across app activations**, since this
+  session the window moved from X=449 to X=216 between two activations of the same app).
+- Correctly showed a confirmation dialog first: *"Stop the coordinator? This terminates the
+  coordinator's CLI and its sandbox. Anything running in its terminal ends; its sub-agents keep running
+  until you stop them."* (`184-stop-coordinator-correct-coords.png`) — accurate, honest copy.
+- Confirmed: the coordinator panel cleanly returned to the CLI-picker/"Start coordinator" empty state,
+  and — verifying the dialog's own claim — the Merge Queue's entries were untouched, still showing their
+  prior state immediately after (`185-stop-coordinator-confirmed.png`). Matrix row G4 is now UI-click-
+  verified for the coordinator-stop half. (Note: this session's queue rows turned out to be the stale
+  #24 entries, not real live sub-agents, so "sub-agents keep running" wasn't independently re-provable
+  against a real container this leg — but the panel behavior itself is correct regardless.)
+
+## 27. [Confirmed via real UI click] H7 — remaining two themes (Atelier, System)
+
+- Both selected via `System Events` menu-item clicks (`View > Theme > …`), which proved more reliable
+  than raw CGEvent clicks for submenu tracking (a raw CGEvent click on "Atelier" visually looked like a
+  no-op — see below — while the accessibility-driven click was unambiguous).
+- **Atelier**: confirmed applied via pixel sampling, not just eyeballing — chrome/sidebar background
+  measurably shifted from Midnight Loom's cool `rgb(25,28,33)` to a warm dark `rgb(34,31,27)`
+  (`176`/`178`/`179-atelier-via-systemevents.png`). Worth a note for future legs: Atelier and Midnight
+  Loom are both dark themes close enough in value that a quick visual glance can miss the switch
+  entirely — pixel-sample, don't just eyeball, when confirming theme changes between two dark themes.
+- **System**: confirmed correctly following the OS's current Dark appearance
+  (`defaults read -g AppleInterfaceStyle` → `Dark`; app chrome rendered at Midnight-Loom-equivalent
+  `rgb(25,28,33)`, screenshot `180-system-theme.png`).
+- **All 4 themes + System are now UI-click-verified** across this and earlier legs (Daylight Loom,
+  Graphite from an earlier leg's #16; Atelier and System this leg). H7 is CLOSED as a matrix row.

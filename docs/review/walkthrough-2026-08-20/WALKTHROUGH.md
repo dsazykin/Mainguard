@@ -522,3 +522,53 @@ a clean, fully-documented boundary rather than rushing the remaining #22 live-cl
 still-gapped matrix rows (E6, D2/D4/D5, C2/C3, G1 context-menu, G4, H2/H4/H6, I2, B1, H7's remaining 2
 themes) without adequate care. Next leg should pick up with a fresh coordinator spawn for #22's final live
 confirmation, then continue down the gapped-rows list.
+
+## Step 023 (2026-08-23, continuation) — H7 fully closed, G4 confirmed live, and a significant new architectural finding (#24) on stale merge-queue state
+
+The app (PID 59432/64785 across relaunches) and daemon had survived idle since the last leg. The app
+window itself needed `osascript activate` to become onscreen again (`171`) — not a repeat of #14 (the
+process was never windowless, the window just wasn't the active one), and a useful reusable fact: **this
+app's window position is not stable across activations** — it moved from X=449 to X=216 between two
+`activate` calls in this same leg, which caused a real self-inflicted coordinate bug (below).
+
+**H7 (themes) fully closed.** Selected Atelier and System via `View > Theme` — a raw CGEvent click on
+the "Atelier" submenu item looked like a complete no-op by eye (`176`/`178`), but pixel-sampling the
+chrome background (`rgb(25,28,33)` → `rgb(34,31,27)`) proved it had actually applied; two dark themes
+can be close enough in value to fool a visual check. Switched to `System Events` menu-item clicks for
+reliability going forward and confirmed both Atelier and System (which correctly follows the OS's Dark
+appearance) unambiguously (`179`, `180`). All 4 themes + System are now real-click-verified across this
+and the H7-opening leg.
+
+**G4 (Stop coordinator) confirmed live**, after a genuine self-inflicted bug: calculated the "Stop
+coordinator" button's screen position once from an early screenshot and reused it as an absolute
+coordinate — but it's a window-relative position, and the window had since moved. First click landed
+harmlessly on empty chrome (or triggered an unrelated repo auto-fetch on activate); recalibrated via
+`System Events`'s reported window origin (`216,196`) + the button's relative point, which landed
+correctly. Confirmation dialog copy is accurate (explicitly says sub-agents keep running); confirmed the
+panel returns to the CLI-picker empty state and the queue rows are untouched by the stop
+(`184`, `185`).
+
+**New finding, HIGH, architectural (ISSUES-LOG #24):** while checking the Resource Monitor for a G1
+context-menu test, noticed it reported only 4 tracked agents while the Merge Queue rail claimed "10 in
+play." Checked ground truth: `docker ps -a` shows exactly **one** real agent container on the machine;
+the daemon's own `MergeQueueRows` table shows **15 rows** stuck in `Working`, all dated 2026-08-20 (three
+days stale), for agent ids with no backing container at all. This is the same shape of bug as the
+already-fixed #18/#20 (daemon state drifting from Docker reality with no reconciliation) but in a
+**different component** — the `AgentSessionReconciler` from `67b9cc1f` only wired into `AgentSessionStore`
+(what the Resource Monitor correctly reads), not `MergeQueueRows`. Every one of the 15 phantom rows still
+renders live Verify/Resume/Discard buttons. Not attempted this leg — flagged for a dedicated Opus/Fable
+pass with the exact evidence trail (agent ids, DB query, docker output) recorded in the log entry.
+
+**G1 (right-click context menu)**: right-clicked a live queue row with real CGEvents at verified
+coordinates — no context menu appeared. Not chased further; logged as ISSUES-LOG #25, needs a
+deliberate check of whether queue rows have a context menu at all or whether G1's pause affordance lives
+on a different surface entirely.
+
+**Matrix coverage after this leg**: E1-E5, E7, G3, G4 (stop half), H7 (all 4 themes + System), I1 (both
+halves) now UI-click-verified. Still gapped: E6, D2/D4/D5, C2/C3, G1 (needs a real answer, not just a
+failed attempt), H2/H4/H6, I2, B1. New: #24 (HIGH, needs dedicated fix pass), #25 (minor, needs
+investigation).
+
+Stopping here — this leg found one significant new architectural issue that deserves the same careful
+treatment as #18-20 rather than a rushed fix, plus closed out H7 and G4 cleanly. Next leg should pick up
+with G1's real answer, then the remaining D/C/H/I/B rows.
