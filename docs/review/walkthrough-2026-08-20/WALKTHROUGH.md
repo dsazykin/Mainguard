@@ -494,3 +494,31 @@ D2/D4/D5, C2/C3, G1 (context-menu), G4, H2/H4/H6, I2, B1 (BYOK isolation specifi
 Stopping here at a clean, fully-committed boundary — the terminal investigation (diagnosis, fix,
 regression test, live verification, and writing up the follow-on garbling finding) consumed this leg's
 budget; no attempt was made at the remaining gapped rows.
+
+## Step 022 (2026-08-23, screen-unlock resume) — automation confirmed working, #22 partially re-verified via live repro, new HIGH bug found on the Coordinator panel
+
+Real days had passed since the last leg (system clock 2026-08-20 → 2026-08-23); the app (PID 59432) and
+daemon (PID 59441) both survived idle the whole time. Confirmed GUI automation works cleanly now that the
+screen is unlocked — an AppleScript `System Events click at {x,y}` correctly hit the "Reopen Last
+Repository?" dialog's Reopen button on the first recalibrated attempt (`166`), fully corroborating the
+prior leg's diagnosis that the screen lock, not a permission or app regression, was the sole blocker.
+
+Navigated to the Coordinator panel for the reopened `e2e-fixture` repo and found it showing **"Still
+starting the coordinator"** (`167`) — clicked **Restart**, no visible change (`168`). Investigated against
+ground truth rather than assuming it was a stuck build: `docker ps`/`docker top` showed the underlying
+container (`3cd48ab2…`) genuinely alive and running a real `claude` process with 2:22 of accumulated CPU
+time; `~/.mainguard/logs/rpc.log` showed the daemon's own `ListAgents` correctly and continuously reporting
+`state=Working, role=coordinator` for it the entire time (once a minute, from the client's own login-harvest
+sweep); `spawn.log` showed the daemon explicitly logging `(agent left running)` on every harvest — this
+looks like the tail end of an earlier leg's real-CLI OAuth session, deliberately preserved rather than torn
+down. So the daemon has had the correct answer the whole time; the Coordinator panel's own "has this started"
+signal is what's stuck. Logged as **ISSUES-LOG #23 (HIGH, OPEN)** — not fixed this leg (client-side binding
+investigation, same complexity class as #19), flagged for a dedicated Opus/Fable pass. Worked around by
+leaving that coordinator alone (it may be a real, worth-preserving OAuth session) and continuing with a fresh
+scripted coordinator instead of tearing it down.
+
+Given the budget this investigation and its careful, ground-truth-checked write-up consumed, stopping here at
+a clean, fully-documented boundary rather than rushing the remaining #22 live-click re-verification and the
+still-gapped matrix rows (E6, D2/D4/D5, C2/C3, G1 context-menu, G4, H2/H4/H6, I2, B1, H7's remaining 2
+themes) without adequate care. Next leg should pick up with a fresh coordinator spawn for #22's final live
+confirmation, then continue down the gapped-rows list.

@@ -686,3 +686,45 @@ the next leg for completeness, but not a gap in the fix.
   finding — but #5 was observed on a LIVE coordinator over ~40 s, which the interim engine's known Ink/Yoga gaps
   (no DECSTBM scroll regions, no insert/delete line, no alt screen — see `docs/repo-map/mainguard-app-shell.md`)
   can produce on their own. #5 is left OPEN deliberately; it needs its own look, not a claimed fix.
+
+### 23. [OPEN, HIGH] A coordinator "left running" from a prior session gets permanently stuck on "Still starting the coordinator"
+- **Step:** 022 (2026-08-23 leg, screen-unlock resume)
+- **Repro:** reopened the app after several real days idle (app/daemon processes survived, PID 59432/59441
+  unchanged since 2026-08-20 18:52). Navigated to the Coordinator panel for `e2e-fixture` and it showed:
+  *"Still starting the coordinator — Its sandbox has been starting for a while without drawing a terminal...
+  leave Mainguard running and it should come up on its own... If it never comes up, check the daemon logs
+  (oobe.log)."* Clicked **Restart** — no visible change, message persists identically afterward.
+- **This is NOT actually a stuck/building sandbox.** Verified directly against reality, three ways:
+  1. `docker ps` shows container `c8ee732503d1` (`mainguard-…-3cd48ab2bc1b4678b475749f8e9521dc`) `Up 6 hours`,
+     correctly labeled `mainguard.agent.role=coordinator`, `mainguard.kind=claude-code`.
+  2. `docker top` inside it shows a real `claude` process with **2:22 of accumulated CPU time** — actively
+     alive and doing something, not stuck mid-build.
+  3. `~/.mainguard/logs/rpc.log` shows the daemon's own `ListAgents` responding correctly and continuously
+     (every ~60s, from the client's login-harvest sweep — see #19's investigation) with
+     `AgentInfo { agent_id=3cd48ab2…, agent_kind=claude-code, state=Working, role=coordinator }` — the daemon
+     has known the correct state the entire time.
+  4. `~/.mainguard/logs/spawn.log` shows a `HarvestAgentCredentials` call every minute logging
+     `(agent left running)` for this exact agent id — i.e. the daemon deliberately preserved this container
+     across sessions (this looks like the tail end of an earlier leg's real-claude-code OAuth/credential-harvest
+     flow, intentionally left alive rather than torn down).
+  5. `~/.mainguard/logs/terminal.log` shows the terminal WAS bound once, at spawn time (`16:23:25`,
+     `cli bound agent=3cd48ab2… container=c8ee732503d1… engine=Interim`) — and never again since. No
+     `AttachTerminal` activity since original spawn, days ago.
+- **Read together, this points at a client-side binding bug, not a daemon bug**: the daemon's state (`Working`,
+  `role=coordinator`) has been correct and available via `ListAgents` the whole time, but the Coordinator
+  panel's "has it started" signal appears to depend on something else — plausibly a transition/event it expects
+  to observe live (e.g. a state-change delta, or a first successful `AttachTerminal` draw) rather than the
+  current polled state, the same shape of bug `804ae632`/`67b9cc1f` fixed for #19's rail binding. A coordinator
+  that's already `Working` by the time the panel binds (rather than transitioning to `Working` while the panel
+  watches) may never satisfy that condition. Not chased further into the client code this leg — needs a
+  dedicated pass, same as #19 needed.
+- **Severity: HIGH** — this makes a coordinator's own panel permanently unusable (no terminal, can't send it a
+  prompt, can't see its output) after an app restart if the coordinator itself wasn't restarted at the same
+  time, with no in-app recovery (Restart button click had no effect). The daemon-side data needed to fix it —
+  `ListAgents` returning the correct role/state — is right there; this is a projection/binding bug, not missing
+  data.
+- **Not fixed this leg** (client-side binding investigation, same complexity class as #19) — flagged for a
+  dedicated Opus/Fable pass. **Worked around** by leaving this coordinator alone and spawning a fresh scripted
+  coordinator to continue the walkthrough, rather than force-tearing-down what might be a real, intentionally-
+  preserved OAuth session.
+- Screenshot: `007-coordinator-attempt2.png`, `008-restart-clicked.png` (identical, confirming Restart's no-op).
