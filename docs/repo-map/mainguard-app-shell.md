@@ -760,7 +760,14 @@
     **wheel-scroll through the scrollback ring** — the 10k-line buffer always existed but the control
     never rendered it, so the terminal looked unscrollable (user-reported in the live cycle test):
     3 lines/notch via `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
-    "you are viewing history" signal), any keystroke snaps back to live). The
+    "you are viewing history" signal), any keystroke snaps back to live). **Geometry deferral
+    (ISSUES-LOG #22):** the control constructs its `VtScreen` with `awaitGeometry: true`, so the
+    engine HOLDS fed bytes (bounded 2 MB, past which it parses rather than drops) until the first
+    layout pass establishes the real (cols, rows) — `ArrangeOverride` now sizes the engine itself
+    instead of waiting for the ViewModel's ~50 ms debounced round trip. Without it a rehydrated
+    agent's replayed scrollback (which the daemon sends within milliseconds of attach, long before
+    arrange) is parsed at the 80×24 placeholder and, since this engine has no reflow, stays wrapped
+    at 80 columns forever — the garbled restart-resume terminal. The
     renderer is the fallback for the planned vendored `Iciclecreek.Avalonia.Terminal` (see note below).
     **Known field gaps (2026-07-22), deferred to P2-18 by decision — do NOT grow `VtScreen` toward
     conformance:** Ink/Yoga TUIs (claude-code) mis-render — no scroll regions (DECSTBM), insert/delete

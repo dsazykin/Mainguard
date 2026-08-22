@@ -46,7 +46,12 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
     private readonly Typeface _typeface = new(MonoFamily);
     private readonly Dictionary<uint, ImmutableSolidColorBrush> _brushCache = new();
 
-    private VtScreen _screen = new(80, 24);
+    // awaitGeometry: the engine holds bytes until the first layout pass tells it the pane's real
+    // (cols, rows). A rehydrated agent's whole scrollback replays within milliseconds of attach —
+    // far ahead of Avalonia's arrange, and ahead of the ViewModel's ~50 ms debounced resize — and
+    // this engine has no reflow, so anything parsed at this 80×24 placeholder stays wrapped at 80
+    // columns forever. That was the garbled restart-resume replay (ISSUES-LOG #22).
+    private VtScreen _screen = new(80, 24, awaitGeometry: true);
     private double _cellWidth;
     private double _cellHeight;
 
@@ -147,8 +152,9 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
     {
         // A fresh VtScreen at the current geometry IS the pristine state (screen + scrollback + modes).
         var (cols, rows) = (_screen.Cols, _screen.Rows);
+        var awaitGeometry = _screen.GeometryPending; // cleared only by a real layout pass, never by Clear
         _screen.ClipboardCopyRequested -= OnClipboardCopyRequested;
-        _screen = new VtScreen(cols, rows);
+        _screen = new VtScreen(cols, rows, awaitGeometry);
         _screen.ClipboardCopyRequested += OnClipboardCopyRequested;
         InvalidateVisual();
     }
@@ -189,10 +195,19 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
 
         var cols = Math.Max(1, (int)(size.Width / _cellWidth));
         var rows = Math.Max(1, (int)(size.Height / _cellHeight));
-        if (cols == _screen.Cols && rows == _screen.Rows)
+        if (cols == _screen.Cols && rows == _screen.Rows && !_screen.GeometryPending)
         {
             return;
         }
+
+        // Size the engine from THIS layout pass, not from the ViewModel's debounced round trip: the
+        // debounce exists so a drag-resize does not spam the daemon with SIGWINCH, but it also means
+        // the engine would spend ~50 ms at the wrong width — which is precisely the window a
+        // restart-resume replay lands in. Resizing here also releases any bytes the engine held while
+        // its geometry was still unknown. The ViewModel's later Resize(cols, rows) is then a no-op,
+        // and its SendResizeAsync still tells the daemon, unchanged.
+        _screen.Resize(cols, rows);
+        InvalidateVisual();
 
         UserResized?.Invoke(this, new TerminalResizeEventArgs(cols, rows));
     }

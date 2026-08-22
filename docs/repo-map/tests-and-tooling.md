@@ -636,7 +636,14 @@
     plus incomplete-CSI/UTF-8/endless-escape holds), `PtySessionTests` (`LinuxOnly` forkpty probes: cat
     echo round-trip, isatty-true, Ctrl+C interrupt, kill, resize→winsize; a `WindowsOnly` ConPTY smoke),
     `TerminalScrollbackTests` (the pure `VtScreen`: 10k circular scrollback cap, grid readback of
-    text/SGR colour/cursor/UTF-8), `TerminalViewModelTests` (VM forwarding of Ctrl+C→0x03,
+    text/SGR colour/cursor/UTF-8), `TerminalReplayGeometryTests` (ISSUES-LOG #21+#22 as one pair —
+    a rehydrated agent's replay must be BOTH present and laid out at the pane's real width: bytes fed
+    before any layout are held and then parsed at the first `Resize`, identical to a native parse at
+    that width; the pre-fix parse-then-resize ordering is kept as an explicit garbled witness; a
+    same-size resize still releases the buffer; chunk boundaries and the UTF-8 decoder survive the
+    hold; the 2 MB cap parses rather than drops; and an `[AvaloniaFact]` drives the whole ordering
+    end to end through a real `TerminalControl` + real arrange pass),
+    `TerminalViewModelTests` (VM forwarding of Ctrl+C→0x03,
     output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table), and
     `Headless/TerminalRenderHarness` (a coloured TUI frame through the interim engine captured in
     MidnightLoom + DaylightLoom, `terminal_frame_*.png`), and `Headless/BootstrapProgressRenderHarness`

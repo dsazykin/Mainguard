@@ -74,6 +74,14 @@ internal sealed class VtScreen
     private bool _oscCapture;
     private bool _oscOverflow;
 
+    // Bytes fed before the real geometry is known (non-null ⇔ GeometryPending). Bounded well above
+    // the daemon's 512 KB replay ring (BoundTerminalSession.ReplayCapBytes) so a normal reattach
+    // always fits; past the cap the screen stops waiting and parses at whatever size it has, because
+    // rendering wrapped-wrong output beats dropping it or growing without bound.
+    private const int PendingFeedCapBytes = 2 * 1024 * 1024;
+    private List<byte[]>? _pendingFeed;
+    private int _pendingFeedBytes;
+
     /// <summary>Raised when the application requests a clipboard write via OSC 52 (e.g. claude-code's
     /// "c to copy" login screen) — the decoded text to place on the HOST clipboard. Queries (payload
     /// "?") are ignored: answering one would leak the host clipboard to the jailed CLI.</summary>
@@ -83,15 +91,30 @@ internal sealed class VtScreen
     /// in ESC[200~ / ESC[201~ so the CLI treats it as one paste, not typed keystrokes.</summary>
     public bool BracketedPaste { get; private set; }
 
-    public VtScreen(int cols, int rows)
+    /// <param name="awaitGeometry">
+    /// When true the screen starts in <see cref="GeometryPending"/>: <see cref="Feed"/> holds bytes
+    /// instead of parsing them until the first <see cref="Resize"/> establishes the real (cols, rows).
+    /// The renderer passes true because the daemon replays a rehydrated agent's whole scrollback
+    /// within milliseconds of attach — long before Avalonia's layout pass can report the pane's real
+    /// width — and this engine has no reflow, so anything parsed at the constructor default wraps at
+    /// the wrong column forever (ISSUES-LOG #22).
+    /// </param>
+    public VtScreen(int cols, int rows, bool awaitGeometry = false)
     {
         Cols = Math.Max(1, cols);
         Rows = Math.Max(1, rows);
         _screen = NewScreen(Cols, Rows);
+        _pendingFeed = awaitGeometry ? new List<byte[]>() : null;
     }
 
     public int Cols { get; private set; }
     public int Rows { get; private set; }
+
+    /// <summary>True while the screen is still holding fed bytes because its real geometry has not
+    /// been established yet (see the <c>awaitGeometry</c> constructor argument). The first
+    /// <see cref="Resize"/> — of ANY size, including one equal to the current one — clears it and
+    /// parses what was held.</summary>
+    public bool GeometryPending => _pendingFeed is not null;
 
     /// <summary>Number of lines currently held in scrollback (capped at <see cref="MaxScrollback"/>).</summary>
     public int ScrollbackCount => _scrollback.Count;
@@ -142,6 +165,43 @@ internal sealed class VtScreen
     }
 
     public void Feed(ReadOnlySpan<byte> data)
+    {
+        if (_pendingFeed is { } pending)
+        {
+            if (_pendingFeedBytes + data.Length <= PendingFeedCapBytes)
+            {
+                pending.Add(data.ToArray());
+                _pendingFeedBytes += data.Length;
+                return;
+            }
+
+            // Over the cap with still no geometry: give up waiting and parse everything at the
+            // current size rather than buffer unboundedly or drop the agent's output.
+            DrainPendingFeed();
+        }
+
+        FeedCore(data);
+    }
+
+    /// <summary>Parses everything held while the geometry was pending, in arrival order, so the
+    /// incremental UTF-8 decoder sees the identical byte boundaries it would have seen live.</summary>
+    private void DrainPendingFeed()
+    {
+        var pending = _pendingFeed;
+        _pendingFeed = null;
+        _pendingFeedBytes = 0;
+        if (pending is null)
+        {
+            return;
+        }
+
+        foreach (var chunk in pending)
+        {
+            FeedCore(chunk);
+        }
+    }
+
+    private void FeedCore(ReadOnlySpan<byte> data)
     {
         // Decode UTF-8 incrementally (the streamer already avoids splitting codepoints, but the
         // decoder tolerates a partial tail across Feed calls regardless).
@@ -574,6 +634,9 @@ internal sealed class VtScreen
         rows = Math.Max(1, rows);
         if (cols == Cols && rows == Rows)
         {
+            // Same size, but this is still the moment the geometry became REAL rather than assumed —
+            // a pane that happens to lay out at the constructor default must not strand its replay.
+            DrainPendingFeed();
             return;
         }
 
@@ -593,6 +656,11 @@ internal sealed class VtScreen
         Rows = rows;
         _cursorRow = Math.Min(_cursorRow, rows - 1);
         _cursorCol = Math.Min(_cursorCol, cols - 1);
+
+        // Geometry is established — parse the held replay against it. Must happen AFTER the grid is
+        // re-allocated above: this engine has no reflow, so bytes parsed at the wrong width stay
+        // wrapped at the wrong width for the rest of the session (ISSUES-LOG #22).
+        DrainPendingFeed();
     }
 
     public TerminalGridSnapshot ReadGrid()
