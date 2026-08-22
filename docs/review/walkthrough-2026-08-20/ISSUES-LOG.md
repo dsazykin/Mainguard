@@ -548,3 +548,83 @@ the next leg for completeness, but not a gap in the fix.
   `docker unpause` (the #20 repro itself) produced the same correction in the other direction, with
   `docker inspect` confirming `Status=running Paused=false`. Also covered end to end by
   `AgentSessionReconcileDockerTests.Reconcile_ShouldFollowAnOutOfBandPauseAndUnpause`.
+
+## 21. [CLOSED — commit TBD] Coordinator terminal renders blank after restart-resume, even once the panel correctly binds to the live agent (#19's own remaining verification step)
+
+- **Repro** (real UI, not RPC): rebuilt the daemon+app from `804ae632` (the #18/#19/#20 fix), started a
+  real `claude-code` coordinator through the UI (authenticated, banner visible), then killed and
+  relaunched just the app process (daemon left running, jail untouched) — the exact "one live click of
+  Engage→Resume-shaped" restart re-test #19's own log entry asked for, applied here to the coordinator
+  terminal instead.
+- **The panel binding itself is correct** (#19's fix holds): "Stop coordinator" is enabled, the agent id
+  is shown, no "No coordinator running" false state. But the terminal pane under it renders **fully
+  blank** — just a cursor, no banner, no output — even though it is bound to a live, correctly-identified
+  agent. Screenshot `164-terminal-blank-despite-correct-binding-new-bug.png`.
+- **Confirmed NOT a daemon/data problem**: a raw `AttachTerminal` RPC against the same agent id, made
+  independently via a headless script, returned 2570 bytes of real scrollback (the full claude-code
+  welcome banner + auto-mode status line) instantly. The daemon replays scrollback correctly; the UI
+  simply never rendered it. A click inside the terminal pane did not force a repaint either
+  (`159`→ wait, see `007`/no-op check) — ruled out as a stale-paint issue, not a data-arrival timing
+  fluke on the daemon side.
+- **Root cause**: `Mainguard.Agents.UI/ViewModels/TerminalViewModel.cs` — `EnsureCoordinatorTerminal`
+  (`ControlCenterViewModel.cs:656`) constructs the `TerminalViewModel` and immediately fires
+  `AttachTerminalAsync`, which opens the gRPC stream and starts pumping `OnOutputReceived` almost
+  instantly for a rehydrated agent (the daemon replays existing scrollback with no CLI-startup delay to
+  wait through). But `TerminalViewModel.AttachView(ITerminalView view)` — which sets the `_view` field
+  that `OnOutputReceived` feeds — is only called later, when Avalonia's `DataContextChanged` binding pass
+  runs in `TerminalView.axaml.cs`'s `Bind()`. On a **fresh spawn**, the CLI's own multi-second startup
+  delay before it prints anything covers this race completely, so the bug was invisible every time this
+  walkthrough tested a fresh spawn. On **restart-resume**, the replay burst can — and, reproduced here,
+  does — arrive before `Bind()` runs, and `_view?.FeedOutput(data)` on a null `_view` silently drops it
+  with no error, log line, or visible symptom besides the blank pane.
+
+### FIXED — commit TBD
+
+- `TerminalViewModel` now buffers output (`List<byte[]>` under a dedicated lock) whenever it's called
+  with `_view` still null, instead of dropping it. `AttachView` flushes anything buffered into the
+  now-real view, in order, the moment it's called — closing the exact race above without changing the
+  fresh-spawn path's behavior at all (the buffer is simply always empty there, since `Bind()` beats the
+  CLI's first byte by seconds).
+- Regression test `TerminalViewModelTests.OutputReceived_BeforeAttachView_ShouldBeBufferedThenFlushed`
+  reproduces the race directly (push output, then attach) and **was confirmed to fail against the
+  pre-fix code** (`Assert.Single() Failure: The collection was empty`) before the fix, green after.
+  A second test, `OutputReceived_AfterAttachView_ShouldStillFeedDirectly_NotDoubled`, guards against the
+  fix accidentally double-feeding output that arrives after a normal attach. All 13
+  `TerminalViewModelTests` green; `dotnet build` clean.
+- **Verified live**, not just by test: killed and relaunched the app again against the same live
+  coordinator jail with the fix built in — the terminal pane now renders real content instead of a blank
+  cursor. Screenshot `165-terminal-buffering-fix-content-renders-but-garbled.png`.
+
+## 22. [OPEN — needs a dedicated pass, likely Opus] Replayed scrollback renders with corrupted line-wrapping once #21's fix makes it visible at all
+
+- Fixing #21 above makes the replay actually reach the screen — but what reaches it is visibly garbled:
+  words split mid-token onto the next line (`"yourl" / "imit,"` for what should read `"your limit,"`),
+  fragments duplicated/interleaved (`"o| tonuFable"` where the original banner reads `"o Run /model and
+  select"`). Screenshot `165-terminal-buffering-fix-content-renders-but-garbled.png` next to the
+  original raw-RPC capture (`checkterm.fsx` output, same session) confirms the RAW bytes the daemon sent
+  are correct and un-corrupted — the corruption is introduced during rendering, not transport.
+- **This matches an already-logged, older finding** (findings.md, "UI bug — ghost coordinator resurfaces
+  with garbled terminal output") — this is very likely the same underlying defect, now reproduced through
+  a cleaner, more deliberate repro path (a real restart-resume on a known-good agent, not an incidental
+  ghost-coordinator fallback).
+- **Leading hypothesis, not yet implemented or verified**: a column-width mismatch. `AttachView`'s flush
+  (from #21's fix) happens as soon as Avalonia's `DataContextChanged` binding pass runs — but the
+  terminal engine's actual (cols, rows) size is set later, by a **layout-driven** resize
+  (`TerminalView.axaml.cs`'s `OnUserResized` → `TerminalViewModel.OnUserResize` → `_view.Resize(...)`),
+  which cannot fire until the control has real on-screen bounds. If the buffered replay — recorded by
+  the original session at whatever its real terminal width was (visibly 100+ columns wide in the raw
+  capture) — gets fed into a `VtScreen` still at its constructor-default size, every absolute
+  cursor-position escape in that recording would misplace text relative to the narrower buffer, which is
+  exactly the shape of corruption observed (words wrapping early, fragments landing in the wrong place).
+- **Why this wasn't attempted in this pass**: fixing it correctly means changing when the buffered
+  replay is flushed relative to layout-driven resize (e.g. defer the flush until after the first real
+  resize, or resize the screen to a known-correct size before flushing) — timing-sensitive UI-layout
+  work against an "interim" terminal engine (`VtScreen`/`TerminalControl`, explicitly flagged elsewhere
+  in this repo as due for a P2-18 replacement) where getting the ordering wrong risks reintroducing #21's
+  blank-pane bug or breaking live keystrokes on the fresh-spawn path that today works correctly. Per this
+  leg's model-tier instruction, flagging for a dedicated Opus/Fable pass rather than attempting it here.
+- **Concrete next step for that pass**: confirm the column-width hypothesis (log the `VtScreen`'s
+  cols/rows at flush time vs. at the first real resize; or diff against the raw `checkterm.fsx`-style
+  capture's implied width from its cursor-position escapes), then decide between "defer flush until
+  after first resize" vs. "resize to a sane default before flush, then re-resize" — the former is
+  probably correct but needs verifying it doesn't reintroduce a blank-pane window of its own.

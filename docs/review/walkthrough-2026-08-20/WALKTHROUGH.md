@@ -446,3 +446,51 @@ kept as the record of the miss.
 completed — still gapped). Two new confirmed findings (#19, #20) instead. Stopping here at a clean
 commit boundary — the click-registration issue needs fresh eyes/recalibration before more live-UI rows
 can be attempted reliably.
+
+## Step 021 (this leg) — I1 re-verified fixed after a real bundle rebuild, terminal-buffer race found+fixed live, garbled-replay rendering re-confirmed and flagged
+
+Rebuilt the daemon and app from `804ae632` (previous leg's #18/#19/#20 reconciliation fix) so the running
+bundle actually carried it — the prior leg's log explicitly noted the live app predated that commit.
+Relaunched clean (`160-restart-verification-fresh-relaunch.png`), reopened the fixture repo, and found
+the header correctly reading `7 in play · 7 in history` — the `c1e4c3e` ordering fix still holds on a
+genuinely fresh process.
+
+The one pre-existing jail on this machine has no `mainguard.agent.role` label (created before the label
+existed) and correctly adopts as a role-less worker, so it couldn't exercise the coordinator-binding fix
+either way (`161-coordinator-panel-no-role-labeled-jail.png`) — exactly the known limit the last leg
+flagged. Started a **real claude-code coordinator** through the actual UI to get a properly-labeled jail
+(`162-real-coordinator-spawned-for-i1-retest.png`), confirmed via `docker ps` that the new container
+carries `mainguard.agent.role=coordinator`, then killed and relaunched just the app process (daemon and
+jail left untouched) — the real restart-resume repro #19's fix needed.
+
+**Result: `163-i1-fix-confirmed-panel-binds-after-restart.png` — matrix row I1 is now genuinely
+UI-click-verified, not just test-verified.** The Coordinator panel correctly showed the live agent id and
+an active "Stop coordinator" button immediately after restart, no "No coordinator running" false state.
+
+**New bug found and fixed live this leg (ISSUES-LOG #21, HIGH):** the terminal pane under the
+correctly-bound panel rendered fully blank (`164`) despite the daemon holding real, correct scrollback for
+that exact agent (confirmed via an independent raw RPC call — 2570 bytes, the full claude-code banner,
+returned instantly). Root-caused to a race in `TerminalViewModel`: output can arrive and be silently
+dropped (`_view?.FeedOutput` on a null `_view`) before Avalonia's binding pass calls `AttachView` — a race
+a fresh spawn's multi-second CLI-startup delay always covered, but a rehydrated agent's near-instant
+scrollback replay does not. Fixed by buffering output until the view attaches, then flushing it in order;
+proved the regression test fails against pre-fix code before restoring the fix. Rebuilt, relaunched
+against the same live jail, confirmed real content now renders (`165`).
+
+**New/re-confirmed open finding (ISSUES-LOG #22)**: what #21's fix makes visible is itself garbled —
+words split mid-token, fragments out of order — matching an older, less-clean repro from a prior leg's
+ghost-coordinator finding. Leading hypothesis: the buffered replay flushes before the terminal's real
+column width is known (that comes later, from a layout-driven resize), so the original recording's
+absolute cursor-position escapes misplace text against a too-narrow buffer. Not attempted here — this is
+timing-sensitive layout work against an engine flagged elsewhere as due for replacement, and getting the
+ordering wrong risks reintroducing #21's blank-pane bug. Flagged for a dedicated Opus/Fable pass with a
+concrete next step recorded in the log entry.
+
+**Matrix coverage after this leg:** I1 (restart resume, both the coordinator-identity half from the
+previous leg and the terminal-content half from this one) now fully UI-click-verified. Still gapped: E6,
+D2/D4/D5, C2/C3, G1 (context-menu), G4, H2/H4/H6, I2, B1 (BYOK isolation specifically), H7's remaining
+2 themes (Atelier, Midnight Loom/System-follow).
+
+Stopping here at a clean, fully-committed boundary — the terminal investigation (diagnosis, fix,
+regression test, live verification, and writing up the follow-on garbling finding) consumed this leg's
+budget; no attempt was made at the remaining gapped rows.
