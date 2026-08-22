@@ -803,7 +803,7 @@ the next leg for completeness, but not a gap in the fix.
   (dtach/tmux, or the socket the `SessionLeader`'s unused `SocketPath` field already anticipates) would
   make a restart survivable end-to-end. Worth its own item; it is an architecture change, not a bug fix.
 
-## 24. [OPEN, HIGH — architectural, same shape as #18/#20 but in a different component] MergeQueueRows persist stale "Working" state indefinitely with no reconciliation against real Docker jails
+## 24. [CLOSED — commit `cb713d89`] MergeQueueRows persist stale "Working" state indefinitely with no reconciliation against real Docker jails
 
 - **Repro**: on this live, days-old daemon (system clock 2026-08-20 → 2026-08-23 idle survival), the
   Merge Queue rail read **"10 in play"** with 5+ distinct agent ids all shown `Working`
@@ -845,7 +845,65 @@ the next leg for completeness, but not a gap in the fix.
   treatment `AgentSessionReconciler` gave `AgentSessionStore` — reconcile against Docker on a timer,
   decide and implement what a vanished-container `Working` row should become.
 
-## 25. [OPEN, minor — matrix row G1] Right-clicking a Merge Queue row produces no context menu
+### CLOSED — commit `cb713d89`. The diagnosis above was right about the gap and wrong about the remedy: the state word was never the lie, the LIVENESS was
+
+- **The gap was exactly as described.** `MergeQueueRows` was never wired into `67b9cc1f`'s reconciler and
+  had no equivalent of its own. Queue state is push-only — something calls a transition or the row never
+  moves — and neither stopping an agent nor a jail dying out of band *is* a transition, so nothing could
+  ever walk a `Working` row back toward reality.
+- **The "real product decision" this entry flagged has an answer, and it is NOT a new terminal state — it
+  is "don't move the merge state at all".** The obvious fix (walk a jail-less entry to `Discarded`) turns
+  out to be actively destructive, and the thing it would destroy is a feature this repo already shipped:
+  `AgentResumeService` exists *precisely* to hand a stranded entry a live jail again on its own branch —
+  same id, same commits, same verification history — in its own words, "so it can be verified and merged
+  instead of only discarded". `Discarded` is terminal, nothing leaves it, and `EnsureEntry` refuses to
+  resurrect an id it already holds. So an auto-discard would have silently converted every one of these 15
+  recoverable entries into a permanently unrecoverable one — a reconcile pass reaping user work while the
+  user looks away, which is the failure mode this area has already paid for once. **The Resume button on
+  those phantom rows was never the bug; it was the correct action.**
+- **What was actually wrong**, once that is seen: liveness was *asserted* from a store nothing corrected.
+  `MergeQueueGrpcService`'s `HasLiveSandbox` read `AgentSessionStore` alone, which is wrong in **both**
+  directions and stays wrong — it is memory-only, so after a daemon restart every surviving entry read as
+  jail-less; and a session `AgentSessionReconciler` marks `Unresponsive` **keeps its container id**, so a
+  dead agent went on reporting a live sandbox and went on offering Verify. Nothing re-published the queue
+  either: the stream re-pushes only on `Changed`, and jail death is not a transition, so the rail served
+  whatever liveness the client last heard, indefinitely.
+- **The fix** (`MergeQueue.ReconcileJails` + `HasLiveJail`, driven from `AgentSessionReconciler`): the
+  existing 30 s pass now also sweeps every registered queue **off the Docker listing it already takes** —
+  no second polling loop, and it runs *after* the session pass so it reads corrected liveness. It marks and
+  un-marks the jail-liveness of non-terminal entries, replaces `CanMerge`'s wording for
+  `Working`/`StaleVerified` (both old sentences promise something impossible without a sandbox: "not
+  verified yet" is about a branch still on its way; "re-verifying" is the cascade's promise and the cascade
+  needs a jail to keep it), audits each move as `queue_entry_jail_reconciled` by `system:reconciler`, and
+  republishes via `NotifyGateChanged`. **No merge state moves, no row is written, no EF migration exists** —
+  liveness is a measurement of the engine, not a decision, and a measurement in SQLite outlives its own
+  truth (the row would keep asserting "stranded" after a resume). `HasLiveJail` is three-valued and answers
+  `null` *per entry* until a pass has actually looked. The client needed no change at all: `QueueRailViewModel`
+  already gates Verify on `!= false` and Resume on `== false` — it was simply being fed a bad answer.
+- **Verified against the REAL stale data.** The fix was run over a *copy* of the live
+  `~/.mainguard/mainguard-daemon.db` (read-only by construction — `ReconcileJails` persists nothing) against
+  the real Docker engine, with this entry's exact 15 rows in it. Result: **15 entries stranded — the 14
+  phantom `Working` rows plus one equally stale `Verified` — and the one genuinely live agent
+  (`f1574a0ba9b443ffa2a5b2f9345df622`, the same single container `docker ps -a` reports) correctly spared**,
+  still reading `live=True` / "not verified yet". Terminal rows were skipped and kept their own wording
+  ("already merged" / "rejected in review"). The DB's state tally after the pass was **byte-identical**
+  (15 Working · 7 Merged · 4 Discarded · 3 Rejected · 1 Verified) — nothing destroyed, which is the point.
+  Every one of those 14 rows now renders with Verify withheld, Resume offered, and the honest sentence
+  *"the agent's sandbox is gone — resume the entry to give it one, or discard it"*.
+- **Tests:** `Mainguard.Tests/MergeQueueJailReconcileTests` (12, unit) pins the rules — including the two
+  that carry the design: merge state never moves, and liveness does not survive a restart.
+  `Mainguard.Server.Tests/MergeQueueJailReconcileDockerTests` (3, `RequiresDocker`) drives the real
+  reconciler over a real registry against real jails killed **out of band**: the killed entry is stranded,
+  the survivor untouched, a returning jail un-strands it, and a merely *paused* jail is not stranded (Docker
+  says `"paused"`, not `"running"`; reading liveness as `Running` would strand every entry the kill switch
+  had frozen). 94 merge-queue + 23 reconcile/resume Docker tests green; full solution build clean.
+- **One flake worth recording for future legs**, since it cost a diagnostic detour: `QueueEntryResumeDockerTests`
+  failed once with `OCI runtime exec failed … current working directory is outside of container mount
+  namespace root -- possible container breakout detected`. That is an OrbStack `docker exec` flake, not a
+  regression — confirmed by stashing the change (passed), restoring it (passed), and running the combined
+  Docker suites (23/23). If you see that message, re-run before chasing it.
+
+## 25. [CLOSED — not a gap. The pause affordance lives on a different surface] Right-clicking a Merge Queue row produces no context menu
 
 - Right-clicked a live queue row (`swift rclick.swift`, real `rightMouseDown`/`rightMouseUp` CGEvents at
   the row's real screen coordinates, confirmed by cross-checking the window's accessibility-reported
@@ -857,6 +915,18 @@ the next leg for completeness, but not a gap in the fix.
   menu exists but wasn't hit due to a coordinate or hit-testing problem. Needs a deliberate look at
   wherever pause is actually meant to be triggered by right-click, if that surface exists at all — grep
   for `ContextMenu`/`ContextFlyout` in the Agents.UI views before assuming this is a real gap.
+
+### CLOSED — answer (a). Queue rows have no context menu **by design**, and G1's right-click pause is a different panel
+
+- `QueueRailView.axaml` contains **zero** `ContextMenu`/`ContextFlyout` — the grep the entry itself
+  suggested. Every queue-row action is a visible button and always has been: `OpenReview`, `Verify`,
+  `Resume`, `ClearStalledVerification`, `BeginDiscard` → `ConfirmDiscard`/`CancelDiscard`. There is nothing
+  a right-click was supposed to reveal, so the null result was the correct behaviour, not a miss.
+- **G1's "right-click context-menu pause" is the Resource Monitor**, not the merge queue:
+  `Mainguard.Agents.UI/Views/ResourceMonitorView.axaml:83-95` puts a `ContextMenu` on each agent row with
+  exactly two items — `{Binding PauseMenuLabel}` → `PauseOrResumeCommand`, and "End task" →
+  `EndTaskCommand`. That is the surface the matrix row means; the walkthrough right-clicked the wrong panel.
+- No code change. Re-test G1 against a Resource Monitor row in a future leg.
 
 ## 26. [Confirmed via real UI click] G4 — Stop coordinator, full flow
 
