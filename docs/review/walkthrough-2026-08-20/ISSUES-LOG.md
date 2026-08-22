@@ -42,7 +42,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - **What actually happened:** the Merge Queue panel's `ItemsControl` (`QueueRailView.axaml`) IS wrapped in a working `ScrollViewer` — but 5 leftover `Working` entries from earlier debugging sessions (dead jails, `docker rm -f`'d hours ago, never Discarded through the UI) sat at the top of the list, ahead of the fresh spawn, filling the visible area. The scrollbar thumb is thin/low-contrast and easy to miss — I myself initially concluded the queue was "stuck" and spent a long diagnostic detour before realizing I simply hadn't scrolled down far enough (and my first scroll attempt used the wrong on-screen coordinates, landing on the terminal panel instead of the queue panel, which looked like confirmation the panel didn't scroll at all).
 - **Why this matters:** this is very plausibly exactly what the user experienced ("the spawned agent didn't appear in the merge queue") — not a data/wiring failure, but a real discoverability problem: a handful of accumulated stale/dead entries can bury a brand-new, fully-live entry below the fold with no visual cue ("3 more below", a badge count, sorting live entries to the top) that anything is hidden.
 - Severity: medium-high — no data is wrong or lost, but the practical, observed effect ("my agent isn't in the queue") is identical to a real bug from the user's perspective, and is easy to reproduce simply by letting a few dead entries accumulate (which happens naturally from normal testing/experimentation).
-- **Fixed in a later leg of this same pass (Step 013)**: reproduced a SECOND time on a truly fresh spawn against a confirmed-fresh binary (ruled out a `StreamChannel`-fix regression first, via a `stat`-timestamp check that caught the running app was stale — see Step 013), which made the mechanism obvious: `MergeQueue.Agents` returns stable dictionary-insertion order, and Merged/Rejected rows persist forever by design (E4/E5), so they permanently occupy the front of that order — bottom-of-list is where every fresh spawn lands, always. Fixed with `MergeQueueGrpcService.OrderForDisplay` — a stable partition (actionable states first, terminal last, relative order preserved within each group) — wired into `Snapshot()`. 3 new unit tests in `Mainguard.Server.Tests/QueueDisplayOrderTests.cs` (no daemon/Docker required) pass; full solution rebuild clean. Committed `7497202`, pushed. The remaining, NOT-fixed half of the original suggestion (an explicit "N more" / unread-count affordance, or auto-collapsing long-stranded entries into their own sub-section) is still a legitimate follow-up but no longer required for correctness — the actionable-first sort alone means a user opening the panel always sees live work first, without scrolling.
+- **Fixed in a later leg of this same pass (Step 013)**: reproduced a SECOND time on a truly fresh spawn against a confirmed-fresh binary (ruled out a `StreamChannel`-fix regression first, via a `stat`-timestamp check that caught the running app was stale — see Step 013), which made the mechanism obvious: `MergeQueue.Agents` returns stable dictionary-insertion order, and Merged/Rejected rows persist forever by design (E4/E5), so they permanently occupy the front of that order — bottom-of-list is where every fresh spawn lands, always. Fixed with `MergeQueueGrpcService.OrderForDisplay` — a stable partition (actionable states first, terminal last, relative order preserved within each group) — wired into `Snapshot()`. 3 new unit tests in `Mainguard.Server.Tests/QueueDisplayOrderTests.cs` (no daemon/Docker required) pass; full solution rebuild clean. Committed `7497202`, pushed. The remaining, NOT-fixed half of the original suggestion (an explicit "N more" / unread-count affordance, or auto-collapsing long-stranded entries into their own sub-section) is still a legitimate follow-up but no longer required for correctness — the actionable-first sort alone means a user opening the panel always sees live work first, without scrolling. **Update 2026-08-22:** that deferred half went on to cause a second false HIGH report (#13 — a Rejected row read as vanished when it was rendering below the fold), so the count cue was built after all: the rail header now carries `"N in play · N in history (merged/rejected, below)"` (commit `c1e4c3e`).
 
 ### 5. [OPEN, real & reproducible] Coordinator terminal's onboarding banner renders badly garbled
 - **Steps:** 008 (screenshots `031`, `033`, `034`, `036`, `037`)
@@ -157,7 +157,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - The daemon's own `lifecycle.log` shows a normal "shutdown requested — draining" / "stopped" pair at 15:30:28 UTC (matching local 17:30:28, 14s before the crash timestamp) followed by a relaunch at 15:38:50 UTC — consistent with the client crashing and something (the OS or a supervising script) relaunching both processes ~8 minutes later, though this pass did not confirm whether that gap was manual or automatic.
 - **Not root-caused** — the release build strips managed exception type/message from the native crash report, so the actual exception (`NullReferenceException`? something UI-thread-specific?) is not recoverable from this artifact alone without a debug build or attached debugger at the time. Flagging as a real, confirmed crash for follow-up; possibly related to finding #11 above (a crash mid-stream could plausibly be *what* orphaned the queue pump in the first place, though the timestamps don't overlap — the crash was at 17:30:42, the dead-stream `StreamQueue` call was at 17:45:13, ~15 minutes later, i.e. after a full app restart already happened in between — so they are almost certainly independent incidents, not cause-and-effect).
 
-### 13. [CONFIRMED — real regression, HIGH] Rejected queue entries never appear in the Merge Queue panel at all
+### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
 - **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
 - **What happened:** `RejectEntry` succeeded correctly — `rpc.log` confirms `RejectEntryResponse { rejected=True, rejected_by=os:danielsazykin, rejected_at=... }` — and `sqlite3 ~/.mainguard/mainguard-daemon.db` confirms the row is durably persisted as `State='Rejected'`. But the entry vanished from the Merge Queue panel entirely instead of showing as a `Rejected` row. This directly contradicts E5's own spec ("stays on the stream, unlike Discard") and contradicts this SAME walkthrough's own Step 004, which observed a *different* pre-existing Rejected entry (`b5224606390f4de89b205f6982502c67`) rendering correctly in the rail earlier in the session.
 - **Ruled out data loss and stale-push theories, decisively:** `SELECT State, count(*) FROM MergeQueueRows WHERE RepoHash=... GROUP BY State` returns `Discarded|4, Merged|5, Rejected|2, Working|6` — both Rejected rows are durably there. Fully quit and relaunched the app + daemon (a cold `open`, not a soft reconnect) and reopened the repo from scratch: the panel STILL shows exactly 8 rows (6 Working + 2 Merged) and zero Rejected rows on a fresh cold snapshot, ruling out a live-push propagation gap (the class of bug #11 was) — this is either a hydration/query bug or a rendering bug, not a missed event.
@@ -165,3 +165,49 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - **Note the two known-Rejected rows differ in one respect that might matter**: `b5224606390f4de89b205f6982502c67` (rendered fine in Step 004, timestamp `2026-08-18`) predates today's `7497202` ordering fix; `506a60e6...` (missing now, timestamp `2026-08-22` today) postdates it. Worth checking directly whether `7497202`'s `OrderForDisplay` — or the `Snapshot()` method around it — was touched in a way that's order-safe but not inclusion-safe, and whether `b5224606...` would STILL render today if re-checked (not re-verified this leg — a fast, valuable next step).
 - Severity: **HIGH** — Reject is supposed to leave a permanent, visible record (that's the whole point of it being different from Discard); if rejected work silently disappears from the panel a reviewer has no way to know a rejection ever happened without going to the database directly, and the user's own emphasis this session was specifically on "already-merged/queue-state entries going missing" as the class of bug that started this whole pass.
 - **Not fixed this leg** — per the standing instruction, a bug this structurally unclear (four ruled-out layers, no located drop point) needs a dedicated deeper investigation rather than a rushed guess; flagged prominently in the final report for a follow-up pass, likely by the same kind of focused investigation that closed #11.
+
+#### Resolution (2026-08-22, dedicated follow-up leg) — **the row was on screen the whole time**
+
+- **There is no drop point, which is why four layers of reading did not find one.** `MergeQueue.Agents`,
+  `OrderForDisplay`, `Snapshot`, `ApplyQueueUpdate` and `QueueRailViewModel.Refresh` are all
+  inclusion-safe exactly as the previous leg concluded. Scrolling the live panel with a real scroll-wheel
+  event found `506a60e6…` rendering correctly as **Rejected / "rejected in review"** — as the **13th of
+  13** rows, four scroll-lines below the fold.
+- **The count that should have caught this earlier:** the DB holds 13 non-Discarded rows for the repo
+  (6 Working + 5 Merged + 2 Rejected). The panel fits **8**. The leg above counted the 8 visible rows
+  (6 Working + 2 Merged), matched "2 Merged" against "5 Merged in the DB" without noticing the shortfall,
+  and read the difference as Rejected-specific loss. It was not Rejected-specific: **three Merged rows
+  were equally "missing"**, by the same mechanism. That arithmetic is the tell, and it is worth
+  remembering — a partial count is not an absence.
+- **`7497202` WAS implicated, but as the other half of its own fix, not as a filter.** It sorts actionable
+  entries ahead of terminal ones (correct, and still correct), but leaves the terminal group in
+  `MergeQueue.Agents`' dictionary order — which is **spawn order, not decision order**. So a branch
+  rejected thirty seconds ago sorts behind every terminal row ever spawned before it: last on any repo
+  with history. That also explains the "one renders, one doesn't" observation exactly — `b5224606…` was
+  spawned early, so it sits near the FRONT of the terminal group and stayed visible; `506a60e6…` was
+  spawned late and went to the very back. Nothing about the newer row's format, DTO shape or round-trip
+  differed at all.
+- **Why it reads as a HIGH data bug from the chair:** the human presses Reject, the row leaves the visible
+  panel at that instant (it moves from the actionable group to the bottom of history), and the rail's
+  scrollbar is a thin low-contrast thumb with no "N more" cue — the un-fixed half of **#4**, now hiding
+  the row the human had just acted on. Two separate false HIGH reports (#4's first diagnosis, then this
+  one) have now come out of that one missing affordance.
+- **Fixed** in `c1e4c3e`: (1) `MergeQueue.LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory
+  and rehydrates it on restart (never restamps — a restart must not flatten history order); (2)
+  `OrderForDisplay` takes that as an optional decision clock and sorts the terminal group **newest verdict
+  first** (unknown timestamps keep their insertion position at the back — never dropped; the actionable
+  group stays oldest-first, because it is a work queue); (3) `QueueRailViewModel.CountText` renders
+  `"6 in play · 7 in history (merged/rejected, below)"` under the rail's `main <sha>` line, so a list
+  taller than its viewport says so.
+- **Tests:** 2 new `QueueDisplayOrderTests` units (a fresh verdict heads history; terminal rows with no
+  timestamp survive at the back) + `QueueEntryLifecycleTests.RejectEntry_PutsTheFreshVerdictAtTheHeadOf…`,
+  an end-to-end positional assertion driving two real `RejectEntry` RPCs and reading the order off
+  `StreamQueue`. 16 queue-display/lifecycle tests, 57 server merge-queue-area tests and 84
+  client-side queue/rail tests all green; full solution builds clean.
+- **Verified live** on the rebuilt Pro app (cold relaunch of app + daemon, repo reopened, real scroll
+  events): header reads `6 in play · 7 in history (merged/rejected, below)`, and `506a60e6…` **Rejected**
+  is now the first history row, immediately under the last Working entry.
+- **Follow-up still open (small):** the fix makes the newest verdict the top of history, but with enough
+  actionable rows a fresh verdict can still start below the fold. The count line now tells the user rows
+  exist down there; an explicit "jump to history" or a sticky section header would tell them where. Not
+  required for correctness.
