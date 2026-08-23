@@ -167,6 +167,15 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   report and a clean process disappearance are different symptoms, and #19's leg saw the latter — that
   pattern is more consistent with the process being terminated from outside (or exiting a main loop) than
   with an unhandled managed exception, which is what produced the 08-20 report.
+- **2026-08-23 — REPRODUCED, with a trigger.** See the "New finding" block at the end of **#37**:
+  clicking **Restart** on the Coordinator panel crashed the client the same way
+  (`Mainguard-2026-08-23-031119.ips`: `SIGABRT`, `abort()`, faulting thread `com.apple.main-thread`,
+  `IL_Throw → DispatchManagedException → DispatchExSecondPass → TerminateProcess → PROCAbort`). The daemon
+  log pins the ORDER: the client died ~90 ms after the follow-up `SpawnAgent` was sent and its death is
+  what cancelled that spawn, not the reverse. `StartCoordinatorCoreAsync` catches everything, so the
+  suspects are `RunStartupAsync` (no catch) and the stop leg it awaits — `[RelayCommand]`'s
+  `AsyncRelayCommand` rethrows onto the synchronization context by default. Next step is named there:
+  reproduce with the head run from a terminal so the managed exception type actually gets printed.
 
 ### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
 - **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
@@ -1093,6 +1102,15 @@ the next leg for completeness, but not a gap in the fix.
     the interaction under test), then doing the actual assertion — clicking the row's real Verify button —
     via genuine UI automation, consistent with the pass's own "RPC only for setup, never for the thing under
     test" rule.
+    - **Caveat learned the hard way in #37 — read this before reusing the workaround.** The harness builds
+      the `SpawnAgentRequest` by hand, so it carries **none** of what the real client attaches to a spawn:
+      no `extra_env` (the user's `llm_env_*` custom BYOK keys), no `cli_credentials`, no `cli_settings`.
+      That is invisible and harmless while the thing under test is downstream of the spawn (Verify, the
+      queue, a flagged change), and it silently becomes the measurement the moment the claim is about what
+      a spawn CARRIES into the jail — which is exactly how #37 was logged as a MEDIUM product defect that
+      does not exist. When in doubt, check the request in `~/.mainguard/logs/rpc.log`: the real client
+      multiplexes every call onto one connection, so a `SpawnAgent` that is request `:00000001` on its own
+      fresh peer port is the harness, not the app.
   - **Worth a dedicated look**: if a screen-reader or switch-control user hits the same wall via real
     assistive tech (not just synthetic automation), this ComboBox has a real accessibility defect, not just
     an automation-friendliness one — the AX tree exposing correct `menu item` elements that don't actually
@@ -1160,7 +1178,7 @@ the next leg for completeness, but not a gap in the fix.
   both settle-paths in `RunVerificationAsync` require the awaited call to actually complete (successfully or
   by exception) to run at all.
 
-## 37. [CONFIRMED, MEDIUM] B1 (adjacent) — the "Custom key" credential is saved but never delivered to the agent's environment
+## 37. [CLOSED — NOT A DEFECT, commit `72e878d4`. The measurement, not the product, was wrong] B1 (adjacent) — the "Custom key" credential is saved but never delivered to the agent's environment
 
 - Row B1 asks about the primary Anthropic BYOK path (`Settings → AI Providers → Store an API key`), which
   validates against the live Anthropic API before saving — no real Anthropic key was available this
@@ -1193,3 +1211,92 @@ the next leg for completeness, but not a gap in the fix.
   follow-up with a manifest that actually declares a custom env var name to see if THAT path works and only
   the unconditional "every agent" framing in the UI copy is what's wrong, versus the delivery mechanism
   itself being broken for all adapters regardless of declaration.
+
+### CLOSED — commit `72e878d4`. The delivery mechanism works; the spawns that were measured never carried the key in the first place
+
+The above is a careful, correct set of observations with one wrong join: **the agents it inspected were
+not spawned by the client.** #33 introduced an RPC workaround for the CLI-picker ComboBox ("use
+`SpawnAgentAsync` via RPC for the CLI-selection step only"), and that harness constructs a
+`SpawnAgentRequest` by hand. It has no keyring and never populates `extra_env`. Every jail examined here
+therefore had, correctly and by construction, an empty `agent.env`.
+
+**How that was established, in order:**
+
+- **The daemon's own `rpc.log` distinguishes the two callers.** The running client multiplexes every RPC
+  onto ONE connection — around the spawns in question that is `peer=127.0.0.1:54543`, request ids
+  `0HNO0M77PN5UU:00000003 … :00000025` (six stream pumps, ListAgents, HarvestAgentCredentials, …). Both
+  spawns cited above arrived on their own fresh connections (`:54481` and `:54575`) whose **first and only
+  request was `SpawnAgent`** — the harness's signature, not the app's. Both logged `extra_env=[]`.
+- **The keyring entry was genuinely there and genuinely readable.** `~/.mainguard/Keyring/
+  llm_env_TEST_CUSTOM_MARKER.keyring` was written at `00:58:26Z`, i.e. *before* both spawns (`00:58:52Z`
+  and `01:00:08Z`) — so "the key existed but did not travel" was true, and the reason was the caller.
+- **The client leg was then run in isolation**, against the real user keyring, in a throwaway harness that
+  reflects into `DaemonBackedOrchestrator.CollectCustomEnvKeys()`: it returned
+  `TEST_CUSTOM_MARKER = <39 chars>`. The client reads the keyring correctly.
+- **Confirmed live through the real UI, which is the decisive leg.** Reopened the fixture repo, opened the
+  Coordinator panel, clicked **Restart** — a genuine UI click, no RPC shortcut — and the daemon logged:
+  `SpawnAgentRequest { … agent_kind=claude-code, role=coordinator, extra_env=[EnvEntry { name=TEST_CUSTOM_MARKER, value=*** }], … }`.
+  The custom key does reach the wire on a real spawn.
+- The daemon-side remainder (`AgentGrpcService` → `AgentSpawnService` → `SandboxAgentLauncher.BuildSecrets`
+  → `DockerSandboxEngine.WriteSecretFileAsync`) is straight-line and unconditional for `extraEnv`, and is
+  now **proved rather than read**: see the new tests below.
+
+**What was actually wrong, and is fixed:** the page's own sentence — "it is injected into every agent's
+environment" — is the one claim on that surface that is not literally true. A jail running an **external
+pull request's** code is spawned `withoutHostCredentials` and deliberately inherits neither the user's
+`llm_env_*` entries nor any harvested CLI login (`AgentSpawnService.SpawnAsync`; the comment there calls it
+the untrusted-agent boundary). The copy now names that exception, in both the ViewModel's confirmation
+message and the page's blurb.
+
+**What was missing, and is added:** nothing covered the hop between "the keyring holds `llm_env_*`" and
+"the jail's env-file holds `NAME=value`", which is exactly why this took a live-UI leg plus a log
+forensics pass to answer. Two new tests close it:
+
+- `Mainguard.Tests/CustomEnvKeyDeliveryTests.cs` — the client leg over an in-memory keyring and an
+  uncontacted `DaemonClient`: the `llm_env_` prefix is stripped before the wire (a variable named
+  `llm_env_FOO` inside the jail is invisible to the CLI and would look exactly like this bug), every
+  stored entry travels, the other keyring families (`llm_<provider>`, `cli_login_*`, `token_*`) are never
+  injected as environment variables, an unreadable value is skipped rather than shipped as an empty
+  variable, and "nothing stored" yields an empty set rather than the `null` that means *fall back to the
+  daemon's per-repo cache*.
+- A fourth `[RequiresDockerFact]` in `Mainguard.Server.Tests/Agents/SecretDeliveryDockerTests.cs` — the
+  end-to-end leg into a **real jail**, for precisely the combination doubted above: an installed adapter
+  declaring **no** `apiKeyEnvVar` (the `scripted` shape) and no model key, so the custom entry is the only
+  thing in the file. The production `BuildSecrets` composes it (a hand-rolled dictionary would still pass
+  if `BuildSecrets` dropped `extraEnv`), and the sentinel-framed in-jail probe asserts the file is
+  non-empty and carries the whole `NAME=<nonce>` line at `0400` owned by the agent uid — with a paired
+  negative control that `llm_env_` does not survive into the name. **Passes against a real jail.**
+
+**Methodology lesson, worth more than the entry itself:** the RPC-for-setup workaround from #33 was
+correctly scoped for *that* leg ("RPC only for setup, never for the thing under test"), and silently
+became the thing under test here — the spawn's payload *was* the measurement. When a leg's claim is about
+what a spawn CARRIES, the spawn itself has to be a real UI action, or the request must be inspected in
+`~/.mainguard/logs/rpc.log` before any conclusion is drawn about the jail. `rpc.log` answers this in one
+grep and would have closed the entry in minutes.
+
+**Row B1 status is unchanged:** the primary Anthropic BYOK path still needs a real key to exercise its
+validate-then-store leg, and remains genuinely open.
+
+### New finding while verifying this entry: a reproducible client SIGABRT (adds to #12)
+
+Restarting the coordinator from the Coordinator panel crashed the client, and this is the first repro with
+a trigger attached:
+
+- Real UI clicks: Coordinator → **Restart**. The daemon logged `StopAgent` OK, then the follow-up
+  `SpawnAgent` **at `01:11:17.25Z`**, and ~90 ms later every one of the client's six stream RPCs ended at
+  once (`01:11:17.345Z`) and `TerminalService/Attach` faulted with *"Can't write the message because the
+  request is complete."* The spawn then failed `Internal` at `01:11:18.36Z` with a Docker
+  `TaskCanceledException` — i.e. the **client died first** and its death cancelled the in-flight spawn,
+  not the other way round.
+- `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-23-031119.ips`: `EXC_CRASH (SIGABRT)`, `abort()
+  called`, faulting thread `com.apple.main-thread`, stack
+  `IL_Throw → DispatchManagedException → DispatchExSecondPass → TerminateProcess → PROCAbort` — an
+  **unhandled managed exception on the UI thread**, which is the .NET "no handler anywhere" abort.
+- Not from `StartCoordinatorCoreAsync`: that method catches `OperationCanceledException`,
+  `RpcException` and bare `Exception` on every path. The unguarded neighbours are `RunStartupAsync` (no
+  catch) and the stop leg it awaits, and `[RelayCommand]`'s default `AsyncRelayCommand` rethrows onto the
+  synchronization context rather than swallowing — so an exception escaping `StopCoordinatorCoreAsync`
+  during a Restart would land exactly here. **Hypothesis, not yet confirmed** — the crash report carries no
+  managed exception type, so the next leg should reproduce it with the client's stderr captured (run the
+  head from a terminal rather than the .app bundle) to name the exception before changing anything.
+- Severity: **HIGH** — it takes the whole app down, and Restart is an ordinary, unremarkable action.
