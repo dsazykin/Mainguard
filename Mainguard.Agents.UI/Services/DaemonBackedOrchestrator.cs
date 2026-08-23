@@ -281,8 +281,16 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>The user's custom env-var keys (<c>llm_env_*</c>) as name→value pairs, ready for
-    /// SpawnAgent's <c>extra_env</c>. Values come fresh from the keyring per spawn.</summary>
-    private IReadOnlyDictionary<string, string> CollectCustomEnvKeys()
+    /// SpawnAgent's <c>extra_env</c>. Values come fresh from the keyring per spawn.
+    ///
+    /// <para><b>Internal, not private, on purpose (ISSUES-LOG #37).</b> This is the leg that decides
+    /// whether a "Custom key" saved in AI Providers reaches an agent at all, and nothing covered it:
+    /// a walkthrough leg that spawned agents through a raw <c>SpawnAgent</c> RPC (bypassing this
+    /// method entirely) saw an empty <c>agent.env</c> in the jail and read it as a delivery defect in
+    /// the product. It is not — but "the client really does read the keyring and really does put the
+    /// pairs on the wire" was unprovable without a test, so `CustomEnvKeyDeliveryTests` pins it.</para>
+    /// </summary>
+    internal IReadOnlyDictionary<string, string> CollectCustomEnvKeys()
     {
         var extra = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var keystoreKey in _keystoreList(ApiKeyProviderMap.CustomEnvKeyPrefix))

@@ -191,7 +191,12 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
         CustomApiKey = string.Empty; // null the candidate immediately (invariant 1)
         CustomEnvVarName = string.Empty;
         IsHealthError = false;
-        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into every agent's environment.";
+        // "every agent" was an overstatement the code never made (ISSUES-LOG #37 held this sentence up
+        // as the contract and it is the one claim here that is not literally true): a jail running an
+        // EXTERNAL pull request's code is spawned withoutHostCredentials and deliberately inherits none
+        // of these — see AgentSpawnService.SpawnAsync. Say the exception rather than let a reader who
+        // checks it conclude the whole feature is broken.
+        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into the environment of every agent you start, except jails running an external pull request's code.";
         RefreshRows();
     }
 

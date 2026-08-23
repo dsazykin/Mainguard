@@ -65,7 +65,7 @@
                     <Border Classes="Card" Background="{DynamicResource SurfaceCard}" CornerRadius="8" Padding="14" Margin="0,0,0,4">
                         <StackPanel Spacing="10">
                             <TextBlock Text="Custom key (any environment variable)" FontWeight="SemiBold" FontSize="13" Foreground="{DynamicResource TextPrimary}"/>
-                            <TextBlock Text="For CLIs that read their own variable — opencode, OpenRouter, a proxy endpoint. Stored in your OS keyring and injected into every agent's environment; custom keys are not health-checked."
+                            <TextBlock Text="For CLIs that read their own variable — opencode, OpenRouter, a proxy endpoint. Stored in your OS keyring and injected into the environment of every agent you start, except jails running an external pull request's code; custom keys are not health-checked."
                                        FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
                             <Grid ColumnDefinitions="220,*">
                                 <TextBox Grid.Column="0" Classes="Mono"

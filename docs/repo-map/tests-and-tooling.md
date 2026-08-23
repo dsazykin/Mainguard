@@ -629,7 +629,18 @@
     unreachable/unknown-provider/cancellation typed throws), `CredentialInjectorTests` (purity + newline
     rejection), `SecureKeyStoreTests` (`ISecureKeyStore` round-trip + backing-file removal),
     `ApiKeySettingsViewModelTests` (invalid-not-stored, valid-stored-and-nulled + re-check on re-save,
-    delete, and the `TosAcknowledgment` cross-context persistence via in-memory SQLite). **P2-03
+    delete, and the `TosAcknowledgment` cross-context persistence via in-memory SQLite),
+    `CustomEnvKeyDeliveryTests` (**ISSUES-LOG #37** — the CLIENT leg of BYOK "Custom key" delivery, over
+    an in-memory keyring and an uncontacted `DaemonClient`: `DaemonBackedOrchestrator.CollectCustomEnvKeys`
+    reads every `llm_env_*` entry back and puts it on the wire under the BARE variable name, the prefix
+    is stripped, the OTHER keyring families — `llm_<provider>`, `cli_login_*`, `token_*` — are never
+    injected as environment variables, an unreadable/empty value is skipped rather than shipped as an
+    empty variable, a bare `llm_env_` name is dropped rather than failing the whole spawn's name
+    validation, and "nothing stored" yields an empty set rather than the null that means *fall back to
+    the daemon's per-repo cache*. It exists because a walkthrough leg measured spawns made through a raw
+    `SpawnAgent` RPC — which bypasses this method and carries `extra_env=[]` by construction — and read
+    the resulting empty in-jail `agent.env` as a product defect; the product was right and unprovably
+    so). **P2-03
     terminal tests:**
   - `VtBoundaryDetectorTests` (the correctness heart — the split-at-every-offset corpus over CSI SGR /
     OSC 8 both terminators / DCS / SS3 / 2·3·4-byte UTF-8 / ZWJ emoji, reassembling byte-identically,
@@ -1944,7 +1955,14 @@
   when the probe printed nothing, so a missing frame is its own reported failure, and the nonce means
   a stale or coincidentally-0400 file cannot satisfy it. A third test pins the *reason* the archive
   API is unusable by asserting Docker really does refuse `ExtractArchiveToContainerAsync` into the
-  read-only-rootfs jail — if that ever starts passing, the transport can be revisited),
+  read-only-rootfs jail — if that ever starts passing, the transport can be revisited. A fourth test is
+  the **BYOK "Custom key" leg** (ISSUES-LOG #37): the production `SandboxAgentLauncher.BuildSecrets`
+  composes the env-file for the awkward combination — an installed adapter declaring NO `apiKeyEnvVar`
+  and no model key, so the user's custom `extraEnv` entry is the only thing in the file — and the
+  framed in-jail probe asserts the file is non-empty and carries the whole `NAME=<nonce>` line at `400`
+  owned by the agent uid, with a paired negative control that the keystore's `llm_env_` prefix does NOT
+  survive into the variable name. `BuildSecrets` composes it rather than the test hand-rolling a
+  dictionary, because a hand-rolled one would still pass if `BuildSecrets` dropped `extraEnv`),
   **`Agents/CliLoginRoundTripDockerTests.cs`** (`[RequiresDockerFact]` — the **CLI-login round-trip**
   end to end against real jails: a per-run nonce is written into jail #1's tmpfs `$HOME` at the one
   path a temp install marker DECLARES, `SandboxAgentLauncher.HarvestCliCredentialsAsync` reads it back

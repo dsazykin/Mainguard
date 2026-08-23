@@ -631,7 +631,11 @@
   - `ApiKeySettingsViewModel`/`ApiKeyProviderRowViewModel` (P2-01: validate-then-store off the UI thread
     with cancellation on page close, keyed `llm_<provider>`, candidate key nulled after every check,
     per-provider delete; injectable keystore/health-check/db seams; now the Settings **AI Providers**
-    page — `ApiKeySettingsViewModel` implements `ISettingsPage`) and `CliOAuthTosDialogViewModel`
+    page — `ApiKeySettingsViewModel` implements `ISettingsPage`. Its **Custom key** section stores any
+    env-var name under `llm_env_<NAME>` with no health check, and its confirmation names the ONE
+    exception to "injected into every agent you start" — a jail running an external pull request's code
+    is spawned `withoutHostCredentials` and inherits none of them, ISSUES-LOG #37) and
+    `CliOAuthTosDialogViewModel`
     (writes the persisted `TosAcknowledgment` on acknowledge).
   - `TerminalViewModel` (P2-03) wires the engine (`ITerminalView`) to the daemon stream
     (`ITerminalGateway`): forwards engine keystrokes (incl. Ctrl+C→0x03) to the daemon, feeds daemon
