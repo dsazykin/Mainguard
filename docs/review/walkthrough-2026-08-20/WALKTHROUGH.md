@@ -601,3 +601,67 @@ now UI-click-verified. **Still gapped**: E6, D2/D4/D5, C2/C3, H2/H4/H6, I2, B1 �
 reached this leg; G1's investigation (calibration attempts, code-reading, cross-checking against
 `docker ps`/`rpc.log`) consumed the leg's budget on its own. Next leg should start fresh on E6 or D2 and
 work down the remaining list; no architectural fix is pending from this leg (unlike the last several).
+
+(A separate leg attempted E6/D2/D4/D5/C2/C3/H2/H4/I2/B1 and confirmed H4 live — Settings → Daemon Logs
+shows real, non-empty daemon output — but otherwise burned its budget on what turned out to be a false
+alarm: Settings-sidebar clicks appeared to land without switching panels. The user manually reproduced the
+same navigation successfully; root cause was the user actively using the machine at the same time as the
+automation, which intermittently stole input from the synthetic clicks. **Not a product bug** — logged as
+a methodology note (#29) rather than a defect. No code changes, no new matrix rows closed.)
+
+## Step 025 — I2 (daemon skew refresh) confirmed live via a real orphaned-daemon repro; H2 (egress
+allowlist) fully confirmed; D2 (verify FAIL path) confirmed live with a genuinely broken test
+
+**I2 — confirmed live, not just conceptually.** Opened Settings → About and found a live, naturally-
+occurring version skew: the running app reported commit `ce3eb056` while its child daemon process (still
+alive from an earlier launch) reported the older `8b225a12` — several commits behind, since the daemon
+hadn't been restarted across a run of intervening commits. Rather than just observe this passively, ran
+the actual repro the matrix row asks for: killed **only** the app process (`kill -TERM`), leaving the
+daemon alive and orphaned (reparented to PID 1, confirmed via `ps`), then relaunched the app fresh.
+Result: the new app instance correctly detected and killed the stale orphaned daemon and spawned a brand
+new child in its place (`191`) — confirmed via `ps` showing the old daemon PID gone and a new one parented
+to the new app PID. Reopened the repo (`192`) and the Merge Queue rebuilt correctly, including rendering
+the `c1e4c3e` jail-liveness fix's wording live ("the agent's sandbox is gone — resume the entry to give it
+one, or discard it") on a genuinely fresh process. Checked About again (`193`): the **App** version now
+correctly read the current HEAD (`5012b610`) — the app side of the skew is real and self-corrects on
+relaunch, matching I2's claim.
+
+**One residual, build-tooling-only, not a live product bug**: even after this successful relaunch, the
+**daemon**'s own version stamp lagged behind the app's (`7ac49596` vs the app's `5012b610`) — because the
+on-disk payload DLL the daemon relaunches from hadn't been rebuilt to the latest commit despite a full
+`dotnet build Mainguard.slnx -c Release` (MSBuild's incremental-build skip logic, or a separate
+bundle/publish step not triggered by plain `dotnet build` — not chased further, out of scope for a live-UI
+pass). This is a local-dev-build artifact, not something a real bundled release could exhibit (app and
+daemon are built/bundled atomically in a real release pipeline) — noted for awareness, not filed as a bug.
+
+**H2 — fully confirmed live.** Clicked "Network..." from the Coordinator panel, which opens a real
+separate "Agent Network Allowlist" window (`194`) listing pre-allowlisted hosts (Anthropic API, NuGet,
+OpenAI, crates.io) with per-host Remove buttons and an "Allow a host" form. Filled in a test host via real
+synthetic keystrokes (name + host fields, confirmed via screenshot the text actually landed), clicked
+Allow — the form cleared (`195`), and scrolling the list confirmed the new "Test Host" entry rendered live,
+correctly tagged "Custom" (`196`) — the add-a-host-live-re-renders-the-proxy claim confirmed. Removed it
+again via its Remove button to leave the environment clean (`197`), confirmed gone. **Not exercised this
+leg**: the adversarial "block a non-allowlisted host from inside a live jail" check — no live jail was
+running at the time; needs a follow-up with an active agent.
+
+**D2 — FAIL path confirmed live with a genuine test failure**, the row's core claim. Built a new adapter,
+`scripted-fail` (`~/mainguard/adapters/bin/scripted-fail` + `registry/scripted-fail.json`), that commits a
+change breaking `calc.js`'s `add()` function (`return a + b + 1`) against the e2e-fixture's real
+`test.js`, which asserts `add(2,3) === 5`. **Note**: the new adapter wasn't picked up by the already-
+running daemon (adapter registry is scanned at daemon startup, not live-reloaded) — required a full
+app+daemon restart to register, which is itself a mildly useful data point (registry scanning is
+boot-time-only, consistent with I2's "skewed daemon" framing but for adapters, not versions). Selected
+`scripted-fail` from the CLI dropdown (via keyboard Down-arrow cycling after a click — the dropdown's
+popup itself never visibly rendered under CGEvent/System-Events clicks despite several techniques tried,
+but arrow-key selection worked reliably once focused; logged as a minor automation-methodology note, not
+chased as a product bug since keyboard selection is itself a legitimate accessible interaction path),
+clicked Start coordinator (`198`) — the agent spawned, committed the deliberately-broken change, and
+appeared in the queue as `c03bfe83…`. Clicked its **Verify** button: the entry correctly returned
+`tests failed — node test.js` as the reason (`199`) and the row stayed in **Working** state, not silently
+retried and not falsely marked Verified — exactly what D2 requires. **Not yet exercised**: the other two
+legs of D2's 3-way trap (a mis-tokenized verify command, and a missing toolchain) — need their own scripted
+adapters, not attempted this leg due to time.
+
+**Matrix coverage after this leg**: I2, H2 now fully UI-click-verified. D2 partially verified (FAIL-path
+leg confirmed; mis-tokenized/missing-toolchain legs still open). Still gapped: E6, D2's remaining two legs,
+D4, D5, C2, C3, H6, B1.

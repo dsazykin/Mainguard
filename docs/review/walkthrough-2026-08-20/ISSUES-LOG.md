@@ -996,3 +996,79 @@ the next leg for completeness, but not a gap in the fix.
   fix), this specific ambiguity naturally goes away; it only affects pre-label-era orphans.
 - **Matrix row G1 is UI-click-verified**: the context menu exists, is reachable by right-click, and
   Pause/End task both wire to real RPCs with honest (non-crashing, non-silent) responses.
+
+## 29. [Methodology note, not a Mainguard bug] Settings-sidebar "navigation failure" was environmental, not a defect
+
+- A prior leg observed CGEvent clicks landing on the correct Settings sidebar item (confirmed via
+  accessibility coordinates) with the main panel never switching content — logged tentatively as a
+  possible navigation bug pending confirmation, since it would have blocked reaching H2/I2/B1 entirely.
+- The user manually reproduced the same Settings sidebar navigation on their own machine immediately
+  after and confirmed it switches panels correctly every time. The root cause was the user actively
+  using their own mouse/keyboard on the same machine at the same time automation was running — competing
+  real input intermittently stole focus/clicks from the synthetic ones, producing an apparent "click
+  landed, nothing happened" symptom that had nothing to do with the app.
+- **Not a product defect. Standing methodology rule going forward: live-UI automation legs should not
+  run while the user is concurrently using the machine for anything else** — if a click's effect can't be
+  confirmed by screenshot content change, prefer re-running cleanly over concluding a bug, especially for
+  navigation-only interactions that are cheap to retry.
+
+## 30. [Confirmed via real UI click, real repro] I2 — daemon skew refresh confirmed with a genuine orphaned daemon
+
+- Found a live, naturally-occurring version skew in Settings → About: the running app reported a newer
+  commit than its still-alive child daemon process (which hadn't been restarted across several
+  intervening commits). Deliberately reproduced I2's exact scenario rather than just observing it: killed
+  only the app process (`kill -TERM`), confirmed via `ps` that the daemon survived as an orphan
+  (reparented to PID 1), then relaunched the app fresh.
+- **Result: the new app instance correctly detected and killed the stale orphaned daemon and spawned a
+  new one.** `ps` before/after confirmed the old daemon PID gone, a new daemon PID parented to the new app
+  PID. Reopened the repo — the Merge Queue rebuilt correctly (including the `c1e4c3e` jail-liveness
+  wording rendering live), and Settings → About showed the App's own version now matching current HEAD.
+- **Residual, build-tooling-only, NOT a live product bug**: even after the successful relaunch, the
+  daemon's own version stamp still lagged the app's — the on-disk payload DLL the daemon spawns from
+  hadn't been rebuilt to the latest commit despite a full `dotnet build Mainguard.slnx -c Release` (likely
+  MSBuild's incremental-skip logic or a separate bundle/publish step not triggered by plain `dotnet
+  build`). Not chased further — this is a local dev-build artifact; a real release pipeline builds app and
+  daemon payload atomically, so this specific mismatch couldn't occur outside a dev loop like this one.
+- **Matrix row I2 is UI-click-verified**: the core claim (a skewed/stale daemon gets killed and refreshed
+  on app launch, and the queue rebuilds against the fresh daemon) holds.
+
+## 31. [Confirmed via real UI click] H2 — egress allowlist fully confirmed (view, add, remove, live re-render)
+
+- Opened the real "Agent Network Allowlist" window via the Coordinator panel's "Network..." button.
+  Confirmed the pre-allowlisted hosts render (Anthropic API, NuGet, OpenAI, crates.io, npm, PyPI, more).
+  Filled the "Allow a host" form with real synthetic keystrokes (Name="Test Host",
+  Host="test-egress-check.example.com"), confirmed the text landed correctly via screenshot before
+  submitting, clicked Allow — the form cleared and the new host rendered live in the list, correctly
+  tagged "Custom". Removed it again via its own Remove button, confirmed gone — left the environment
+  clean.
+- **Matrix row H2 is UI-click-verified for the allowlist CRUD + live-re-render half.** The adversarial
+  half (curl a non-allowlisted host from inside a live jail → confirm it's actually blocked + a
+  Sandbox-health event) was NOT exercised this leg — no live jail was running with an active shell to
+  drive it; needs a follow-up leg with a real agent attached.
+
+## 32. [Confirmed via real UI click, real broken test] D2 — verify FAIL path confirmed live (one of three legs)
+
+- Built a new adapter (`scripted-fail`, `~/mainguard/adapters/bin/scripted-fail` +
+  `registry/scripted-fail.json`) that commits a change genuinely breaking `calc.js`'s `add()` (returns
+  `a + b + 1`) against the e2e-fixture's real `test.js`, which asserts `add(2,3) === 5`.
+- **Methodology note, not a bug**: the daemon's adapter registry is scanned at daemon startup, not
+  live-reloaded — the newly-created `scripted-fail.json` wasn't selectable until a full app+daemon
+  restart. Consistent with how #23's investigation described daemon-side state generally; worth knowing
+  for future scripted-adapter work.
+- **Methodology note, not chased as a bug**: the CLI-picker ComboBox's dropdown popup never visibly
+  rendered under either raw CGEvent clicks or AppleScript `System Events click at` — tried both, several
+  coordinate variations, across a fresh app relaunch. What DID work reliably: clicking the control once to
+  give it focus, then driving selection with the Down arrow key via `System Events key code 125`, checking
+  the displayed value after each press. This is a legitimate accessible interaction path (not a hack), so
+  it wasn't logged as a confirmed defect — but the popup itself never being visible is worth a look in a
+  dedicated pass since it may indicate an Avalonia `ComboBox` popup rendering/hit-test issue specific to
+  synthetic input.
+- Selected `scripted-fail` via the above method, clicked "Start coordinator" — the agent spawned,
+  committed the deliberately-broken change, and a new queue entry (`c03bfe83…`) appeared. Clicked its
+  **Verify** button.
+- **Result: the entry correctly returned `tests failed — node test.js` as the reason and stayed in
+  `Working` state** — not silently retried, not falsely marked Verified. This is exactly what D2's core
+  claim requires.
+- **Matrix row D2 is PARTIALLY UI-click-verified**: the genuine-test-failure leg is confirmed. The other
+  two legs of the 3-way trap — a mis-tokenized verify command, and a missing toolchain — still need their
+  own scripted adapters and haven't been exercised live yet.
