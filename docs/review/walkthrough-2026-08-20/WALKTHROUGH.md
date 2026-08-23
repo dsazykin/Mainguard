@@ -665,3 +665,81 @@ adapters, not attempted this leg due to time.
 **Matrix coverage after this leg**: I2, H2 now fully UI-click-verified. D2 partially verified (FAIL-path
 leg confirmed; mis-tokenized/missing-toolchain legs still open). Still gapped: E6, D2's remaining two legs,
 D4, D5, C2, C3, H6, B1.
+
+## Step 026 — D2's remaining two legs confirmed live; D5 confirmed end-to-end; E6 analyzed as
+## structurally hard to force; B1 partially confirmed with a real finding on the adjacent custom-key path
+
+**D2 — missing-toolchain leg** confirmed live. Declared `.mainguard/toolchain: rust-stable` directly on
+`main` (pushed to the daemon's bare mirror via the `mainguard-local` remote — main's toolchain baseline is
+read live from the mirror, not cached, so no daemon restart was needed for this leg), then clicked Verify
+on the already-`Working` `c03bfe83…` entry (`200`). Result: `Can't verify — Could not provision the
+verification toolchain [rust-stable] declared by repo '...': 'rust-stable' is declared but absent from
+the worker's jail — the probe \`cargo --version\` exited 127. Verification was NOT run; this is a
+provisioning failure, not a failing test.` — a third, clearly distinct wording from both the genuine
+test-failure message and (below) the mis-tokenized-command message, satisfying D2's "all three land
+differently-worded" requirement. Reverted the toolchain declaration on `main` immediately after (pushed a
+follow-up commit removing it) so it wouldn't poison every subsequent verification this session.
+
+**D2 — mis-tokenized-command leg** confirmed live. Built a `scripted-badcmd` adapter (committed
+`.mainguard/verify: node test.js && echo done` — a `&&` token that survives argv tokenization). The
+CLI-picker dropdown would not commit a selection under any of four distinct automation techniques tried
+this leg (CGEvent click, keyboard arrow-keys, AppleScript `System Events click` on the actual accessibility
+menu item, and a direct `AXPress` action on that same element) — confirmed via the accessibility tree that
+the popup genuinely opens and lists the right items, but no technique closes it with a different selection
+committed. This is now a well-confirmed automation limitation (see ISSUES-LOG #33 methodology note), not a
+one-off flake. Worked around by using `SpawnAgentAsync` via RPC for the CLI-selection step only (setup, not
+the thing under test), then clicking the row's real **Verify** button in the UI for the actual assertion
+(`201`): `Can't verify — The verification command contains '&&', which needs a shell — ... Wrap it in a
+shell instead: sh -c "node test.js && echo done"` — third distinct wording confirmed. Discarded the entry
+afterward.
+
+**D5 — flagged-change (P2-11)** confirmed live, full loop. Built a `scripted-ci` adapter that commits
+`.github/workflows/ci.yml`. Spawned (RPC setup, same dropdown workaround), clicked Verify: entry reached
+**Verified** but the rail showed "1 flagged change needs acknowledgment" and no Merge button (`202`).
+Opened Review: cockpit shows a red "FLAGGED — acknowledge each to enable merge" banner naming
+`.github/workflows/ci.yml` with reason "CI workflow changed (runs with repo credentials)", the actual diff
+content, and Merge greyed out (`203`). Clicked Acknowledge: banner badge flips to "Acknowledged", footer
+reads "ready to merge", and Merge lights up (`204`) — the full block→acknowledge→unblock loop confirmed
+live, not just the initial flag.
+
+**E6 — Clear stalled verification** — analyzed, not force-reproduced live. Read `MergeQueue.cs` closely:
+both exit paths of `RunVerificationAsync` (success and failure) unconditionally settle the entry out of
+`Verifying` before returning, and `ResumeAfterRestartAsync` explicitly re-drives any run a daemon restart
+interrupted (or strands it back to **Working**, never leaving it in `Verifying`, if the jail is confirmed
+gone). `TryClearStalledVerification`'s own doc comment names its actual audience: a repo whose queue is
+never rebuilt after a restart, a container-runtime probe that cannot even run, or some future path that
+freezes an entry a different way — none of which are honestly reproducible via realistic live UI actions in
+a bounded session. Concluding this is a **legitimate coverage gap from thoroughness, not a bug** — the
+system's self-healing on the ordinary interrupted-run path is solid enough that E6's precondition is hard
+to hit by accident, which is the point of the escape hatch existing at all. Logged as ISSUES-LOG #34
+(methodology note, not a defect) with the reasoning above for whoever picks this up next with more time
+budget (e.g. `docker kill -SIGSTOP` on the jail mid-exec to see if the daemon-side probe hangs rather than
+errors, which might be the one path that doesn't self-heal).
+
+**B1 — BYOK key path** — partially confirmed, with a real new finding. The primary Anthropic-key path
+(`Settings → AI Providers → Store an API key`) validates against the live Anthropic API before saving ("An
+invalid key is never saved") — no real Anthropic key was available this session, so that specific path's
+save-then-isolate claim is **still unverified live** (accessed the Settings window successfully via
+`Cmd+,`, confirmed it renders correctly, `205`, but did not attempt a fake key since the UI's own contract
+says it would correctly refuse to save one, which isn't the interesting half of the claim). Used the
+adjacent, not-health-checked **Custom key** path instead — same settings page, explicitly for "CLIs that
+read their own variable... stored in your OS keyring and injected into every agent's environment." Saved a
+throwaway marker (`TEST_CUSTOM_MARKER` = a recognizable fake value, `206`) via real keystrokes and a real
+click — UI confirmed "Stored TEST_CUSTOM_MARKER... it is injected into every agent's environment."
+
+Spawned a fresh `scripted` coordinator and checked the actual jail: `docker exec <jail> env` — **no leak**,
+the raw marker value never appears in the container's process environment (correct, matches the B5
+secrets-delivery contract). But checking the intended delivery path, `/run/secrets/agent/agent.env` (0400,
+correctly owned by `agent:agent`, matching the documented mechanism) — **the file is present but empty**.
+Not a caching/timing artifact: killed and relaunched the app+daemon fully, spawned a second fresh agent
+against the same freshly-loaded keyring entry, checked again — still empty. **Confirmed as a real defect**:
+the custom-key feature's own UI claim ("injected into every agent's environment") does not hold for a
+`scripted`-class adapter; the credential is durably saved to the OS keyring (the "Stored" badge and Remove
+button in Settings persisted across the restart, confirming the save side works) but never actually reaches
+the agent's environment via either path checked. Logged as ISSUES-LOG #35 (MEDIUM — fails safe, no leak, but
+the feature is silently non-functional, which would strand a real OpenRouter/custom-provider user with an
+agent that can't authenticate and no error telling them why).
+
+**Matrix coverage after this leg**: D2 (all three legs), D5 now fully UI-click-verified. E6 and B1's primary
+Anthropic-key leg remain genuinely open (documented reasoning above, not abandoned without explanation).
+Still gapped: C2, C3, H6, B1's Anthropic-key leg specifically.

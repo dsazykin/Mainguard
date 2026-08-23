@@ -1072,3 +1072,124 @@ the next leg for completeness, but not a gap in the fix.
 - **Matrix row D2 is PARTIALLY UI-click-verified**: the genuine-test-failure leg is confirmed. The other
   two legs of the 3-way trap — a mis-tokenized verify command, and a missing toolchain — still need their
   own scripted adapters and haven't been exercised live yet.
+
+## 33. [Confirmed via real UI click; also a confirmed automation-methodology finding] D2 — mis-tokenized verify command leg, plus the CLI-picker dropdown genuinely won't commit a selection under any tested technique
+
+- Built `scripted-badcmd` (`~/mainguard/adapters/bin/scripted-badcmd` + `registry/scripted-badcmd.json`)
+  that commits `.mainguard/verify: node test.js && echo done` — a `&&` token that survives argv
+  tokenization and needs a shell.
+- **Automation finding, escalated from #32's "methodology note"**: this leg tried FOUR distinct techniques
+  to select `scripted-badcmd` in the CLI-picker ComboBox — (1) a raw CGEvent click on the dropdown, (2)
+  `System Events key code 125` (Down arrow) after clicking to focus, (3) `System Events click` on the
+  actual accessibility-tree menu item (confirmed via `entire contents of window 1` that the popup really
+  does open and really does list `scripted-badcmd 1.0.0` as a real `menu item` element), and (4) a direct
+  `perform action "AXPress"` on that same menu item. **All four left the bound value reading
+  `claude-code 2.1.234`, unchanged, with the popup accessibility tree still showing itself open afterward.**
+  #32's "arrow-key selection works reliably" conclusion does not reproduce this leg — worth re-testing
+  fresh in case it's state-dependent (e.g. only reproducible with a specific set of adapters registered, or
+  only after several prior selections in the same session), but as observed this is a real, repeatable
+  automation dead-end, not a fluke.
+  - Worked around by using `SpawnAgentAsync` via RPC for the CLI-selection step only (setup/plumbing, not
+    the interaction under test), then doing the actual assertion — clicking the row's real Verify button —
+    via genuine UI automation, consistent with the pass's own "RPC only for setup, never for the thing under
+    test" rule.
+  - **Worth a dedicated look**: if a screen-reader or switch-control user hits the same wall via real
+    assistive tech (not just synthetic automation), this ComboBox has a real accessibility defect, not just
+    an automation-friendliness one — the AX tree exposing correct `menu item` elements that don't actually
+    commit on click/AXPress is exactly the shape of bug that would manifest that way.
+- Clicked **Verify** on the resulting `6fef552a…` entry. **Result**: `Can't verify — The verification
+  command contains '&&', which needs a shell — and this command is run argv-style with no shell, so '&&'
+  would be passed to 'node' as an ordinary argument and the rest of the line would never run. Nothing was
+  executed and no verification was recorded... Wrap it in a shell instead: sh -c "node test.js && echo
+  done"` — a third wording, clearly distinguishable from both the genuine-failure message (#32) and the
+  missing-toolchain message (#34 below).
+- Discarded the entry afterward via a real UI click (confirm dialog + "Yes, discard").
+- **Matrix row D2, mis-tokenized-command leg: CONFIRMED.**
+
+## 34. [Confirmed via real UI click] D2 — missing-toolchain leg
+
+- Declared `.mainguard/toolchain: rust-stable` directly on the fixture's `main` branch (a real, catalogued
+  toolchain id — `ToolchainCatalog.cs` — that the base jail image does not actually carry pre-installed).
+  Pushed straight to the daemon's bare mirror via the `mainguard-local` remote; confirmed this needed no
+  daemon restart, since the toolchain baseline is read live off the mirror at verify time (`git show
+  main:.mainguard/toolchain`), not cached — unlike the CLI-adapter registry (#32).
+- Clicked **Verify** on the already-`Working` `c03bfe83…` entry. **Result**: `Can't verify — Could not
+  provision the verification toolchain [rust-stable] declared by repo '...': 'rust-stable' is declared but
+  absent from the worker's jail — the probe \`cargo --version\` exited 127. Verification was NOT run; this
+  is a provisioning failure, not a failing test.` — a third, clearly distinct wording.
+- **Reverted the toolchain declaration on `main` immediately after** (a follow-up commit removing
+  `.mainguard/toolchain`, pushed to the mirror) so it wouldn't silently block every later verification this
+  session — confirmed via the next spawn's successful `Working`→`Verified` transition that the revert took.
+- **Matrix row D2, missing-toolchain leg: CONFIRMED.** All three legs of D2's 3-way trap are now
+  UI-click-verified with genuinely distinguishable wording, satisfying the row's full requirement.
+
+## 35. [Confirmed via real UI click, full loop] D5 — flagged-change (P2-11)
+
+- Built `scripted-ci` (`~/mainguard/adapters/bin/scripted-ci` + `registry/scripted-ci.json`) that commits a
+  new `.github/workflows/ci.yml`.
+- Spawned via the RPC-for-setup-only workaround (#33), clicked **Verify**: entry reached **Verified** but
+  the rail immediately showed "1 flagged change needs acknowledgment" with no Merge affordance on the row.
+- Opened **Review**: cockpit renders a red "FLAGGED — acknowledge each to enable merge" banner naming
+  `.github/workflows/ci.yml`, reason "CI workflow changed (runs with repo credentials)", the real diff
+  content in the right-hand pane, and the footer's **Merge** button visibly disabled.
+- Clicked **Acknowledge**: the flagged-item badge flips to "Acknowledged", the footer text changes to
+  "ready to merge", and **Merge** becomes enabled (purple, clickable) — confirmed via screenshot, not
+  inferred.
+- **Matrix row D5: CONFIRMED, full block→acknowledge→unblock loop**, not just the initial flag.
+
+## 36. [Methodology note, not a bug] E6 — Clear stalled verification: structurally hard to force-reproduce live
+
+- Read `MergeQueue.RunVerificationAsync` closely: BOTH exit paths (the successful-run branch and the
+  exception-catch branch) unconditionally move the entry out of `Verifying` before the method returns —
+  there is no code path where a run ends and leaves the entry stuck in `Verifying` with `_verifying` no
+  longer containing its id.
+- Read `ResumeAfterRestartAsync`: a daemon restart that catches an entry mid-run explicitly either re-drives
+  the verification (if the jail is still there) or strands the entry back to **Working** (if the jail is
+  confirmed gone) — never leaves it sitting in `Verifying` for a human to `Clear`.
+- `TryClearStalledVerification`'s own doc comment names the actual audience this exists for: a repo whose
+  queue is never rebuilt after a restart (so no resume pass ever runs against it), a container-runtime probe
+  that cannot even execute, or some other freeze mechanism entirely — none of which are honestly
+  reproducible via realistic, bounded-time live UI actions.
+- **Conclusion: this is a legitimate coverage gap arising from the system's own thoroughness, not a
+  discovered defect.** The ordinary "verification interrupted" path self-heals reliably in both directions
+  (re-run or strand-to-Working), which is exactly why forcing E6's specific precondition live is hard — the
+  escape hatch exists for failure modes the self-healing code can't detect, not for the common case.
+- **Concrete next step for whoever revisits this with more time budget**: try `docker kill -SIGSTOP` (not
+  `-SIGKILL`) on a jail mid-`exec` to see whether the daemon-side probe call hangs indefinitely rather than
+  throwing promptly — that's the one shape of failure the current self-healing code might not catch, since
+  both settle-paths in `RunVerificationAsync` require the awaited call to actually complete (successfully or
+  by exception) to run at all.
+
+## 37. [CONFIRMED, MEDIUM] B1 (adjacent) — the "Custom key" credential is saved but never delivered to the agent's environment
+
+- Row B1 asks about the primary Anthropic BYOK path (`Settings → AI Providers → Store an API key`), which
+  validates against the live Anthropic API before saving — no real Anthropic key was available this
+  session, so that specific path's save-then-isolate claim is still genuinely open. Settings window itself
+  was reached and confirmed rendering correctly via `Cmd+,` (a real separate window, not a popup — clicks
+  landed reliably on it unlike the CLI-picker ComboBox).
+- Used the adjacent, explicitly-not-health-checked **Custom key (any environment variable)** field instead,
+  since it doesn't require a real credential to test: saved `TEST_CUSTOM_MARKER` = a recognizable fake
+  value via real keystrokes + a real click. UI confirmed: `Stored TEST_CUSTOM_MARKER (custom keys are
+  stored without provider validation) — it is injected into every agent's environment.` The "Stored" badge
+  persisted correctly across a later full app+daemon restart, confirming the keyring save itself works.
+- Spawned a fresh `scripted` coordinator, checked ground truth on the host:
+  - `docker exec <jail> env` — the marker does **not** appear anywhere in the container's process
+    environment. Correct, no leak, matches the B5 secrets-delivery contract (secrets shouldn't sit in plain
+    container env).
+  - `/run/secrets/agent/agent.env` (the documented delivery path per an earlier session's adapter script
+    convention) — present, correctly `-r-------- agent:agent` (0400), but **the file is empty**.
+- **Ruled out timing/caching**: killed and relaunched the app+daemon fully (fresh daemon process, fresh read
+  of the OS keyring), spawned a second fresh agent against the same stored key — `agent.env` still empty.
+- **Confirmed as a real defect, not a security leak**: the credential saves correctly and does NOT leak into
+  the container environment (fails safe), but the feature's own UI claim — "injected into every agent's
+  environment" — does not hold for a `scripted`-class adapter. The secrets file the delivery mechanism is
+  supposed to populate exists but is never written to for this credential type/adapter combination.
+- **Severity: MEDIUM.** Not a security issue (nothing leaks), but a real user relying on this for an
+  OpenRouter/custom-provider CLI would have a silently non-functional integration — the agent's process
+  would fail to authenticate with no error pointing at the actual cause (an empty secrets file it never
+  checks the emptiness of).
+- **Not chased further**: whether this is scoped correctly for `claude-code`-class adapters (which declare
+  a real `apiKeyEnvVar` in their registry manifest, unlike `scripted`'s empty one) wasn't tested — worth a
+  follow-up with a manifest that actually declares a custom env var name to see if THAT path works and only
+  the unconditional "every agent" framing in the UI copy is what's wrong, versus the delivery mechanism
+  itself being broken for all adapters regardless of declaration.
