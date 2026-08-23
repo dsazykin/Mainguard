@@ -6,8 +6,20 @@
 - **`ShellEntryPoint.cs`** (shell) — the shared entry-point plumbing both heads call: the
   interactive-rebase editor argv shims (`--rebase-editor` writes the todo list, `--rebase-msg`
   supplies the reword/squash message keyed by original SHA — `TryHandleShim` runs + returns *before*
-  Avalonia starts, don't reorder), the single-instance guard, and `BuildAvaloniaApp`.
+  Avalonia starts, don't reorder), the single-instance guard, `CrashGuard.Install` (via `AfterSetup`),
+  and `BuildAvaloniaApp`.
   `TryHandleShim` hands back an **exit code** the head must assign to `Environment.ExitCode`.
+- **`CrashGuard.cs`** (shell) — the app-wide unhandled-exception net, installed by `RunDesktop` (via
+  `AppBuilder.AfterSetup`, so the Dispatcher exists) for BOTH heads. `Dispatcher.UIThread.UnhandledException`
+  is the one that matters: an exception escaping a dispatcher job — a `Dispatcher.UIThread.Post` callback,
+  or the `async void` rethrow `[RelayCommand]`'s `AsyncRelayCommand` performs on a faulted command body —
+  has no frame below it to catch it, so .NET calls `abort()` and the whole GUI dies (ISSUES-LOG #12: clicking
+  Coordinator → Restart took the client down with SIGABRT mid-`SpawnAgent`). It marks such exceptions handled,
+  appends the full exception to **`<data root>/logs/client-crash.log`** (the client had NO file log before —
+  the only evidence a crash left was an unsymbolicated native stack) and raises a shell toast. Also records
+  `AppDomain.UnhandledException` (can't be handled, but can be diagnosed) and observes
+  `TaskScheduler.UnobservedTaskException`. A net, not a licence: commands that can fail still catch their own
+  failures and render them in context.
 - **`SingleInstanceGuard.cs`** (shell) — the cross-platform single-instance guard behind
   `RunDesktop`: the named mutex on Windows, an exclusive flock on `<data root>/app.lock` on Unix
   (a named mutex does not exclude across processes on macOS — two instances both "won"

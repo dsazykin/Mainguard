@@ -312,6 +312,103 @@ public class CoordinatorCliStartTests
         Assert.NotEqual(firstId, host.CoordinatorAgentId);    // a new session id
     }
 
+    // ---- ISSUES-LOG #12: a faulting Restart must not be able to abort the process ------------------
+
+    /// <summary>
+    /// <b>The #12 crash, at the level it actually killed the app.</b> Clicking Coordinator → Restart took
+    /// the whole client down with <c>SIGABRT</c> — an unhandled managed exception on
+    /// <c>com.apple.main-thread</c>, which took every open stream RPC with it mid-<c>SpawnAgent</c>.
+    ///
+    /// <para>The mechanism is <c>[RelayCommand]</c>'s generated <c>AsyncRelayCommand</c>:
+    /// <see cref="System.Windows.Input.ICommand.Execute"/> — what a clicked button calls — awaits the
+    /// command body inside an <c>async void</c> helper, so a faulted body is not handed back to a caller,
+    /// it is RE-THROWN onto the synchronization context. On Avalonia that lands as a dispatcher job with
+    /// no frame left below it to catch it, and .NET aborts. <c>StartCoordinatorCoreAsync</c> guarded its
+    /// own spawn, but Restart is stop-THEN-start and neither the stop leg nor the projection refreshes
+    /// were covered.</para>
+    ///
+    /// <para>So this drives the command the way the BUTTON does (<c>ICommand.Execute</c>, not
+    /// <c>ExecuteAsync</c>) with a teardown that throws, and asserts nothing reached the dispatcher's
+    /// unhandled-exception hook — i.e. nothing would have aborted the process. The handler is attached
+    /// (marking it handled) so a regression records a failed assert instead of taking the test host down
+    /// with it, exactly as <c>CrashGuard</c> does in the app.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public async Task RestartCoordinator_WhoseTeardownThrows_ReportsIt_AndNeverEscapesTheCommand()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+
+        var escaped = new List<Exception>();
+        void OnUnhandled(object? _, DispatcherUnhandledExceptionEventArgs e)
+        {
+            escaped.Add(e.Exception);
+            e.Handled = true;
+        }
+
+        Dispatcher.UIThread.UnhandledException += OnUnhandled;
+        try
+        {
+            host.ProjectionFailure = new InvalidOperationException("the projection could not be read");
+            ((System.Windows.Input.ICommand)vm.RestartCoordinatorCommand).Execute(null);
+            await WaitUntilAsync(() => !vm.IsStartingCoordinator, TimeSpan.FromSeconds(5));
+            host.ProjectionFailure = null; // the surface must be usable again once the fault clears
+            Dispatcher.UIThread.RunJobs();
+        }
+        finally
+        {
+            Dispatcher.UIThread.UnhandledException -= OnUnhandled;
+        }
+
+        Assert.Empty(escaped);                                   // nothing that could have aborted the process
+        Assert.False(vm.IsStartingCoordinator);                  // the busy flag was released
+        Assert.Equal("the projection could not be read", vm.CoordinatorStartError); // and it is ON the card
+    }
+
+    /// <summary>The same guarantee through the awaited seam the other tests use: a Restart whose stop leg
+    /// throws completes, it does not propagate. (<c>ExecuteAsync</c> is the honest path — the bug was that
+    /// the button does not use it.)</summary>
+    [AvaloniaFact]
+    public async Task RestartCoordinator_WhoseTeardownThrows_CompletesRatherThanPropagating()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+
+        host.ProjectionFailure = new InvalidOperationException("the projection could not be read");
+        await vm.RestartCoordinatorCommand.ExecuteAsync(null); // must not throw
+        host.ProjectionFailure = null;
+
+        Assert.Equal("the projection could not be read", vm.CoordinatorStartError);
+    }
+
+    /// <summary>Stop runs through the confirm prompt's own <c>[RelayCommand]</c> — the same
+    /// <c>async void</c> hazard one level down. A teardown that throws must leave the prompt dismissible
+    /// rather than stranding it on a spinner (and must not escape).</summary>
+    [AvaloniaFact]
+    public async Task StopCoordinator_WhoseTeardownThrows_ClearsBusy_AndNeverEscapesTheCommand()
+    {
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        var host = new FakeCliHost();
+        using var vm = new ControlCenterViewModel(BundleWith(host, mock));
+        await vm.LoadInstalledClisAsync();
+        await vm.StartCoordinatorCommand.ExecuteAsync(null);
+
+        vm.StopCoordinatorCommand.Execute(null);
+        host.ProjectionFailure = new InvalidOperationException("the projection could not be read");
+        await vm.StopPrompt!.ConfirmCommand.ExecuteAsync(null); // must not throw
+        host.ProjectionFailure = null;
+
+        Assert.False(vm.IsStoppingCoordinator);
+        Assert.Null(vm.StopPrompt);                         // the overlay is dismissed, not stranded on its spinner
+        Assert.Equal("the projection could not be read", vm.CoordinatorStartError);
+    }
+
     // ---- ISSUES-LOG #23: "has it started?" off the current state, not off a transition -------------
 
     /// <summary>
@@ -811,7 +908,14 @@ public class CoordinatorCliStartTests
 
         // ---- IAgentService ----
 
-        public IReadOnlyList<AgentInfo> ListAgents() => Agents.ToArray();
+        /// <summary>ISSUES-LOG #12 — models the projection read failing. This is the FIRST thing Restart's
+        /// stop leg does and, unlike the <c>EndAgentAsync</c> call below it, nothing around it caught: the
+        /// exception rode straight out of the command body, which for a <c>[RelayCommand]</c> means onto
+        /// the synchronization context, which means <c>abort()</c>.</summary>
+        public Exception? ProjectionFailure { get; set; }
+
+        public IReadOnlyList<AgentInfo> ListAgents() =>
+            ProjectionFailure is null ? Agents.ToArray() : throw ProjectionFailure;
 
         public event Action<AgentEvent>? EventReceived;
 

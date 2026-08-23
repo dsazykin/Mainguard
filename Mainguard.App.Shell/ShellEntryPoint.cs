@@ -73,7 +73,10 @@ public static class ShellEntryPoint
             return;
         }
 
-        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        // ISSUES-LOG #12: install the unhandled-exception net BEFORE the message loop starts, but AFTER
+        // Avalonia's setup (Dispatcher.UIThread is only meaningful once the platform is up) — AfterSetup
+        // is the one hook that is both. Without it a single faulting dispatcher job aborts the process.
+        BuildAvaloniaApp().AfterSetup(_ => CrashGuard.Install()).StartWithClassicDesktopLifetime(args);
     }
 
     // Avalonia configuration, don't remove; also used by visual designer.

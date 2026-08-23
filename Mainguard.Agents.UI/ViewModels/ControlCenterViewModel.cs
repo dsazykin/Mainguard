@@ -839,7 +839,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>Runs a start/restart body under a fresh <see cref="_startupCts"/> so Stop can cancel it,
     /// holding <see cref="IsStartingCoordinator"/> across the spawn. Refuses to overlap another start or a
-    /// stop-in-progress.</summary>
+    /// stop-in-progress.
+    ///
+    /// <para><b>ISSUES-LOG #12 — this catch is not decoration, it is the difference between an error
+    /// message and a dead app.</b> Both callers are <c>[RelayCommand]</c>s, and the generated
+    /// <c>AsyncRelayCommand.Execute</c> awaits its body in an <c>async void</c> helper: a faulted body is
+    /// not returned to anyone, it is re-thrown onto the synchronization context, where no frame is left to
+    /// catch it and .NET aborts the process. <see cref="StartCoordinatorCoreAsync"/> guards its own spawn,
+    /// but the legs around it did not — the stop half of Restart, and the projection refreshes both halves
+    /// run — so a Restart whose teardown or re-projection threw took the whole client down mid-spawn,
+    /// killing every open stream RPC with it. Anything a start/restart can throw belongs on the coordinator
+    /// card as text; nothing here is worth a crash.</para></summary>
     private async Task RunStartupAsync(Func<CancellationToken, Task> body)
     {
         if (IsStartingCoordinator || IsStoppingCoordinator)
@@ -855,6 +865,19 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         try
         {
             await body(cts.Token);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException
+            || (ex is Grpc.Core.RpcException rpc && rpc.StatusCode == Grpc.Core.StatusCode.Cancelled))
+        {
+            // Stop cancelled the launch — that path owns the teardown and the messaging, so stay quiet.
+            if (!_startupStopRequested)
+            {
+                CoordinatorStartError = "Starting the coordinator was cancelled.";
+            }
+        }
+        catch (Exception ex)
+        {
+            CoordinatorStartError = ex.Message;
         }
         finally
         {
@@ -918,6 +941,12 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             {
                 CoordinatorTerminal?.ClearView();
             }
+        }
+        catch (Exception ex)
+        {
+            // ISSUES-LOG #12: same async-void hazard as RunStartupAsync — this runs as the stop prompt's
+            // [RelayCommand] confirm, so an escape here aborts the process instead of failing the stop.
+            CoordinatorStartError = ex.Message;
         }
         finally
         {
