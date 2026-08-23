@@ -743,3 +743,42 @@ agent that can't authenticate and no error telling them why).
 **Matrix coverage after this leg**: D2 (all three legs), D5 now fully UI-click-verified. E6 and B1's primary
 Anthropic-key leg remain genuinely open (documented reasoning above, not abandoned without explanation).
 Still gapped: C2, C3, H6, B1's Anthropic-key leg specifically.
+
+## Step 025 (2026-08-23, continuation) — ISSUES-LOG #12 live-reverified (app survives Restart), C2 confirmed, C3 interrupted by focus contention
+
+Regenerated the dev bundle from `cc8f4c36` and relaunched clean (the running app was stale, Aug 18). Reopened
+`e2e-fixture`, navigated to the Coordinator panel — it correctly showed the `DetachedNotice` message from
+#23's fix, not a stuck spinner (`242`). Clicked **Restart** with a real `CGEvent` click: **the app survived**
+— same PIDs before and after, a real `docker exec … claude` process spawned, and a genuine fresh Claude Code
+v2.1.234 session rendered with the preserved OAuth login intact (`243`). No new `client-crash.log` entry, no
+new `.ips` crash report. **ISSUES-LOG #12 is CLOSED, live-confirmed.** Bonus: the same screenshot reconfirms
+#24 (merge-queue jail reconciliation) still correctly rendering "the agent's sandbox is gone" on stale rows
+instead of a false-live Verify affordance.
+
+**C2 (terminal wheel-scroll) — CONFIRMED, both directions.** First tried against the live real claude-code
+session: real `CGEvent` scroll-wheel events at verified coordinates (confirmed via `mousepos.swift` and
+frontmost-app checks — the click point and app focus were both correct) produced **zero visible change**
+across two attempts (15 and 60 ticks). Rather than log this as a scroll regression, ruled out the known
+confound first: claude-code's full-screen TUI repaints in place and was mid-interactive-prompt
+("Set up auto mode?") at the time, which the test matrix already flags as a poor scroll-test surface. Spawned
+a `scripted` coordinator instead (via RPC for setup only — the interaction under test stayed 100% real UI),
+typed a plain `for i in $(seq 1 200); do echo scroll-test-line-$i; done` directly into its raw `sh -i` shell
+via `System Events keystroke` (full text landed correctly, no drops), and scrolled with real wheel events
+(`244` → `245`): the pane scrolled cleanly all the way back to line 1 and the original command. Scrolled back
+down (`246`): returned cleanly to line 200 at the live cursor. **C2 is genuinely working** — the earlier
+zero-response was the already-documented claude-code-TUI caveat, not a broken feature.
+
+**C3 (OSC 52 clipboard) — started, interrupted.** Set a known clipboard baseline (`CLIPBOARD-BASELINE-EMPTY-
+MARKER` via `pbpaste`/`osascript set the clipboard`), then attempted to type an OSC 52 escape sequence
+(`printf '\033]52;c;%s\a' "$(echo -n OSC52-TEST-PAYLOAD | base64)"`) into the scripted agent's shell. The
+Mainguard window had lost focus between the click and the keystroke send (confirmed: frontmost app was
+`Terminal`, not `Mainguard`, immediately after) — the user was actively using their own machine at the same
+time, and the synthetic keystroke landed in the user's own terminal instead of the jail (visible to the user,
+who echoed the exact command back mid-turn, confirming the leak). Clipboard remained at the baseline marker,
+confirming nothing reached the app. **Not logged as a product finding — this is the same focus-contention
+methodology gap as before**, not a Mainguard defect. Stopped automation immediately rather than fight for
+focus. C3 and H6 remain genuinely untested; next leg should re-attempt once the user confirms the machine is
+free, and should re-verify frontmost-app before every keystroke send, not just before click sequences.
+
+**Matrix coverage after this leg**: ISSUES-LOG #12 closed with live confirmation. C2 now fully UI-click-
+verified. Still gapped: C3, H6, B1's Anthropic-key leg.
