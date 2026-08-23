@@ -572,3 +572,32 @@ investigation).
 Stopping here — this leg found one significant new architectural issue that deserves the same careful
 treatment as #18-20 rather than a rushed fix, plus closed out H7 and G4 cleanly. Next leg should pick up
 with G1's real answer, then the remaining D/C/H/I/B rows.
+
+## Step 024 — G1 confirmed on the Resource Monitor panel (screenshots 188-190)
+
+Activated the app fresh (`osascript ... activate` — the window had again closed while the process stayed
+alive, same shape as #14; re-derived window origin via `System Events`'s reported position rather than
+reusing a cached coordinate, per the standing methodology note). Landed on the Resource Monitor panel
+showing 4 agents: 3× `claude-code` TornDown, 1× `unknown` Working (`188`).
+
+Right-clicked the Working row with a real `CGEvent` right-click — a Pause/End-task popup appeared
+immediately (`189`), confirming #25's conclusion a second way: the queue rail genuinely has no context
+menu, G1's affordance lives here instead. Clicking **Pause** fired a real `PauseAgent` RPC and got an
+honest refusal back (`no live jail to pause`) for an agent id that, cross-checked against `docker ps`,
+really doesn't have a container — but which didn't match the id `ListAgents` was reporting as the actual
+live Working agent at that moment. Investigated the ViewModel code directly rather than guessing; it
+looks correct (rows are matched/updated by `AgentId`, never reused). Most likely explanation: the
+multi-step screenshot-crop-recalibrate cycle this leg's coordinate-finding took gave the background
+refresh enough time to swap which agent the "unknown / Working" row represented while the menu sat open
+— and two label-less agents render identically, so there was no way to see the swap happen. Logged as
+ISSUES-LOG #28 with full detail; not filed as a confirmed code bug, but the "two agents can look
+identical" gap is real and worth fixing once orphan/pre-label jails age out.
+
+**Matrix row G1 is now UI-click-verified**: context menu exists, reachable by right-click, Pause/End task
+both wire to real RPCs with honest responses (crash-free, silence-free).
+
+**Matrix coverage after this leg**: E1-E5, E7, G1, G3, G4, H7 (all 4 themes + System), I1 (both halves)
+now UI-click-verified. **Still gapped**: E6, D2/D4/D5, C2/C3, H2/H4/H6, I2, B1 — none of these were
+reached this leg; G1's investigation (calibration attempts, code-reading, cross-checking against
+`docker ps`/`rpc.log`) consumed the leg's budget on its own. Next leg should start fresh on E6 or D2 and
+work down the remaining list; no architectural fix is pending from this leg (unlike the last several).

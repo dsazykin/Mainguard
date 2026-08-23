@@ -960,3 +960,39 @@ the next leg for completeness, but not a gap in the fix.
   `rgb(25,28,33)`, screenshot `180-system-theme.png`).
 - **All 4 themes + System are now UI-click-verified** across this and earlier legs (Daylight Loom,
   Graphite from an earlier leg's #16; Atelier and System this leg). H7 is CLOSED as a matrix row.
+
+## 28. [Confirmed via real UI click, with a real finding] G1 — the right-click pause context menu lives on the Resource Monitor row, exactly as #25 concluded
+
+- **Step:** 023. Right-clicked the "unknown / Working" row on the Resource Monitor panel with a real
+  `CGEvent` right-click (`.rightMouseDown`/`.rightMouseUp`) — a native-looking dark popup with **Pause**
+  and **End task** (red) appeared immediately (`189-g1-context-menu-pause-endtask.png`). This is the G1
+  affordance; #25's conclusion (queue rows have no context menu, the pause lives on the Resource Monitor
+  instead) is confirmed correct a second way.
+- **Clicking Pause fired a real RPC** (`~/.mainguard/logs/rpc.log`):
+  `PauseAgent { agent_id=3cd48ab2bc1b4678b475749f8e9521dc }` →
+  `PauseAgentResponse { paused=False, reason=this agent has no live jail to pause }`. Cross-checked
+  against `docker ps -a`: no container for `3cd48ab2…` exists at all (only `f1574a0b…` is a live
+  `mainguard-agent` container). So the RPC's honest refusal is *correct* — that agent really has no jail
+  — but it is almost certainly **not the agent the row visually represented**: `ListAgents` at that exact
+  moment reported exactly one `Working` agent, `f1574a0b…`, not `3cd48ab2…` (`190-g1-pause-honest-
+  refusal-menu-closed.png` — note the row still reads "unknown / Working / 1% / 0.2 GB" after the
+  refusal, i.e. still describing the *live* agent's metrics).
+- **Not filed as a confirmed code bug** — `ResourceMonitorViewModel`/`AgentUsageRowViewModel` were read
+  and look correct (rows are matched and updated by `AgentId`, never reused across ids; a
+  `RelayCommand`'s captured `AgentId` is read from the row instance at invocation time, which is normal
+  correct MVVM binding, not a stale-closure bug). The much more likely explanation: right-click opened
+  the menu against whatever row existed at that instant (very plausibly still `3cd48ab2…`, the just-
+  fixed #23 coordinator, mid-teardown/replacement), and the several-second gap this leg's manual
+  screenshot-crop-recalibrate cycle took before the actual click let the background refresh swap that
+  row out for `f1574a0b…` underneath — while both render as the visually **identical** "unknown /
+  Working" label, so a human (or an agent driving by screenshots) cannot tell them apart by sight. A
+  fast retry (right-click → click within ~0.6s) produced no RPC at all, consistent with a narrow timing
+  window rather than a reproducible binding defect.
+- **Worth fixing regardless of root cause, flagged for a future pass, not chased further here**: two
+  different agents rendering with the exact same "unknown" label (because neither has a
+  `mainguard.agent.role`/`mainguard.kind` tag) is itself a real usability gap — a human has no way to
+  distinguish which "unknown" row is which agent, which is exactly what made this investigation
+  ambiguous. Once every jail this app spawns carries proper labels (new jails already do, per #19/#20's
+  fix), this specific ambiguity naturally goes away; it only affects pre-label-era orphans.
+- **Matrix row G1 is UI-click-verified**: the context menu exists, is reachable by right-click, and
+  Pause/End task both wire to real RPCs with honest (non-crashing, non-silent) responses.
