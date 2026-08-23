@@ -151,7 +151,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 
   **Residual unknown, and why it is no longer load-bearing:** which of paths 1–3 fired at 15:45:13 cannot be distinguished from the surviving log — the client emits no line of its own, and a client-side provision failure leaves no daemon-side trace at all. All three are closed, and the failure mode they shared (a torn-down pump with no one left to restart it) is now closed at the source in two independent ways. **Not reproduced live** by GUI automation: the winning interleave needs two repo-opens inside a ~150 ms `ProvisionRepo` window, which is not reliably hand-drivable through the UI — the deterministic fails-before unit tests are the stronger evidence here, and are what would catch a regression. **Follow-up worth doing anyway (not blocking):** the client still logs *nothing* when a pump binds, unbinds or gives up, which is the single biggest reason this took three legs to pin — one debug line per re-subscribe and per `ClearActiveRepo` would have answered it in minutes.
 
-### 12. [CONFIRMED — separate finding] The Mainguard.app UI client crashed (SIGABRT) once during this session
+### 12. [FIXED — commit `cc8f4c36`. Root cause found: `[RelayCommand]`'s `async void` rethrow, over a bare leg of Restart. Live re-verification BLOCKED on a locked screen] The Mainguard.app UI client crashed (SIGABRT) once during this session
 - **Step:** 013/014 boundary
 - `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-20-173042.ips`: `Mainguard` (the UI client, not the daemon) crashed with `EXC_CRASH`/`SIGABRT` at 2026-08-20 17:30:42 local time — the crash trace shows `IL_Throw` → `DispatchManagedException` → `abort()`, i.e. an **unhandled .NET managed exception** reached the top of the stack and crashed the process, not a native fault. This was the only Mainguard-attributed crash report from today (a separate `dotnet_...plist` crash-reporter entry from 13:37 is very likely an unrelated `dotnet test` process crash, not the product).
 - The daemon's own `lifecycle.log` shows a normal "shutdown requested — draining" / "stopped" pair at 15:30:28 UTC (matching local 17:30:28, 14s before the crash timestamp) followed by a relaunch at 15:38:50 UTC — consistent with the client crashing and something (the OS or a supervising script) relaunching both processes ~8 minutes later, though this pass did not confirm whether that gap was manual or automatic.
@@ -176,6 +176,68 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   suspects are `RunStartupAsync` (no catch) and the stop leg it awaits — `[RelayCommand]`'s
   `AsyncRelayCommand` rethrows onto the synchronization context by default. Next step is named there:
   reproduce with the head run from a terminal so the managed exception type actually gets printed.
+- **2026-08-23 — ROOT-CAUSED AND FIXED (commit `cc8f4c36`).** The previous leg's hypothesis was right, and
+  the `.ips` proves the mechanism on its own once you read the frames rather than just the symbols.
+
+  **What the crash report actually says.** `Mainguard-2026-08-23-031119.ips`, faulting thread
+  `com.apple.main-thread`: `IL_Throw → DispatchManagedException → DispatchExSecondPass → SfiNextWorker →
+  TerminateProcess → PROCAbort`. Three things follow from that stack, and together they name the bug:
+  1. **`IL_Throw` is present**, so this was an *explicitly thrown* exception (a `throw` statement or an
+     `ExceptionDispatchInfo.Throw`), not a null dereference — an NRE arrives as a converted hardware fault
+     and never goes through `IL_Throw`.
+  2. **`IL_Throw` sits directly on the original frame chain**, so the report shows the real throw site: nine
+     managed frames, `Main` at the bottom, then the Avalonia dispatcher pump, then **exactly ONE frame**
+     above it. A render-path or projection-path throw would show a dozen; this was thrown by the dispatcher
+     callback itself.
+  3. That one frame is JIT'd ~29 MB above every other managed frame on the stack — i.e. compiled for the
+     *first time* at the moment of the crash. `AsyncMethodBuilderCore.ThrowAsync`'s posted rethrow callback
+     is exactly that: a method the process had never executed before, because no `async void` had ever
+     faulted before.
+
+  **So: an `async void` faulted, and its rethrow found no handler.** The `async void` is not ours to see in
+  the source — it is inside `[RelayCommand]`. The generated `AsyncRelayCommand.Execute` — *what a clicked
+  button calls*, unlike the `ExecuteAsync` every existing test used — awaits the command body in a private
+  `async void` helper, so a faulted body is not returned to a caller: it is re-thrown onto the
+  synchronization context. On Avalonia that is a dispatcher job with nothing below it, and .NET aborts. That
+  is why this was undiagnosable from the artifact: the exception's own frames were long gone by the time it
+  was re-thrown, and a `.ips` carries no managed exception type.
+
+  **Which leg.** `StartCoordinatorCoreAsync` catches `OperationCanceledException`, `RpcException` and bare
+  `Exception` around its spawn — but Restart is stop-THEN-start, and `RunStartupAsync` (the wrapper both
+  Start and Restart run through) had **no catch at all**. Everything the stop leg does outside its one inner
+  `try` — the `ListAgents()` projection read that opens `StopCoordinatorCoreAsync`, and the `RefreshAgents()`
+  / `RefreshCoordinatorCli()` re-projections that both halves run — rode straight out of the command body.
+  The daemon log agrees on timing: the client was inside `await host.StartCoordinatorAsync(...)` (the
+  `SpawnAgent` RPC was still open, and only ended `Internal` a second *after* the client was gone), so the
+  fatal throw came from the UI thread while that await was outstanding — not from the spawn call itself,
+  which was guarded.
+
+  **The fix, two layers.**
+  - `RunStartupAsync` and `StopCoordinatorConfirmedAsync` now catch. A start/restart failure renders on the
+    coordinator card as text (cancellation still unwinds quietly), and `CoordinatorStopPromptViewModel`'s
+    confirm no longer strands the overlay on a spinner it can never clear.
+  - New **`Mainguard.App.Shell/CrashGuard.cs`**, installed by `ShellEntryPoint.RunDesktop` for both heads:
+    handles `Dispatcher.UIThread.UnhandledException` so **no** other unguarded `[RelayCommand]` or posted
+    callback can repeat this, appends the full exception to **`<data root>/logs/client-crash.log`**, and
+    raises a shell toast. This is the diagnosability half and it matters as much as the survival half — the
+    client had no file log whatsoever, which is why two crash reports across three days named nothing.
+
+  **Regression tests** (`CoordinatorCliStartTests`, 3 new `[AvaloniaFact]`s): they drive Restart *the way
+  the button does* — `((ICommand)vm.RestartCoordinatorCommand).Execute(null)`, not `ExecuteAsync` — with the
+  projection read throwing, subscribe to `Dispatcher.UIThread.UnhandledException`, and assert nothing
+  reaches it. All three fail on the old code (verified by reverting the catch and re-running: 3 failed / 27
+  passed), all pass on the new. `dotnet build` clean; the 30-test `CoordinatorCliStartTests` suite green.
+
+- **What is NOT verified, and be honest about it.** The exact exception *type and message* is still unknown —
+  the fix removes the crash regardless of which exception it was, but it does not name it. **Live
+  re-verification of the Restart click did not happen: the machine's screen was locked
+  (`CGSSessionScreenIsLocked = 1`) for the whole leg, so no synthetic click could reach the app** (this was
+  checked, then re-polled for five minutes; screenshots of the window still work while locked, which is what
+  made the lock easy to miss — `swift locked.swift` in the session scratchpad is the reliable check, the
+  window-list one is not). The fixed build IS running on-device (relaunched from a terminal so stdout/stderr
+  are captured to the scratchpad's `client2.out`). **Next leg: unlock, click Coordinator → Restart, and
+  confirm two things — the app survives, and if the underlying fault still occurs, `client-crash.log` now
+  names it.** That log is the thing to check first if any client oddity shows up from here on.
 
 ### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
 - **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
@@ -1300,3 +1362,9 @@ a trigger attached:
   managed exception type, so the next leg should reproduce it with the client's stderr captured (run the
   head from a terminal rather than the .app bundle) to name the exception before changing anything.
 - Severity: **HIGH** — it takes the whole app down, and Restart is an ordinary, unremarkable action.
+- **2026-08-23 — root-caused and fixed under #12 (commit `cc8f4c36`).** The hypothesis above was correct:
+  the unguarded neighbour was `RunStartupAsync`, and `[RelayCommand]`'s `AsyncRelayCommand` rethrow is
+  indeed what turned it fatal — the `.ips` frame layout proves it without needing the terminal repro (see
+  #12's 2026-08-23 block for the reading). Two layers of fix plus three `[AvaloniaFact]` regressions that
+  drive the command through `ICommand.Execute`, the async-void path a click actually takes. Live
+  re-verification is still outstanding — the screen was locked for this leg.
