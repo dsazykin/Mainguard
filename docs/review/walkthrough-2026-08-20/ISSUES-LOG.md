@@ -638,7 +638,7 @@ the next leg for completeness, but not a gap in the fix.
   `docker inspect` confirming `Status=running Paused=false`. Also covered end to end by
   `AgentSessionReconcileDockerTests.Reconcile_ShouldFollowAnOutOfBandPauseAndUnpause`.
 
-## 21. [CLOSED — commit TBD] Coordinator terminal renders blank after restart-resume, even once the panel correctly binds to the live agent (#19's own remaining verification step)
+## 21. [CLOSED — commit `578656d6`] Coordinator terminal renders blank after restart-resume, even once the panel correctly binds to the live agent (#19's own remaining verification step)
 
 - **Repro** (real UI, not RPC): rebuilt the daemon+app from `804ae632` (the #18/#19/#20 fix), started a
   real `claude-code` coordinator through the UI (authenticated, banner visible), then killed and
@@ -667,7 +667,7 @@ the next leg for completeness, but not a gap in the fix.
   does — arrive before `Bind()` runs, and `_view?.FeedOutput(data)` on a null `_view` silently drops it
   with no error, log line, or visible symptom besides the blank pane.
 
-### FIXED — commit TBD
+### FIXED — commit `578656d6`
 
 - `TerminalViewModel` now buffers output (`List<byte[]>` under a dedicated lock) whenever it's called
   with `_view` still null, instead of dropping it. `AttachView` flushes anything buffered into the
@@ -1386,3 +1386,48 @@ a trigger attached:
   #12's 2026-08-23 block for the reading). Two layers of fix plus three `[AvaloniaFact]` regressions that
   drive the command through `ICommand.Execute`, the async-void path a click actually takes. Live
   re-verification is still outstanding — the screen was locked for this leg.
+
+## 38. [Confirmed via real UI click, real feature] H6 — deep link activation
+
+- Verified the `mainguard://` scheme end to end, not just parsed. `Info.plist` in the built bundle
+  (`build/macos-bundle/out/Mainguard.app/Contents/Info.plist`) declares `CFBundleURLTypes` for scheme
+  `mainguard`; `lsregister -dump` confirmed macOS LaunchServices has it bound to this exact bundle
+  (`trustedCodeSignatures` present, `roles: Viewer`). Code path is real too:
+  `Mainguard.App.Shell/App.axaml.cs:341-350` wires `IActivatableLifetime.Activated` →
+  `ProtocolActivatedEventArgs` → `HandleDeepLink`, which parses via the pure `DeepLinkParser`
+  (`Mainguard.Git/Security/DeepLink.cs`) and, for `open-agent/<id>`, calls
+  `vm.ShowAgentCommand.Execute(agentId)` (`open-repo`/`open-pr` are activation-only today — explicitly
+  documented in the source as a deliberate follow-up, not a bug).
+- **Repro**: navigated to Repo viewer via a real click (`248`), confirming a clean starting state distinct
+  from any agent view. Ran `open "mainguard://open-agent/b5c89f5588764f808e952cd3bc97156b"` (a real live
+  coordinator's id) from a terminal — a genuine OS-level protocol activation, not an in-process bypass.
+  Result (`249`): the window switched to a full three-column agent-detail layout (Terminal + Agent
+  diff/Plan/Merge-to-main + Staging) scoped to that exact agent id, header reading
+  `scripted · agent/b5c89f5588764f808e952cd3bc97156b...` — visually and structurally distinct from both the
+  plain Repo viewer and the plain Coordinator panel (compare `247`). The Coordinator sidebar item is also
+  highlighted as active.
+- **H6 is genuinely working** for the one command it implements. No bug found; `open-repo`/`open-pr`
+  activation-only behavior is pre-existing, intentional, and documented in the source — not re-logged here.
+
+## 39. [Confirmed via real UI click, real feature] C3 — OSC 52 clipboard
+
+- Verified real OSC 52 support end to end, through the actual composer UI, not a background RPC bypass.
+  Implementation lives in `Mainguard.Agents.UI/Controls/VtScreen.cs:336-373` — the VT/ANSI parser
+  recognizes an OSC string starting `52;`, decodes the base64 payload (ignoring `?` query payloads, which
+  is the correct security posture — never echo the *current* clipboard back to the jail), and raises
+  `ClipboardCopyRequested`.
+- **Repro**: set a known clipboard baseline (`PRE-C3-BASELINE`, confirmed via `pbpaste`). Clicked the
+  Coordinator's composer text field, pasted (`Cmd+V`, via the system clipboard, to avoid AppleScript's
+  backslash-escaping breaking a literal `printf '\033]52;...'` string — a keystroke-layer limitation, not
+  an app issue) `printf '\033]52;c;T1NDNTItVEVTVC1WQUxVRQ==\a'` (`250`/`251`, base64 of
+  `OSC52-TEST-VALUE`), reset the system clipboard to a second distinct baseline
+  (`PRE-C3-BASELINE-2`) so any change could only be attributed to the app, then clicked **Send** — a real
+  click on the real composer button, which delivers into the agent's live shell exactly like the C2 leg's
+  confirmed-working prompt delivery.
+- **Result (`252`)**: the terminal echoed `$ printf '\033]52;c;T1NDNTItVEVTVC1WQUxVRQ==\a'` and returned to
+  a clean `$` prompt (the command ran without error). `pbpaste` immediately after: `OSC52-TEST-VALUE` — the
+  macOS system clipboard was genuinely overwritten by the jail's terminal output, through the app's real
+  rendering path.
+- **C3 is genuinely working.** No bug found. Leftover: the real system clipboard was left holding the test
+  marker `OSC52-TEST-VALUE` at the end of this test — harmless, safe to overwrite, not the user's own prior
+  clipboard content (which was not captured before this leg started and could not be restored).

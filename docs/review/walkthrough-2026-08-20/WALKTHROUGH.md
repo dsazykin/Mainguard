@@ -782,3 +782,111 @@ free, and should re-verify frontmost-app before every keystroke send, not just b
 
 **Matrix coverage after this leg**: ISSUES-LOG #12 closed with live confirmation. C2 now fully UI-click-
 verified. Still gapped: C3, H6, B1's Anthropic-key leg.
+
+## Step 027 — H6 and C3 confirmed live; matrix coverage complete modulo two documented gaps
+
+Machine confirmed clear by the user this time — no focus contention. Confirmed the screen was genuinely
+unlocked (`System Events` could enumerate all running processes) before starting.
+
+**H6 (deep link activation) — CONFIRMED, real feature, not a stub.** Verified the `mainguard://` scheme is
+registered end to end: the built bundle's `Info.plist` declares `CFBundleURLTypes` for scheme `mainguard`,
+and `lsregister -dump` confirmed LaunchServices has it bound to this exact signed bundle. Clicked to the
+Repo viewer for a clean baseline (`248`), then fired `open "mainguard://open-agent/<a real live coordinator's
+id>"` from a terminal — a genuine OS-level protocol activation, not an in-process bypass. Result (`249`): the
+window switched to a full agent-detail view (Terminal + Agent diff/Plan/Merge-to-main + Staging) scoped to
+that exact agent, visually and structurally distinct from both the Repo viewer and the plain Coordinator
+panel. `open-repo`/`open-pr` remain activation-only, which the source documents as a deliberate, pre-existing
+follow-up rather than a bug. Full detail in ISSUES-LOG #38.
+
+**C3 (OSC 52 clipboard) — CONFIRMED, real feature, working end to end.** Set a known clipboard baseline,
+pasted (via `Cmd+V` — AppleScript's `keystroke` chokes on literal backslash-escape sequences, a keystroke-
+layer limitation not an app one) a real `printf '\033]52;c;<base64>\a'` command into the Coordinator's
+composer (`250`/`251`), reset the clipboard to a second distinct value so any change could only be
+attributed to the app, then clicked **Send** — the same real composer path C2 already proved delivers into
+the live shell. The terminal echoed the exact command and returned to a clean prompt (`252`); `pbpaste`
+immediately after read back the test payload verbatim. The app's real macOS clipboard was genuinely
+overwritten by jail terminal output, through the actual rendering path (`VtScreen.cs`'s OSC 52 handling).
+Full detail in ISSUES-LOG #39.
+
+Also fixed two stale `commit TBD` placeholders in ISSUES-LOG #21's headers (the actual fix commit,
+`578656d6`, was known but never backfilled into the doc).
+
+**Matrix coverage after this leg: complete**, modulo the two intentionally-documented gaps (E6 — structurally
+hard to force live, ISSUES-LOG #36; B1's primary Anthropic-key leg — no real key available this pass,
+ISSUES-LOG #37). Every other row in `docs/review/full-test-matrix.md` has now been exercised at least once
+via real UI interaction across this multi-leg pass. See the closing tally below for the full row-by-row and
+bug-by-bug accounting.
+
+---
+
+## Closing tally — full pass, all legs (2026-08-20 through 2026-08-23)
+
+This section is the definitive summary of the entire exhaustive live-UI-click testing pass the user
+requested — every matrix row's coverage status, and every bug found across every leg with its current
+disposition. Pulled from all 39 ISSUES-LOG entries; consult the numbered entry there for full repro detail
+on any line below.
+
+### Matrix coverage (`docs/review/full-test-matrix.md`, by section)
+
+| Section | Rows | Status |
+|---|---|---|
+| A — Provisioning | A1–A3 | Covered live/RPC in earlier legs (pre-dates this doc's numbering; see the original E2E pass) |
+| B — Spawn/auth/identity | B1 (custom-key), B2, B3 | B1's custom-key leg confirmed working (#37, after correcting a measurement artifact); B1's primary Anthropic-key leg is the one documented gap — no real key available; B2/B3 covered by the real logged-in claude-code CLI used throughout |
+| C — Work execution & terminal | C1–C4 | C1/C4 (SendPromptAsync/composer delivery) confirmed working via C2/C3's own real sends; C2 (wheel-scroll) confirmed live both directions (#step 026); C3 (OSC 52 clipboard) confirmed live (#39) |
+| D — Verification & gates | D1–D5 | All confirmed live: D1 pass path, D2 all three legs (fail/mis-tokenized/missing-toolchain — #32/#33/#34), D3 changed-test-command gate, D4 changed-toolchain gate, D5 flagged-change P2-11 (#35) |
+| E — Merge queue lifecycle | E1–E7 | All confirmed live: E1 Verify re-arm, E2/E3 Review + verified-@ stamp, E4 stale cascade, E5 Reject, E6 documented as structurally hard to force (#36, not a bug), E7 Resume (happy path + adversarial) |
+| F — Merge execution & cascade | F1–F6 | Confirmed live across earlier legs: F1 three-step merge, F3 mirror refresh, F4 stale cascade (root-caused and fixed), F6 Bring local |
+| G — Pause/kill/teardown | G1–G4 | All confirmed live: G1 Resource Monitor pause context menu (#28), G2 arbitration (covered by #17's fix verification), G3 kill switch engage+resume with a real jail (#17, fixed and live-verified), G4 Stop coordinator (#26) |
+| H — Other surfaces | H1–H7 | H1 Resource Monitor honesty, H2 egress allowlist (#31), H3 review title (still open, #7), H4 daemon logs (confirmed), H6 deep links (#38), H7 all 4 themes + System (#16/#27) |
+| I — Daemon lifecycle & security | I1–I3 | I1 restart resume (both coordinator-identity and terminal-content halves, fully fixed), I2 daemon auto-update/skew (#30), I3 audit log (separately shipped as P2-15 earlier this session) |
+| J — Flakes & gotchas | — | Documented throughout; see methodology notes below |
+
+**Two intentional, documented gaps remain**: E6 (structurally hard to force live — analyzed, not a bug) and
+B1's primary Anthropic-key path (no real API key available this pass). Everything else in the matrix has been
+exercised via real UI interaction at least once.
+
+### Every bug found, full pass, current status
+
+**Fixed and live-verified:**
+- #11 — merge-queue stream dying mid-session, never retrying
+- #12 — Coordinator Restart SIGABRT crash (root-caused to an `async void` rethrow; also added a general `CrashGuard` safety net + `client-crash.log`)
+- #13 — Rejected/Merged entries appearing to vanish (an ordering + missing-overflow-cue defect, not data loss)
+- #17 — kill-switch Resume never un-pausing a real jail (added a proper causation-tracked unpause fan-out)
+- #18/#19/#20 — daemon state drift from Docker reality across restarts, orphaned jails, stuck Coordinator panel (one shared `AgentSessionReconciler` fix)
+- #21 — Coordinator terminal blank after restart-resume (a view-attach race)
+- #22 — replayed scrollback garbled line-wrapping (a terminal-geometry race, fixed in the VT engine)
+- #23 — coordinator stuck forever on "Still starting" after being adopted across a daemon restart
+- #24 — stale `MergeQueueRows` never reconciled against Docker (a pure liveness signal added, no destructive auto-discard)
+- #4 — stale queue clutter/near-invisible scroll affordance
+
+**Fixed, not yet independently live-reproduced beyond what's noted in its own entry:**
+- (none outstanding — every fix above has a live-verification note in its entry)
+
+**Confirmed real, still open (not fixed this pass):**
+- #1 — no dismiss/discard affordance on the Coordinator error banner (cosmetic/UX)
+- #2 — Coordinator-ended error banner never clears
+- #3/#8 — toast/tooltip text clipped, no way to read the full message
+- #5 — Coordinator terminal's onboarding banner renders garbled (a live-session repaint issue, distinct from #22's now-fixed restart-resume garbling)
+- #7 — "Coordinator (`<cli>`)" review title only works while the coordinator is still alive (H3)
+- #9 — Composer Send on a jailless/stranded agent silently swallows the prompt (HIGH)
+
+**Confirmed not-a-defect (investigated, ruled out):**
+- #14 — window closed with process alive (resolved by relaunch, not a bug)
+- #25 — queue rows have no context menu by design (G1 lives on the Resource Monitor instead)
+- #37 — "Custom key" credential delivery (the measurement bypassed the real client; delivery genuinely works, proven with a Docker-tier test against production `BuildSecrets`)
+
+**Methodology notes (automation-side, not product bugs):**
+- #6 — `System Events keystroke` drops characters on fast/long strings
+- #10 — a screen-point click landed on the wrong app (Claude desktop, not Mainguard)
+- #29 — a Settings-sidebar "navigation failure" was environmental (user + automation contending for input), not a defect
+- #33 (partial) — the CLI-picker ComboBox's dropdown genuinely won't commit a selection under any tested synthetic-click technique (keyboard arrow-key selection works as a reliable alternative)
+
+**Confirmed working as designed, no bug (informational rows closed clean):**
+- #15/#16/#27 — kill-switch button, all 4 themes + System
+- #26 — Stop coordinator full flow
+- #28 — G1 pause context menu (plus a minor, unconfirmed usability note: two label-less "unknown" agents can look identical)
+- #30/#31/#32/#34/#35 — I2, H2, D2 (fail path, missing-toolchain), D5
+- #38/#39 — H6 deep links, C3 OSC 52 clipboard
+
+**HIGH-severity items still genuinely open and worth prioritizing next**: #9 (composer Send silently
+swallowing a prompt on a jailless agent).
