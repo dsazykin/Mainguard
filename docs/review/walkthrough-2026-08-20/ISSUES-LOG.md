@@ -239,6 +239,24 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   confirm two things — the app survives, and if the underlying fault still occurs, `client-crash.log` now
   names it.** That log is the thing to check first if any client oddity shows up from here on.
 
+- **LIVE RE-VERIFIED, 2026-08-23, screen unlocked.** Regenerated the dev bundle from `cc8f4c36` (`make-bundle.sh
+  --head pro`), killed the stale (Aug 18) app/daemon pair, relaunched clean. Reopened `e2e-fixture`, navigated
+  to the Coordinator panel — it showed the honest `DetachedNotice` message from #23's fix ("No terminal is
+  attached to this agent … Restart the agent to get a terminal you can talk to") for the pre-existing agent
+  `6fef552ade1b46858aa745304c9400ea`, not a stuck spinner. Clicked **Restart** with a real `CGEvent` click at
+  the button's on-screen coordinates (`242-issue12-detached-notice-before-restart.png` →
+  `243-issue12-app-survived-restart-real-claude-code.png`). **The app survived.** `ps aux` confirms both the app (PID 78861) and daemon (PID 78901)
+  processes are still the same PIDs from before the click, unchanged. A real `docker exec … claude` process
+  spawned (PID 79039) and the Coordinator panel rendered a genuine, freshly-started Claude Code v2.1.234
+  session ("Welcome back Daniel!", `daniel.sazykin@gmail.com`'s org) — the preserved OAuth login carried over
+  cleanly. No new file appeared under `~/.mainguard/logs/client-crash.log` (checked, absent — consistent with
+  no crash occurring), and `~/Library/Logs/DiagnosticReports/` has no report newer than the original
+  `Mainguard-2026-08-23-031119.ips` from before the fix. **ISSUES-LOG #12 is CLOSED**, live-confirmed, not
+  just test-confirmed. Bonus: the same screenshot incidentally reconfirms #24 (merge-queue jail-liveness
+  reconciliation) still holding — the three older stale `Working` entries now render the honest "the agent's
+  sandbox is gone — resume the entry to give it one, or discard it" message rather than a false-live Verify
+  affordance.
+
 ### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
 - **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
 - **What happened:** `RejectEntry` succeeded correctly — `rpc.log` confirms `RejectEntryResponse { rejected=True, rejected_by=os:danielsazykin, rejected_at=... }` — and `sqlite3 ~/.mainguard/mainguard-daemon.db` confirms the row is durably persisted as `State='Rejected'`. But the entry vanished from the Merge Queue panel entirely instead of showing as a `Rejected` row. This directly contradicts E5's own spec ("stays on the stream, unlike Discard") and contradicts this SAME walkthrough's own Step 004, which observed a *different* pre-existing Rejected entry (`b5224606390f4de89b205f6982502c67`) rendering correctly in the rail earlier in the session.
