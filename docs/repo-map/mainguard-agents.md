@@ -1244,7 +1244,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       against zero queues forever — the same no-caller defect one level up. `EnsureQueue` is the moment a
       repo's persisted queue state re-enters the process, and every path into it (`ProvisionRepo`, a
       jailed spawn, the PR-intake target resolver) is an RPC handler, so the pass necessarily lands after
-      merge-reconcile and the swarm reconciler.)
+      merge-reconcile and the swarm reconciler. **Dev-only seeding seam** (docs/design/queue-seeding.md):
+      the optional `syntheticVerifications` registry — always passed by the daemon, empty in production —
+      lets a registered `seed-` id take a seeded arm of the private `RunVerificationAsync`: the jail half
+      (extracted as `ResolveJailAndPublishForVerification`) is skipped, the mirror-read half (RT-D2 +
+      toolchain resolution, both gate armings, `ArmFlaggedChangeReview`) still runs for real, and
+      `RunSyntheticVerificationAsync` returns the plan's outcome pinned to the queue's main with the
+      REQUIRED `[seeded — not executed]` provenance marker + an honest artifact log; `RequeueStaleAsync`
+      likewise ends a seeded entry at one of the two real termini — Hold (rest at `StaleVerified`) or the
+      no-jail `Block` to `Working` — never the null-rebaser re-verify, which would mint fresh evidence
+      for a branch not on top of main.)
+    - `SyntheticVerificationRegistry.cs` (the dev-only queue-seeding seam's data:
+      `SyntheticVerificationPlan` — requested outcome, clamped hold, `SyntheticStaleBehavior`
+      Hold|Cascade, the hold-cancellation CTS and the retained in-flight task the clear path must await
+      before `MergeQueue.Cancel` (the row-resurrection ordering rule) — plus the thread-safe
+      `(repoHash, agentId)`→plan registry. Registration REFUSES any id without the `seed-` prefix: a
+      plan for a real agent's id would silently replace that agent's real verification, the one
+      substitution the design exists to make impossible. Only writer: the flag-gated
+      `QueueSeedingService`.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
