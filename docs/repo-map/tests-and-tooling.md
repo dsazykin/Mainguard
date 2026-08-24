@@ -164,6 +164,18 @@
   and a genuinely in-flight run is skipped by both arms; plus the discard-wins-the-race pair — a discard
   landing inside the jail probe is not reported as re-run, and `RunVerificationAsync` on an entry that went
   terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`),
+  `QueueSeederTests` (the dev-only queue seeder over a REAL bare mirror + REAL origin checkout — the
+  `MergeQueueProvisionerTests` fixture posture, because the property under test is that seeded entries
+  travel the production wiring. The sandbox engine THROWS on any use and `resolveContainerId` answers
+  null, so the suite passing is itself the structural proof that seeding executes nothing in any jail;
+  the record half of the forgery rule is asserted directly (`[seeded — not executed]` provenance +
+  "NO RUN WAS EXECUTED" artifact). Covers: every static target state incl. the review family; the real
+  Flagged/RT-D2 gate blocks; the genuinely-in-flight hold with `ClearStalledVerification`'s "wait"
+  refusal and the drain-before-Cancel non-resurrection; the [Verified, Merged] stale pair whose merge
+  REALLY advances origin main and whose cascade REALLY stales-and-holds the co-seed; the
+  origin-not-on-main verbatim refusal with the lease handed back; `PushCommits` really invalidating a
+  Verified seed; the loud verify-config auto-provision; and the registry refusing a plan for a
+  non-`seed-` id),
   `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
   older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
   the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake
