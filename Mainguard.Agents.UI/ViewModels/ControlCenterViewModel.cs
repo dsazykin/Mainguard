@@ -100,6 +100,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>P2-47 #7: the review cockpit overlay (non-null → shown), built from the live GetMergeDiff RPC.</summary>
     [ObservableProperty] private ReviewCockpitViewModel? _reviewCockpit;
 
+    /// <summary>The DEV-ONLY seeding panel — null (card absent) unless the daemon answered the
+    /// availability probe, i.e. unless it was STARTED with the seeding boot flag. Never set for a
+    /// mock-backed harness. See <c>ProbeQueueSeedingAsync</c>.</summary>
+    [ObservableProperty] private QueueSeedingPanelViewModel? _queueSeeding;
+
     /// <summary>Fix 2: the egress block-notification prompt (non-null → shown) — an agent's CLI died on a
     /// host the sandbox proxy refused; Unblock adds it + retries, Keep blocked dismisses.</summary>
     [ObservableProperty] private EgressBlockPromptViewModel? _egressBlockPrompt;
@@ -310,7 +315,15 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         _agents.EventReceived += OnAgentEvent;
         // Fix 2: a CLI that dies on a blocked host raises this — show the unblock/keep prompt.
-        if (_agents is Services.DaemonBackedOrchestrator dbo) dbo.EgressBlocked += OnEgressBlocked;
+        if (_agents is Services.DaemonBackedOrchestrator dbo)
+        {
+            dbo.EgressBlocked += OnEgressBlocked;
+            // Dev-only queue seeding: probe once, in the background. A daemon without the boot flag
+            // has the service UNMAPPED (UNIMPLEMENTED), the gateway answers false, QueueSeeding stays
+            // null, and the card never exists — absent, not disabled. Mock-backed harnesses never
+            // reach this branch at all.
+            _ = ProbeQueueSeedingAsync(dbo);
+        }
         // Changed is raised by the coordinator, the kill switch, AND the merge queue (same requery
         // pattern). Field bug (2026-08-20): the queue leg was missing entirely — EnsureEntry's push
         // landed in GetQueue()'s answer correctly but nothing ever re-pulled it, so a fresh spawn's
@@ -460,6 +473,30 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     });
 
     // ---- Fix 2: egress block-notification prompt ----
+
+    /// <summary>
+    /// Dev-only queue seeding, decided by the DAEMON: one background probe of `GetSeedingStatus`. The
+    /// gateway answers false for UNIMPLEMENTED (no boot flag — the shipped shape) and PermissionDenied;
+    /// only a genuine yes constructs the panel. Failures are swallowed on purpose — an unreachable
+    /// daemon already surfaces through the ordinary reconnect machinery, and a dev card must never add
+    /// a second error channel for it.
+    /// </summary>
+    private async Task ProbeQueueSeedingAsync(Services.DaemonBackedOrchestrator dbo)
+    {
+        try
+        {
+            var gateway = dbo.CreateQueueSeedingGateway();
+            if (await gateway.IsAvailableAsync().ConfigureAwait(false))
+            {
+                await Dispatcher.UIThread.InvokeAsync(() =>
+                    QueueSeeding = new QueueSeedingPanelViewModel(gateway));
+            }
+        }
+        catch (Exception)
+        {
+            // The panel simply stays hidden.
+        }
+    }
 
     private void OnEgressBlocked(Services.EgressBlockInfo info) => Dispatcher.UIThread.Post(() =>
     {

@@ -346,6 +346,13 @@ public sealed class DaemonBackedOrchestrator :
     /// open it at all.</summary>
     public IPrIntakeGateway CreatePrIntakeGateway() => new DaemonPrIntakeGateway(_client);
 
+    /// <summary>The DEV-ONLY queue-seeding seam (docs/design/queue-seeding.md), same factory shape as
+    /// the gateways above. The repo handle is read live so the panel always seeds the repo the rail is
+    /// showing. On a daemon without the seeding boot flag the gateway's availability probe answers
+    /// false (the service is unmapped) and the panel never appears.</summary>
+    public IQueueSeedingGateway CreateQueueSeedingGateway()
+        => new DaemonQueueSeedingGateway(_client, () => _repoHandle);
+
     /// <summary>Fix 2: raised when a spawned agent's CLI DIED on a host the default-deny proxy refused,
     /// so the operator can unblock it and retry. Fired from the agent-event pump thread (the consumer
     /// marshals to the UI thread).</summary>
