@@ -72,3 +72,113 @@ Mac run's `ISSUES-LOG.md` are used as the re-verification list instead.
   contents in the outer (Linux) shell and decoding inside the VM, which sidesteps nested-quoting
   entirely). Verified byte-for-byte correct content after write.
 
+
+## 3. RPC driver harness (runbook §3)
+
+Wrote `rpc-harness.fsx`, referencing DLLs from `Mainguard.Server.Tests/bin/Release/net10.0/`
+(built with the **Windows-side** dotnet, since the harness must reach the daemon over
+`127.0.0.1:5250` exactly as the Windows client does) plus
+`Microsoft.Extensions.Logging.Abstractions` 9.0.0/net8.0 from the NuGet cache, per the runbook.
+`dotnet fsi` run via `powershell.exe` (not WSL bash — a Linux-side fsi would sit in a different
+network namespace than `MainguardEnv`'s forwarded loopback).
+
+First run: connected, got `GetDaemonInfoAsync` (daemon `0.2.8+6124b3b5e…` — matches this
+branch's HEAD, confirming the daemon really is running the code under test), `ProvisionRepoAsync`
+on the fixture — sync remote name came back **`mainguard-vm`**, exactly as the substrate table
+predicts (vs `mainguard-local` on macOS). Registered the git remote on the checkout (its URL is a
+`\\wsl.localhost\MainguardEnv\...` UNC path — added via WSL git since it just writes the config
+string, but any actual fetch/merge against it must go through **Windows** git, since WSL git does
+not understand UNC paths).
+
+### Finding: sandbox image runtime rebuild is broken on this Docker engine (TARGETARCH empty)
+
+`SpawnAgentAsync(role="coordinator")` initially refused with `FailedPrecondition`: "Mainguard OS
+sandbox image(s) need provisioning (outdated: mainguard-agent-base:latest)". The daemon's own log
+(`~/.mainguard/logs/lifecycle.log` on the Windows client) showed it attempting a **runtime**
+`docker build` of `mainguard-agent-base` (triggered because this branch's newer commits moved the
+`SandboxImageVersions.AgentBase` source-hash constant past what the existing 2-week-old image was
+labeled with) — and that build failing:
+
+```
+sandbox images: mainguard-agent-base:latest — BuildFailed: docker build exited 1: The command
+'/bin/sh -c case "${TARGETARCH}" in amd64) ...; arm64) ...; *) echo "no pinned nix-installer for
+TARGETARCH ''" >&2; exit 1 ;; esac && curl ... nix-installer-${NIX_PLATFORM} ...' returned a
+non-zero code: 1
+```
+
+**Root-caused, not guessed:** reproduced the exact `docker build` by hand from the payload's
+`images/mainguard-agent-base/Dockerfile` — `TARGETARCH` came back **completely empty**, hitting
+the Dockerfile's `*)` fallback. `TARGETARCH` is a BuildKit-automatic build-arg that this machine's
+Docker engine (`20.10.24+dfsg1` inside `MainguardEnv`, an older engine without BuildKit's
+platform-inference active) never populates for a plain `docker build` — unlike the Mac run's
+OrbStack/Docker Desktop, which auto-populates it. Confirmed the network/pin itself is completely
+fine: manually curling the pinned Nix installer URL
+(`https://install.determinate.systems/nix/tag/v3.21.8/nix-installer-x86_64-linux`) inside an
+identical `debian:bookworm-slim` container returns HTTP 200 with a SHA-256 that matches the
+Dockerfile's pin exactly. This is a genuine substrate difference in the "Docker build backend"
+category the brief called out as a risk area, not literally named there but the same species of
+bug (shared code assumes a modern container-engine default that silently doesn't hold on older
+WSL2/Docker Desktop configurations).
+
+The Dockerfile's own header comment states this image must be **"Built in CI / the release
+pipeline ONLY — NEVER at runtime (G-16: a runtime docker build severs the agent PTY)"** — yet the
+app/daemon startup path (`SandboxImageProvisioner` / the daemon spawn preflight) DOES attempt
+exactly that runtime rebuild whenever it detects the image is stale, and that path is what's
+broken here. Whether the *design* (falling back to a live rebuild at all when G-16 says never) or
+just the *TARGETARCH plumbing* is the bug is a genuine open question — flagged for the fix, not
+decided unilaterally mid-walkthrough.
+
+**Unblocked immediately (per the standing instruction) with a manual, minimal, non-code
+workaround**: rebuilt the image by hand with the missing pieces the runtime path should have
+supplied — `docker build --build-arg TARGETARCH=amd64 --label
+mainguard.image.version=<SandboxImageVersions.AgentBase> -t mainguard-agent-base:latest .` — which
+built clean and let the daemon's preflight accept the image immediately. This is a docker-side
+fix only; **no source file was changed for this**, and the real code path that constructs the
+runtime `docker build` invocation still needs a proper fix (tracked as an open finding below, not
+applied yet pending confirming the exact call site).
+
+### Cycle steps 1-2 (spawn + verify) — PASS
+
+With the image fixed, re-ran the harness clean:
+```
+== spawning scripted coordinator ==
+agentId=0372e37675dc497490172d00cb90fe8c
+== waiting for agent branch to appear (up to 20s) ==
+for-each-ref output: 82cc22e30f726743d4864bd1ad272058ed7c685d commit refs/heads/agent/0372e37675dc497490172d00cb90fe8c
+branch found: true (after 1 s)
+== running verification ==
+Ran=true Passed=true Reason=verified against main@769e21bd
+queue entry: agent=0372e37675dc497490172d00cb90fe8c state=Verified verifiedMainSha=769e21bdad4286eb79a88edbdd4ab3ec9b6a706b hasLiveSandbox=true
+CanMerge=true reason=
+```
+Matches runbook §4 step 1's assertion (jail + `agent/<id>` ref within ~20s — here 1s) and step 2's
+assertion (`Ran=true, Passed=true`, `Verified` state, `VerifiedMainSha` set, `CanMerge=true`).
+
+## 4. GUI automation limitation found: repository-list rows are not activatable via UI Automation or synthetic mouse input
+
+While attempting to open the fixture repo through the app's own "Select Repo" picker (a secondary
+`RepoPickerWindow`), found and root-caused (see ISSUES-LOG) that repository list rows expose only a
+bare `TextBlock` to UI Automation with no `InvokePattern`/`SelectionItemPattern` ancestor before the
+containing `ListBox`/`ScrollViewer`/`Window` — and that neither raw `SendInput` mouse clicks nor a
+genuine two-click double-click (confirmed via `SetCursorPos`/`Cursor.Position` cross-check, so the
+click coordinates were verified correct) register with this Avalonia surface at all. UI Automation
+`InvokePattern` DID work for named elements that expose it (buttons: Dismiss, the toolbar's folder
+icon, "Select Repo" menu item), and `SendMessage(hwnd, BM_CLICK, ...)` worked for the native Win32
+"Select folder" common dialog's buttons. Pivoted to the RPC harness for repo provisioning, per the
+runbook's own preference for RPC over "OS-specific and brittle" GUI automation for setup steps —
+this is exactly that case. Logged as an accessibility/automation gap (ISSUES-LOG), not fixed inline
+(would need investigating why Avalonia's `ListBox` items aren't getting per-item automation peers,
+a real but non-blocking UI concern separate from this pass's goal).
+
+### Bonus finding: auto-detected repo entry mislabeled as ".git"
+
+Using the picker's "auto-detect repositories" folder-browse flow (invoked via UI Automation
+`InvokePattern` on the toolbar icon — this DID work) and pointing it at a folder that IS itself a
+git repo (rather than a parent folder containing several repos), the newly detected entry was
+added to the list labeled **`.git`** instead of the repo's actual folder name (`e2e-fixture`). Data
+is fine (the entry is real and selectable) — purely a display-label bug, most likely the
+auto-detect scanner using the found `.git` subdirectory's own name as the display name instead of
+its parent when the scan ROOT itself is the repo (as opposed to the common case of scanning a
+parent folder containing multiple repos, where the parent's name is correctly used, as seen for
+`AGY Cortex`/`demo`/`GitLoom`/etc.). Logged in ISSUES-LOG, not fixed (cosmetic, low severity, not
+blocking).
