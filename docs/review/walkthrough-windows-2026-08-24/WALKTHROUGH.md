@@ -298,3 +298,73 @@ either way," and `RejectEntry`'s comment says the same for review verdicts. `Thr
 called by `BeginMerge` and `ConfirmMerge` only — exactly the two operations that actually touch git.
 **The matrix's own G3 wording is the stale artifact here, not the code** — flagging the mismatch
 (ISSUES-LOG) rather than "fixing" working, intentionally-designed behavior.
+
+## 6. Real UI verification: repo opened, Review cockpit, Merge — all via actual clicks
+
+### Harness correction: screenshots were clipped to ~67% of the window this whole session
+
+Discovered while trying to see the Merge Queue rail (off the right edge in every prior
+screenshot): this machine's physical resolution is 2560×1600, but pinning the harness thread to
+`DPI_AWARENESS_CONTEXT_UNAWARE` (the earlier calibration fix) captures at the **virtualized**
+1707×1067 — correct for click-coordinate consistency, but it silently cropped every screenshot to
+the left ~67% of the real window, since the app itself renders at full physical resolution (a
+proper per-monitor-DPI-aware Avalonia app). Switched to
+`DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` instead: screenshots now consistently come back
+2560×1600 across repeated calls (verified 3x), and — because UI Automation coordinates are
+independent of the caller's DPI context — this changes nothing about the click mechanism (still
+`InvokePattern`/`BM_CLICK`, never raw `SendInput`, which this session conclusively confirmed
+**never reaches this app's input pipeline via any mouse method tried**, not just for list rows: a
+literal, coordinate-verified click on the hamburger menu icon — a plain, definitely-clickable
+button — produced no effect either, only `InvokePattern` did). No prior finding in this log
+needs retracting — every actual interaction was always driven by `InvokePattern`/`BM_CLICK`, never
+by the (silently no-op) `SendInput` calls — but every prior *screenshot* undersold how much UI was
+actually there. Re-took the Coordinator/Merge-queue screenshot after the fix; the rail was there
+all along.
+
+### Unblocking repo-open in the real UI (working around W2)
+
+Since W2 (repository-list rows have no `InvokePattern`) blocks opening a NEW repo through the
+picker, and I needed a repo genuinely open in the app's own UI (not just bound via my separate RPC
+harness connection) to test Coordinator/Merge Queue/Review panels live: edited
+`C:\Users\yikes\AppData\Local\Mainguard\config.json`'s `LastOpenedRepoPath` from the stale
+`mg-testrepo` to `e2e-fixture` directly, closed the app (`Stop-Process`, not a graceful Exit — the
+menu-bar toggle needed to reach Exit wasn't landing reliably at that moment; a proper graceful-quit
+restart-resilience check is still owed separately), relaunched, and used the **"Reopen Last
+Repository?"** prompt's real `Reopen` button (confirmed `InvokePattern`-capable) — landing on the
+real Repo Viewer for `e2e-fixture` (branch `main`, Sync/Repository menus, staging panel all
+present). This is a config-file workaround for the picker bug, not a repo-opening mechanism under
+test itself — same spirit as using RPC for setup.
+
+### Coordinator panel — live, real terminal output
+
+Navigating to **Coordinator** (real click) showed a genuine live terminal for one of the scripted
+coordinators spawned earlier via RPC, with its actual commit output
+(`[agent/ba2a7f91... 7d68c4e] feat: add note module (ba2a7f91)`) — confirms C1 (PTY round trip) is
+real, not just RPC-asserted.
+
+### Merge queue rail — re-confirms the Mac run's count-header fix (`c1e4c3e`) holds
+
+The rail showed **"8 in play · 3 in history (merged/rejected, below)"** — the exact header format
+`c1e4c3e` introduced (ISSUES-LOG #13/#4) to fix the "stale entries push new ones below the fold
+with no cue" bug. Holds correctly under this substrate with a genuinely large (11-entry) queue
+built up over this session's testing.
+
+### Review cockpit + Merge — real clicks, both outcomes confirmed
+
+Clicked **Review** (real `InvokePattern` click) on the top queue entry: cockpit opened with the
+correct title format `Review — Coordinator (scripted) · agent/<id> → main`, the diff view, and
+Reject/Bring local/Merge buttons — matches H3 exactly (title names the CLI kind, not a raw GUID).
+
+Clicked **Merge** on that first entry: `BeginMerge` was granted, then correctly **abandoned** —
+"verification is stale — the branch no longer fast-forwards onto 'main'". Traced this to real git
+topology, not a bug: this session's many parallel RPC test runs forked ~9 sibling `agent/*`
+branches off different points as `main` advanced past each of them independently, and this
+particular entry's branch genuinely predates the current `main` tip with no common
+fast-forward path. **This is F2's exact contract working correctly** ("a branch that no longer
+fast-forwards → refused, main NOT moved") — confirmed `main`'s sha was unchanged after the abandon.
+
+Picked a second entry whose branch sits directly on the current `main` tip (confirmed via
+`git log --graph`), clicked **Review** then **Merge** on it for real: `main` advanced to that
+agent's own commit sha, and `node test.js` still printed "all tests green" afterward. **F1's full
+three-step (BeginMerge → client `git merge --ff-only` → ConfirmMerge) verified via actual UI
+clicks**, not just the RPC harness.
