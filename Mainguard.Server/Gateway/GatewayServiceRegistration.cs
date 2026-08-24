@@ -101,6 +101,15 @@ public static class GatewayServiceRegistration
         // wiring decision instead of a flag-dependent shape it could not distinguish from drift.
         services.AddSingleton<SyntheticVerificationRegistry>();
 
+        // ...and the seeder itself, likewise unconditional and inert: its only caller is the
+        // flag-gated QueueSeedingService, which a daemon without the boot flag never maps.
+        services.AddSingleton(sp => new QueueSeeder(
+            provisioner: sp.GetRequiredService<MergeQueueProvisioner>(),
+            registry: sp.GetRequiredService<IMergeQueueRegistry>(),
+            synthetic: sp.GetRequiredService<SyntheticVerificationRegistry>(),
+            repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
+            log: log));
+
         // MG-10: the missing constructor call. `new MergeQueue(...)` and `registry.Register(...)` existed
         // ONLY in the test projects, so the registry stayed empty for the daemon's whole lifetime and every
         // merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were neither enforced nor bypassable,

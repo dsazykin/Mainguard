@@ -77,6 +77,14 @@ public sealed class RoleInterceptor : Interceptor
         // two writes are denied, on the same boundary as BeginMerge/DiscardEntry above.
         "/mainguard.v1.PrIntakeService/UpdatePrIntakeSettings",
         "/mainguard.v1.PrIntakeService/SubscribePrIntakeSource",
+        // The dev-only queue seeder composes EnsureEntry + a supplied verification outcome + the
+        // merge walk in one RPC — every power this list denies the coordinator piecemeal, reachable
+        // at once. Denied unconditionally (whether or not the seeding flag is up): the boot flag
+        // decides whether the OPERATOR gets the surface, never whether an agent does.
+        "/mainguard.v1.QueueSeedingService/SeedQueueEntries",
+        "/mainguard.v1.QueueSeedingService/PushCommits",
+        "/mainguard.v1.QueueSeedingService/ClearSeededEntries",
+        "/mainguard.v1.QueueSeedingService/GetSeedingStatus",
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",

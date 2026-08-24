@@ -303,6 +303,20 @@ public static class DaemonHost
         // sent unless MAINGUARD_TSA_URL names an endpoint (no default third-party traffic).
         builder.Services.AddHostedService<Runtime.AuditAnchorService>();
 
+        // Dev-only queue seeding (docs/design/queue-seeding.md §7): the enablement is captured HERE,
+        // once, at startup — env flag (options) or the in-proc test tier's configuration key — and is
+        // immutable for the process's life. Announced loudly: a seeding daemon must never be mistaken
+        // for a production one.
+        var queueSeeding = new QueueSeedingOptions(
+            options.QueueSeedingEnabled || builder.Configuration["Daemon:EnableQueueSeeding"] == "1");
+        builder.Services.AddSingleton(queueSeeding);
+        if (queueSeeding.Enabled)
+        {
+            lifecycle.LogWarning(
+                "QUEUE SEEDING ENABLED (MAINGUARD_ENABLE_QUEUE_SEEDING) — dev only: this daemon accepts "
+                + "synthetic merge-queue entries. Never run a real repository against it.");
+        }
+
         builder.Services.AddGrpc(o =>
         {
             // EVERY RPC is authenticated (no public-method allowlist), then role/terminal-lock enforced
@@ -310,6 +324,10 @@ public static class DaemonHost
             // access-logged through the secret field mask. Order: authenticate, authorize, log.
             o.Interceptors.Add<BearerTokenInterceptor>();
             o.Interceptors.Add<RoleInterceptor>();
+            // The seeding belt sits AFTER authentication and role enforcement: it exists to refuse the
+            // dev-only QueueSeedingService on a daemon not started for seeding, even if a refactor ever
+            // made that service's mapping unconditional (the primary gate is that it is not mapped).
+            o.Interceptors.Add<SeedingGateInterceptor>();
             o.Interceptors.Add<SecretMaskingInterceptor>();
         });
 
@@ -478,6 +496,15 @@ public static class DaemonHost
         app.MapGrpcService<CoordinatorGrpcService>();
         app.MapGrpcService<EgressGrpcService>();
         app.MapGrpcService<AuditGrpcService>();
+
+        // Dev-only queue seeding — the PRIMARY gate (docs/design/queue-seeding.md §7): a daemon not
+        // started with the boot flag never maps the service, so every call is UNIMPLEMENTED — the
+        // service structurally is not there. SeedingGateInterceptor is the belt behind this line, and
+        // the client reads UNIMPLEMENTED-vs-answer as "hide/show the dev panel".
+        if (app.Services.GetRequiredService<Auth.QueueSeedingOptions>().Enabled)
+        {
+            app.MapGrpcService<QueueSeedingGrpcService>();
+        }
     }
 
     /// <summary>
