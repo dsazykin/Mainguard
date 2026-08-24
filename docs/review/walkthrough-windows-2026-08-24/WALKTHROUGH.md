@@ -368,3 +368,85 @@ Picked a second entry whose branch sits directly on the current `main` tip (conf
 agent's own commit sha, and `node test.js` still printed "all tests green" afterward. **F1's full
 three-step (BeginMerge → client `git merge --ff-only` → ConfirmMerge) verified via actual UI
 clicks**, not just the RPC harness.
+
+## 7. Real UI verification: Resources panel (H1) + kill switch (G3) — full cycle, real clicks
+
+Navigated to **Resources** (real click): showed all 13 live scripted-agent jails, `CPU 0%`/
+`RAM 0.0 GB` per row (a genuinely-measured zero, not the unmeasured-`—` case — consistent with
+trivial idle `sh -i` jails), and the honest unmetered-spend explainer text verbatim: *"Spend isn't
+tracked for these sessions... Agents signed in interactively talk to the provider directly, so
+there is no figure to show — not a figure of zero."* Matches H1 exactly. Bonus: 3 rows showed
+**"Rebasing onto the new main after a merge"** live in the Task column — the stale-cascade
+keep-alive rebase from step 6, visibly legible to the user, not just internally tracked.
+
+**Kill switch (G3), via the real sidebar "Stop all" button** (its child text has no `InvokePattern`
+— same family as W2's list-row gap, but its parent IS a real `Button` with `InvokePattern`, so this
+one's clickable): invoked it for real.
+- Button label correctly flipped to **"Frozen — resume"**.
+- `docker ps` (ground truth, not the UI): **all 13 jails** showed `(Paused)` — not just the first.
+- Resources panel (after a short live-refresh delay): every row updated to **`Paused`** with the
+  exact message *"Kill switch engaged — jail paused, terminal input severed. Resume to recover."*
+  — matches G3's "never a false 'Paused'" bar, and here it's a TRUE paused for every single one.
+- Clicked the same button again (now labeled "Frozen — resume"): `docker ps` afterward shows
+  **zero** jails still paused — all 13 correctly un-paused.
+
+This is the fullest possible confirmation of G3 short of a genuinely adversarial mid-verification/
+mid-merge engage (not attempted this pass) — engage and resume both driven by a real sidebar click,
+both checked against Docker directly, not just the app's own say-so, matching the Mac run's
+`ee9be50` fix (ISSUES-LOG #17) and now also its H1 resource-honesty and F4 cascade-visibility
+claims, all on this substrate.
+
+## 8. Closing tally
+
+**Runbook §4 cycle (spawn → verify → gate → cascade → pause/kill-switch → merge): every
+numbered step exercised, all PASS** — steps 1-2 via RPC, steps 3-4 via both RPC AND real UI clicks
+(Review/Merge), step 5 (changed-test-command gate + reject) via RPC, step 6 (stale cascade) via
+RPC, step 7 (pause/resume) via RPC, step 8 (kill switch) via BOTH RPC and real UI clicks.
+Runbook §5 (real claude-code agent, needs a human login) and §6 (restart resilience, needs a
+clean graceful-quit re-verify) were not reached this pass — flagged as open below, not silently
+skipped.
+
+**Matrix rows touched this pass:** A1 (repo provision, RPC) partial; C1 (PTY output, real UI)
+confirmed; D1/D3/D7 (verify pass path + changed-test-command gate) confirmed via RPC; E2/E3 (Review
+reachable, verified-@ stamp) confirmed via real UI; F1/F2/F3/F4 (merge three-step, non-ff refusal,
+mirror refresh, stale cascade) all confirmed, F1/F2 via real UI; G1 (pause/resume) confirmed via
+RPC with real docker cross-check; G3 (kill switch) confirmed via **real UI** with real docker
+cross-check, both directions; H1 (resource honesty) confirmed via real UI. Untouched this pass:
+A2/A3, B1-B5 (BYOK/OAuth — needs a human login), D2/D4/D5/D6, E1/E4-E7, F5/F6, G2/G4, H2/H4-H7,
+I1-I5 — a large remaining surface, honestly not covered, not silently assumed green.
+
+**Bugs found this pass**, severity and status:
+- **W1 — sandbox image runtime build fails (`TARGETARCH` unset) — HIGH — FIXED** (`d8b371e`,
+  50/50 tests green).
+- **W2 — repository-list rows have no UI-Automation activation path — MEDIUM — OPEN** (logged,
+  worked around via RPC + a config-file edit, not source-fixed).
+- **W3 — auto-detected repo mislabeled `.git` instead of its folder name — LOW/cosmetic — OPEN.**
+- **W4 — git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote —
+  HIGH — OPEN** (this session's `safe.directory=*` is a local unblock only, not a fix; real fix
+  needs someone to nail the exact path form git will match).
+- **W5 — rejected/discarded-by actor renders as a bare `uid:1000`, not a human identity — LOW —
+  OPEN.**
+- **Matrix-doc correction (not a bug):** `full-test-matrix.md`'s G3 wording ("BeginMerge/
+  DiscardEntry refused while frozen") is stale against deliberate, documented, correct code —
+  Discard/Reject are intentionally NOT kill-switch-gated. Flag for whoever owns the matrix doc.
+
+**Positive re-confirmations** (Mac-run fixes holding on this substrate): `ee9be50` (kill-switch
+resume un-pausing a real jail) — RPC AND real UI, both directions; `c1e4c3e` (queue count-header,
+"N in play · N in history") — visually confirmed with an 11-entry queue; the general merge-queue
+lifecycle (`7497202` display ordering, `978db19`/`a972b02` provision-binding fixes) — implicitly
+exercised throughout without any of the symptoms those fixes addressed recurring.
+
+**Git status:** clean except two untouched, unrelated pre-existing untracked files
+(`mainguard-findings.md`, `mainguard-security-audit-phase2.md`, dated 2026-08-06, out of scope for
+this pass). All work committed to `port/macos` and pushed after every meaningful step — no
+uncommitted work at risk.
+
+**What's still open / next leg's starting point:**
+1. W4 (git dubious-ownership/UNC) — the highest-value follow-up; blocks every real merge for every
+   Windows+WSL2 user until solved.
+2. W2 (repo-list row activation) — a real Avalonia automation-peer gap worth its own investigation.
+3. The real-agent leg (§5, needs a human to complete an OAuth login) and restart-resilience (§6,
+   needs a clean graceful Exit → relaunch, not the process-kill used to pick up the config edit)
+   were not reached — next session should start there.
+4. The full A-J fresh pass (priority 3) was not attempted — this session prioritized the
+   already-fixed-bug re-verification and the cycle spine per the brief's own stated order.

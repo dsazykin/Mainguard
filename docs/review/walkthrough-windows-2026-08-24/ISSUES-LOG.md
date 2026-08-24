@@ -158,3 +158,29 @@ verdicts. Only `BeginMerge` and `ConfirmMerge` — the two operations that actua
 "fixing" correct, intentional behavior. Kill-switch engage/resume itself (both jails pausing,
 both correctly un-pausing) re-confirms the Mac run's `ee9be50` fix (ISSUES-LOG #17) holds under
 this machine's Docker Desktop/WSL2 backend.
+
+### Confirmed via real UI clicks: kill switch (G3) full cycle, resource-honesty (H1), Review/Merge (E2/H3/F1/F2)
+
+- **G3 kill switch**, sidebar "Stop all" → real click (its label text has no `InvokePattern` but
+  its parent `Button` does): engaged, button flipped to "Frozen — resume", **all 13** live jails
+  showed `docker ps` `(Paused)` (cross-checked directly, not just trusting the UI), Resources panel
+  updated every row to `Paused` with the honest message "Kill switch engaged — jail paused,
+  terminal input severed. Resume to recover." Clicked again: all 13 un-paused, confirmed via
+  `docker ps` again. Re-confirms `ee9be50` (ISSUES-LOG #17) holds under Docker Desktop's WSL2
+  backend via the real button this time, not just RPC.
+- **H1 resource honesty**: real Resources panel showed the exact unmetered-spend explainer text,
+  genuinely-measured `0%`/`0.0 GB` (not the unmeasured-`—` case) for idle scripted jails, and — a
+  nice bonus — live "Rebasing onto the new main after a merge" task text on the stale-cascade
+  entries from earlier RPC testing, proving the cascade is user-visible, not just internal.
+- **E2/H3/F1/F2**: Review cockpit opened with the correct `Coordinator (scripted)` title (not a
+  raw GUID) via a real click; Merge correctly refused a genuinely non-fast-forwardable entry
+  (an artifact of this session's own heavy parallel RPC testing creating divergent sibling
+  branches — confirmed via `git log --graph`, not a product bug) without moving `main`; a second,
+  genuinely fast-forwardable entry merged successfully via real clicks, `main` advanced to the
+  right sha, and `node test.js` still passed afterward.
+
+All of the above via `InvokePattern`/`BM_CLICK` — this session never got a raw `SendInput` mouse
+click to register with this Avalonia app, on any element, including a plain, simple button (the
+hamburger menu) tested specifically to rule out "maybe it's just list rows." Worth flagging for
+whoever picks up W2: if a future pass wants real mouse-driven testing (not UI-Automation-driven),
+this environment's `SendInput` path needs its own investigation first.
