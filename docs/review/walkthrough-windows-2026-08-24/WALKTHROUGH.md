@@ -450,3 +450,58 @@ uncommitted work at risk.
    were not reached — next session should start there.
 4. The full A-J fresh pass (priority 3) was not attempted — this session prioritized the
    already-fixed-bug re-verification and the cycle spine per the brief's own stated order.
+
+## 9. Restart resilience (runbook §6) — a genuine substrate difference from the macOS assumption
+
+Clicked the real **Exit** menu item (found via the hamburger "Toggle menu bar" — a distinct button
+from the sidebar's own collapse/expand toggle, which are two different controls at similar
+positions and easy to confuse; cost real time this leg). A confirmation dialog appeared —
+**"Exit Mainguard? 13 agents are still running. Exiting stops the Mainguard environment and
+terminates them mid-task. Their work stays on their branches, but sessions cannot be resumed."**
+— with Cancel / "Exit and stop agents".
+
+**This is the finding, not a side note:** the runbook's restart-resilience assumption ("Quit the
+app (NOT 'Stop all') — a plain quit; the daemon and jails outlive the UI") does **not** hold here.
+Confirmed directly: after clicking "Exit and stop agents", `wsl -l -v` showed `MainguardEnv`
+**Stopped**, and all 13 jails showed `Exited (255)` — the entire VM was torn down, not just the UI
+process. Traced to `"StopVmOnExit": true` in `config.json` — a real, named setting, not a bug, but
+one that makes a plain "Exit" on Windows behave like the Mac run's "Stop all" in consequence (every
+live agent genuinely dies), because the Windows/WSL2 substrate's daemon lives inside a VM with a
+real resource cost, unlike the macOS run's natively-hosted daemon. **The runbook was written from
+the macOS run's perspective and its §6 assumption is substrate-specific, not universal** — worth a
+correction for whoever maintains it, and worth deciding deliberately (not by accident) whether
+`StopVmOnExit`'s default should differ from what shipped here.
+
+**What DID work well, and re-confirms real fixes:**
+- Relaunching correctly detected the stopped VM and showed an honest, step-by-step **"Getting
+  Mainguard ready"** boot sequence (Start the environment → Connect to the daemon → Apply updates →
+  Check sandbox images), each step checked off as it completed — good OOBE-honesty-principle UX,
+  matching H5's spirit even though this isn't literally first-run.
+- The **persisted merge queue survived completely intact** — all 11 entries (7 in play, 4 in
+  history), full state, full history — confirmed the daemon's SQLite-backed queue is genuinely
+  durable across a full VM teardown, not just an in-memory convenience.
+- **Coordinator correctly showed "No coordinator running"** rather than something misleadingly
+  claiming to still be attached — honest given the real state (no jail survived to attach to).
+- **The stranded-entry reconciliation re-confirms the Mac run's fix directly**: `Working` entries
+  (whose jails were destroyed) now show the exact honest message *"the agent's sandbox is gone —
+  resume the entry to give it one, or discard it"* — matching ISSUES-LOG #23/#24's fix, holding
+  after a substantially more destructive event (full VM teardown, not just a daemon restart) than
+  the Mac run tested.
+- New, worth a closer look next session (not chased further this pass): previously-clean `Verified`
+  entries now additionally show *"flagged-change review has not run for this branch (no
+  acknowledgment record)"* post-restart — unclear yet whether this is an honest new gap the
+  reconciliation correctly surfaced (the flagged-change check itself needs a live sandbox to run,
+  and can't have after a teardown) or a reconciliation regression that over-flags. Logged as an
+  open question, not a confirmed bug either way.
+
+**Side notes from this leg:**
+- The sidebar's collapse/expand state is persisted to `config.json`'s `SectionRailExpanded` — an
+  earlier accidental click (chasing the wrong "hamburger") left it collapsed, and it stayed
+  collapsed across two further app kills/relaunches until edited back in the config directly. Not
+  a bug — a persisted preference behaving exactly as designed — but worth knowing for whoever
+  automates this UI next: the hamburger icon (top-left, toggles the **top menu bar** —
+  Select Repo/Settings/Exit) and the sidebar's own collapse toggle (further down, toggles icon-only
+  mode) are two separate controls that look similar and are easy to hit by mistake.
+- Collapsed sidebar icons expose **no accessible name at all** to UI Automation (not even a
+  fallback) — worth folding into W2's accessibility finding if someone picks that up: the gap isn't
+  only list rows, collapsed nav icons lose their name too.
