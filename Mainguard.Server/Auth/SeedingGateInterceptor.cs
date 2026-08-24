@@ -8,9 +8,9 @@ namespace Mainguard.Server.Auth;
 /// <summary>
 /// Whether this daemon was STARTED with queue seeding enabled (docs/design/queue-seeding.md §7).
 /// Built once in <c>DaemonHost.ConfigureServices</c> from the boot-captured
-/// <c>MAINGUARD_ENABLE_QUEUE_SEEDING</c> (or the in-proc test tier's <c>Daemon:EnableQueueSeeding</c>
-/// configuration key) and immutable thereafter — the gate is a fact about process startup, never a
-/// runtime toggle.
+/// <c>MAINGUARD_ENABLE_QUEUE_SEEDING</c> and immutable thereafter — the gate is a fact about process
+/// startup, never a runtime toggle. (The in-proc test tier replaces the singleton itself:
+/// <c>DaemonFixture.EnableQueueSeeding</c>.)
 /// </summary>
 public sealed record QueueSeedingOptions(bool Enabled);
 

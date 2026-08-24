@@ -109,9 +109,9 @@
   rejected server-side while the read/output stream flows — never UI-only.
 - **`Auth/SeedingGateInterceptor.cs`** — the dev-only queue-seeding BELT (docs/design/queue-seeding.md
   §7): `QueueSeedingOptions(bool Enabled)` is built once at boot (`MAINGUARD_ENABLE_QUEUE_SEEDING`
-  via `DaemonOptions.QueueSeedingEnabled`, or the in-proc test tier's `Daemon:EnableQueueSeeding`
-  configuration key) and this interceptor `PermissionDenied`s the `/mainguard.v1.QueueSeedingService/`
-  method prefix when disabled. Deliberately the belt, not the primary: the primary gate is that
+  via `DaemonOptions.QueueSeedingEnabled`; the in-proc test tier replaces the singleton —
+  `DaemonFixture.EnableQueueSeeding`) and this interceptor `PermissionDenied`s the
+  `/mainguard.v1.QueueSeedingService/` method prefix when disabled. Deliberately the belt, not the primary: the primary gate is that
   `DaemonHost.MapServices` never maps `QueueSeedingGrpcService` without the flag (disabled ⇒
   UNIMPLEMENTED — the client's hide-the-panel probe), and this layer exists so a refactor that made
   the mapping unconditional still refuses loudly.

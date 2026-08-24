@@ -150,9 +150,12 @@ daemon surface stays small and every individual call remains an honest state-mac
 
 ## 7. Gating — three layers, one flag
 
-`MAINGUARD_ENABLE_QUEUE_SEEDING=1` (or the `Daemon:EnableQueueSeeding` configuration key — the
-in-proc test-host seam) is captured **once at daemon startup** into a `QueueSeedingOptions`
-singleton and never re-read.
+`MAINGUARD_ENABLE_QUEUE_SEEDING=1` is captured **once at daemon startup** into a
+`QueueSeedingOptions` singleton and never re-read. (The in-proc test tier flips it by replacing
+that singleton in `ConfigureTestServices` — `DaemonFixture.EnableQueueSeeding`; a `UseSetting`
+configuration key measurably never reaches `builder.Configuration` during the daemon's
+`ConfigureServices` under the minimal-hosting test factory, and a process-wide env var cannot
+differ between two side-by-side test hosts.)
 
 1. **Primary: the service is not mapped.** `DaemonHost.MapServices` maps
    `QueueSeedingGrpcService` only when enabled; disabled ⇒ every call is `UNIMPLEMENTED`.

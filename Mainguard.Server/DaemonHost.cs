@@ -304,11 +304,13 @@ public static class DaemonHost
         builder.Services.AddHostedService<Runtime.AuditAnchorService>();
 
         // Dev-only queue seeding (docs/design/queue-seeding.md §7): the enablement is captured HERE,
-        // once, at startup — env flag (options) or the in-proc test tier's configuration key — and is
-        // immutable for the process's life. Announced loudly: a seeding daemon must never be mistaken
-        // for a production one.
-        var queueSeeding = new QueueSeedingOptions(
-            options.QueueSeedingEnabled || builder.Configuration["Daemon:EnableQueueSeeding"] == "1");
+        // once, at startup, from the boot env flag — immutable for the process's life. The in-proc
+        // test tier flips it by REPLACING this singleton in ConfigureTestServices (DaemonFixture.
+        // EnableQueueSeeding): a UseSetting configuration key measurably never reaches
+        // builder.Configuration at this point under the minimal-hosting test factory, and a
+        // process-wide env var cannot differ between two side-by-side test hosts. Announced loudly:
+        // a seeding daemon must never be mistaken for a production one.
+        var queueSeeding = new QueueSeedingOptions(options.QueueSeedingEnabled);
         builder.Services.AddSingleton(queueSeeding);
         if (queueSeeding.Enabled)
         {

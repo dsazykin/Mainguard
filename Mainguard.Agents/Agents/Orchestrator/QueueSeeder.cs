@@ -149,7 +149,17 @@ public sealed class QueueSeeder
             }
         }
 
-        return new SeedBatchReport(results, context.Queue.CurrentMainSha, provisionedVerifyConfig);
+        // Reported states are FINAL states: a later spec legitimately moves an earlier seed (a Merged
+        // spec's cascade stales a Verified one), and reporting where each entry ended is what makes
+        // the response the truth about the batch rather than a per-step log of it.
+        var queue = context.Queue;
+        var final = results
+            .Select(r => queue.Agents.Contains(r.AgentId) || queue.DiscardedAgents.Contains(r.AgentId)
+                ? r with { ReachedState = queue.GetState(r.AgentId).ToString() }
+                : r)
+            .ToList();
+
+        return new SeedBatchReport(final, queue.CurrentMainSha, provisionedVerifyConfig);
     }
 
     private async Task<SeedOutcome> SeedOneAsync(

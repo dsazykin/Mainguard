@@ -12,9 +12,9 @@ option csharp_namespace = "Mainguard.Protos.V1";
 // visibly synthetic in its own immutable record ("[seeded — not executed]").
 //
 // GATING — this whole service is unreachable in a shipped build. It is mapped by the daemon only
-// when MAINGUARD_ENABLE_QUEUE_SEEDING=1 (or the Daemon:EnableQueueSeeding configuration key, the
-// in-proc test seam) was set at process startup: disabled means UNIMPLEMENTED, with a
-// SeedingGateInterceptor prefix-deny as the belt behind that primary. Every method is additionally
+// when MAINGUARD_ENABLE_QUEUE_SEEDING=1 was set at process startup (the in-proc test tier replaces
+// the captured options singleton instead — DaemonFixture.EnableQueueSeeding): disabled means
+// UNIMPLEMENTED, with a SeedingGateInterceptor prefix-deny as the belt behind that primary. Every method is additionally
 // on RoleInterceptor.CoordinatorDeniedMethods unconditionally — seeding composes EnsureEntry +
 // verification + merge power, none of which a coordinator credential may hold. Seeding is never an
 // in-jail IPC op; it exists on the operator gRPC surface only.
