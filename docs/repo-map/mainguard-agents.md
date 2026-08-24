@@ -261,7 +261,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
-      injectable pnpm runner.
+      injectable pnpm runner. `RunWithEnv` is the one env-accepting overload — extra env merged UNDER
+      the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the queue
+      seeder's scratch `GIT_INDEX_FILE` plumbing.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only
@@ -1244,7 +1246,35 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       against zero queues forever — the same no-caller defect one level up. `EnsureQueue` is the moment a
       repo's persisted queue state re-enters the process, and every path into it (`ProvisionRepo`, a
       jailed spawn, the PR-intake target resolver) is an RPC handler, so the pass necessarily lands after
-      merge-reconcile and the swarm reconciler.)
+      merge-reconcile and the swarm reconciler. **Dev-only seeding seam** (docs/design/queue-seeding.md):
+      the optional `syntheticVerifications` registry — always passed by the daemon, empty in production —
+      lets a registered `seed-` id take a seeded arm of the private `RunVerificationAsync`: the jail half
+      (extracted as `ResolveJailAndPublishForVerification`) is skipped, the mirror-read half (RT-D2 +
+      toolchain resolution, both gate armings, `ArmFlaggedChangeReview`) still runs for real, and
+      `RunSyntheticVerificationAsync` returns the plan's outcome pinned to the queue's main with the
+      REQUIRED `[seeded — not executed]` provenance marker + an honest artifact log; `RequeueStaleAsync`
+      likewise ends a seeded entry at one of the two real termini — Hold (rest at `StaleVerified`) or the
+      no-jail `Block` to `Working` — never the null-rebaser re-verify, which would mint fresh evidence
+      for a branch not on top of main.)
+    - `QueueSeeder.cs` (the dev-only merge-queue seeder — docs/design/queue-seeding.md; only caller
+      is the flag-gated `QueueSeedingService`. `SeedAsync` walks each spec to its target state through
+      the REAL `MergeQueue` public transitions over a REAL plumbing-fabricated `agent/seed-<n>` branch
+      in the mirror (flavors: Plain / Flagged — a CI workflow the real classifier must flag / a
+      drifted `.mainguard/verify` for the real RT-D2 gate); `Merged` is the full RT-D1 lease walk
+      around a real `--ff-only` merge in the ORIGIN checkout; `StaleVerified` a real out-of-band
+      empty commit on origin main + mirror refresh + the real cascade; `PushCommits` appends real
+      commits and drives the real `NotifyNewCommits`; `ClearAsync` obeys the resurrection-ordering
+      rule (terminal-or-drained BEFORE `Cancel`) and is structurally `seed-`-scoped; every entry gets
+      a `queue_entry_seeded` audit event and an auto-provisioned `.mainguard/verify` is reported
+      loudly.)
+    - `SyntheticVerificationRegistry.cs` (the dev-only queue-seeding seam's data:
+      `SyntheticVerificationPlan` — requested outcome, clamped hold, `SyntheticStaleBehavior`
+      Hold|Cascade, the hold-cancellation CTS and the retained in-flight task the clear path must await
+      before `MergeQueue.Cancel` (the row-resurrection ordering rule) — plus the thread-safe
+      `(repoHash, agentId)`→plan registry. Registration REFUSES any id without the `seed-` prefix: a
+      plan for a real agent's id would silently replace that agent's real verification, the one
+      substitution the design exists to make impossible. Only writer: the flag-gated
+      `QueueSeedingService`.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the

@@ -646,6 +646,45 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             CallOptions(ct, deadline));
     }
 
+    // ---- Dev-only queue seeding (docs/design/queue-seeding.md) -----------
+    // A daemon started without MAINGUARD_ENABLE_QUEUE_SEEDING never maps this service, so these
+    // calls answer UNIMPLEMENTED there — which is the dev panel's hide signal, not an error.
+
+    /// <summary>The seeding availability probe + the daemon's enumeration of seeded entries.</summary>
+    public async Task<GetSeedingStatusResponse> GetSeedingStatusAsync(
+        CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.GetSeedingStatusAsync(new GetSeedingStatusRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Seeds one ordered batch of queue entries (per-entry verbatim refusals in the body).</summary>
+    public async Task<SeedQueueEntriesResponse> SeedQueueEntriesAsync(
+        SeedQueueEntriesRequest request, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.SeedQueueEntriesAsync(request, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Appends real commits to a seeded branch and drives the real new-commits invalidation.</summary>
+    public async Task<PushCommitsResponse> PushSeedCommitsAsync(
+        string repoHandle, string agentId, int count, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.PushCommitsAsync(
+            new PushCommitsRequest { RepoHandle = repoHandle, AgentId = agentId, Count = count },
+            CallOptions(ct, deadline));
+    }
+
+    /// <summary>Removes every seeded entry of a repo (structurally seed- scoped daemon-side).</summary>
+    public async Task<ClearSeededEntriesResponse> ClearSeededEntriesAsync(
+        string repoHandle, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.ClearSeededEntriesAsync(
+            new ClearSeededEntriesRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
+    }
+
     /// <summary>P2-47 #7: the agent-branch-vs-main diff for the review cockpit, parsed into <see cref="FilePatch"/>
     /// via the pure T-06 <c>PatchParser</c> on the client. Returns the resolved branch + main + patch list.</summary>
     public async Task<(string Branch, string MainBranch, IReadOnlyList<Mainguard.Git.Models.FilePatch> Files)> GetMergeDiffAsync(

@@ -101,9 +101,20 @@
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
   or approve its own plans), and the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` —
   the chain carries other agents' prompts/outputs and the human's decisions, none of it a
-  coordinator's to read). **Terminal input lock:** wraps the `TerminalService.Attach` request
+  coordinator's to read), and every `QueueSeedingService` method unconditionally (seeding composes
+  EnsureEntry + a supplied verification outcome + the merge walk — every power this list denies
+  piecemeal, reachable at once; the boot flag decides whether the OPERATOR gets the surface, never
+  whether an agent does). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
   rejected server-side while the read/output stream flows — never UI-only.
+- **`Auth/SeedingGateInterceptor.cs`** — the dev-only queue-seeding BELT (docs/design/queue-seeding.md
+  §7): `QueueSeedingOptions(bool Enabled)` is built once at boot (`MAINGUARD_ENABLE_QUEUE_SEEDING`
+  via `DaemonOptions.QueueSeedingEnabled`; the in-proc test tier replaces the singleton —
+  `DaemonFixture.EnableQueueSeeding`) and this interceptor `PermissionDenied`s the
+  `/mainguard.v1.QueueSeedingService/` method prefix when disabled. Deliberately the belt, not the primary: the primary gate is that
+  `DaemonHost.MapServices` never maps `QueueSeedingGrpcService` without the flag (disabled ⇒
+  UNIMPLEMENTED — the client's hide-the-panel probe), and this layer exists so a refactor that made
+  the mapping unconditional still refuses loudly.
 - **`Auth/ConnectionRoleRegistry.cs`** (P2-14) — maps a bearer token → `ConnectionRole` (primary
   session token = `Operator`; issued/registered coordinator tokens = `Coordinator`).
   - **`Auth/TerminalLockRegistry.cs`** — the set of agents whose terminal input is severed (managed
@@ -482,6 +493,14 @@
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
   - `TerminalGrpcService` writes a read-only banner + defensively rejects input `data` frames for a
     `TerminalLockRegistry`-locked agent.
+  - **`Services/QueueSeedingGrpcService.cs`** (the DEV-ONLY seeding transport —
+    docs/design/queue-seeding.md; validation + dispatch to `QueueSeeder`, actor daemon-derived via
+    `IApproverIdentityResolver`, `RepoProvisioningException` → typed `NOT_FOUND`, per-entry verbatim
+    refusals in the response body. Mapped by `DaemonHost.MapServices` ONLY when
+    `QueueSeedingOptions.Enabled` (the primary gate; disabled ⇒ UNIMPLEMENTED, which is also the dev
+    panel's hide probe), prefix-denied by `SeedingGateInterceptor` as the belt, coordinator-denied at
+    `RoleInterceptor` unconditionally, and its constructor REFUSES to build on a flagless daemon as
+    the last brace. Seeds are logged at Warning — a seeding daemon should read loud in its own log.)
   - **`Services/PrIntakeGrpcService.cs`** (P2-12: `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/
     `SubscribePrIntakeSource` over the daemon's `IPrIntakeStore`, mapped in `DaemonHost.MapServices`
     beside `MergeQueueGrpcService`. Validation + dispatch only. **`Update` persists, then re-READS and
