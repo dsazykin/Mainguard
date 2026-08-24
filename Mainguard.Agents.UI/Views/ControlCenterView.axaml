@@ -259,6 +259,8 @@
           <RowDefinition Height="Auto"/>
           <!-- the telemetry row; resized by TelemetrySeam, collapsed by the code-behind when hidden -->
           <RowDefinition Height="Auto"/>
+          <!-- the dev-only seeding card; the row is zero unless the daemon enabled seeding -->
+          <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
         <Border Grid.Row="0" MinHeight="160" Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
@@ -278,6 +280,15 @@
                 Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
           <views:TelemetryPanelView DataContext="{Binding Telemetry}"/>
+        </Border>
+        <!-- DEV-ONLY queue seeding (docs/design/queue-seeding.md): the card EXISTS only when the
+             daemon answered the availability probe — a daemon without the boot flag never maps the
+             service, QueueSeeding stays null, and this row collapses to nothing. -->
+        <Border Grid.Row="3" Margin="0,8,0,0"
+                IsVisible="{Binding QueueSeeding, Converter={x:Static ObjectConverters.IsNotNull}}"
+                Background="{DynamicResource SurfacePanel}" CornerRadius="12"
+                BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
+          <views:QueueSeedingPanelView DataContext="{Binding QueueSeeding}"/>
         </Border>
       </Grid>
     </Grid>

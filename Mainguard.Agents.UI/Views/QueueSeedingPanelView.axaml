@@ -1,0 +1,76 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+             x:Class="Mainguard.Agents.UI.Views.QueueSeedingPanelView"
+             x:DataType="vm:QueueSeedingPanelViewModel">
+
+  <!-- DEV-ONLY queue seeding (docs/design/queue-seeding.md §6-7). This card exists only when the
+       daemon answered the availability probe (the service is unmapped without the boot flag), so it
+       never renders in a shipped configuration. The presets are client-side drivers over the RPC
+       primitives; every refusal below renders the daemon's words verbatim. -->
+
+  <StackPanel Margin="10" Spacing="8">
+    <StackPanel Orientation="Horizontal" Spacing="6">
+      <TextBlock Text="Queue seeding" FontSize="16" FontWeight="SemiBold"
+                 Foreground="{DynamicResource TextPrimary}"/>
+      <!-- The dev badge: warning hue by MEANING (this daemon accepts synthetic entries), pill radius. -->
+      <Border CornerRadius="999" Padding="8,1" VerticalAlignment="Center"
+              BorderThickness="1" BorderBrush="{DynamicResource WarningBrush}">
+        <TextBlock Text="dev" FontSize="10" Foreground="{DynamicResource WarningBrush}"/>
+      </Border>
+    </StackPanel>
+
+    <!-- one entry, shaped by hand -->
+    <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" Margin="0,2,0,0">
+      <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" Spacing="6">
+        <ComboBox ItemsSource="{Binding TargetStates}" SelectedItem="{Binding SelectedState}"
+                  MinWidth="128" FontSize="12"/>
+        <ComboBox ItemsSource="{Binding Flavors}" SelectedItem="{Binding SelectedFlavor}"
+                  MinWidth="96" FontSize="12"/>
+        <NumericUpDown Value="{Binding Count}" Minimum="1" Maximum="50" Increment="1"
+                       FormatString="0" MinWidth="84" FontSize="12"
+                       ToolTip.Tip="How many clones of this entry to seed"/>
+      </StackPanel>
+      <Button Grid.Row="0" Grid.Column="1" Content="Seed" Classes="Primary" Padding="14,4"
+              Command="{Binding SeedCommand}" IsEnabled="{Binding !IsBusy}"/>
+      <StackPanel Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Orientation="Horizontal"
+                  Spacing="10" Margin="0,6,0,0">
+        <CheckBox Content="verification fails" IsChecked="{Binding VerificationFails}" FontSize="11"/>
+        <StackPanel Orientation="Horizontal" Spacing="4"
+                    ToolTip.Tip="Verifying target: how long the run stays genuinely in flight (seconds)">
+          <TextBlock Text="hold" FontSize="11" Foreground="{DynamicResource TextMuted}"
+                     VerticalAlignment="Center"/>
+          <NumericUpDown Value="{Binding HoldSeconds}" Minimum="1" Maximum="600" Increment="15"
+                         FormatString="0" MinWidth="84" FontSize="12"/>
+        </StackPanel>
+      </StackPanel>
+    </Grid>
+
+    <!-- scenario presets: compositions of the primitives, one honest batch each -->
+    <WrapPanel>
+      <Button Content="Stale pair" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding SeedStalePairCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="[Verified, Merged] — the merge is real and its cascade stales the co-seed"/>
+      <Button Content="One of each" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding SeedOneOfEachCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="Every seedable shape once, incl. a verify-FAIL record and real flagged items"/>
+      <Button Content="Overflow ×12" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding SeedOverflowCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="A dozen Verified entries — the display-order/scroll reproduction"/>
+      <Button Content="Merge during verify" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding SeedMergeDuringVerifyCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="Holds one entry mid-run while a sibling's real merge fires the real cascade"/>
+      <Button Content="Push commits" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding PushCommitsCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="Appends a real commit to the last-seeded entry — the real invalidation follows"/>
+      <Button Content="Clear seeded" Classes="DangerQuiet" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding ClearSeededCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="Removes every seeded entry of this repo (seed- ids only, structurally)"/>
+    </WrapPanel>
+
+    <!-- the daemon's words, verbatim -->
+    <TextBlock Text="{Binding StatusText}" FontSize="11" Foreground="{DynamicResource TextMuted}"
+               TextWrapping="Wrap"
+               IsVisible="{Binding StatusText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+  </StackPanel>
+</UserControl>

@@ -164,6 +164,33 @@
   and a genuinely in-flight run is skipped by both arms; plus the discard-wins-the-race pair — a discard
   landing inside the jail probe is not reported as re-run, and `RunVerificationAsync` on an entry that went
   terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`),
+  `SeedingCompatibilityTests` (in `Mainguard.Server.Tests` — **the queue-seeding COMPATIBILITY
+  CONTRACT**, docs/design/queue-seeding.md §9: the gate defaults seeding depends on pinned in BOTH
+  directions (`ChangedTestCommandGate` passes unknown ids, `FlaggedChangeGate` MG-40-denies them —
+  i.e. seeding depends on the mirror-read half running); the coordinator-branch TRIPWIRE — fails the
+  moment a `WorkerPlanGate`/`*ReadinessTrigger` type lands, with the doc comment addressed to whoever
+  merges those branches (extend the seeder with plan seeding via `SeedEntrySpec`'s reserved fields
+  8/9, re-pin directly, only then remove); the lifecycle verbs refusing unknown ids; the boot-flag
+  wire contract — flagless daemon ⇒ UNIMPLEMENTED, flagged ⇒ status answers while a coordinator token
+  stays PermissionDenied; and the `SeedingGateInterceptor` belt driven directly over a method-only
+  `ServerCallContext`),
+  `QueueSeedingRpcTests` (in `Mainguard.Server.Tests` — the seeding surface END TO END over a
+  seeding-enabled in-proc daemon + the shipped `ProvisionRepo`: batch seeding whose entries the
+  ordinary `CanMerge` RPC then serves, the auto-provisioned verify config reported loudly, the
+  over-the-wire stale pair whose merge really advances origin main, `PushCommits` invalidation,
+  the clear round-trip, and typed NOT_FOUND / InvalidArgument refusals),
+  `QueueSeederTests` (the dev-only queue seeder over a REAL bare mirror + REAL origin checkout — the
+  `MergeQueueProvisionerTests` fixture posture, because the property under test is that seeded entries
+  travel the production wiring. The sandbox engine THROWS on any use and `resolveContainerId` answers
+  null, so the suite passing is itself the structural proof that seeding executes nothing in any jail;
+  the record half of the forgery rule is asserted directly (`[seeded — not executed]` provenance +
+  "NO RUN WAS EXECUTED" artifact). Covers: every static target state incl. the review family; the real
+  Flagged/RT-D2 gate blocks; the genuinely-in-flight hold with `ClearStalledVerification`'s "wait"
+  refusal and the drain-before-Cancel non-resurrection; the [Verified, Merged] stale pair whose merge
+  REALLY advances origin main and whose cascade REALLY stales-and-holds the co-seed; the
+  origin-not-on-main verbatim refusal with the lease handed back; `PushCommits` really invalidating a
+  Verified seed; the loud verify-config auto-provision; and the registry refusing a plan for a
+  non-`seed-` id),
   `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
   older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
   the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake

@@ -94,6 +94,22 @@ public static class GatewayServiceRegistration
         services.AddSingleton<MergeQueueRegistry>();
         services.AddSingleton<IMergeQueueRegistry>(sp => sp.GetRequiredService<MergeQueueRegistry>());
 
+        // Dev-only queue seeding (docs/design/queue-seeding.md): the synthetic-verification seam is
+        // registered and wired UNCONDITIONALLY — and stays empty for the daemon's whole lifetime
+        // unless the flag-gated QueueSeedingService (never mapped in a shipped daemon) populates it.
+        // Unconditional so the provisioner's exact-set optional-control assertion pins ONE stated
+        // wiring decision instead of a flag-dependent shape it could not distinguish from drift.
+        services.AddSingleton<SyntheticVerificationRegistry>();
+
+        // ...and the seeder itself, likewise unconditional and inert: its only caller is the
+        // flag-gated QueueSeedingService, which a daemon without the boot flag never maps.
+        services.AddSingleton(sp => new QueueSeeder(
+            provisioner: sp.GetRequiredService<MergeQueueProvisioner>(),
+            registry: sp.GetRequiredService<IMergeQueueRegistry>(),
+            synthetic: sp.GetRequiredService<SyntheticVerificationRegistry>(),
+            repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
+            log: log));
+
         // MG-10: the missing constructor call. `new MergeQueue(...)` and `registry.Register(...)` existed
         // ONLY in the test projects, so the registry stayed empty for the daemon's whole lifetime and every
         // merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were neither enforced nor bypassable,
@@ -181,7 +197,10 @@ public static class GatewayServiceRegistration
             // asks the question rule 2 stands for (was published work LOST) by patch-id instead.
             publishRebasedAgentRef: (repoHash, agentId) =>
                 (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
-                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false));
+                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false,
+            // The dev-only seeding seam — always passed, empty in production (see the registration
+            // above and the parameter's own doc; the exact-set composition test pins this line).
+            syntheticVerifications: sp.GetRequiredService<SyntheticVerificationRegistry>()));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
