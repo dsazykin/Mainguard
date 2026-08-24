@@ -91,6 +91,16 @@
     `RoleInterceptor`: subscribing is a provisioning act — it makes the daemon fetch PR heads and ask the
     gated spawn chain for a jail per open bot PR — so an agent able to call it could manufacture queue
     entries and jails, or widen the bot-author list until its own PRs were intake'd),
+    `queueseeding.proto` (**dev-only `QueueSeedingService`** —
+    `SeedQueueEntries`/`PushCommits`/`ClearSeededEntries`/`GetSeedingStatus`, the merge-queue
+    seeding surface of `docs/design/queue-seeding.md`: legitimate entries in any `WorkerMergeState`
+    produced by driving the REAL state-machine methods with synthetic input. Mapped by the daemon
+    ONLY when `MAINGUARD_ENABLE_QUEUE_SEEDING=1` was set at process startup (disabled ⇒
+    `UNIMPLEMENTED`, plus a `SeedingGateInterceptor` prefix-deny as the belt), and every method is
+    on the coordinator's denied list unconditionally. Ids are daemon-assigned `seed-<n>` — the
+    prefix is the clear-scope boundary; no actor fields (daemon-derived identity); refusals are
+    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are RESERVED for
+    the coordinator phase-2/3 plan dimension per the compat contract),
     `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and
