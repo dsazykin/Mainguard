@@ -101,3 +101,60 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 Not yet started at the time of this log snapshot; the substrate-readiness blocker (W1) and the
 GUI-automation calibration (W2/W3 discovered along the way) consumed the setup phase. Tracked
 separately in WALKTHROUGH.md's running log as each one is actually re-driven live.
+
+### W4. [OPEN, HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
+
+- **Where:** runbook §4 steps 3-4 (`BringBranchLocalAsync`/`ConfirmMergeAsync`), first attempt.
+- Every fetch against the daemon-provisioned sync remote (`mainguard-vm`, a
+  `\\wsl.localhost\MainguardEnv\...` UNC path) fails with git's own
+  `fatal: detected dubious ownership in repository at '...'` until `safe.directory` is configured
+  for that path.
+- **Root-caused, not a harness artifact:** grepped `Mainguard.Agents`/`Mainguard.Agents.UI`/
+  `Mainguard.Git` end to end for `safe.directory`/`safe\.directory`/`dubious` — zero hits anywhere.
+  `SyncRemoteRegistrar.cs` (the only code that registers this remote) does a plain
+  `IGitService.AddRemote`/`SetRemoteUrl`, nothing else. This will reproduce identically for every
+  real user's first merge on a fresh Windows+WSL2 install, not just this harness.
+- **Attempted the narrow fix, it silently failed:** `git config --global --add safe.directory
+  '<exact UNC path>'` did not unblock the fetch even though the value stored in `.gitconfig` and
+  the path in git's own error text were character-identical side by side. `safe.directory=*` DID
+  unblock it immediately for the same exact path. This points at a git-for-Windows-specific
+  path-normalization quirk with `\\wsl.localhost\...`-style UNC paths that defeats
+  `safe.directory`'s exact-string match — a real, reproducible git behavior, not a fluke (retested
+  across a fresh repo handle/mirror path with the same result).
+- **Not fixed this pass** — the real fix needs someone to either find the exact string
+  representation git will actually match for a WSL UNC path (may require testing quoted forms,
+  a trailing-slash variant, or the `\\wsl$\` legacy alias instead of `\\wsl.localhost\`), or avoid
+  UNC entirely (e.g. route the mirror through a mapped drive letter). This is exactly the kind of
+  fiddly, easy-to-get-subtly-wrong git/OS-path interaction the standing instructions say deserves a
+  dedicated pass rather than a guessed one-line patch.
+- **Workaround used for the rest of this walkthrough:** `git config --global --add safe.directory
+  '*'` on this machine only — a real (if narrow) security relaxation, not applied as a source
+  change, so every merge/fetch step in this log from here on ran with that override active.
+- Severity: **HIGH** — this blocks the single most important guarantee of the whole product (a
+  verified agent branch actually reaching `main`) for every Windows+WSL2 user, on the very first
+  merge, with an unhelpful raw git error and no Mainguard-authored guidance pointing at the fix.
+
+### W5. [OPEN, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
+
+- **Where:** `RejectEntryResponse.rejected_by` / `DiscardEntryResponse.discarded_by`.
+- On the Mac run this field read `os:danielsazykin` (ISSUES-LOG #13, 2026-08-20). On this machine
+  the identical field/flow returns **`uid:1000`** — the WSL2 VM's internal Linux user id, which
+  means nothing to a Windows user looking at their own audit trail.
+- Not chased to a root cause this pass (would need reading `_identity.Resolve(context)`'s
+  Windows-side implementation) — flagged for follow-up. Correctness is unaffected (the value is
+  still a real, stable actor identifier), only its human-readability regresses on this substrate.
+- Severity: low.
+
+### Note — `full-test-matrix.md`'s G3 wording is stale, not the kill-switch code
+
+While driving G3 (kill switch) via RPC, `DiscardEntryAsync` succeeded on a live, frozen queue —
+initially read as a regression against the matrix's own line: **"freezes the queue (BeginMerge/
+DiscardEntry refused while frozen)."** Reading `MergeQueueGrpcService.cs` before touching anything
+shows this is deliberate: `DiscardEntry`'s own doc comment states "The kill switch does NOT gate
+it. Freezing the queue stops merges; it is not a reason to forbid the human from tidying an entry
+that can no longer merge either way," and `RejectEntry` carries the identical rationale for review
+verdicts. Only `BeginMerge` and `ConfirmMerge` — the two operations that actually touch git — call
+`ThrowIfFrozen`. **The matrix text needs updating, not the code** — flagging here rather than
+"fixing" correct, intentional behavior. Kill-switch engage/resume itself (both jails pausing,
+both correctly un-pausing) re-confirms the Mac run's `ee9be50` fix (ISSUES-LOG #17) holds under
+this machine's Docker Desktop/WSL2 backend.

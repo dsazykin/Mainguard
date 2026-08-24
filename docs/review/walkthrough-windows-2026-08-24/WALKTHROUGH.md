@@ -182,3 +182,119 @@ its parent when the scan ROOT itself is the repo (as opposed to the common case 
 parent folder containing multiple repos, where the parent's name is correctly used, as seen for
 `AGY Cortex`/`demo`/`GitLoom`/etc.). Logged in ISSUES-LOG, not fixed (cosmetic, low severity, not
 blocking).
+
+## 5. Cycle steps 3-8 (runbook §4) — via RPC harness, all PASS
+
+### Step 3-4: bring local + merge — PASS
+```
+== bring branch local ==
+Done=true LocalBranch=agent/474ebd2b7c9c44a2b12186b6cf259c4b Reason=
+second bring-local: Done=true LocalBranch=agent/474ebd2b7c9c44a2b12186b6cf259c4b Reason=
+== merge ==
+MergeOutcome: Origin=Local AgentId=474ebd2b7c9c44a2b12186b6cf259c4b MainBranch=main NewMainSha=a68846e7...
+second ConfirmMergeAsync correctly refused: Can't merge — already merged.
+```
+Verified independently: `git rev-parse main` in the checkout now reads `a68846e7...` (matching
+`NewMainSha`), `src/note-474ebd2b.js` exists, `node test.js` prints "all tests green". Re-running
+`BringBranchLocalAsync` a second time correctly no-ops (`Done=true`, no error) rather than
+refetching/erroring.
+
+### Finding W4: git "dubious ownership" blocks every fetch/merge against the WSL UNC mirror remote
+
+The first `BringBranchLocalAsync`/`ConfirmMergeAsync` attempt refused with a git-native error, not
+a Mainguard one:
+```
+fatal: detected dubious ownership in repository at '\\wsl.localhost\MainguardEnv\home\mainguard\...'
+```
+Confirmed this is **not** an artifact of my manual `git remote add` (skipping something the real
+`SyncRemoteRegistrar` does) — read `Mainguard.App.Shell/Services/SyncRemoteRegistrar.cs` in full:
+it does exactly a remote add/update via `IGitService`, nothing else, and grepping the whole
+`Mainguard.Agents`/`Mainguard.Agents.UI`/`Mainguard.Git` trees for `safe.directory` / `safe\.directory`
+/ `dubious` returns **zero hits** — nothing in the codebase ever configures this, on any platform.
+So this will reproduce identically for every real user on a fresh Windows+WSL2 install the first
+time they try to merge, not just in this harness.
+
+**Attempted the narrow, correct fix first** — `git config --global --add safe.directory
+'<exact mirror UNC path>'` — and it did **not** work, even though the stored `.gitconfig` value and
+the path git reported as dubious were character-identical on inspection. Diagnosed (not guessed)
+that this is a known git-for-Windows quirk with `\\wsl.localhost\...`-style UNC paths and
+`safe.directory`'s exact-string matching (likely an internal path-normalization difference between
+what git resolves the repository's canonical path to versus the literal string accepted on the
+command line) — confirmed by testing `safe.directory=*`, which worked immediately for the exact
+same path. Used `*` **only as this test session's manual, local unblock** — it is a real (if
+narrow) security relaxation and was not applied as a source change; a real fix needs someone to
+either find the exact string git actually wants for a WSL UNC path, or reroute the sync remote
+through a mapped drive letter / a path form git's ownership check accepts natively.
+
+**Not fixed this pass** (per the standing guidance — this needs someone to nail down the exact
+path-matching behavor, not a one-line guess): logged as a HIGH severity, blocking-by-default
+finding in ISSUES-LOG. Every subsequent RPC-harness run in this walkthrough runs with
+`safe.directory=*` active on this machine — noted here so that fact travels with the rest of the
+day's results.
+
+### Step 5: changed-test-command gate (scripted-evil) — PASS
+```
+Ran=true Passed=true Reason=verified against main@a68846e7
+state=Verified flaggedItems=1
+  flagged: FlaggedItem { Id = changed-test-command, ..., Fact = the test command changed on this branch vs main — a branch cannot be allowed to self-green, Acknowledged = False }
+CanMerge=false reason=the test command changed vs main — acknowledge to merge
+merge correctly refused: Can't merge — the test command changed vs main — acknowledge to merge.
+== rejecting the evil entry ==
+rejected by=uid:1000 at=24/08/2026 21:15:09 +00:00
+post-reject state=Rejected
+```
+Matches every runbook §4 step-5 assertion: reaches Verified but CanMerge=false, FlaggedItems names
+`changed-test-command`, ConfirmMerge throws, Reject transitions it to terminal `Rejected` (not
+gone from the stream).
+
+### Finding W5 (minor): rejected-by/discarded-by actor renders as a raw `uid:1000`, not a human identity
+
+On the Mac run, `RejectEntryResponse.rejected_by` rendered as `os:danielsazykin` (ISSUES-LOG #13) —
+a real macOS account name. On this machine the same field comes back **`uid:1000`** — the WSL2
+VM's internal Linux uid, not anything a Windows user would recognize as themselves. Whatever
+resolves "the current actor" (`_identity.Resolve(context)` server-side, per
+`MergeQueueGrpcService.cs`) evidently falls back to a bare POSIX uid when it cannot determine a
+real OS account name — worth checking whether that's because this RPC harness connects without the
+Windows-side identity context the real app supplies, or whether the Windows CLIENT genuinely has no
+equivalent of `os:<username>` wired up at all (i.e. every real Windows user would see `uid:1000` in
+their own audit trail, not their own name). Not chased further this pass — logged for follow-up;
+low severity (correctness is unaffected, only the human-readability of the audit actor field).
+
+### Step 6: stale cascade — PASS
+Spawned two honest scripted agents (A, B), verified both, merged A, then polled B every 2s for 30s:
+B was back to `Verified` with `VerifiedMainSha` equal to A's merge's `NewMainSha` on the **very
+first** poll (≤2s) — the cascade + keep-alive rebase completed faster than this harness's polling
+granularity could catch the transient `StaleVerified` state. Confirmed the *outcome* the runbook
+cares about (B ends up re-verified against the NEW main, unprompted) — a positive result, just too
+fast to also capture the intermediate state on video, so to speak.
+
+### Step 7: pause/resume — PASS (real docker jail, RPC-driven)
+```
+Paused before: false
+Paused after PauseAgentAsync: true
+Paused after ResumeAgentAsync: false
+```
+
+### Step 8: kill switch — PASS, re-confirms ISSUES-LOG #17's fix holds on WSL2/Docker
+Spawned 2 live jails, engaged via `IKillSwitchService.EngageAsync()`:
+```
+after engage: IsFrozen=true Phase=Frozen PhaseText=queue frozen · 11 agents paused
+jail1 Paused=true  jail2 Paused=true (BOTH must be true, not just the first)
+== resume ==
+after resume: IsFrozen=false Phase=Armed
+jail1 Paused=false  jail2 Paused=false (BOTH must now be false)
+```
+Both jails paused, both correctly un-paused on Resume — this is exactly the bug the Mac run's
+ISSUES-LOG #17 fixed (`ee9be50`, "Resume does NOT un-pause a real jail"); it holds under Docker
+Desktop's WSL2 backend, not just OrbStack.
+
+**Correction to my own first read, logged so it isn't relitigated:** initially misread a
+`DiscardEntryAsync` succeeding *while frozen* as a regression against `full-test-matrix.md`'s G3
+line ("freezes the queue (BeginMerge/DiscardEntry refused while frozen)"). Reading
+`MergeQueueGrpcService.cs` shows this is **deliberate, documented behavior**, not a bug — the doc
+comment directly on `DiscardEntry` states "The kill switch does NOT gate it. Freezing the queue
+stops merges; it is not a reason to forbid the human from tidying an entry that can no longer merge
+either way," and `RejectEntry`'s comment says the same for review verdicts. `ThrowIfFrozen` is
+called by `BeginMerge` and `ConfirmMerge` only — exactly the two operations that actually touch git.
+**The matrix's own G3 wording is the stale artifact here, not the code** — flagging the mismatch
+(ISSUES-LOG) rather than "fixing" working, intentionally-designed behavior.
