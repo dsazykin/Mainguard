@@ -214,7 +214,30 @@ The proto reserves field numbers for the plan dimension (`with_plan`, `scope`) w
 naming those branches, so the extension lands as fields filling reserved slots rather than a
 redesign.
 
-## 10. Honesty ledger
+## 10. Live verification (2026-08-25, macOS, real Pro app + real daemon)
+
+Driven end-to-end through the shipped GUI against the `e2e-fixture` scratch repo:
+
+- Boot banner fired; the dev card appeared ONLY on the flagged daemon and was absent — not
+  disabled, absent — on a flagless one (same app build, negative pass).
+- "One of each" → 7 seeded, all final states correct on the rail (Rejected in history, Discarded
+  off the rail); the seeded artifact read `resolved-command: node test.js [seeded — not executed]`
+  with the fixture's REAL verify command, actor `os:danielsazykin`.
+- "Stale pair" → the origin checkout's `main` really advanced to the seeded commit (`git log`
+  verified) and the rail's main sha rendered the same sha; co-seed HELD at `StaleVerified`.
+- "Merge during verify" → an entry stayed genuinely `Verifying` (held) while the sibling's real
+  merge fired the real cascade over it — the reproducible race window.
+- "Overflow ×12", `PushCommits` (Verified → Working via the real invalidation) and
+  "Clear seeded" (25 cleared, 0 failed, rail census restored EXACTLY to its pre-seeding
+  17-in-play · 7-in-history, zero `seed-` refs left in the mirror) all verified live.
+- **Fix that came out of the pass:** the panel's availability probe was one-shot and raced the
+  app-spawned daemon's bind — the card never appeared on a daemon that had the flag. The probe now
+  retries transport errors patiently; UNIMPLEMENTED/PermissionDenied stay final.
+- Known polish (non-blocking): on a narrow rail the Seed row can clip its count stepper, and the
+  status text reflows the preset buttons as it grows; the rail viewport gets short when all four
+  cards are stacked on a small window.
+
+## 11. Honesty ledger
 
 **Real:** every state transition (legality-checked), every persisted row, every audit event, the
 branches/commits/diffs, gate arming and flag classification, the merge (actual ff-only under an

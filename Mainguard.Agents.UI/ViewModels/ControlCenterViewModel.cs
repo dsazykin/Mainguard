@@ -475,26 +475,36 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     // ---- Fix 2: egress block-notification prompt ----
 
     /// <summary>
-    /// Dev-only queue seeding, decided by the DAEMON: one background probe of `GetSeedingStatus`. The
-    /// gateway answers false for UNIMPLEMENTED (no boot flag — the shipped shape) and PermissionDenied;
-    /// only a genuine yes constructs the panel. Failures are swallowed on purpose — an unreachable
-    /// daemon already surfaces through the ordinary reconnect machinery, and a dev card must never add
-    /// a second error channel for it.
+    /// Dev-only queue seeding, decided by the DAEMON: a background probe of `GetSeedingStatus`. The
+    /// gateway answers false ONLY for the two definitive noes — UNIMPLEMENTED (no boot flag, the
+    /// shipped shape) and PermissionDenied — and that answer is final. A transport failure is a
+    /// different fact entirely: this ViewModel is constructed while the daemon may still be starting
+    /// (measured live — the one-shot probe raced the app-spawned daemon's bind and the card never
+    /// appeared on a daemon that HAD the flag), so transport errors retry patiently in the
+    /// background. The unreachable-daemon condition itself surfaces through the ordinary reconnect
+    /// machinery; this loop must never add a second error channel for it.
     /// </summary>
     private async Task ProbeQueueSeedingAsync(Services.DaemonBackedOrchestrator dbo)
     {
-        try
+        var gateway = dbo.CreateQueueSeedingGateway();
+        for (var attempt = 0; attempt < 40; attempt++)
         {
-            var gateway = dbo.CreateQueueSeedingGateway();
-            if (await gateway.IsAvailableAsync().ConfigureAwait(false))
+            try
             {
-                await Dispatcher.UIThread.InvokeAsync(() =>
-                    QueueSeeding = new QueueSeedingPanelViewModel(gateway));
+                if (await gateway.IsAvailableAsync().ConfigureAwait(false))
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                        QueueSeeding = new QueueSeedingPanelViewModel(gateway));
+                }
+
+                return; // a definitive yes or a definitive no — either way, decided.
             }
-        }
-        catch (Exception)
-        {
-            // The panel simply stays hidden.
+            catch (Exception)
+            {
+                // Not an answer (daemon still starting / channel not up) — ask again shortly.
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
         }
     }
 
