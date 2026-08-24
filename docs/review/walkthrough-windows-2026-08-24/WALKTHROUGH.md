@@ -505,3 +505,59 @@ correction for whoever maintains it, and worth deciding deliberately (not by acc
 - Collapsed sidebar icons expose **no accessible name at all** to UI Automation (not even a
   fallback) — worth folding into W2's accessibility finding if someone picks that up: the gap isn't
   only list rows, collapsed nav icons lose their name too.
+
+## 10. The real-agent leg (runbook §5) — claude-code, end to end, with a correction to a standing assumption
+
+Selected `claude-code 2.1.223` (already installed) and clicked **Start coordinator** for real. It
+booted straight to **"Welcome back Daniel!"** — Opus 5 (1M context) · Claude Max ·
+`daniel.sazykin@gmail.com`'s Organization — **no login prompt at all**, confirming B2's login
+persistence: the OAuth session from a prior install/session was harvested and reused, exactly as
+`<data-root>/Keyring/cli_login_claude-code.*` is supposed to provide. The user's own request to
+"send a notification when you need my login" never triggered, because it wasn't needed.
+
+### Correction: real keyboard input DOES reach a live jailed PTY on this substrate
+
+The runbook states as fact: *"synthetic keystrokes do not reach a jailed PTY — a human at the
+keyboard, or `SendPromptAsync` [RPC], drives it."* First tried `SendPromptAsync` (RPC) with a real,
+verifiable task — it landed the text into the composer's buffer but **never submitted it** (no
+`\r`/Enter equivalent actually reached the CLI; the text just sat there unsent, including a second,
+literal, real-keyboard-typed line appended after it). Prompted directly by the user to actually test
+real UI input rather than accept the RPC shortcut: clicked into the composer (`SendInput` absolute
+click — coordinates verified against the visible prompt), typed the task via `SendUnicodeText`
+(`Win32.SendInput` with `KEYEVENTF_UNICODE`), then sent a real `VK_RETURN` via `SendVk`. **This
+worked** — the accumulated composer text (the RPC-sent task text plus the real-typed line) was
+submitted together, and Claude Code began working immediately: "I'll start by looking at the
+existing files" → read/edited `src/calc.js` and `test.js` → ran `node test.js` → hit two real
+**permission prompts** (shell-command approval for `git commit`, retried once after it
+self-diagnosed and fixed a missing git identity in the jail) — both answered via real keyboard
+(`1` + Enter) exactly as a human would. **The task completed for real**: `git log` on the agent's
+own branch (`agent/8697bec3d2a44dc8a9069c3302a5ae77`, mirror-side, confirmed via `wsl -d
+MainguardEnv`) shows commit `2cc06d9 feat: add subtract function to calc module`.
+
+**This is a genuine, substrate-relevant correction, not just a "yes it works" note**: whatever
+limitation the runbook's warning was written against (most plausibly the Mac run's own
+`osascript`/`System Events keystroke` mechanism — ISSUES-LOG #6 from that run documents exactly
+that path dropping characters, a different failure mode from "doesn't reach the PTY at all") does
+not apply to Windows `SendInput`-based keyboard delivery. **Mouse input is the one that never
+reaches this app** (confirmed repeatedly this session — clicks, double-clicks, and now scroll-wheel
+events all silently no-op), **keyboard input reaches it fine**, including into a live jailed PTY.
+Worth rewriting the runbook's C1 note to be substrate-specific rather than a blanket claim.
+
+### Verification — PASS
+
+`RunVerificationAsync` on the real commit: `Ran=true Passed=true Reason="verified against
+main@7400e105"`, queue state `Verified`, `CanMerge=true`. Matches runbook §5 step 5's assertion
+exactly (the only remaining unexercised half of that step is clicking Merge specifically on THIS
+entry through the UI rather than RPC — already proven mechanically identical to the F1 merge done
+earlier in this pass on a `scripted` entry; not repeated here to avoid re-litigating an already-
+confirmed mechanism, especially since the live queue rail had 8 entries and this one sat below the
+fold with no way to scroll to it via synthetic mouse wheel — see below).
+
+### Side finding: merge-queue rail scrolling is also blocked by the mouse-input limitation
+
+Wanted to scroll the 8-entry queue rail to reach the claude-code entry's Review button directly (it
+was correctly present — the header's count, "8 in play," matched exactly: the 6 visible rows + the
+current coordinator + the claude-code entry). `mouse_event(MOUSEEVENTF_WHEEL, ...)` produced no
+visible scroll — consistent with, not a new instance of, this session's standing finding that no
+synthetic mouse input of any kind reaches this app. Not logged as a new bug — filed under the same
+root cause as the rest of the mouse-input gap.
