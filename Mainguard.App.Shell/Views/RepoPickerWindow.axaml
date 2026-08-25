@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Mainguard.App.Shell.ViewModels"
         xmlns:models="using:Mainguard.Git.Models"
+        xmlns:controls="using:Mainguard.App.Shell.Controls"
         x:Class="Mainguard.App.Shell.Views.RepoPickerWindow"
         x:DataType="vm:MainWindowViewModel"
         x:Name="Root"
@@ -44,6 +45,10 @@
           <Style Selector="Border:pointerover">
             <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
           </Style>
+          <!-- Keyboard focus reads like hover, so a Tab-focused row is visible (W2). -->
+          <Style Selector="Border:focus-within">
+            <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
+          </Style>
           <Style Selector="Border:pressed">
             <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
           </Style>
@@ -64,10 +69,15 @@
           </ContextMenu>
         </Border.ContextMenu>
 
-        <Grid ColumnDefinitions="3,*"
+        <!-- RepoRow is a Grid that also carries an InvokePattern automation peer + Enter/Space
+             activation, so the row is reachable by keyboard and assistive tech, not only by
+             double-click (W2). Everything below is unchanged. -->
+        <controls:RepoRow ColumnDefinitions="3,*"
+              AutomationProperties.Name="{Binding DisplayName}"
               PointerPressed="Repo_PointerPressed"
               PointerMoved="Repo_PointerMoved"
               DoubleTapped="Repo_DoubleTapped"
+              Activated="Repo_Activated"
               DragDrop.AllowDrop="True"
               Background="Transparent">
 
@@ -79,7 +89,7 @@
             <Ellipse Width="8" Height="8" Fill="{Binding CustomIconColor, TargetNullValue='#8B8BF5'}" Margin="8,0,10,0" />
             <TextBlock Text="{Binding DisplayName}" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
           </StackPanel>
-        </Grid>
+        </controls:RepoRow>
       </Border>
     </DataTemplate>
 

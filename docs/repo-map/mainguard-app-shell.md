@@ -368,7 +368,11 @@
       (the repositories tree, moved out of MainWindow's docked sidebar 2026-07-11 so the workspace runs
       full-width: shares `MainWindowViewModel` as DataContext, carries the Repository/WorkspaceCategory
       templates, drag-to-categorize, rename/delete keys, and the delete-confirmation overlay; opened via
-      `OpenRepoPickerCommand`, single instance, double-click opens the repo and closes the picker — the
+      `OpenRepoPickerCommand`, single instance, double-click opens the repo and closes the picker. Each
+      row's surface is `Controls/RepoRow`, so Enter/Space and UI Automation `Invoke` open it too (W2 —
+      the rows previously exposed no activation path to the keyboard or to assistive tech at all); the
+      row is `AutomationProperties.Name`d from `DisplayName` and shows the hover wash on `:focus-within`
+      so a Tab-focused row is visible. The
       title-bar hamburger used to open this directly, but it is now a pure compact/expand toggle
       (`ToggleToolbarCommand`/`IsToolbarExpanded`, persisted as `UserPreferences.ToolbarExpanded`) and
       **Select Repo** is one of the four items — Select Repo / Close Repository / Settings / Exit — the
@@ -786,6 +790,14 @@
     (alternating `SurfaceDeep`/`SurfaceCard`, resolved at render time + re-resolved on
     `ThemeManager.ThemeChanged`), so transparent pixels are distinguishable from surface-coloured ones
     in every theme.
+  - `RepoRow.cs` (W2) — the repo picker's repository-row surface: a `Grid` subclass that adds the
+    activation path the raw-pointer-handler row never had. `Activate()` raises the `Activated` routed
+    event, reached from Enter/Space (the row is `Focusable`, so it is also a tab stop) and from
+    `RepoRowAutomationPeer` — a `ControlAutomationPeer` reporting `AutomationControlType.ListItem` and
+    implementing `IInvokeProvider`, so UI Automation and screen readers can open a repository.
+    Deliberately NOT a `Button` wrapper: a Button would swallow the pointer press that
+    `RepoPickerWindow`'s select-then-drag gesture depends on. `RepoPickerAccessibilityTests` pins both
+    the Invoke and the Enter paths.
   - `TerminalControl.cs` + `VtScreen.cs` (P2-03) — the interim terminal engine behind `ITerminalView`:
     `VtScreen` is a pure, Avalonia-free VT parser + cell grid (SGR colour, cursor motion, erase,
     10k-line circular scrollback, OSC 52 clipboard-copy decode → `ClipboardCopyRequested` — queries
