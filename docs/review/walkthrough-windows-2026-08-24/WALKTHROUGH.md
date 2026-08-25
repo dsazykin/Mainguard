@@ -604,3 +604,51 @@ here too:
 **No new bugs found in this feature on this substrate** — every claim in its own design doc's live
 macOS verification held here too. Cleaned up (`Clear seeded`, confirmed `Cleared 10`) and disabled
 the flag (reverted the systemd edit) before continuing.
+
+## 12. Priority 2/3 continued: Settings surfaces, themes, daemon logs, Agent CLIs
+
+**P2-21/22 scope check** (delegated research first): confirmed WebView2 is pure roadmap language
+with zero hits anywhere in `.cs`/`.axaml`/`.csproj` — nothing to test. Confirmed P2-21/22's own
+docs explicitly gate a full fresh-install/UAC/reboot-resume cycle and a real uninstall behind
+"required manual matrix — human approval required," and most of both plans now ships as the
+in-app `OobeWizardViewModel` wizard rather than the standalone installer exe. Chose the safe,
+already-provisioned-VM-only surface (Settings → Agent CLIs) over re-running system-level
+enablement or uninstall, consistent with that gating.
+
+**Settings dialog** (real clicks throughout): opened cleanly, all panels present (General,
+Keyboard Shortcuts, Accounts, SSH Keys, Git Profiles, AI Providers, Agent CLIs, Toolchains, PR
+Intake, Mainguard OS, Daemon Logs, About).
+
+- **"Stop Mainguard OS on exit" is a real, visible, checked-by-default checkbox** under
+  General → Window & Exit — this **corrects §9's framing**: the VM-teardown-on-Exit behavior isn't
+  a hidden substrate quirk, it's a legitimate, user-facing, already-implemented setting that
+  happened to default ON. The runbook's assumption ("the daemon and jails outlive the UI quit")
+  is still wrong as a cross-platform default claim, but a user hitting this can simply uncheck it —
+  worth softening the earlier finding's severity accordingly.
+- **H7 themes, closing the Mac run's gaps**: switched to **System** (correctly followed the OS's
+  dark preference, no defects) and **Daylight Loom** (correctly relit every panel — sidebar,
+  settings, merge-queue cards — to the light palette)., closing the two themes the Mac run flagged
+  as untested ("Atelier and a full System-theme check were not exercised").
+- **Found and fixed a real theme bug**: switching to Daylight Loom left the **Coordinator terminal
+  panel's background pure black** while everything else relit correctly. Root-caused (delegated,
+  then verified myself): neither `TerminalControl` nor `TerminalGridControl` (the two swappable PTY
+  rendering engines) subscribed to `ThemeManager.ThemeChanged`, unlike the sibling
+  `CommitGraphCanvas`, which does. Both already re-resolve their color tokens fresh on every
+  `Render()` call — the only missing piece was asking for a repaint when the theme changes, since
+  both engines are deliberately damage-driven (repaint only on new PTY bytes/resize/scroll, "never
+  on an idle timer"). **Fixed** in `ba28ae7`: added the same `OnAttachedToVisualTree`/
+  `OnDetachedFromVisualTree` + `ThemeManager.ThemeChanged` hook to both engines. New regression test
+  (`TerminalRenderHarness.ThemeSwitch_WhileAttached_RepaintsTerminalBackground`) drives an in-place
+  theme switch on an already-rendered control and compares encoded frame bytes — **confirmed failing
+  against the pre-fix code** (verified via `git stash` on just the two control files), **passing
+  after**.
+- **H4 Daemon Logs — confirmed working**: real journal entries streamed in (`mainguardd.Rpc`
+  RPC-begin/end lines), matching the matrix's "WSL reads journalctl" expectation exactly.
+- **P2-22 Agent CLIs panel** — found **W6**: reports the actively-in-use, already-installed
+  Claude Code (v2.1.223, confirmed via the daemon's own `ListInstalledAdapters`) as **"Not
+  installed"** alongside an `Install` button offering v2.1.218. Root-caused to
+  `AgentCliInstaller.IsInstalledAsync`'s health probe doing an **exact-substring version match**
+  against the currently-*offered* manifest version rather than "is any working version present" —
+  since the actual install (2.1.223) doesn't contain the substring "2.1.218", the probe reads false.
+  Logged as an open design question (should version drift from the pin surface as "update
+  available" instead of "not installed"?) rather than guessed at with a rushed fix.

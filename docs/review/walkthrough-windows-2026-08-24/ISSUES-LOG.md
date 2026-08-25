@@ -184,3 +184,26 @@ click to register with this Avalonia app, on any element, including a plain, sim
 hamburger menu) tested specifically to rule out "maybe it's just list rows." Worth flagging for
 whoever picks up W2: if a future pass wants real mouse-driven testing (not UI-Automation-driven),
 this environment's `SendInput` path needs its own investigation first.
+
+### W6. [OPEN, MEDIUM — real, confirmed] Settings → Agent CLIs reports an installed CLI as "Not installed" when its installed version differs from the currently-pinned one
+
+- **Where:** Settings → Agent CLIs (P2-22 adapter-channel UI), real click.
+- Claude Code had been in active use all session (spawned, driven through a real task, verified,
+  merged — see §10 of WALKTHROUGH.md) at version **2.1.223** (confirmed via the daemon's own
+  `ListInstalledAdapters` RPC and the VM's `adapters/registry/claude-code.json`). The Settings
+  panel nonetheless showed **"Claude Code v2.1.218 — Not installed"** with an `Install` button.
+- **Root-caused:** `AgentCliInstaller.IsInstalledAsync`
+  (`Mainguard.Agents/Agents/Adapters/AgentCliInstaller.cs`) runs a health-probe command in the VM
+  and checks `probe.Stdout.Contains(spec.HealthProbe.ExpectedVersionSubstring, Ordinal)` — an
+  **exact substring match against the currently-offered manifest version** (2.1.218), not "is some
+  working version installed." Since the actually-installed 2.1.223 doesn't contain "2.1.218", the
+  probe fails and the CLI reads as not-installed, even though it demonstrably works (this same
+  install drove a real end-to-end agent cycle minutes earlier in this same session).
+- **Not fixed this pass** — this is a genuine design question, not a one-line patch: should
+  "installed" mean "any healthy version is present" (with drift-from-pin surfaced separately, e.g.
+  "installed (v2.1.223) — v2.1.218 recommended"), or does exact-version matching exist deliberately
+  (e.g. to force a re-install/update after a pin bump, for integrity reasons)? Flagging for a
+  deliberate decision rather than guessing.
+- Severity: medium — cosmetic/confusing (a user could be told to "Install" something already
+  working, or click Install and have it no-op/reinstall unnecessarily), not a correctness or
+  security issue — the actually-installed adapter is unaffected and still fully functional.
