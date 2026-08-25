@@ -331,23 +331,27 @@ public static class ProDesktopHost
 
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
                 var installed = (await installer.ListAsync(cts.Token).ConfigureAwait(false))
-                    .Where(o => o.IsInstalled).Select(o => o.Id)
-                    .ToHashSet(StringComparer.Ordinal);
+                    .Where(o => o.IsInstalled)
+                    .ToDictionary(o => o.Id, o => o.InstalledVersion!, StringComparer.Ordinal);
                 if (installed.Count == 0)
                 {
                     return;
                 }
 
                 var updates = (await updater.CheckForUpdatesAsync(cts.Token).ConfigureAwait(false))
-                    .Where(u => installed.Contains(u.Id))
+                    .Where(u => installed.ContainsKey(u.Id))
                     .ToList();
                 if (updates.Count == 0)
                 {
                     return;
                 }
 
+                // Use the PROBED installed version, not AgentCliUpdate.InstalledVersion (the pin this
+                // update supersedes) — the two drift apart whenever the disk copy is ahead of the pin
+                // (W6), and announcing the pin here would tell a user already on 2.1.223 that they are
+                // "still on 2.1.218".
                 var summary = string.Join(", ",
-                    updates.Select(u => $"{u.DisplayName} {u.InstalledVersion} → {u.LatestVersion}"));
+                    updates.Select(u => $"{u.DisplayName} {installed[u.Id]} → {u.LatestVersion}"));
                 Avalonia.Threading.Dispatcher.UIThread.Post(() => ProComposition.ShowShellToast(
                     $"Agent CLI update{(updates.Count > 1 ? "s" : "")} available: {summary}. "
                     + "Update (or later revert) from Tools → Agent CLIs.", false));
