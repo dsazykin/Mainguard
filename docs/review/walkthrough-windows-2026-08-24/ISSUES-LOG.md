@@ -102,7 +102,7 @@ Not yet started at the time of this log snapshot; the substrate-readiness blocke
 GUI-automation calibration (W2/W3 discovered along the way) consumed the setup phase. Tracked
 separately in WALKTHROUGH.md's running log as each one is actually re-driven live.
 
-### W4. [OPEN, HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
+### W4. [FIXED, was HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
 
 - **Where:** runbook §4 steps 3-4 (`BringBranchLocalAsync`/`ConfirmMergeAsync`), first attempt.
 - Every fetch against the daemon-provisioned sync remote (`mainguard-vm`, a
@@ -121,18 +121,49 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   path-normalization quirk with `\\wsl.localhost\...`-style UNC paths that defeats
   `safe.directory`'s exact-string match — a real, reproducible git behavior, not a fluke (retested
   across a fresh repo handle/mirror path with the same result).
-- **Not fixed this pass** — the real fix needs someone to either find the exact string
-  representation git will actually match for a WSL UNC path (may require testing quoted forms,
-  a trailing-slash variant, or the `\\wsl$\` legacy alias instead of `\\wsl.localhost\`), or avoid
-  UNC entirely (e.g. route the mirror through a mapped drive letter). This is exactly the kind of
-  fiddly, easy-to-get-subtly-wrong git/OS-path interaction the standing instructions say deserves a
-  dedicated pass rather than a guessed one-line patch.
-- **Workaround used for the rest of this walkthrough:** `git config --global --add safe.directory
-  '*'` on this machine only — a real (if narrow) security relaxation, not applied as a source
-  change, so every merge/fetch step in this log from here on ran with that override active.
 - Severity: **HIGH** — this blocks the single most important guarantee of the whole product (a
   verified agent branch actually reaching `main`) for every Windows+WSL2 user, on the very first
   merge, with an unhelpful raw git error and no Mainguard-authored guidance pointing at the fix.
+
+#### RESOLVED — root-caused and fixed (`Mainguard.Git/Services/UncRemoteTrust.cs`)
+
+Measured live against git 2.45.1.windows.1 and the real MainguardEnv mirror. **Two independent
+findings**, the first of which invalidates the obvious fix:
+
+1. **`safe.directory` is ignored in command scope — including `*`.** Git reads it through
+   `read_very_early_config()`, which sets `ignore_cmdline = 1`. Measured, all against the same live
+   mirror with no config present: `git -c safe.directory=<exact path>` → **fails**;
+   `git -c safe.directory=*` → **fails**; `GIT_CONFIG_COUNT=1 KEY_0=safe.directory VALUE_0=<path>` →
+   **fails**; same with `*` → **fails**. Only file-based *system*/*global* scopes are honoured
+   (`GIT_CONFIG_SYSTEM` → **works**, `GIT_CONFIG_GLOBAL` → **works**, real `.gitconfig` → **works**).
+   So the tempting one-line `-c safe.directory=…` patch would have compiled, shipped, and changed
+   nothing.
+2. **Why the "character-identical" exact path didn't match.** It wasn't a UNC normalization quirk at
+   all. The value had reached `.gitconfig` under-escaped: the file held
+   `directory = \\wsl.localhost\\MainguardEnv\\…` (two leading backslashes), and since `\` is a
+   config-file **escape character**, git parsed that as `\wsl.localhost\MainguardEnv\…` — **one**
+   leading backslash, which is not a UNC path and can never match. `git config --get-all
+   safe.directory | cat -A` shows the single backslash; the side-by-side comparison that "looked
+   identical" was comparing the *escaped file text* against the *unescaped error text*. Re-adding the
+   same path so the file holds four leading backslashes makes it read back as `\\wsl.localhost\…` and
+   the fetch **succeeds**. The forward-slash spelling `//wsl.localhost/…` does **not** match — the
+   literal Windows spelling is required.
+
+**The fix**: `UncRemoteTrust.RunGitTrustingRemote(repoPath, remoteName, args…)` reads
+`remote.<name>.url` and, only when it is a UNC repository path, writes a throwaway config file naming
+that one exact directory in `safe.directory` and passes it as `GIT_CONFIG_SYSTEM` for that single
+child process. The shim `include.path`s the real system config so the user loses no setting, and
+**nothing is written to the user's own config at any scope** — no `*`, no global entry. Wired into
+the three client-side sync-remote fetches: `BringLocalService`, `ForegroundMergeService` (the merge
+path), and `ExternalPrMergeService`. Non-UNC remotes and non-Windows hosts take an early return to
+the unmodified `GitService.RunGit`.
+
+**Live verification** (`BringLocalService.BringLocal` driven as a real Windows process against the
+real mirror, with **zero** `safe.directory` entries in any scope — the `*` workaround removed):
+plain `git fetch` in the same fixture, same UNC path → `exit=128 fatal: detected dubious ownership`;
+`BringLocal(...)` immediately after → `Done=True`, `refs/heads/agent/025f8540…` created at the
+mirror's real tip `9cc1365 feat: add note module`. The global `*` relaxation this walkthrough relied
+on has been **removed from this machine** and is no longer needed.
 
 ### W5. [OPEN, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
 
