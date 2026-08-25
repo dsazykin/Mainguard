@@ -879,6 +879,16 @@
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
     `raw` frame; a fake backs the ViewModel tests.
+  - `AutoDetectScan.cs` — the pure directory walk behind the sidebar's "auto-detect repositories"
+    folder browse, split out of `MainWindowViewModel.ScanAutoDetectFolderAsync` so the walk is
+    unit-pinned (`AutoDetectScanTests`) while the ViewModel keeps only the persistence around it.
+    `Scan(rootPath, isGitRepository)` → `AutoDetectedRepo(Path, DisplayName, CategoryName?)`: the
+    chosen root when the root is ITSELF a repository, otherwise its immediate subdirectories plus one
+    grouping level down (the grouping folder's name becomes the workspace category); unreadable
+    directories are skipped, never thrown. The root-is-a-repository case is a correctness requirement,
+    not a convenience — walking a repository's own children used to add its `.git` directory as a
+    repository literally named ".git" (walkthrough bug W3), which `IGitService.IsGitRepository`
+    now independently refuses as well.
   - `SyncRemoteRegistrar.cs` (P2-06) — the small, testable idempotent sync-remote registration helper:
     takes the remote name/URL **verbatim from the daemon's `ProvisionRepo` response** (never a hardcoded
     literal) and, via `IGitService`, adds it / updates a changed URL / no-ops when unchanged.

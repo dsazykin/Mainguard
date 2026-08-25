@@ -1441,67 +1441,46 @@ public partial class MainWindowViewModel : ViewModelBase, IDisposable, IShellRai
 
             if (defaultCategory == null) return;
 
-            var dirs = Directory.GetDirectories(AutoDetectPath);
+            // The directory walk itself lives in the pure, unit-pinned Services/AutoDetectScan —
+            // including the case this method used to get wrong: a chosen root that IS a repository
+            // is that one repository (walking its children added its `.git` dir as a repo named
+            // ".git" — walkthrough bug W3).
+            var candidates = Services.AutoDetectScan.Scan(AutoDetectPath, gitService.IsGitRepository);
             bool anyAdded = false;
+            var groupCategories = new Dictionary<string, WorkspaceCategory>(StringComparer.Ordinal);
 
-            foreach (var dir in dirs)
+            foreach (var candidate in candidates)
             {
-                if (gitService.IsGitRepository(dir))
-                {
-                    if (!await dbContext.Repositories.AnyAsync(r => r.Path == dir))
-                    {
-                        var repo = new Repository
-                        {
-                            Path = dir,
-                            DisplayName = Path.GetFileName(dir),
-                            CategoryId = defaultCategory.CategoryId,
-                            LastAccessed = System.DateTime.UtcNow
-                        };
-                        dbContext.Repositories.Add(repo);
-                        anyAdded = true;
-                    }
-                }
-                else
-                {
-                    try
-                    {
-                        var subdirs = Directory.GetDirectories(dir);
-                        bool categoryCreated = false;
-                        WorkspaceCategory? curCategory = null;
+                if (await dbContext.Repositories.AnyAsync(r => r.Path == candidate.Path)) continue;
 
-                        foreach (var subdir in subdirs)
+                var category = defaultCategory;
+                if (!string.IsNullOrEmpty(candidate.CategoryName))
+                {
+                    var groupName = candidate.CategoryName!;
+                    if (!groupCategories.TryGetValue(groupName, out var groupCategory))
+                    {
+                        // A grouping folder only becomes a category when it actually contributes a
+                        // new repository — an all-known group adds nothing, as before.
+                        groupCategory = await dbContext.WorkspaceCategories.FirstOrDefaultAsync(c => c.Name == groupName);
+                        if (groupCategory == null)
                         {
-                            if (gitService.IsGitRepository(subdir))
-                            {
-                                if (!await dbContext.Repositories.AnyAsync(r => r.Path == subdir))
-                                {
-                                    if (!categoryCreated)
-                                    {
-                                        curCategory = await dbContext.WorkspaceCategories.FirstOrDefaultAsync(c => c.Name == Path.GetFileName(dir));
-                                        if (curCategory == null)
-                                        {
-                                            curCategory = new WorkspaceCategory { Name = Path.GetFileName(dir) };
-                                            dbContext.WorkspaceCategories.Add(curCategory);
-                                            await dbContext.SaveChangesAsync();
-                                        }
-                                        categoryCreated = true;
-                                    }
-
-                                    var repo = new Repository
-                                    {
-                                        Path = subdir,
-                                        DisplayName = Path.GetFileName(subdir),
-                                        CategoryId = curCategory!.CategoryId,
-                                        LastAccessed = System.DateTime.UtcNow
-                                    };
-                                    dbContext.Repositories.Add(repo);
-                                    anyAdded = true;
-                                }
-                            }
+                            groupCategory = new WorkspaceCategory { Name = groupName };
+                            dbContext.WorkspaceCategories.Add(groupCategory);
+                            await dbContext.SaveChangesAsync();
                         }
+                        groupCategories[groupName] = groupCategory;
                     }
-                    catch { }
+                    category = groupCategory;
                 }
+
+                dbContext.Repositories.Add(new Repository
+                {
+                    Path = candidate.Path,
+                    DisplayName = candidate.DisplayName,
+                    CategoryId = category.CategoryId,
+                    LastAccessed = System.DateTime.UtcNow
+                });
+                anyAdded = true;
             }
 
             if (anyAdded)
