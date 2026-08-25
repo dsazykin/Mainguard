@@ -32,6 +32,18 @@ public sealed class QueueSeederTests : IDisposable
     private readonly SyntheticVerificationRegistry _synthetic = new();
     private readonly MergeQueueRegistry _registry = new();
 
+    // The phase-2 plan pipeline, wired exactly as the daemon wires it (design §9): one PlanApprovalService,
+    // one WorkerPlanGate over it, that gate ANDed into every queue as an IMergeGate, and the provisioner's
+    // SA-1/F6 scope lookup reading APPROVED plans out of that same service.
+    private readonly PlanApprovalService _plans;
+    private readonly WorkerPlanGate _planGate;
+
+    public QueueSeederTests()
+    {
+        _plans = new PlanApprovalService(audit: _audit);
+        _planGate = new WorkerPlanGate(_plans, _audit);
+    }
+
     // ---- Static targets --------------------------------------------------
 
     [Fact]
@@ -133,6 +145,171 @@ public sealed class QueueSeederTests : IDisposable
         Assert.True(ctx.ChangedTestCommand!.IsUnacknowledged(outcome.AgentId));
         Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out var reason));
         Assert.Contains("test command changed", reason);
+    }
+
+    // ---- The plan dimension (design §9) ----------------------------------
+
+    /// <summary>
+    /// A seed WITHOUT <c>WithPlan</c> is outside the plan gate entirely, and both halves of that matter:
+    /// the gate's unheld-id default lets it merge (a seeded entry is no more coordinator-delegated than a
+    /// manual-mode agent), and the stricter auto-verify predicate refuses it, so no automatic caller ever
+    /// fires a verification at an entry that has no agent and no jail behind it.
+    ///
+    /// <para>These are the same two properties <c>SeedingCompatibilityTests</c> pins against the bare gate;
+    /// asserted here against an id the seeder REALLY produced, because "the gate is permissive for unheld
+    /// ids" only protects seeding if seeded ids are actually unheld.</para>
+    /// </summary>
+    [Fact]
+    public async Task ASeedWithoutAPlan_IsOutsideThePlanGate_Permitted_AndAutoVerifyIneligible()
+    {
+        var (seeder, repoHash, _) = Provision();
+
+        var report = await seeder.SeedAsync(repoHash,
+            new[] { new SeedSpec(WorkerMergeState.Verified) }, Actor, CancellationToken.None);
+        var agentId = Assert.Single(report.Results).AgentId;
+
+        Assert.True(_planGate.Allows(agentId, out var allowReason), allowReason);
+        Assert.False(_planGate.MayAutoVerify(agentId, out var autoReason));
+        Assert.Contains("not a plan-gated worker", autoReason);
+        Assert.Null(_plans.LatestForWorker(agentId));
+
+        // ...and it really is mergeable — the permissive default is load-bearing, not decorative.
+        Assert.True(_registry.Resolve(repoHash)!.Queue.CanMerge(agentId, out var mergeReason), mergeReason);
+    }
+
+    /// <summary>
+    /// <c>WithPlan</c> drives the REAL pipeline — <see cref="WorkerPlanGate.Hold"/> →
+    /// <see cref="PlanApprovalService.Present"/> → <see cref="PlanApprovalService.Approve"/> — so the id
+    /// becomes a genuinely plan-gated worker: the gate holds it, the plan record exists with a real
+    /// approver and a real approval event, and the merge gate now passes it because that plan was
+    /// APPROVED rather than because the gate never heard of it.
+    ///
+    /// <para>The one synthetic fact is authorship (no worker inspected anything), and the record says so
+    /// about itself — the plan twin of the verification record's "[seeded — not executed]".</para>
+    /// </summary>
+    [Fact]
+    public async Task SeedWithPlan_DrivesTheRealPlanPipeline_AndTheRecordSaysItIsSeeded()
+    {
+        var (seeder, repoHash, _) = Provision();
+
+        var report = await seeder.SeedAsync(repoHash,
+            new[] { new SeedSpec(WorkerMergeState.Verified, WithPlan: true) }, Actor, CancellationToken.None);
+
+        var outcome = Assert.Single(report.Results);
+        Assert.Equal("", outcome.Refusal);
+        Assert.Equal("Verified", outcome.ReachedState);
+
+        // Held for real: the id is now inside the gate, so the auto-verify predicate answers as it does
+        // for any approved worker (nothing ARMS the trigger for it — the mirror is not watched).
+        Assert.True(_planGate.MayAutoVerify(outcome.AgentId, out var autoReason), autoReason);
+        Assert.True(_plans.HasApprovedPlan(outcome.AgentId));
+        Assert.True(_planGate.Allows(outcome.AgentId, out var allowReason), allowReason);
+
+        var plan = _plans.LatestForWorker(outcome.AgentId)!;
+        Assert.Equal(PlanStatus.Approved, plan.Status);
+        Assert.Equal(Actor, plan.ApproverIdentity);
+        Assert.Equal(QueueSeeder.SeededCoordinatorId, plan.CoordinatorId);
+        Assert.Contains(QueueSeeder.SeededPlanMarker, plan.Plan.Approach);
+        Assert.Contains(QueueSeeder.SeededPlanMarker, plan.Plan.TestStrategy);
+
+        // The real pipeline's own audit events, not the seeder's paraphrase of them.
+        Assert.Contains(_audit.Read(), e => e.Type == "worker_task_withheld" && e.Fields["worker_agent_id"] == outcome.AgentId);
+        Assert.Contains(_audit.Read(), e => e.Type == "plan_presented" && e.Fields["worker_agent_id"] == outcome.AgentId);
+        Assert.Contains(_audit.Read(), e => e.Type == "plan_approved" && e.Fields["worker_agent_id"] == outcome.AgentId);
+        Assert.Contains(_audit.Read(), e => e.Type == QueueSeeder.SeededEvent
+            && e.Fields["agent"] == outcome.AgentId && e.Fields["with_plan"] == "true"
+            && e.Fields["plan_id"] == plan.PlanId);
+
+        // Default scope is the seed's own path, so with_plan alone changes nothing about mergeability.
+        Assert.True(_registry.Resolve(repoHash)!.Queue.CanMerge(outcome.AgentId, out var mergeReason), mergeReason);
+    }
+
+    /// <summary>
+    /// The arm this parameter exists for (SA-1/F6): a plan-gated seed whose approved scope does NOT cover
+    /// what its commit touches gets a real <see cref="FlaggedKind.OutOfApprovedScope"/> must-acknowledge
+    /// item and cannot merge until a human acknowledges it. Nothing is injected — the item is produced by
+    /// the same <c>ArmFlaggedChangeReview</c> pass a real branch's verification runs, comparing the real
+    /// merge diff against the real approved plan's scope.
+    /// </summary>
+    [Fact]
+    public async Task SeedWithPlan_OutsideItsScope_ArmsTheRealOutOfApprovedScopeItem()
+    {
+        var (seeder, repoHash, _) = Provision();
+
+        var report = await seeder.SeedAsync(repoHash,
+            new[] { new SeedSpec(WorkerMergeState.Verified, WithPlan: true, Scope: new[] { "docs/" }) },
+            Actor, CancellationToken.None);
+
+        var outcome = Assert.Single(report.Results);
+        Assert.Equal("Verified", outcome.ReachedState);
+        Assert.Equal(new[] { "docs/" }, _plans.LatestForWorker(outcome.AgentId)!.Plan.Scope);
+
+        var ctx = _registry.Resolve(repoHash)!;
+        Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out _));
+
+        var store = ctx.FlaggedChanges!.PeekStore(outcome.AgentId)!;
+        var item = Assert.Single(store.Items, i => i.Kind == Mainguard.Git.Review.FlaggedKind.OutOfApprovedScope);
+        Assert.Equal($"seed/{outcome.AgentId}.txt", item.Path);
+
+        store.Acknowledge(item.Id);
+        Assert.True(ctx.Queue.CanMerge(outcome.AgentId, out var reason), reason);
+    }
+
+    /// <summary>
+    /// Clearing releases the plan gate's hold, so the id returns to the permitted/ineligible pair every
+    /// unheld id has. The decided plan RECORD survives — a decided plan is history, exactly as it is for a
+    /// real worker whose spawn service dropped its hold at teardown — and a seed id is a fresh guid, so
+    /// nothing can inherit it.
+    /// </summary>
+    [Fact]
+    public async Task Clearing_ReleasesThePlanGatesHold_ButKeepsTheDecidedPlanAsHistory()
+    {
+        var (seeder, repoHash, _) = Provision();
+
+        var report = await seeder.SeedAsync(repoHash,
+            new[] { new SeedSpec(WorkerMergeState.Verified, WithPlan: true) }, Actor, CancellationToken.None);
+        var agentId = Assert.Single(report.Results).AgentId;
+        Assert.True(_planGate.MayAutoVerify(agentId, out _));
+
+        await seeder.ClearAsync(repoHash, Actor);
+
+        Assert.False(_planGate.MayAutoVerify(agentId, out var reason));
+        Assert.Contains("not a plan-gated worker", reason);
+        Assert.True(_planGate.Allows(agentId, out _));
+        Assert.Equal(PlanStatus.Approved, _plans.LatestForWorker(agentId)!.Status);
+    }
+
+    /// <summary>
+    /// A substrate without the plan pipeline refuses a <c>WithPlan</c> spec verbatim and leaves NOTHING
+    /// behind — no branch, no registry row, no entry. A half-seeded entry that looked plan-gated and was
+    /// not is precisely the fabricated state this tool exists to never produce.
+    /// </summary>
+    [Fact]
+    public async Task WithPlan_OnASubstrateWithoutThePlanPipeline_IsRefused_AndSeedsNothing()
+    {
+        var (_, repoHash, _) = Provision();
+        var repos = new RepoProvisioner(_vmRoot);
+        var planless = new QueueSeeder(
+            new MergeQueueProvisioner(
+                registry: _registry, repos: repos, leases: new InMemoryMergeLeaseStore(),
+                resolveContainerId: (_, _) => null,
+                queueStore: _ => new InMemoryMergeQueueStore(),
+                verificationStore: _ => new InMemoryVerificationStore(),
+                sandboxes: new ThrowingSandboxEngine(),
+                artifactDirectory: NewDir("mainguard-seed-artifacts-"),
+                mergeDiff: new MergeBranchDiffService(repos, (_, _) => true),
+                syntheticVerifications: _synthetic),
+            _registry, _synthetic, repos);
+
+        Assert.False(planless.CanSeedPlans);
+        var report = await planless.SeedAsync(repoHash,
+            new[] { new SeedSpec(WorkerMergeState.Verified, WithPlan: true) }, Actor, CancellationToken.None);
+
+        var outcome = Assert.Single(report.Results);
+        Assert.Contains("no coordinator plan pipeline", outcome.Refusal);
+        Assert.Equal("", outcome.ReachedState);
+        Assert.Null(RevParse(BarePath(repoHash), "refs/heads/agent/" + outcome.AgentId));
+        Assert.DoesNotContain(_registry.Resolve(repoHash)!.Queue.Agents, id => id == outcome.AgentId);
     }
 
     [Fact]
@@ -334,9 +511,19 @@ public sealed class QueueSeederTests : IDisposable
             artifactDirectory: NewDir("mainguard-seed-artifacts-"),
             mergeDiff: new MergeBranchDiffService(repos, (_, _) => true),
             audit: _audit,
+            planGate: _planGate,
+            // SA-1/F6, read the way the composition root reads it: APPROVED plans only, keyed by the
+            // worker's own agent id — which for a seeded entry is the seed id itself.
+            resolveApprovedPlan: agentId =>
+                _plans.LatestForWorker(agentId) is { Status: PlanStatus.Approved } approved
+                    ? approved.Plan
+                    : null,
             syntheticVerifications: _synthetic);
 
-        return (new QueueSeeder(provisioner, _registry, _synthetic, repos), repoHash, verifications);
+        return (
+            new QueueSeeder(provisioner, _registry, _synthetic, repos, log: null, plans: _plans, planGate: _planGate),
+            repoHash,
+            verifications);
     }
 
     private string BarePath(string repoHash) => new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash);

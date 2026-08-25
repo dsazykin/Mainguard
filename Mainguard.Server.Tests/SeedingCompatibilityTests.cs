@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Mainguard.Agents.Agents;
@@ -51,40 +53,120 @@ public sealed class SeedingCompatibilityTests
         Assert.NotEqual("", reason);
     }
 
-    // ---- (b) No automatic verification fires for seeded ids --------------------------------------
+    // ---- (b) The coordinator plan gate, in both of its two directions ----------------------------
+    //
+    // These four replace the tripwire this file carried until the phase-2/3 merge
+    // (NoAutomaticVerificationCallerExistsYet_TripwireForTheCoordinatorBranches), which asserted that
+    // no automatic caller of MergeQueue.RunVerificationAsync existed yet and named — for whoever did the
+    // merge — the three things to do before removing it. All three are done: the seeder gained real plan
+    // seeding (SeedSpec.WithPlan/Scope over the proto's formerly-reserved fields 8/9, exercised by
+    // QueueSeederTests), and the two properties the tripwire stood in for are pinned DIRECTLY below.
 
     /// <summary>
-    /// TODAY no automatic caller of <c>MergeQueue.RunVerificationAsync</c> exists at all, and this
-    /// tripwire is how the seeder finds out the moment one lands. The coordinator phase-2/3 branches
-    /// (`feat/coordinator-phase-2-worker-authored-plans` / `feat/coordinator-phase-3-role-lock`) add
-    /// exactly the two types probed here.
-    ///
-    /// <para><b>To whoever merges those branches — this failure is addressed to you, and it is not a
-    /// nuisance pin.</b> Before deleting or re-pinning it: (1) assert `WorkerPlanGate.Allows` stays
-    /// permissive for ids it never held AND `MayAutoVerify` refuses them — seeded ids must pass the
-    /// new merge gate and stay invisible to `WorkerReadinessTrigger`; (2) extend `QueueSeeder` with
-    /// real plan seeding (`WorkerPlanGate.Hold` → `PlanApprovalService.Present` → approve, for a
-    /// synthetic id), filling `SeedEntrySpec`'s reserved proto fields 8/9 (`with_plan`, `scope`) —
-    /// without that, plan-gated verification and the scope arm of the flagged review exist in the
-    /// product and cannot be seeded, which is precisely the silent-coverage rot this contract
-    /// exists to prevent; (3) replace this tripwire with direct pins on both properties.</para>
+    /// <b>Direction 1 — the merge gate lets an unheld id through.</b> <see cref="WorkerPlanGate"/> is a
+    /// third <see cref="IMergeGate"/> ANDed into every queue, and a seeded entry (like a manual-mode agent
+    /// or an external-PR head) is not a coordinator-delegated worker. If this gate answered "no" for ids it
+    /// never held, every seeded entry — and every non-coordinated branch in the product — would become
+    /// unmergeable, silently, at merge time.
     /// </summary>
     [Fact]
-    public void NoAutomaticVerificationCallerExistsYet_TripwireForTheCoordinatorBranches()
+    public void WorkerPlanGate_StaysPermissive_ForAnIdItNeverHeld()
     {
-        var agentsAssembly = typeof(MergeQueue).Assembly;
-        var arrivals = agentsAssembly.GetTypes()
-            .Where(t => t.Name.Contains("ReadinessTrigger", StringComparison.Ordinal)
-                || t.Name.Contains("WorkerPlanGate", StringComparison.Ordinal))
-            .Select(t => t.FullName)
+        var gate = new WorkerPlanGate(new Mainguard.Agents.Agents.Orchestrator.PlanApprovalService());
+
+        Assert.True(gate.Allows("seed-unknown", out var reason), reason);
+        Assert.Equal("", reason);
+    }
+
+    /// <summary>
+    /// <b>Direction 2 — the automatic trigger refuses the same id.</b> <c>MayAutoVerify</c> is deliberately
+    /// NOT <c>Allows</c>: an automatic trigger reading the permissive merge default would start spending
+    /// test-suite runs on every agent in the daemon. A seeded entry has no jail and no agent, so an
+    /// automatic verification fired at one would be a refusal-shaped failure nobody asked for.
+    /// </summary>
+    [Fact]
+    public void TheAutoVerifyPredicate_RefusesAnIdThePlanGateNeverHeld()
+    {
+        var gate = new WorkerPlanGate(new Mainguard.Agents.Agents.Orchestrator.PlanApprovalService());
+
+        Assert.False(gate.MayAutoVerify("seed-unknown", out var reason));
+        Assert.Contains("not a plan-gated worker", reason);
+    }
+
+    /// <summary>
+    /// The same two facts as the queue and the trigger themselves see them, rather than as the gate reports
+    /// them — because "the predicate says no" and "the trigger therefore does nothing" are different
+    /// claims, and only the second one is the guarantee. A seeded id armed on a real
+    /// <see cref="WorkerReadinessTrigger"/> is dropped <see cref="ReadinessOutcome.Ineligible"/>, and the
+    /// queue's verification runner (which throws here) is never entered.
+    /// </summary>
+    [Fact]
+    public void ASeededId_ArmedOnTheRealTrigger_IsDroppedIneligible_AndNothingRuns()
+    {
+        var temp = Path.Combine(Path.GetTempPath(), "mainguard-seedcompat-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(temp);
+        try
+        {
+            var registry = new MergeQueueRegistry();
+            registry.Register("repo", new MergeQueueContext(
+                new MergeQueue(
+                    repoHash: "repo", currentMainSha: "abc",
+                    store: new InMemoryMergeQueueStore(),
+                    verifications: new InMemoryVerificationStore(),
+                    runVerification: (id, _) => throw new InvalidOperationException(
+                        $"the automatic trigger started a verification for '{id}' — a seeded entry has no "
+                        + "agent and no jail, so this can only be a fabricated automatic caller")),
+                new InMemoryMergeLeaseStore()));
+
+            using var watcher = new AgentRefWatcher(
+                new AgentRefMediator(new AgentRepoManager(temp), _ => temp),
+                new AgentRepoManager(temp),
+                AgentRefWatcher.DriveManually);
+            // A virtual clock, so the quiet period is elapsed by advancing it rather than by sleeping.
+            var now = DateTimeOffset.UnixEpoch;
+            using var trigger = new WorkerReadinessTrigger(
+                source: watcher,
+                queues: registry,
+                planGate: new WorkerPlanGate(new Mainguard.Agents.Agents.Orchestrator.PlanApprovalService()),
+                sweepInterval: WorkerReadinessTrigger.DriveManually,
+                clock: () => now);
+
+            trigger.NotifyAdvanced("repo", "seed-abcd1234", "sha1");
+            now = now.AddHours(1);
+            var decision = Assert.Single(trigger.PollOnce());
+
+            Assert.Equal(ReadinessOutcome.Ineligible, decision.Outcome);
+            Assert.Contains("not a plan-gated worker", decision.Reason);
+            Assert.Empty(trigger.Armed);
+        }
+        finally
+        {
+            try { Directory.Delete(temp, recursive: true); } catch { /* best-effort temp cleanup */ }
+        }
+    }
+
+    /// <summary>
+    /// ...and the structural half, which is what makes the pin above hold for the <c>with_plan</c> seeds
+    /// too. A plan-seeded id IS a plan-gated worker by construction, so <c>MayAutoVerify</c> answers TRUE
+    /// for it — the guarantee there cannot come from the predicate, and comes instead from the trigger
+    /// never being armed: it arms only from <see cref="AgentRefWatcher.Advanced"/>, which reads registered
+    /// agents' OWN repositories, never the bare mirror the seeder writes its refs into. This asserts the
+    /// seeder cannot reach around that: it holds no handle on the trigger or on the ref machinery, so no
+    /// seeding call can start an automatic verification whatever the predicate says.
+    /// </summary>
+    [Fact]
+    public void TheSeeder_HoldsNoHandleOnTheAutomaticVerificationMachinery()
+    {
+        var forbidden = new[] { typeof(WorkerReadinessTrigger), typeof(AgentRefWatcher), typeof(AgentRefMediator) };
+
+        var dependencies = typeof(QueueSeeder).GetConstructors()
+            .SelectMany(c => c.GetParameters().Select(p => p.ParameterType))
+            .Concat(typeof(QueueSeeder)
+                .GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+                .Select(f => f.FieldType))
             .ToList();
 
-        Assert.True(arrivals.Count == 0,
-            "The coordinator plan-gate/auto-verify machinery has arrived: " + string.Join(", ", arrivals)
-            + ". Read this test's doc comment — the queue seeder must be extended (plan seeding via the"
-            + " reserved SeedEntrySpec fields 8/9) and these properties re-pinned directly before this"
-            + " tripwire is removed. Deleting it without doing that turns the seeder into a tool that"
-            + " silently no longer covers what the queue does.");
+        Assert.DoesNotContain(dependencies, d => forbidden.Contains(d));
     }
 
     // ---- (c) Entry creation stays where the seeder assumes it is ---------------------------------

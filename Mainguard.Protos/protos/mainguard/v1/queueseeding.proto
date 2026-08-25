@@ -79,15 +79,21 @@ message SeedEntrySpec {
   // daemon-derived from the connection (IApproverIdentityResolver), exactly as DiscardEntry.
   string reason = 7;
 
-  // Reserved for the coordinator phase-2/3 plan dimension (branches
-  // feat/coordinator-phase-2-worker-authored-plans / feat/coordinator-phase-3-role-lock):
-  //   8 = with_plan (drive the real WorkerPlanGate.Hold → PlanApprovalService.Present → approve
-  //       for the synthetic id, so plan-gated merge/auto-verify flows become seedable),
-  //   9 = scope (the approved TaskPlan.Scope paths for the out-of-approved-scope arm).
-  // SeedingCompatibilityTests fails on those branches' merge until these are implemented — the
-  // seeder must not silently stop covering the flows the queue grows.
-  reserved 8, 9;
-  reserved "with_plan", "scope";
+  // The coordinator phase-2/3 plan dimension (the slots reserved for it before those branches
+  // merged). Drives the REAL plan pipeline for this seeded id — WorkerPlanGate.Hold (the daemon
+  // withholds a task) → PlanApprovalService.Present (a plan is presented against the
+  // one-live-plan-per-worker invariant) → Approve (daemon-derived approver) — so plan-gated merge
+  // and the out-of-approved-scope arm of the flagged review become seedable. Nothing is fabricated
+  // here either: the plan is a real record with a real approval, and it says of ITSELF that no
+  // worker authored it ("[seeded — not authored by a worker]" on its approach/test strategy).
+  // A seeded id WITHOUT this stays outside the plan gate entirely — permitted by WorkerPlanGate's
+  // unheld-id default and ineligible for WorkerReadinessTrigger, exactly like a manual-mode agent.
+  bool with_plan = 8;
+  // with_plan only: the approved TaskPlan.Scope path patterns. EMPTY (the default) means "the path
+  // this seed's own commit touches", so a plan-gated seed is in-scope and merges; naming any other
+  // pattern set puts the seeded commit OUTSIDE its approved scope and arms the real
+  // FlaggedKind.OutOfApprovedScope must-acknowledge item (SA-1/F6). Ignored without with_plan.
+  repeated string scope = 9;
 }
 
 message SeedQueueEntriesResponse {

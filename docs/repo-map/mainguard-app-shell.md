@@ -362,7 +362,8 @@
       composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table; its trimmed Detail column
       carries a full-value tooltip — a blocked host you cannot read is a blocked host you cannot act on),
       `QueueSeedingPanelView` (the DEV-ONLY seeding card under the telemetry card in the right rail —
-      warning-hued "dev" pill, state/flavor/count pickers, hold + verify-fails, the preset buttons and
+      warning-hued "dev" pill, state/flavor/count pickers, hold + verify-fails, the preset buttons
+      (incl. "Plan-gated": one in-scope + one out-of-scope entry through the REAL plan pipeline) and
       the DangerQuiet Clear; the hosting `Border` in `ControlCenterView` is `IsVisible`-bound to
       `QueueSeeding` not-null, so a daemon without the seeding boot flag never shows a trace of it),
       `ResourceMonitorView` (the
@@ -675,7 +676,9 @@
     `QueueSeedingPanelViewModel` (the DEV-ONLY seeding card, docs/design/queue-seeding.md §6-7 — a thin
     driver over `IQueueSeedingGateway` whose scenario presets are CLIENT-side compositions of the RPC
     primitives ("Stale pair" is literally two specs in one ordered batch; "Merge during verify" holds
-    one entry mid-run while a sibling's real merge fires the real cascade); refusals render the
+    one entry mid-run while a sibling's real merge fires the real cascade; "Plan-gated" seeds both arms
+    of the phase-2 plan dimension — an approved scope that covers the seed's own commit, and one that
+    does not, blocking on the real out-of-approved-scope item); refusals render the
     daemon's words verbatim; `ControlCenterViewModel.QueueSeeding` stays null — card absent, not
     disabled — unless the daemon's one-shot `ProbeQueueSeedingAsync` availability probe answered yes,
     which a daemon without the boot flag never does),
@@ -950,7 +953,7 @@
     queue seeder — `IsAvailableAsync` (false, never a throw, for UNIMPLEMENTED/PermissionDenied: the
     unmapped service IS the visibility contract, no capability flag travels) + `SeedAsync`/
     `PushCommitsAsync`/`ClearAsync` over `SeedEntryRequestItem`/`SeedResultItem`/`SeedBatchResult`,
-    wire vocabulary verbatim. Built via `DaemonBackedOrchestrator.CreateQueueSeedingGateway()` — the
+    wire vocabulary verbatim (incl. the plan dimension's `WithPlan`/`Scope`). Built via `DaemonBackedOrchestrator.CreateQueueSeedingGateway()` — the
     same factory shape as the intake/egress gateways — with the repo handle read LIVE so the panel
     always seeds the repo the rail is showing.)
   - `IPrIntakeGateway.cs` (P2-12: the App's seam to the **daemon-owned** external-PR-intake

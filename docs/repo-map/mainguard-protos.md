@@ -99,8 +99,11 @@
     `UNIMPLEMENTED`, plus a `SeedingGateInterceptor` prefix-deny as the belt), and every method is
     on the coordinator's denied list unconditionally. Ids are daemon-assigned `seed-<n>` — the
     prefix is the clear-scope boundary; no actor fields (daemon-derived identity); refusals are
-    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are RESERVED for
-    the coordinator phase-2/3 plan dimension per the compat contract),
+    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are the coordinator
+    phase-2/3 plan dimension the compat contract reserved them for: `with_plan` drives the REAL
+    `WorkerPlanGate.Hold` → `PlanApprovalService.Present` → approve walk for the synthetic id, and
+    `scope` is the approved `TaskPlan.Scope` — empty meaning "the seed's own path", anything else
+    arming the real out-of-approved-scope must-ack item),
     `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and

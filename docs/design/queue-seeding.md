@@ -193,26 +193,62 @@ IPC op** — the coordinator branches pin the agent-socket op surface with a sub
 - **Clear before disabling:** `ClearSeededEntries` itself requires the flag; seeded rows left
   behind with the flag off are real rows and must be discarded through the ordinary UI.
 
-## 9. The phase-2/3 compatibility contract
+## 9. The plan dimension — the phase-2/3 contract, discharged
 
 The coordinator branches (`feat/coordinator-phase-2-worker-authored-plans`,
 `feat/coordinator-phase-3-role-lock`) add `WorkerPlanGate` (a third `IMergeGate`, permissive for
 ids never `Hold()`-ed) and `WorkerReadinessTrigger` (auto-verification; `MayAutoVerify` refuses
-un-held ids). `SeedingCompatibilityTests` pins the properties seeding relies on so merging those
-branches **fails loudly** until the seeder is extended rather than silently rotting:
+un-held ids). `SeedingCompatibilityTests` carried a tripwire that failed the moment those two types
+landed, addressed to whoever merged them and naming three things to do before removing it. All three
+are done, and this section is what they became.
+
+**(1) The two properties, pinned directly.** `WorkerPlanGate.Allows` stays permissive for an id it
+never held — a seeded entry is no more coordinator-delegated than a manual-mode agent or an
+external-PR head, and a gate answering "no" for unknown ids would make every one of them unmergeable.
+`MayAutoVerify` refuses that same id, deliberately stricter, so an automatic trigger never begins
+spending suite runs on entries nobody delegated. Both are asserted against the bare gate *and* against
+an id the seeder really produced, and one test drives a real `WorkerReadinessTrigger`: a `seed-` id
+armed on it is dropped `Ineligible`, over a queue whose verification runner throws if it is ever
+entered.
+
+**(2) Real plan seeding — `with_plan` / `scope`,** filling proto fields 8/9, the slots reserved for
+exactly this. `with_plan` drives the real pipeline for the synthetic id: `WorkerPlanGate.Hold` (the
+daemon withholds a task — the same call the spawn path makes) → `PlanApprovalService.Present` (against
+the real one-live-plan-per-worker invariant) → `Approve` (with the calling connection's own
+daemon-derived operator identity). The entry is then a genuinely plan-gated worker: it passes the merge
+gate because its plan was **approved**, not because the gate never heard of it.
+
+`scope` is the approved `TaskPlan.Scope`. Empty (the default) means *the path this seed's own commit
+touches*, so `with_plan` alone changes nothing about mergeability — it only moves the id inside the
+gate. Naming any other pattern set puts the seeded commit outside its approved scope and arms the real
+`FlaggedKind.OutOfApprovedScope` must-acknowledge item (SA-1/F6), blocking the merge until a human
+acknowledges it. That arm needs `MergeQueueProvisioner`'s `resolveApprovedPlan`, which the composition
+root passes as of phase 2 — the binding is exact (a plan is keyed by the worker's own agent id, which
+is the id the plan gate holds and the id the queue tracks the branch under) rather than the guess the
+parameter was previously left null to avoid; see `coordinator-phase-2-decisions.md` §3a.
+
+What is synthetic in a seeded plan is **authorship, and only authorship** — no worker inspected
+anything — so the record says so about itself: `[seeded — not authored by a worker]` on the approach and
+test-strategy fields a human reads, plus a `seed-coordinator` coordinator id. The approval is *not*
+synthetic: it records the real operator who called the RPC, because approving as "unknown" would be an
+unattributable approval, which `Approve` refuses outright. `ClearSeededEntries` drops the gate's hold
+(the id returns to the permitted/ineligible pair every unheld id has) and deliberately leaves the decided
+plan as history, exactly as a real worker's teardown does; a seed id is a fresh guid, so nothing inherits
+it. A substrate with no plan pipeline **refuses** a `with_plan` spec verbatim and seeds nothing at all —
+no branch, no row, no entry — rather than producing something that looks plan-gated and is not. The dev
+panel's "Plan-gated" preset is one of each arm: in-scope (merges) and out-of-scope (blocked).
+
+**(3) The rest of the contract, unchanged.** Still pinned by `SeedingCompatibilityTests`:
 
 - (a) the gate defaults of §3, in both directions;
-- (b) no automatic caller of `RunVerificationAsync` fires for a `seed-` id — after the merge,
-  `WorkerReadinessTrigger` must report such ids `Ineligible`, and plan-gated flows count as
-  covered only once the seeder gains real plan seeding (`WorkerPlanGate.Hold` →
-  `PlanApprovalService.Present` → approve, for a synthetic id);
+- (b) the seeder holds **no handle** on `WorkerReadinessTrigger`, `AgentRefWatcher` or
+  `AgentRefMediator` — asserted structurally, and that is what carries the no-automatic-verification
+  guarantee across to the `with_plan` seeds, whose `MayAutoVerify` legitimately answers *true*: the
+  trigger arms only from the watcher's sweep over registered agents' **own** repositories, never over
+  the bare mirror the seeder writes its refs into (§2), so nothing ever arms it for a seeded id;
 - (c) `TryDiscard`/`TryReject` refuse unknown ids, and the seeder always `EnsureEntry`s first;
 - (d) the service is `UNIMPLEMENTED` without the flag, and a coordinator token is
   `PermissionDenied` on every seeding method with it.
-
-The proto reserves field numbers for the plan dimension (`with_plan`, `scope`) with comments
-naming those branches, so the extension lands as fields filling reserved slots rather than a
-redesign.
 
 ## 10. Live verification (2026-08-25, macOS, real Pro app + real daemon)
 
@@ -241,7 +277,11 @@ Driven end-to-end through the shipped GUI against the `e2e-fixture` scratch repo
 
 **Real:** every state transition (legality-checked), every persisted row, every audit event, the
 branches/commits/diffs, gate arming and flag classification, the merge (actual ff-only under an
-actual lease, actual cascade), the jail-liveness measurements, the new-commits invalidation.
+actual lease, actual cascade), the jail-liveness measurements, the new-commits invalidation, and —
+for a `with_plan` seed — the whole plan walk: the withheld task, the presentation against the real
+one-live-plan-per-worker invariant, the approval with its real daemon-derived approver, and the
+scope comparison the approved plan then feeds.
 **Synthetic:** the test-command *execution* (outcome supplied; provenance real and self-labelled),
-the agent behind the id (absent, reported absent), and the client-side T-19 journal entry for a
+the agent behind the id (absent, reported absent), the *authorship* of a seeded plan (no worker wrote
+it; the record says so in the fields a human reads), and the client-side T-19 journal entry for a
 seeded merge (absent; documented).

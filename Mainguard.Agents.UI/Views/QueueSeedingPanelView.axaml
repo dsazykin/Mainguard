@@ -60,6 +60,9 @@
       <Button Content="Merge during verify" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
               Command="{Binding SeedMergeDuringVerifyCommand}" IsEnabled="{Binding !IsBusy}"
               ToolTip.Tip="Holds one entry mid-run while a sibling's real merge fires the real cascade"/>
+      <Button Content="Plan-gated" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
+              Command="{Binding SeedPlanGatedCommand}" IsEnabled="{Binding !IsBusy}"
+              ToolTip.Tip="Two entries through the REAL plan pipeline (held → presented → approved): one inside its approved scope, one outside it"/>
       <Button Content="Push commits" Classes="Secondary" Padding="10,3" FontSize="11" Margin="0,0,6,6"
               Command="{Binding PushCommitsCommand}" IsEnabled="{Binding !IsBusy}"
               ToolTip.Tip="Appends a real commit to the last-seeded entry — the real invalidation follows"/>

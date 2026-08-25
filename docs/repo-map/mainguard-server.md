@@ -536,7 +536,10 @@
     `QueueSeedingOptions.Enabled` (the primary gate; disabled ⇒ UNIMPLEMENTED, which is also the dev
     panel's hide probe), prefix-denied by `SeedingGateInterceptor` as the belt, coordinator-denied at
     `RoleInterceptor` unconditionally, and its constructor REFUSES to build on a flagless daemon as
-    the last brace. Seeds are logged at Warning — a seeding daemon should read loud in its own log.)
+    the last brace. `SeedEntrySpec`'s `with_plan`/`scope` map onto `SeedSpec.WithPlan`/`Scope` — an
+    empty repeated `scope` deliberately becomes `null`, not an empty list, because "no scope named"
+    selects the seed's own path while an empty `TaskPlan.Scope` would put every file out of scope.
+    Seeds are logged at Warning — a seeding daemon should read loud in its own log.)
   - **`Services/PrIntakeGrpcService.cs`** (P2-12: `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/
     `SubscribePrIntakeSource` over the daemon's `IPrIntakeStore`, mapped in `DaemonHost.MapServices`
     beside `MergeQueueGrpcService`. Validation + dispatch only. **`Update` persists, then re-READS and

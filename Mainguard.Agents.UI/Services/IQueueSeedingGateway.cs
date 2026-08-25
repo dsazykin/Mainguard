@@ -7,6 +7,11 @@ namespace Mainguard.Agents.UI.Services;
 /// <summary>One seed request row, mirroring the wire's <c>SeedEntrySpec</c> vocabulary verbatim
 /// (target state and flavor names travel as strings so the panel and the daemon share one
 /// vocabulary and a mismatch is a typed daemon refusal, never a silent client remap).</summary>
+/// <param name="WithPlan">Drive the real phase-2 plan pipeline for this entry (held → presented →
+/// approved), so plan-gated merge and the out-of-approved-scope arm are reachable without an agent.</param>
+/// <param name="Scope"><paramref name="WithPlan"/> only: the approved plan's scope patterns. Empty means
+/// "the path this seed's own commit touches" — in scope, merges; anything else arms the real
+/// out-of-approved-scope must-acknowledge item.</param>
 public sealed record SeedEntryRequestItem(
     string TargetState,
     int Count = 1,
@@ -14,7 +19,9 @@ public sealed record SeedEntryRequestItem(
     bool VerificationFails = false,
     int HoldSeconds = 0,
     string StaleBehavior = "HOLD",
-    string Reason = "");
+    string Reason = "",
+    bool WithPlan = false,
+    IReadOnlyList<string>? Scope = null);
 
 /// <summary>One seeded entry's outcome — <paramref name="Refusal"/> empty on success, verbatim otherwise.</summary>
 public sealed record SeedResultItem(string AgentId, string ReachedState, string Refusal);

@@ -131,12 +131,17 @@ public sealed class MergeQueueProvisioner
     /// agent has none. Supplying it turns on the <c>out-of-approved-scope</c> arm of the detector: every
     /// file the branch touches outside <c>TaskPlan.Scope</c> becomes its own must-acknowledge item.
     ///
-    /// <para><b>Null in the daemon today, and that is a statement of fact rather than a default.</b> There is
-    /// no agent→approved-plan binding anywhere in the running daemon: <c>PlanApprovalService.PlanApproved</c>
-    /// has no production subscriber, no spawn path accepts or records a plan id, and <c>AgentSession</c>
-    /// carries none — so no honest implementation of this callback exists yet to pass. The scope comparison
-    /// is therefore wired, tested and inert, waiting on the plan-authorship pipeline; it is NOT reported as
-    /// enforced. See the PR body and <c>docs/design/coordinator-phase-2-decisions.md</c> §3a.</para>
+    /// <para><b>Wired by the daemon since phase 2, and the history is the point.</b> It used to be null for
+    /// a stated reason: there was no agent→approved-plan binding anywhere in the running daemon, so any
+    /// callback passed here would have compared diffs against a GUESSED scope and reported that as
+    /// enforcement — worse than the honest gap. Worker-authored plans supply the exact binding, because a
+    /// plan is keyed by the WORKER's own agent id, which is the same id the plan gate holds and the same
+    /// id the merge queue tracks the branch under. The composition root reads it through
+    /// <c>PlanStatus.Approved</c> only (a pending or rejected plan's scope has authorised nothing), and an
+    /// agent with no approved plan still resolves null — unmanaged, scope comparison skipped, exactly as
+    /// before. See <c>docs/design/coordinator-phase-2-decisions.md</c> §3a and
+    /// <c>docs/design/queue-seeding.md</c> §9 (the seeder's <c>with_plan</c>/<c>scope</c> specs are how
+    /// this arm is exercised without spawning an agent).</para>
     /// </param>
     /// <param name="publishAgentRef">
     /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
