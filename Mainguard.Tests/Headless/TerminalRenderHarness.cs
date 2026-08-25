@@ -41,6 +41,50 @@ public class TerminalRenderHarness
         }
     }
 
+    // Reproduces the live finding (Windows/WSL2 walkthrough, 2026-08-25): switching theme while a
+    // TerminalControl is already attached and rendered left the old theme's background on screen,
+    // because neither terminal engine subscribed to ThemeManager.ThemeChanged (unlike the sibling
+    // CommitGraphCanvas, which does). Compares the actual encoded pixels of the SAME control before
+    // and after an in-place theme switch (no new control is created, unlike Capture_TerminalFrame_
+    // DarkAndLight above) — identical bytes would mean the repaint never happened. Fails before the
+    // ThemeChanged hook was added, passes after.
+    [AvaloniaFact]
+    public void ThemeSwitch_WhileAttached_RepaintsTerminalBackground()
+    {
+        try
+        {
+            ThemeManager.Apply("MidnightLoom", persist: false);
+
+            var terminal = new TerminalControl();
+            var win = new Window { Content = terminal, Width = 200, Height = 100 };
+            win.Show();
+            terminal.FeedOutput(Encoding.UTF8.GetBytes("x"));
+            for (var i = 0; i < 5; i++) Pump();
+
+            var darkBytes = EncodePng(win.CaptureRenderedFrame());
+
+            ThemeManager.Apply("DaylightLoom", persist: false);
+            for (var i = 0; i < 5; i++) Pump();
+
+            var lightBytes = EncodePng(win.CaptureRenderedFrame());
+
+            Assert.False(darkBytes.AsSpan().SequenceEqual(lightBytes),
+                "the rendered frame did not change after a theme switch — the terminal engine never repainted");
+            HarnessHygiene.Teardown(win);
+        }
+        finally
+        {
+            ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        }
+    }
+
+    private static byte[] EncodePng(Avalonia.Media.Imaging.WriteableBitmap? frame)
+    {
+        using var ms = new MemoryStream();
+        frame!.Save(ms);
+        return ms.ToArray();
+    }
+
     private static void CaptureOnce(string fileName)
     {
         var terminal = new TerminalControl();
