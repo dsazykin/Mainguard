@@ -12,16 +12,16 @@ colors:
   text-primary: "#E6E9EF"
   text-muted: "#8A93A6"
   on-accent: "#0B0D10"
-  accent: "#8B8BF5"
+  accent: "#8487F0"
   accent-hover: "#A5A5F8"
   accent-selection: "#268B8BF5"
   success: "#42B968"
   success-hover: "#5BCB7F"
-  danger: "#F87171"
+  danger: "#E5484D"
   danger-hover: "#FA8C8C"
   warning: "#E3B341"
   info: "#58A6FF"
-  lane-1: "#8B8BF5"
+  lane-1: "#9F9FFC"
   lane-2: "#F472B6"
   lane-3: "#2DD4BF"
   lane-4: "#E3B341"
@@ -94,22 +94,22 @@ components:
 
 **Creative North Star: "The Quiet Gatehouse"**
 
-Mainguard is a native instrument for engineers doing high-stakes git work — staging, rebasing, resolving conflicts — and, in its next phase, standing watch over a fleet of autonomous coding agents from a single desk, where nothing lands on `main` unguarded. The system is deliberately quiet: layered charcoal surfaces, hairline dividers, and exactly one signature accent (indigo-violet) that appears only where the eye should land — the current branch, the primary action, the active selection. Everything else recedes into a controlled, engineered calm. Motion is fast and functional (120–150ms fades, no bounce), never decorative; depth comes from stacked flat surfaces and a soft shadow on floating overlays, not from glassmorphism or gradients.
+Mainguard is a native instrument for engineers doing high-stakes git work — staging, rebasing, resolving conflicts — and, in its next phase, standing watch over a fleet of autonomous coding agents from a single desk, where nothing lands on `main` unguarded. The system is deliberately quiet: layered charcoal surfaces, hairline dividers, and exactly one signature accent (indigo-violet) that appears only where the eye should land — the current branch, the primary action, the active selection. Everything else recedes into a controlled, engineered calm. Motion is fast and functional (120–150ms fades, no bounce), never decorative; depth comes from stacked flat surfaces and a soft shadow on floating overlays, not from gradients — and not from glassmorphism as decoration; the one sanctioned translucency is the opt-in macOS vibrancy chrome defined in §4.
 
 This system explicitly rejects the templated "VS Code extension" look — generic web-view chrome bolted onto Electron — and the bland blue-and-gray enterprise SaaS dashboard. It equally rejects security-vendor iconography — no shields, padlocks, or fortress imagery; the guard reads as calm discipline, not armor. Mainguard is rendered natively at 60fps; its surfaces are tuned per pixel, not inherited from a component library default.
 
 **Key Characteristics:**
-- One design system, five interchangeable color themes (Midnight Watch default, Day Watch, Command Deck, Atelier, Aurora) — shape, spacing, and typography never change between them.
+- One design system, four interchangeable color themes (Midnight Loom default, Daylight Loom — light, Graphite — the macOS-native neutral graphite, Atelier) — shape, spacing, and typography never change between them. (Command Deck and Loom Aurora were retired in the 2026-08 restyle: their saturated palette read as generic-AI-website, not instrument.)
 - A single signature accent color per theme, reserved for the one emphasized action or state per view.
 - Flat, layered surfaces (window → panel → card) instead of shadows-as-decoration.
 - Semantic color roles named by meaning (Success, Danger, Warning, Info), never referenced by literal hue in code.
 
 ## 2. Colors
 
-The palette below is Midnight Watch, the default theme; four sibling themes (Day Watch — light, Command Deck, Atelier, Aurora) redefine every value below while keeping the same roles. No surface, text, or component may reference a hex value directly — only the named role.
+The palette below is Midnight Loom, the default theme; three sibling themes (Daylight Loom — light, Graphite, Atelier) redefine every value below while keeping the same roles. No surface, text, or component may reference a hex value directly — only the named role.
 
 ### Primary
-- **Signature Violet** (`#8B8BF5`, hover `#A5A5F8`): the one accent per screen — current branch, links, the single `Accent`-class button, focus rings, active selection tint (`#268B8BF5` at low opacity).
+- **Signature Violet** (`#8487F0`, hover `#9EA1F5`): the one accent per screen — current branch, links, the single `Accent`-class button, focus rings, active selection tint (`#268487F0` at low opacity).
 
 ### Neutral
 - **Void** (`#0F1115`): the window background every floating panel sits on.
@@ -124,7 +124,7 @@ The palette below is Midnight Watch, the default theme; four sibling themes (Day
 ### Named Rules
 **The One Accent Rule.** At most one `Button.Accent` per view. The signature violet marks the single emphasized action; everything else is neutral (`Button.Primary`), muted (`Button.Secondary`), or semantic (`Success`/`Danger`).
 
-**The Semantic-Not-Literal Rule.** Success (`#42B968`), Danger (`#F87171`), Warning (`#E3B341`), and Info (`#58A6FF`) are fixed roles used by meaning across every theme — destructive actions are always Danger, never an ad-hoc red. Commit-graph lanes (`Lane1`–`Lane5`) are deliberately decoupled from these semantic colors so graph topology never accidentally implies status.
+**The Semantic-Not-Literal Rule.** Success (`#42B968`), Danger (`#E5484D`), Warning (`#E3B341`), and Info (`#58A6FF`) are fixed roles used by meaning across every theme — destructive actions are always Danger, never an ad-hoc red. Commit-graph lanes (`Lane1`–`Lane5`) are deliberately decoupled from these semantic colors so graph topology never accidentally implies status.
 
 ## 3. Typography
 
@@ -154,6 +154,8 @@ Mainguard is flat by default and layered, not shadowed: depth comes from steppin
 
 ### Named Rules
 **The Flat-By-Default Rule.** Panels, cards, and buttons at rest carry no shadow — separation comes from surface-tone stepping and hairline borders. Shadows appear only on transient overlay chrome, never on persistent layout.
+
+**The Vibrancy Exception (macOS, opt-in).** Flat and opaque remains the default — and the canonical, harness-verified rendering on every platform. On macOS only, a user preference ("Translucent window chrome", off by default) may render the main window's OUTER chrome — the window background, title bar, and section rail — over the system vibrancy blur (`NSVisualEffectView` via Avalonia's AcrylicBlur transparency hint). The mechanics: those three paints bind the `ChromeWindowBackground`/`ChromePanelBackground` indirection tokens (opaque duplicates of `SurfaceWindow`/`SurfacePanel` in every theme), which `VibrancyManager` shadows with the theme's `SurfaceWindowVibrant`/`SurfacePanelVibrant` translucent variants only while the platform has actually granted the blur. Content surfaces — cards, diff, terminal, every reading surface — never route through the chrome tokens and are always opaque; contrast gates are evaluated against the opaque values. This is material, not decoration: no translucency anywhere else, and never as a substitute for surface-tone stepping.
 
 ## 5. Components
 
@@ -193,10 +195,10 @@ A virtualized, vector-drawn DAG lane router rendered directly (not via a chart l
 
 ### Do:
 - **Do** bind every color through a named `{DynamicResource}` token, referenced by semantic role (e.g. `TextMuted`, `DangerBrush`), never by literal hue.
-- **Do** keep shape, spacing, and typography identical across all five themes — only color values change.
+- **Do** keep shape, spacing, and typography identical across all themes — only color values change.
 - **Do** limit each view to at most one `Button.Accent`; route destructive actions through `Button.Danger`, cancels through `Button.Secondary`.
 - **Do** keep motion to 120–150ms opacity/brush transitions with no layout shift.
-- **Do** verify any new UI reads correctly in both Midnight Watch (dark) and Day Watch (light) before shipping it.
+- **Do** verify any new UI reads correctly in both Midnight Loom (dark) and Daylight Loom (light) before shipping it.
 
 ### Don't:
 - **Don't** hardcode a hex color or use `StaticResource` for anything that should follow a live theme switch — only `DynamicResource` tracks `ThemeManager`'s runtime swap.

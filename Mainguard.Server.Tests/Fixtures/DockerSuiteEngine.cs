@@ -19,8 +19,9 @@ namespace Mainguard.Server.Tests.Fixtures;
 /// containers and networks identically on both:</para>
 /// <list type="bullet">
 ///   <item><b>The app's engine</b> — a dockerd running INSIDE the <c>MainguardEnv</c> WSL distro.
-///   <c>mainguardd</c> runs there as a systemd unit (<c>StartDaemonStep</c>) and builds its Docker client
-///   with a bare <c>new DockerClientConfiguration()</c>, so "the local socket" for it is MainguardEnv's.
+///   <c>mainguardd</c> runs there as a systemd unit (<c>StartDaemonStep</c>) and resolves its Docker
+///   client via <c>DockerEndpointResolver</c> (the library default inside the VM), so "the local
+///   socket" for it is MainguardEnv's.
 ///   The owner's live jails, <c>mainguard-egress-proxy</c> and the <c>mainguard-agents</c>/
 ///   <c>mainguard-egress</c> topology live here.</item>
 ///   <item><b>The test engine</b> — whatever dockerd the shell running <c>dotnet test</c> sees, which on

@@ -251,9 +251,26 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       deferred to a future task — documented on the interface).
     - `Wsl2AgentEnvironment.cs` (the WSL2 impl: `SubstrateId="wsl2"`, capabilities
       `(false,false,"9p","wsl")`, resolves the sync remote to a `\\wsl.localhost\…\repos\<hash>.git` UNC
-      handle — **the only place the `mainguard-vm` name literal lives**, SC-2; now also constructs the
-      P2-07 `DockerSandboxEngine` + `EgressProxyConfigurator` over a lazily-created Docker client —
-      building the client requires no live daemon).
+      handle — **the only place the `mainguard-vm` name literal lives**, SC-2; the substrate-neutral
+      collaborators now come from `AgentEnvironmentComposition`, and what stays here is exactly the
+      WSL2-specific part: the UNC prefix and the `WslAdapterInstallHost`-backed toolchain channel).
+    - `AgentEnvironmentComposition.cs` (the composition every substrate shares — provisioner,
+      worktrees, package caches, egress, hardened sandbox engine, toolchain-image builder — extracted
+      from the WSL2 ctor when the macos-host substrate arrived; the MG-3/MG-43/MG-17 and
+      allowlist-persistence invariants are documented HERE and bind both substrates. The Docker
+      client is lazily created via `DockerEndpointResolver`, so construction needs no live engine).
+    - `MacHostAgentEnvironment.cs` (the macos-host impl: `SubstrateId="macos-host"`, capabilities
+      `(false,false,"virtiofs","docker")`, daemon natively on the Mac with state under `~/mainguard`,
+      sandboxes through the resolved Docker engine — Docker Desktop / OrbStack / Colima. Resolves the
+      sync remote to the plain local bare path — **the only place the `mainguard-local` name literal
+      lives**, SC-2. `Toolchains` installs through `ContainerAdapterInstallHost` (in-jail CLIs and
+      toolchains are linux — a host-side install would be wrong by construction), and
+      `ToolchainsRootPath` overrides to the mac daemon-side tree. Deviates from the ESC's deferred
+      B4 "macos-vm" topology — recorded in the substrate ADR/B-doc.)
+    - `AgentEnvironmentFactory.cs` (the one place the per-platform facade choice is made, ESC §0.3:
+      macOS → macos-host, everything else → WSL2 — on Linux that IS the production in-VM daemon.
+      `DaemonHost` registers `IAgentEnvironment` through it; pinned by
+      `AgentEnvironmentFactoryTests`.)
     - `AgentGitCommand.cs` (internal checked wrapper — delegates to the one audited `GitService.RunGit`
       primitive and maps a non-zero exit to a typed exception; NOT a second runner, spawns nothing.
       Carries the **MG-1** hardening on every daemon-side git — `core.hooksPath=/dev/null`,
@@ -262,7 +279,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       the shared mirror is now read-only to every jail, so its `config`/`hooks` are no longer an attack
       surface at all, and what remains to defend is the per-agent repo + worktree, which the daemon also
       runs git against). All git routes through `GitService.RunGit`; the only process spawn here is the
-      injectable pnpm runner.
+      injectable pnpm runner. `RunWithEnv` is the one env-accepting overload — extra env merged UNDER
+      the hardening pins (re-applied last, so a caller cannot un-pin them) — added for the queue
+      seeder's scratch `GIT_INDEX_FILE` plumbing.
   - **`Agents/Bootstrap/`** (P2-05 MainguardOS bootstrapper — client-side; gets a WSL2-enabled
     Windows machine to a health-checked `mainguardd`).
     - `WslConfigMerger.cs` (the **pure**, IO-free INI merge for `%UserProfile%\.wslconfig`: adds only
@@ -273,6 +292,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       pure argument-list builders scoped to our `MainguardEnv` distro only — lifecycle is
       `--terminate`→poll→`--unregister`, **never the VM-wide shutdown verb (G-12)**;
       `WslRunner.ParseDistroList` for `--list --quiet`).
+    - `HostCommandRunner.cs` (the macos-host `IWslRunner`: accepts the in-distro shapes the
+      bootstrap layer builds, strips the WSL prefix and runs the inner command DIRECTLY on the
+      host — "the place commands run" IS the host there, so `SandboxImageProvisioner` and friends
+      work unchanged. VM lifecycle verbs throw typed — no VM of ours exists to manage, and a
+      caller reaching for one is a composition bug. `-u root` runs as the current user.)
+    - `MacDaemonController.cs` (lifecycle of the LOCAL mainguardd on macos-host: idempotent start
+      from the app payload through the dotnet muxer — never the payload apphost, which current
+      macOS SIGKILLs outside its first-run location — pgrep-by-payload-dll discovery, and
+      SIGTERM-then-SIGKILL stop.)
+    - `MacDaemonUpdater.cs` (the macos-host `IDaemonUpdater`: the daemon runs OFF the payload the
+      app ships, so tier-1 refresh is stop + start from it — no staging copy, no systemd, no VM.)
+    - `MacDaemonLaunchAgent.cs` (optional launchd integration — "keep the agent platform running
+      at login": a per-user LaunchAgent starting mainguardd from the app payload with KeepAlive,
+      installed/booted via `launchctl bootstrap gui/<uid>`, nothing elevated; with it installed a
+      refresh degenerates to "stop and let launchd respawn from the same payload dir".)
+    - `MacOobeState.cs` (the macos-host first-run marker — deliberately simpler than the WSL OOBE's
+      staged machine: no reboot-resume, no elevation, no VM import, so "completed once" is the only
+      stage worth persisting; deleting `macos-oobe.json` re-runs the flow.)
     - `IBootstrapStep.cs` (the check/act step interface +
       `BootstrapStageState`/`BootstrapProgress`/`BootstrapOptions`, the `IBootstrapFileSystem` and
       `IDaemonHealthProbe` seams, plus `IBootstrapStepDiagnostics` (a step names its own unmet condition
@@ -660,6 +697,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       form: that comparison drives destructive recreate paths (a jail, and the shared proxy whose
       replacement strands every running jail's egress), so a naive `!=` against a digest would recreate
       the world on every spawn). **Docker impls:**
+    - `DockerEndpointResolver.cs` — where the daemon's Docker endpoint comes from, so the sandbox
+      layer works against whichever engine the machine runs (Docker Desktop / OrbStack / Colima).
+      Mirrors the docker CLI's own order: `DOCKER_HOST` → the CLI's current context (read straight
+      from `~/.docker`, no process spawned) → well-known engine sockets → library default. Windows
+      stays on the library default (named pipe) so the WSL2 substrate never changes under a stray
+      `DOCKER_HOST`. Consumed by `Wsl2AgentEnvironment`, `DaemonHost`'s resource-sampler client,
+      and the gateway's container lister.
     - `DockerSandboxEngine.cs` (persistent jail keyed by repo+agent — `docker start` a stopped one,
       recreate on base-image change; **no runtime image-build** — G-16; writes secrets to per-owner 0400
       tmpfs via stdin exec, never argv/env — that stdin rides `ExecStdinTransport.cs` and NOT
@@ -741,7 +785,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       completes on both, so the `AttachStdin` hang that forced `ExecStdinTransport.cs` onto a raw socket
       does not affect this endpoint)
     - `DockerAgentLister.cs` (P2-08: lists `mainguard.agent`-labelled containers → `AgentContainerState`
-      for the swarm reconciler — Docker as the sole liveness truth). Seccomp/proxy images live under
+      for the swarm reconciler — Docker as the sole liveness truth. It also owns the label-name constants
+      the jail is stamped with: `mainguard.kind` and `mainguard.agent.role` were added for ISSUES-LOG #18
+      because the daemon's live session store is in-memory, so after a restart the labels are the ONLY
+      record of what an agent IS and a surviving coordinator was otherwise adopted back as an anonymous,
+      role-less worker. `mainguard.agent.role` is deliberately not `mainguard.role`, which already means
+      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. The record now also
+      carries `Paused` and a computed `Live` (`Running || Paused`): Docker reports a frozen container as
+      `"paused"`, not `"running"`, so reading `Running` as "still here" made a daemon restart during an
+      engaged kill switch declare the agent dead and force-remove its worktree). Seccomp/proxy images live under
       `images/` (built in CI, never at runtime). **MG-42 — per-repo verification toolchain** (the curated
       base image has no .NET/Rust/JDK/Ruby/PHP, so the merge queue could not verify Mainguard's own repo,
       nor most languages the product targets): `ToolchainCatalog.cs` (the **closed, product-owned** set of
@@ -1075,11 +1127,29 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Orchestrator/` (P2-10 merge queue + verification runs + stale invalidation — the
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
-      `GetState`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`; every legal transition enumerated,
+      `GetState`/`LastChangedAt`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      `LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory (rehydrated on restart, never
+      restamped) so the rail can order its permanent history by when a verdict was GIVEN rather than by
+      spawn order — ISSUES-LOG #13; every legal transition enumerated,
       every illegal one throws typed `InvalidMergeStateTransitionException`; each transition persisted in
       the same transaction (restart resumes; `ResumeAfterRestartAsync(hasLiveJail)` + its background
       `BeginResumeAfterRestart`/`LastResume` pair re-drive an interrupted `Verifying` — see the
-      restart-resume note below); `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
+      restart-resume note below); **`ReconcileJails(hasLiveJail)` + `HasLiveJail(agentId)` +
+      `MergeQueueJailReport` (ISSUES-LOG #24 — the jail-liveness axis)**: queue state is push-only exactly
+      as `AgentSession.State` was, so an entry kept saying `Working` about an agent whose jail had been
+      gone for days, with Verify offered on it. A pass marks/unmarks entries whose sandbox is gone, swaps
+      `CanMerge`'s wording to `StrandedReason` for `Working`/`StaleVerified` (both of the old sentences
+      promise something that cannot happen without a sandbox), audits each move as `JailReconciledEvent`
+      by `ReconcilerActor` (`system:reconciler`, never a person), and republishes via `NotifyGateChanged`
+      — the stream re-pushes only on `Changed`, so without it the rail keeps serving the liveness the
+      client last heard. **It moves no merge state, deliberately**: `AgentResumeService` exists to give a
+      stranded entry a live jail again on its own branch with its commits intact, and `Discarded` is
+      terminal with no path back, so an automatic discard would convert every recoverable entry into an
+      unrecoverable one. Liveness is **not persisted** (it is a measurement of the engine, not a decision
+      — a row asserting "stranded" would outlive its own truth), so `HasLiveJail` is three-valued and
+      answers `null` per-entry until a pass has actually looked; a probe that throws means "no answer",
+      never "no jail". Driven from `AgentSessionReconciler`; `MergeQueueGrpcService` prefers its answer
+      for the wire's `HasLiveSandbox`. `NotifyMainMoved` flips every fresh `Verified`/verified-`AwaitingReview` →
       `StaleVerified` and auto re-queues FIFO by original verification time; `CanMerge` false unless
       `Verified`/fresh AND every composable `IMergeGate` allows; the human merge (`ConfirmHumanMerge` →
       `Merged`) + `RequestReview`/`Reject`/`NotifyNewCommits` are **not** on `IMergeQueue`
@@ -1094,8 +1164,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       after a restart). **Human entry lifecycle** (also NOT on `IMergeQueue`, for the same reason the
       merge is not — an agent-reachable discard is a way to erase the evidence blocking its own branch):
       `TryDiscard(agentId, by, reason)` walks any non-terminal entry to the new terminal
-      `WorkerMergeState.Discarded` — distinct from `Rejected` (a verdict on the CODE, reachable only
-      from `AwaitingReview`) and from `Merged` — persisting a `QueueEntryDiscard` (`GetDiscard`) on the
+      `WorkerMergeState.Discarded` — distinct from `Rejected` (a verdict on the CODE, now reachable
+      in the product via `TryReject(agentId, by, reason)`: legal only from `Verified`/`AwaitingReview`,
+      the Verified→AwaitingReview→Rejected walk mirrors `MarkMergedLocked` under one lock, appends the
+      `queue_entry_rejected` audit event with by/reason/from_state — the audit log is the durable
+      record, there is no per-row reject column — and the rejected row STAYS in `Agents` as its
+      terminal, unlike a discard) and from `Merged` — persisting a `QueueEntryDiscard` (`GetDiscard`) on the
       entry's own row in the same `Save` and appending the `queue_entry_discarded` audit event; it
       refuses an untracked id (`SetStateLocked` would otherwise invent the entry, since every unknown
       agent defaults to `Working`) and any terminal one. A discarded entry leaves **`Agents`** — the
@@ -1142,7 +1216,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `NotifyMainMoved` for a committed-but-unrecorded merge, else releases the lease + surfaces the
       interrupted attempt — exactly once or none). `MergeQueueRegistry.cs`
       (`IMergeQueueRegistry`/`MergeQueueRegistry` + `MergeQueueContext` — the per-repo queue+leases the
-      gRPC service resolves through). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
+      gRPC service resolves through; `Handles()` snapshots the active handles on the READ interface, so
+      the ISSUES-LOG #24 jail sweep can enumerate every live queue without being handed the concrete
+      registry and thereby the ability to Register/Remove queues it has no business creating). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
       `Models/`). **`MergeBranchDiffService.cs`** (P2-47 #7 — `IMergeBranchDiffService`: the daemon-side
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`
@@ -1192,7 +1268,35 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       against zero queues forever — the same no-caller defect one level up. `EnsureQueue` is the moment a
       repo's persisted queue state re-enters the process, and every path into it (`ProvisionRepo`, a
       jailed spawn, the PR-intake target resolver) is an RPC handler, so the pass necessarily lands after
-      merge-reconcile and the swarm reconciler.)
+      merge-reconcile and the swarm reconciler. **Dev-only seeding seam** (docs/design/queue-seeding.md):
+      the optional `syntheticVerifications` registry — always passed by the daemon, empty in production —
+      lets a registered `seed-` id take a seeded arm of the private `RunVerificationAsync`: the jail half
+      (extracted as `ResolveJailAndPublishForVerification`) is skipped, the mirror-read half (RT-D2 +
+      toolchain resolution, both gate armings, `ArmFlaggedChangeReview`) still runs for real, and
+      `RunSyntheticVerificationAsync` returns the plan's outcome pinned to the queue's main with the
+      REQUIRED `[seeded — not executed]` provenance marker + an honest artifact log; `RequeueStaleAsync`
+      likewise ends a seeded entry at one of the two real termini — Hold (rest at `StaleVerified`) or the
+      no-jail `Block` to `Working` — never the null-rebaser re-verify, which would mint fresh evidence
+      for a branch not on top of main.)
+    - `QueueSeeder.cs` (the dev-only merge-queue seeder — docs/design/queue-seeding.md; only caller
+      is the flag-gated `QueueSeedingService`. `SeedAsync` walks each spec to its target state through
+      the REAL `MergeQueue` public transitions over a REAL plumbing-fabricated `agent/seed-<n>` branch
+      in the mirror (flavors: Plain / Flagged — a CI workflow the real classifier must flag / a
+      drifted `.mainguard/verify` for the real RT-D2 gate); `Merged` is the full RT-D1 lease walk
+      around a real `--ff-only` merge in the ORIGIN checkout; `StaleVerified` a real out-of-band
+      empty commit on origin main + mirror refresh + the real cascade; `PushCommits` appends real
+      commits and drives the real `NotifyNewCommits`; `ClearAsync` obeys the resurrection-ordering
+      rule (terminal-or-drained BEFORE `Cancel`) and is structurally `seed-`-scoped; every entry gets
+      a `queue_entry_seeded` audit event and an auto-provisioned `.mainguard/verify` is reported
+      loudly.)
+    - `SyntheticVerificationRegistry.cs` (the dev-only queue-seeding seam's data:
+      `SyntheticVerificationPlan` — requested outcome, clamped hold, `SyntheticStaleBehavior`
+      Hold|Cascade, the hold-cancellation CTS and the retained in-flight task the clear path must await
+      before `MergeQueue.Cancel` (the row-resurrection ordering rule) — plus the thread-safe
+      `(repoHash, agentId)`→plan registry. Registration REFUSES any id without the `seed-` prefix: a
+      plan for a real agent's id would silently replace that agent's real verification, the one
+      substitution the design exists to make impossible. Only writer: the flag-gated
+      `QueueSeedingService`.)
   - **`Agents/Orchestrator/` (P2-11 review-cockpit rules — flag detection + provenance emit + gate
     wiring, pure/daemon-side, no UI).**
     - `FlaggedChangeDetector.cs` (the **pure** flag detector + F6 scope: `Detect(mergeDiff)` → the
@@ -1378,6 +1482,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `KillSwitchGate` (SA-1/F4 — before any await, so no `BeginMerge`/spawn slips the fan-out window;
       `QueueFrozenException`), then yield-all fan-out over an `IKillTarget` (timeout →
       `PauseAsync`/`docker pause`), then a journal snapshot via `IKillJournal` before returning;
+      **`ResumeAsync` is the real mirror** (ISSUES-LOG #17 — it used to be `_gate.Resume()` and nothing
+      else, leaving every paused jail frozen for the life of the daemon): the epoch's fan-out set is
+      remembered, `IKillTarget.UnpauseAsync` releases exactly those agents under the same RT-D4 deadline,
+      the freeze flag then clears in a `finally` so a wedged engine can never also trap the queue, and an
+      agent whose release could not be confirmed comes back `ResumeFailed` and STAYS in the ledger so a
+      second press retries exactly it (`KillResumeOutcome`/`KillAgentResume`/`KillResumeReport`, audited
+      as `killswitch_resume` under the same RT-D3 never-block posture);
       `KillSwitchTiming` holds the **RT-D4 fixed absolute `Ceiling`** —
       `FanOutDeadline = min(ceiling, max(5 s, 50×RTT))`, the ceiling a compile-time constant INDEPENDENT
       of the measured RTT, and `RttWouldExceedCeiling` feeds the P2-08 A3 `Unresponsive` signal; RT-D3:
@@ -1422,7 +1533,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       pinned version substring); pin survival is structural — the install cmd + probe both carry the pin,
       so a breaking upstream never changes what's installed (the simulation test). Seams:
       `IAdapterChannelSource` (+ real `HttpsAdapterChannelSource`, HTTPS-only), `IAdapterInstallHost` (+
-      real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`), `IAdapterManifestCache` (+
+      real `WslAdapterInstallHost` over `IWslRunner` `wsl -d MainguardEnv --`, and
+      `ContainerAdapterInstallHost.cs` — the macos-host implementation: every command runs in a
+      DISPOSABLE agent-base container with the daemon-owned adapters + toolchains roots mounted
+      read-write AT THEIR VM PATHS, so the channels' command shapes, markers and the spawn path's
+      VmRoot→SandboxMount rewrite work verbatim while the bytes land in the host trees the jails
+      later mount read-only; `AdapterPaths.DaemonSideRoot()`/`ToolchainPaths.DaemonSideRoot()` are
+      where the daemon READS those trees per substrate, and the starter manifest's `platformBinary`
+      sources carry both linux-x64 and linux-arm64 entries), `IAdapterManifestCache` (+
       real `FileAdapterManifestCache` under appdata — refresh is explicit, so app + adapter updates move
       independently); typed `AdapterChannelException`/`AdapterChannelError`). **P2-48 wires this from a
       solid-but-uncalled mechanism into the shipped DYNAMIC-CLI feature** (the user picks CLIs at setup
@@ -1540,10 +1658,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       JSON, so a hand-written override still bypasses this gate — the UPDATE PATH is provenance-verified,
       adapter installs as a whole are not.)
 
-- **`Services/`** — the three merge services that live in `Mainguard.Agents`, not `Mainguard.Git` (they are agent-platform concerns, and `ForegroundMergeService` is the human-gated one):
+- **`Services/`** — the merge/handoff services that live in `Mainguard.Agents`, not `Mainguard.Git` (they are agent-platform concerns, and `ForegroundMergeService` is the human-gated one):
+  - `BranchHandoffService.cs` — `BringLocalService`, the cockpit's **Bring local**: fetches
+    `agent/<id>` from the SC-2 sync remote via `UncRemoteTrust.RunGitTrustingRemote` (W4 — on Windows
+    that remote is a `\\wsl.localhost\…` UNC path git refuses as "dubious ownership" unless the mirror
+    is named in a FILE-scoped `safe.directory`; `-c` cannot do it) (explicit refspec, "couldn't find remote ref" classified
+    as "the agent hasn't published it") then updates `refs/heads/agent/<id>` with a journaled
+    (T-19 `CreateBranch`) NON-forced `git fetch . src:dst` — creates, fast-forwards, and REFUSES a
+    diverged or checked-out branch with git's stderr; HEAD never moves. Every refusal is a phrased
+    `BringLocalResult.Reason` (the button was a silent null-delegate no-op for its whole prior life);
+    driven from `DaemonBackedOrchestrator.BringBranchLocalAsync` with a toast either way. Pinned by
+    `Mainguard.Tests/BringLocalServiceTests`.
   - `IForegroundMergeService.cs` / `ForegroundMergeService.cs` — the P2-10 Windows-side, human-gated
     "Merge to Main" (the only path to `Merged`). Fetches the SC-2-resolved sync remote
-    (`IAgentEnvironment.ResolveSyncRemote` — never a hardcoded literal), then merges `agent/<id>` onto
+    (`IAgentEnvironment.ResolveSyncRemote` — never a hardcoded literal) through
+    `UncRemoteTrust.RunGitTrustingRemote` (W4 UNC dubious-ownership), then merges `agent/<id>` onto
     main under the **A5 ref-level compare-and-swap** — `git merge --ff-only` IS the atomic CAS on
     `refs/heads/main` (a verified branch was keep-alive-rebased onto its main, so it fast-forwards; a
     moved main makes `--ff-only` refuse → the CAS loses → no merge → re-verify), **not** an
@@ -1562,7 +1691,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     (`IExternalPrMergeExecutor`), for an `External` (intake'd upstream PR) entry: the merge happens **on
     the host**, never by fast-forwarding the mirrored `agent/pr-<n>` branch — that local ff would
     "succeed" while the PR stayed open upstream, which is divergent state that reads as correct from
-    inside the app.
+    inside the app. Its sync-remote preflight fetch goes through `UncRemoteTrust.RunGitTrustingRemote`
+    (W4 UNC dubious-ownership); the separate `hostRemote` fetch stays a plain `GitService.RunGit`
+    because a host remote is never a UNC path.
     - `IHostPullRequestGateway`/`HostPullRequestGateway` is the deliberately two-method host seam (read a
       PR, merge a PR — so this path structurally cannot close/comment/review, P2-12 invariant 1) over the
       ONE audited T-23 transport; it is also what lets tests drive a fake host instead of live GitHub.

@@ -53,6 +53,11 @@ public interface IFlaggedChangeSource
 /// </summary>
 public sealed class DaemonFlaggedChangeSource : IFlaggedChangeSource
 {
+    /// <summary>The daemon's well-known flagged-item id for "this branch changed its own test
+    /// command" (mirrors <c>MergeQueueGrpcService.ChangedTestCommandItemId</c> — the id is part of
+    /// the wire vocabulary, not an internal detail; the cockpit header keys off it).</summary>
+    public const string ChangedTestCommandItemId = "changed-test-command";
+
     private readonly IMergeQueueService _queue;
 
     public DaemonFlaggedChangeSource(IMergeQueueService queue)

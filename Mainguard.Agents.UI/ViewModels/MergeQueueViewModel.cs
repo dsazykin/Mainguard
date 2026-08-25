@@ -17,7 +17,7 @@ namespace Mainguard.Agents.UI.ViewModels;
 /// stale cascade is shown as a re-verification wave (never a silent reorder), and the merge button is
 /// bound to <see cref="MergeQueue.CanMerge"/> with the reason surfaced verbatim. The override sits
 /// behind a confirm + loud warning and is a SEPARATE path — the merge button stays disabled.
-/// Design tokens / component classes only; no raw colors; renders in all five themes.
+/// Design tokens / component classes only; no raw colors; renders in every theme.
 /// </summary>
 public partial class MergeQueueViewModel : ViewModelBase, IDisposable
 {

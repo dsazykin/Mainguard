@@ -33,7 +33,7 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class QueueEntryLifecycleRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     // Production-length ids: DaemonBackedOrchestrator projects Name = AgentId and Branch = agent/<id>,
     // and the owner's own entries look like this.
@@ -111,7 +111,7 @@ public class QueueEntryLifecycleRenderHarness
             Assert.Contains("DangerQuiet", d.Classes);
             Assert.DoesNotContain("Accent", d.Classes);
             // Destructive by hue: the class resolves the danger token, not a raw colour and not the
-            // accent's fill. Compared against the theme's own token so this holds in all five.
+            // accent's fill. Compared against the theme's own token so this holds in every theme.
             Assert.Equal(Resource("DangerBrush"), (d.Foreground as ISolidColorBrush)?.Color);
             Assert.NotEqual(Resource("AccentBrush"), (d.Background as ISolidColorBrush)?.Color);
         }
@@ -262,10 +262,10 @@ public class QueueEntryLifecycleRenderHarness
         HarnessHygiene.Teardown(win);
     }
 
-    /// <summary>The captures to judge this on: the resting rail and the armed confirmation, in all five
+    /// <summary>The captures to judge this on: the resting rail and the armed confirmation, in every theme
     /// themes. Daylight Loom is LIGHT — the quiet destructive has to read as destructive there too.</summary>
     [AvaloniaFact]
-    public void Capture_QueueEntryLifecycle_AllFiveThemes()
+    public void Capture_QueueEntryLifecycle_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {
@@ -341,6 +341,8 @@ public class QueueEntryLifecycleRenderHarness
     /// </summary>
     private sealed class StubQueue : IMergeQueueService
     {
+        public event Action? Changed;
+
         public List<string> Discarded { get; } = new();
 
         /// <summary>Every (agentId, agentKind) a resume actually reached the seam with.</summary>
@@ -389,6 +391,9 @@ public class QueueEntryLifecycleRenderHarness
             Discarded.Add(agentId);
             return Task.FromResult(new QueueEntryDiscardOutcome(agentId, "uid:1000", DateTimeOffset.UnixEpoch));
         }
+
+        public Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason) =>
+            Task.FromResult(new QueueEntryRejectOutcome(agentId, "uid:1000", DateTimeOffset.UnixEpoch));
 
         public Task ClearStalledVerificationAsync(string agentId) => Task.CompletedTask;
 

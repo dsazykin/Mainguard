@@ -35,6 +35,15 @@ public class ApproverIdentityDaemonDerivedTests
     /// same for every caller. Locking that down keeps the code and its documentation honest — an approval
     /// record attributes the host session, and cannot say which local principal approved. Changing that
     /// is a transport/trust-model decision, not a refactor.
+    ///
+    /// <para>W5 — the shape is now <c>os:&lt;name&gt;</c> on EVERY platform, Linux included. The old
+    /// Linux-only <c>uid:&lt;euid&gt;</c> branch was a leftover of the retracted <c>SO_PEERCRED</c>
+    /// framing (a peer credential is a number), and it made the same daemon-session attribution render
+    /// as a bare <c>uid:1000</c> on Windows/WSL2 — where the daemon runs in-VM as <c>User=mainguard</c> —
+    /// against <c>os:&lt;name&gt;</c> on a macOS host. <c>uid:</c> survives only as the last resort for a
+    /// euid with no passwd entry, where <c>Environment.UserName</c> returns "" and a bare <c>"os:"</c>
+    /// would be a blank actor. This asserts the normal path AND pins the regression: on Linux the value
+    /// is specifically NOT the raw euid form any more.</para>
     /// </summary>
     [Fact]
     public void PeerCredentialResolver_ReportsTheDaemonsOwnIdentity_ConstantForEveryCaller()
@@ -49,14 +58,18 @@ public class ApproverIdentityDaemonDerivedTests
         Assert.False(string.IsNullOrWhiteSpace(first));
         Assert.Equal(first, second);
 
+        // Any real test box (CI included) has a passwd entry for its own euid, so the friendly name is
+        // the path under test; the uid fallback is unreachable here by construction.
+        Assert.False(string.IsNullOrWhiteSpace(Environment.UserName));
+
+        // This test runs in the same process as the in-proc daemon, so "the daemon's user" is ours.
+        Assert.Equal($"os:{Environment.UserName}", first);
+
         if (OperatingSystem.IsLinux())
         {
-            // This test runs in the same process as the in-proc daemon, so "the daemon's euid" is ours.
-            Assert.Equal($"uid:{geteuid()}", first);
-        }
-        else
-        {
-            Assert.Equal($"os:{Environment.UserName}", first);
+            // Regression pin: Linux no longer takes a separate raw-euid branch.
+            Assert.DoesNotContain("uid:", first);
+            Assert.NotEqual($"uid:{geteuid()}", first);
         }
     }
 

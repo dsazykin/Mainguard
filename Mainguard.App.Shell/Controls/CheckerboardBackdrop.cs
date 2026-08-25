@@ -11,7 +11,7 @@ namespace Mainguard.App.Shell.Controls;
 /// cannot tell transparent pixels from surface-coloured pixels, which is exactly the question an
 /// image diff asks. The checker alternates the <c>SurfaceDeep</c> and <c>SurfaceCard</c> tokens
 /// (resolved at render time, like <see cref="CommitGraphCanvas"/>, so it reads correctly in all
-/// five themes and follows live theme switches) — a deliberately quiet two-surface check rather
+/// registered themes and follows live theme switches) — a deliberately quiet two-surface check rather
 /// than the hard grey/white of raster editors, so the images stay the loudest thing on the stage.
 /// </summary>
 public sealed class CheckerboardBackdrop : Control

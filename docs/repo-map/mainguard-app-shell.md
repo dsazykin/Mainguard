@@ -6,8 +6,25 @@
 - **`ShellEntryPoint.cs`** (shell) — the shared entry-point plumbing both heads call: the
   interactive-rebase editor argv shims (`--rebase-editor` writes the todo list, `--rebase-msg`
   supplies the reword/squash message keyed by original SHA — `TryHandleShim` runs + returns *before*
-  Avalonia starts, don't reorder), the single-instance guard, and `BuildAvaloniaApp`.
+  Avalonia starts, don't reorder), the single-instance guard, `CrashGuard.Install` (via `AfterSetup`),
+  and `BuildAvaloniaApp`.
   `TryHandleShim` hands back an **exit code** the head must assign to `Environment.ExitCode`.
+- **`CrashGuard.cs`** (shell) — the app-wide unhandled-exception net, installed by `RunDesktop` (via
+  `AppBuilder.AfterSetup`, so the Dispatcher exists) for BOTH heads. `Dispatcher.UIThread.UnhandledException`
+  is the one that matters: an exception escaping a dispatcher job — a `Dispatcher.UIThread.Post` callback,
+  or the `async void` rethrow `[RelayCommand]`'s `AsyncRelayCommand` performs on a faulted command body —
+  has no frame below it to catch it, so .NET calls `abort()` and the whole GUI dies (ISSUES-LOG #12: clicking
+  Coordinator → Restart took the client down with SIGABRT mid-`SpawnAgent`). It marks such exceptions handled,
+  appends the full exception to **`<data root>/logs/client-crash.log`** (the client had NO file log before —
+  the only evidence a crash left was an unsymbolicated native stack) and raises a shell toast. Also records
+  `AppDomain.UnhandledException` (can't be handled, but can be diagnosed) and observes
+  `TaskScheduler.UnobservedTaskException`. A net, not a licence: commands that can fail still catch their own
+  failures and render them in context.
+- **`SingleInstanceGuard.cs`** (shell) — the cross-platform single-instance guard behind
+  `RunDesktop`: the named mutex on Windows, an exclusive flock on `<data root>/app.lock` on Unix
+  (a named mutex does not exclude across processes on macOS — two instances both "won"
+  on-device). Either form is released by the kernel when the holder dies, so a crash never
+  wedges the next launch.
 - **`RebaseEditorShim.cs`** (shell) — the shim's actual work, split out so it is testable.
   **The exit code is the contract with git**: git reads 0 from `GIT_SEQUENCE_EDITOR` as "the editor
   wrote your todo" and otherwise proceeds with its own default todo — a plain `pick` of every commit —
@@ -281,7 +298,17 @@
       the live session (full CLI + sandbox teardown). A **connect watchdog** (`CoordinatorConnectTimeout`,
       45 s, test-shortenable) flips `CoordinatorConnectTimedOut` when connecting overstays with no first
       frame and no death — the loader stops pretending and points at Stop instead of spinning forever (it
-      never auto-kills — a real first-launch sandbox build can be slow). And the honest dead-coordinator
+      never auto-kills — a real first-launch sandbox build can be slow). **ISSUES-LOG #23** splits that
+      stalled card in two on `CoordinatorHasStarted`, which is read off the coordinator's CURRENT
+      lifecycle state rather than off a first-frame EVENT: a coordinator adopted across a daemon restart
+      is already `Working` the first time the projection sees it, has no transition left to fire, and its
+      terminal can never draw again (its PTY died with the daemon that owned it) — so it used to sit on
+      "Still starting the coordinator" forever. A started coordinator now gets the honest
+      "running — its terminal isn't attached" card with **Restart** on it, and a running session's
+      `Detail` (e.g. the reconciler's adoption line) is no longer rendered as launch progress nor allowed
+      to buy the watchdog's 20-minute working budget. Restart itself no longer degrades into a silent
+      Stop when nothing is picked in the (hidden-while-live) CLI picker: it falls back to the installed
+      CLI, and says why when there is none. And the honest dead-coordinator
       card (`IsCoordinatorDead` — the newest coordinator-role session reached a terminal state: says it
       ended, keeps its terminal open for the replay — `ShowCoordinatorTerminal` stays true (the daemon
       retains the bound session's replay — the CLI's final output is the why), and un-gates the start card
@@ -334,6 +361,10 @@
       `AgentDocumentView` (terminal tail + plan tree + health strip + flagged-gate review section +
       composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table; its trimmed Detail column
       carries a full-value tooltip — a blocked host you cannot read is a blocked host you cannot act on),
+      `QueueSeedingPanelView` (the DEV-ONLY seeding card under the telemetry card in the right rail —
+      warning-hued "dev" pill, state/flavor/count pickers, hold + verify-fails, the preset buttons and
+      the DangerQuiet Clear; the hosting `Border` in `ControlCenterView` is `IsVisible`-bound to
+      `QueueSeeding` not-null, so a daemon without the seeding boot flag never shows a trace of it),
       `ResourceMonitorView` (the
       Resources **tab** — task-manager style: totals header + CPU history decomposing into one live row
       per agent (CPU/RAM/spend/state/task, stable order so an open context menu never gets yanked),
@@ -345,7 +376,11 @@
       (the repositories tree, moved out of MainWindow's docked sidebar 2026-07-11 so the workspace runs
       full-width: shares `MainWindowViewModel` as DataContext, carries the Repository/WorkspaceCategory
       templates, drag-to-categorize, rename/delete keys, and the delete-confirmation overlay; opened via
-      `OpenRepoPickerCommand`, single instance, double-click opens the repo and closes the picker — the
+      `OpenRepoPickerCommand`, single instance, double-click opens the repo and closes the picker. Each
+      row's surface is `Controls/RepoRow`, so Enter/Space and UI Automation `Invoke` open it too (W2 —
+      the rows previously exposed no activation path to the keyboard or to assistive tech at all); the
+      row is `AutomationProperties.Name`d from `DisplayName` and shows the hover wash on `:focus-within`
+      so a Tab-focused row is visible. The
       title-bar hamburger used to open this directly, but it is now a pure compact/expand toggle
       (`ToggleToolbarCommand`/`IsToolbarExpanded`, persisted as `UserPreferences.ToolbarExpanded`) and
       **Select Repo** is one of the four items — Select Repo / Close Repository / Settings / Exit — the
@@ -421,7 +456,9 @@
   so unpinning a host destination removes it from the sidebar immediately), `GeneralSettingsViewModel`
   (new Settings **General** page — Theme / Layout / Agent-prompting / Close-to-tray / Stop-VM-on-exit
   / the pinned-sidebar-icon rows above, all absorbed from the old File-menu dropdown submenus into one
-  page), `ISettingsPage` (`Mainguard.UI.ViewModels` — the minimal `OnActivated()`/`OnDeactivated()`
+  page; the theme picker is data-driven off `ThemeManager.Themes` + the System pseudo-row via
+  `SettingsThemeRowViewModel` — key/display-name/`IsSelected`, refreshed against the persisted choice
+  on every pick, so the lineup lives only in `ThemeManager` and the active choice is marked), `ISettingsPage` (`Mainguard.UI.ViewModels` — the minimal `OnActivated()`/`OnDeactivated()`
   interface, same weight class as `IShellRailHost`, that every Settings page's ViewModel implements so
   `SettingsViewModel`'s page-switch logic can notify it), `VersionsViewModel` (promoted from the old
   small Settings dialog's read-only About/versions footer card into its own Settings **About** page
@@ -566,8 +603,13 @@
     control center flips them; the shell hosts it as opaque `AgentRailContent` → `AgentRailView` via
     ViewLocator, so the shell names no Pro rail type), `QueueRailViewModel`/`QueueEntryViewModel` (the
     rail projection over `IMergeQueueService` — **the merge-queue surface the shipped Control Center
-    actually hosts**: state words, `CanMerge` gate line, the one Review accent on the front-most fresh
-    Verified entry, and the per-row **`VerifyCommand`** — the human verification trigger. The command is
+    actually hosts**: state words, `CanMerge` gate line, the header `CountText` ("N in play · N in
+    history") that keeps a row scrolled below the fold from reading as a row that vanished (ISSUES-LOG
+    #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
+    `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
+    non-accent `ShowSecondaryReview` button on every other reviewable row (the cockpit is the only
+    home of the Merge button, so a verified branch without a Review path is unmergeable), and the
+    per-row **`VerifyCommand`** — the human verification trigger. The command is
     deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
     (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
     daemon's `MergeQueue.RunVerificationAsync` and the new state arrives back on the queue stream.
@@ -590,7 +632,7 @@
     `MergeQueueViewModel`/`MergeQueueRowViewModel` (P2-10: the rail bound to the **real** `MergeQueue`
     state machine — subscribes to its `Changed` event, per-row state word + `main@sha` label +
     `CanMerge`-gated Merge button with the reason as tooltip + the loud stale-override behind a confirm;
-    design tokens/five themes; render-harness-driven, not yet mounted on MainWindow),
+    design tokens/registered themes; render-harness-driven, not yet mounted on MainWindow),
     `ReviewCockpitViewModel` +
     `ReviewFileRowViewModel`/`ReviewHunkRowViewModel`/`FlaggedChangesPanelViewModel`/`FlaggedItemRowViewModel`
     (P2-11: composes the pure-Core rules into the cockpit — `ReviewCockpitContext` inputs → risk-ordered
@@ -630,12 +672,23 @@
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
     Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
+    `QueueSeedingPanelViewModel` (the DEV-ONLY seeding card, docs/design/queue-seeding.md §6-7 — a thin
+    driver over `IQueueSeedingGateway` whose scenario presets are CLIENT-side compositions of the RPC
+    primitives ("Stale pair" is literally two specs in one ordered batch; "Merge during verify" holds
+    one entry mid-run while a sibling's real merge fires the real cascade); refusals render the
+    daemon's words verbatim; `ControlCenterViewModel.QueueSeeding` stays null — card absent, not
+    disabled — unless the daemon's one-shot `ProbeQueueSeedingAsync` availability probe answered yes,
+    which a daemon without the boot flag never does),
     `VibeModeViewModel`/`VibeCardViewModel` (P3-02/03/04: the event→friendly-card translation, the
     three-action triage with the honest disabled state, publish → live-URL card).
   - `ApiKeySettingsViewModel`/`ApiKeyProviderRowViewModel` (P2-01: validate-then-store off the UI thread
     with cancellation on page close, keyed `llm_<provider>`, candidate key nulled after every check,
     per-provider delete; injectable keystore/health-check/db seams; now the Settings **AI Providers**
-    page — `ApiKeySettingsViewModel` implements `ISettingsPage`) and `CliOAuthTosDialogViewModel`
+    page — `ApiKeySettingsViewModel` implements `ISettingsPage`. Its **Custom key** section stores any
+    env-var name under `llm_env_<NAME>` with no health check, and its confirmation names the ONE
+    exception to "injected into every agent you start" — a jail running an external pull request's code
+    is spawned `withoutHostCredentials` and inherits none of them, ISSUES-LOG #37) and
+    `CliOAuthTosDialogViewModel`
     (writes the persisted `TosAcknowledgment` on acknowledge).
   - `TerminalViewModel` (P2-03) wires the engine (`ITerminalView`) to the daemon stream
     (`ITerminalGateway`): forwards engine keystrokes (incl. Ctrl+C→0x03) to the daemon, feeds daemon
@@ -713,7 +766,15 @@
     pipeline is idempotent — it used to be hosted directly by the standalone `AddReposToOsView` window,
     now it is wrapped by `MainguardOsPageViewModel`, the Settings **Mainguard OS** page, which
     additionally cancels an in-flight copy on `ISettingsPage.OnDeactivated` and adds
-    `RebuildSandboxImagesCommand`), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
+    `RebuildSandboxImagesCommand`), `MacOobeViewModel` + `Views/MacOobeWindow` (the macos-host
+    first-run: sequential retryable checks — Docker engine via `DockerEndpointResolver` + a live
+    version ping, the ~/mainguard file-sharing canary run in a throwaway container, jail-image
+    probe/build through the shared installer in the background, daemon start + pinned-mTLS
+    answer — then the agent-CLI picker over the container install host and the start-at-login
+    launchd toggle; Continue gates only on engine + daemon, marks `MacOobeState` completed and
+    hands off to the SAME startup-window path the control-center route takes.
+    `ProDesktopHost.DecideLaunchRoute` routes macOS by the completed marker, and the keep-alive /
+    resume-task-sweep Windows machinery no-ops there), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
     Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
     subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
     gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from
@@ -754,7 +815,15 @@
   - `CheckerboardBackdrop.cs` — the token-drawn transparency checkerboard behind both image stages
     (alternating `SurfaceDeep`/`SurfaceCard`, resolved at render time + re-resolved on
     `ThemeManager.ThemeChanged`), so transparent pixels are distinguishable from surface-coloured ones
-    in all five themes.
+    in every theme.
+  - `RepoRow.cs` (W2) — the repo picker's repository-row surface: a `Grid` subclass that adds the
+    activation path the raw-pointer-handler row never had. `Activate()` raises the `Activated` routed
+    event, reached from Enter/Space (the row is `Focusable`, so it is also a tab stop) and from
+    `RepoRowAutomationPeer` — a `ControlAutomationPeer` reporting `AutomationControlType.ListItem` and
+    implementing `IInvokeProvider`, so UI Automation and screen readers can open a repository.
+    Deliberately NOT a `Button` wrapper: a Button would swallow the pointer press that
+    `RepoPickerWindow`'s select-then-drag gesture depends on. `RepoPickerAccessibilityTests` pins both
+    the Invoke and the Enter paths.
   - `TerminalControl.cs` + `VtScreen.cs` (P2-03) — the interim terminal engine behind `ITerminalView`:
     `VtScreen` is a pure, Avalonia-free VT parser + cell grid (SGR colour, cursor motion, erase,
     10k-line circular scrollback, OSC 52 clipboard-copy decode → `ClipboardCopyRequested` — queries
@@ -762,7 +831,18 @@
     monospace cell renderer over it (dirty-flag invalidation, key→VT byte mapping incl. Ctrl+C→0x03,
     host-clipboard bridge: OSC 52 → clipboard, Ctrl(+Shift)+V / Shift+Insert paste → CR-normalized,
     bracket-wrapped bytes toward the PTY, terminal palette from
-    `TerminalBackground`/`TerminalForeground`/`TerminalCursor`/`TerminalAnsi0-15` theme tokens). The
+    `TerminalBackground`/`TerminalForeground`/`TerminalCursor`/`TerminalAnsi0-15` theme tokens, and
+    **wheel-scroll through the scrollback ring** — the 10k-line buffer always existed but the control
+    never rendered it, so the terminal looked unscrollable (user-reported in the live cycle test):
+    3 lines/notch via `VtScreen.ScrollbackLine` cells, cursor hidden while scrolled (the honest
+    "you are viewing history" signal), any keystroke snaps back to live). **Geometry deferral
+    (ISSUES-LOG #22):** the control constructs its `VtScreen` with `awaitGeometry: true`, so the
+    engine HOLDS fed bytes (bounded 2 MB, past which it parses rather than drops) until the first
+    layout pass establishes the real (cols, rows) — `ArrangeOverride` now sizes the engine itself
+    instead of waiting for the ViewModel's ~50 ms debounced round trip. Without it a rehydrated
+    agent's replayed scrollback (which the daemon sends within milliseconds of attach, long before
+    arrange) is parsed at the 80×24 placeholder and, since this engine has no reflow, stays wrapped
+    at 80 columns forever — the garbled restart-resume terminal. The
     renderer is the fallback for the planned vendored `Iciclecreek.Avalonia.Terminal` (see note below).
     **Known field gaps (2026-07-22), deferred to P2-18 by decision — do NOT grow `VtScreen` toward
     conformance:** Ink/Yoga TUIs (claude-code) mis-render — no scroll regions (DECSTBM), insert/delete
@@ -806,6 +886,17 @@
     `BrowserLauncher`: refuses anything that isn't an existing directory, then platform-dispatches
     `explorer.exe`/`open`/`xdg-open`; best-effort, never throws);
   - `PullRequestsViewModel` takes it as its default `_revealInFileExplorer` delegate.
+  - `TerminalLauncher.cs` — the single open-a-folder-in-the-OS-terminal path (same hygiene as the
+    reveal path): macOS `open -a Terminal`, Windows `wt.exe` falling back to `cmd`, Linux
+    `x-terminal-emulator`. Surfaced from the macOS menu bar's Repository menu.
+  - `MacMenuBar.cs` — the macOS top-of-screen menu bar (no-op elsewhere): File / Repository /
+    View / Help built over EXISTING seams — repo actions dispatch through
+    `MainWindowViewModel.InvokeActionByIdCommand` (the same registry the shortcuts and palette
+    use, so availability rules hold), themes through `ThemeManager` keys ("System" included),
+    reveal/terminal through the launchers above. The menu bar follows the KEY window on macOS,
+    so `Attach` is called from MainWindow's ctor and from every `ChromedWindow` via the
+    `ChromedWindow.MenuInstaller` seam; `App.axaml` names the application ("Mainguard") because
+    Avalonia titles the app menu from `Application.Name`, not the bundle.
   - `BrowserOpener.cs` (P2-22 — the App's `IBrowserOpener`, a thin adapter over `BrowserLauncher` so
     `LoopbackOAuthListener` opens the authorize URL through the ONE launcher, no second path).
   - `DeepLinkHandler.cs` (P2-22 — the `mainguard://` entry point: `RegisterProtocolAsync` (per-user
@@ -826,6 +917,16 @@
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
     `raw` frame; a fake backs the ViewModel tests.
+  - `AutoDetectScan.cs` — the pure directory walk behind the sidebar's "auto-detect repositories"
+    folder browse, split out of `MainWindowViewModel.ScanAutoDetectFolderAsync` so the walk is
+    unit-pinned (`AutoDetectScanTests`) while the ViewModel keeps only the persistence around it.
+    `Scan(rootPath, isGitRepository)` → `AutoDetectedRepo(Path, DisplayName, CategoryName?)`: the
+    chosen root when the root is ITSELF a repository, otherwise its immediate subdirectories plus one
+    grouping level down (the grouping folder's name becomes the workspace category); unreadable
+    directories are skipped, never thrown. The root-is-a-repository case is a correctness requirement,
+    not a convenience — walking a repository's own children used to add its `.git` directory as a
+    repository literally named ".git" (walkthrough bug W3), which `IGitService.IsGitRepository`
+    now independently refuses as well.
   - `SyncRemoteRegistrar.cs` (P2-06) — the small, testable idempotent sync-remote registration helper:
     takes the remote name/URL **verbatim from the daemon's `ProvisionRepo` response** (never a hardcoded
     literal) and, via `IGitService`, adds it / updates a changed URL / no-ops when unchanged.
@@ -845,6 +946,13 @@
     factory shape as `CreateTerminalGateway`; reached from `ControlCenterViewModel`'s
     `OpenEgressAllowlistCommand` — the coordinator toolbar's "Network…" button and the egress block
     prompt's "Manage allowlist…").
+  - `IQueueSeedingGateway.cs` / `DaemonQueueSeedingGateway.cs` (the App's seam to the DEV-ONLY daemon
+    queue seeder — `IsAvailableAsync` (false, never a throw, for UNIMPLEMENTED/PermissionDenied: the
+    unmapped service IS the visibility contract, no capability flag travels) + `SeedAsync`/
+    `PushCommitsAsync`/`ClearAsync` over `SeedEntryRequestItem`/`SeedResultItem`/`SeedBatchResult`,
+    wire vocabulary verbatim. Built via `DaemonBackedOrchestrator.CreateQueueSeedingGateway()` — the
+    same factory shape as the intake/egress gateways — with the repo handle read LIVE so the panel
+    always seeds the repo the rail is showing.)
   - `IPrIntakeGateway.cs` (P2-12: the App's seam to the **daemon-owned** external-PR-intake
     configuration — `LoadAsync`/`SaveAsync`/`SubscribeAsync` over `PrIntakeConfiguration` +
     `PrIntakeSourceItem`. `InMemoryPrIntakeGateway` (which calls `PrIntakeSettings.Normalized` rather
@@ -872,7 +980,10 @@
   - `AgentNotificationService.cs` (P2-13: OS/in-window toast on an agent transition INTO waiting/blocked
     (AwaitingReview/Conflict), suppressed when the app is foregrounded on that agent; first observation
     baselines silently; `IAgentNotifier` seam with the `WindowNotificationManager`-backed default + a
-    fake for tests).
+    fake for tests. NOW WIRED: `ControlCenterViewModel.RefreshAgents` feeds it per reconciled row and
+    `Forget`s removed agents; the shipped notifier is `OsAgentNotifier.cs` — a Notification Center
+    banner via `MacNative` on macOS, the shell toast elsewhere/on failure. `RefreshAttention` also
+    mirrors the attention count onto the macOS Dock badge.)
   - `SpawnProgressWatchdog.cs` (the spawn RPC's deadline, measured from the daemon's **last sign of
     life** rather than from the start of the call. `SpawnAgent` carried a flat 5-minute gRPC deadline; a
     first run builds the repo's ~2.9 GB toolchain image inside that call, so the client hung up on a
@@ -949,8 +1060,9 @@
     used to vanish into an unobserved task and the button read as "nothing happened"): awaits
     `ConfirmMergeAsync`, and turns each outcome into one visible line — the daemon's reason verbatim
     (§3.4) as a warning toast, or `Merged agent/<id> into main.` — never throwing at its caller. It is
-    now the one place for the entry-lifecycle actions too (`DiscardAsync`,
-    `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
+    now the one place for the entry-lifecycle actions too (`DiscardAsync`, `RejectAsync` — the
+    review verdict "no", driven from the cockpit's two-step DangerQuiet Reject with an optional
+    reason box — `ClearStalledVerificationAsync`, `ResumeAsync`), which need the same contract for a sharper reason: the
     daemon answers a REFUSED discard (or resume) with an ordinary successful RPC carrying
     `discarded=false` / `resumed=false`, so "no
     exception" is not evidence anything was removed. `DaemonBackedOrchestrator.DiscardEntryAsync` turns
@@ -1023,9 +1135,14 @@
   here, it is injected at runtime by `ProDesktopHost.InjectProChrome`); `ShellEntryPoint` (the shared
   arg-shim + single-instance guard + `BuildAvaloniaApp` both heads call — the git-editor
   `--rebase-editor` / `--rebase-msg` self-invocation shims); `MainWindow`+`MainWindowViewModel`
-  (repo-provisioning on open reached via the new `IAgentPlatformSurface.ProvisionRepoAsync` seam so
-  the shell never names `DaemonClient`; the ctor takes only the degraded-banner STRING, never the Pro
-  `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
+  (repo-provisioning on open reached via the `IAgentPlatformSurface.ProvisionRepoAsync` seam so
+  the shell never names `DaemonClient` — the seam now returns a `RepoProvisionOutcome` and a FAILED
+  provision is surfaced with an error toast + a bottom-left retry card
+  (`IsAgentProvisionRetryVisible`/`RetryAgentProvisioningCommand`) instead of being swallowed; the
+  Pro implementation clears the previously active repo before provisioning, so a failed/slow
+  provision leaves the merge rail empty rather than pointed at the previously opened repo — pinned
+  by `Mainguard.Tests/RepoProvisioningHonestyTests`; the ctor takes only the degraded-banner STRING,
+  never the Pro `StartupResult`); every git + host-collab `Views/`↔`ViewModels/`, `RepoDashboardViewModel`,
   `Controls/`, `Converters/`; `Editions/ClientManifest`; the Client
   `ClientFirstRunWindow`/`ClientFirstRunViewModel`; `VersionsViewModel` (the daemon/OS-version rows
   come from the `Editions/ShellVersionProbe` Mainguard.UI seam — `null` under Client → honest
@@ -1083,7 +1200,14 @@
   App-side Pro `Services/` moved here too
   (`ProductionStartupEnvironment`/`ProductionShutdownEnvironment`, `LaunchRouter`,
   `EndToEndDaemonHealthProbe`, `SandboxImageInstaller`, `DaemonUpdateToastPublisher`,
-  `AgentNotificationService`, `DockLayoutPersistence`, `DeepLinkHandler`), reseamed to reach the shell
+  `AgentNotificationService`, `DockLayoutPersistence`, `DeepLinkHandler`, and
+  `MacStartupEnvironment` — the macos-host `IAppStartupEnvironment`: "wake the VM" becomes
+  "ensure the local mainguardd runs from the payload" (`MacDaemonController`), tier-1 refresh
+  restarts that process (`MacDaemonUpdater`), tier-2 never offers (no OS to upgrade), and the
+  image probe/build runs against the host engine through `HostCommandRunner`;
+  `ProDesktopHost.CreateStartupWindow` selects it by platform, `DecideLaunchRoute` goes straight
+  to the control center on macOS — the OOBE wizard is the WSL2 provisioning flow — and the VM
+  stop / agent-CLI update-check paths no-op there), reseamed to reach the shell
   only via `ProComposition` (toasts via `ShowShellToast`, settings via `ProComposition.Settings`,
   version via entry assembly). Grants `Mainguard.Tests` `InternalsVisibleTo` (the moved
   `VtScreen`/terminal grid-readback hooks). Referenced by `Mainguard.Pro.App` (the Pro head — the ONLY

@@ -91,10 +91,118 @@ public sealed class QueueEntryLifecycleTests
         Assert.Equal("its agent was stopped weeks ago", record!.Reason);
         Assert.Equal(WorkerMergeState.Working, record.FromState);
 
-        var audited = Assert.Single(audit.Read(), e => e.Type == MergeQueue.DiscardedEvent);
+        // Scoped by repo handle, like every other daemon-DB assertion here: since P2-15 the audit
+        // log is PERSISTED, and the in-proc hosts share one run-scoped daemon DB — an unscoped
+        // Single() would see other tests' discards (the very isolation note on _repoHandle above).
+        var audited = Assert.Single(audit.Read(),
+            e => e.Type == MergeQueue.DiscardedEvent && e.Fields["repo"] == _repoHandle);
         Assert.Equal("stranded", audited.Fields["agent"]);
-        Assert.Equal(_repoHandle, audited.Fields["repo"]);
         Assert.False(string.IsNullOrWhiteSpace(audited.Fields["when"]));
+    }
+
+    // ---- 1b. reject: the review verdict "no", over the real RPC ----------------------------------
+
+    /// <summary>
+    /// A VERIFIED entry rejected over the real RPC lands on the daemon's terminal <c>Rejected</c> (never
+    /// <c>Merged</c>), is attributed to the daemon-derived identity, and the audit event carries the
+    /// reviewer's reason. An entry that was never verified is refused with wording that points at
+    /// Discard — rejecting is a judgment about reviewed work, and there is nothing to review yet.
+    /// </summary>
+    [Fact]
+    public async Task RejectEntry_RejectsAVerifiedEntry_AndRefusesAnUnverifiedOne()
+    {
+        using var host = new DaemonFixture();
+        var audit = host.Services.GetRequiredService<IAuditLog>();
+        var queue = SeedQueue(host, audit);
+        queue.EnsureEntry("reviewed", MergeEntryOrigin.Local);
+        queue.EnsureEntry("unverified", MergeEntryOrigin.Local);
+        await queue.RunVerificationAsync("reviewed", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verified, queue.GetState("reviewed"));
+        var (client, headers) = Client(host);
+
+        var refused = await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = "unverified",
+            Reason = "",
+        }, headers);
+        Assert.False(refused.Rejected);
+        Assert.Contains("only a verified branch", refused.Reason);
+        Assert.Contains("discard", refused.Reason);
+
+        var response = await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = "reviewed",
+            Reason = "wrong approach entirely",
+        }, headers);
+
+        Assert.True(response.Rejected, response.Reason);
+        Assert.False(string.IsNullOrWhiteSpace(response.RejectedBy));
+        Assert.Equal(WorkerMergeState.Rejected, queue.GetState("reviewed"));
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState("reviewed"));
+
+        // The request carries no actor field — the attribution is the daemon's, structurally (SA-1/F2).
+        var fields = RejectEntryRequest.Descriptor.Fields.InDeclarationOrder().Select(f => f.Name).ToArray();
+        Assert.DoesNotContain("actor", fields);
+        Assert.DoesNotContain("rejected_by", fields);
+
+        // Repo-scoped for the same shared-daemon-DB reason as the discard test above.
+        var audited = Assert.Single(audit.Read(),
+            e => e.Type == MergeQueue.RejectedEvent && e.Fields["repo"] == _repoHandle);
+        Assert.Equal("reviewed", audited.Fields["agent"]);
+        Assert.Equal("wrong approach entirely", audited.Fields["reason"]);
+        Assert.Equal(response.RejectedBy, audited.Fields["by"]);
+
+        // Unlike a discard (housekeeping — the row vanishes), a reject is a review VERDICT: the row
+        // stays on the stream as the terminal it reached, so the rail renders "Rejected" rather than
+        // silently losing the record of a branch a human said no to.
+        var after = await SnapshotAsync(client, headers);
+        var row = Assert.Single(after.Entries, e => e.AgentId == "reviewed");
+        Assert.Equal(nameof(WorkerMergeState.Rejected), row.State);
+    }
+
+    /// <summary>
+    /// ISSUES-LOG #13. A rejection the human just made must be the FIRST row of the rail's permanent
+    /// history, not the last.
+    ///
+    /// <para>Terminal rows are kept forever and, before this, rendered in <b>spawn</b> order behind the
+    /// actionable ones — so on a repo with any testing history a branch rejected ten seconds ago came off
+    /// the stream dead last, below the fold of a scrolling panel. Live-clicking that produced a HIGH
+    /// "rejected entries vanish from the merge queue" report against a row that was on screen the whole
+    /// time. The row being merely PRESENT (asserted above) is not enough: the human has to be able to see
+    /// the verdict they just gave, so position is the assertion.</para>
+    /// </summary>
+    [Fact]
+    public async Task RejectEntry_PutsTheFreshVerdictAtTheHeadOfTheRailsHistory_NotBehindOlderTerminalRows()
+    {
+        using var host = new DaemonFixture();
+        var queue = SeedQueue(host, host.Services.GetRequiredService<IAuditLog>());
+        var (client, headers) = Client(host);
+
+        // Spawn order is old → new; the fresh rejection is deliberately the LAST entry created, which is
+        // exactly the position the old ordering buried it in.
+        foreach (var id in new[] { "old-verdict", "newer-verdict" })
+        {
+            queue.EnsureEntry(id, MergeEntryOrigin.Local);
+            await queue.RunVerificationAsync(id, CancellationToken.None);
+            var rejected = await client.RejectEntryAsync(new RejectEntryRequest
+            {
+                RepoHandle = _repoHandle,
+                AgentId = id,
+                Reason = "no",
+            }, headers);
+            Assert.True(rejected.Rejected, rejected.Reason);
+        }
+
+        var after = await SnapshotAsync(client, headers);
+        var order = after.Entries.Select(e => e.AgentId).ToArray();
+
+        // Nothing is dropped: the still-working entry and both verdicts are all on the stream.
+        Assert.Equal(new[] { "merging", "newer-verdict", "old-verdict" }, order);
+        Assert.All(
+            after.Entries.Where(e => e.AgentId.EndsWith("-verdict", StringComparison.Ordinal)),
+            e => Assert.Equal(nameof(WorkerMergeState.Rejected), e.State));
     }
 
     /// <summary>

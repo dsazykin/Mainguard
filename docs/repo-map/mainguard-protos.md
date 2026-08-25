@@ -11,7 +11,12 @@
     shared message cannot be put on the coordinator's denied list), and `ResumeAgentRequest` carries no
     `role`, so a resume structurally cannot mint a coordinator. Like `DiscardEntryRequest` it carries no
     actor either. A refusal is `resumed=false` + a verbatim reason on a successful RPC, never a status
-    code, so "no exception" is not evidence a jail exists; + the PR3 **`ListInstalledAdapters`** —
+    code, so "no exception" is not evidence a jail exists; **`PauseAgent`/`UnpauseAgent`** — the human
+    per-agent pause (docker pause on the jail; NOT containment — no terminal lock, one agent,
+    recoverable): "Unpause" because `ResumeAgent` is the adoption above; a human pause is STICKY (the
+    cascade's yield runs through a frozen jail but never wakes it) and a human unpause DEFERS to an
+    in-flight machine hold with a self-clearing refusal (`HumanPauseLedger`); refusal-as-response, no
+    actor field, both on the coordinator's denied list; + the PR3 **`ListInstalledAdapters`** —
     the installed agent CLIs as `InstalledAdapterInfo{id,version,api_key_env_var}`, env-var NAMES only,
     never values; plus **`GetDaemonInfo`** — the tier-1 skew probe returning `daemon_version` (the
     Mainguard.Server assembly informational version) + `payload_version` (the `/etc/mainguardos-release`
@@ -36,6 +41,11 @@
     (alt-screen/bracketed-paste/DECCKM/mouse+SGR); `ClipboardCopy` — daemon-decoded OSC 52 SETs (queries
     never answered); and the `GetScrollback` RPC — lazy absolute-indexed scrollback pages for
     reattach/recovery/thin clients).
+  - `audit.proto` (P2-15: `AuditService` — `VerifyAudit` (chain + mirror walked daemon-side; head
+    seq/hash; `persistent=false` flags the in-memory fallback journal so a heap verify can never
+    pass as tamper-evidence) and `ReadAudit` (paged decrypted canonical envelopes) — the audit
+    store's first production readers; both RPCs coordinator-denied at the RoleInterceptor, and
+    redaction/retention deliberately have NO RPC).
   - `egress.proto` (`EgressService`: List/Add/RemoveAllowlistHost — the App's only path to the
     daemon-owned default-deny allowlist (ESC-I2); Add re-renders the running proxy live, powering the
     Fix-2 unblock. `agent.proto`'s `StateChange` carries a `reason` (a Dead CLI's exit tail) so the App
@@ -52,12 +62,15 @@
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate; **`DiscardEntry`/`ClearStalledVerification`** are the human
+    unmergeable branch rather than a gate; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
     entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
     takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
-    untouched) and, like `ApprovePlanRequest`, carries **no actor field** — the discarding identity is
-    daemon-derived, because an attribution the client fills in is one any token-holder can forge; both
-    RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.has_live_sandbox`**
+    untouched); `RejectEntry` is the review verdict "no" — terminal `Rejected`, legal only from
+    `Verified`/`AwaitingReview` (an unverified entry is refused toward Discard), and unlike a discard
+    the rejected row STAYS on the queue stream as its terminal so the verdict is never silently lost;
+    both, like `ApprovePlanRequest`, carry **no actor field** — the acting identity is
+    daemon-derived, because an attribution the client fills in is one any token-holder can forge; all
+    three RPCs are on the coordinator's denied list at `RoleInterceptor`. **`QueueEntry.has_live_sandbox`**
     (`optional`) says whether the entry still HAS a jail — the fact that decides whether it is workable at
     all, since verification runs only in the worker's own sandbox — so the rail can offer Resume on a
     stranded row and withhold Verify instead of leaving an enabled button whose only behaviour is an
@@ -78,6 +91,16 @@
     `RoleInterceptor`: subscribing is a provisioning act — it makes the daemon fetch PR heads and ask the
     gated spawn chain for a jail per open bot PR — so an agent able to call it could manufacture queue
     entries and jails, or widen the bot-author list until its own PRs were intake'd),
+    `queueseeding.proto` (**dev-only `QueueSeedingService`** —
+    `SeedQueueEntries`/`PushCommits`/`ClearSeededEntries`/`GetSeedingStatus`, the merge-queue
+    seeding surface of `docs/design/queue-seeding.md`: legitimate entries in any `WorkerMergeState`
+    produced by driving the REAL state-machine methods with synthetic input. Mapped by the daemon
+    ONLY when `MAINGUARD_ENABLE_QUEUE_SEEDING=1` was set at process startup (disabled ⇒
+    `UNIMPLEMENTED`, plus a `SeedingGateInterceptor` prefix-deny as the belt), and every method is
+    on the coordinator's denied list unconditionally. Ids are daemon-assigned `seed-<n>` — the
+    prefix is the clear-scope boundary; no actor fields (daemon-derived identity); refusals are
+    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are RESERVED for
+    the coordinator phase-2/3 plan dimension per the compat contract),
     `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and

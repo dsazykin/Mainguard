@@ -191,7 +191,12 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
         CustomApiKey = string.Empty; // null the candidate immediately (invariant 1)
         CustomEnvVarName = string.Empty;
         IsHealthError = false;
-        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into every agent's environment.";
+        // "every agent" was an overstatement the code never made (ISSUES-LOG #37 held this sentence up
+        // as the contract and it is the one claim here that is not literally true): a jail running an
+        // EXTERNAL pull request's code is spawned withoutHostCredentials and deliberately inherits none
+        // of these — see AgentSpawnService.SpawnAsync. Say the exception rather than let a reader who
+        // checks it conclude the whole feature is broken.
+        HealthMessage = $"Stored {name} (custom keys are stored without provider validation) — it is injected into the environment of every agent you start, except jails running an external pull request's code.";
         RefreshRows();
     }
 
@@ -226,7 +231,12 @@ public partial class ApiKeySettingsViewModel : ViewModelBase, ISettingsPage
 
         IsCliOAuthEnabled = true;
         IsHealthError = false;
-        HealthMessage = "Using your Claude subscription (CLI OAuth). The API-key path stays recommended.";
+        // Honest about what just happened: the acknowledgment is recorded (and the badge shows), but
+        // no spawn path reads this flag — authentication happens in the CLI's own terminal when no
+        // API key is stored, and the harvested login is restored into new jails. This button GATES
+        // nothing; pretending otherwise was the B9 finding.
+        HealthMessage = "Terms acknowledged. Start a coordinator and sign in inside its terminal — "
+            + "the login is saved to your keychain and restored into new jails. The API-key path stays recommended.";
     }
 
     /// <summary>Called by the View when the page closes: cancel any in-flight health check.</summary>

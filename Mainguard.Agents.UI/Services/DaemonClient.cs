@@ -61,6 +61,10 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     private readonly Func<string> _tokenProvider;
     private readonly BackoffPolicy _backoff;
     private GrpcChannel? _channel;
+    // A SEPARATE HTTP/2 connection for StreamQueueAsync — see its doc comment. Its own field/factory
+    // call (not Channel()'s) so it never shares a connection, and therefore a flow-control window, with
+    // the terminal's continuous PTY stream or anything else on the shared channel.
+    private GrpcChannel? _streamChannel;
     private ConnectionState _state = ConnectionState.Down;
 
     public DaemonClient(Func<GrpcChannel> channelFactory, Func<string> tokenProvider, BackoffPolicy? backoff = null)
@@ -284,6 +288,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new ProvisionedRepo(response.RepoHandle, response.SyncRemoteName, response.SyncRemoteUrl);
     }
 
+    /// <summary>Human per-agent pause (docker pause on the jail; refusal-as-response).</summary>
+    public async Task<PauseAgentResponse> PauseAgentAsync(string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.PauseAgentAsync(new PauseAgentRequest { AgentId = agentId }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Human per-agent resume ("unpause" — ResumeAgent is the stranded-entry adoption).</summary>
+    public async Task<UnpauseAgentResponse> UnpauseAgentAsync(string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.UnpauseAgentAsync(new UnpauseAgentRequest { AgentId = agentId }, CallOptions(ct, deadline));
+    }
+
     /// <summary>Stops an agent (authenticated, deadlined). The result carries the CLI login-state
     /// files the daemon harvested from the jail's tmpfs $HOME just before teardown (SECRET contents)
     /// — the caller persists them into the host OS keychain so the login survives the relaunch.</summary>
@@ -484,11 +502,21 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
     // ---- P2-10 merge queue (P2-47 #1) ----
 
     /// <summary>Streams the P2-10 merge-queue snapshot-then-deltas for a repo handle (one attach; the
-    /// caller re-subscribes to reconnect). No wall-clock deadline — long-lived, ended by cancellation.</summary>
+    /// caller re-subscribes to reconnect). No wall-clock deadline — long-lived, ended by cancellation.
+    ///
+    /// <para><b>On its own HTTP/2 connection</b> (<see cref="StreamChannel"/>), not the shared
+    /// <see cref="Channel"/> — field bug, found live 2026-08-20: with a coordinator's terminal attached
+    /// (<c>TerminalService/Attach</c>, a continuous PTY byte stream), a fresh queue entry's push could sit
+    /// unsent for minutes on the shared connection's flow-control window, which the chatty terminal
+    /// stream keeps saturated. The rail's data was correct the entire time — <c>GetQueue()</c> answered
+    /// right away over a fresh connection — only THIS delivery was starved. Reproduced with the terminal
+    /// idling, not even actively printing, so it is the open stream's flow-control reservation, not its
+    /// throughput, that was the problem.</para>
+    /// </summary>
     public async IAsyncEnumerable<QueueUpdate> StreamQueueAsync(
         string repoHandle, [EnumeratorCancellation] CancellationToken ct)
     {
-        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        var client = new MergeQueueService.MergeQueueServiceClient(StreamChannel());
         using var call = client.StreamQueue(new StreamQueueRequest { RepoHandle = repoHandle }, AuthOnly(ct));
         await foreach (var update in call.ResponseStream.ReadAllAsync(ct).ConfigureAwait(false))
         {
@@ -594,6 +622,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Rejects a VERIFIED entry in review (terminal). Same identity discipline as
+    /// <see cref="DiscardEntryAsync"/>: the request carries no actor field — the daemon derives it.</summary>
+    public async Task<RejectEntryResponse> RejectEntryAsync(
+        string repoHandle, string agentId, string reason, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.RejectEntryAsync(new RejectEntryRequest
+        {
+            RepoHandle = repoHandle,
+            AgentId = agentId,
+            Reason = reason ?? string.Empty,
+        }, CallOptions(ct, deadline));
+    }
+
     /// <summary>Clears a <c>Verifying</c> entry with no run behind it, returning it to <c>Working</c>.</summary>
     public async Task<ClearStalledVerificationResponse> ClearStalledVerificationAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
@@ -602,6 +644,45 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return await client.ClearStalledVerificationAsync(
             new ClearStalledVerificationRequest { RepoHandle = repoHandle, AgentId = agentId },
             CallOptions(ct, deadline));
+    }
+
+    // ---- Dev-only queue seeding (docs/design/queue-seeding.md) -----------
+    // A daemon started without MAINGUARD_ENABLE_QUEUE_SEEDING never maps this service, so these
+    // calls answer UNIMPLEMENTED there — which is the dev panel's hide signal, not an error.
+
+    /// <summary>The seeding availability probe + the daemon's enumeration of seeded entries.</summary>
+    public async Task<GetSeedingStatusResponse> GetSeedingStatusAsync(
+        CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.GetSeedingStatusAsync(new GetSeedingStatusRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Seeds one ordered batch of queue entries (per-entry verbatim refusals in the body).</summary>
+    public async Task<SeedQueueEntriesResponse> SeedQueueEntriesAsync(
+        SeedQueueEntriesRequest request, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.SeedQueueEntriesAsync(request, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Appends real commits to a seeded branch and drives the real new-commits invalidation.</summary>
+    public async Task<PushCommitsResponse> PushSeedCommitsAsync(
+        string repoHandle, string agentId, int count, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.PushCommitsAsync(
+            new PushCommitsRequest { RepoHandle = repoHandle, AgentId = agentId, Count = count },
+            CallOptions(ct, deadline));
+    }
+
+    /// <summary>Removes every seeded entry of a repo (structurally seed- scoped daemon-side).</summary>
+    public async Task<ClearSeededEntriesResponse> ClearSeededEntriesAsync(
+        string repoHandle, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new QueueSeedingService.QueueSeedingServiceClient(Channel());
+        return await client.ClearSeededEntriesAsync(
+            new ClearSeededEntriesRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
     }
 
     /// <summary>P2-47 #7: the agent-branch-vs-main diff for the review cockpit, parsed into <see cref="FilePatch"/>
@@ -655,12 +736,15 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return await client.EngageAsync(new EngageKillRequest(), CallOptions(ct, deadline));
     }
 
-    /// <summary>Resumes from a kill: clears the freeze, unpauses agents.</summary>
-    public async Task<bool> ResumeKillAsync(CancellationToken ct, TimeSpan? deadline = null)
+    /// <summary>
+    /// Resumes from a kill: un-pauses every jail the kill switch itself froze, then clears the freeze.
+    /// Returns the whole report — <c>AgentsResumeFailed &gt; 0</c> means those jails are still paused, which
+    /// the caller must not paper over (ISSUES-LOG #17: the release used to clear a flag and nothing else).
+    /// </summary>
+    public async Task<ResumeKillResponse> ResumeKillAsync(CancellationToken ct, TimeSpan? deadline = null)
     {
         var client = new KillSwitchService.KillSwitchServiceClient(Channel());
-        var response = await client.ResumeAsync(new ResumeKillRequest(), CallOptions(ct, deadline));
-        return response.Resumed;
+        return await client.ResumeAsync(new ResumeKillRequest(), CallOptions(ct, deadline));
     }
 
     // ---- P2-08 gateway / telemetry (P2-47 #4) ----
@@ -767,11 +851,17 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
 
     private GrpcChannel Channel() => _channel ??= _channelFactory();
 
+    private GrpcChannel StreamChannel() => _streamChannel ??= _channelFactory();
+
     private void ResetChannel()
     {
         var old = _channel;
         _channel = null;
         old?.Dispose();
+
+        var oldStream = _streamChannel;
+        _streamChannel = null;
+        oldStream?.Dispose();
     }
 
     private Metadata AuthHeaders() => new() { { "authorization", $"bearer {_tokenProvider()}" } };

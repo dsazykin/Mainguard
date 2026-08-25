@@ -13,9 +13,9 @@
     <Product>Mainguard</Product>
     <AssemblyTitle>Mainguard</AssemblyTitle>
     <Company>Mainguard</Company>
-    <Version>0.2.7</Version>
-    <FileVersion>0.2.7.0</FileVersion>
-    <InformationalVersion>0.2.7</InformationalVersion>
+    <Version>0.2.8</Version>
+    <FileVersion>0.2.8.0</FileVersion>
+    <InformationalVersion>0.2.8</InformationalVersion>
     <Copyright>Copyright © Mainguard</Copyright>
   </PropertyGroup>
 
@@ -56,6 +56,11 @@
          daemon from when versions skew (Core DaemonUpdater; resolved at runtime as
          AppContext.BaseDirectory/payload/daemon). Absent locally → warn-only, the auto-updater skips. -->
     <MainguardDaemonPayload Condition="'$(MainguardDaemonPayload)' == ''">$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\build\mainguardos\payload\daemon'))</MainguardDaemonPayload>
+    <!-- The RID the dev daemon payload publishes for — the platform the daemon actually RUNS on:
+         linux-x64 (inside the WSL2 VM) everywhere except macOS, where the macos-host substrate runs
+         mainguardd natively on the host, so the payload must be an osx-arm64 publish. -->
+    <MainguardDaemonRid Condition="'$(MainguardDaemonRid)' == '' and $([MSBuild]::IsOSPlatform('OSX'))">osx-arm64</MainguardDaemonRid>
+    <MainguardDaemonRid Condition="'$(MainguardDaemonRid)' == ''">linux-x64</MainguardDaemonRid>
     <!-- Tier-2 in-place VM upgrade: the payload's release stamp (MAINGUARDOS_VERSION=…) bundled next to the
          tarball as payload/mainguardos-release — the app's EXPECTED payload version. Absent → warn-only. -->
     <MainguardOsReleaseStamp Condition="'$(MainguardOsReleaseStamp)' == ''">$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)..\build\mainguardos\out\mainguardos-release'))</MainguardOsReleaseStamp>
@@ -69,7 +74,11 @@
     <MainguardImageTars Condition="'$(MainguardImageTars)' == ''">$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\build\images'))</MainguardImageTars>
   </PropertyGroup>
 
-  <Target Name="CopyElevatedHelperToOutput" AfterTargets="Build">
+  <!-- The elevated helper and the MainguardOS tarball are the WSL2 substrate's cargo: the macos-host
+       substrate has no VM to import and no UAC hand-off, so the four targets below are skipped on
+       macOS rather than warning on every build about payloads that cannot apply there. -->
+  <Target Name="CopyElevatedHelperToOutput" AfterTargets="Build"
+          Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
     <ItemGroup>
       <_ElevatedHelperFiles Include="$(_ElevatedHelperOutDir)Mainguard.Installer.Elevated.*" />
       <_ElevatedHelperFiles Include="$(_ElevatedHelperOutDir)$(RuntimeIdentifier)\Mainguard.Installer.Elevated.*" Condition="'$(RuntimeIdentifier)' != ''" />
@@ -82,7 +91,8 @@
           Condition="'@(_ElevatedHelperFiles)' != ''" />
   </Target>
 
-  <Target Name="CopyElevatedHelperToPublish" AfterTargets="Publish">
+  <Target Name="CopyElevatedHelperToPublish" AfterTargets="Publish"
+          Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
     <ItemGroup>
       <_ElevatedHelperFiles Include="$(_ElevatedHelperOutDir)Mainguard.Installer.Elevated.*" />
       <_ElevatedHelperFiles Include="$(_ElevatedHelperOutDir)$(RuntimeIdentifier)\Mainguard.Installer.Elevated.*" Condition="'$(RuntimeIdentifier)' != ''" />
@@ -95,7 +105,8 @@
           Condition="'@(_ElevatedHelperFiles)' != ''" />
   </Target>
 
-  <Target Name="BundleMainguardOsPayloadToOutput" AfterTargets="Build">
+  <Target Name="BundleMainguardOsPayloadToOutput" AfterTargets="Build"
+          Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
     <!-- A plain source build stays warning-free; the loud Warning is on Publish (packaging) below. -->
     <Message Importance="high"
              Text="MainguardOS payload not found at '$(MainguardOsPayload)' — building without a bundled VM (first-run import will show the actionable 'payload missing' message). Build it via build/mainguardos/build.sh or set /p:MainguardOsPayload=&lt;path&gt; for a packaged build."
@@ -115,7 +126,8 @@
           Condition="Exists('$(MainguardOsReleaseStamp)')" />
   </Target>
 
-  <Target Name="BundleMainguardOsPayloadToPublish" AfterTargets="Publish">
+  <Target Name="BundleMainguardOsPayloadToPublish" AfterTargets="Publish"
+          Condition="!$([MSBuild]::IsOSPlatform('OSX'))">
     <Warning Text="MainguardOS payload not found at '$(MainguardOsPayload)'; the published app will not be able to import the VM. Set /p:MainguardOsPayload=&lt;path to CI artifact&gt; for the packaged build."
              Condition="!Exists('$(MainguardOsPayload)')" />
     <MakeDir Directories="$(PublishDir)payload" Condition="Exists('$(MainguardOsPayload)')" />
@@ -156,7 +168,7 @@
     <!-- $(MainguardDotnetHost), not a bare `dotnet`: an Exec resolves the command from the CHILD's PATH,
          so this used to fail with MSB3073/127 whenever the SDK lived outside the default location, even
          when the build itself was launched by absolute path. See Directory.Build.props. -->
-    <Exec Command="&quot;$(MainguardDotnetHost)&quot; publish &quot;$(MSBuildThisFileDirectory)..\Mainguard.Server\Mainguard.Server.csproj&quot; -c $(Configuration) -r linux-x64 --self-contained true -p:BuildDaemonPayload=false -o &quot;$(MainguardDaemonPayload.TrimEnd('\'))&quot;" />
+    <Exec Command="&quot;$(MainguardDotnetHost)&quot; publish &quot;$(MSBuildThisFileDirectory)..\Mainguard.Server\Mainguard.Server.csproj&quot; -c $(Configuration) -r $(MainguardDaemonRid) --self-contained true -p:BuildDaemonPayload=false -o &quot;$(MainguardDaemonPayload.TrimEnd('\'))&quot;" />
   </Target>
 
   <Target Name="BundleDaemonPayloadToOutput" AfterTargets="Build">
@@ -266,8 +278,10 @@
     <_ElevatedStageDir>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)..\artifacts\elevated-stage\$(Configuration)'))</_ElevatedStageDir>
   </PropertyGroup>
 
+  <!-- Skipped on macOS with the other elevated-helper targets above: the stage exists to be promoted
+       into %ProgramFiles% at the Windows UAC prompt, which the macos-host substrate never raises. -->
   <Target Name="StageElevatedComponentsToPublish" AfterTargets="Publish"
-          Condition="'$(BuildElevatedStage)' != 'false'">
+          Condition="'$(BuildElevatedStage)' != 'false' and !$([MSBuild]::IsOSPlatform('OSX'))">
     <Message Importance="high"
              Text="Publishing the elevated helper self-contained into '$(_ElevatedStageDir)' so the packaged app can relocate it out of %LocalAppData% (MG-15; /p:BuildElevatedStage=false to skip)…" />
     <!-- $(MainguardDotnetHost), not a bare `dotnet` — same PATH hazard as the daemon-payload publish above. -->

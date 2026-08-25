@@ -48,7 +48,9 @@ public class CloneServiceTests : IDisposable
 
     private string NewTarget()
     {
-        var p = Path.Combine(Path.GetTempPath(), "mainguard-clonetgt-" + Guid.NewGuid().ToString("N"));
+        // CanonicalTempRoot, not Path.GetTempPath(): libgit2 reports the clone's real path,
+        // and the StartsWith(target, result) assertion below needs both in the same namespace.
+        var p = Path.Combine(TempRepoFixture.CanonicalTempRoot, "mainguard-clonetgt-" + Guid.NewGuid().ToString("N"));
         _tempDirs.Add(p);
         return p;
     }

@@ -209,9 +209,21 @@ public sealed class TempRepoFixture : IDisposable
                 $"Fixture: git {string.Join(' ', args)} failed: {p.StandardError.ReadToEnd()}");
     }
 
+    // macOS hands out Path.GetTempPath() behind the /var → /private/var symlink, while git
+    // (and everything else that resolves real paths) reports the /private form. Test temp paths
+    // must start canonical, or every "resolved path starts with the given path" assertion fails
+    // by exactly that prefix. Shared by any test that builds its own temp paths for git to
+    // resolve (e.g. clone targets).
+    internal static string CanonicalTempRoot { get; } =
+        OperatingSystem.IsMacOS()
+            && Path.GetTempPath().StartsWith("/var/", StringComparison.Ordinal)
+            && Directory.Exists("/private" + Path.GetTempPath())
+        ? "/private" + Path.GetTempPath()
+        : Path.GetTempPath();
+
     private string NewTempPath(string prefix)
     {
-        var path = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(CanonicalTempRoot, prefix + Guid.NewGuid().ToString("N"));
         _ownedPaths.Add(path);
         return path;
     }

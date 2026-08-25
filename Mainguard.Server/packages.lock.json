@@ -205,6 +205,11 @@
           "SQLitePCLRaw.core": "3.0.3"
         }
       },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
       "Vanara.Core": {
         "type": "Transitive",
         "resolved": "4.2.1",
@@ -241,7 +246,8 @@
           "DiffPlex": "[1.9.0, )",
           "LibGit2Sharp": "[0.30.0, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[9.0.0, )",
-          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )"
+          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )",
+          "System.Security.Cryptography.Pkcs": "[10.0.10, )"
         }
       },
       "mainguard.protos": {
@@ -270,6 +276,36 @@
         "type": "Transitive",
         "resolved": "3.50.4.5",
         "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      }
+    },
+    "net10.0/osx-arm64": {
+      "LibGit2Sharp.NativeBinaries": {
+        "type": "Transitive",
+        "resolved": "2.0.322",
+        "contentHash": "EWQaEevzc8uS1ZGS6T83jqUPBY//2WUSCHwbZHBoHOjlfSehqr30nm/VAhJPzjam/69sv7nlLKVcho9t2XuR/Q=="
+      },
+      "Porta.Pty": {
+        "type": "Transitive",
+        "resolved": "1.0.7",
+        "contentHash": "ARvF8LQTu9qPK7O+i9Mb0bZPuYTt7tdBhhFdCq3FmghIEasJYN3hHToKX6uWaSI6SEOpe2kmhinV74RzdN6gJg==",
+        "dependencies": {
+          "Vanara.PInvoke.Kernel32": "4.2.1"
+        }
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.50.4.5",
+        "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
       }
     },
     "net10.0/win-x64": {
@@ -290,6 +326,11 @@
         "type": "Transitive",
         "resolved": "3.50.4.5",
         "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
       }
     }
   }

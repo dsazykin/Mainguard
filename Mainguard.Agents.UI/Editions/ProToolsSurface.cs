@@ -24,22 +24,31 @@ public sealed class ProToolsSurface : IProToolsSurface
     // read-only adapters mount — no image rebuild, no re-setup.
     public object CreateAgentClisPage()
     {
-        var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
-        var installer = Mainguard.Agents.Agents.Adapters.AgentCliInstaller.CreateDefault(wsl);
+        // The install host is the substrate seam: in-VM over WSL on Windows, a disposable
+        // agent-base container with the daemon-owned roots mounted at their VM paths on macOS.
+        var host = CreateInstallHost();
+        var installer = Mainguard.Agents.Agents.Adapters.AgentCliInstaller.CreateDefault(host);
         // The updater rides along: rows annotate with newer registry releases + one-step revert.
-        var updater = Mainguard.Agents.Agents.Adapters.AgentCliUpdateService.CreateDefault(wsl);
+        var updater = Mainguard.Agents.Agents.Adapters.AgentCliUpdateService.CreateDefault(host);
         return new AgentCliSettingsViewModel(installer, updater);
     }
+
+    private static Mainguard.Agents.Agents.Adapters.IAdapterInstallHost CreateInstallHost() =>
+        System.OperatingSystem.IsMacOS()
+            ? new Mainguard.Agents.Agents.Adapters.ContainerAdapterInstallHost(
+                Mainguard.Agents.Agents.Adapters.AdapterPaths.DaemonSideRoot(),
+                Mainguard.Agents.Agents.Toolchains.ToolchainPaths.DaemonSideRoot())
+            : new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(
+                new Mainguard.Agents.Agents.Bootstrap.WslRunner());
 
     // Toolchains: the curated language-toolchain channel, over the SAME in-VM install host the agent-CLI
     // channel uses (one way to run a command in the VM, not two). A toolchain installed here lands in the
     // daemon-owned toolchains root and is bind-mounted READ-ONLY into every new jail — no image rebuild.
     public object CreateToolchainsPage()
     {
-        var wsl = new Mainguard.Agents.Agents.Bootstrap.WslRunner();
-        var host = new Mainguard.Agents.Agents.Adapters.WslAdapterInstallHost(wsl);
-        // Same wiring as Wsl2AgentEnvironment's: no payload source, which is how the channel gets the
-        // production HTTPS fetch. This is the page whose Install button reported
+        var host = CreateInstallHost();
+        // Same wiring as the substrates' own channels: no payload source, which is how the channel
+        // gets the production HTTPS fetch. This is the page whose Install button reported
         // "curl: command not found" for the life of the feature — the VM has no curl, so the payload is
         // fetched here and staged into the VM as verified bytes.
         var channel = new Mainguard.Agents.Agents.Toolchains.ToolchainChannel(host);
@@ -56,8 +65,11 @@ public sealed class ProToolsSurface : IProToolsSurface
     }
 
     // Daemon logs (in-depth per-subsystem logging): the read-only "recent daemon logs" surface over
-    // Core's DaemonLogReader (journalctl / tail over the same WSL seam the OOBE health card uses). A
-    // fresh reader every time this page is (re)activated — the page wrapper disposes the previous one.
+    // Core's DaemonLogReader. On WSL it reads journalctl / tail over the same WSL seam the OOBE
+    // health card uses; on macOS the reader branches internally to the daemon's rolling host files
+    // and NEVER touches the runner — the WslRunner below is constructed unconditionally because the
+    // reader requires the seam, but on macOS it is inert by construction, not by luck. A fresh
+    // reader every time this page is (re)activated — the page wrapper disposes the previous one.
     public object CreateDaemonLogsPage()
     {
         var reader = new Mainguard.Agents.Agents.Bootstrap.DaemonLogReader(

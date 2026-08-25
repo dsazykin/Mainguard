@@ -35,7 +35,7 @@ public class ResourceSamplingDockerTests
     [RequiresDockerDaemonFact]
     public async Task Sampler_BusyContainer_ShouldReportRealNonZeroCpuAndMemory()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
 
@@ -107,7 +107,7 @@ public class ResourceSamplingDockerTests
     [RequiresDockerDaemonFact]
     public async Task Sampler_MissingContainer_ShouldReportUnknownNotZero()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(2));
 
         var sampler = new DockerResourceSampler(docker);

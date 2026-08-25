@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Bootstrap;
@@ -8,11 +9,18 @@ using Mainguard.Agents.Agents.Bootstrap;
 namespace Mainguard.Agents.Agents.Adapters;
 
 /// <summary>One agent CLI as offered to the user (OOBE picker / settings), with its live install state.</summary>
+/// <param name="Version">The version this channel would install today (the effective pin).</param>
+/// <param name="IsInstalled">A runnable copy of this CLI answered its health probe — at ANY version,
+/// not necessarily <paramref name="Version"/>. See <see cref="AgentCliInstaller.ListAsync"/>.</param>
+/// <param name="InstalledVersion">The version that probe actually reported, or null when nothing is
+/// installed. Equal to <paramref name="Version"/> in the ordinary case; different when the installed
+/// copy has drifted from the pin this build ships.</param>
 public sealed record AgentCliOption(
     string Id,
     string DisplayName,
     string Version,
-    bool IsInstalled);
+    bool IsInstalled,
+    string? InstalledVersion = null);
 
 /// <summary>The outcome of installing one CLI — never a bare throw at the UI layer.</summary>
 /// <param name="Error">Null on success; otherwise an actionable, user-facing sentence.</param>
@@ -55,8 +63,12 @@ public sealed class AgentCliInstaller
     /// sha256-pins it, so a fresh install is never a stale shipped version; the bundled pins remain
     /// the offline fallback and the user's accepted-update overrides are always honored.</summary>
     public static AgentCliInstaller CreateDefault(IWslRunner wsl)
+        => CreateDefault(new WslAdapterInstallHost(wsl));
+
+    /// <summary>The same composition over any install host — the macos-host substrate passes the
+    /// container-backed host, since its CLIs execute in-jail (linux), never on the macOS host.</summary>
+    public static AgentCliInstaller CreateDefault(IAdapterInstallHost host)
     {
-        var host = new WslAdapterInstallHost(wsl);
         var pins = new FileAdapterPinOverrideStore();
         var channel = new AdapterChannel(new BundledAdapterChannelSource(), host, new FileAdapterManifestCache(),
             pins: pins);
@@ -64,8 +76,23 @@ public sealed class AgentCliInstaller
     }
 
     /// <summary>
-    /// The CLIs on offer, each flagged with whether it is already installed (a version-matched probe
-    /// in the VM — the same check the channel's idempotence uses, so the picker never lies).
+    /// The CLIs on offer, each flagged with whether a runnable copy is installed in the VM and, when
+    /// one is, WHICH version its health probe reported.
+    ///
+    /// <para><b>"Installed" here means installed AT ALL, not installed at today's pin.</b> This used to
+    /// require the probe's stdout to contain the currently-offered version substring — the same check
+    /// <see cref="AdapterChannel"/> uses — and that is the wrong question for a picker. The pin is an
+    /// offline FLOOR, not a ceiling: <see cref="AgentCliUpdateService.EnsureLatestAsync"/> installs the
+    /// registry's current release, and an app update can ship a newer pin than the copy already on
+    /// disk. Either way the installed version stops containing the offered substring, and the picker
+    /// then reported "Not installed" — with an Install button — for a CLI that was at that moment
+    /// running a live coordinator (walkthrough W6: the probe said 2.1.223, the manifest pinned
+    /// 2.1.218). The drift is surfaced separately, off <see cref="AgentCliOption.InstalledVersion"/>,
+    /// as an annotation on an INSTALLED row rather than as an absence.
+    ///
+    /// <para>The channel's own exact-match probes are deliberately untouched: install-idempotence and
+    /// post-install verification ask "are the bytes we just placed the ones we asked for", which is a
+    /// different question and must stay strict.</para></para>
     /// </summary>
     public async Task<IReadOnlyList<AgentCliOption>> ListAsync(CancellationToken ct = default)
     {
@@ -74,9 +101,11 @@ public sealed class AgentCliInstaller
         foreach (var raw in manifest.Adapters)
         {
             var spec = _channel.EffectiveSpec(raw); // an accepted update moves the offered version too
+            var installed = await ProbeInstalledVersionAsync(spec, ct).ConfigureAwait(false);
             options.Add(new AgentCliOption(
                 spec.Id, spec.DisplayName, spec.Version,
-                await IsInstalledAsync(spec, ct).ConfigureAwait(false)));
+                IsInstalled: installed is not null,
+                InstalledVersion: installed));
         }
 
         return options;
@@ -132,21 +161,53 @@ public sealed class AgentCliInstaller
         return outcomes;
     }
 
-    private async Task<bool> IsInstalledAsync(AdapterSpec spec, CancellationToken ct)
+    /// <summary>
+    /// The version a runnable copy of <paramref name="spec"/> reports in the VM, or null when there is
+    /// nothing installed. Two independent conditions, and both are needed to keep the genuinely-absent
+    /// case honest once the pin match is gone:
+    ///
+    /// <para><b>Exit 0.</b> Every health probe in the channel is
+    /// <c>&lt;prefix&gt;/bin/&lt;cli&gt; --version</c>, so a CLI that was never installed exits 127 (no
+    /// such file) and a launcher-only package whose platform executable was never placed exits 1 — that
+    /// placeholder prints "native binary not installed", see <see cref="PlatformBinaryLink"/>. Exit
+    /// status alone already rejects both.</para>
+    ///
+    /// <para><b>A version in stdout.</b> A <c>--version</c> that exits 0 while printing no version at
+    /// all is not a working CLI, so requiring one keeps a degenerate probe from reading as installed —
+    /// and it is what gives the row a real version to show. What the five shipped CLIs actually print:
+    /// <c>2.1.223 (Claude Code)</c>, <c>codex-cli 0.145.0</c>, and a bare <c>0.52.0</c> / <c>0.20.1</c>
+    /// / <c>1.18.4</c>. The first dotted-numeric token covers every one of those shapes without
+    /// assuming the version sits at any particular position in the line.</para>
+    /// </summary>
+    private async Task<string?> ProbeInstalledVersionAsync(AdapterSpec spec, CancellationToken ct)
     {
         if (spec.HealthProbe is null)
-            return false;
+            return null;
         try
         {
             var probe = await _host.RunAsync(spec.HealthProbe.Command, ct).ConfigureAwait(false);
-            return probe.Succeeded
-                && probe.Stdout.Contains(spec.HealthProbe.ExpectedVersionSubstring, StringComparison.Ordinal);
+            return probe.Succeeded ? TryParseVersion(probe.Stdout) : null;
         }
         catch
         {
-            return false; // no VM / no CLI → simply "not installed"; the picker still renders
+            return null; // no VM / no CLI → simply "not installed"; the picker still renders
         }
     }
+
+    /// <summary>The first version-shaped token in a <c>--version</c> line, or null when there is none.</summary>
+    internal static string? TryParseVersion(string? stdout)
+    {
+        if (string.IsNullOrWhiteSpace(stdout))
+            return null;
+        var match = VersionToken.Match(stdout);
+        return match.Success ? match.Value : null;
+    }
+
+    /// <summary><c>major.minor[.patch…][-prerelease|+build]</c> — dotted-NUMERIC, so a CLI name or a
+    /// path sharing the line cannot be mistaken for the version.</summary>
+    private static readonly Regex VersionToken = new(
+        @"\d+\.\d+(?:\.\d+)*(?:[-+][0-9A-Za-z][0-9A-Za-z.\-+]*)?",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     /// <summary>Turns a typed channel refusal into a sentence naming a real cause and a real next step
     /// (every OOBE error must be actionable — an opaque one costs the user a debugging round).</summary>

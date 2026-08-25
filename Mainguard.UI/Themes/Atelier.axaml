@@ -14,6 +14,12 @@
     <SolidColorBrush x:Key="ButtonBg" Color="#272219"/>
     <SolidColorBrush x:Key="BorderHairline" Color="#322D25"/>
 
+    <!-- Outer-chrome indirection (macOS vibrancy, opt-in) — see MidnightLoom for the contract. -->
+    <SolidColorBrush x:Key="ChromeWindowBackground" Color="#171512"/>
+    <SolidColorBrush x:Key="ChromePanelBackground" Color="#1D1A16"/>
+    <SolidColorBrush x:Key="SurfaceWindowVibrant" Color="#CC171512"/>
+    <SolidColorBrush x:Key="SurfacePanelVibrant" Color="#D91D1A16"/>
+
     <!-- Text -->
     <SolidColorBrush x:Key="TextPrimary" Color="#EDE7DB"/>
     <SolidColorBrush x:Key="TextMuted" Color="#9C9284"/>
@@ -27,8 +33,8 @@
     <!-- Semantic -->
     <SolidColorBrush x:Key="SuccessBrush" Color="#8FBC7F"/>
     <SolidColorBrush x:Key="SuccessHover" Color="#A5CC97"/>
-    <SolidColorBrush x:Key="DangerBrush" Color="#E5726A"/>
-    <SolidColorBrush x:Key="DangerHover" Color="#EC8F88"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#D65A4A"/>
+    <SolidColorBrush x:Key="DangerHover" Color="#E06E5E"/>
     <SolidColorBrush x:Key="WarningBrush" Color="#D9B04C"/>
     <SolidColorBrush x:Key="InfoBrush" Color="#6E96BE"/>
 
@@ -38,18 +44,18 @@
     <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#D8A25A"/>
     <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#8FBC7F"/>
     <SolidColorBrush x:Key="AgentStatusStaleBrush" Color="#D9B04C"/>
-    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#AC57A5"/>
-    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#E5726A"/>
+    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#A8799B"/>
+    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#D65A4A"/>
     <SolidColorBrush x:Key="AgentStatusRateLimitedBrush" Color="#D9B04C"/>
-    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#E5726A"/>
+    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#D65A4A"/>
     <SolidColorBrush x:Key="AgentStatusPausedBrush" Color="#9C9284"/>
 
     <!-- Commit-graph lanes -->
     <!-- Lanes decoupled from semantic status tokens (DESIGN.md §2); retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#E4C399"/>
-    <SolidColorBrush x:Key="Lane2" Color="#AC57A5"/>
+    <SolidColorBrush x:Key="Lane1" Color="#DBBC93"/>
+    <SolidColorBrush x:Key="Lane2" Color="#B06A9E"/>
     <SolidColorBrush x:Key="Lane3" Color="#C7E0BF"/>
-    <SolidColorBrush x:Key="Lane4" Color="#3A698E"/>
+    <SolidColorBrush x:Key="Lane4" Color="#40739C"/>
     <SolidColorBrush x:Key="Lane5" Color="#DA9A91"/>
 
     <!-- Diff line backgrounds -->
@@ -57,7 +63,7 @@
     <SolidColorBrush x:Key="DiffRemovedBg" Color="#33201D"/>
     <!-- Intra-line (word-level) emphasis + trailing-whitespace marker (T-13) -->
     <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#668FBC7F"/>
-    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66E5726A"/>
+    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66D65A4A"/>
     <SolidColorBrush x:Key="DiffWhitespaceMarker" Color="#55D9B04C"/>
 
     <!-- Blame age-heat gutter (T-11): recent → BlameAgeNew, old → BlameAgeOld. -->
@@ -69,7 +75,7 @@
          Loom stays readable; the 256-colour cube (16-255) is computed in code. -->
     <SolidColorBrush x:Key="TerminalBackground" Color="#141018"/>
     <SolidColorBrush x:Key="TerminalForeground" Color="#EDE6F2"/>
-    <SolidColorBrush x:Key="TerminalCursor" Color="#C08AF0"/>
+    <SolidColorBrush x:Key="TerminalCursor" Color="#D8A25A"/>
     <SolidColorBrush x:Key="TerminalAnsi0" Color="#000000"/>
     <SolidColorBrush x:Key="TerminalAnsi1" Color="#CD3131"/>
     <SolidColorBrush x:Key="TerminalAnsi2" Color="#2AA745"/>

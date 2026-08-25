@@ -72,7 +72,7 @@ public partial class BlameView : UserControl
 ///
 /// TODO(T-11 human-review): blame-gutter visual polish. The gutter is functionally wired (heat bar,
 /// author/sha/date text, boundary shading, click-to-select, tooltip) but the exact metrics —
-/// column width, font size, heat ramp/contrast across all five themes, tooltip styling, and live
+/// column width, font size, heat ramp/contrast across all themes, tooltip styling, and live
 /// redraw on a theme switch while blame is open — are deliberately left for tomorrow's visual pass.
 /// </summary>
 public sealed class BlameGutterMargin : AbstractMargin
