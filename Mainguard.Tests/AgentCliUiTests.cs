@@ -209,6 +209,104 @@ public class AgentCliUiTests
         Assert.Equal("v2.1.210", vm.Clis.Single(c => c.Id == "claude-code").VersionLabel);
     }
 
+    // ---- installed-but-pin-drifted (walkthrough W6) ---------------------------------------------
+    //
+    // The picker asked the WRONG QUESTION: it required the probe's stdout to contain the currently
+    // OFFERED version substring, i.e. "is the pinned version installed", and rendered anything else as
+    // "Not installed" with an Install button. But the pin is a floor, not a ceiling — EnsureLatestAsync
+    // installs the registry's current release, and an app update can move the pin under an existing
+    // install — so the versions legitimately differ. Live evidence: claude-code probed 2.1.223 while
+    // the bundled manifest pinned 2.1.218, and Settings called it "Not installed" while a coordinator
+    // was actively running on it. The channel's own exact-match probes (idempotence, post-install
+    // verification) are a different question and stay strict.
+
+    [Fact]
+    public async Task Settings_InstalledCliAheadOfThePin_ShouldReadAsInstalled_NotAsMissing()
+    {
+        var fx = new Fixture();
+        fx.Host.PreInstalled.Add("claude-code");
+        fx.Host.ProbeStdout["claude-code"] = "2.1.223 (Claude Code)"; // manifest pins 2.1.210
+        var vm = new AgentCliSettingsViewModel(fx.CreateInstaller());
+
+        await vm.RefreshCommand.ExecuteAsync(null);
+
+        var row = vm.Clis.Single(c => c.Id == "claude-code");
+        Assert.True(row.IsInstalled);
+        Assert.False(row.CanInstall); // no Install button for a CLI that is right there and working
+        // The drift is an ANNOTATION on an installed row, never an absence: the chip names what
+        // actually runs, and the line names both versions so the two can't look contradictory.
+        Assert.Equal("2.1.223", row.InstalledVersion);
+        Assert.Equal("v2.1.223", row.VersionLabel);
+        Assert.True(row.HasVersionDrift);
+        Assert.Contains("Installed", row.InstalledLabel, StringComparison.Ordinal);
+        Assert.Contains("2.1.223", row.InstalledLabel, StringComparison.Ordinal);
+        Assert.Contains("2.1.210", row.InstalledLabel, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Settings_InstalledCliAtThePin_ShouldNotClaimDrift()
+    {
+        var fx = new Fixture();
+        fx.Host.PreInstalled.Add("claude-code");
+        var vm = new AgentCliSettingsViewModel(fx.CreateInstaller());
+
+        await vm.RefreshCommand.ExecuteAsync(null);
+
+        var row = vm.Clis.Single(c => c.Id == "claude-code");
+        Assert.True(row.IsInstalled);
+        Assert.Equal("2.1.210", row.InstalledVersion);
+        Assert.False(row.HasVersionDrift);
+        Assert.Equal("Installed — verified at the pinned version", row.InstalledLabel);
+    }
+
+    [Fact]
+    public async Task Settings_CliThatWasNeverInstalled_ShouldStillReadAsNotInstalled()
+    {
+        // The half of this that must NOT move: loosening the version match must not loosen the
+        // absence check. Nothing installed → the probe exits non-zero (127 in the VM, no such file).
+        var fx = new Fixture();
+        var vm = new AgentCliSettingsViewModel(fx.CreateInstaller());
+
+        await vm.RefreshCommand.ExecuteAsync(null);
+
+        Assert.All(vm.Clis, row =>
+        {
+            Assert.False(row.IsInstalled);
+            Assert.Null(row.InstalledVersion);
+            Assert.True(row.CanInstall);
+        });
+    }
+
+    [Fact]
+    public async Task Settings_ProbeExitingZeroWithNoVersion_ShouldReadAsNotInstalled()
+    {
+        // The other half: a broken CLI whose --version somehow exits 0 but reports no version is not
+        // an install. This is what stops "probe.Succeeded alone" from being the whole condition — a
+        // launcher whose platform binary was never placed is the real-world shape of this.
+        var fx = new Fixture();
+        fx.Host.PreInstalled.Add("claude-code");
+        fx.Host.ProbeStdout["claude-code"] = "native binary not installed";
+        var vm = new AgentCliSettingsViewModel(fx.CreateInstaller());
+
+        await vm.RefreshCommand.ExecuteAsync(null);
+
+        var row = vm.Clis.Single(c => c.Id == "claude-code");
+        Assert.False(row.IsInstalled);
+        Assert.Null(row.InstalledVersion);
+        Assert.True(row.CanInstall);
+    }
+
+    [Theory]
+    [InlineData("2.1.223 (Claude Code)", "2.1.223")]
+    [InlineData("codex-cli 0.145.0", "0.145.0")]
+    [InlineData("0.52.0\n", "0.52.0")]
+    [InlineData("1.18.4", "1.18.4")]
+    [InlineData("3.0.0-rc.2", "3.0.0-rc.2")]
+    [InlineData("", null)]
+    [InlineData("native binary not installed", null)]
+    public void VersionToken_ShouldMatchWhatTheShippedProbesActuallyPrint(string stdout, string? expected)
+        => Assert.Equal(expected, AgentCliInstaller.TryParseVersion(stdout));
+
     [Fact]
     public async Task Settings_InstallOne_ShouldInstallOnlyThatCli()
     {
@@ -456,6 +554,12 @@ public class AgentCliUiTests
             ["codex"] = "0.144.4",
         };
 
+        /// <summary>What an installed CLI's <c>--version</c> prints, overriding <see cref="Versions"/>.
+        /// Lets a test stand up the real-world cases the pinned default cannot: an installed copy whose
+        /// version has DRIFTED from the manifest pin, and a degenerate probe that exits 0 while naming
+        /// no version at all.</summary>
+        public readonly Dictionary<string, string> ProbeStdout = new();
+
         public async Task<AdapterCommandResult> RunAsync(IReadOnlyList<string> command, CancellationToken ct)
         {
             // Probe: "/bin/<id> --version".
@@ -464,7 +568,8 @@ public class AgentCliUiTests
                 var id = command[0][(command[0].LastIndexOf('/') + 1)..];
                 var isUp = PreInstalled.Contains(id) || Installed.Contains(id);
                 return isUp
-                    ? new AdapterCommandResult(0, Versions[id], "")
+                    ? new AdapterCommandResult(
+                        0, ProbeStdout.TryGetValue(id, out var stdout) ? stdout : Versions[id], "")
                     : new AdapterCommandResult(1, "", "not installed");
             }
 

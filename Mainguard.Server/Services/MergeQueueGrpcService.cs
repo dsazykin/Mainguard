@@ -28,14 +28,20 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     private readonly IMergeBranchDiffService _mergeDiff;
     private readonly Mainguard.Server.Auth.IApproverIdentityResolver _identity;
     private readonly Mainguard.Server.Runtime.AgentSessionStore _sessions;
+
+    /// <summary>The queue provisioner, for the post-confirm mirror-main refresh. Optional (null in
+    /// the slimmest unit fixtures): without one the mirror simply catches up at the next provision.</summary>
+    private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? _queues;
     private readonly ILogger _log;
 
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
         Mainguard.Server.Auth.IApproverIdentityResolver identity,
         Mainguard.Server.Runtime.AgentSessionStore sessions,
-        ILoggerFactory loggerFactory)
+        ILoggerFactory loggerFactory,
+        Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? queues = null)
     {
+        _queues = queues;
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
         _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
@@ -261,6 +267,18 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
         _log.LogInformation("ConfirmMerge repo={Repo} agent={Agent} newMainSha={Sha}",
             request.RepoHandle, request.AgentId, request.NewMainSha);
+
+        // Pull the mirror's main forward NOW rather than at the next repo-open: a spawn in the gap
+        // would base its worktree on the pre-merge main, and EnsureQueue's reconcile — which trusts
+        // the mirror — would walk the queue's authoritative main BACKWARDS to it, making every later
+        // verification coherent-but-unmergeable (observed live; the E2E suite never walks this window
+        // because it verifies before merging). Best-effort by design: the merge has landed either way.
+        if (_queues is not null && !_queues.TryRefreshMirrorMainAfterMerge(request.RepoHandle, out var refresh))
+        {
+            _log.LogWarning("ConfirmMerge: mirror main refresh failed repo={Repo}: {Reason}",
+                request.RepoHandle, refresh);
+        }
+
         return Task.FromResult(new ConfirmMergeResponse { Confirmed = true });
     }
 
@@ -381,6 +399,57 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     }
 
     /// <summary>
+    /// The review verdict "no" — the human judged a verified branch's work and rejected it (terminal).
+    /// Mirrors <see cref="DiscardEntry"/> exactly: daemon-derived actor (no actor field on the request),
+    /// refusal-as-response, refused while this entry holds the outstanding merge lease, NOT gated by
+    /// the kill switch (freezing merges is not a reason to forbid a review verdict). The state rules —
+    /// only Verified/AwaitingReview can be rejected — live in <c>MergeQueue.TryReject</c>.
+    /// </summary>
+    public override Task<RejectEntryResponse> RejectEntry(RejectEntryRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        var ctx = Resolve(request.RepoHandle);
+
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is not null && string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            const string held =
+                "a merge is in progress for this entry — finish or abandon it before rejecting";
+            _log.LogWarning("RejectEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, held);
+            return Task.FromResult(new RejectEntryResponse { Rejected = false, Reason = held });
+        }
+
+        // SA-1/F2: the actor comes from the connection, never from the message.
+        var actor = _identity.Resolve(context);
+        var when = DateTimeOffset.UtcNow;
+
+        if (!ctx.Queue.TryReject(request.AgentId, actor, request.Reason ?? string.Empty, out var refusal))
+        {
+            _log.LogWarning("RejectEntry refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, refusal);
+            return Task.FromResult(new RejectEntryResponse { Rejected = false, Reason = refusal });
+        }
+
+        _log.LogInformation(
+            "RejectEntry repo={Repo} agent={Agent} by={By} reason={Reason}",
+            request.RepoHandle, request.AgentId, actor,
+            string.IsNullOrWhiteSpace(request.Reason) ? "(none given)" : request.Reason);
+
+        return Task.FromResult(new RejectEntryResponse
+        {
+            Rejected = true,
+            Reason = "",
+            RejectedBy = actor,
+            RejectedAt = when.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        });
+    }
+
+    /// <summary>
     /// Clears a <c>Verifying</c> state with no run behind it (see the RPC comment in the proto). The
     /// "is anything actually running" question is only answerable here — the in-flight set is daemon
     /// memory — so both the decision and the refusal live daemon-side.
@@ -459,7 +528,8 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     {
         var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
-        foreach (var agentId in queue.Agents)
+        var orderedAgentIds = OrderForDisplay(queue.Agents, queue.GetState, queue.LastChangedAt);
+        foreach (var agentId in orderedAgentIds)
         {
             var can = queue.CanMerge(agentId, out var reason);
             var entry = new QueueEntry
@@ -477,9 +547,17 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 // a fact no client can derive. Keyed on (repo, agent) — an id is unique per repo and not
                 // globally, and answering from another repo's live `pr-7` would report a stranded entry
                 // as healthy, which is the precise failure that keeps it stranded.
-                HasLiveSandbox = _sessions.Find(
-                    new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
-                    ?.ContainerId is { Length: > 0 },
+                //
+                // ISSUES-LOG #24: the RECONCILED answer wins when there is one. The session store alone was
+                // wrong in both directions and stayed wrong — it is memory-only, so after a daemon restart
+                // every surviving entry read as jail-less until something re-spawned it; and a session the
+                // reconciler has marked Unresponsive keeps its container id, so a dead agent went on
+                // reporting a live sandbox and went on offering Verify. MergeQueue.ReconcileJails measures
+                // this against Docker every 30s and answers null only until its first pass, which is what
+                // the store is still consulted for.
+                HasLiveSandbox = queue.HasLiveJail(agentId)
+                    ?? (_sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
+                        ?.ContainerId is { Length: > 0 }),
             };
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));
@@ -488,6 +566,55 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
 
         return update;
     }
+
+    /// <summary>
+    /// The rail's display order. <c>MergeQueue.Agents</c> is stable dictionary-insertion order — oldest
+    /// entry first, forever. Merged/Rejected rows are kept as a permanent record (by design — see
+    /// <c>MergeQueue.Agents</c>' own doc comment on Discard), so on a repo with any testing/iteration
+    /// history they accumulate at the FRONT of that order and bury every new, actionable entry at the
+    /// bottom of the rail behind a thin scrollbar with no "N more" cue. Live-clicking this (2026-08-20)
+    /// reproduced exactly the "my spawned agent isn't in the queue" symptom — the entry was there, just
+    /// scrolled out of view. A stable partition (actionable first, terminal last, relative order
+    /// preserved within each) fixes discoverability without changing queue membership or any state
+    /// semantics. <c>internal</c> so it's independently unit-testable without a live queue.
+    ///
+    /// <para><b>Within the terminal group the order is newest decision first</b>, by
+    /// <c>MergeQueue.LastChangedAt</c> — because insertion order is SPAWN order, not decision order. With
+    /// the partition alone, a branch rejected thirty seconds ago renders behind every Merged/Rejected row
+    /// spawned before it, i.e. at the very bottom of a list several viewports tall — and the human who
+    /// just clicked Reject sees the entry disappear off the end of the rail instead of taking its place in
+    /// the history. That was filed as a HIGH "rejected entries vanish from the queue" regression
+    /// (walkthrough 2026-08-20, ISSUES-LOG #13) when nothing had vanished: the row was rendering, 13th of
+    /// 13, below the fold. The actionable group is deliberately NOT re-sorted — it is a work queue, and
+    /// oldest-first is the order work should be picked up in.</para>
+    /// </summary>
+    /// <param name="decidedAt">
+    /// When an entry last transitioned. Optional: <c>null</c> (and a null answer for any single id) keeps
+    /// that entry in its insertion position within its group, so a caller with no clock — and a row
+    /// written by a daemon that predates the field — degrades to the plain stable partition.
+    /// </param>
+    internal static IEnumerable<string> OrderForDisplay(
+        IEnumerable<string> agentIds,
+        Func<string, Mainguard.Agents.Agents.WorkerMergeState> stateOf,
+        Func<string, DateTimeOffset?>? decidedAt = null)
+    {
+        var ordered = agentIds.ToList();
+        var actionable = ordered.Where(id => !IsTerminalForDisplay(stateOf(id)));
+        var terminal = ordered.Where(id => IsTerminalForDisplay(stateOf(id)));
+
+        if (decidedAt is not null)
+        {
+            // Descending by decision time; OrderByDescending is stable, so entries with no timestamp
+            // (all equal at DateTimeOffset.MinValue) keep their relative insertion order at the back.
+            terminal = terminal.OrderByDescending(id => decidedAt(id) ?? DateTimeOffset.MinValue);
+        }
+
+        return actionable.Concat(terminal);
+    }
+
+    private static bool IsTerminalForDisplay(Mainguard.Agents.Agents.WorkerMergeState state)
+        => state is Mainguard.Agents.Agents.WorkerMergeState.Merged
+            or Mainguard.Agents.Agents.WorkerMergeState.Rejected;
 
     /// <summary>
     /// The must-acknowledge items blocking <paramref name="agentId"/>, as the review surface has to render

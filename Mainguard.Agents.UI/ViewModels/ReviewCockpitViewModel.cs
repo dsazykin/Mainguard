@@ -83,6 +83,10 @@ public partial class ReviewCockpitViewModel : ViewModelBase
     private readonly Services.IFlaggedChangeSource? _live;
     private readonly Func<string, CancellationToken, Task>? _bringLocal;
     private readonly Action<string>? _onMerge;
+
+    /// <summary>(agentId, reason) → the reject request; null when the composition has no daemon
+    /// behind it (design harness), in which case the Reject button is not rendered at all.</summary>
+    private readonly Func<string, string, Task>? _onReject;
     private readonly List<ReviewHunkRowViewModel> _flatHunks = new();
 
     public ObservableCollection<ReviewFileRowViewModel> Files { get; } = new();
@@ -136,13 +140,15 @@ public partial class ReviewCockpitViewModel : ViewModelBase
         MergeQueue? queue = null,
         Func<string, CancellationToken, Task>? bringLocal = null,
         Action<string>? onMerge = null,
-        Services.IFlaggedChangeSource? live = null)
+        Services.IFlaggedChangeSource? live = null,
+        Func<string, string, Task>? onReject = null)
     {
         _ctx = ctx ?? throw new ArgumentNullException(nameof(ctx));
         _queue = queue;
         _live = live;
         _bringLocal = bringLocal;
         _onMerge = onMerge;
+        _onReject = onReject;
 
         if (live is not null)
         {
@@ -205,6 +211,14 @@ public partial class ReviewCockpitViewModel : ViewModelBase
                 ? "test command changed on this branch — flagged below"
                 : "command unchanged from main";
             TestDeltaSummary = $"{delta.PassedCurrent} green{newPart} · {delta.FailedCurrent} failed · {cmd}";
+        }
+        else if (_ctx.ChangedTestCommand)
+        {
+            // The wire carries the changed-command FACT (a flagged item) without the run counts —
+            // render the warning alone rather than hiding it behind an absent delta. This is the one
+            // header line a reviewer must not miss: the branch's green was measured by a command the
+            // branch itself rewrote.
+            TestDeltaSummary = "test command changed on this branch — flagged below";
         }
     }
 
@@ -310,6 +324,41 @@ public partial class ReviewCockpitViewModel : ViewModelBase
             await _bringLocal(_ctx.AgentId, ct).ConfigureAwait(false);
         }
     }
+
+    // ---- Reject (the review verdict "no") --------------------------------
+
+    /// <summary>Two-step arm, the rail's Discard convention: the first press arms, the second sends.</summary>
+    [ObservableProperty]
+    private bool _isConfirmingReject;
+
+    /// <summary>The reviewer's optional reason, recorded verbatim by the daemon.</summary>
+    [ObservableProperty]
+    private string _rejectReason = "";
+
+    /// <summary>Whether this cockpit can reject at all — false when no reject handler was composed
+    /// (the design/render harness), so the button never renders as a dead control.</summary>
+    public bool CanReject => _onReject is not null;
+
+    [RelayCommand]
+    private async Task RejectAsync()
+    {
+        if (_onReject is null)
+        {
+            return;
+        }
+
+        if (!IsConfirmingReject)
+        {
+            IsConfirmingReject = true;
+            return;
+        }
+
+        IsConfirmingReject = false;
+        await _onReject(_ctx.AgentId, RejectReason).ConfigureAwait(false);
+    }
+
+    [RelayCommand]
+    private void CancelReject() => IsConfirmingReject = false;
 
     // ---- Review-sprint mode (§3.7) --------------------------------------
 

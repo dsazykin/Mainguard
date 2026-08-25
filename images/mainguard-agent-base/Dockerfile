@@ -48,12 +48,24 @@ RUN groupadd -g 1000 agent      && useradd -u 1000 -g 1000 -m -s /bin/bash agent
 # download the versioned `nix-installer` binary, so it is skipped entirely: the pinned binary is
 # fetched from the version-addressed URL the script itself would have used, its SHA-256 is checked
 # before it is made executable, and only then is it run with exactly the same arguments.
-# Refresh: bump NIX_INSTALLER_VERSION, download the artefact, and paste its `sha256sum`.
+# Refresh: bump NIX_INSTALLER_VERSION, download BOTH arch artefacts, and paste their `sha256sum`s.
+#
+# TARGETARCH (BuildKit-provided: amd64 in CI/the WSL2 VM, arm64 on the macos-host substrate)
+# selects the artefact; each arch carries its OWN pinned SHA-256, verified against the publisher's
+# released checksums. An arch this file has no pin for fails the build loudly — never an
+# unverified fetch.
+ARG TARGETARCH
 ARG NIX_INSTALLER_VERSION=v3.21.8
-ARG NIX_INSTALLER_SHA256=eecf66f62b044f40b0632d8e9ea72ffc3bd3214357d09317117febff748e71b3
-RUN curl --proto '=https' --tlsv1.2 -sSf -L -o /tmp/nix-installer \
-      "https://install.determinate.systems/nix/tag/${NIX_INSTALLER_VERSION}/nix-installer-x86_64-linux" \
-    && echo "${NIX_INSTALLER_SHA256}  /tmp/nix-installer" | sha256sum -c - \
+ARG NIX_INSTALLER_SHA256_AMD64=eecf66f62b044f40b0632d8e9ea72ffc3bd3214357d09317117febff748e71b3
+ARG NIX_INSTALLER_SHA256_ARM64=fa5b3a13dffd70ea8f9575c3d0fe3af4cb2f881dfcb03983634dbe6756d4e39e
+RUN case "${TARGETARCH}" in \
+      amd64) NIX_PLATFORM=x86_64-linux;  NIX_SHA256="${NIX_INSTALLER_SHA256_AMD64}" ;; \
+      arm64) NIX_PLATFORM=aarch64-linux; NIX_SHA256="${NIX_INSTALLER_SHA256_ARM64}" ;; \
+      *) echo "no pinned nix-installer for TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && curl --proto '=https' --tlsv1.2 -sSf -L -o /tmp/nix-installer \
+      "https://install.determinate.systems/nix/tag/${NIX_INSTALLER_VERSION}/nix-installer-${NIX_PLATFORM}" \
+    && echo "${NIX_SHA256}  /tmp/nix-installer" | sha256sum -c - \
     && chmod 0755 /tmp/nix-installer \
     && /tmp/nix-installer install linux --no-confirm --init none \
         --extra-conf "experimental-features = nix-command flakes" \
@@ -72,11 +84,18 @@ ENV PATH=/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 # SHA-256, and unpack it — one pinned, checksummed artefact and no launcher. Verified byte-identical to
 # what the old recipe produced: the extracted binary's sha256 matches the `/usr/local/bin/devbox` in the
 # image built from the previous Dockerfile, so this is a pure provenance change, not a version bump.
-# Refresh: bump DEVBOX_VERSION and paste the release tarball's `sha256sum`.
+# Refresh: bump DEVBOX_VERSION and paste both arch tarballs' `sha256sum`s (the release's
+# checksums.txt carries them). Same TARGETARCH selection discipline as the nix-installer above.
 ARG DEVBOX_VERSION=0.17.5
-ARG DEVBOX_SHA256=eb2d8fb34266ba3befc294d7d6f56e2cd4da2cacb7a0cf52db5b8092575544f8
-RUN curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/devbox.tar.gz \
-      "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/devbox_${DEVBOX_VERSION}_linux_amd64.tar.gz" \
+ARG DEVBOX_SHA256_AMD64=eb2d8fb34266ba3befc294d7d6f56e2cd4da2cacb7a0cf52db5b8092575544f8
+ARG DEVBOX_SHA256_ARM64=880901fff1ce7bf48086c12d84535bc14c257b56cb0d05e93e037f2cb1b1d529
+RUN case "${TARGETARCH}" in \
+      amd64) DEVBOX_ARCH=amd64; DEVBOX_SHA256="${DEVBOX_SHA256_AMD64}" ;; \
+      arm64) DEVBOX_ARCH=arm64; DEVBOX_SHA256="${DEVBOX_SHA256_ARM64}" ;; \
+      *) echo "no pinned devbox for TARGETARCH '${TARGETARCH}'" >&2; exit 1 ;; \
+    esac \
+    && curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/devbox.tar.gz \
+      "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_VERSION}/devbox_${DEVBOX_VERSION}_linux_${DEVBOX_ARCH}.tar.gz" \
     && echo "${DEVBOX_SHA256}  /tmp/devbox.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox \
     && chmod 0755 /usr/local/bin/devbox \

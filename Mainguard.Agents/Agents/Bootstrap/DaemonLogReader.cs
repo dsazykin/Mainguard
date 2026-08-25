@@ -27,10 +27,15 @@ public sealed class DaemonLogReader
 
     public DaemonLogReader(IWslRunner wsl) => _wsl = wsl ?? throw new ArgumentNullException(nameof(wsl));
 
-    /// <summary>The unified daemon journal tail (every subsystem interleaved), oldest→newest.</summary>
+    /// <summary>The unified daemon journal tail (every subsystem interleaved), oldest→newest.
+    /// macos-host has no journal — the daemon is a host process writing rolling files under the
+    /// data root — so the unified view merges every subsystem file's tail by the ISO timestamp
+    /// each line starts with (lexicographic == chronological for that format).</summary>
     public Task<string> ReadRecentAsync(int lines, CancellationToken ct = default) =>
-        RunAsync(WslCommands.InDistroAsRoot(
-            "journalctl", "-u", "mainguardd", "--no-pager", "-n", Clamp(lines).ToString(), "-o", "cat"), ct);
+        OperatingSystem.IsMacOS()
+            ? Task.FromResult(ReadMacUnified(Clamp(lines)))
+            : RunAsync(WslCommands.InDistroAsRoot(
+                "journalctl", "-u", "mainguardd", "--no-pager", "-n", Clamp(lines).ToString(), "-o", "cat"), ct);
 
     /// <summary>One subsystem's rolling file tail (e.g. <c>spawn.log</c>), oldest→newest.</summary>
     public Task<string> ReadSubsystemAsync(string subsystem, int lines, CancellationToken ct = default)
@@ -38,8 +43,67 @@ public sealed class DaemonLogReader
         if (string.IsNullOrWhiteSpace(subsystem))
             return Task.FromResult(string.Empty);
 
+        if (OperatingSystem.IsMacOS())
+        {
+            return Task.FromResult(ReadMacFileTail(
+                System.IO.Path.Combine(MacLogsDir(), SanitizeSubsystem(subsystem) + ".log"), Clamp(lines)));
+        }
+
         var file = $"{VmLogsDir}/{SanitizeSubsystem(subsystem)}.log";
         return RunAsync(WslCommands.InDistroAsRoot("tail", "-n", Clamp(lines).ToString(), file), ct);
+    }
+
+    /// <summary>The macos-host daemon's own logs directory (a host path — same data root).</summary>
+    private static string MacLogsDir() =>
+        System.IO.Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "logs");
+
+    private static string ReadMacUnified(int lines)
+    {
+        try
+        {
+            var dir = MacLogsDir();
+            if (!System.IO.Directory.Exists(dir)) return string.Empty;
+
+            var merged = new List<string>();
+            foreach (var file in System.IO.Directory.EnumerateFiles(dir, "*.log"))
+            {
+                merged.AddRange(TailLines(file, lines));
+            }
+            merged.Sort(StringComparer.Ordinal); // ISO-timestamp-prefixed lines sort chronologically
+            var skip = merged.Count > lines ? merged.Count - lines : 0;
+            return string.Join('\n', merged.GetRange(skip, merged.Count - skip));
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static string ReadMacFileTail(string file, int lines)
+    {
+        try
+        {
+            return System.IO.File.Exists(file) ? string.Join('\n', TailLines(file, lines)) : string.Empty;
+        }
+        catch (Exception)
+        {
+            return string.Empty;
+        }
+    }
+
+    private static List<string> TailLines(string file, int lines)
+    {
+        // Share-tolerant read: the daemon appends to these files while we tail them.
+        using var stream = new System.IO.FileStream(
+            file, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
+        using var reader = new System.IO.StreamReader(stream);
+        var buffer = new Queue<string>(lines);
+        while (reader.ReadLine() is { } line)
+        {
+            if (buffer.Count == lines) buffer.Dequeue();
+            buffer.Enqueue(line);
+        }
+        return new List<string>(buffer);
     }
 
     private async Task<string> RunAsync(IReadOnlyList<string> args, CancellationToken ct)

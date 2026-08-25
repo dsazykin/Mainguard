@@ -17,6 +17,72 @@ namespace Mainguard.Git.Migrations
 #pragma warning disable 612, 618
             modelBuilder.HasAnnotation("ProductVersion", "9.0.0");
 
+            modelBuilder.Entity("Mainguard.Git.Models.AuditAnchorRow", b =>
+                {
+                    b.Property<long>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("AnchoredAtText")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("HeadHash")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<long>("HeadSeq")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("RequestedAtText")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<byte[]>("Token")
+                        .HasColumnType("BLOB");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("HeadSeq")
+                        .IsUnique();
+
+                    b.ToTable("AuditAnchors");
+                });
+
+            modelBuilder.Entity("Mainguard.Git.Models.AuditRecordRow", b =>
+                {
+                    b.Property<long>("Seq")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Hash")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("KeyId")
+                        .HasColumnType("TEXT");
+
+                    b.Property<byte[]>("PayloadCiphertext")
+                        .HasColumnType("BLOB");
+
+                    b.Property<string>("PrevHash")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("Redacted")
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("TimestampText")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Type")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Seq");
+
+                    b.ToTable("AuditRecords");
+                });
+
             modelBuilder.Entity("Mainguard.Git.Models.ExpectedAgent", b =>
                 {
                     b.Property<long>("Id")

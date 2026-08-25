@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package mainguard.v1;
+
+option csharp_namespace = "Mainguard.Protos.V1";
+
+// P2-15: the read/verify surface over the tamper-evident audit chain — the first production READERS
+// of a store that previously had 28 writers and none. Human-facing only: both RPCs are on the
+// coordinator-denied list (RoleInterceptor) — the chain carries other agents' prompts/outputs and
+// plan/merge decisions, none of which is a coordinator's to read. Verification runs daemon-side over
+// the decrypted canonical envelopes; redaction/retention have NO RPC — redaction is a deliberate,
+// local act and retention is the daemon's own job.
+service AuditService {
+  // Walks the whole chain (+ the file-mirror witness): exit contract of `mainguardd audit verify`,
+  // over the wire.
+  rpc VerifyAudit(VerifyAuditRequest) returns (VerifyAuditResponse);
+
+  // Records from from_seq (ascending, at most take). payload_json is the decrypted canonical
+  // envelope {identity, payload, seq, timestamp, type}; a redacted record carries the tombstone.
+  rpc ReadAudit(ReadAuditRequest) returns (ReadAuditResponse);
+}
+
+message VerifyAuditRequest {}
+
+message VerifyAuditResponse {
+  bool valid = 1;
+  // Meaningful only when valid=false (proto3 zero-default would otherwise read as "seq 0 bad").
+  bool has_first_bad_seq = 2;
+  int64 first_bad_seq = 3;
+  int64 head_seq = 4;            // 0 on an empty chain
+  string head_hash = 5;          // genesis constant on an empty chain
+  // False when the daemon is running on the in-memory fallback journal — a verify over a store
+  // that dies with the process is not evidence, and saying so beats pretending.
+  bool persistent = 6;
+}
+
+message ReadAuditRequest {
+  int64 from_seq = 1;
+  int32 take = 2;
+}
+
+message AuditRecordEntry {
+  int64 seq = 1;
+  string timestamp = 2;          // ISO-8601 round-trip ("O"), exactly as hashed
+  string type = 3;
+  string payload_json = 4;
+  string prev_hash = 5;
+  string hash = 6;
+}
+
+message ReadAuditResponse {
+  repeated AuditRecordEntry records = 1;
+  bool persistent = 2;
+}

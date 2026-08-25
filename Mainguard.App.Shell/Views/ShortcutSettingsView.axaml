@@ -3,7 +3,7 @@
         xmlns:vm="using:Mainguard.App.Shell.ViewModels"
         x:Class="Mainguard.App.Shell.Views.ShortcutSettingsView"
         x:DataType="vm:ShortcutSettingsViewModel"
-        FontFamily="{StaticResource FontUi}">
+        FontFamily="{DynamicResource FontUi}">
     <StackPanel Spacing="10" MaxWidth="480">
         <TextBlock Text="Keyboard Shortcuts" FontSize="18" FontWeight="SemiBold"
                    Foreground="{DynamicResource TextPrimary}" />

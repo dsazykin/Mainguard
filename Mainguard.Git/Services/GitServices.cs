@@ -60,6 +60,18 @@ public class GitService : IGitService
             return false;
         }
 
+        // A repository is a WORKING directory, never the `.git` directory itself. libgit2's
+        // Repository.IsValid answers true for both — a raw `<repo>/.git` has exactly the
+        // HEAD/objects/refs signature it looks for — so any directory scan that walks a repo's
+        // children would otherwise register the git internals as a second repository whose folder
+        // name is literally ".git" (walkthrough bug W3). Only the exact name `.git` is rejected:
+        // a bare mirror such as `<hash>.git` (the agent platform's repos root) is a real repository.
+        var leaf = Path.GetFileName(Path.TrimEndingDirectorySeparator(path));
+        if (string.Equals(leaf, ".git", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         try
         {
             return Repository.IsValid(path);
@@ -318,9 +330,9 @@ public class GitService : IGitService
     }
 
     /// <summary>
-    /// Removes a single working-tree file. On Windows the file is sent to the
-    /// Recycle Bin so a mis-clicked discard is recoverable; on other platforms
-    /// (no standard trash API) it falls back to a hard delete.
+    /// Removes a single working-tree file. On Windows it goes to the Recycle Bin and on macOS to
+    /// the Finder Trash (with Put Back), so a mis-clicked discard is recoverable; Linux (no
+    /// standard trash API) falls back to a hard delete.
     /// </summary>
     private static void SafeDeleteFile(string fullPath)
     {
@@ -331,9 +343,42 @@ public class GitService : IGitService
                 Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
                 Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
         }
+        else if (OperatingSystem.IsMacOS() && TryTrashOnMac(fullPath))
+        {
+            // Sent to the Trash — nothing else to do.
+        }
         else
         {
             System.IO.File.Delete(fullPath);
+        }
+    }
+
+    /// <summary>
+    /// macOS ships <c>/usr/bin/trash</c> (Finder-integrated; "Put Back" works). False on any
+    /// failure so the caller's hard delete keeps the discard's contract — the file must be gone
+    /// either way; the Trash is a courtesy, never a silent no-op.
+    /// </summary>
+    private static bool TryTrashOnMac(string fullPath)
+    {
+        try
+        {
+            if (!System.IO.File.Exists("/usr/bin/trash")) return false;
+
+            var psi = new System.Diagnostics.ProcessStartInfo("/usr/bin/trash")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            psi.ArgumentList.Add(fullPath);
+            using var trash = System.Diagnostics.Process.Start(psi);
+            if (trash is null) return false;
+            trash.WaitForExit(10_000);
+            return trash.HasExited && trash.ExitCode == 0 && !System.IO.File.Exists(fullPath);
+        }
+        catch
+        {
+            return false;
         }
     }
 
@@ -1214,9 +1259,15 @@ public class GitService : IGitService
         {
             // No stored token: let git use its own credential helpers / prompts,
             // but never block on an interactive prompt in the GUI.
+            var env = new Dictionary<string, string> { ["GIT_TERMINAL_PROMPT"] = "0" };
+            // Trusts a Windows UNC remote (the WSL2 sync-remote mirror) for this one invocation when
+            // it is the resolved remote — this path is reached whenever a caller lets ResolveRemoteName
+            // pick a remote rather than naming one explicitly (e.g. AutoFetchService), which can land on
+            // the sync remote in a repo where it is the only one configured. See UncRemoteTrust.
+            using var trust = UncRemoteTrust.PrepareTrustFor(repoPath, remoteName, env);
             try
             {
-                RunGitChecked(repoPath, new Dictionary<string, string> { ["GIT_TERMINAL_PROMPT"] = "0" }, args);
+                RunGitChecked(repoPath, env, args);
             }
             catch (AuthenticationRequiredException ex)
             {
@@ -1258,12 +1309,13 @@ public class GitService : IGitService
 
         fullArgs.AddRange(args);
 
-        var env = new Dictionary<string, string>
+        var tokenEnv = new Dictionary<string, string>
         {
             ["MAINGUARD_TOKEN"] = token,
             ["GIT_TERMINAL_PROMPT"] = "0"
         };
-        RunGitChecked(repoPath, env, fullArgs.ToArray());
+        using var tokenTrust = UncRemoteTrust.PrepareTrustFor(repoPath, remoteName, tokenEnv);
+        RunGitChecked(repoPath, tokenEnv, fullArgs.ToArray());
     }
 
     public (int? Ahead, int? Behind) GetAheadBehind(string repoPath)

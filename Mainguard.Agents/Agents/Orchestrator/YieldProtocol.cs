@@ -90,6 +90,26 @@ public sealed class UnboundAgentControlChannel : IAgentControlChannel
         Task.FromResult(false);
 }
 
+/// <summary>
+/// Arbitrates between a HUMAN's sticky per-agent pause and the MACHINE's short pause-for-rebase
+/// (the yield's timeout path). Two rules, one ledger:
+/// <list type="bullet">
+/// <item>a human pause is sticky — the machine may run its critical section through a frozen jail
+/// (already quiescent) but must never wake it on resume;</item>
+/// <item>a human unpause defers to an in-flight machine hold (an honest, self-clearing refusal) so a
+/// click can never break the rebase's pause open mid-write.</item>
+/// </list>
+/// </summary>
+public interface IPauseArbiter
+{
+    /// <summary>True while a human holds this agent paused (checked by the yield at pause AND resume time).</summary>
+    bool IsHumanPaused(string agentId);
+
+    /// <summary>Marks the machine's critical section (pause-rebase-unpause); dispose to release.
+    /// While any hold is outstanding for the agent, a human unpause is refused.</summary>
+    IDisposable HoldForMachine(string agentId);
+}
+
 /// <summary>The cooperative-yield request seam. The single gateway to a mutable worktree.</summary>
 public interface IYieldProtocol
 {
@@ -123,24 +143,31 @@ public sealed class YieldProtocol : IYieldProtocol
     private readonly Func<string, string?> _containerIdFor;
     private readonly IAgentSupervisor _supervisor;
     private readonly TimeSpan _defaultTimeout;
+    private readonly IPauseArbiter? _arbiter;
 
     /// <param name="channelFor">Resolves the dedicated control channel for an agent.</param>
     /// <param name="sandbox">The sandbox engine (pause/unpause on the timeout path).</param>
     /// <param name="containerIdFor">Resolves an agent's live container id (Docker-as-truth); null → no pause possible.</param>
     /// <param name="supervisor">Reflects the yield/pause state in agent metadata (optional).</param>
     /// <param name="defaultTimeout">Overrides the 10 s cooperative window (tests use a short one).</param>
+    /// <param name="arbiter">The human-pause ledger (optional; null = no human pause feature, today's
+    /// exact behavior). With one bound, the timeout path takes a machine hold for its critical
+    /// section, skips the docker-pause when the human already froze the jail, and — decisively — the
+    /// resume re-checks the human flag AT RESUME TIME and leaves a human-paused jail frozen.</param>
     public YieldProtocol(
         Func<string, IAgentControlChannel> channelFor,
         ISandboxEngine sandbox,
         Func<string, string?> containerIdFor,
         IAgentSupervisor? supervisor = null,
-        TimeSpan? defaultTimeout = null)
+        TimeSpan? defaultTimeout = null,
+        IPauseArbiter? arbiter = null)
     {
         _channelFor = channelFor ?? throw new ArgumentNullException(nameof(channelFor));
         _sandbox = sandbox ?? throw new ArgumentNullException(nameof(sandbox));
         _containerIdFor = containerIdFor ?? throw new ArgumentNullException(nameof(containerIdFor));
         _supervisor = supervisor ?? NullAgentSupervisor.Instance;
         _defaultTimeout = defaultTimeout ?? DefaultTimeout;
+        _arbiter = arbiter;
     }
 
     public async Task<IYieldToken> RequestYieldAsync(string agentId, TimeSpan? timeout = null, CancellationToken ct = default)
@@ -172,14 +199,47 @@ public sealed class YieldProtocol : IYieldProtocol
             ?? throw new InvalidOperationException(
                 $"Agent '{agentId}' did not yield and has no live container to pause (Docker reports none).");
 
-        await _sandbox.PauseAsync(containerId, ct).ConfigureAwait(false);
+        // The machine's critical section is marked in the arbiter FIRST, so a human unpause arriving
+        // between here and the token's resume is refused rather than breaking the pause open mid-write.
+        var hold = _arbiter?.HoldForMachine(agentId);
+        try
+        {
+            // A human-paused jail is already frozen — pausing again is a no-op at best and an engine
+            // error at worst; the rebase's quiescence requirement is already met.
+            if (_arbiter?.IsHumanPaused(agentId) != true)
+            {
+                await _sandbox.PauseAsync(containerId, ct).ConfigureAwait(false);
+            }
+        }
+        catch
+        {
+            hold?.Dispose();
+            throw;
+        }
+
         _supervisor.MarkState(agentId, "Paused", "Yield timed out; jail paused for the update.");
 
         return new YieldToken(agentId, YieldOutcome.ByPause, async () =>
         {
-            await _sandbox.UnpauseAsync(containerId, CancellationToken.None).ConfigureAwait(false);
-            _supervisor.ResumeInput(agentId);
-            _supervisor.MarkState(agentId, "Working", null);
+            try
+            {
+                // Checked at RESUME time, not capture time: a human who paused the agent DURING the
+                // machine's hold has said "stay frozen", and the machine must not override that on its
+                // way out. The hold is released either way — the human's own unpause takes over.
+                if (_arbiter?.IsHumanPaused(agentId) == true)
+                {
+                    _supervisor.MarkState(agentId, "Paused", "Paused by you.");
+                    return;
+                }
+
+                await _sandbox.UnpauseAsync(containerId, CancellationToken.None).ConfigureAwait(false);
+                _supervisor.ResumeInput(agentId);
+                _supervisor.MarkState(agentId, "Working", null);
+            }
+            finally
+            {
+                hold?.Dispose();
+            }
         });
     }
 

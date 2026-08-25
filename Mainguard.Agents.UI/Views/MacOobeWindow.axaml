@@ -1,0 +1,72 @@
+<views:ChromedWindow xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+        xmlns:views="using:Mainguard.UI.Views"
+        xmlns:controls="using:Mainguard.UI.Controls"
+        x:Class="Mainguard.Agents.UI.Views.MacOobeWindow"
+        x:DataType="vm:MacOobeViewModel"
+        Title="Welcome to Mainguard"
+        Width="560" Height="620" MinWidth="480" MinHeight="520"
+        WindowStartupLocation="CenterScreen"
+        Background="{DynamicResource SurfaceWindow}">
+    <!-- The macos-host first-run: a checklist over the substrate's real prerequisites (engine,
+         file sharing, jail images, daemon), the agent-CLI picker, and the start-at-login toggle.
+         Tokens only; SuccessBrush/DangerBrush/InfoBrush already exist in every theme. -->
+    <Grid RowDefinitions="Auto,*">
+        <controls:CustomTitleBar Grid.Row="0"/>
+        <ScrollViewer Grid.Row="1">
+            <StackPanel Margin="20" Spacing="15">
+                <TextBlock Text="Welcome to Mainguard" FontSize="20" FontWeight="SemiBold"
+                           Foreground="{DynamicResource TextPrimary}"/>
+                <TextBlock Text="Setting up the agent platform on this Mac. Agents run in hardened Linux containers through your Docker engine — nothing installs outside your home directory."
+                           TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
+
+                <Border Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}"
+                        BorderThickness="1" CornerRadius="8" Padding="15">
+                    <ItemsControl ItemsSource="{Binding Steps}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:MacOobeStepViewModel">
+                                <Grid ColumnDefinitions="24,Auto,*" Margin="0,5">
+                                    <TextBlock Grid.Column="0" Text="{Binding Glyph}" FontWeight="Bold"
+                                               Foreground="{DynamicResource TextPrimary}"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding Title}" FontWeight="SemiBold" MinWidth="130"
+                                               Foreground="{DynamicResource TextPrimary}"/>
+                                    <TextBlock Grid.Column="2" Text="{Binding Detail}" TextWrapping="Wrap"
+                                               Foreground="{DynamicResource TextMuted}"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Border>
+
+                <Button Content="Retry checks" Classes="Secondary" Padding="12,6"
+                        Command="{Binding RunChecksCommand}" IsEnabled="{Binding !IsRunning}"/>
+
+                <StackPanel Spacing="8" IsVisible="{Binding CliListLoaded}">
+                    <TextBlock Text="Agent CLIs" FontWeight="SemiBold" FontSize="14"
+                               Foreground="{DynamicResource TextPrimary}"/>
+                    <TextBlock Text="Installed into the shared adapters tree (inside a build container — never onto this Mac) and available to every agent. Add more later from Tools → Agent CLIs."
+                               TextWrapping="Wrap" Foreground="{DynamicResource TextMuted}"/>
+                    <ItemsControl ItemsSource="{Binding Clis}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate x:DataType="vm:MacOobeCliRowViewModel">
+                                <Grid ColumnDefinitions="*,Auto" Margin="0,2">
+                                    <CheckBox Grid.Column="0" Content="{Binding Label}" IsChecked="{Binding IsSelected}"
+                                              IsEnabled="{Binding !IsInstalled}"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding Status}" VerticalAlignment="Center"
+                                               Foreground="{DynamicResource TextMuted}"/>
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+
+                <CheckBox Content="Keep the agent platform running at login (launchd)"
+                          IsChecked="{Binding StartAtLogin}"/>
+
+                <Button Content="Continue" Classes="Primary" Padding="15,8" HorizontalAlignment="Right"
+                        Command="{Binding ContinueCommand}" IsEnabled="{Binding CanContinue}"/>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</views:ChromedWindow>

@@ -60,10 +60,17 @@ public static class SandboxImageCommands
 
     /// <summary>Builds <paramref name="imageTag"/> from <paramref name="vmSourceDir"/> (the
     /// /mnt-translated bundled Windows source dir), stamping the <see cref="SandboxImageVersions.LabelKey"/>
-    /// label with <paramref name="version"/> so the staleness probe + spawn preflight can key on it.</summary>
+    /// label with <paramref name="version"/> so the staleness probe + spawn preflight can key on it.
+    /// Passes <c>TARGETARCH=amd64</c> explicitly: this build always runs inside the WSL2
+    /// <c>MainguardEnv</c> VM (always x86_64 — arm64 is the separate macos-host substrate), and
+    /// <c>TARGETARCH</c> is a BuildKit-automatic build-arg that an older, non-BuildKit-by-default
+    /// docker engine (confirmed: 20.10.24+dfsg1) never populates for a plain <c>docker build</c> —
+    /// left unset, <c>images/mainguard-agent-base/Dockerfile</c>'s per-arch nix-installer case
+    /// statement falls to its <c>*)</c> branch and fails every build on such an engine.</summary>
     public static IReadOnlyList<string> BuildImage(string imageTag, string vmSourceDir, string version) =>
         WslCommands.InDistro(
             "docker", "build",
+            "--build-arg", "TARGETARCH=amd64",
             "--label", $"{SandboxImageVersions.LabelKey}={version}",
             "-t", imageTag, vmSourceDir);
 

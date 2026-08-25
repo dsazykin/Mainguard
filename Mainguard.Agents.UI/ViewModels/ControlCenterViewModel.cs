@@ -100,6 +100,11 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// <summary>P2-47 #7: the review cockpit overlay (non-null → shown), built from the live GetMergeDiff RPC.</summary>
     [ObservableProperty] private ReviewCockpitViewModel? _reviewCockpit;
 
+    /// <summary>The DEV-ONLY seeding panel — null (card absent) unless the daemon answered the
+    /// availability probe, i.e. unless it was STARTED with the seeding boot flag. Never set for a
+    /// mock-backed harness. See <c>ProbeQueueSeedingAsync</c>.</summary>
+    [ObservableProperty] private QueueSeedingPanelViewModel? _queueSeeding;
+
     /// <summary>Fix 2: the egress block-notification prompt (non-null → shown) — an agent's CLI died on a
     /// host the sandbox proxy refused; Unblock adds it + retries, Keep blocked dismisses.</summary>
     [ObservableProperty] private EgressBlockPromptViewModel? _egressBlockPrompt;
@@ -200,6 +205,26 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// working on, silence is not the diagnosis, so this stays false.</para></summary>
     [ObservableProperty] private bool _coordinatorConnectTimedOut;
 
+    /// <summary>
+    /// The daemon already reports the live coordinator as <b>past its startup</b> — it is running, whatever
+    /// its terminal is or isn't doing.
+    ///
+    /// <para><b>ISSUES-LOG #23.</b> Every "has the coordinator come up yet?" signal on this surface used to
+    /// be the terminal's first drawn frame (<see cref="TerminalViewModel.HasReceivedOutput"/>) — an EVENT,
+    /// and one that only ever fires while we are watching. A coordinator that was already running before
+    /// this app process attached has no first frame left to give: the daemon that owned its PTY is gone
+    /// (a daemon restart detaches a live CLI permanently — the jail keeps running, but the
+    /// <c>docker exec</c>-under-forkpty terminal behind it cannot be re-bound), so the attach produces
+    /// nothing at all, forever. The surface then sat on "Still starting the coordinator" for six hours
+    /// against an agent the daemon was continuously reporting as <c>state=Working, role=coordinator</c>.</para>
+    ///
+    /// <para>The cure is the one #19 needed, applied to a different field: derive the answer from the
+    /// CURRENT polled state as well as from the live event, so a session we did not watch start still reads
+    /// as started. A started coordinator whose terminal never draws is reported as what it is — running,
+    /// with a detached terminal — instead of as a launch that is still going.</para>
+    /// </summary>
+    [ObservableProperty] private bool _coordinatorHasStarted;
+
     /// <summary>What the daemon says it is doing while the coordinator starts (currently: the per-repo
     /// toolchain image build, which is the only step that runs for minutes). Empty when it has said
     /// nothing. Fed by the launch-progress state deltas, which carry a new <c>reason</c> while the
@@ -244,6 +269,9 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// never re-time a loop that is already running.</summary>
     private readonly TimeSpan _cliLoadRetryDelay = CliLoadRetryDelay;
 
+    /// <summary>P2-13 §6 — the waiting/blocked-transition notifier, fed from RefreshAgents.</summary>
+    private readonly Services.AgentNotificationService _attentionNotifications;
+
     public ControlCenterViewModel(OrchestratorServices services)
         : this(services, dockLayouts: null) { }
 
@@ -274,12 +302,36 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // The rail is a thin view over this VM; the shell hosts it as AgentRailContent (2d).
         _agentRail = new AgentRailViewModel(this);
 
+        // P2-13 §6, finally wired: a transition INTO a waiting/blocked state raises an OS-level
+        // notification (Notification Center on macOS, shell toast elsewhere), suppressed only when
+        // the app is foregrounded ON that agent. Fed from RefreshAgents — the one reconcile loop.
+        _attentionNotifications = new Services.AgentNotificationService(
+            new Services.OsAgentNotifier(),
+            isAppForegrounded: static () =>
+                (Application.Current?.ApplicationLifetime
+                    as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?
+                    .MainWindow?.IsActive == true,
+            foregroundedAgentId: () => SelectedAgentId);
+
         _agents.EventReceived += OnAgentEvent;
         // Fix 2: a CLI that dies on a blocked host raises this — show the unblock/keep prompt.
-        if (_agents is Services.DaemonBackedOrchestrator dbo) dbo.EgressBlocked += OnEgressBlocked;
-        // Changed is raised by both the coordinator and the kill switch (same requery pattern).
+        if (_agents is Services.DaemonBackedOrchestrator dbo)
+        {
+            dbo.EgressBlocked += OnEgressBlocked;
+            // Dev-only queue seeding: probe once, in the background. A daemon without the boot flag
+            // has the service UNMAPPED (UNIMPLEMENTED), the gateway answers false, QueueSeeding stays
+            // null, and the card never exists — absent, not disabled. Mock-backed harnesses never
+            // reach this branch at all.
+            _ = ProbeQueueSeedingAsync(dbo);
+        }
+        // Changed is raised by the coordinator, the kill switch, AND the merge queue (same requery
+        // pattern). Field bug (2026-08-20): the queue leg was missing entirely — EnsureEntry's push
+        // landed in GetQueue()'s answer correctly but nothing ever re-pulled it, so a fresh spawn's
+        // entry sat unrendered until an unrelated AgentEvent/coordinator/kill change refreshed the
+        // rail. "The spawned agent never appeared in the queue" was this.
         _coordinator.Changed += OnChanged;
         _kill.Changed += OnChanged;
+        _queue.Changed += OnChanged;
         _telemetry.Sampled += OnSampled;
         ThemeManager.ThemeChanged += OnThemeChanged;
 
@@ -356,7 +408,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
             .ToList();
         for (int i = Agents.Count - 1; i >= 0; i--)
             if (snapshot.All(a => a.AgentId != Agents[i].AgentId))
+            {
+                _attentionNotifications.Forget(Agents[i].AgentId);
                 Agents.RemoveAt(i);
+            }
 
         // Reconcile IN the projection's order, rank by rank (LIFO, P2-13). Existing rows are moved
         // rather than replaced, so a row's identity — and therefore the rail's selection — survives.
@@ -380,6 +435,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 Agents[at].Update(info);
                 if (at != rank) Agents.Move(at, rank);
             }
+
+            _attentionNotifications.OnStatusChanged(
+                info.AgentId, info.Name,
+                Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromLifecycle(info.State));
         }
 
         RefreshAttention();
@@ -400,6 +459,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         AttentionCount = _coordinator.GetPendingPlans().Count
                        + _agents.ListAgents().Count(a => AttentionPolicy.IsAttentionRequired(a.State));
         HasAttention = AttentionCount > 0;
+
+        // The Dock badge mirrors the SAME count (no-op off macOS). Cleared when nothing waits.
+        Mainguard.UI.Platform.MacNative.SetDockBadge(
+            AttentionCount > 0 ? AttentionCount.ToString(System.Globalization.CultureInfo.InvariantCulture) : null);
     }
 
     // Live theme switch: the badge converter resolves against the active theme variant, so nudge
@@ -410,6 +473,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     });
 
     // ---- Fix 2: egress block-notification prompt ----
+
+    /// <summary>
+    /// Dev-only queue seeding, decided by the DAEMON: a background probe of `GetSeedingStatus`. The
+    /// gateway answers false ONLY for the two definitive noes — UNIMPLEMENTED (no boot flag, the
+    /// shipped shape) and PermissionDenied — and that answer is final. A transport failure is a
+    /// different fact entirely: this ViewModel is constructed while the daemon may still be starting
+    /// (measured live — the one-shot probe raced the app-spawned daemon's bind and the card never
+    /// appeared on a daemon that HAD the flag), so transport errors retry patiently in the
+    /// background. The unreachable-daemon condition itself surfaces through the ordinary reconnect
+    /// machinery; this loop must never add a second error channel for it.
+    /// </summary>
+    private async Task ProbeQueueSeedingAsync(Services.DaemonBackedOrchestrator dbo)
+    {
+        var gateway = dbo.CreateQueueSeedingGateway();
+        for (var attempt = 0; attempt < 40; attempt++)
+        {
+            try
+            {
+                if (await gateway.IsAvailableAsync().ConfigureAwait(false))
+                {
+                    await Dispatcher.UIThread.InvokeAsync(() =>
+                        QueueSeeding = new QueueSeedingPanelViewModel(gateway));
+                }
+
+                return; // a definitive yes or a definitive no — either way, decided.
+            }
+            catch (Exception)
+            {
+                // Not an answer (daemon still starting / channel not up) — ask again shortly.
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+        }
+    }
 
     private void OnEgressBlocked(Services.EgressBlockInfo info) => Dispatcher.UIThread.Post(() =>
     {
@@ -480,6 +577,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         state is AgentLifecycleState.Merged or AgentLifecycleState.Rejected
             or AgentLifecycleState.Dead or AgentLifecycleState.TornDown;
 
+    /// <summary>The lifecycle words that mean "this session has not finished coming up yet". Everything
+    /// else — <c>Working</c>, <c>Paused</c>, <c>RateLimited</c>, <c>AwaitingReview</c> … — is a session
+    /// that HAS started, however it is behaving now. See <see cref="CoordinatorHasStarted"/>.</summary>
+    private static bool IsStartupState(AgentLifecycleState state) =>
+        state is AgentLifecycleState.Requested or AgentLifecycleState.PlanPending
+            or AgentLifecycleState.Provisioning;
+
     /// <summary>
     /// Coordinator-CLI card state, derived from the coordinator-role sessions in the projection:
     /// LIVE when one is in a non-terminal state; DEAD (honestly, with the start card un-gated) when
@@ -501,6 +605,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         IsCoordinatorLive = live is not null || startedUnprojected;
         IsCoordinatorDead = !IsCoordinatorLive && coordinators.Count > 0;
+        // #23: "has it started?" read off the CURRENT state, not only off a first terminal frame. A
+        // coordinator adopted from a previous daemon (already Working when we first see it) never
+        // transitions while we watch, so an event-only signal can never come true for it.
+        CoordinatorHasStarted = live is not null && !IsStartupState(live.State);
         CanStartCoordinator = host is not null && !IsCoordinatorLive;
         ShowCoordinatorTerminal = IsCoordinatorLive || IsCoordinatorDead;
 
@@ -518,8 +626,13 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         // The live coordinator's Detail while it is still starting: the daemon's launch-progress line
         // (currently the toolchain image build). Taken only from a LIVE, not-yet-drawn coordinator, so a
-        // dead one's exit reason can never leak into the loader as if it were progress.
-        SetCoordinatorStartDetail(live is not null && !IsCoordinatorDead ? live.Detail ?? "" : "");
+        // dead one's exit reason can never leak into the loader as if it were progress — and (#23) only
+        // while the session really IS still starting: a running session's Detail is not launch progress.
+        // The reconciler's adoption line ("Adopted after a daemon restart — this jail was already
+        // running.") is a Detail, and shown here it read as progress AND bought the stall watchdog the
+        // 20-minute working budget, on a session that had finished starting days earlier.
+        SetCoordinatorStartDetail(
+            live is not null && !IsCoordinatorDead && IsStartupState(live.State) ? live.Detail ?? "" : "");
         UpdateConnecting();
     }
 
@@ -773,7 +886,17 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>Runs a start/restart body under a fresh <see cref="_startupCts"/> so Stop can cancel it,
     /// holding <see cref="IsStartingCoordinator"/> across the spawn. Refuses to overlap another start or a
-    /// stop-in-progress.</summary>
+    /// stop-in-progress.
+    ///
+    /// <para><b>ISSUES-LOG #12 — this catch is not decoration, it is the difference between an error
+    /// message and a dead app.</b> Both callers are <c>[RelayCommand]</c>s, and the generated
+    /// <c>AsyncRelayCommand.Execute</c> awaits its body in an <c>async void</c> helper: a faulted body is
+    /// not returned to anyone, it is re-thrown onto the synchronization context, where no frame is left to
+    /// catch it and .NET aborts the process. <see cref="StartCoordinatorCoreAsync"/> guards its own spawn,
+    /// but the legs around it did not — the stop half of Restart, and the projection refreshes both halves
+    /// run — so a Restart whose teardown or re-projection threw took the whole client down mid-spawn,
+    /// killing every open stream RPC with it. Anything a start/restart can throw belongs on the coordinator
+    /// card as text; nothing here is worth a crash.</para></summary>
     private async Task RunStartupAsync(Func<CancellationToken, Task> body)
     {
         if (IsStartingCoordinator || IsStoppingCoordinator)
@@ -789,6 +912,19 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         try
         {
             await body(cts.Token);
+        }
+        catch (Exception ex) when (ex is OperationCanceledException
+            || (ex is Grpc.Core.RpcException rpc && rpc.StatusCode == Grpc.Core.StatusCode.Cancelled))
+        {
+            // Stop cancelled the launch — that path owns the teardown and the messaging, so stay quiet.
+            if (!_startupStopRequested)
+            {
+                CoordinatorStartError = "Starting the coordinator was cancelled.";
+            }
+        }
+        catch (Exception ex)
+        {
+            CoordinatorStartError = ex.Message;
         }
         finally
         {
@@ -853,6 +989,12 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 CoordinatorTerminal?.ClearView();
             }
         }
+        catch (Exception ex)
+        {
+            // ISSUES-LOG #12: same async-void hazard as RunStartupAsync — this runs as the stop prompt's
+            // [RelayCommand] confirm, so an escape here aborts the process instead of failing the stop.
+            CoordinatorStartError = ex.Message;
+        }
         finally
         {
             IsStoppingCoordinator = false;
@@ -865,16 +1007,40 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
     /// A cancel (Stop pressed mid-launch, or the daemon dropped the call) unwinds quietly.</summary>
     private async Task StartCoordinatorCoreAsync(CancellationToken ct)
     {
-        if (_agents is not Services.ICliAgentHost host || SelectedCli is null)
+        if (_agents is not Services.ICliAgentHost host)
         {
+            return;
+        }
+
+        // #23: never return silently on a missing pick. Restart is stop-then-start, so a null SelectedCli
+        // turned Restart into a Stop that said nothing — the coordinator went away and the surface gave no
+        // reason. Fall back to the one installed CLI we know about (the picker is HIDDEN while a
+        // coordinator is live, so nothing on screen would have let the user set it), and when there is
+        // genuinely nothing to start, say so.
+        var cli = SelectedCli ??= InstalledClis.FirstOrDefault();
+        if (cli is null)
+        {
+            CoordinatorStartError = InstalledClis.Count == 0
+                ? "No agent CLI is installed for Mainguard to run — install one, then start a coordinator."
+                : "Pick which agent CLI to run, then start the coordinator.";
             return;
         }
 
         CoordinatorStartError = "";
         IsCoordinatorFocus = true; // the coordinator's terminal is this surface's center content
+
+        // No key, no saved login: say up front that the CLI will ask for a sign-in in its terminal —
+        // otherwise the first-run coordinator just looks stuck at a prompt nobody mentioned.
+        if (_agents is Services.DaemonBackedOrchestrator credentialProbe
+            && !credentialProbe.HasStoredCredentialFor(cli))
+        {
+            SetCoordinatorStartDetail(
+                "No API key or saved login is stored — the CLI will ask you to sign in inside its terminal.");
+        }
+
         try
         {
-            await host.StartCoordinatorAsync(SelectedCli, ct);
+            await host.StartCoordinatorAsync(cli, ct);
             RefreshAgents();
             RefreshCoordinatorCli(); // attaches the coordinator's inline interactive terminal
         }
@@ -1078,8 +1244,21 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
             if (diff is not null)
             {
-                var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name ?? agentId;
-                var ctx = new ReviewCockpitContext(agentId, name, diff.Branch, diff.Files)
+                // The rail's Agents list filters coordinator-role sessions out (they drive the
+                // coordinator card instead), so a coordinator's own queue entry used to fall through
+                // to the raw GUID here and the cockpit header read "Review — <guid>". Fall back to the
+                // unfiltered agent list and name the role honestly.
+                var name = Agents.FirstOrDefault(a => a.AgentId == agentId)?.Name;
+                if (name is null)
+                {
+                    var info = _agents.ListAgents().FirstOrDefault(a => a.AgentId == agentId);
+                    name = info?.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator
+                        ? $"Coordinator ({info.Name})"
+                        : info?.Name;
+                }
+
+                var entry = _queue.GetQueue().FirstOrDefault(e => e.AgentId == agentId);
+                var ctx = new ReviewCockpitContext(agentId, name ?? agentId, diff.Branch, diff.Files)
                 {
                     // The "verified @ <sha>" stamp. The bare 4-arg ctor left every enrichment property
                     // unset, so BuildHeader was a no-op and a reviewer was told nothing about what the
@@ -1088,8 +1267,14 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     // the entry has not been verified, in which case no stamp is drawn — an absent
                     // stamp is the honest rendering of "not verified", and inventing one would be the
                     // exact false reassurance this surface exists to prevent.
-                    VerifiedAgainstSha = _queue.GetQueue()
-                        .FirstOrDefault(e => e.AgentId == agentId)?.VerifiedMainSha,
+                    VerifiedAgainstSha = entry?.VerifiedMainSha,
+
+                    // The changed-test-command fact is already on the wire as a flagged item — the gate
+                    // arms it daemon-side and streams it with the entry. TraceRanges/TestDelta stay
+                    // null: the wire does not carry them, and inventing either would render provenance
+                    // the daemon never attested.
+                    ChangedTestCommand = entry?.FlaggedItems.Any(
+                        f => f.Id == Services.DaemonFlaggedChangeSource.ChangedTestCommandItemId) == true,
                 };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same
@@ -1098,8 +1283,25 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                 // any checkmark it did draw would have cleared a store the merge gate never reads.
                 ReviewCockpit = new ReviewCockpitViewModel(
                     ctx,
+                    bringLocal: async (id, ct) =>
+                    {
+                        // The outcome is a toast either way — for most of this button's life it was
+                        // bound to nothing and pressing it was a silent no-op.
+                        var result = await daemon.BringBranchLocalAsync(id, ct).ConfigureAwait(true);
+                        Editions.ProComposition.ShowShellToast(
+                            result.Done
+                                ? $"'{result.LocalBranch}' is now a local branch — the agent keeps working"
+                                : $"Can't bring local — {result.Reason}",
+                            !result.Done);
+                    },
                     onMerge: id => _ = Services.MergeActionRunner.RunAsync(_queue, id),
-                    live: new Services.DaemonFlaggedChangeSource(_queue));
+                    live: new Services.DaemonFlaggedChangeSource(_queue),
+                    onReject: async (id, reason) =>
+                    {
+                        await Services.MergeActionRunner.RejectAsync(_queue, id, reason).ConfigureAwait(true);
+                        CloseReview();
+                        Queue.Refresh();
+                    });
                 return;
             }
         }
@@ -1133,32 +1335,106 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
     /// <summary>The most recent ProvisionRepo answer paired with the Windows path it was provisioned FROM
     /// (the daemon only ever hands back opaque handles — G-14 — so the path has to be remembered here).</summary>
-    private (string RepoHandle, string RepoPath, string SyncRemoteName)? _lastProvisioned;
+    private (string RepoHandle, string RepoPath, string SyncRemoteName, string SyncRemoteUrl)? _lastProvisioned;
 
-    /// <summary>Provision the just-opened repo into the daemon (P2-06) and return its sync-remote binding
-    /// for the shell to register with its own IGitService (step 2f seam). Gated on the real
-    /// DaemonBackedOrchestrator like <see cref="SetActiveRepo"/>, so the mock/design harness returns null
-    /// (no daemon); any transport failure is swallowed to null — agents are simply unavailable until the
-    /// daemon is up, and the Git client is unaffected.</summary>
-    public async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoSyncBinding?> ProvisionRepoAsync(string repoPath)
+    /// <summary>Test seam: plants the "this repo is already open" state a mid-session re-open finds,
+    /// which production only reaches through a real ProvisionRepo RPC. Never called by the app.</summary>
+    internal void SeedLastProvisionedForTest(
+        string repoHandle, string repoPath, string syncRemoteName, string syncRemoteUrl)
+        => _lastProvisioned = (repoHandle, repoPath, syncRemoteName, syncRemoteUrl);
+
+    /// <summary>Provision the just-opened repo into the daemon (P2-06) and return the outcome for the
+    /// shell to act on (register the sync remote on success; toast + retry card on failure — step 2f
+    /// seam). Gated on the real DaemonBackedOrchestrator like <see cref="SetActiveRepo"/>, so the
+    /// mock/design harness returns null ("no agent platform", never an error). The previously active
+    /// repo is cleared FIRST: a failed or slow provision must leave the queue rail empty, not showing —
+    /// and a Merge not fast-forwarding — the repo opened before this one. Runs on the adapter's shared
+    /// channel with the same 5-minute deadline as the OOBE path; the old per-call client's swallowed
+    /// 5-second budget is what made agents silently unavailable on any repo with a non-trivial clone.</summary>
+    public async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoProvisionOutcome?> ProvisionRepoAsync(string repoPath)
     {
-        if (_agents is not Services.DaemonBackedOrchestrator)
+        if (_agents is not Services.DaemonBackedOrchestrator daemon)
         {
             return null;
         }
+
+        // SERIALIZED, and that is the load-bearing half of the ISSUES-LOG #11 fix. The shell starts this
+        // fire-and-forget (`_ = TryRegisterSyncRemoteAsync(...)` on every repo open), so two opens a few
+        // hundred milliseconds apart — a picker double-click, "Reopen Last Repository?" landing on top of
+        // a palette open — ran two of these CONCURRENTLY. Both then read `_lastProvisioned` before either
+        // wrote it, so the same-repo short-circuit below could not fire for either, and the two bodies
+        // interleaved as: A clears → B clears → A provisions → A binds (pump starts) → B's provision
+        // returns/fails → B either rebinds much later or, on ANY failure, never rebinds at all. The
+        // observed signature was exactly that: a StreamQueue opened and cancelled 32 ms later, then never
+        // reattempted, because the surviving caller had already given up on the binding. One at a time
+        // makes the loser see the winner's finished binding and take the no-op path.
+        await _provisionGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            return await ProvisionRepoCoreAsync(daemon, repoPath).ConfigureAwait(false);
+        }
+        finally
+        {
+            _provisionGate.Release();
+        }
+    }
+
+    /// <summary>One at a time through <see cref="ProvisionRepoAsync"/> — see its comment; overlapping
+    /// repo-opens are what let a clear land after another call's bind and strand the queue pump.</summary>
+    private readonly System.Threading.SemaphoreSlim _provisionGate = new(1, 1);
+
+    private async System.Threading.Tasks.Task<Mainguard.UI.Editions.RepoProvisionOutcome?> ProvisionRepoCoreAsync(
+        Services.DaemonBackedOrchestrator daemon, string repoPath)
+    {
+        // Re-opening the repo that's already active and pumping is a real, common trigger (the repo
+        // picker, the command palette's "Open <repo>" entry, and "Reopen Last Repository?" all fire
+        // unconditionally, even when that repo is already the one on screen) — found live 2026-08-20
+        // (ISSUES-LOG #11: a redundant re-open blanked a working queue rail for the duration of a real
+        // ProvisionRepo RPC, up to its 5-minute deadline, with zero UI feedback that a background
+        // reprovision was even in flight, looking exactly like a dead/empty queue). Skip the
+        // clear+reprovision round trip entirely when nothing has actually changed.
+        var previous = _lastProvisioned;
+        if (previous is { } current
+            && string.Equals(current.RepoPath, repoPath, StringComparison.Ordinal)
+            && daemon.IsBoundTo(current.RepoHandle))
+        {
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Success(new Mainguard.UI.Editions.RepoSyncBinding(
+                current.RepoHandle, current.SyncRemoteName, current.SyncRemoteUrl));
+        }
+
+        _lastProvisioned = null;
+        daemon.ClearActiveRepo();
+        Queue.Refresh();
 
         try
         {
-            using var daemon = Services.DaemonClient.ForLoopback();
-            using var cts = new System.Threading.CancellationTokenSource(TimeSpan.FromSeconds(5));
-            var provisioned = await daemon.ProvisionRepoAsync(repoPath, cts.Token).ConfigureAwait(false);
-            _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName);
-            return new Mainguard.UI.Editions.RepoSyncBinding(
-                provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl);
+            var provisioned = await daemon.ProvisionRepoAsync(repoPath, System.Threading.CancellationToken.None)
+                .ConfigureAwait(false);
+            _lastProvisioned = (provisioned.RepoHandle, repoPath, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl);
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Success(new Mainguard.UI.Editions.RepoSyncBinding(
+                provisioned.RepoHandle, provisioned.SyncRemoteName, provisioned.SyncRemoteUrl));
         }
-        catch
+        catch (Exception ex)
         {
-            return null;
+            // A failed RE-provision of the repo we were already bound to must not be worse than doing
+            // nothing at all. The clear above has already torn the pump down, and on this path nothing
+            // downstream ever calls SetActiveRepo again — which is how a transient daemon hiccup turned a
+            // working merge queue into a permanently blank rail that only an app restart recovered. The
+            // handle is the repo's content hash and does not change between provisions, so re-arming it
+            // hands the pump back to its own reconnect-forever loop. Deliberately NOT done when the path
+            // differs: a failed switch to repo B must never resurrect repo A's queue (the B4 regression).
+            if (previous is { } prior && string.Equals(prior.RepoPath, repoPath, StringComparison.Ordinal))
+            {
+                _lastProvisioned = prior;
+                daemon.SetActiveRepo(prior.RepoHandle, prior.RepoPath, prior.SyncRemoteName);
+            }
+
+            var reason = ex is Grpc.Core.RpcException rpc
+                ? (rpc.StatusCode == Grpc.Core.StatusCode.Unavailable
+                    ? "the agent daemon isn't reachable"
+                    : rpc.Status.Detail is { Length: > 0 } detail ? detail : rpc.StatusCode.ToString())
+                : ex.Message;
+            return Mainguard.UI.Editions.RepoProvisionOutcome.Failure(reason);
         }
     }
 
@@ -1204,8 +1480,15 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         if (_agents is Services.DaemonBackedOrchestrator dbo) dbo.EgressBlocked -= OnEgressBlocked;
         _coordinator.Changed -= OnChanged;
         _kill.Changed -= OnChanged;
+        // Paired with the `_queue.Changed += OnChanged` in the constructor. It was the one subscription
+        // with no matching detach, so a disposed VM stayed wired to the live queue stream and kept
+        // Dispatcher-posting into its own torn-down surfaces on every push.
+        _queue.Changed -= OnChanged;
         _telemetry.Sampled -= OnSampled;
         ThemeManager.ThemeChanged -= OnThemeChanged;
+        // (_provisionGate is deliberately NOT disposed: a provision can still be in flight here, and a
+        // disposed SemaphoreSlim would turn its Release into an ObjectDisposedException on the way out.
+        // It allocates no wait handle, so there is nothing to leak.)
 
         // Abort an in-flight coordinator launch + its connect watchdog so nothing dangles past disposal.
         try { _startupCts?.Cancel(); } catch { /* already disposed */ }

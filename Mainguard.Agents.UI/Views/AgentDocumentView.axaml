@@ -112,6 +112,10 @@
         <Button Grid.Column="1" Classes="Primary" Content="Send" FontSize="12" Margin="8,0,0,0"
                 Command="{Binding SendPromptCommand}" IsEnabled="{Binding CanPromptDirectly}"/>
       </Grid>
+      <!-- The send's outcome, verbatim (a locked managed-worker terminal, transport down). The
+           composer keeps the text on a refusal, so the status explains why it is still there. -->
+      <TextBlock Text="{Binding PromptStatus}" FontSize="11" Foreground="{DynamicResource DangerBrush}"
+                 TextWrapping="Wrap" IsVisible="{Binding PromptStatus, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
     </StackPanel>
   </Grid>
 </UserControl>

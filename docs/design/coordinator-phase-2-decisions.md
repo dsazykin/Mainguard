@@ -217,6 +217,22 @@ It should be the next change, on its own, with its own tests. The phase-2 work m
 doing, not less: for the first time the scope being compared against was written by something that had
 read the code.
 
+**Resolved — and which half resolved when matters.** The gate half landed on `phase2` before this branch
+merged with it: `FlaggedChangeGate` is registered, ANDed into the queue's `gates`, and armed at
+verification time from the committed trees (`MergeQueueProvisioner.ArmFlaggedChangeReview`), with MG-40's
+default-DENY for an id whose review never ran. What that half could not supply was the *comparison* —
+`resolveApprovedPlan` stayed deliberately unwired, because the daemon had no agent→approved-plan binding
+and a guessed one would have compared diffs against the wrong scope and reported that as enforcement.
+
+Phase 2 is that binding: a plan is keyed by the **worker's own agent id**, which is the same id the plan
+gate holds and the same id the merge queue tracks the branch under. The composition root therefore now
+passes `resolveApprovedPlan` (approved plans only — a pending or rejected plan's scope has authorised
+nothing; an agent with no approved plan still resolves null and skips the comparison),
+`CompositionRootResolutionTests` pins it in the wired set with that reason, and the arm is exercised
+without spawning an agent through the queue seeder's `with_plan`/`scope` specs
+(`docs/design/queue-seeding.md` §9). The behaviour change is bounded to plan-gated workers: an unmanaged
+branch is classified exactly as it was.
+
 ---
 
 ## 4. What phase 3 still has to do

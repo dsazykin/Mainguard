@@ -43,6 +43,18 @@ public sealed record DaemonOptions
         = Environment.GetEnvironmentVariable("MAINGUARD_TERMINAL_ENGINE");
 
     /// <summary>
+    /// Dev-only merge-queue seeding (docs/design/queue-seeding.md §7). Captured from
+    /// <c>MAINGUARD_ENABLE_QUEUE_SEEDING</c> ONCE, at options construction — i.e. at process startup —
+    /// and never re-read: the whole gate is "was this daemon STARTED as a seeding daemon". Off (the
+    /// only value a shipped build ever sees) leaves <c>QueueSeedingService</c> unmapped entirely.
+    /// The in-proc test tier flips it per host by replacing the <c>QueueSeedingOptions</c> singleton
+    /// (<c>DaemonFixture.EnableQueueSeeding</c>) — a process-wide env var cannot vary between two
+    /// test daemons in one process.
+    /// </summary>
+    public bool QueueSeedingEnabled { get; init; }
+        = Environment.GetEnvironmentVariable("MAINGUARD_ENABLE_QUEUE_SEEDING") == "1";
+
+    /// <summary>
     /// MG-13/MG-4: the address the MODEL GATEWAY listener binds, or null (default) to leave it
     /// disabled. The gRPC control plane is always loopback-only and is unaffected by this.
     ///

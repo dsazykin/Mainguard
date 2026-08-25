@@ -29,11 +29,11 @@ public class CommitGraphCanvas : Control
     // truth (fallbacks match the Midnight Loom defaults).
     private static readonly (string Key, string Fallback)[] _laneKeys =
     {
-        ("Lane1", "#8B8BF5"),
-        ("Lane2", "#F472B6"),
-        ("Lane3", "#2DD4BF"),
-        ("Lane4", "#E3B341"),
-        ("Lane5", "#58A6FF")
+        ("Lane1", "#9F9FFC"),
+        ("Lane2", "#D0709F"),
+        ("Lane3", "#C0EAE3"),
+        ("Lane4", "#F2A918"),
+        ("Lane5", "#0B87F5")
     };
 
     private IBrush[]? _laneColorsCache;

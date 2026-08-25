@@ -48,7 +48,13 @@ public static class ProDesktopHost
     /// session (in-memory only; the next launch re-offers).</summary>
     private static bool _vmUpgradeDeclinedThisSession;
 
-    private static void EnsureKeepAlive() => _vmKeepAlive ??= new VmKeepAlive();
+    private static void EnsureKeepAlive()
+    {
+        // macos-host: no MainguardEnv to hold awake — a holder would just spawn a missing
+        // wsl.exe in a backoff loop forever. The daemon's own MacSleepAssertion covers sleep.
+        if (OperatingSystem.IsMacOS()) return;
+        _vmKeepAlive ??= new VmKeepAlive();
+    }
 
     private static void ReleaseKeepAlive()
     {
@@ -85,16 +91,37 @@ public static class ProDesktopHost
         // elevated ONLOGON task just fired us — its purpose is served and we are the elevated instance,
         // the one place its deletion can never be denied.
         var launchedByResumeTask = Environment.GetCommandLineArgs().Contains("--resume");
-        SweepResumeTaskAtStartup(launchedByResumeTask);
+        if (!OperatingSystem.IsMacOS())  // resume tasks are schtasks — Windows machinery only
+            SweepResumeTaskAtStartup(launchedByResumeTask);
 
         var route = DecideLaunchRoute();
 
         // OOBE is its own sequence (the wizard); the control-center route runs the startup sequence behind
         // the loading screen — VM wake, daemon reachable, tier-1 refresh, and the consented tier-2 upgrade
         // all complete (or degrade with a banner) BEFORE the shell opens.
-        desktop.MainWindow = route == LaunchRoute.Oobe
-            ? new OobeWizardView { DataContext = CreateOobeWizardViewModel() }
-            : CreateStartupWindow();
+        desktop.MainWindow = route != LaunchRoute.Oobe
+            ? CreateStartupWindow()
+            : OperatingSystem.IsMacOS()
+                ? CreateMacOobeWindow(desktop)
+                : new OobeWizardView { DataContext = CreateOobeWizardViewModel() };
+    }
+
+    /// <summary>The macos-host first-run window; completion hands off to the same startup-window
+    /// path the ControlCenter route takes, so post-OOBE behavior is one code path.</summary>
+    private static MacOobeWindow CreateMacOobeWindow(IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        MacOobeWindow? window = null;
+        window = new MacOobeWindow
+        {
+            DataContext = new MacOobeViewModel(onCompleted: () =>
+            {
+                var startup = CreateStartupWindow();
+                desktop.MainWindow = startup;
+                startup.Show();
+                window?.Close();
+            }),
+        };
+        return window;
     }
 
     /// <summary>Shows the shutdown window, runs <see cref="AppShutdownSequence"/> (release keep-alive, and —
@@ -129,6 +156,10 @@ public static class ProDesktopHost
     /// framework Exit backstop both call this without the terminate ever running twice.</summary>
     private static async Task StopVmScopedAsync(CancellationToken ct)
     {
+        // macos-host: there is no MainguardEnv VM — the Docker engine manages its own lifetime.
+        if (OperatingSystem.IsMacOS())
+            return;
+
         if (System.Threading.Interlocked.Exchange(ref _vmStopRan, 1) != 0)
             return;
 
@@ -195,6 +226,16 @@ public static class ProDesktopHost
 
     private static LaunchRoute DecideLaunchRoute()
     {
+        // macos-host: its own first-run flow (engine detection, file-sharing canary, jail images,
+        // daemon, CLI picker — MacOobeWindow). The completed marker is the whole state machine on
+        // this substrate (no reboot-resume, no elevation); the skip flags below are honored first.
+        if (OperatingSystem.IsMacOS())
+        {
+            var skip = string.Equals(Environment.GetEnvironmentVariable("MAINGUARD_SKIP_OOBE"), "1", StringComparison.Ordinal)
+                || Environment.GetCommandLineArgs().Any(a => a is "--control-center" or "--no-oobe");
+            return skip || MacOobeState.IsCompleted() ? LaunchRoute.ControlCenter : LaunchRoute.Oobe;
+        }
+
         // Phase-4: MAINGUARD_SKIP_OOBE is the current name; MAINGUARD_SKIP_OOBE stays honored as a
         // read-fallback for one release (a CI script / shell profile may still set the old name).
         if (string.Equals(
@@ -222,11 +263,19 @@ public static class ProDesktopHost
     private static StartupWindow CreateStartupWindow()
     {
         var vm = new StartupWindowViewModel();
-        var env = new ProductionStartupEnvironment(EnsureKeepAlive, ProComposition.LogOobe)
-        {
-            Host = vm,
-            VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
-        };
+        // The per-substrate startup environment: WSL legs on Windows, the host-local daemon +
+        // Docker-engine legs on macOS (MacStartupEnvironment). Same AppStartupSequence over both.
+        IAppStartupEnvironment env = OperatingSystem.IsMacOS()
+            ? new MacStartupEnvironment(ProComposition.LogOobe)
+            {
+                Host = vm,
+                VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
+            }
+            : new ProductionStartupEnvironment(EnsureKeepAlive, ProComposition.LogOobe)
+            {
+                Host = vm,
+                VmUpgradeDeclinedThisSession = _vmUpgradeDeclinedThisSession,
+            };
         var sequence = new AppStartupSequence(env);
         vm.SequenceRunner = (progress, ct) => RunStartupSequenceAsync(sequence, env, progress, ct);
         return new StartupWindow { DataContext = vm };
@@ -234,7 +283,7 @@ public static class ProDesktopHost
 
     private static async Task<StartupResult> RunStartupSequenceAsync(
         AppStartupSequence sequence,
-        ProductionStartupEnvironment env,
+        IAppStartupEnvironment env,
         IProgress<StartupProgress> progress,
         CancellationToken ct)
     {
@@ -258,6 +307,15 @@ public static class ProDesktopHost
     /// </summary>
     private static void KickAgentCliUpdateCheck()
     {
+        // macos-host: skipped for now — the installed-CLI listing runs a version probe per CLI,
+        // which on this substrate spawns a container each; that is fine behind the Tools page's
+        // explicit click and too heavy for a silent every-launch sweep. Revisit with a cheaper
+        // marker-only listing.
+        if (OperatingSystem.IsMacOS())
+        {
+            return;
+        }
+
         if (Interlocked.Exchange(ref _cliUpdateCheckRan, 1) != 0)
         {
             return;
@@ -273,23 +331,27 @@ public static class ProDesktopHost
 
                 using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
                 var installed = (await installer.ListAsync(cts.Token).ConfigureAwait(false))
-                    .Where(o => o.IsInstalled).Select(o => o.Id)
-                    .ToHashSet(StringComparer.Ordinal);
+                    .Where(o => o.IsInstalled)
+                    .ToDictionary(o => o.Id, o => o.InstalledVersion!, StringComparer.Ordinal);
                 if (installed.Count == 0)
                 {
                     return;
                 }
 
                 var updates = (await updater.CheckForUpdatesAsync(cts.Token).ConfigureAwait(false))
-                    .Where(u => installed.Contains(u.Id))
+                    .Where(u => installed.ContainsKey(u.Id))
                     .ToList();
                 if (updates.Count == 0)
                 {
                     return;
                 }
 
+                // Use the PROBED installed version, not AgentCliUpdate.InstalledVersion (the pin this
+                // update supersedes) — the two drift apart whenever the disk copy is ahead of the pin
+                // (W6), and announcing the pin here would tell a user already on 2.1.223 that they are
+                // "still on 2.1.218".
                 var summary = string.Join(", ",
-                    updates.Select(u => $"{u.DisplayName} {u.InstalledVersion} → {u.LatestVersion}"));
+                    updates.Select(u => $"{u.DisplayName} {installed[u.Id]} → {u.LatestVersion}"));
                 Avalonia.Threading.Dispatcher.UIThread.Post(() => ProComposition.ShowShellToast(
                     $"Agent CLI update{(updates.Count > 1 ? "s" : "")} available: {summary}. "
                     + "Update (or later revert) from Tools → Agent CLIs.", false));

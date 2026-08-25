@@ -60,6 +60,76 @@ public sealed class YieldProtocolTests
         Assert.Equal(1, sandbox.UnpauseCount);
     }
 
+    // ---- The human-pause arbiter (the cascade's pause vs the human's pause) ----
+
+    [Fact]
+    public async Task Yield_OverAHumanPausedJail_SkipsThePause_AndNeverWakesItOnResume()
+    {
+        var channel = new RecordingChannel(readyAnswer: false);
+        var sandbox = new RecordingSandbox();
+        var arbiter = new FakeArbiter { HumanPaused = true };
+        var protocol = new YieldProtocol(_ => channel, sandbox, _ => "container-1",
+            defaultTimeout: TimeSpan.FromMilliseconds(10), arbiter: arbiter);
+
+        var token = await protocol.RequestYieldAsync("a1");
+
+        // The jail is already frozen by the human — pausing again is skipped, but the machine's
+        // critical section is still marked (a human unpause mid-rebase must be refusable).
+        Assert.Equal(0, sandbox.PauseCount);
+        Assert.Equal(1, arbiter.Holds);
+
+        token.Resume();
+
+        // THE rule: the machine never wakes a human-paused jail on its way out — and the hold clears.
+        Assert.Equal(0, sandbox.UnpauseCount);
+        Assert.Equal(0, arbiter.Holds);
+    }
+
+    [Fact]
+    public async Task HumanPause_DuringTheMachineHold_IsHonoredAtResumeTime()
+    {
+        var channel = new RecordingChannel(readyAnswer: false);
+        var sandbox = new RecordingSandbox();
+        var arbiter = new FakeArbiter { HumanPaused = false };
+        var protocol = new YieldProtocol(_ => channel, sandbox, _ => "container-1",
+            defaultTimeout: TimeSpan.FromMilliseconds(10), arbiter: arbiter);
+
+        var token = await protocol.RequestYieldAsync("a1");
+        Assert.Equal(1, sandbox.PauseCount); // not human-paused at capture time → the machine paused
+
+        // The human pauses WHILE the machine holds the jail. Checked at RESUME time, not capture time.
+        arbiter.HumanPaused = true;
+        token.Resume();
+
+        Assert.Equal(0, sandbox.UnpauseCount);
+        Assert.Equal(0, arbiter.Holds);
+    }
+
+    private sealed class FakeArbiter : IPauseArbiter
+    {
+        public bool HumanPaused { get; set; }
+        public int Holds { get; private set; }
+
+        public bool IsHumanPaused(string agentId) => HumanPaused;
+
+        public IDisposable HoldForMachine(string agentId)
+        {
+            Holds++;
+            return new Release(this);
+        }
+
+        private sealed class Release : IDisposable
+        {
+            private FakeArbiter? _owner;
+            public Release(FakeArbiter owner) => _owner = owner;
+            public void Dispose()
+            {
+                var o = Interlocked.Exchange(ref _owner, null);
+                if (o is not null) o.Holds--;
+            }
+        }
+    }
+
     [Fact]
     public async Task Yield_Timeout_NoLiveContainer_Throws()
     {

@@ -448,6 +448,11 @@
           "SQLitePCLRaw.core": "3.0.3"
         }
       },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      },
       "Vanara.Core": {
         "type": "Transitive",
         "resolved": "4.2.1",
@@ -540,7 +545,8 @@
           "DiffPlex": "[1.9.0, )",
           "LibGit2Sharp": "[0.30.0, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[9.0.0, )",
-          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )"
+          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )",
+          "System.Security.Cryptography.Pkcs": "[10.0.10, )"
         }
       },
       "mainguard.protos": {

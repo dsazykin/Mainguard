@@ -69,6 +69,10 @@ public class MainWindowShellRenderHarness
 
         try
         {
+            // Park the wall-clock auto-dismiss: on a loaded CI runner the open+pump sequence
+            // below can outlive the 6 s timer and dismiss a toast mid-capture, turning the
+            // stacked-count assertion into a race (observed on the shared macOS runner).
+            ToastViewModel.AutoDismissOverrideMs = 600_000;
             ThemeManager.Apply("MidnightLoom", persist: false);
 
             var vm = new MainWindowViewModel();
@@ -113,6 +117,7 @@ public class MainWindowShellRenderHarness
         }
         finally
         {
+            ToastViewModel.AutoDismissOverrideMs = null;
             ThemeManager.Apply("MidnightLoom", persist: false);
         }
     }
@@ -123,7 +128,7 @@ public class MainWindowShellRenderHarness
     // ItemsControl carried no Grid.Row and so landed in row 0 — the 44px custom title bar — where
     // VerticalAlignment="Bottom" anchors to the bottom of the TITLE BAR, i.e. the top of the window
     // (and grew that Auto row to fit). Geometry is asserted, not eyeballed; the PNGs are for the
-    // design-system pass across all five themes.
+    // design-system pass across all themes.
     [AvaloniaFact]
     public void ShellToasts_ShouldSitInTheBottomRightCorner_InEveryTheme()
     {

@@ -25,7 +25,13 @@
   steps get the daemon's `IAuditLog` + log sink so a pass that prunes agents or reaps PTY sessions
   leaves an artifact); best-effort
   DB-backed stores with an in-memory fallback so the daemon always starts, all resolved from DI so a
-  test host can override them; **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
+  test host can override them; **P2-15 adds `RegisterAuditLog`** — `IAuditLog` rides the same DB
+  posture decision: the `ChainedAuditLog` (+ `IChainedAuditLog` for the verify surface + retention)
+  over the daemon DB when it opened, with the mirror at `<db>.audit-mirror` and the AES-GCM key in a
+  `SecureKeyring` rooted beside it, constructed EAGERLY so a store problem lands in migration.log;
+  `InMemoryAuditLog` fallback otherwise, with the will-not-survive-restart loss logged out loud
+  (note: the in-proc test tier's hosts share one run-scoped daemon DB, so Server.Tests audit
+  assertions are repo/agent-scoped, and the chain itself re-reads its head per append); **P2-47 adds `RegisterPrIntake`** — the P2-12 external-PR intake chain
   (`IPullRequestService`→`PullRequestService`, `IPrIntakeStore`→`DbPrIntakeStore`/in-memory fallback,
   `IPrHeadFetcher`→`PrHeadFetcher` over the substrate worktree path,
   **`IPrWorkerHost`→`Runtime/ExternalPrWorkerHost` (the spawn seam, sharing the merge queue's
@@ -52,6 +58,21 @@
     still boots and still serves the human Verify button. Stop disposes the trigger (unsubscribe + wait
     for the sweep in flight). Asserted from the real composition root by
     `WorkerReadinessTriggerWiringTests`.
+  - **`Runtime/AuditRetentionService.cs`** (P2-15) — hosted retention sweep: once at boot and every
+    24 h, records older than 90 d are expired as chained REDACTIONS (tombstoned payloads, count
+    unchanged, chain verifiable — the schema's triggers would refuse a delete anyway); a no-op on
+    the in-memory fallback journal, and a failed sweep logs + retries next round, never taking the
+    daemon down.
+  - **`Runtime/AuditAnchorService.cs`** (P2-15) — hourly best-effort RFC 3161 sweep: heads queue by
+    the `AuditAnchorQueue` policy (1000 records / 24 h) regardless, but nothing is SENT unless
+    `MAINGUARD_TSA_URL` names an endpoint — no default install silently talks to a third party, and
+    an operator who configures a TSA later gets the queued backlog anchored on the next sweep. A
+    TSA failure leaves rows pending (anchoring is best-effort, chaining is not).
+  - **`Runtime/MacSleepAssertion.cs`** — macos-host only (registered on macOS alone): while any
+    `mainguard.agent`-labeled container is running, hold a sleep assertion via a child
+    `caffeinate -im -w <daemon pid>` so idle sleep / App Nap cannot stall a verification; the
+    `-w` ties the assertion to the daemon's own lifetime (a killed daemon never leaks a machine
+    that refuses to sleep) and the child is killed the moment the last agent stops.
   - **`Runtime/PrIntakeHostedService.cs`** (P2-13 carried-in from P2-12) — the daemon scheduler slot
     that drives `IExternalPrIntake.RunAsync` (the external-PR poll loop); **P2-47 registered the intake
     dependency chain (`RegisterPrIntake` in `GatewayServiceRegistration`) so this now RUNS the poll loop
@@ -79,7 +100,7 @@
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
   `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
-  (`DiscardEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
+  (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
   blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
   branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
@@ -87,17 +108,36 @@
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
   `SpawnAgentRequest`) and the human-only
   plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
-  or approve its own plans). **Terminal input lock:** wraps the `TerminalService.Attach` request
+  or approve its own plans), and the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` —
+  the chain carries other agents' prompts/outputs and the human's decisions, none of it a
+  coordinator's to read), and every `QueueSeedingService` method unconditionally (seeding composes
+  EnsureEntry + a supplied verification outcome + the merge walk — every power this list denies
+  piecemeal, reachable at once; the boot flag decides whether the OPERATOR gets the surface, never
+  whether an agent does). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
   rejected server-side while the read/output stream flows — never UI-only.
+- **`Auth/SeedingGateInterceptor.cs`** — the dev-only queue-seeding BELT (docs/design/queue-seeding.md
+  §7): `QueueSeedingOptions(bool Enabled)` is built once at boot (`MAINGUARD_ENABLE_QUEUE_SEEDING`
+  via `DaemonOptions.QueueSeedingEnabled`; the in-proc test tier replaces the singleton —
+  `DaemonFixture.EnableQueueSeeding`) and this interceptor `PermissionDenied`s the
+  `/mainguard.v1.QueueSeedingService/` method prefix when disabled. Deliberately the belt, not the primary: the primary gate is that
+  `DaemonHost.MapServices` never maps `QueueSeedingGrpcService` without the flag (disabled ⇒
+  UNIMPLEMENTED — the client's hide-the-panel probe), and this layer exists so a refactor that made
+  the mapping unconditional still refuses loudly.
 - **`Auth/ConnectionRoleRegistry.cs`** (P2-14) — maps a bearer token → `ConnectionRole` (primary
   session token = `Operator`; issued/registered coordinator tokens = `Coordinator`).
   - **`Auth/TerminalLockRegistry.cs`** — the set of agents whose terminal input is severed (managed
     workers `Lock`; manual-mode unlocked).
   - **`Auth/ApproverIdentityResolver.cs`** —
-    `IApproverIdentityResolver`/`PeerCredentialIdentityResolver`: resolves the plan approver **from the
-    connection** (Linux euid / OS user under the loopback same-host trust boundary), never from the
-    request (SA-1/F2); the honest host-trust residual is documented in the file.
+    `IApproverIdentityResolver`/`PeerCredentialIdentityResolver`: resolves the plan approver from the
+    **daemon's own** OS user under the loopback same-host trust boundary, never from the request
+    (SA-1/F2); the honest host-trust residual (loopback TCP carries no peer credential, so the value is a
+    constant that attributes the host session and cannot tell two callers apart) is documented in the
+    file. **W5: one format on every platform — `os:<name>`.** The old Linux-only `uid:<euid>` branch was a
+    leftover of the retracted `SO_PEERCRED` framing and made Windows/WSL2 (daemon in-VM as
+    `User=mainguard`) render a bare `uid:1000`; `Environment.UserName` goes through `getpwuid`, not
+    `$USER`, so it is not env-spoofable. `uid:<euid>` remains only as the last resort for a euid with no
+    passwd entry, where `Environment.UserName` returns `""`.
 - **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the G-13 registry of
   `(message, field number)` secrets (every `// SECRET` proto field) and the access-log formatter that
   redacts them (value/length/prefix never logged). **`SecretMaskingInterceptor` now also records
@@ -273,6 +313,44 @@
     per connection (`AgentIpcProtocol`); malformed input gets an error response. Each connection is served
     on its own task, which is what lets a worker's plan presentation **park on the socket for hours**
     without blocking the accept loop or another agent's request.
+  - **`Runtime/AgentPauseService.cs`** — the human per-agent Pause/Resume bodies behind
+    `AgentService.PauseAgent`/`UnpauseAgent`, plus **`HumanPauseLedger`** (the `IPauseArbiter`
+    singleton every repo's `YieldProtocol` consults). Not containment: no terminal lock, one agent.
+    Fans over EVERY session behind the id (`pr-<n>` exists per-repo); tolerates "already paused" BY
+    `ISandboxEngine.IsPausedAsync` inspect state, never by error-message substring (engine wordings
+    differ per version). The arbitration rules: a human pause is sticky — the cascade's yield runs
+    through a frozen jail and never wakes it (checked at RESUME time in `YieldProtocol`) — and a
+    human unpause is refused while a machine hold is outstanding (self-clearing, seconds). Refusals
+    are answers, not exceptions. Pinned by `Mainguard.Server.Tests/AgentPauseTests` (incl. a real
+    docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
+  - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
+    (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
+    startup and every 30 s. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
+    what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
+    restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
+    run outside the app left a stale state word standing indefinitely. This pass: adopts a live jail with
+    no session record (kind + orchestration role read off its own `mainguard.kind` /
+    `mainguard.agent.role` labels), corrects the **pause axis only** toward Docker (never flattening
+    `RateLimited`/`Yielding`/`AwaitingReview` to `Working`), and marks a session whose container is gone
+    `Unresponsive` with the reason. It destroys nothing — no container is ever stopped or removed, and a
+    stopped-but-present persistent jail is left alone because the engine re-starts those by name.
+    Adoption is gated on `ownsRepo` (this daemon hosts the repository's bare mirror), since the container
+    engine is machine-wide; the lister is deliberately allowed to THROW so an unreachable engine skips
+    the pass instead of reading as "every jail vanished". `MAINGUARD_DISABLE_SESSION_RECONCILE=1` turns
+    it off (the `Mainguard.Server.Tests` module initializer sets it — the Mac mirror root `~/mainguard`
+    is not under `MAINGUARD_DATA_ROOT`, so an in-proc test daemon would otherwise adopt a developer's
+    real jails). **ISSUES-LOG #24 — the pass now also sweeps every registered `IMergeQueueRegistry` queue
+    through `MergeQueue.ReconcileJails`, off the listing it already took** (a second Docker timer would
+    poll the engine twice for one fact and then have to decide which copy wins). Merge-queue rows had the
+    identical push-only defect: stopping an agent is not a queue transition and a jail dying out of band
+    is not one either, so entries kept reporting `Working` — with Verify enabled — about agents that had
+    not existed for days (found live: 15 such rows against ONE real container). The sweep moves **no merge
+    state**; it corrects the *jail-liveness axis* only, and its liveness rule is two-sided (Docker settles
+    what the engine can see; the session store settles the starting-container window the spawn path has
+    just written). Reported as `QueueStranded`/`QueueRecovered` on the report and in the `queue_stranded`/
+    `queue_recovered` audit fields. Pinned by `Mainguard.Server.Tests/AgentSessionReconcileTests` +
+    `AgentSessionReconcileDockerTests` + `MergeQueueJailReconcileDockerTests`.
   - **`Runtime/SessionKeyCache.cs`** (PR3) — memory-only per-kind model-key cache (the daemon has no
     keystore; keys only arrive on `SpawnAgent`), so a coordinator-initiated worker of the same kind
     reuses the client-supplied key; also caches the per-kind CLI login-state files a client spawn
@@ -393,7 +471,10 @@
   **`TerminalGrpcService.cs`** (P2-03/PR3: a
   **bound** CLI session streams replay-then-live frames — a detach only unsubscribes, a locked
   (managed) attach gets the banner + output but `PERMISSION_DENIED` on input; otherwise the per-attach
-  `PtySession` factory path through `TerminalStreamer`, else the P2-02 echo. P2-18: an
+  `PtySession` factory path through `TerminalStreamer`, else — for an agent the session store KNOWS
+  but that has no bound CLI — the `DetachedNotice` attach (ISSUES-LOG #23: says so in one unprompted
+  frame and discards input, instead of a silent echo that emitted nothing until the user typed and so
+  read, client-side, as a CLI still starting up forever), else the P2-02 echo for an unknown id. P2-18: an
   `AttachOptions(grid:true)` first frame on a libvterm-engine session takes the grid pump instead —
   atomic snapshot then live `GridUpdate`/`ClipboardCopy` frames, same input/lock semantics — and the
   new `GetScrollback` RPC pages the session's daemon-side ring), **`RepoSyncGrpcService.cs`** (P2-06:
@@ -412,7 +493,16 @@
   the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
   which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
   enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
-  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded; `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
+  meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded;
+  `Snapshot`'s entry order runs through `OrderForDisplay` (`internal static`, unit-tested in
+  `Mainguard.Server.Tests/QueueDisplayOrderTests.cs`) — a stable partition putting actionable states
+  ahead of the permanent Merged/Rejected record, since `MergeQueue.Agents`' raw dictionary-insertion
+  order buries a fresh spawn behind however much terminal history a repo has accumulated (found live
+  2026-08-20, reproduced the "spawned agent isn't in the queue" symptom exactly), and **within** the
+  terminal group ordering newest-decision-first by `MergeQueue.LastChangedAt` — insertion order is
+  SPAWN order, so the partition alone put a just-rejected branch dead last on the rail and the human
+  who clicked Reject saw the entry leave the panel (ISSUES-LOG #13, filed HIGH against a row that was
+  rendering below the fold the whole time); `RunVerification`/`CanMerge`/`BeginMerge`/`ConfirmMerge` —
   resolves the per-repo `MergeQueue` via `IMergeQueueRegistry`, typed `NOT_FOUND` for an unknown
   handle; **P2-47 #7 adds `GetMergeDiff`** dispatching to the injected `IMergeBranchDiffService`,
   typed `NOT_FOUND` when the mirror/branch is missing; **P2-11 wiring:** `FlaggedItemsFor` projects the
@@ -421,7 +511,12 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **Entry lifecycle:** `DiscardEntry` refuses while this
+  record and bypass the gate's default-DENY. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
+  between a merge and the next repo-open based its worktree on the stale mirror main and
+  `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving
+  coherent-but-unmergeable Verified entries (observed live; the E2E suite verifies before merging so
+  it never walks that window). **Entry lifecycle:** `DiscardEntry` (and `RejectEntry`, its clone for the review verdict) refuses while this
   repo's outstanding merge lease names the entry — a terminal transition inside the
   `BeginMerge`→`ConfirmMerge` window would make `ConfirmMerge` refuse to record a merge that really
   landed — derives the actor from `IApproverIdentityResolver` (never the request; there is no such
@@ -434,6 +529,17 @@
     shared `KillSwitchGate` and return `FAILED_PRECONDITION` while frozen (SA-1/F4);
   - `TerminalGrpcService` writes a read-only banner + defensively rejects input `data` frames for a
     `TerminalLockRegistry`-locked agent.
+  - **`Services/QueueSeedingGrpcService.cs`** (the DEV-ONLY seeding transport —
+    docs/design/queue-seeding.md; validation + dispatch to `QueueSeeder`, actor daemon-derived via
+    `IApproverIdentityResolver`, `RepoProvisioningException` → typed `NOT_FOUND`, per-entry verbatim
+    refusals in the response body. Mapped by `DaemonHost.MapServices` ONLY when
+    `QueueSeedingOptions.Enabled` (the primary gate; disabled ⇒ UNIMPLEMENTED, which is also the dev
+    panel's hide probe), prefix-denied by `SeedingGateInterceptor` as the belt, coordinator-denied at
+    `RoleInterceptor` unconditionally, and its constructor REFUSES to build on a flagless daemon as
+    the last brace. `SeedEntrySpec`'s `with_plan`/`scope` map onto `SeedSpec.WithPlan`/`Scope` — an
+    empty repeated `scope` deliberately becomes `null`, not an empty list, because "no scope named"
+    selects the seed's own path while an empty `TaskPlan.Scope` would put every file out of scope.
+    Seeds are logged at Warning — a seeding daemon should read loud in its own log.)
   - **`Services/PrIntakeGrpcService.cs`** (P2-12: `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/
     `SubscribePrIntakeSource` over the daemon's `IPrIntakeStore`, mapped in `DaemonHost.MapServices`
     beside `MergeQueueGrpcService`. Validation + dispatch only. **`Update` persists, then re-READS and
@@ -456,6 +562,18 @@
     `WorkerPlanGate` and Managed-session population that refuses the coordinator a spawn — a surface that
     re-derived its own number could disagree with the gate it is rendering) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
+  - **`Services/AuditGrpcService.cs`** (P2-15) — transport for `AuditService` (`VerifyAudit`/
+    `ReadAudit`): the audit store's first production readers. Verification/decryption live in
+    `IChainedAuditLog`; on the in-memory fallback journal both RPCs still answer with
+    `persistent=false` (a heap verify must never read as tamper-evidence). Coordinator-denied at
+    the `RoleInterceptor`; `ReadAudit` pages are capped at 500 records (payloads carry full
+    prompts/outputs).
+  - **`Cli/AuditCommands.cs`** (P2-15) — the offline `mainguardd audit verify [--data <db>]` verb
+    (dispatched in `Program.cs` before daemon options, so it can never bind a port): walks the
+    chain + mirror via `ChainedAuditLog` and validates stored RFC 3161 anchor tokens structurally
+    (an anchor that no longer matches its recorded head hash exits 2 like chain tamper), prints
+    head seq/hash; exit contract 0 intact (missing store / pre-chain DB = intact by definition) /
+    2 tampered with first-bad-seq printed / 64 usage / 1 cannot-verify.
   - **`Runtime/SandboxKillTarget.cs`** (MG-8) — the `IKillTarget` that actually **stops work**, in
     three ordered steps: sever terminal input (`TerminalLockRegistry` + `SessionLeader.PauseInput` —
     in-proc and I/O-free, so they run BEFORE any Docker round-trip and an unreachable engine can never
@@ -464,7 +582,17 @@
     then mark session state, with an unpausable jail marked `Unresponsive` rather than `Paused`. It
     REPLACED `SessionStoreKillTarget`, which only wrote `MarkState(…, "Paused")` while every process
     kept executing and every terminal stayed typeable — containment that was really just relabelling.
-    Resume deliberately does NOT un-contain; recovery is an explicit per-agent action.
+    Also the **release** half (`UnpauseAsync`, ISSUES-LOG #17): it keeps a per-agent **causation ledger**
+    of what it actually transitioned — which containers *it* paused, and whether *it* took the terminal
+    lock / closed the leader's input gate — and `KillSwitch.ResumeAsync` reverses exactly those entries.
+    A jail already frozen when the stop fired (a human pause, or the keep-alive rebase's yield hold —
+    detected by engine STATE, never by error text) is reported as contained but is NOT recorded as ours,
+    so Resume leaves it paused; the injected `IPauseArbiter` (the `HumanPauseLedger`) is re-checked at
+    release time so a human pause that lands DURING the freeze also wins. A terminal lock taken at spawn
+    (a role property) survives the cycle — that was the concern behind the original "Resume deliberately
+    does NOT un-contain", honoured precisely instead of by refusing to recover at all. A container that
+    no longer exists is released by definition (logged, skipped); an unpause the engine refuses marks the
+    session `Unresponsive` with "the jail is STILL paused" and keeps it in the retry ledger.
   - `DaemonHost.cs` registers one `IAgentEnvironment` (`Wsl2AgentEnvironment`) as a singleton, the P2-14
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe

@@ -2,6 +2,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:vm="using:Mainguard.App.Shell.ViewModels"
         xmlns:models="using:Mainguard.Git.Models"
+        xmlns:controls="using:Mainguard.App.Shell.Controls"
         x:Class="Mainguard.App.Shell.Views.RepoPickerWindow"
         x:DataType="vm:MainWindowViewModel"
         x:Name="Root"
@@ -44,6 +45,10 @@
           <Style Selector="Border:pointerover">
             <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
           </Style>
+          <!-- Keyboard focus reads like hover, so a Tab-focused row is visible (W2). -->
+          <Style Selector="Border:focus-within">
+            <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
+          </Style>
           <Style Selector="Border:pressed">
             <Setter Property="Background" Value="{DynamicResource SurfaceHover}" />
           </Style>
@@ -64,10 +69,15 @@
           </ContextMenu>
         </Border.ContextMenu>
 
-        <Grid ColumnDefinitions="3,*"
+        <!-- RepoRow is a Grid that also carries an InvokePattern automation peer + Enter/Space
+             activation, so the row is reachable by keyboard and assistive tech, not only by
+             double-click (W2). Everything below is unchanged. -->
+        <controls:RepoRow ColumnDefinitions="3,*"
+              AutomationProperties.Name="{Binding DisplayName}"
               PointerPressed="Repo_PointerPressed"
               PointerMoved="Repo_PointerMoved"
               DoubleTapped="Repo_DoubleTapped"
+              Activated="Repo_Activated"
               DragDrop.AllowDrop="True"
               Background="Transparent">
 
@@ -79,7 +89,7 @@
             <Ellipse Width="8" Height="8" Fill="{Binding CustomIconColor, TargetNullValue='#8B8BF5'}" Margin="8,0,10,0" />
             <TextBlock Text="{Binding DisplayName}" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
           </StackPanel>
-        </Grid>
+        </controls:RepoRow>
       </Border>
     </DataTemplate>
 
@@ -87,7 +97,8 @@
     <DataTemplate DataType="{x:Type models:WorkspaceCategory}">
       <StackPanel>
         <Grid ColumnDefinitions="*, Auto" DragDrop.AllowDrop="True" PointerPressed="Category_PointerPressed" PointerMoved="Category_PointerMoved" Background="Transparent">
-          <ToggleButton Classes="RepoCategory" Classes.selected="{Binding IsSelected}" Grid.Column="0" IsChecked="{Binding IsExpanded, Mode=TwoWay}" Click="Category_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Background="Transparent" BorderThickness="0" Padding="10,5">
+          <ToggleButton Classes="RepoCategory" Classes.selected="{Binding IsSelected}" Grid.Column="0" IsChecked="{Binding IsExpanded, Mode=TwoWay}" Click="Category_Click" HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" Background="Transparent" BorderThickness="0" Padding="10,5"
+                        AutomationProperties.Name="{Binding Name}">
             <ToggleButton.ContextMenu>
               <ContextMenu>
                 <MenuItem Header="Rename Category" Command="{ReflectionBinding #Root.DataContext.RenameCategoryCommand}" CommandParameter="{Binding}" />
@@ -109,7 +120,7 @@
               </StackPanel>
             </Grid>
           </ToggleButton>
-          <Button ToolTip.Tip="Add Repository" Grid.Column="1" Content="+" Padding="6,0" FontSize="16" FontWeight="Bold"
+          <Button ToolTip.Tip="Add Repository" AutomationProperties.Name="Add Repository" Grid.Column="1" Content="+" Padding="6,0" FontSize="16" FontWeight="Bold"
                   Command="{ReflectionBinding #Root.DataContext.AddRepositoryToCategoryCommand}"
                   CommandParameter="{Binding}"
                   Background="Transparent" BorderThickness="0" Foreground="{DynamicResource TextMuted}" Cursor="Hand" VerticalAlignment="Center" Margin="0,0,10,0"/>
@@ -134,19 +145,19 @@
                    TextTrimming="CharacterEllipsis" />
 
         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="2" HorizontalAlignment="Right">
-          <Button Content="+" ToolTip.Tip="New Category" Command="{Binding CreateCategoryCommand}"
+          <Button Content="+" ToolTip.Tip="New Category" AutomationProperties.Name="New Category" Command="{Binding CreateCategoryCommand}"
                   Classes="IconButton" Foreground="{DynamicResource TextMuted}"
                   VerticalAlignment="Center" Padding="6,2"/>
-          <Button ToolTip.Tip="Create Git Repository" Command="{Binding CreateGitRepositoryCommand}" Classes="IconButton">
+          <Button ToolTip.Tip="Create Git Repository" AutomationProperties.Name="Create Git Repository" Command="{Binding CreateGitRepositoryCommand}" Classes="IconButton">
             <PathIcon Data="{StaticResource DocumentAddIcon}" Width="14" Height="14" Foreground="{DynamicResource TextMuted}"/>
           </Button>
-          <Button ToolTip.Tip="Clone from Cloud" Command="{Binding OpenCloudSyncCommand}" Classes="IconButton">
+          <Button ToolTip.Tip="Clone from Cloud" AutomationProperties.Name="Clone from Cloud" Command="{Binding OpenCloudSyncCommand}" Classes="IconButton">
             <PathIcon Data="{StaticResource CloudIcon}" Width="14" Height="14" Foreground="{DynamicResource TextMuted}"/>
           </Button>
-          <Button ToolTip.Tip="Select Auto-Detect Folder" Command="{Binding SelectAutoDetectFolderCommand}" Classes="IconButton">
+          <Button ToolTip.Tip="Select Auto-Detect Folder" AutomationProperties.Name="Select Auto-Detect Folder" Command="{Binding SelectAutoDetectFolderCommand}" Classes="IconButton">
             <PathIcon Data="{StaticResource FolderIcon}" Width="14" Height="14" Foreground="{DynamicResource TextMuted}"/>
           </Button>
-          <Button ToolTip.Tip="Scan Auto-Detect Folder" Command="{Binding ScanAutoDetectFolderCommand}" Classes="IconButton">
+          <Button ToolTip.Tip="Scan Auto-Detect Folder" AutomationProperties.Name="Scan Auto-Detect Folder" Command="{Binding ScanAutoDetectFolderCommand}" Classes="IconButton">
             <PathIcon Classes.spinning="{Binding IsScanning}" Data="{StaticResource RefreshIcon}" Width="14" Height="14" Foreground="{DynamicResource TextMuted}">
               <PathIcon.RenderTransform>
                 <RotateTransform/>

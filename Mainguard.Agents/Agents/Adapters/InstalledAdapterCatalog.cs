@@ -82,6 +82,12 @@ public sealed class InstalledAdapterCatalog
     {
     }
 
+    /// <summary>The catalog over the CURRENT host's daemon-side registry — the VM layout where the
+    /// daemon runs in the VM, <c>~/mainguard/adapters/registry</c> on macos-host (see
+    /// <see cref="AdapterPaths.DaemonSideRoot"/>). Composition roots use THIS, not the bare ctor.</summary>
+    public static InstalledAdapterCatalog CreateForHost() =>
+        new(AdapterPaths.DaemonSideRegistryDir());
+
     public InstalledAdapterCatalog(string registryDir)
     {
         _registryDir = registryDir;

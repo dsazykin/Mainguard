@@ -268,7 +268,7 @@ public sealed class GatewayConfinementDockerTests
         ConfinementWorld.SeedRepoAt(sourceRepo);
         ConfinementWorld.WriteAdapterMarkerIn(registryDir);
 
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         var environment = new Wsl2AgentEnvironment(vmRoot: vmRoot, gatewayEndpoint: Unreachable);
         var launcher = new SandboxAgentLauncher(
             environment,
@@ -359,7 +359,7 @@ public sealed class GatewayConfinementDockerTests
 
         public TestDaemonHost.RunningDaemon Daemon { get; private set; } = null!;
 
-        public IDockerClient Docker { get; } = new DockerClientConfiguration().CreateClient();
+        public IDockerClient Docker { get; } = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
 
         public RecordingUpstream Upstream { get; } = new();
 
