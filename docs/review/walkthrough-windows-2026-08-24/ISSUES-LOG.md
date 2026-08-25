@@ -310,11 +310,22 @@ daemon's own log line as ground truth (`by=os:mainguard`, `rejected_by=os:maingu
 Settings → Agent CLIs now showing the correct drift-aware label. All five hold. Full detail in
 WALKTHROUGH.md §13.
 
-### Note — repo-picker toolbar icons and category headers share W2's original bug, unfixed
+### Note — repo-picker toolbar icons and category headers shared W2's original bug — FIXED
 
-Found while re-verifying W2: the repo picker's own toolbar buttons (add/clone/auto-detect/refresh)
-and its category-header rows (`vs_code`, `Personal`, `Work`) still report the fallback
-`"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"` accessible name — the same defect class
-W2 fixed for the section rail and the repo rows themselves, just never extended to these. Not
-fixed this pass (outside the scope of the requested fix-verification); flagged for a follow-up
-pass through `RepoPickerWindow.axaml`'s toolbar and category-header templates.
+Found while re-verifying W2: the repo picker's own toolbar buttons (add category / create repo /
+clone / auto-detect select+scan), its "Add Repository" per-category `+` button, and its
+category-header rows (`vs_code`, `Personal`, `Work`) still reported the fallback
+`"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"` (or a bare, non-descriptive `"+"`)
+accessible name — the same defect class W2 fixed for the section rail and the repo rows
+themselves, just never extended to these.
+- **Fixed** in `Mainguard.App.Shell/Views/RepoPickerWindow.axaml`: added
+  `AutomationProperties.Name` to all five toolbar buttons (matching their existing `ToolTip.Tip`
+  text), the per-category `+` button ("Add Repository"), and the category-header `ToggleButton`
+  (bound to the category's `Name`, so it reads correctly for every category at every nesting depth
+  — the template is recursive).
+- Regression pinned by `RepoPickerAccessibilityTests.ToolbarButtonsAndCategoryHeader_ExposeRealAccessibleNames`,
+  which rejects the `Avalonia.*`/bare-`+` fallback specifically rather than merely checking for a
+  non-empty name — the same "looks applied but isn't" trap the original rail-button fix (W2) had to
+  guard against. Confirmed failing against the pre-fix XAML (`git stash` on just that file) with
+  exactly the found-instead list `[+, Avalonia.Controls.PathIcon ×6, Avalonia.Controls.Grid, +,
+  Cancel, Delete]`, passing after.

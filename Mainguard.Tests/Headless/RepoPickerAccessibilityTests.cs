@@ -5,6 +5,7 @@ using Avalonia;
 using Avalonia.Automation.Peers;
 using Avalonia.Automation.Provider;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Input;
@@ -81,6 +82,49 @@ public class RepoPickerAccessibilityTests
 
             Assert.Same(repo, vm.SelectedNode);
             Assert.Same(repo, vm.InvalidRepository);
+        }
+        finally
+        {
+            HarnessHygiene.Teardown(win);
+        }
+    }
+
+    /// <summary>
+    /// Follow-up to W2 (found during its live re-verification): the picker's own toolbar buttons
+    /// (add category / create repo / clone / auto-detect select+scan) and its category-header
+    /// <c>ToggleButton</c> shared the identical defect the repo rows had — <c>ButtonAutomationPeer</c>'s
+    /// <c>Content?.ToString()</c> fallback reported <c>"Avalonia.Controls.PathIcon"</c> for the
+    /// icon-only buttons and <c>"Avalonia.Controls.Grid"</c> for the category header (whose Content is
+    /// a chevron+label Grid), not the empty string a naive check would expect — the same "looks
+    /// applied but isn't" shape the W2 rail-button fix (ActivityBarRenderHarness) already found.
+    /// Reject <c>Avalonia.*</c> names specifically, not just blank ones, so a regression can't hide
+    /// behind a not-technically-empty junk name again.
+    /// </summary>
+    [AvaloniaFact]
+    public void ToolbarButtonsAndCategoryHeader_ExposeRealAccessibleNames()
+    {
+        var win = ShowPicker(out _, out _);
+        try
+        {
+            foreach (var expected in new[]
+                     {
+                         "New Category", "Create Git Repository", "Clone from Cloud",
+                         "Select Auto-Detect Folder", "Scan Auto-Detect Folder", "Add Repository",
+                     })
+            {
+                var button = win.GetVisualDescendants().OfType<Button>()
+                    .FirstOrDefault(b => ControlAutomationPeer.CreatePeerForElement(b).GetName() == expected);
+                Assert.True(button is not null,
+                    $"no toolbar button exposes the accessible name '{expected}' — " +
+                    "found instead: [" + string.Join(", ", win.GetVisualDescendants().OfType<Button>()
+                        .Select(b => ControlAutomationPeer.CreatePeerForElement(b).GetName())) + "]");
+            }
+
+            var category = win.GetVisualDescendants().OfType<ToggleButton>()
+                .FirstOrDefault(t => ControlAutomationPeer.CreatePeerForElement(t).GetName() == "Probe");
+            Assert.True(category is not null, "the 'Probe' category header does not expose its name — " +
+                "found instead: [" + string.Join(", ", win.GetVisualDescendants().OfType<ToggleButton>()
+                    .Select(t => ControlAutomationPeer.CreatePeerForElement(t).GetName())) + "]");
         }
         finally
         {
