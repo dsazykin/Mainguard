@@ -652,3 +652,71 @@ Intake, Mainguard OS, Daemon Logs, About).
   since the actual install (2.1.223) doesn't contain the substring "2.1.218", the probe reads false.
   Logged as an open design question (should version drift from the pin surface as "update
   available" instead of "not installed"?) rather than guessed at with a rushed fix.
+
+## 13. Fix-verification pass (2026-08-25) — all five follow-up fixes (W2-W6) confirmed live
+
+Rebuilt `Mainguard.Pro.App` in Release via the Windows-side `dotnet` (the daemon auto-update
+mechanism republished the in-VM binary automatically, same pattern as §11), relaunched, and
+re-drove every one of the five bugs fixed after the original findings report through real UI —
+not RPC — with a clean `.gitconfig` baseline (only the pre-existing `PiVision` `safe.directory`
+entry; nothing added by the earlier W4 investigation survived cleanup). Screenshots
+`followup-01` through `followup-28`.
+
+- **W2 (repo-list UIA gap) — CONFIRMED FIXED**, via the exact TreeWalker methodology the original
+  bug was found with: walked from the `e2e-fixture` row's own name upward looking for
+  `IInvokeProvider`. Found it at **depth 0** — the row itself is now `ControlType.ListItem`,
+  `IsKeyboardFocusable=True`, and supports `InvokePattern` directly (previously nothing on the
+  chain did). Followed with a genuine keyboard test: `SetFocus()` on the row via UIA, then a raw
+  `VK_RETURN` through `SendInput` — the picker closed and the main window showed "Opening
+  repository…", proving real Enter-key activation reaches the ViewModel end-to-end, not just that
+  the pattern exists.
+  - **New, adjacent finding (not part of W2's original scope):** the repo-picker's own toolbar
+    icons (add/clone/auto-detect/refresh) and the category-header rows (`vs_code`, `Personal`,
+    `Work`) still report the same junk `"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"`
+    fallback names W2 fixed for the section rail and repo rows — `AutomationProperties.Name` was
+    never added there. Same bug class, different location; not fixed this pass (out of scope of
+    the requested verification), logged for a follow-up.
+- **W3 (auto-detect mislabels root repo as `.git`) — CONFIRMED FIXED**, with a genuinely fresh
+  reproduction rather than relying on the stale `.git`-labeled entry already sitting in the list
+  from the original bug report (re-scanning the already-added `e2e-fixture` would have proven
+  nothing — dedup-by-path could mask a labeling bug). Created a brand-new throwaway repo
+  (`w3-repro-test`), pointed the auto-detect folder-browse dialog directly at its root (a real
+  Win32 dialog, navigated via Ctrl+L address bar + typed path + a real `Select Folder` click), and
+  the picker's list gained a new entry correctly labeled **`w3-repro-test`** — sitting right next
+  to the untouched stale `.git` entry from before the fix, a clean before/after contrast in the
+  same screenshot. Cleaned up afterward (real `Remove` → `Delete` confirm via the picker's own
+  context menu, then deleted the throwaway repo from disk).
+- **W4 (WSL2 UNC dubious-ownership) — CONFIRMED FIXED**, the highest-value check since this fix
+  touches the product's core guarantee. Opened the Review cockpit for a genuinely `Verified` queue
+  entry (`8697bec3d2a44dc8a9069c3302a5ae77`, left over from earlier this session, whose sandbox
+  jail container was still running 14+ hours later) and clicked the real **"Bring local"** button —
+  the exact operation `BringLocalService.BringLocal` performs, and the exact operation that used to
+  fail with `fatal: detected dubious ownership`. Result: a **green success toast**, then verified
+  against ground truth rather than trusting the toast color: `git branch -a` inside
+  `e2e-fixture` now shows both `agent/8697bec3d2a44dc8a9069c3302a5ae77` and
+  `remotes/mainguard-vm/agent/8697bec3d2a44dc8a9069c3302a5ae77` as real local refs, and
+  `.gitconfig`'s `safe.directory` list is **still just the one pre-existing `PiVision` entry** —
+  proving the trust really is applied per-invocation via the throwaway `GIT_CONFIG_SYSTEM` shim,
+  never persisted globally. (The cockpit's `Merge` button itself stayed disabled for this entry —
+  gated on an unrelated flagged-change-review acknowledgment policy, not a W4 concern; not chased
+  further since the fetch itself is the operation under test.)
+- **W5 (raw `uid:1000` actor identity) — CONFIRMED FIXED**, ground-truth verified via the real
+  daemon log rather than a UI label (the rail doesn't surface the actor string directly). Clicked
+  **Reject** on the same queue entry through the cockpit's real confirm flow; Settings → Daemon
+  Logs then showed, verbatim: `mainguardd.Merge[0] RejectEntry repo=... agent=8697bec3d2a44dc8a9069c3302a5ae77
+  by=os:mainguard reason=(none given)` and `RejectEntryResponse { rejected=True, ...,
+  rejected_by=os:mainguard, ... }` — the exact `os:<name>` shape the fix unifies on, resolved to
+  the VM's `mainguard` service account (not a bare `uid:1000`, not the Windows user — the honest
+  answer per the fix's own reasoning).
+- **W6 (Agent CLIs false "Not installed") — CONFIRMED FIXED.** Settings → Agent CLIs now shows
+  Claude Code with a green checkmark and **"Installed — v2.1.223 is what runs here; this Mainguard
+  build pins v2.1.218"**, plus a separate, honest **"Update available: v2.1.245"** annotation and an
+  "Update to v2.1.245" button — replacing the old false "Not installed" + `Install` button pairing.
+  Both the drift annotation and the registry-update annotation render correctly and distinctly on
+  the same row, exactly as the fix's design intended.
+
+**Net result: all 5 follow-up fixes (W2-W6) hold under genuine, real-UI-driven re-verification on
+this exact substrate** — two of them (W4, W5) additionally confirmed against ground truth (git
+refs on disk, the daemon's own structured log) rather than just a UI label or toast color. One new,
+narrow accessibility gap found in passing (repo-picker toolbar/category-header names) and logged,
+not fixed, since it's outside what was asked for this pass.

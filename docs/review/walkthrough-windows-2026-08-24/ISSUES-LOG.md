@@ -297,3 +297,24 @@ this environment's `SendInput` path needs its own investigation first.
   `Mainguard.Tests/AgentCliUiTests.cs`'s
   `Settings_InstalledCliAheadOfThePin_ShouldReadAsInstalled_NotAsMissing`, plus three guard cases
   proving the loosened predicate didn't take genuine-absence detection with it).
+
+### Live re-verification of W2-W6 (2026-08-25) — see WALKTHROUGH.md §13
+
+All five fixes above were re-driven through real UI (not RPC) on this same substrate after
+merging: W2 via the same UIA `TreeWalker` methodology that found the original bug (now finds
+`InvokePattern` at depth 0, plus a genuine keyboard-Enter activation), W3 via a fresh throwaway
+repo (not the already-added, dedup-prone `e2e-fixture`), W4 via a real **"Bring local"** click on a
+live `Verified` queue entry with ground-truth confirmation (`git branch -a` shows the real fetched
+branch; `.gitconfig` gained no new `safe.directory` entry), W5 via a real **Reject** click with the
+daemon's own log line as ground truth (`by=os:mainguard`, `rejected_by=os:mainguard`), and W6 via
+Settings → Agent CLIs now showing the correct drift-aware label. All five hold. Full detail in
+WALKTHROUGH.md §13.
+
+### Note — repo-picker toolbar icons and category headers share W2's original bug, unfixed
+
+Found while re-verifying W2: the repo picker's own toolbar buttons (add/clone/auto-detect/refresh)
+and its category-header rows (`vs_code`, `Personal`, `Work`) still report the fallback
+`"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"` accessible name — the same defect class
+W2 fixed for the section rail and the repo rows themselves, just never extended to these. Not
+fixed this pass (outside the scope of the requested fix-verification); flagged for a follow-up
+pass through `RepoPickerWindow.axaml`'s toolbar and category-header templates.
