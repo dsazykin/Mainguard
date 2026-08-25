@@ -25,6 +25,11 @@ public static class WindowChromePolicy
     /// <summary>False on macOS, where the native traffic lights replace the hand-drawn buttons.</summary>
     public static bool CustomButtonsVisible => !System.OperatingSystem.IsMacOS();
 
+    /// <summary>False on macOS, where File/Repository/View/Help live in the system menu bar instead
+    /// of the hand-drawn title bar's hamburger-toggled toolbar — every item there is a menu or
+    /// flyout, so on macOS it would only duplicate what the native menu bar already offers.</summary>
+    public static bool InWindowMenuVisible => !System.OperatingSystem.IsMacOS();
+
     /// <summary>
     /// Title-bar padding: on macOS the leading edge starts past the traffic-light cluster
     /// (~70 px at 1x) so no content sits underneath it.

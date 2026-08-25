@@ -9,6 +9,7 @@ using Avalonia.Media;
 using Avalonia.Media.Immutable;
 using Avalonia.Threading;
 using Mainguard.Agents.Terminal;
+using Mainguard.UI.Theming;
 
 namespace Mainguard.Agents.UI.Controls;
 
@@ -63,6 +64,29 @@ public sealed class TerminalControl : Control, ITerminalView, ITerminalEngineCon
         // OSC 52: the jailed CLI's own "copy" (claude-code's login screen `c`) lands on the HOST
         // clipboard — the whole point of the sequence; without this the CLI says "copied" into the void.
         _screen.ClipboardCopyRequested += OnClipboardCopyRequested;
+    }
+
+    // The engine is dirty-flag driven (see the class doc) so a theme switch — which changes no
+    // PTY bytes, no size — never triggers a repaint on its own, leaving the old theme's colors on
+    // screen until the next byte/resize/scroll forces one. ResolveBrush/ResolveColor already
+    // re-read the current theme's tokens every call; the only missing piece is asking for a
+    // repaint when the theme actually changes.
+    protected override void OnAttachedToVisualTree(Avalonia.VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+        ThemeManager.ThemeChanged += OnThemeChanged;
+    }
+
+    protected override void OnDetachedFromVisualTree(Avalonia.VisualTreeAttachmentEventArgs e)
+    {
+        base.OnDetachedFromVisualTree(e);
+        ThemeManager.ThemeChanged -= OnThemeChanged;
+    }
+
+    private void OnThemeChanged()
+    {
+        _brushCache.Clear();
+        InvalidateVisual();
     }
 
     private void OnClipboardCopyRequested(string text) => _ = SetHostClipboardAsync(text);

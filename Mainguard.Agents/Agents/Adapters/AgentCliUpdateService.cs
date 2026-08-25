@@ -10,7 +10,13 @@ using Mainguard.Agents.Agents.Bootstrap;
 
 namespace Mainguard.Agents.Agents.Adapters;
 
-/// <summary>One available agent-CLI update: the effective installed pin vs the registry's latest.</summary>
+/// <summary>One available agent-CLI update: the effective pin this update would replace vs the
+/// registry's latest.</summary>
+/// <param name="InstalledVersion">The current EFFECTIVE PIN (<c>spec.Version</c>), not a probed
+/// installed version — this type has no probe access. It can be older than what is actually on disk
+/// (see <see cref="AgentCliOption.InstalledVersion"/>, W6); callers that need the truth on-disk
+/// version must cross-reference <see cref="AgentCliInstaller.ListAsync"/> themselves, as
+/// <c>ProDesktopHost.KickAgentCliUpdateCheck</c> does.</param>
 public sealed record AgentCliUpdate(string Id, string DisplayName, string InstalledVersion, string LatestVersion);
 
 /// <summary>

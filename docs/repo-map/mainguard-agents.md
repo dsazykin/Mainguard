@@ -1572,7 +1572,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
 
 - **`Services/`** — the merge/handoff services that live in `Mainguard.Agents`, not `Mainguard.Git` (they are agent-platform concerns, and `ForegroundMergeService` is the human-gated one):
   - `BranchHandoffService.cs` — `BringLocalService`, the cockpit's **Bring local**: fetches
-    `agent/<id>` from the SC-2 sync remote (explicit refspec, "couldn't find remote ref" classified
+    `agent/<id>` from the SC-2 sync remote via `UncRemoteTrust.RunGitTrustingRemote` (W4 — on Windows
+    that remote is a `\\wsl.localhost\…` UNC path git refuses as "dubious ownership" unless the mirror
+    is named in a FILE-scoped `safe.directory`; `-c` cannot do it) (explicit refspec, "couldn't find remote ref" classified
     as "the agent hasn't published it") then updates `refs/heads/agent/<id>` with a journaled
     (T-19 `CreateBranch`) NON-forced `git fetch . src:dst` — creates, fast-forwards, and REFUSES a
     diverged or checked-out branch with git's stderr; HEAD never moves. Every refusal is a phrased
@@ -1581,7 +1583,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `Mainguard.Tests/BringLocalServiceTests`.
   - `IForegroundMergeService.cs` / `ForegroundMergeService.cs` — the P2-10 Windows-side, human-gated
     "Merge to Main" (the only path to `Merged`). Fetches the SC-2-resolved sync remote
-    (`IAgentEnvironment.ResolveSyncRemote` — never a hardcoded literal), then merges `agent/<id>` onto
+    (`IAgentEnvironment.ResolveSyncRemote` — never a hardcoded literal) through
+    `UncRemoteTrust.RunGitTrustingRemote` (W4 UNC dubious-ownership), then merges `agent/<id>` onto
     main under the **A5 ref-level compare-and-swap** — `git merge --ff-only` IS the atomic CAS on
     `refs/heads/main` (a verified branch was keep-alive-rebased onto its main, so it fast-forwards; a
     moved main makes `--ff-only` refuse → the CAS loses → no merge → re-verify), **not** an
@@ -1600,7 +1603,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     (`IExternalPrMergeExecutor`), for an `External` (intake'd upstream PR) entry: the merge happens **on
     the host**, never by fast-forwarding the mirrored `agent/pr-<n>` branch — that local ff would
     "succeed" while the PR stayed open upstream, which is divergent state that reads as correct from
-    inside the app.
+    inside the app. Its sync-remote preflight fetch goes through `UncRemoteTrust.RunGitTrustingRemote`
+    (W4 UNC dubious-ownership); the separate `hostRemote` fetch stays a plain `GitService.RunGit`
+    because a host remote is never a UNC path.
     - `IHostPullRequestGateway`/`HostPullRequestGateway` is the deliberately two-method host seam (read a
       PR, merge a PR — so this path structurally cannot close/comment/review, P2-12 invariant 1) over the
       ONE audited T-23 transport; it is also what lets tests drive a fake host instead of live GitHub.

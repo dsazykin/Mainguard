@@ -120,9 +120,15 @@
   - **`Auth/TerminalLockRegistry.cs`** — the set of agents whose terminal input is severed (managed
     workers `Lock`; manual-mode unlocked).
   - **`Auth/ApproverIdentityResolver.cs`** —
-    `IApproverIdentityResolver`/`PeerCredentialIdentityResolver`: resolves the plan approver **from the
-    connection** (Linux euid / OS user under the loopback same-host trust boundary), never from the
-    request (SA-1/F2); the honest host-trust residual is documented in the file.
+    `IApproverIdentityResolver`/`PeerCredentialIdentityResolver`: resolves the plan approver from the
+    **daemon's own** OS user under the loopback same-host trust boundary, never from the request
+    (SA-1/F2); the honest host-trust residual (loopback TCP carries no peer credential, so the value is a
+    constant that attributes the host session and cannot tell two callers apart) is documented in the
+    file. **W5: one format on every platform — `os:<name>`.** The old Linux-only `uid:<euid>` branch was a
+    leftover of the retracted `SO_PEERCRED` framing and made Windows/WSL2 (daemon in-VM as
+    `User=mainguard`) render a bare `uid:1000`; `Environment.UserName` goes through `getpwuid`, not
+    `$USER`, so it is not env-spoofable. `uid:<euid>` remains only as the last resort for a euid with no
+    passwd entry, where `Environment.UserName` returns `""`.
 - **`Logging/SecretFieldMask.cs`** + **`SecretMaskingInterceptor.cs`** — the G-13 registry of
   `(message, field number)` secrets (every `// SECRET` proto field) and the access-log formatter that
   redacts them (value/length/prefix never logged). **`SecretMaskingInterceptor` now also records

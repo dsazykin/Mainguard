@@ -39,7 +39,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - **Live-reverified**, not just unit-tested: after the fix, `SpawnAgentAsync` and the whole
   spawn→verify cycle ran clean through the RPC harness (see WALKTHROUGH.md §3).
 
-### W2. [OPEN, real & reproducible] Repository-list rows are not activatable via UI Automation or synthetic mouse input
+### W2. [FIXED — commit `5204e97`] Repository-list rows are not activatable via UI Automation or synthetic mouse input
 
 - **Where:** the "Select Repo" picker (`RepoPickerWindow`), while trying to open the fixture repo
   through the real UI (not RPC) for the first time.
@@ -60,20 +60,33 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   `SendMessage(hwnd, BM_CLICK, ...)` worked for the native Win32 "Select folder" common dialog's
   own buttons. So the gap is specific to this list's row-level automation peers, not a broad
   environment problem.
-- **Not fixed this pass** — pivoted to the RPC harness (`ProvisionRepoAsync`/`SetActiveRepo`) for
+- **Originally deferred** — pivoted to the RPC harness (`ProvisionRepoAsync`/`SetActiveRepo`) for
   repo binding, exactly as the runbook recommends for setup steps ("prefer RPC... over GUI
-  automation, which is OS-specific and brittle"). A real fix means giving Avalonia's `ListBox` item
-  containers proper automation peers/keyboard activation, which is a UI-layer change, not a
-  same-pass patch.
+  automation, which is OS-specific and brittle").
+- **Fixed (commit `5204e97`).** The rows were never `ListBox` items — the template renders a plain
+  `Border`/`Grid` with raw pointer handlers, which is why nothing on the chain had a peer. The row
+  surface is now `Mainguard.App.Shell/Controls/RepoRow`, a `Grid` subclass carrying a
+  `ControlAutomationPeer` that reports `AutomationControlType.ListItem` and implements
+  `IInvokeProvider`, plus Enter/Space activation and `Focusable=true`. Not wrapped in a `Button`
+  on purpose: a Button captures the pointer press that the select-then-drag gesture depends on.
+  `Headless/RepoPickerAccessibilityTests` pins it, finding the row by walking up for an
+  `IInvokeProvider` exactly as this investigation's `TreeWalker` did.
 - Severity: medium — doesn't block the app (the RPC-equivalent action, opening the LAST repo via
   the reopen-prompt, does work — see W2 note below), but anyone driving this list by keyboard or
   assistive tech has no way to open a NEW entry after adding it, only ever the single
   most-recently-opened one via the reopen prompt.
 - **Note:** the "Reopen Last Repository?" prompt's own Dismiss/Reopen buttons DO work (they're real
-  named buttons with `InvokePattern`) — only the scrolling list of *all* repos lacks any activation
+  named buttons with `InvokePattern`) — only the scrolling list of *all* repos lacked any activation
   path.
+- **Related, found while fixing W2 and fixed with it:** every `Button.railItem` in the main window's
+  section rail (and the Pro agent rail) had no usable accessible name. Avalonia does not fall back to
+  `ToolTip.Tip`, and `ButtonAutomationPeer`'s `Content?.ToString()` fallback reported the literal
+  string `"Avalonia.Controls.Grid"` — which is why "no name at all" is *almost* right: there is a
+  name, it is junk, and a non-emptiness check would have called it healthy. Four
+  `AutomationProperties.Name` bindings fix it; the guard in `ActivityBarRenderHarness` rejects
+  `Avalonia.*` names rather than merely empty ones.
 
-### W3. [OPEN, cosmetic] Auto-detected repository entry mislabeled as `.git` instead of its folder name
+### W3. [FIXED, cosmetic] Auto-detected repository entry mislabeled as `.git` instead of its folder name
 
 - **Where:** the picker's "auto-detect repositories" folder-browse flow (its own toolbar icon,
   tooltip "Select folder for auto-detecting repositories").
@@ -89,10 +102,20 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   correctly-provisioned handle; this is purely a display-label bug, most plausibly the auto-detect
   scanner using the found `.git` directory's own name as the display name rather than its parent
   when the scan root and the repo root coincide.
-- **Not fixed this pass** — cosmetic, low severity, first reproduction (no prior art in the Mac
-  run's log — genuinely new, not a re-verification).
 - Severity: low — purely cosmetic; does not affect provisioning, verification, or merge (confirmed
   via the RPC harness, which addresses repos by handle/path, never by this display label).
+- **Root cause + fix (follow-up pass).** `MainWindowViewModel.ScanAutoDetectFolderAsync` walked only
+  the chosen root's children and grandchildren, never testing the root itself; `GitService
+  .IsGitRepository` (`LibGit2Sharp.Repository.IsValid`) also returns true for a bare `<repo>/.git`
+  path, so a root that was itself a repo produced exactly one "found repo": its own `.git` dir. Fix
+  lives in a new, independently testable `AutoDetectScan.cs`: the root is now returned under its own
+  folder name (no descent) when it is itself a repo; `GitService.IsGitRepository` also gained a
+  defensive guard refusing any path whose leaf is exactly `.git`, name-exact so the agent platform's
+  bare mirrors (`<hash>.git`) are unaffected.
+- Status: **FIXED** (`Mainguard.App.Shell/Services/AutoDetectScan.cs`,
+  `Mainguard.Git/Services/GitServices.cs`; regression pinned by
+  `Mainguard.Tests/AutoDetectScanTests.cs`, including
+  `ADotGitDirectory_IsNeverItselfARepository`).
 
 ---
 
@@ -102,7 +125,7 @@ Not yet started at the time of this log snapshot; the substrate-readiness blocke
 GUI-automation calibration (W2/W3 discovered along the way) consumed the setup phase. Tracked
 separately in WALKTHROUGH.md's running log as each one is actually re-driven live.
 
-### W4. [OPEN, HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
+### W4. [FIXED, was HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
 
 - **Where:** runbook §4 steps 3-4 (`BringBranchLocalAsync`/`ConfirmMergeAsync`), first attempt.
 - Every fetch against the daemon-provisioned sync remote (`mainguard-vm`, a
@@ -121,20 +144,51 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   path-normalization quirk with `\\wsl.localhost\...`-style UNC paths that defeats
   `safe.directory`'s exact-string match — a real, reproducible git behavior, not a fluke (retested
   across a fresh repo handle/mirror path with the same result).
-- **Not fixed this pass** — the real fix needs someone to either find the exact string
-  representation git will actually match for a WSL UNC path (may require testing quoted forms,
-  a trailing-slash variant, or the `\\wsl$\` legacy alias instead of `\\wsl.localhost\`), or avoid
-  UNC entirely (e.g. route the mirror through a mapped drive letter). This is exactly the kind of
-  fiddly, easy-to-get-subtly-wrong git/OS-path interaction the standing instructions say deserves a
-  dedicated pass rather than a guessed one-line patch.
-- **Workaround used for the rest of this walkthrough:** `git config --global --add safe.directory
-  '*'` on this machine only — a real (if narrow) security relaxation, not applied as a source
-  change, so every merge/fetch step in this log from here on ran with that override active.
 - Severity: **HIGH** — this blocks the single most important guarantee of the whole product (a
   verified agent branch actually reaching `main`) for every Windows+WSL2 user, on the very first
   merge, with an unhelpful raw git error and no Mainguard-authored guidance pointing at the fix.
 
-### W5. [OPEN, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
+#### RESOLVED — root-caused and fixed (`Mainguard.Git/Services/UncRemoteTrust.cs`)
+
+Measured live against git 2.45.1.windows.1 and the real MainguardEnv mirror. **Two independent
+findings**, the first of which invalidates the obvious fix:
+
+1. **`safe.directory` is ignored in command scope — including `*`.** Git reads it through
+   `read_very_early_config()`, which sets `ignore_cmdline = 1`. Measured, all against the same live
+   mirror with no config present: `git -c safe.directory=<exact path>` → **fails**;
+   `git -c safe.directory=*` → **fails**; `GIT_CONFIG_COUNT=1 KEY_0=safe.directory VALUE_0=<path>` →
+   **fails**; same with `*` → **fails**. Only file-based *system*/*global* scopes are honoured
+   (`GIT_CONFIG_SYSTEM` → **works**, `GIT_CONFIG_GLOBAL` → **works**, real `.gitconfig` → **works**).
+   So the tempting one-line `-c safe.directory=…` patch would have compiled, shipped, and changed
+   nothing.
+2. **Why the "character-identical" exact path didn't match.** It wasn't a UNC normalization quirk at
+   all. The value had reached `.gitconfig` under-escaped: the file held
+   `directory = \\wsl.localhost\\MainguardEnv\\…` (two leading backslashes), and since `\` is a
+   config-file **escape character**, git parsed that as `\wsl.localhost\MainguardEnv\…` — **one**
+   leading backslash, which is not a UNC path and can never match. `git config --get-all
+   safe.directory | cat -A` shows the single backslash; the side-by-side comparison that "looked
+   identical" was comparing the *escaped file text* against the *unescaped error text*. Re-adding the
+   same path so the file holds four leading backslashes makes it read back as `\\wsl.localhost\…` and
+   the fetch **succeeds**. The forward-slash spelling `//wsl.localhost/…` does **not** match — the
+   literal Windows spelling is required.
+
+**The fix**: `UncRemoteTrust.RunGitTrustingRemote(repoPath, remoteName, args…)` reads
+`remote.<name>.url` and, only when it is a UNC repository path, writes a throwaway config file naming
+that one exact directory in `safe.directory` and passes it as `GIT_CONFIG_SYSTEM` for that single
+child process. The shim `include.path`s the real system config so the user loses no setting, and
+**nothing is written to the user's own config at any scope** — no `*`, no global entry. Wired into
+the three client-side sync-remote fetches: `BringLocalService`, `ForegroundMergeService` (the merge
+path), and `ExternalPrMergeService`. Non-UNC remotes and non-Windows hosts take an early return to
+the unmodified `GitService.RunGit`.
+
+**Live verification** (`BringLocalService.BringLocal` driven as a real Windows process against the
+real mirror, with **zero** `safe.directory` entries in any scope — the `*` workaround removed):
+plain `git fetch` in the same fixture, same UNC path → `exit=128 fatal: detected dubious ownership`;
+`BringLocal(...)` immediately after → `Done=True`, `refs/heads/agent/025f8540…` created at the
+mirror's real tip `9cc1365 feat: add note module`. The global `*` relaxation this walkthrough relied
+on has been **removed from this machine** and is no longer needed.
+
+### W5. [FIXED, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
 
 - **Where:** `RejectEntryResponse.rejected_by` / `DiscardEntryResponse.discarded_by`.
 - On the Mac run this field read `os:danielsazykin` (ISSUES-LOG #13, 2026-08-20). On this machine
@@ -144,6 +198,27 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   Windows-side implementation) — flagged for follow-up. Correctness is unaffected (the value is
   still a real, stable actor identifier), only its human-readability regresses on this substrate.
 - Severity: low.
+- **Root cause + fix (follow-up pass).** `PeerCredentialIdentityResolver` branched on
+  `IsOSPlatform(Linux)` and returned `uid:{geteuid()}` there, `os:{Environment.UserName}`
+  everywhere else. On Windows/WSL2 mainguardd runs *inside* the VM, so it took the Linux branch;
+  the Mac daemon runs natively on a non-Linux host, so it took the other. **The framing above is
+  half wrong and worth correcting:** this is not an "identity regression", because the resolved
+  value is not the caller's identity on *either* platform — loopback TCP carries no peer
+  credential, so it is the daemon's own account, a constant. `os:danielsazykin` only looked like a
+  human because on macOS the daemon happens to run as one. The real defect was narrower and real:
+  the `uid:` shape was a leftover of the original (retracted in MG-16) `SO_PEERCRED` framing — a
+  peer credential is a *number* — and MG-16 fixed only the documentation, leaving the format. No
+  technical reason survived it: `Environment.UserName` resolves through `getpwuid`, not
+  `$USER`/`$LOGNAME` (verified — it ignores those even when set to another value, so it is not
+  env-spoofable), and the VM image gives the service account a real passwd entry
+  (`useradd … mainguard`) that the unit runs as (`User=mainguard`). Unified on `os:<name>` for all
+  platforms; on Windows/WSL2 this now reads `os:mainguard` — **the service account, not the
+  Windows user**, which is the honest answer and all this field ever meant. `uid:<euid>` survives
+  only as a last resort for a euid with no passwd entry, where `Environment.UserName` returns `""`
+  (verified) and a bare `os:` would be a blank actor.
+- Status: **FIXED** (`Mainguard.Server/Auth/ApproverIdentityResolver.cs`; regression pinned by
+  `ApproverIdentityDaemonDerivedTests.PeerCredentialResolver_ReportsTheDaemonsOwnIdentity_ConstantForEveryCaller`,
+  which previously asserted the `uid:` literal on Linux).
 
 ### Note — `full-test-matrix.md`'s G3 wording is stale, not the kill-switch code
 
@@ -184,3 +259,73 @@ click to register with this Avalonia app, on any element, including a plain, sim
 hamburger menu) tested specifically to rule out "maybe it's just list rows." Worth flagging for
 whoever picks up W2: if a future pass wants real mouse-driven testing (not UI-Automation-driven),
 this environment's `SendInput` path needs its own investigation first.
+
+### W6. [FIXED, MEDIUM — real, confirmed] Settings → Agent CLIs reports an installed CLI as "Not installed" when its installed version differs from the currently-pinned one
+
+- **Where:** Settings → Agent CLIs (P2-22 adapter-channel UI), real click.
+- Claude Code had been in active use all session (spawned, driven through a real task, verified,
+  merged — see §10 of WALKTHROUGH.md) at version **2.1.223** (confirmed via the daemon's own
+  `ListInstalledAdapters` RPC and the VM's `adapters/registry/claude-code.json`). The Settings
+  panel nonetheless showed **"Claude Code v2.1.218 — Not installed"** with an `Install` button.
+- **Root-caused:** `AgentCliInstaller.IsInstalledAsync`
+  (`Mainguard.Agents/Agents/Adapters/AgentCliInstaller.cs`) runs a health-probe command in the VM
+  and checks `probe.Stdout.Contains(spec.HealthProbe.ExpectedVersionSubstring, Ordinal)` — an
+  **exact substring match against the currently-offered manifest version** (2.1.218), not "is some
+  working version installed." Since the actually-installed 2.1.223 doesn't contain "2.1.218", the
+  probe fails and the CLI reads as not-installed, even though it demonstrably works (this same
+  install drove a real end-to-end agent cycle minutes earlier in this same session).
+- Severity: medium — cosmetic/confusing (a user could be told to "Install" something already
+  working, or click Install and have it no-op/reinstall unnecessarily), not a correctness or
+  security issue — the actually-installed adapter is unaffected and still fully functional.
+  - **Root cause + fix (follow-up pass).** Resolved the design question in favor of "installed" =
+  "a healthy version is present," with drift surfaced honestly rather than hidden. Exit status
+  (from the manifest's own verification notes) already distinguishes real absence and the known
+  `claude-code`/`opencode` npm-launcher-without-native-binary failure mode from a working CLI, so
+  the version-substring match wasn't load-bearing for that; it just also had to parse whichever of
+  the two real stdout shapes (`2.1.223 (Claude Code)` vs `codex-cli 0.145.0`) a given adapter uses.
+  `AgentCliInstaller.IsInstalledAsync` → `ProbeInstalledVersionAsync`, returning the parsed version
+  (or null) instead of a boolean exact-match. The Settings row now reads the truthful
+  `InstalledLabel` (e.g. "Installed — v2.1.223 is what runs here; this Mainguard build pins
+  v2.1.218") instead of a hardcoded "verified at the pinned version" string. `AnnotateUpdatesAsync`
+  (npm-registry-vs-pin) was deliberately left untouched — it isn't the drift mechanism and routing
+  drift through it would have offered an `Update` that `ApplyUpdateAsync` guarantees to refuse
+  (MG-14 blocks downgrades). `AdapterChannel.cs`'s install-idempotence/verification checks, which
+  correctly need an exact-pin match, are unaffected.
+- Status: **FIXED** (`Mainguard.Agents/Agents/Adapters/AgentCliInstaller.cs`,
+  `Mainguard.Agents.UI/ViewModels/AgentCliRowViewModel.cs`,
+  `Mainguard.Agents.UI/Views/AgentCliSettingsView.axaml`; regression pinned by
+  `Mainguard.Tests/AgentCliUiTests.cs`'s
+  `Settings_InstalledCliAheadOfThePin_ShouldReadAsInstalled_NotAsMissing`, plus three guard cases
+  proving the loosened predicate didn't take genuine-absence detection with it).
+
+### Live re-verification of W2-W6 (2026-08-25) — see WALKTHROUGH.md §13
+
+All five fixes above were re-driven through real UI (not RPC) on this same substrate after
+merging: W2 via the same UIA `TreeWalker` methodology that found the original bug (now finds
+`InvokePattern` at depth 0, plus a genuine keyboard-Enter activation), W3 via a fresh throwaway
+repo (not the already-added, dedup-prone `e2e-fixture`), W4 via a real **"Bring local"** click on a
+live `Verified` queue entry with ground-truth confirmation (`git branch -a` shows the real fetched
+branch; `.gitconfig` gained no new `safe.directory` entry), W5 via a real **Reject** click with the
+daemon's own log line as ground truth (`by=os:mainguard`, `rejected_by=os:mainguard`), and W6 via
+Settings → Agent CLIs now showing the correct drift-aware label. All five hold. Full detail in
+WALKTHROUGH.md §13.
+
+### Note — repo-picker toolbar icons and category headers shared W2's original bug — FIXED
+
+Found while re-verifying W2: the repo picker's own toolbar buttons (add category / create repo /
+clone / auto-detect select+scan), its "Add Repository" per-category `+` button, and its
+category-header rows (`vs_code`, `Personal`, `Work`) still reported the fallback
+`"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"` (or a bare, non-descriptive `"+"`)
+accessible name — the same defect class W2 fixed for the section rail and the repo rows
+themselves, just never extended to these.
+- **Fixed** in `Mainguard.App.Shell/Views/RepoPickerWindow.axaml`: added
+  `AutomationProperties.Name` to all five toolbar buttons (matching their existing `ToolTip.Tip`
+  text), the per-category `+` button ("Add Repository"), and the category-header `ToggleButton`
+  (bound to the category's `Name`, so it reads correctly for every category at every nesting depth
+  — the template is recursive).
+- Regression pinned by `RepoPickerAccessibilityTests.ToolbarButtonsAndCategoryHeader_ExposeRealAccessibleNames`,
+  which rejects the `Avalonia.*`/bare-`+` fallback specifically rather than merely checking for a
+  non-empty name — the same "looks applied but isn't" trap the original rail-button fix (W2) had to
+  guard against. Confirmed failing against the pre-fix XAML (`git stash` on just that file) with
+  exactly the found-instead list `[+, Avalonia.Controls.PathIcon ×6, Avalonia.Controls.Grid, +,
+  Cancel, Delete]`, passing after.

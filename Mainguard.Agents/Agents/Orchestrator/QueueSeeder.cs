@@ -244,16 +244,16 @@ public sealed class QueueSeeder
                 return "";
 
             case WorkerMergeState.Verifying:
-            {
-                // Started, deliberately NOT awaited: the hold keeps the run genuinely in flight. The
-                // task is retained on the plan so the clear path can drain it before Cancel (the
-                // row-resurrection ordering rule), and observed so a cancelled hold faults nothing.
-                var plan = _synthetic.TryGet(repoHandle, agentId)!;
-                var run = queue.RunVerificationAsync(agentId, CancellationToken.None);
-                plan.InFlight = run;
-                Observe(run);
-                return "";
-            }
+                {
+                    // Started, deliberately NOT awaited: the hold keeps the run genuinely in flight. The
+                    // task is retained on the plan so the clear path can drain it before Cancel (the
+                    // row-resurrection ordering rule), and observed so a cancelled hold faults nothing.
+                    var plan = _synthetic.TryGet(repoHandle, agentId)!;
+                    var run = queue.RunVerificationAsync(agentId, CancellationToken.None);
+                    plan.InFlight = run;
+                    Observe(run);
+                    return "";
+                }
 
             case WorkerMergeState.Verified:
                 await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
@@ -272,25 +272,25 @@ public sealed class QueueSeeder
                 return queue.TryDiscard(agentId, actor, spec.Reason, out var discardRefusal) ? "" : discardRefusal;
 
             case WorkerMergeState.StaleVerified:
-            {
-                await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
-
-                // A REAL out-of-band main move (a scenario the queue's reconcile explicitly
-                // supports): an empty commit on origin main, fetched into the mirror, reconciled by
-                // EnsureQueue — which fires the real NotifyMainMoved cascade. The seeded plan's
-                // StaleBehavior decides where the cascade leaves this entry; Hold is the resting
-                // StaleVerified this target exists for.
-                var refusal = AdvanceOriginMain(repoHandle, barePath, mainBranch,
-                    $"seed: advance main to stale {agentId}");
-                if (refusal is not null)
                 {
-                    return refusal;
-                }
+                    await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
 
-                _provisioner.EnsureQueue(repoHandle);
-                await queue.LastCascade.ConfigureAwait(false);
-                return "";
-            }
+                    // A REAL out-of-band main move (a scenario the queue's reconcile explicitly
+                    // supports): an empty commit on origin main, fetched into the mirror, reconciled by
+                    // EnsureQueue — which fires the real NotifyMainMoved cascade. The seeded plan's
+                    // StaleBehavior decides where the cascade leaves this entry; Hold is the resting
+                    // StaleVerified this target exists for.
+                    var refusal = AdvanceOriginMain(repoHandle, barePath, mainBranch,
+                        $"seed: advance main to stale {agentId}");
+                    if (refusal is not null)
+                    {
+                        return refusal;
+                    }
+
+                    _provisioner.EnsureQueue(repoHandle);
+                    await queue.LastCascade.ConfigureAwait(false);
+                    return "";
+                }
 
             case WorkerMergeState.Merged:
                 return await MergeSeededAsync(repoHandle, context, barePath, mainBranch, agentId, ct)

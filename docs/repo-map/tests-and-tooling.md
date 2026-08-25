@@ -81,6 +81,14 @@
     This is what caught the actual cause of the owner's clipped Toolchains page: `ScrollViewer.Padding`
     is subtracted on arrange but not on measure, so every settings page was measured 56px wider than the
     room it got — fixed by moving the gutter to a `Margin` on the content.
+  - **`Mainguard.Tests/AutoDetectScanTests.cs`** — pins `Mainguard.App.Shell/Services/AutoDetectScan`,
+    the sidebar auto-detect walk, over real git repos in a temp tree. Regression for walkthrough bug
+    W3 (a chosen root that IS a repository was added as an entry labelled ".git"): the
+    root-is-a-repository shortcut (own folder name, default category, trailing separator from the
+    folder picker tolerated) and `GitService.IsGitRepository` refusing a `.git` directory even though
+    `LibGit2Sharp.Repository.IsValid` accepts it — both halves asserted, so either one regressing
+    fails here. The unchanged common case is pinned alongside: top-level repos, one grouping level →
+    its own category, non-repos skipped, third level out of scope, missing root never throws.
   - **`Mainguard.Tests/AddReposToOsViewModelTests.cs`** — the post-setup Add-Repos-to-Mainguard-OS
     window over the same fake seams as `OobeRepoOnboardingTests`: honest empty scan, per-row failure
     isolation with a live retry, the named daemon-unreachable cause (never a crash), quiet idempotent
@@ -261,7 +269,14 @@
   `Headless/ReviewCockpitRenderHarness` (the real cockpit in every theme →
   `review_cockpit_<Theme>.png`); `Headless/MainWindowRailRenderHarness` — the integrated MainWindow
   with the section rail (repo section, coordinator section, collapsed rail) + the task-manager
-  resource monitor (rows + end-confirm) + the repo picker; `GitServicesTests`, `GitServiceTagTests`,
+  resource monitor (rows + end-confirm) + the repo picker;
+  `Headless/RepoPickerAccessibilityTests` (W2 — the repo-picker rows must be activatable by
+  something other than a mouse: it walks UP from the row's name `TextBlock` looking for an
+  `IInvokeProvider`, exactly as the Windows walkthrough's `TreeWalker` did, then asserts the peer is
+  a NAMED, keyboard-focusable `ListItem` and that both `Invoke()` and a focused Enter keypress select
+  and open that row's repository. Finding the row by pattern rather than by control type is what
+  makes it fail — not fail to compile — against a tree with no automation peer);
+  `GitServicesTests`, `GitServiceTagTests`,
   `GitServiceWorktreeTests`, `WorktreePorcelainParserTests`, `GitServiceDiffAgainstCommitTests`,
   `InteractiveRebaseServiceTests`, `PatchParserTests`, `PatchBuilderTests`,
   `GitServicePartialStagingTests`, `CommitGraphRouterTests`, `CommitGraphRouterWideDagTests` (the H2
@@ -1280,7 +1295,13 @@
   every theme × BYOK / OAuth / failed-sample / no-agents → `resources_*.png` in
   `artifacts_headless/`; the VM truths are asserted beside each capture so a blank surface cannot pass
   as green), and the `Headless/ActivityBarRenderHarness` (the per-theme
-  rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`). **`Terminal/`** is
+  rail PNGs + the Flight/Conversation dock workspace PNGs → `artifacts_headless/`, plus
+  `Rail_Buttons_AreNamedForAutomation_EvenWhenCollapsed` — every `Button.railItem` must expose a REAL
+  accessible name in the collapsed, icon-only state. Note the shape of that assertion: Avalonia's
+  `ButtonAutomationPeer` falls back to `Content?.ToString()`, so an unnamed rail button reports
+  `"Avalonia.Controls.Grid"` — a non-empty name that says nothing. Asserting non-emptiness alone
+  passed against the unfixed rail, so the test rejects `Avalonia.*` names AND requires each
+  `RailSections` label to appear). **`Terminal/`** is
   the P2-04 VT conformance & replay harness: `ITerminalEngineHarness.cs` (the engine-agnostic "feed
   bytes → read grid" seam + `GridSnapshot`/`GridCell`/`CellColor`/`CellAttrs` with a deterministic
   golden serializer and cell-by-cell diff), `InterimEngineHarness.cs` (adapts the P2-03 `VtScreen`

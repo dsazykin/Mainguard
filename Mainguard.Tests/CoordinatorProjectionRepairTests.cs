@@ -160,7 +160,7 @@ public sealed class CoordinatorProjectionRepairTests
 
         // The sweep's harvest half will fail against the uncontacted client; that is deliberate and must
         // not stop the repair, which happens before any per-agent call.
-        await adapter.PersistLiveAgentLoginsAsync(CancellationToken.None).ConfigureAwait(false);
+        await adapter.PersistLiveAgentLoginsAsync(CancellationToken.None);
 
         Assert.Equal(
             CoordinatorId,

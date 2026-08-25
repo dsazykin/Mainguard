@@ -229,7 +229,8 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         // A failed fetch is fatal, not cosmetic: whatever agent/<id> happens to be in this repo is then
         // an unknown-age copy, and merging it would land work the queue never verified.
         var syncRemote = _resolveSyncRemote(request.RepoHash);
-        var (fetchCode, _, fetchErr) = GitService.RunGit(request.RepoPath, "fetch", syncRemote.Name);
+        var (fetchCode, _, fetchErr) = UncRemoteTrust.RunGitTrustingRemote(
+            request.RepoPath, syncRemote.Name, "fetch", syncRemote.Name);
         if (fetchCode != 0)
         {
             return new ForegroundMergeResult(false, null, CasLost: false,

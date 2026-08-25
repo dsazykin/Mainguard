@@ -505,3 +505,218 @@ correction for whoever maintains it, and worth deciding deliberately (not by acc
 - Collapsed sidebar icons expose **no accessible name at all** to UI Automation (not even a
   fallback) — worth folding into W2's accessibility finding if someone picks that up: the gap isn't
   only list rows, collapsed nav icons lose their name too.
+
+## 10. The real-agent leg (runbook §5) — claude-code, end to end, with a correction to a standing assumption
+
+Selected `claude-code 2.1.223` (already installed) and clicked **Start coordinator** for real. It
+booted straight to **"Welcome back Daniel!"** — Opus 5 (1M context) · Claude Max ·
+`daniel.sazykin@gmail.com`'s Organization — **no login prompt at all**, confirming B2's login
+persistence: the OAuth session from a prior install/session was harvested and reused, exactly as
+`<data-root>/Keyring/cli_login_claude-code.*` is supposed to provide. The user's own request to
+"send a notification when you need my login" never triggered, because it wasn't needed.
+
+### Correction: real keyboard input DOES reach a live jailed PTY on this substrate
+
+The runbook states as fact: *"synthetic keystrokes do not reach a jailed PTY — a human at the
+keyboard, or `SendPromptAsync` [RPC], drives it."* First tried `SendPromptAsync` (RPC) with a real,
+verifiable task — it landed the text into the composer's buffer but **never submitted it** (no
+`\r`/Enter equivalent actually reached the CLI; the text just sat there unsent, including a second,
+literal, real-keyboard-typed line appended after it). Prompted directly by the user to actually test
+real UI input rather than accept the RPC shortcut: clicked into the composer (`SendInput` absolute
+click — coordinates verified against the visible prompt), typed the task via `SendUnicodeText`
+(`Win32.SendInput` with `KEYEVENTF_UNICODE`), then sent a real `VK_RETURN` via `SendVk`. **This
+worked** — the accumulated composer text (the RPC-sent task text plus the real-typed line) was
+submitted together, and Claude Code began working immediately: "I'll start by looking at the
+existing files" → read/edited `src/calc.js` and `test.js` → ran `node test.js` → hit two real
+**permission prompts** (shell-command approval for `git commit`, retried once after it
+self-diagnosed and fixed a missing git identity in the jail) — both answered via real keyboard
+(`1` + Enter) exactly as a human would. **The task completed for real**: `git log` on the agent's
+own branch (`agent/8697bec3d2a44dc8a9069c3302a5ae77`, mirror-side, confirmed via `wsl -d
+MainguardEnv`) shows commit `2cc06d9 feat: add subtract function to calc module`.
+
+**This is a genuine, substrate-relevant correction, not just a "yes it works" note**: whatever
+limitation the runbook's warning was written against (most plausibly the Mac run's own
+`osascript`/`System Events keystroke` mechanism — ISSUES-LOG #6 from that run documents exactly
+that path dropping characters, a different failure mode from "doesn't reach the PTY at all") does
+not apply to Windows `SendInput`-based keyboard delivery. **Mouse input is the one that never
+reaches this app** (confirmed repeatedly this session — clicks, double-clicks, and now scroll-wheel
+events all silently no-op), **keyboard input reaches it fine**, including into a live jailed PTY.
+Worth rewriting the runbook's C1 note to be substrate-specific rather than a blanket claim.
+
+### Verification — PASS
+
+`RunVerificationAsync` on the real commit: `Ran=true Passed=true Reason="verified against
+main@7400e105"`, queue state `Verified`, `CanMerge=true`. Matches runbook §5 step 5's assertion
+exactly (the only remaining unexercised half of that step is clicking Merge specifically on THIS
+entry through the UI rather than RPC — already proven mechanically identical to the F1 merge done
+earlier in this pass on a `scripted` entry; not repeated here to avoid re-litigating an already-
+confirmed mechanism, especially since the live queue rail had 8 entries and this one sat below the
+fold with no way to scroll to it via synthetic mouse wheel — see below).
+
+### Side finding: merge-queue rail scrolling is also blocked by the mouse-input limitation
+
+Wanted to scroll the 8-entry queue rail to reach the claude-code entry's Review button directly (it
+was correctly present — the header's count, "8 in play," matched exactly: the 6 visible rows + the
+current coordinator + the claude-code entry). `mouse_event(MOUSEEVENTF_WHEEL, ...)` produced no
+visible scroll — consistent with, not a new instance of, this session's standing finding that no
+synthetic mouse input of any kind reaches this app. Not logged as a new bug — filed under the same
+root cause as the rest of the mouse-input gap.
+
+## 11. Re-verifying the new queue-seeding feature (`feat/queue-seeding`, merged mid-session) on Windows/WSL2
+
+A third session pushed a brand-new dev-only merge-queue seeding tool to `port/macos` while this
+pass was running (§8 above — merged cleanly). Its own design doc
+(`docs/design/queue-seeding.md` §10) records a live macOS verification from earlier the same day.
+Since this is exactly the kind of cross-platform re-verification this whole pass is for, tested it
+here too:
+
+- **Enabling it required a systemd unit edit** (`MAINGUARD_ENABLE_QUEUE_SEEDING=1` on
+  `mainguardd.service` inside `MainguardEnv`, as root) — flagged to the user first since it's a
+  system-level change to the VM; approved, then reverted cleanly after testing.
+- **The daemon binary needed rebuilding first**: the running `mainguardd` predated the merge (no
+  seeding banner, no `QueueSeedingService`). Rebuilt `Mainguard.Pro.App` (which republishes the
+  in-VM daemon payload) and relaunched — the client's own tier-1 daemon auto-update mechanism
+  picked up the new binary automatically, confirmed via the boot log: `daemon auto-update:
+  refreshing skewed daemon`, followed by `QUEUE SEEDING ENABLED (MAINGUARD_ENABLE_QUEUE_SEEDING) —
+  dev only...` and `GetSeedingStatusResponse { enabled=True, seeded_entries=[] }`. **This is itself
+  a live confirmation of I2 (daemon auto-update)** — a real skewed→current daemon refresh, not
+  simulated.
+- **The dev card appeared correctly and immediately** — confirms the design doc's own noted fix
+  ("the panel's availability probe was one-shot and raced the app-spawned daemon's bind... now
+  retries transport errors patiently") holds on this substrate too: the card was there on first
+  load, no stale/absent card.
+- **"One of each" preset** (real click): seeded 7 entries in one shot, all landing in their
+  correct final states — `Working ×2, Verified ×2, AwaitingReview ×1, Rejected ×1, Discarded ×1` —
+  the rail's count went from `8 in play · 5 in history` to `13 in play · 6 in history`, arithmetic
+  consistent with Discarded leaving the rail (per E4) while Rejected stays visible (per E5).
+- **"Merge during verify" preset** (real click): `main` genuinely advanced (confirmed via the sha
+  shown changing, `27ee4817...`) — a real merge landed through the real three-step path while a
+  sibling held in a genuine synthetic-verification hold, exactly the race-window reproduction the
+  design doc describes.
+- **"Clear seeded"** (real click): *"Cleared 10 seeded entries."* and the rail census returned to
+  **exactly** `8 in play · 5 in history` — the precise pre-seeding baseline, byte-for-byte matching
+  the macOS run's own "restored EXACTLY to its pre-seeding... census" claim.
+- **Terminal correctly showed the honest detached-coordinator message** (matching Mac ISSUES-LOG
+  #12's fix family) after the daemon restart picked up the new binary: *"No terminal is attached to
+  this agent — nothing you type here reaches a CLI. This is usually a daemon restart... Restart the
+  agent to get a terminal you can talk to."*
+
+**No new bugs found in this feature on this substrate** — every claim in its own design doc's live
+macOS verification held here too. Cleaned up (`Clear seeded`, confirmed `Cleared 10`) and disabled
+the flag (reverted the systemd edit) before continuing.
+
+## 12. Priority 2/3 continued: Settings surfaces, themes, daemon logs, Agent CLIs
+
+**P2-21/22 scope check** (delegated research first): confirmed WebView2 is pure roadmap language
+with zero hits anywhere in `.cs`/`.axaml`/`.csproj` — nothing to test. Confirmed P2-21/22's own
+docs explicitly gate a full fresh-install/UAC/reboot-resume cycle and a real uninstall behind
+"required manual matrix — human approval required," and most of both plans now ships as the
+in-app `OobeWizardViewModel` wizard rather than the standalone installer exe. Chose the safe,
+already-provisioned-VM-only surface (Settings → Agent CLIs) over re-running system-level
+enablement or uninstall, consistent with that gating.
+
+**Settings dialog** (real clicks throughout): opened cleanly, all panels present (General,
+Keyboard Shortcuts, Accounts, SSH Keys, Git Profiles, AI Providers, Agent CLIs, Toolchains, PR
+Intake, Mainguard OS, Daemon Logs, About).
+
+- **"Stop Mainguard OS on exit" is a real, visible, checked-by-default checkbox** under
+  General → Window & Exit — this **corrects §9's framing**: the VM-teardown-on-Exit behavior isn't
+  a hidden substrate quirk, it's a legitimate, user-facing, already-implemented setting that
+  happened to default ON. The runbook's assumption ("the daemon and jails outlive the UI quit")
+  is still wrong as a cross-platform default claim, but a user hitting this can simply uncheck it —
+  worth softening the earlier finding's severity accordingly.
+- **H7 themes, closing the Mac run's gaps**: switched to **System** (correctly followed the OS's
+  dark preference, no defects) and **Daylight Loom** (correctly relit every panel — sidebar,
+  settings, merge-queue cards — to the light palette)., closing the two themes the Mac run flagged
+  as untested ("Atelier and a full System-theme check were not exercised").
+- **Found and fixed a real theme bug**: switching to Daylight Loom left the **Coordinator terminal
+  panel's background pure black** while everything else relit correctly. Root-caused (delegated,
+  then verified myself): neither `TerminalControl` nor `TerminalGridControl` (the two swappable PTY
+  rendering engines) subscribed to `ThemeManager.ThemeChanged`, unlike the sibling
+  `CommitGraphCanvas`, which does. Both already re-resolve their color tokens fresh on every
+  `Render()` call — the only missing piece was asking for a repaint when the theme changes, since
+  both engines are deliberately damage-driven (repaint only on new PTY bytes/resize/scroll, "never
+  on an idle timer"). **Fixed** in `ba28ae7`: added the same `OnAttachedToVisualTree`/
+  `OnDetachedFromVisualTree` + `ThemeManager.ThemeChanged` hook to both engines. New regression test
+  (`TerminalRenderHarness.ThemeSwitch_WhileAttached_RepaintsTerminalBackground`) drives an in-place
+  theme switch on an already-rendered control and compares encoded frame bytes — **confirmed failing
+  against the pre-fix code** (verified via `git stash` on just the two control files), **passing
+  after**.
+- **H4 Daemon Logs — confirmed working**: real journal entries streamed in (`mainguardd.Rpc`
+  RPC-begin/end lines), matching the matrix's "WSL reads journalctl" expectation exactly.
+- **P2-22 Agent CLIs panel** — found **W6**: reports the actively-in-use, already-installed
+  Claude Code (v2.1.223, confirmed via the daemon's own `ListInstalledAdapters`) as **"Not
+  installed"** alongside an `Install` button offering v2.1.218. Root-caused to
+  `AgentCliInstaller.IsInstalledAsync`'s health probe doing an **exact-substring version match**
+  against the currently-*offered* manifest version rather than "is any working version present" —
+  since the actual install (2.1.223) doesn't contain the substring "2.1.218", the probe reads false.
+  Logged as an open design question (should version drift from the pin surface as "update
+  available" instead of "not installed"?) rather than guessed at with a rushed fix.
+
+## 13. Fix-verification pass (2026-08-25) — all five follow-up fixes (W2-W6) confirmed live
+
+Rebuilt `Mainguard.Pro.App` in Release via the Windows-side `dotnet` (the daemon auto-update
+mechanism republished the in-VM binary automatically, same pattern as §11), relaunched, and
+re-drove every one of the five bugs fixed after the original findings report through real UI —
+not RPC — with a clean `.gitconfig` baseline (only the pre-existing `PiVision` `safe.directory`
+entry; nothing added by the earlier W4 investigation survived cleanup). Screenshots
+`followup-01` through `followup-28`.
+
+- **W2 (repo-list UIA gap) — CONFIRMED FIXED**, via the exact TreeWalker methodology the original
+  bug was found with: walked from the `e2e-fixture` row's own name upward looking for
+  `IInvokeProvider`. Found it at **depth 0** — the row itself is now `ControlType.ListItem`,
+  `IsKeyboardFocusable=True`, and supports `InvokePattern` directly (previously nothing on the
+  chain did). Followed with a genuine keyboard test: `SetFocus()` on the row via UIA, then a raw
+  `VK_RETURN` through `SendInput` — the picker closed and the main window showed "Opening
+  repository…", proving real Enter-key activation reaches the ViewModel end-to-end, not just that
+  the pattern exists.
+  - **New, adjacent finding (not part of W2's original scope):** the repo-picker's own toolbar
+    icons (add/clone/auto-detect/refresh) and the category-header rows (`vs_code`, `Personal`,
+    `Work`) still report the same junk `"Avalonia.Controls.PathIcon"` / `"Avalonia.Controls.Grid"`
+    fallback names W2 fixed for the section rail and repo rows — `AutomationProperties.Name` was
+    never added there. Same bug class, different location; not fixed this pass (out of scope of
+    the requested verification), logged for a follow-up.
+- **W3 (auto-detect mislabels root repo as `.git`) — CONFIRMED FIXED**, with a genuinely fresh
+  reproduction rather than relying on the stale `.git`-labeled entry already sitting in the list
+  from the original bug report (re-scanning the already-added `e2e-fixture` would have proven
+  nothing — dedup-by-path could mask a labeling bug). Created a brand-new throwaway repo
+  (`w3-repro-test`), pointed the auto-detect folder-browse dialog directly at its root (a real
+  Win32 dialog, navigated via Ctrl+L address bar + typed path + a real `Select Folder` click), and
+  the picker's list gained a new entry correctly labeled **`w3-repro-test`** — sitting right next
+  to the untouched stale `.git` entry from before the fix, a clean before/after contrast in the
+  same screenshot. Cleaned up afterward (real `Remove` → `Delete` confirm via the picker's own
+  context menu, then deleted the throwaway repo from disk).
+- **W4 (WSL2 UNC dubious-ownership) — CONFIRMED FIXED**, the highest-value check since this fix
+  touches the product's core guarantee. Opened the Review cockpit for a genuinely `Verified` queue
+  entry (`8697bec3d2a44dc8a9069c3302a5ae77`, left over from earlier this session, whose sandbox
+  jail container was still running 14+ hours later) and clicked the real **"Bring local"** button —
+  the exact operation `BringLocalService.BringLocal` performs, and the exact operation that used to
+  fail with `fatal: detected dubious ownership`. Result: a **green success toast**, then verified
+  against ground truth rather than trusting the toast color: `git branch -a` inside
+  `e2e-fixture` now shows both `agent/8697bec3d2a44dc8a9069c3302a5ae77` and
+  `remotes/mainguard-vm/agent/8697bec3d2a44dc8a9069c3302a5ae77` as real local refs, and
+  `.gitconfig`'s `safe.directory` list is **still just the one pre-existing `PiVision` entry** —
+  proving the trust really is applied per-invocation via the throwaway `GIT_CONFIG_SYSTEM` shim,
+  never persisted globally. (The cockpit's `Merge` button itself stayed disabled for this entry —
+  gated on an unrelated flagged-change-review acknowledgment policy, not a W4 concern; not chased
+  further since the fetch itself is the operation under test.)
+- **W5 (raw `uid:1000` actor identity) — CONFIRMED FIXED**, ground-truth verified via the real
+  daemon log rather than a UI label (the rail doesn't surface the actor string directly). Clicked
+  **Reject** on the same queue entry through the cockpit's real confirm flow; Settings → Daemon
+  Logs then showed, verbatim: `mainguardd.Merge[0] RejectEntry repo=... agent=8697bec3d2a44dc8a9069c3302a5ae77
+  by=os:mainguard reason=(none given)` and `RejectEntryResponse { rejected=True, ...,
+  rejected_by=os:mainguard, ... }` — the exact `os:<name>` shape the fix unifies on, resolved to
+  the VM's `mainguard` service account (not a bare `uid:1000`, not the Windows user — the honest
+  answer per the fix's own reasoning).
+- **W6 (Agent CLIs false "Not installed") — CONFIRMED FIXED.** Settings → Agent CLIs now shows
+  Claude Code with a green checkmark and **"Installed — v2.1.223 is what runs here; this Mainguard
+  build pins v2.1.218"**, plus a separate, honest **"Update available: v2.1.245"** annotation and an
+  "Update to v2.1.245" button — replacing the old false "Not installed" + `Install` button pairing.
+  Both the drift annotation and the registry-update annotation render correctly and distinctly on
+  the same row, exactly as the fix's design intended.
+
+**Net result: all 5 follow-up fixes (W2-W6) hold under genuine, real-UI-driven re-verification on
+this exact substrate** — two of them (W4, W5) additionally confirmed against ground truth (git
+refs on disk, the daemon's own structured log) rather than just a UI label or toast color. One new,
+narrow accessibility gap found in passing (repo-picker toolbar/category-header names) and logged,
+not fixed, since it's outside what was asked for this pass.
