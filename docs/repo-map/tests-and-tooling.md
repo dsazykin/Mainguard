@@ -81,6 +81,14 @@
     This is what caught the actual cause of the owner's clipped Toolchains page: `ScrollViewer.Padding`
     is subtracted on arrange but not on measure, so every settings page was measured 56px wider than the
     room it got — fixed by moving the gutter to a `Margin` on the content.
+  - **`Mainguard.Tests/AutoDetectScanTests.cs`** — pins `Mainguard.App.Shell/Services/AutoDetectScan`,
+    the sidebar auto-detect walk, over real git repos in a temp tree. Regression for walkthrough bug
+    W3 (a chosen root that IS a repository was added as an entry labelled ".git"): the
+    root-is-a-repository shortcut (own folder name, default category, trailing separator from the
+    folder picker tolerated) and `GitService.IsGitRepository` refusing a `.git` directory even though
+    `LibGit2Sharp.Repository.IsValid` accepts it — both halves asserted, so either one regressing
+    fails here. The unchanged common case is pinned alongside: top-level repos, one grouping level →
+    its own category, non-repos skipped, third level out of scope, missing root never throws.
   - **`Mainguard.Tests/AddReposToOsViewModelTests.cs`** — the post-setup Add-Repos-to-Mainguard-OS
     window over the same fake seams as `OobeRepoOnboardingTests`: honest empty scan, per-row failure
     isolation with a live retry, the named daemon-unreachable cause (never a crash), quiet idempotent

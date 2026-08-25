@@ -60,6 +60,18 @@ public class GitService : IGitService
             return false;
         }
 
+        // A repository is a WORKING directory, never the `.git` directory itself. libgit2's
+        // Repository.IsValid answers true for both — a raw `<repo>/.git` has exactly the
+        // HEAD/objects/refs signature it looks for — so any directory scan that walks a repo's
+        // children would otherwise register the git internals as a second repository whose folder
+        // name is literally ".git" (walkthrough bug W3). Only the exact name `.git` is rejected:
+        // a bare mirror such as `<hash>.git` (the agent platform's repos root) is a real repository.
+        var leaf = Path.GetFileName(Path.TrimEndingDirectorySeparator(path));
+        if (string.Equals(leaf, ".git", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         try
         {
             return Repository.IsValid(path);
