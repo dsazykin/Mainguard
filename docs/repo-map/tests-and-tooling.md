@@ -195,10 +195,13 @@
   `SeedingCompatibilityTests` (in `Mainguard.Server.Tests` — **the queue-seeding COMPATIBILITY
   CONTRACT**, docs/design/queue-seeding.md §9: the gate defaults seeding depends on pinned in BOTH
   directions (`ChangedTestCommandGate` passes unknown ids, `FlaggedChangeGate` MG-40-denies them —
-  i.e. seeding depends on the mirror-read half running); the coordinator-branch TRIPWIRE — fails the
-  moment a `WorkerPlanGate`/`*ReadinessTrigger` type lands, with the doc comment addressed to whoever
-  merges those branches (extend the seeder with plan seeding via `SeedEntrySpec`'s reserved fields
-  8/9, re-pin directly, only then remove); the lifecycle verbs refusing unknown ids; the boot-flag
+  i.e. seeding depends on the mirror-read half running); the coordinator plan gate in BOTH of its
+  directions, which replaced the pre-merge tripwire once its three demands were discharged —
+  `WorkerPlanGate.Allows` permissive for an id it never held, `MayAutoVerify` refusing that same id,
+  a `seed-` id armed on a REAL `WorkerReadinessTrigger` dropped `Ineligible` over a queue whose
+  runner throws if entered, and the structural pin that `QueueSeeder` holds no handle on the trigger
+  or the ref machinery (which is what carries the guarantee to the `with_plan` seeds, whose
+  `MayAutoVerify` legitimately answers true); the lifecycle verbs refusing unknown ids; the boot-flag
   wire contract — flagless daemon ⇒ UNIMPLEMENTED, flagged ⇒ status answers while a coordinator token
   stays PermissionDenied; and the `SeedingGateInterceptor` belt driven directly over a method-only
   `ServerCallContext`),
@@ -206,7 +209,9 @@
   seeding-enabled in-proc daemon + the shipped `ProvisionRepo`: batch seeding whose entries the
   ordinary `CanMerge` RPC then serves, the auto-provisioned verify config reported loudly, the
   over-the-wire stale pair whose merge really advances origin main, `PushCommits` invalidation,
-  the clear round-trip, and typed NOT_FOUND / InvalidArgument refusals),
+  the clear round-trip, the `with_plan`/`scope` plan dimension (both entries really held → presented →
+  approved, the in-scope one merging and the out-of-scope one blocked by the shipped `CanMerge`), and
+  typed NOT_FOUND / InvalidArgument refusals),
   `QueueSeederTests` (the dev-only queue seeder over a REAL bare mirror + REAL origin checkout — the
   `MergeQueueProvisionerTests` fixture posture, because the property under test is that seeded entries
   travel the production wiring. The sandbox engine THROWS on any use and `resolveContainerId` answers
@@ -217,8 +222,12 @@
   refusal and the drain-before-Cancel non-resurrection; the [Verified, Merged] stale pair whose merge
   REALLY advances origin main and whose cascade REALLY stales-and-holds the co-seed; the
   origin-not-on-main verbatim refusal with the lease handed back; `PushCommits` really invalidating a
-  Verified seed; the loud verify-config auto-provision; and the registry refusing a plan for a
-  non-`seed-` id),
+  Verified seed; the loud verify-config auto-provision; the registry refusing a plan for a
+  non-`seed-` id; and the PLAN dimension — a plan-less seed staying outside the gate
+  (permitted-to-merge / auto-verify-ineligible), `WithPlan` driving the real Hold → Present → Approve
+  walk with the seeded-authorship marker on the record, `Scope` arming the real out-of-approved-scope
+  must-ack item, clearing releasing the hold while keeping the decided plan as history, and a
+  plan-pipeline-less substrate refusing `WithPlan` while seeding nothing at all),
   `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
   older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
   the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake

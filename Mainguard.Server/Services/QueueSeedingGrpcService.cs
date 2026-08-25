@@ -177,6 +177,10 @@ public sealed class QueueSeedingGrpcService : QueueSeedingService.QueueSeedingSe
             VerificationFails: spec.VerificationFails,
             HoldSeconds: spec.HoldSeconds,
             StaleBehavior: stale,
-            Reason: spec.Reason ?? string.Empty);
+            Reason: spec.Reason ?? string.Empty,
+            WithPlan: spec.WithPlan,
+            // Null, not an empty list: "no scope was named" is what selects the seed's own path as the
+            // approved scope, whereas an empty TaskPlan.Scope puts EVERY file out of scope.
+            Scope: spec.Scope.Count > 0 ? spec.Scope.ToList() : null);
     }
 }

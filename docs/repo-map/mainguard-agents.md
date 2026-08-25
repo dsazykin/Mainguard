@@ -1258,8 +1258,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       out of a truncated diff hunk; and acks bind to the set's content hash, so client-composed items would
       address ids the gate never had. Neither tree yielding the blob ⇒ an `unreadable` unknown item, not
       silence. The optional `resolveApprovedPlan` (agentId → approved
-      `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it is **null in the daemon** because no
-      agent→approved-plan binding exists yet. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
+      `TaskPlan`) turns on the SA-1/F6 out-of-scope arm; it was **null in the daemon** while no
+      agent→approved-plan binding existed, and phase-2's worker-authored plans supply that binding
+      exactly (a plan is keyed by the worker's own agent id), so the composition root now passes it
+      reading APPROVED plans only — an agent with no approved plan still resolves null and is
+      classified as unmanaged, exactly as before. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
       ANDed in beside those two — the backstop that stops a worker whose own plan was never approved from
       merging, whatever it verified. All three gates are independent and all three must say yes, and the
       gate array is built ONCE (`var gates`) and passed to `MergeQueue`: composing a fresh literal at the
@@ -1271,7 +1274,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       EXACTLY at the composition root — measured, deleting `audit:`/`log:`/`publishAgentRef:` from
       `GatewayServiceRegistration` left 504 tests green, and each substitutes a weaker behaviour silently
       (a throwaway audit sink, no merge log, verification against whatever the ref watcher last saw).
-      `resolveApprovedPlan`'s absence is pinned as hard as the others' presence. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
+      `resolveApprovedPlan`'s presence — and the reason it stopped being absent — is pinned as hard as
+      the rest. **Restart-resume wiring:** `EnsureQueue`'s `created` branch
       now also calls `MergeQueue.BeginResumeAfterRestart`, passing `resolveContainerId` as the jail probe
       — this is `ResumeAfterRestartAsync`'s production caller. It is here rather than in
       `DaemonBootSequence` because a boot task would have nothing to iterate: the registry is empty at
@@ -1297,9 +1301,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       around a real `--ff-only` merge in the ORIGIN checkout; `StaleVerified` a real out-of-band
       empty commit on origin main + mirror refresh + the real cascade; `PushCommits` appends real
       commits and drives the real `NotifyNewCommits`; `ClearAsync` obeys the resurrection-ordering
-      rule (terminal-or-drained BEFORE `Cancel`) and is structurally `seed-`-scoped; every entry gets
-      a `queue_entry_seeded` audit event and an auto-provisioned `.mainguard/verify` is reported
-      loudly.)
+      rule (terminal-or-drained BEFORE `Cancel`, then the plan gate's hold) and is structurally
+      `seed-`-scoped; every entry gets a `queue_entry_seeded` audit event and an auto-provisioned
+      `.mainguard/verify` is reported loudly. `WithPlan`/`Scope` (design §9) drive the REAL phase-2
+      plan pipeline for the synthetic id — `WorkerPlanGate.Hold` → `PlanApprovalService.Present` →
+      `Approve` under the caller's own daemon-derived identity — so plan-gated merge and the SA-1/F6
+      out-of-approved-scope arm are seedable; the plan record carries `SeededPlanMarker`, authorship
+      being the one synthetic fact, and a substrate without the pipeline refuses `WithPlan` verbatim
+      having created nothing.)
     - `SyntheticVerificationRegistry.cs` (the dev-only queue-seeding seam's data:
       `SyntheticVerificationPlan` — requested outcome, clamped hold, `SyntheticStaleBehavior`
       Hold|Cascade, the hold-cancellation CTS and the retained in-flight task the clear path must await

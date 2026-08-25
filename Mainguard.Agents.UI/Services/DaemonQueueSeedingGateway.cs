@@ -55,6 +55,10 @@ public sealed class DaemonQueueSeedingGateway : IQueueSeedingGateway
             HoldSeconds = e.HoldSeconds,
             StaleBehavior = e.StaleBehavior,
             Reason = e.Reason,
+            WithPlan = e.WithPlan,
+            // Left empty when no scope was named: the daemon reads "empty" as "the seed's own path",
+            // which is what keeps a plan-gated seed in scope rather than flagging every file it touches.
+            Scope = { e.Scope ?? Array.Empty<string>() },
         }));
 
         // Seeding a Merged/StaleVerified spec does real git work; give the batch room.

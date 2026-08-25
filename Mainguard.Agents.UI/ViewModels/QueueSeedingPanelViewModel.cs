@@ -80,6 +80,19 @@ public partial class QueueSeedingPanelViewModel : ViewModelBase
         new SeedEntryRequestItem("Discarded", Reason: "seeded housekeeping"),
     });
 
+    /// <summary>
+    /// The phase-2 plan dimension, both arms (design §9): one plan-gated entry whose approved scope
+    /// COVERS what its commit touches — so it merges — and one whose approved scope does not, so the real
+    /// out-of-approved-scope item blocks it until a human acknowledges. Both plans are really held,
+    /// really presented and really approved; only their authorship is synthetic, and they say so.
+    /// </summary>
+    [RelayCommand]
+    private Task SeedPlanGatedAsync() => RunBatchAsync("Plan-gated", new[]
+    {
+        new SeedEntryRequestItem("Verified", WithPlan: true),
+        new SeedEntryRequestItem("Verified", WithPlan: true, Scope: new[] { "docs/" }),
+    });
+
     /// <summary>Overflow/ordering reproduction: a dozen verified entries at once.</summary>
     [RelayCommand]
     private Task SeedOverflowAsync() => RunBatchAsync("Overflow ×12",

@@ -28,6 +28,17 @@ public enum SeedFlavor
 /// <summary>One seed request: reach <paramref name="TargetState"/> for <paramref name="Count"/> new
 /// entries. Specs are processed in order, and order is semantic — a <c>Merged</c> spec really moves
 /// main and thereby really stales every earlier <c>Verified</c> seed.</summary>
+/// <param name="WithPlan">
+/// Drive the coordinator phase-2 plan pipeline for this entry FOR REAL (design §9): the daemon holds a
+/// task for the synthetic id, a plan is presented against the one-live-plan-per-worker invariant, and a
+/// human approval is recorded. Without it the seeded id is outside the plan gate entirely — which is the
+/// property the seeder has always relied on and which is now pinned directly.
+/// </param>
+/// <param name="Scope">
+/// <see cref="WithPlan"/> only: the approved plan's scope patterns. Null/empty means "the path this
+/// seed's own commit touches", so a plan-gated seed is IN scope and merges; any other pattern set puts
+/// the seeded commit outside its approved scope and arms the real out-of-approved-scope must-ack item.
+/// </param>
 public sealed record SeedSpec(
     WorkerMergeState TargetState,
     int Count = 1,
@@ -35,7 +46,9 @@ public sealed record SeedSpec(
     bool VerificationFails = false,
     int HoldSeconds = 0,
     SyntheticStaleBehavior StaleBehavior = SyntheticStaleBehavior.Hold,
-    string Reason = "");
+    string Reason = "",
+    bool WithPlan = false,
+    IReadOnlyList<string>? Scope = null);
 
 /// <summary>One seeded entry's outcome. <paramref name="Refusal"/> is empty on success and verbatim
 /// otherwise — refusal-as-response, per the wire convention of the queue's own RPCs.</summary>
@@ -79,27 +92,53 @@ public sealed class QueueSeeder
     /// the clear path's scope is this prefix, structurally.</summary>
     public const string IdPrefix = SyntheticVerificationRegistry.RequiredIdPrefix;
 
+    /// <summary>
+    /// The plan-record twin of <see cref="SyntheticVerificationPlan.SeededProvenanceMarker"/>. A seeded
+    /// plan is a REAL record with a REAL approval — the one thing it must never be mistaken for is a plan
+    /// a worker inspected a repository and wrote, so it says so about itself, in the field a human reads.
+    /// </summary>
+    public const string SeededPlanMarker = " [seeded — not authored by a worker]";
+
+    /// <summary>The coordinator id recorded on a seeded plan. Carries the <see cref="IdPrefix"/> so a
+    /// seeded plan is identifiable from the plan record alone, exactly as a seeded entry is from its id.</summary>
+    public const string SeededCoordinatorId = IdPrefix + "coordinator";
+
     private const string VerifyConfigContent = "true\n";
 
     private readonly MergeQueueProvisioner _provisioner;
     private readonly IMergeQueueRegistry _registry;
     private readonly SyntheticVerificationRegistry _synthetic;
     private readonly IRepoProvisioner _repos;
+    private readonly PlanApprovalService? _plans;
+    private readonly WorkerPlanGate? _planGate;
     private readonly Action<string>? _log;
 
+    /// <param name="plans">The phase-2 plan service. Optional, and its absence is a stated fact rather
+    /// than a default: a substrate without the coordinator plan pipeline can still seed everything else,
+    /// and a <c>WithPlan</c> spec there is REFUSED verbatim instead of quietly producing an entry that
+    /// looks plan-gated and is not.</param>
+    /// <param name="planGate">The daemon-side plan gate — the same instance the merge queue ANDs in as an
+    /// <see cref="IMergeGate"/>, or the hold this seeder arms would not be the hold anything reads.</param>
     public QueueSeeder(
         MergeQueueProvisioner provisioner,
         IMergeQueueRegistry registry,
         SyntheticVerificationRegistry synthetic,
         IRepoProvisioner repos,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        PlanApprovalService? plans = null,
+        WorkerPlanGate? planGate = null)
     {
         _provisioner = provisioner ?? throw new ArgumentNullException(nameof(provisioner));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _synthetic = synthetic ?? throw new ArgumentNullException(nameof(synthetic));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
+        _plans = plans;
+        _planGate = planGate;
         _log = log;
     }
+
+    /// <summary>True when this seeder can drive the phase-2 plan pipeline (both halves wired).</summary>
+    public bool CanSeedPlans => _plans is not null && _planGate is not null;
 
     // ---- Seeding ---------------------------------------------------------
 
@@ -169,11 +208,22 @@ public sealed class QueueSeeder
         var queue = context.Queue;
         var agentId = IdPrefix + Guid.NewGuid().ToString("N")[..8];
 
+        // Asked BEFORE anything is created: a plan-gated seed this substrate cannot drive must leave no
+        // branch, no registry row and no entry behind, because a half-seeded entry that LOOKS plan-gated
+        // and is not is exactly the fabricated state this tool refuses to produce.
+        if (spec.WithPlan && !CanSeedPlans)
+        {
+            return new SeedOutcome(agentId, "",
+                "this daemon has no coordinator plan pipeline wired — with_plan needs WorkerPlanGate "
+                + "and PlanApprovalService, so seed without it (the entry is then outside the plan gate, "
+                + "which is what an unheld id has always been)");
+        }
+
         try
         {
             // 1. The real branch — a real commit on top of the mirror's main, before anything else,
             //    so every downstream consumer (diff, review, merge) has real git data from the start.
-            CreateSeedBranch(barePath, mainBranch, agentId, spec.Flavor);
+            var seededPath = CreateSeedBranch(barePath, mainBranch, agentId, spec.Flavor);
 
             // 2. The synthetic-verification plan, registered BEFORE the entry can verify. For targets
             //    that never verify it is still registered: it marks the id as seeded to the requeue
@@ -185,10 +235,23 @@ public sealed class QueueSeeder
                 staleBehavior: spec.StaleBehavior);
             _synthetic.Register(repoHandle, agentId, plan);
 
-            // 3. The entry itself — the ONE creation path everything real uses.
+            // 3. The plan dimension, BEFORE the entry can verify or merge: the real
+            //    Hold → Present → Approve walk, so the plan gate holds this id for real and the
+            //    approved scope is in place by the time the verification arms the flagged-change review.
+            var planId = "";
+            if (spec.WithPlan)
+            {
+                var planRefusal = SeedPlan(agentId, spec, seededPath, actor, out planId);
+                if (planRefusal.Length > 0)
+                {
+                    return new SeedOutcome(agentId, "", planRefusal);
+                }
+            }
+
+            // 4. The entry itself — the ONE creation path everything real uses.
             _provisioner.EnsureEntry(repoHandle, agentId, MergeEntryOrigin.Local);
 
-            // 4. The audit record that this entry is synthetic input, before any further transition.
+            // 5. The audit record that this entry is synthetic input, before any further transition.
             _provisioner.AuditLog.Append(new AuditEvent(SeededEvent, new Dictionary<string, string>
             {
                 ["repo"] = repoHandle,
@@ -196,10 +259,12 @@ public sealed class QueueSeeder
                 ["by"] = string.IsNullOrWhiteSpace(actor) ? "unknown" : actor,
                 ["target_state"] = spec.TargetState.ToString(),
                 ["flavor"] = spec.Flavor.ToString(),
+                ["with_plan"] = spec.WithPlan ? "true" : "false",
+                ["plan_id"] = planId,
                 ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
             }));
 
-            // 5. The walk to the target — existing public transitions only.
+            // 6. The walk to the target — existing public transitions only.
             var refusal = await WalkToTargetAsync(repoHandle, context, barePath, mainBranch, agentId, spec, actor, ct)
                 .ConfigureAwait(false);
 
@@ -225,6 +290,64 @@ public sealed class QueueSeeder
 
     private static bool NeedsVerification(SeedSpec spec) => spec.TargetState is not
         (WorkerMergeState.Working or WorkerMergeState.Discarded);
+
+    /// <summary>
+    /// The phase-2 plan pipeline, driven for real for a synthetic id (design §9): the daemon
+    /// <see cref="WorkerPlanGate.Hold"/>s a task for this id exactly as the spawn path does, a plan is
+    /// <see cref="PlanApprovalService.Present"/>ed against the one-live-plan-per-worker invariant, and
+    /// the operator's own daemon-derived identity approves it. Every refusal along the way is returned
+    /// verbatim; nothing writes a plan record by hand.
+    ///
+    /// <para><b>What is synthetic here is authorship, and only authorship</b> — there is no worker, so no
+    /// worker inspected the repository and wrote this. The record says that of itself
+    /// (<see cref="SeededPlanMarker"/> in the two free-text fields a human reads, plus the
+    /// <see cref="SeededCoordinatorId"/>), for the same reason the seeded verification record labels its
+    /// own outcome: a plan that could pass for worker-authored is a forgery, not a fixture.</para>
+    ///
+    /// <para><b>The approval is NOT synthetic.</b> <paramref name="actor"/> is the daemon-derived operator
+    /// identity of the connection that called the seeding RPC — the same identity a real approval records
+    /// — and that person really did ask for this. Approving as "unknown" or as a fabricated human would be
+    /// an unattributable approval, which <see cref="PlanApprovalService.Approve"/> refuses outright.</para>
+    ///
+    /// <para><b>Default scope is the seed's own path</b> so <c>with_plan</c> alone changes nothing about
+    /// mergeability — it only moves the id inside the plan gate. Naming any other scope is what arms the
+    /// real out-of-approved-scope item, which is the arm this parameter exists to make seedable.</para>
+    /// </summary>
+    private string SeedPlan(string agentId, SeedSpec spec, string seededPath, string actor, out string planId)
+    {
+        planId = "";
+        var title = $"seeded plan-gated entry {agentId}";
+        var taskPrompt = $"the task withheld from {agentId}{SeededPlanMarker}";
+        var scope = spec.Scope is { Count: > 0 }
+            ? spec.Scope.Where(s => !string.IsNullOrWhiteSpace(s)).ToList()
+            : new List<string> { seededPath };
+
+        // (1) The daemon withholds the task — the same call AgentSpawnService makes on the spawn path.
+        _planGate!.Hold(agentId, SeededCoordinatorId, title, taskPrompt, budgetUsd: 0m);
+
+        // (2) The plan is presented, through the real invariant (a second Present for this id refuses).
+        var presented = _plans!.Present(
+            agentId,
+            SeededCoordinatorId,
+            title,
+            new TaskPlanFields(scope, "supplied by the queue seeder" + SeededPlanMarker,
+                "none — no work was executed" + SeededPlanMarker),
+            taskPrompt,
+            budgetUsd: 0m);
+        if (!presented.IsPresented || presented.PlanId is null)
+        {
+            _planGate.Forget(agentId);
+            return presented.Message;
+        }
+
+        // (3) ...and the operator who called the RPC approves it, attributably.
+        _plans.Approve(presented.PlanId, string.IsNullOrWhiteSpace(actor) ? "queue-seeder" : actor);
+        planId = presented.PlanId;
+        _log?.Invoke(
+            $"queue seeder agent={agentId} plan={planId} — the REAL plan pipeline ran "
+            + $"(held → presented → approved) over {scope.Count} scope pattern(s)");
+        return "";
+    }
 
     private async Task<string> WalkToTargetAsync(
         string repoHandle, MergeQueueContext context, string barePath, string mainBranch,
@@ -503,6 +626,13 @@ public sealed class QueueSeeder
             queue.Cancel(agentId);
             TryGit(barePath, out _, "update-ref", "-d", "refs/heads/agent/" + agentId);
             _synthetic.Remove(repoHandle, agentId);
+
+            // ...and (5) the plan gate's hold, exactly as AgentSpawnService.Forget drops a stopped
+            // worker's. The plan RECORD deliberately survives — a decided plan is history, and
+            // PlanApprovalService has no delete for the same reason the audit chain has none — but the
+            // id stops being a plan-gated worker, so it returns to the permissive/ineligible pair every
+            // other unheld id has. A seed id is a fresh guid, so nothing can inherit the leftover record.
+            _planGate?.Forget(agentId);
             cleared.Add(agentId);
         }
 
@@ -525,7 +655,9 @@ public sealed class QueueSeeder
     /// <c>refs/heads/agent/&lt;agentId&gt;</c>. Pure plumbing against the bare mirror — no worktree,
     /// no hooks (the mirror has none, and the hardened runner pins them off regardless).
     /// </summary>
-    private void CreateSeedBranch(string barePath, string mainBranch, string agentId, SeedFlavor flavor)
+    /// <returns>The repository path the commit touches — the flavor's own path, which is also the
+    /// default approved scope of a <c>WithPlan</c> seed (see <see cref="SeedPlan"/>).</returns>
+    private string CreateSeedBranch(string barePath, string mainBranch, string agentId, SeedFlavor flavor)
     {
         var mainSha = Run(barePath, "rev-parse", "--verify", mainBranch).Trim();
         var (path, content) = flavor switch
@@ -541,6 +673,7 @@ public sealed class QueueSeeder
         var commit = CommitOnTop(barePath, mainSha, path, content, $"seed: {agentId} ({flavor})");
         Run(barePath, "update-ref", "refs/heads/agent/" + agentId, commit,
             new string('0', 40)); // CAS from zero — the ref must not already exist
+        return path;
     }
 
     /// <summary>One plumbing commit: <paramref name="parentSha"/>'s tree with one blob added/replaced.</summary>
