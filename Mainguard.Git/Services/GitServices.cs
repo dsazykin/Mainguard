@@ -1259,9 +1259,15 @@ public class GitService : IGitService
         {
             // No stored token: let git use its own credential helpers / prompts,
             // but never block on an interactive prompt in the GUI.
+            var env = new Dictionary<string, string> { ["GIT_TERMINAL_PROMPT"] = "0" };
+            // Trusts a Windows UNC remote (the WSL2 sync-remote mirror) for this one invocation when
+            // it is the resolved remote — this path is reached whenever a caller lets ResolveRemoteName
+            // pick a remote rather than naming one explicitly (e.g. AutoFetchService), which can land on
+            // the sync remote in a repo where it is the only one configured. See UncRemoteTrust.
+            using var trust = UncRemoteTrust.PrepareTrustFor(repoPath, remoteName, env);
             try
             {
-                RunGitChecked(repoPath, new Dictionary<string, string> { ["GIT_TERMINAL_PROMPT"] = "0" }, args);
+                RunGitChecked(repoPath, env, args);
             }
             catch (AuthenticationRequiredException ex)
             {
@@ -1303,12 +1309,13 @@ public class GitService : IGitService
 
         fullArgs.AddRange(args);
 
-        var env = new Dictionary<string, string>
+        var tokenEnv = new Dictionary<string, string>
         {
             ["MAINGUARD_TOKEN"] = token,
             ["GIT_TERMINAL_PROMPT"] = "0"
         };
-        RunGitChecked(repoPath, env, fullArgs.ToArray());
+        using var tokenTrust = UncRemoteTrust.PrepareTrustFor(repoPath, remoteName, tokenEnv);
+        RunGitChecked(repoPath, tokenEnv, fullArgs.ToArray());
     }
 
     public (int? Ahead, int? Behind) GetAheadBehind(string repoPath)

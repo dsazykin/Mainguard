@@ -54,35 +54,53 @@ internal static class UncRemoteTrust
     internal static (int Code, string Out, string Err) RunGitTrustingRemote(
         string repoPath, string remoteName, params string[] args)
     {
+        var env = new Dictionary<string, string>();
+        using var trust = PrepareTrustFor(repoPath, remoteName, env);
+        return GitService.RunGit(repoPath, env, default, args);
+    }
+
+    /// <summary>
+    /// The reusable half of <see cref="RunGitTrustingRemote"/>: when <paramref name="remoteName"/>
+    /// resolves to a Windows UNC path, writes the throwaway shim and adds <c>GIT_CONFIG_SYSTEM</c> to
+    /// <paramref name="environment"/> so THIS ONE git invocation trusts it; returns null (and leaves
+    /// <paramref name="environment"/> untouched) for any other remote. Exists so the same trust can be
+    /// folded into <see cref="GitService"/>'s authenticated fetch/pull/push path — which already builds
+    /// its own environment dictionary for token injection — rather than only the three call sites that
+    /// invoke git directly.
+    ///
+    /// <para>Dispose the returned handle after the git process this environment was built for has
+    /// exited; it deletes the shim file. Safe to <c>using</c> even when null is returned.</para>
+    /// </summary>
+    internal static IDisposable? PrepareTrustFor(
+        string repoPath, string remoteName, IDictionary<string, string> environment)
+    {
         var trusted = ResolveUncRemoteUrl(repoPath, remoteName);
         if (trusted is null)
         {
-            return GitService.RunGit(repoPath, args);
+            return null;
         }
 
-        string? shim = null;
+        string shim;
         try
         {
             shim = WriteShim(ResolveSystemConfigPath(repoPath), trusted);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // A temp directory we cannot write to must not turn a fetch into a crash: run git
+            // A temp directory we cannot write to must not turn the operation into a crash: run git
             // unmodified and let its own dubious-ownership message reach the caller's phrased reason.
-            return GitService.RunGit(repoPath, args);
+            return null;
         }
 
-        try
+        environment["GIT_CONFIG_SYSTEM"] = shim;
+        return new ShimCleanup(shim);
+    }
+
+    private sealed class ShimCleanup(string path) : IDisposable
+    {
+        public void Dispose()
         {
-            return GitService.RunGit(
-                repoPath,
-                new Dictionary<string, string> { ["GIT_CONFIG_SYSTEM"] = shim },
-                default,
-                args);
-        }
-        finally
-        {
-            try { File.Delete(shim); } catch { /* best-effort; the temp dir is ours */ }
+            try { File.Delete(path); } catch { /* best-effort; the temp dir is ours */ }
         }
     }
 
