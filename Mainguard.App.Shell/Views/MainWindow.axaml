@@ -194,8 +194,11 @@
             <Grid ColumnDefinitions="Auto, *, Auto, Auto">
 
                 <!-- Left Side: hamburger toggle + compact (Branch/Sync/Repository) or expanded
-                     (Select Repo/Close Repository/Settings/Exit) — JetBrains-style, never both at once. -->
-                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                     (Select Repo/Close Repository/Settings/Exit) — JetBrains-style, never both at once.
+                     Hidden entirely on macOS (code-behind, WindowChromePolicy.InWindowMenuVisible):
+                     every item here is a menu/flyout, and on macOS those live in the native menu bar
+                     (Services.MacMenuBar) instead — Windows/Linux keep this exactly as before. -->
+                <StackPanel x:Name="MenuBarGroup" Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
 
                     <!-- Hamburger: a pure compact/expand toggle now — Select Repo (below) is what opens
                          the repo picker; the old File/Theme/Layout/Keyboard-Shortcuts/Window&amp;Exit

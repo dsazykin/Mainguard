@@ -23,6 +23,7 @@ public partial class MainWindow : Window
         // The macOS menu bar follows the key window — attach the shared menu (no-op elsewhere).
         Services.MacMenuBar.Attach(this);
         WindowButtonsPanel.IsVisible = Mainguard.UI.Views.WindowChromePolicy.CustomButtonsVisible;
+        MenuBarGroup.IsVisible = Mainguard.UI.Views.WindowChromePolicy.InWindowMenuVisible;
         TitleBarBorder.Padding = Mainguard.UI.Views.WindowChromePolicy.TitleBarPadding(TitleBarBorder.Padding);
         // Opt-in macOS vibrancy: attach in the ctor so EVERY construction path (client shell,
         // client first-run handoff, Pro startup handoff) applies the persisted preference.
