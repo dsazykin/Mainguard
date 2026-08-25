@@ -276,7 +276,8 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
         // The verified PR head. The intake materializes pull/<n>/head into the mirror as agent/pr-<n> and
         // re-queues the entry whenever that moves, so the mirror's tip IS the commit the queue verified —
         // which makes it the honest thing to compare the upstream head against.
-        var (fetchCode, _, fetchErr) = GitService.RunGit(request.RepoPath, "fetch", syncRemote.Name);
+        var (fetchCode, _, fetchErr) = UncRemoteTrust.RunGitTrustingRemote(
+            request.RepoPath, syncRemote.Name, "fetch", syncRemote.Name);
         if (fetchCode != 0)
         {
             return new Preflight(

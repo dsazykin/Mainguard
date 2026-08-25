@@ -500,6 +500,28 @@ The all-editions base. Git logic goes here.
       remote-tracking ref gets a local tracking branch created first).
     - `GetRemoteUrl` reads the **raw** `remote.<name>.url` config (not `Remotes[..].Url`) so a
       `url.insteadOf` transport rewrite never hides the user's real host from host/token detection.
+  - `UncRemoteTrust.cs` — lets ONE git invocation read a repository behind a Windows **UNC** path
+    (`\\server\share\…`) without touching the user's own git config (walkthrough W4). The WSL2
+    substrate's sync remote is a bare mirror inside the VM addressed as
+    `\\wsl.localhost\MainguardEnv\…\<hash>.git`; its files carry the VM's owner SID, so every client
+    fetch died with `fatal: detected dubious ownership in repository at '\\wsl.localhost\…'` and
+    blocked the first merge for every Windows+WSL2 user. `RunGitTrustingRemote(repoPath, remoteName,
+    args…)` reads `remote.<name>.url`, and **only** when it is a UNC repository path writes a
+    throwaway config file naming that one exact directory in `safe.directory`, passing it as
+    `GIT_CONFIG_SYSTEM` for that single child process; the shim `include.path`s the real system config
+    so nothing the user configured is lost. Everything else — an https host remote, the macOS
+    substrate's plain local mirror, any non-Windows host — takes an early return to an unmodified
+    `GitService.RunGit`. **Two measured git facts the implementation is built on** (git
+    2.45.1.windows.1, live against a real mirror): (1) `safe.directory` is read through
+    `read_very_early_config()`, which sets `ignore_cmdline = 1`, so `git -c safe.directory=…` and
+    `GIT_CONFIG_COUNT/KEY_0/VALUE_0` are **silently ignored — including the `*` wildcard**; only the
+    file-based system/global scopes work, which is why the obvious `-c` one-liner does nothing.
+    (2) The value must be the literal Windows spelling with backslashes (`\\wsl.localhost\…`);
+    the forward-slash form does not match, and because `\` is a config-file escape character every
+    backslash must be written doubled — an under-escaped value reads back as `\wsl.localhost\…` and
+    never matches while looking identical to git's error text. Pinned by
+    `Mainguard.Tests/UncRemoteTrustTests` (config-file round-trip against real git); the UNC failure
+    itself needs a live WSL2 VM and was verified by hand.
   - `BlameCache.cs` — bounded LRU (~32 entries) keyed `(repoPath, path, headSha)` for T-11 blame results; invalidated per-repo on `RepositoryWatcher.RepositoryChanged`. Never unbounded (rejection trigger).
   - `AutoFetchService.cs` — background auto-fetch (T-10). One `PeriodicTimer` loop over the watched
     repo set fetches (prune) off the UI thread on the `UserPreferences.AutoFetchMinutes` cadence (0 =

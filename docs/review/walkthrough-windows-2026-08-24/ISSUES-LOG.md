@@ -73,7 +73,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   named buttons with `InvokePattern`) — only the scrolling list of *all* repos lacks any activation
   path.
 
-### W3. [OPEN, cosmetic] Auto-detected repository entry mislabeled as `.git` instead of its folder name
+### W3. [FIXED, cosmetic] Auto-detected repository entry mislabeled as `.git` instead of its folder name
 
 - **Where:** the picker's "auto-detect repositories" folder-browse flow (its own toolbar icon,
   tooltip "Select folder for auto-detecting repositories").
@@ -89,10 +89,20 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   correctly-provisioned handle; this is purely a display-label bug, most plausibly the auto-detect
   scanner using the found `.git` directory's own name as the display name rather than its parent
   when the scan root and the repo root coincide.
-- **Not fixed this pass** — cosmetic, low severity, first reproduction (no prior art in the Mac
-  run's log — genuinely new, not a re-verification).
 - Severity: low — purely cosmetic; does not affect provisioning, verification, or merge (confirmed
   via the RPC harness, which addresses repos by handle/path, never by this display label).
+- **Root cause + fix (follow-up pass).** `MainWindowViewModel.ScanAutoDetectFolderAsync` walked only
+  the chosen root's children and grandchildren, never testing the root itself; `GitService
+  .IsGitRepository` (`LibGit2Sharp.Repository.IsValid`) also returns true for a bare `<repo>/.git`
+  path, so a root that was itself a repo produced exactly one "found repo": its own `.git` dir. Fix
+  lives in a new, independently testable `AutoDetectScan.cs`: the root is now returned under its own
+  folder name (no descent) when it is itself a repo; `GitService.IsGitRepository` also gained a
+  defensive guard refusing any path whose leaf is exactly `.git`, name-exact so the agent platform's
+  bare mirrors (`<hash>.git`) are unaffected.
+- Status: **FIXED** (`Mainguard.App.Shell/Services/AutoDetectScan.cs`,
+  `Mainguard.Git/Services/GitServices.cs`; regression pinned by
+  `Mainguard.Tests/AutoDetectScanTests.cs`, including
+  `ADotGitDirectory_IsNeverItselfARepository`).
 
 ---
 
@@ -102,7 +112,7 @@ Not yet started at the time of this log snapshot; the substrate-readiness blocke
 GUI-automation calibration (W2/W3 discovered along the way) consumed the setup phase. Tracked
 separately in WALKTHROUGH.md's running log as each one is actually re-driven live.
 
-### W4. [OPEN, HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
+### W4. [FIXED, was HIGH — real, blocking, confirmed] Git "dubious ownership" blocks every fetch/merge against the WSL2 UNC mirror remote
 
 - **Where:** runbook §4 steps 3-4 (`BringBranchLocalAsync`/`ConfirmMergeAsync`), first attempt.
 - Every fetch against the daemon-provisioned sync remote (`mainguard-vm`, a
@@ -121,18 +131,49 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   path-normalization quirk with `\\wsl.localhost\...`-style UNC paths that defeats
   `safe.directory`'s exact-string match — a real, reproducible git behavior, not a fluke (retested
   across a fresh repo handle/mirror path with the same result).
-- **Not fixed this pass** — the real fix needs someone to either find the exact string
-  representation git will actually match for a WSL UNC path (may require testing quoted forms,
-  a trailing-slash variant, or the `\\wsl$\` legacy alias instead of `\\wsl.localhost\`), or avoid
-  UNC entirely (e.g. route the mirror through a mapped drive letter). This is exactly the kind of
-  fiddly, easy-to-get-subtly-wrong git/OS-path interaction the standing instructions say deserves a
-  dedicated pass rather than a guessed one-line patch.
-- **Workaround used for the rest of this walkthrough:** `git config --global --add safe.directory
-  '*'` on this machine only — a real (if narrow) security relaxation, not applied as a source
-  change, so every merge/fetch step in this log from here on ran with that override active.
 - Severity: **HIGH** — this blocks the single most important guarantee of the whole product (a
   verified agent branch actually reaching `main`) for every Windows+WSL2 user, on the very first
   merge, with an unhelpful raw git error and no Mainguard-authored guidance pointing at the fix.
+
+#### RESOLVED — root-caused and fixed (`Mainguard.Git/Services/UncRemoteTrust.cs`)
+
+Measured live against git 2.45.1.windows.1 and the real MainguardEnv mirror. **Two independent
+findings**, the first of which invalidates the obvious fix:
+
+1. **`safe.directory` is ignored in command scope — including `*`.** Git reads it through
+   `read_very_early_config()`, which sets `ignore_cmdline = 1`. Measured, all against the same live
+   mirror with no config present: `git -c safe.directory=<exact path>` → **fails**;
+   `git -c safe.directory=*` → **fails**; `GIT_CONFIG_COUNT=1 KEY_0=safe.directory VALUE_0=<path>` →
+   **fails**; same with `*` → **fails**. Only file-based *system*/*global* scopes are honoured
+   (`GIT_CONFIG_SYSTEM` → **works**, `GIT_CONFIG_GLOBAL` → **works**, real `.gitconfig` → **works**).
+   So the tempting one-line `-c safe.directory=…` patch would have compiled, shipped, and changed
+   nothing.
+2. **Why the "character-identical" exact path didn't match.** It wasn't a UNC normalization quirk at
+   all. The value had reached `.gitconfig` under-escaped: the file held
+   `directory = \\wsl.localhost\\MainguardEnv\\…` (two leading backslashes), and since `\` is a
+   config-file **escape character**, git parsed that as `\wsl.localhost\MainguardEnv\…` — **one**
+   leading backslash, which is not a UNC path and can never match. `git config --get-all
+   safe.directory | cat -A` shows the single backslash; the side-by-side comparison that "looked
+   identical" was comparing the *escaped file text* against the *unescaped error text*. Re-adding the
+   same path so the file holds four leading backslashes makes it read back as `\\wsl.localhost\…` and
+   the fetch **succeeds**. The forward-slash spelling `//wsl.localhost/…` does **not** match — the
+   literal Windows spelling is required.
+
+**The fix**: `UncRemoteTrust.RunGitTrustingRemote(repoPath, remoteName, args…)` reads
+`remote.<name>.url` and, only when it is a UNC repository path, writes a throwaway config file naming
+that one exact directory in `safe.directory` and passes it as `GIT_CONFIG_SYSTEM` for that single
+child process. The shim `include.path`s the real system config so the user loses no setting, and
+**nothing is written to the user's own config at any scope** — no `*`, no global entry. Wired into
+the three client-side sync-remote fetches: `BringLocalService`, `ForegroundMergeService` (the merge
+path), and `ExternalPrMergeService`. Non-UNC remotes and non-Windows hosts take an early return to
+the unmodified `GitService.RunGit`.
+
+**Live verification** (`BringLocalService.BringLocal` driven as a real Windows process against the
+real mirror, with **zero** `safe.directory` entries in any scope — the `*` workaround removed):
+plain `git fetch` in the same fixture, same UNC path → `exit=128 fatal: detected dubious ownership`;
+`BringLocal(...)` immediately after → `Done=True`, `refs/heads/agent/025f8540…` created at the
+mirror's real tip `9cc1365 feat: add note module`. The global `*` relaxation this walkthrough relied
+on has been **removed from this machine** and is no longer needed.
 
 ### W5. [FIXED, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
 
@@ -206,7 +247,7 @@ hamburger menu) tested specifically to rule out "maybe it's just list rows." Wor
 whoever picks up W2: if a future pass wants real mouse-driven testing (not UI-Automation-driven),
 this environment's `SendInput` path needs its own investigation first.
 
-### W6. [OPEN, MEDIUM — real, confirmed] Settings → Agent CLIs reports an installed CLI as "Not installed" when its installed version differs from the currently-pinned one
+### W6. [FIXED, MEDIUM — real, confirmed] Settings → Agent CLIs reports an installed CLI as "Not installed" when its installed version differs from the currently-pinned one
 
 - **Where:** Settings → Agent CLIs (P2-22 adapter-channel UI), real click.
 - Claude Code had been in active use all session (spawned, driven through a real task, verified,
@@ -220,11 +261,26 @@ this environment's `SendInput` path needs its own investigation first.
   working version installed." Since the actually-installed 2.1.223 doesn't contain "2.1.218", the
   probe fails and the CLI reads as not-installed, even though it demonstrably works (this same
   install drove a real end-to-end agent cycle minutes earlier in this same session).
-- **Not fixed this pass** — this is a genuine design question, not a one-line patch: should
-  "installed" mean "any healthy version is present" (with drift-from-pin surfaced separately, e.g.
-  "installed (v2.1.223) — v2.1.218 recommended"), or does exact-version matching exist deliberately
-  (e.g. to force a re-install/update after a pin bump, for integrity reasons)? Flagging for a
-  deliberate decision rather than guessing.
 - Severity: medium — cosmetic/confusing (a user could be told to "Install" something already
   working, or click Install and have it no-op/reinstall unnecessarily), not a correctness or
   security issue — the actually-installed adapter is unaffected and still fully functional.
+  - **Root cause + fix (follow-up pass).** Resolved the design question in favor of "installed" =
+  "a healthy version is present," with drift surfaced honestly rather than hidden. Exit status
+  (from the manifest's own verification notes) already distinguishes real absence and the known
+  `claude-code`/`opencode` npm-launcher-without-native-binary failure mode from a working CLI, so
+  the version-substring match wasn't load-bearing for that; it just also had to parse whichever of
+  the two real stdout shapes (`2.1.223 (Claude Code)` vs `codex-cli 0.145.0`) a given adapter uses.
+  `AgentCliInstaller.IsInstalledAsync` → `ProbeInstalledVersionAsync`, returning the parsed version
+  (or null) instead of a boolean exact-match. The Settings row now reads the truthful
+  `InstalledLabel` (e.g. "Installed — v2.1.223 is what runs here; this Mainguard build pins
+  v2.1.218") instead of a hardcoded "verified at the pinned version" string. `AnnotateUpdatesAsync`
+  (npm-registry-vs-pin) was deliberately left untouched — it isn't the drift mechanism and routing
+  drift through it would have offered an `Update` that `ApplyUpdateAsync` guarantees to refuse
+  (MG-14 blocks downgrades). `AdapterChannel.cs`'s install-idempotence/verification checks, which
+  correctly need an exact-pin match, are unaffected.
+- Status: **FIXED** (`Mainguard.Agents/Agents/Adapters/AgentCliInstaller.cs`,
+  `Mainguard.Agents.UI/ViewModels/AgentCliRowViewModel.cs`,
+  `Mainguard.Agents.UI/Views/AgentCliSettingsView.axaml`; regression pinned by
+  `Mainguard.Tests/AgentCliUiTests.cs`'s
+  `Settings_InstalledCliAheadOfThePin_ShouldReadAsInstalled_NotAsMissing`, plus three guard cases
+  proving the loosened predicate didn't take genuine-absence detection with it).

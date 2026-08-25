@@ -40,9 +40,12 @@ public sealed class BringLocalService
         var branch = $"agent/{agentId}";
 
         // (1) Fetch exactly this branch — an explicit refspec, so an unrelated fetch failure elsewhere
-        // in the remote can't be mistaken for this branch being absent.
-        var (fetchCode, _, fetchErr) = GitService.RunGit(
-            repoPath, "fetch", syncRemoteName, $"+refs/heads/{branch}:refs/remotes/{syncRemoteName}/{branch}");
+        // in the remote can't be mistaken for this branch being absent. Routed through
+        // UncRemoteTrust because on Windows the sync remote is a \\wsl.localhost\… UNC path into the
+        // VM, which git refuses as "dubious ownership" unless the mirror is named in a file-scoped
+        // safe.directory (see that class for why -c cannot do this).
+        var (fetchCode, _, fetchErr) = UncRemoteTrust.RunGitTrustingRemote(
+            repoPath, syncRemoteName, "fetch", syncRemoteName, $"+refs/heads/{branch}:refs/remotes/{syncRemoteName}/{branch}");
         if (fetchCode != 0)
         {
             // An explicit refspec for a branch the remote doesn't have fails the whole fetch — that
