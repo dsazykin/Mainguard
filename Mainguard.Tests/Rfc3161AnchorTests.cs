@@ -103,7 +103,7 @@ public sealed class Rfc3161AnchorTests : IDisposable
     }
 
     [Fact]
-    public void AnchorValidation_RejectsGarbageTokens_AndWrongHashes()
+    public async Task AnchorValidation_RejectsGarbageTokens_AndWrongHashes()
     {
         Assert.False(Rfc3161AnchorValidation.Validate(new byte[] { 1, 2, 3 }, new string('a', 64), out _));
         Assert.False(Rfc3161AnchorValidation.Validate(Array.Empty<byte>(), new string('a', 64), out _));
@@ -115,7 +115,7 @@ public sealed class Rfc3161AnchorTests : IDisposable
         log.Append("test_event", new { n = 1 }, "tester");
         queue.EnqueueIfDue(log);
         var scripted = new ScriptedTsaClient(); // returns bytes that are NOT a decodable token
-        queue.ProcessPendingAsync(scripted, CancellationToken.None).GetAwaiter().GetResult();
+        await queue.ProcessPendingAsync(scripted, CancellationToken.None);
         Assert.Single(queue.ValidateStoredAnchors());
     }
 

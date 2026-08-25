@@ -173,19 +173,19 @@ public sealed class SeedingCompatibilityTests
     /// daemon cannot demonstrate the belt — the primary answers first with UNIMPLEMENTED).
     /// </summary>
     [Fact]
-    public void TheSeedingBelt_RefusesThePrefix_WhenDisabled()
+    public async Task TheSeedingBelt_RefusesThePrefix_WhenDisabled()
     {
         var interceptor = new SeedingGateInterceptor(new QueueSeedingOptions(Enabled: false));
         var context = new MethodOnlyServerCallContext(SeedingGateInterceptor.MethodPrefix + "SeedQueueEntries");
 
-        var ex = Assert.Throws<RpcException>(() => interceptor.UnaryServerHandler<object, object>(
-            new object(), context, (_, _) => Task.FromResult(new object())).GetAwaiter().GetResult());
+        var ex = await Assert.ThrowsAsync<RpcException>(() => interceptor.UnaryServerHandler<object, object>(
+            new object(), context, (_, _) => Task.FromResult(new object())));
         Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
 
         // ...and it is a PREFIX gate: every other service flows through untouched on the same daemon.
         var other = new MethodOnlyServerCallContext("/mainguard.v1.MergeQueueService/CanMerge");
-        var result = interceptor.UnaryServerHandler<object, object>(
-            new object(), other, (_, _) => Task.FromResult(new object())).GetAwaiter().GetResult();
+        var result = await interceptor.UnaryServerHandler<object, object>(
+            new object(), other, (_, _) => Task.FromResult(new object()));
         Assert.NotNull(result);
     }
 
