@@ -99,11 +99,19 @@ public sealed class UncRemoteTrustTests : IDisposable
 
         var env = new Dictionary<string, string> { ["GIT_CONFIG_SYSTEM"] = shim };
 
+        // mainguard.probe only reaches the shim through its [include], and --system --get does NOT
+        // follow includes (measured: it reads only the target file's own directly-defined entries) —
+        // so this one needs the ordinary merged resolution, unscoped.
         var (probeCode, probe, _) = GitService.RunGit(dir, env, default, "config", "--get", "mainguard.probe");
         Assert.Equal(0, probeCode);
         Assert.Equal("preserved", probe.Trim());
 
-        var (trustCode, trust, _) = GitService.RunGit(dir, env, default, "config", "--get", "safe.directory");
+        // safe.directory IS defined directly in the shim, so --system (as the sibling round-trip test
+        // above uses) is both correct and necessary here: an unscoped --get resolves across every
+        // config scope, and a CI runner's own global safe.directory=* (actions/checkout trusts the
+        // whole workspace that way) outranks GIT_CONFIG_SYSTEM and would mask the shim's value with
+        // the runner's, not this fix's.
+        var (trustCode, trust, _) = GitService.RunGit(dir, env, default, "config", "--system", "--get", "safe.directory");
         Assert.Equal(0, trustCode);
         Assert.Equal(Unc, trust.Trim());
     }
