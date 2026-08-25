@@ -1,10 +1,13 @@
 using System;
 using System.IO;
+using System.Linq;
 using System.Threading;
+using Avalonia.Automation.Peers;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Mock;
 using Mainguard.Agents.UI.ViewModels;
@@ -85,6 +88,60 @@ public class ActivityBarRenderHarness
             Settle();
             win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), $"agent_workspace_{name}.png"));
             win.Content = null;
+            HarnessHygiene.Teardown(win);
+        }
+    }
+
+    // W2 sibling: a COLLAPSED rail is icon-only, and Avalonia never falls back to ToolTip.Tip for the
+    // accessible name (nor to a Grid/PathIcon Content), so every rail button announced nothing at all
+    // to a screen reader. Each one now carries AutomationProperties.Name from its ViewModel, which is
+    // why this holds in both rail states — and this test is what keeps it from silently regressing.
+    [AvaloniaFact]
+    public void Rail_Buttons_AreNamedForAutomation_EvenWhenCollapsed()
+    {
+        Mainguard.App.Shell.App.Edition = new Mainguard.Agents.UI.Editions.ProManifest();
+        Mainguard.Agents.UI.Editions.ProComposition.OrchestratorServicesFactory =
+            () => OrchestratorServices.FromSingle(new MockOrchestrator());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        using var seed = HarnessHygiene.SeedViewAssemblies(Mainguard.App.Shell.App.Edition);
+
+        var vm = new MainWindowViewModel();
+        var win = new MainWindow { DataContext = vm, Width = 1420, Height = 920 };
+        win.Show();
+        Settle();
+        try
+        {
+            vm.ToggleRailCommand.Execute(null); // icons only — the state the gap was reported in
+            Settle();
+            Assert.False(vm.IsRailExpanded);
+
+            var railButtons = win.GetVisualDescendants().OfType<Button>()
+                .Where(b => b.Classes.Contains("railItem"))
+                .ToArray();
+            Assert.NotEmpty(railButtons);
+
+            var names = railButtons
+                .Select(b => ControlAutomationPeer.CreatePeerForElement(b).GetName())
+                .ToArray();
+
+            // "Non-empty" is NOT the bar. Avalonia's ButtonAutomationPeer falls back to
+            // Content?.ToString(), so an unnamed rail button reports the literal string
+            // "Avalonia.Controls.Grid" — a name that exists and says nothing. An earlier version of
+            // this very test asserted only non-emptiness and passed against the unfixed rail.
+            var junk = names
+                .Where(n => string.IsNullOrWhiteSpace(n) || n!.StartsWith("Avalonia.", StringComparison.Ordinal))
+                .ToArray();
+            Assert.True(junk.Length == 0,
+                $"{junk.Length} of {railButtons.Length} rail buttons expose no real accessible name " +
+                $"(Avalonia's Content.ToString() fallback): {string.Join(" | ", junk)}");
+
+            // And the name must be the RIGHT text — the label the user would read when expanded.
+            foreach (var section in vm.RailSections)
+                Assert.Contains(section.Label, names);
+        }
+        finally
+        {
+            if (!vm.IsRailExpanded) vm.ToggleRailCommand.Execute(null); // restore the persisted default
             HarnessHygiene.Teardown(win);
         }
     }

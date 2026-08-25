@@ -39,7 +39,7 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
 - **Live-reverified**, not just unit-tested: after the fix, `SpawnAgentAsync` and the whole
   spawn→verify cycle ran clean through the RPC harness (see WALKTHROUGH.md §3).
 
-### W2. [OPEN, real & reproducible] Repository-list rows are not activatable via UI Automation or synthetic mouse input
+### W2. [FIXED — commit `5204e97`] Repository-list rows are not activatable via UI Automation or synthetic mouse input
 
 - **Where:** the "Select Repo" picker (`RepoPickerWindow`), while trying to open the fixture repo
   through the real UI (not RPC) for the first time.
@@ -60,18 +60,31 @@ not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit
   `SendMessage(hwnd, BM_CLICK, ...)` worked for the native Win32 "Select folder" common dialog's
   own buttons. So the gap is specific to this list's row-level automation peers, not a broad
   environment problem.
-- **Not fixed this pass** — pivoted to the RPC harness (`ProvisionRepoAsync`/`SetActiveRepo`) for
+- **Originally deferred** — pivoted to the RPC harness (`ProvisionRepoAsync`/`SetActiveRepo`) for
   repo binding, exactly as the runbook recommends for setup steps ("prefer RPC... over GUI
-  automation, which is OS-specific and brittle"). A real fix means giving Avalonia's `ListBox` item
-  containers proper automation peers/keyboard activation, which is a UI-layer change, not a
-  same-pass patch.
+  automation, which is OS-specific and brittle").
+- **Fixed (commit `5204e97`).** The rows were never `ListBox` items — the template renders a plain
+  `Border`/`Grid` with raw pointer handlers, which is why nothing on the chain had a peer. The row
+  surface is now `Mainguard.App.Shell/Controls/RepoRow`, a `Grid` subclass carrying a
+  `ControlAutomationPeer` that reports `AutomationControlType.ListItem` and implements
+  `IInvokeProvider`, plus Enter/Space activation and `Focusable=true`. Not wrapped in a `Button`
+  on purpose: a Button captures the pointer press that the select-then-drag gesture depends on.
+  `Headless/RepoPickerAccessibilityTests` pins it, finding the row by walking up for an
+  `IInvokeProvider` exactly as this investigation's `TreeWalker` did.
 - Severity: medium — doesn't block the app (the RPC-equivalent action, opening the LAST repo via
   the reopen-prompt, does work — see W2 note below), but anyone driving this list by keyboard or
   assistive tech has no way to open a NEW entry after adding it, only ever the single
   most-recently-opened one via the reopen prompt.
 - **Note:** the "Reopen Last Repository?" prompt's own Dismiss/Reopen buttons DO work (they're real
-  named buttons with `InvokePattern`) — only the scrolling list of *all* repos lacks any activation
+  named buttons with `InvokePattern`) — only the scrolling list of *all* repos lacked any activation
   path.
+- **Related, found while fixing W2 and fixed with it:** every `Button.railItem` in the main window's
+  section rail (and the Pro agent rail) had no usable accessible name. Avalonia does not fall back to
+  `ToolTip.Tip`, and `ButtonAutomationPeer`'s `Content?.ToString()` fallback reported the literal
+  string `"Avalonia.Controls.Grid"` — which is why "no name at all" is *almost* right: there is a
+  name, it is junk, and a non-emptiness check would have called it healthy. Four
+  `AutomationProperties.Name` bindings fix it; the guard in `ActivityBarRenderHarness` rejects
+  `Avalonia.*` names rather than merely empty ones.
 
 ### W3. [FIXED, cosmetic] Auto-detected repository entry mislabeled as `.git` instead of its folder name
 
