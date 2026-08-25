@@ -5,6 +5,7 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Docker.DotNet;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Audit;
@@ -165,6 +166,183 @@ public sealed class KillContainmentTests
         Assert.Equal(KillAgentOutcome.Paused, snapshot.Agents[0].Outcome);
     }
 
+    // ---- ISSUES-LOG #17 — the release path, and what it must NOT release ----
+
+    /// <summary>
+    /// The whole bug in one test. Engage froze the jail and severed input; Resume used to clear a boolean
+    /// and nothing else, leaving the container paused for the life of the daemon while the Resource
+    /// Monitor's own row said "(recoverable)". Both halves of the containment must now come back.
+    /// </summary>
+    [Fact]
+    public async Task Resume_UnpausesTheJail_AndReleasesTheTerminalLock_TheKillItselfTook()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+
+        await rig.KillSwitch.EngageAsync();
+        Assert.Contains("ctr-a", rig.Engine.Paused);
+        Assert.True(rig.Locks.IsLocked(agentId));
+        Assert.True(rig.Leader.IsPaused(agentId));
+
+        var report = await rig.KillSwitch.ResumeAsync();
+
+        Assert.Equal(KillResumeOutcome.Resumed, Assert.Single(report.Agents).Outcome);
+        Assert.DoesNotContain("ctr-a", rig.Engine.Paused);
+        Assert.False(rig.Locks.IsLocked(agentId), "the kill switch took this lock, so the kill switch must release it");
+        Assert.False(rig.Leader.IsPaused(agentId));
+        Assert.Equal("Working", rig.Store.Find(agentId)!.State);
+        Assert.False(rig.KillSwitch.IsEngaged);
+    }
+
+    /// <summary>
+    /// The distinction the fix must not blur: a human pause and a kill-switch pause are different reasons
+    /// for the same Docker-paused state. A jail the human had already paused is still contained when the
+    /// stop fires (so it is NOT a PauseFailed), but the kill switch never owned that pause and must leave
+    /// it exactly where it found it — the same stickiness <c>AgentPauseService</c> gives a human pause
+    /// against the machine's yield hold.
+    /// </summary>
+    [Fact]
+    public async Task Resume_LeavesAJailTheHumanHadAlreadyPaused_Frozen()
+    {
+        using var rig = new KillRig();
+        var human = rig.AddLiveAgent("ctr-human");
+        var killed = rig.AddLiveAgent("ctr-killed");
+
+        // The human's pause, as AgentPauseService leaves the world: the jail frozen and the ledger marked.
+        await rig.Engine.PauseAsync("ctr-human");
+        rig.Ledger.MarkHumanPaused(human);
+
+        var kill = await rig.KillSwitch.EngageAsync();
+
+        // Containment is satisfied for both — the already-frozen jail is NOT reported as a failed pause.
+        Assert.All(kill.Agents, a => Assert.NotEqual(KillAgentOutcome.PauseFailed, a.Outcome));
+        Assert.Contains("ctr-human", rig.Engine.Paused);
+        Assert.Contains("ctr-killed", rig.Engine.Paused);
+
+        await rig.KillSwitch.ResumeAsync();
+
+        // The kill switch reverses its own pause and only its own.
+        Assert.DoesNotContain("ctr-killed", rig.Engine.Paused);
+        Assert.Contains("ctr-human", rig.Engine.Paused);
+        Assert.True(rig.Ledger.IsHumanPaused(human), "a kill/resume cycle must not clear the human's pause");
+    }
+
+    /// <summary>The same rule at the other end of the race: the ledger says human-paused by the time Resume
+    /// runs, even though the kill switch's own pause call is the one that reached the engine first. The
+    /// human's intent outranks the ledger entry — Resume leaves the jail frozen.</summary>
+    [Fact]
+    public async Task Resume_LeavesAJailTheHumanPausedDuringTheFreeze_Frozen()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+
+        await rig.KillSwitch.EngageAsync();
+        rig.Ledger.MarkHumanPaused(agentId); // the human claims it while the stop is engaged
+
+        await rig.KillSwitch.ResumeAsync();
+
+        Assert.Contains("ctr-a", rig.Engine.Paused);
+        // The terminal sever is still reversed: the human paused the agent's work, not the operator's
+        // ability to type at it.
+        Assert.False(rig.Locks.IsLocked(agentId));
+    }
+
+    /// <summary>
+    /// The concern the original "deliberately no un-containment" note was protecting, kept intact: a
+    /// managed worker's terminal is locked at SPAWN as a role property. The kill switch did not take that
+    /// lock, so the kill switch does not release it — a blanket unlock would hand an operator-locked
+    /// worker a typeable terminal.
+    /// </summary>
+    [Fact]
+    public async Task Resume_KeepsTheSpawnTimeTerminalLockOfAManagedWorker()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+        rig.Locks.Lock(agentId); // coordinated-mode spawn locked it long before any kill
+
+        await rig.KillSwitch.EngageAsync();
+        await rig.KillSwitch.ResumeAsync();
+
+        Assert.DoesNotContain("ctr-a", rig.Engine.Paused);
+        Assert.True(rig.Locks.IsLocked(agentId), "a lock taken at spawn must survive a kill/resume cycle");
+    }
+
+    /// <summary>A container torn down during the freeze is released by definition. It must not be reported
+    /// as a failed release, and it must not abandon the rest of the fan-out.</summary>
+    [Fact]
+    public async Task Resume_ToleratesAJailThatNoLongerExists_AndStillReleasesTheOthers()
+    {
+        using var rig = new KillRig();
+        rig.AddLiveAgent("ctr-gone");
+        rig.AddLiveAgent("ctr-live");
+
+        await rig.KillSwitch.EngageAsync();
+        rig.Engine.Vanish("ctr-gone"); // agent torn down while the stop was engaged
+
+        var report = await rig.KillSwitch.ResumeAsync();
+
+        Assert.All(report.Agents, a => Assert.Equal(KillResumeOutcome.Resumed, a.Outcome));
+        Assert.DoesNotContain("ctr-live", rig.Engine.Paused);
+    }
+
+    /// <summary>An engine that refuses to wake a jail must say so — the row must not read "Working" over a
+    /// container that is demonstrably still frozen (MG-8's lesson, applied to the release).</summary>
+    [Fact]
+    public async Task Resume_WhenUnpauseFails_ReportsResumeFailed_AndNeverClaimsWorking()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+
+        await rig.KillSwitch.EngageAsync();
+        rig.Engine.FailUnpauses = true;
+        var report = await rig.KillSwitch.ResumeAsync();
+
+        Assert.Equal(KillResumeOutcome.ResumeFailed, Assert.Single(report.Agents).Outcome);
+        Assert.Contains("ctr-a", rig.Engine.Paused);
+        Assert.Equal("Unresponsive", rig.Store.Find(agentId)!.State);
+        Assert.Contains("STILL paused", rig.Store.Find(agentId)!.Detail);
+        // The queue is freed regardless — a wedged engine must not also trap the operator.
+        Assert.False(rig.KillSwitch.IsEngaged);
+    }
+
+    /// <summary>
+    /// Engage is idempotent and the UI's control is a toggle, so a second press before any Resume is
+    /// ordinary — and its own pause calls 409 against the jails the FIRST press froze. If that second
+    /// press overwrote the causation ledger, Resume would find nothing it owned and release nothing:
+    /// ISSUES-LOG #17 restored by a double click.
+    /// </summary>
+    [Fact]
+    public async Task Resume_StillReleasesEverything_AfterTwoEngagesWithNoResumeBetween()
+    {
+        using var rig = new KillRig();
+        var agentId = rig.AddLiveAgent("ctr-a");
+
+        await rig.KillSwitch.EngageAsync();
+        await rig.KillSwitch.EngageAsync();
+        Assert.Contains("ctr-a", rig.Engine.Paused);
+
+        await rig.KillSwitch.ResumeAsync();
+
+        Assert.DoesNotContain("ctr-a", rig.Engine.Paused);
+        Assert.False(rig.Locks.IsLocked(agentId));
+    }
+
+    /// <summary>Two repos holding one id: the release fans over BOTH jails, exactly as the pause does.</summary>
+    [Fact]
+    public async Task Resume_WhenTwoReposShareAnAgentId_UnpausesBothJails()
+    {
+        using var rig = new KillRig();
+        rig.AddLiveAgent("ctr-repo-a", "repo-a", "pr-7");
+        rig.AddLiveAgent("ctr-repo-b", "repo-b", "pr-7");
+
+        await rig.KillSwitch.EngageAsync();
+        await rig.KillSwitch.ResumeAsync();
+
+        Assert.Empty(rig.Engine.Paused);
+        Assert.Equal("Working", rig.Store.Find("repo-a", "pr-7")!.State);
+        Assert.Equal("Working", rig.Store.Find("repo-b", "pr-7")!.State);
+    }
+
     /// <summary>The wiring half of MG-8: a containing target that is not the one the daemon resolves fixes
     /// nothing, so assert the composition root itself.</summary>
     [Fact]
@@ -191,7 +369,8 @@ public sealed class KillContainmentTests
             Directory.CreateDirectory(Path.GetDirectoryName(_registryPath)!);
             Leader = new SessionLeader(new LeaderRegistry(_registryPath));
             Locks = new TerminalLockRegistry();
-            Target = new SandboxKillTarget(Store, Engine, Leader, Locks, NullLoggerFactory.Instance);
+            Ledger = new HumanPauseLedger();
+            Target = new SandboxKillTarget(Store, Engine, Leader, Locks, Ledger, NullLoggerFactory.Instance);
             Journal = new JsonKillJournal(
                 Path.Combine(Path.GetDirectoryName(_registryPath)!, "kills.jsonl"));
             // The rig used to pass `rttBudget: () => TimeSpan.Zero` — byte-for-byte the production default
@@ -223,6 +402,9 @@ public sealed class KillContainmentTests
         public SessionLeader Leader { get; }
 
         public TerminalLockRegistry Locks { get; }
+
+        /// <summary>The human/machine pause arbiter the release path consults.</summary>
+        public HumanPauseLedger Ledger { get; }
 
         public SandboxKillTarget Target { get; }
 
@@ -262,12 +444,26 @@ public sealed class KillContainmentTests
         }
     }
 
-    /// <summary>Records pause/unpause by container id; <see cref="FailPauses"/> models an unreachable engine.</summary>
+    /// <summary>
+    /// Models the paused SET rather than a log of pause calls, because the release path is about state:
+    /// a second pause of an already-frozen jail is a 409 in Docker and must be here too, or the
+    /// "somebody else already paused this" arbitration would be untestable without a daemon.
+    /// <see cref="FailPauses"/>/<see cref="FailUnpauses"/> model an unreachable engine;
+    /// <see cref="Vanish"/> models a container removed while the kill switch held it.
+    /// </summary>
     private sealed class RecordingSandboxEngine : ISandboxEngine
     {
-        public ConcurrentBag<string> Paused { get; } = new();
+        private readonly ConcurrentDictionary<string, byte> _paused = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, byte> _gone = new(StringComparer.Ordinal);
+
+        public IReadOnlyCollection<string> Paused => _paused.Keys.ToList();
 
         public bool FailPauses { get; set; }
+
+        public bool FailUnpauses { get; set; }
+
+        /// <summary>The container is removed from under us (agent torn down during the freeze).</summary>
+        public void Vanish(string containerId) => _gone[containerId] = 0;
 
         public Task<SandboxHandle> SpawnAsync(SandboxSpawnRequest request, CancellationToken ct = default) =>
             Task.FromResult(new SandboxHandle($"ctr-{request.AgentId}", Reused: false));
@@ -282,14 +478,46 @@ public sealed class KillContainmentTests
                 throw new InvalidOperationException("docker daemon unreachable");
             }
 
-            Paused.Add(containerId);
+            ThrowIfGone(containerId);
+            if (!_paused.TryAdd(containerId, 0))
+            {
+                // Docker's own answer to pausing a paused container (409). Modelled, because relying on it
+                // is exactly what the kill switch's "was I the one who froze this?" arbitration does.
+                throw new InvalidOperationException("Container is already paused");
+            }
+
             return Task.CompletedTask;
         }
 
-        public Task UnpauseAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
+        public Task UnpauseAsync(string containerId, CancellationToken ct = default)
+        {
+            if (FailUnpauses)
+            {
+                throw new InvalidOperationException("docker daemon unreachable");
+            }
+
+            ThrowIfGone(containerId);
+            _paused.TryRemove(containerId, out _);
+            return Task.CompletedTask;
+        }
+
+        public Task<bool> IsPausedAsync(string containerId, CancellationToken ct = default)
+        {
+            ThrowIfGone(containerId);
+            return Task.FromResult(_paused.ContainsKey(containerId));
+        }
 
         public Task StopAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
 
         public Task RemoveAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
+
+        private void ThrowIfGone(string containerId)
+        {
+            if (_gone.ContainsKey(containerId))
+            {
+                throw new DockerContainerNotFoundException(
+                    System.Net.HttpStatusCode.NotFound, $"No such container: {containerId}");
+            }
+        }
     }
 }

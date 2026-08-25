@@ -51,6 +51,17 @@ internal static class TestDataRootIsolation
     [ModuleInitializer]
     internal static void RedirectDataRootToTempDirectory()
     {
+        // The same isolation, for the one piece of daemon state that is NOT under the data root: the live
+        // session store's reconcile against the container engine. Docker is machine-wide, and the Mac
+        // substrate's mirror root (~/mainguard) is not governed by MAINGUARD_DATA_ROOT — so an in-proc
+        // daemon here answers "yes, I host that repository" for a developer's real jails and adopts them
+        // into its own store, at which point `ListAgents` in an unrelated test returns somebody's live
+        // coordinator. Switched off for the whole assembly, exactly like the data root below and for the
+        // same reason; the pass's own coverage is the RequiresDocker tier, which drives it directly
+        // against containers it created itself.
+        Environment.SetEnvironmentVariable(
+            Mainguard.Server.Runtime.AgentSessionReconcilerService.DisableVariable, "1");
+
         var existing = Environment.GetEnvironmentVariable(MainguardPaths.DataRootOverrideVariable);
         if (!string.IsNullOrWhiteSpace(existing))
         {

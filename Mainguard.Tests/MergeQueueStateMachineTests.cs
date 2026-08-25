@@ -783,6 +783,73 @@ public class MergeQueueStateMachineTests
         Assert.True(h.Queue.CanMerge("a", out _));
     }
 
+    // ---- TryReject (the review verdict "no") -----------------------------
+
+    [Fact]
+    public async Task TryReject_Verified_WalksToRejected_AndAudits()
+    {
+        var h = new Harness();
+        h.Build();
+        await VerifiedAsync(h, "a");
+
+        Assert.True(h.Queue.TryReject("a", "uid:1000", "wrong approach", out var refusal), refusal);
+        Assert.Equal(WorkerMergeState.Rejected, h.Queue.GetState("a"));
+
+        var evt = Assert.Single(h.Audit.Read(), e => e.Type == MergeQueue.RejectedEvent);
+        Assert.Equal("uid:1000", evt.Fields["by"]);
+        Assert.Equal("wrong approach", evt.Fields["reason"]);
+        Assert.Equal("Verified", evt.Fields["from_state"]);
+    }
+
+    [Fact]
+    public async Task TryReject_AwaitingReview_IsAlsoLegal()
+    {
+        var h = new Harness();
+        h.Build();
+        await VerifiedAsync(h, "a");
+        h.Queue.RequestReview("a");
+
+        Assert.True(h.Queue.TryReject("a", "uid:1000", "", out var refusal), refusal);
+        Assert.Equal(WorkerMergeState.Rejected, h.Queue.GetState("a"));
+    }
+
+    [Fact]
+    public async Task TryReject_Working_IsRefused_PointingAtDiscard()
+    {
+        var h = new Harness();
+        h.Build();
+        // Track the entry without verifying it (a run that fails leaves it Working).
+        h.FailFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var refusal));
+        Assert.Contains("only a verified branch", refusal);
+        Assert.Contains("discard", refusal);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
+    }
+
+    [Fact]
+    public void TryReject_UnknownEntry_IsRefused_NotInvented()
+    {
+        var h = new Harness();
+        h.Build();
+
+        Assert.False(h.Queue.TryReject("ghost", "uid:1000", "", out var refusal));
+        Assert.Contains("not in the merge queue", refusal);
+    }
+
+    [Fact]
+    public async Task TryReject_Terminal_IsRefused()
+    {
+        var h = new Harness();
+        h.Build();
+        await VerifiedAsync(h, "a");
+        Assert.True(h.Queue.TryReject("a", "uid:1000", "", out _));
+
+        Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var refusal));
+        Assert.Contains("already Rejected", refusal);
+    }
+
     [Fact]
     public void VerificationCommandResolver_HashesConfig_AndDetectsDrift()
     {

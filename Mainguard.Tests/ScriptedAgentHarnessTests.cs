@@ -54,8 +54,11 @@ public sealed class ScriptedAgentHarnessTests
         var dll = typeof(HarnessEntry).Assembly.Location;
         var apphost = OperatingSystem.IsWindows() ? Path.ChangeExtension(dll, ".exe") : Path.ChangeExtension(dll, null);
 
+        // macOS: never spawn the copied apphost — same-named executables outside their
+        // first-run location get SIGKILLed (see TestTools.SelfInvocation); the dotnet-host
+        // branch below always runs.
         ProcessStartInfo psi;
-        if (apphost is not null && File.Exists(apphost) && apphost != dll)
+        if (!OperatingSystem.IsMacOS() && apphost is not null && File.Exists(apphost) && apphost != dll)
         {
             psi = new ProcessStartInfo(apphost);
         }

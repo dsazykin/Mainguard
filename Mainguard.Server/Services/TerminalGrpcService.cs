@@ -28,11 +28,40 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
 {
     private readonly TerminalSessionManager _sessions;
     private readonly TerminalLockRegistry _locks;
+    private readonly AgentSessionStore? _agents;
 
-    public TerminalGrpcService(TerminalSessionManager sessions, TerminalLockRegistry locks)
+    /// <summary>
+    /// The notice an attach gets when the agent EXISTS but no CLI terminal is bound to it —
+    /// ISSUES-LOG #23. Raw PTY bytes, so CRLF: it is parsed by the client's terminal engine.
+    ///
+    /// <para>This is the case a daemon restart leaves behind. <see cref="Runtime.AgentSessionReconciler"/>
+    /// adopts the surviving jail back into the session store, so <c>ListAgents</c> reports it correctly and
+    /// every surface can see it — but the terminal cannot come back with it. The CLI runs under a
+    /// <c>docker exec -it</c> whose daemon-side forkpty died with the old process, and the Docker API has
+    /// no re-attach for a running exec, so the output of that CLI is gone for good. Before this notice the
+    /// attach fell silently into the P2-02 echo and emitted <b>nothing at all</b>: the client's
+    /// "the CLI is drawing" signal never fired, and the coordinator surface sat on "Still starting the
+    /// coordinator" for hours against an agent the daemon knew was <c>Working</c>. Saying so costs one
+    /// frame and is the difference between a wrong screen and a recoverable one.</para>
+    /// </summary>
+    public const string DetachedNotice =
+        "\r\n[mainguard] No terminal is attached to this agent — nothing you type here reaches a CLI.\r\n"
+        + "This is usually a daemon restart: the sandbox keeps running, but the terminal it was\r\n"
+        + "started with belonged to the previous daemon process and cannot be reconnected. It also\r\n"
+        + "happens when the agent never got a CLI at all (its repository was never provisioned).\r\n"
+        + "Restart the agent to get a terminal you can talk to.\r\n";
+
+    /// <param name="agents">
+    /// The live session registry — read ONLY to tell "this agent exists and simply has no terminal"
+    /// (<see cref="DetachedNotice"/>) from "we have never heard of this agent", which keeps the P2-02
+    /// echo contract for the latter. Optional so a transport-only construction still works.
+    /// </param>
+    public TerminalGrpcService(
+        TerminalSessionManager sessions, TerminalLockRegistry locks, AgentSessionStore? agents = null)
     {
         _sessions = sessions;
         _locks = locks;
+        _agents = agents;
     }
 
     public override async Task Attach(
@@ -100,6 +129,16 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
             if (locked)
             {
                 await LockedAttachAsync(requestStream, responseStream, first, ct);
+                return;
+            }
+
+            // ISSUES-LOG #23: a KNOWN agent with no bound CLI and no bind coming. Say so instead of
+            // dropping into an echo that emits nothing — an attach that never produces a frame reads,
+            // from the client, as a CLI that is still starting up, forever. Unknown ids keep the P2-02
+            // echo: this is a statement about a session we have, not a catch-all.
+            if (agentId is { Length: > 0 } && _agents?.Find(agentId) is not null)
+            {
+                await DetachedAttachAsync(responseStream, requestStream, ct);
                 return;
             }
 
@@ -375,6 +414,35 @@ public sealed class TerminalGrpcService : TerminalService.TerminalServiceBase
         // Page-size cap: a client asking for the whole 10k-line ring pages through it.
         var count = (int)Math.Min(request.Count, 1000);
         return Task.FromResult(bound.GetScrollback(request.Start, count));
+    }
+
+    /// <summary>
+    /// The detached attach (ISSUES-LOG #23): the agent is real and has no terminal. Writes
+    /// <see cref="DetachedNotice"/> so the client has an answer instead of silence, then holds the stream
+    /// open and DISCARDS input — echoing keystrokes back would draw a terminal that looks like it is
+    /// talking to the CLI while reaching nothing at all.
+    /// </summary>
+    private static async Task DetachedAttachAsync(
+        IServerStreamWriter<TerminalOutput> responseStream,
+        IAsyncStreamReader<TerminalInput> requestStream,
+        System.Threading.CancellationToken ct)
+    {
+        await responseStream.WriteAsync(new TerminalOutput
+        {
+            Raw = ByteString.CopyFromUtf8(DetachedNotice),
+        });
+
+        try
+        {
+            await foreach (var _ in requestStream.ReadAllAsync(ct))
+            {
+                // Input has nowhere to go — a detached session has no PTY behind it.
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Client detached — normal teardown.
+        }
     }
 
     /// <summary>

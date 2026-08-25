@@ -152,14 +152,29 @@
       </Border>
     </Grid>
 
-    <!-- Footer: the CanMerge equation as facts + bring-local + merge (§6.4) -->
-    <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto" Margin="0,8,0,0">
+    <!-- Footer: the CanMerge equation as facts + reject + bring-local + merge (§6.4). Reject is the
+         review verdict "no" (terminal) — DangerQuiet, destructive by hue not mass, two-step confirm
+         with an optional reason; hidden entirely when the composition has no reject handler. -->
+    <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,8,0,0">
       <TextBlock Grid.Column="0" Text="{Binding MergeReason}" FontSize="11" VerticalAlignment="Center"
-                 Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
-      <Button Grid.Column="1" Classes="Secondary" Content="Bring local" FontSize="12" Padding="10,3" Margin="0,0,6,0"
+                 Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
+                 IsVisible="{Binding !IsConfirmingReject}"/>
+      <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center"
+                  IsVisible="{Binding IsConfirmingReject}">
+        <TextBlock Text="Reject this branch?" FontSize="11" VerticalAlignment="Center"
+                   Foreground="{DynamicResource DangerBrush}" FontWeight="SemiBold"/>
+        <TextBox Text="{Binding RejectReason, Mode=TwoWay}" Watermark="reason (optional)"
+                 FontSize="11" MinWidth="180" MaxWidth="300"/>
+        <Button Classes="Secondary" Content="Cancel" FontSize="11" Padding="8,2"
+                Command="{Binding CancelRejectCommand}"/>
+      </StackPanel>
+      <Button Grid.Column="1" Classes="DangerQuiet" Content="Reject" FontSize="12" Padding="10,3" Margin="0,0,6,0"
+              Command="{Binding RejectCommand}" IsVisible="{Binding CanReject}"
+              ToolTip.Tip="Reject this branch in review — terminal; the queue records who and why."/>
+      <Button Grid.Column="2" Classes="Secondary" Content="Bring local" FontSize="12" Padding="10,3" Margin="0,0,6,0"
               Command="{Binding BringBranchLocalCommand}"
-              ToolTip.Tip="Fetches this branch into a new worktree — the agent keeps working."/>
-      <Button Grid.Column="2" Classes="Accent" Content="Merge" FontSize="12" Padding="12,3"
+              ToolTip.Tip="Fetches this agent branch from the sync remote into a local branch — the agent keeps working."/>
+      <Button Grid.Column="3" Classes="Accent" Content="Merge" FontSize="12" Padding="12,3"
               Command="{Binding MergeCommand}" IsEnabled="{Binding CanMerge}"
               ToolTip.Tip="{Binding MergeReason}"/>
     </Grid>

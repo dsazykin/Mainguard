@@ -14,6 +14,19 @@ namespace Mainguard.UI.Editions;
 public sealed record RepoSyncBinding(string RepoHandle, string SyncRemoteName, string SyncRemoteUrl);
 
 /// <summary>
+/// The outcome of provisioning a repo into the daemon: a successful <see cref="Binding"/>, or the
+/// human-readable <see cref="FailureReason"/> the shell surfaces (toast + retry card) so a slow or
+/// failed provision is never a silent nothing — for most of this feature's life it was, and the
+/// whole agent platform simply looked dead on any repo whose bare clone outlived a 5-second budget.
+/// Exactly one of the two is non-null.
+/// </summary>
+public sealed record RepoProvisionOutcome(RepoSyncBinding? Binding, string? FailureReason)
+{
+    public static RepoProvisionOutcome Success(RepoSyncBinding binding) => new(binding, null);
+    public static RepoProvisionOutcome Failure(string reason) => new(null, reason);
+}
+
+/// <summary>
 /// The agent-platform surface the shell talks to instead of naming <c>ControlCenterViewModel</c>
 /// directly — so <c>MainWindowViewModel.ControlCenter</c> can be <c>null</c> under an edition
 /// with no agent platform (1a). It exposes EXACTLY the members the shell references on the control
@@ -76,11 +89,14 @@ public interface IAgentPlatformSurface : IDisposable
     void SetActiveRepo(string repoHandle);
 
     /// <summary>
-    /// Provision the just-opened repo into the daemon (P2-06) and return its sync-remote binding, or
-    /// <c>null</c> when the daemon is unreachable / provisioning failed (agents are simply unavailable
-    /// for the repo until the daemon is up — the Git client is unaffected). The Pro implementation owns
-    /// the <c>DaemonClient</c> call; the reference-clean shell registers the returned remote with its own
-    /// <c>IGitService</c> and calls <see cref="SetActiveRepo"/>, so it never names the daemon types (2f).
+    /// Provision the just-opened repo into the daemon (P2-06). Returns the outcome — a sync-remote
+    /// binding on success, a human-readable failure reason otherwise — or <c>null</c> only when this
+    /// surface has no daemon at all (the mock/design harness), which the shell treats as "no agent
+    /// platform", never as an error. The Pro implementation owns the <c>DaemonClient</c> call; the
+    /// reference-clean shell registers the returned remote with its own <c>IGitService</c> and calls
+    /// <see cref="SetActiveRepo"/>, so it never names the daemon types (2f). Implementations must clear
+    /// any previously active repo BEFORE provisioning, so a failed provision leaves the queue pointed
+    /// at nothing rather than at the previously opened repo.
     /// </summary>
-    Task<RepoSyncBinding?> ProvisionRepoAsync(string repoPath);
+    Task<RepoProvisionOutcome?> ProvisionRepoAsync(string repoPath);
 }

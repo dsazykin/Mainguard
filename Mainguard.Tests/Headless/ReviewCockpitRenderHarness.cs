@@ -33,10 +33,10 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class ReviewCockpitRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     [AvaloniaFact]
-    public void Capture_ReviewCockpit_AllFiveThemes()
+    public void Capture_ReviewCockpit_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {
@@ -62,7 +62,7 @@ public class ReviewCockpitRenderHarness
     /// gate at all. All three are new visuals; none may use a raw color or assume a dark theme.
     /// </summary>
     [AvaloniaFact]
-    public void Capture_ReviewCockpit_LiveDaemonPanel_AllFiveThemes()
+    public void Capture_ReviewCockpit_LiveDaemonPanel_AllThemes()
     {
         foreach (var theme in ThemeKeys)
         {

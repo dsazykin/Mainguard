@@ -31,6 +31,15 @@ public static class ToolchainPaths
     /// user's home, exactly like <see cref="Adapters.AdapterPaths.VmRoot"/>.</summary>
     public const string VmRoot = "/home/mainguard/mainguard/toolchains";
 
+    /// <summary>The DAEMON-side toolchains root on the current host — same rule as
+    /// <see cref="Adapters.AdapterPaths.DaemonSideRoot"/>: the VM constant where the daemon runs in
+    /// the VM, <c>~/mainguard/toolchains</c> on macos-host. Commands and markers keep speaking
+    /// <see cref="VmRoot"/>; the container install host mounts this directory at that path.</summary>
+    public static string DaemonSideRoot() =>
+        System.OperatingSystem.IsMacOS()
+            ? System.IO.Path.Combine(Mainguard.Git.MainguardPaths.HomeDirectory(), "mainguard", "toolchains")
+            : VmRoot;
+
     /// <summary>Where <see cref="VmRoot"/> appears inside every agent sandbox (READ-ONLY).</summary>
     public const string SandboxMount = "/opt/mainguard/toolchains";
 

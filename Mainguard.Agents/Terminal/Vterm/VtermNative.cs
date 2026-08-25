@@ -228,7 +228,10 @@ internal static partial class VtermNative
                     return fromEnv;
                 }
 
-                foreach (var candidate in new[] { "libvterm.so", "libvterm.so.0" })
+                // The daemon payload ships the pinned build under the host's native name:
+                // .so on Linux (the WSL2 VM), .dylib on the macos-host substrate.
+                foreach (var candidate in new[]
+                         { "libvterm.so", "libvterm.so.0", "libvterm.dylib", "libvterm.0.dylib" })
                 {
                     var beside = Path.Combine(AppContext.BaseDirectory, candidate);
                     if (File.Exists(beside) && NativeLibrary.TryLoad(beside, out var fromBase))
@@ -237,7 +240,8 @@ internal static partial class VtermNative
                     }
                 }
 
-                if (NativeLibrary.TryLoad("libvterm.so.0", typeof(VtermNative).Assembly, searchPath, out var system))
+                var systemName = OperatingSystem.IsMacOS() ? "libvterm.0.dylib" : "libvterm.so.0";
+                if (NativeLibrary.TryLoad(systemName, typeof(VtermNative).Assembly, searchPath, out var system))
                 {
                     return system;
                 }

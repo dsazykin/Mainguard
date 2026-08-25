@@ -27,10 +27,10 @@ namespace Mainguard.Tests.Headless;
 // the load-bearing VM truths (gate reasons, cascade, freeze) are asserted along the way.
 public class ControlCenterRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     [AvaloniaFact]
-    public void Capture_CoordinatorSurface_AllFiveThemes()
+    public void Capture_CoordinatorSurface_AllThemes()
     {
         using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest()); // Pro: resolve AgentWorkspaceView via ViewLocator (not "Not Found:")
         foreach (var theme in ThemeKeys)
@@ -112,7 +112,7 @@ public class ControlCenterRenderHarness
     /// disabled/in-flight states are legible) on light Daylight Loom as well as the dark themes.
     /// </summary>
     [AvaloniaFact]
-    public void Capture_VerifyTrigger_OnQueueRail_AllFiveThemes()
+    public void Capture_VerifyTrigger_OnQueueRail_AllThemes()
     {
         using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
         foreach (var theme in ThemeKeys)

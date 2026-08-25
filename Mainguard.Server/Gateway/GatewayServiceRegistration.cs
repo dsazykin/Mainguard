@@ -59,6 +59,12 @@ public static class GatewayServiceRegistration
             mergeLeaseStore = new InMemoryMergeLeaseStore();
         }
 
+        // P2-15: the tamper-evident audit chain, riding the same posture decision. Constructed
+        // EAGERLY (it needs no DI) so a store problem surfaces here in migration.log rather than as
+        // a mid-flight RPC failure; on any failure the daemon still starts, on the in-memory
+        // journal — which is exactly the pre-P2-15 behavior, now with the loss stated out loud.
+        RegisterAuditLog(services, dbFactory, dbPath, log);
+
         // The P2-10 queue-state + immutable-verification stores follow the same posture as the gateway
         // stores above: SQLite when the daemon DB opened, in-memory otherwise so the daemon always starts.
         // Bound to locals here (rather than inline in the provisioner registration) because the null check
@@ -87,6 +93,22 @@ public static class GatewayServiceRegistration
         // dictionaries — a registry that is written to and never read from is the bug we are fixing.
         services.AddSingleton<MergeQueueRegistry>();
         services.AddSingleton<IMergeQueueRegistry>(sp => sp.GetRequiredService<MergeQueueRegistry>());
+
+        // Dev-only queue seeding (docs/design/queue-seeding.md): the synthetic-verification seam is
+        // registered and wired UNCONDITIONALLY — and stays empty for the daemon's whole lifetime
+        // unless the flag-gated QueueSeedingService (never mapped in a shipped daemon) populates it.
+        // Unconditional so the provisioner's exact-set optional-control assertion pins ONE stated
+        // wiring decision instead of a flag-dependent shape it could not distinguish from drift.
+        services.AddSingleton<SyntheticVerificationRegistry>();
+
+        // ...and the seeder itself, likewise unconditional and inert: its only caller is the
+        // flag-gated QueueSeedingService, which a daemon without the boot flag never maps.
+        services.AddSingleton(sp => new QueueSeeder(
+            provisioner: sp.GetRequiredService<MergeQueueProvisioner>(),
+            registry: sp.GetRequiredService<IMergeQueueRegistry>(),
+            synthetic: sp.GetRequiredService<SyntheticVerificationRegistry>(),
+            repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
+            log: log));
 
         // MG-10: the missing constructor call. `new MergeQueue(...)` and `registry.Register(...)` existed
         // ONLY in the test projects, so the registry stayed empty for the daemon's whole lifetime and every
@@ -153,7 +175,11 @@ public static class GatewayServiceRegistration
                 // "does this agent have a live sandbox" has one rule in the daemon rather than three.
                 containerIdFor: agentId =>
                     ResolveVerificationJail(sp.GetRequiredService<AgentSessionStore>(), repoHash, agentId),
-                supervisor: sp.GetRequiredService<IAgentSupervisor>()),
+                supervisor: sp.GetRequiredService<IAgentSupervisor>(),
+                // The human-pause arbiter: the cascade's yield runs THROUGH a human-paused jail
+                // (already quiescent) but never wakes it, and its own critical section refuses a
+                // human unpause for its few seconds (see HumanPauseLedger).
+                arbiter: sp.GetRequiredService<Mainguard.Server.Runtime.HumanPauseLedger>()),
             // Where the rebase happens. Only the worktree comes from here — the provisioner resolves the
             // mirror and the main branch from the same two calls that key the queue's own main@sha, so
             // the ref a branch is rebased ONTO and the ref its verification is pinned AGAINST cannot
@@ -175,7 +201,10 @@ public static class GatewayServiceRegistration
             // asks the question rule 2 stands for (was published work LOST) by patch-id instead.
             publishRebasedAgentRef: (repoHash, agentId) =>
                 (sp.GetRequiredService<IAgentEnvironment>().Worktrees as WorktreeManager)
-                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false));
+                    ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false,
+            // The dev-only seeding seam — always passed, empty in production (see the registration
+            // above and the parameter's own doc; the exact-set composition test pins this line).
+            syntheticVerifications: sp.GetRequiredService<SyntheticVerificationRegistry>()));
         // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
         // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
         // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
@@ -330,6 +359,39 @@ public static class GatewayServiceRegistration
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();
+
+        // ISSUES-LOG #18/#20 — the live session store's reconcile against Docker. The two boot
+        // reconcilers above make Docker the truth for the expected-agents table and the PTY leader
+        // registry; NEITHER ever wrote to AgentSessionStore, which is what every surface actually
+        // renders, so a restarted daemon showed zero agents while their jails kept running. This is
+        // that missing half, and it keeps running afterwards to catch out-of-band drift.
+        //
+        // NOTE the lister: it lets a Docker failure PROPAGATE, unlike BuildContainerLister's
+        // empty-on-error. An empty list here would read as "every jail vanished" and mark the whole
+        // swarm Unresponsive the first time the engine was slow to answer.
+        services.AddSingleton(sp => new Runtime.AgentSessionReconciler(
+            sp.GetRequiredService<Runtime.AgentSessionStore>(),
+            listContainers: async ct =>
+            {
+                using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
+                return await DockerAgentLister.ListAsync(docker, ct).ConfigureAwait(false);
+            },
+            // Ownership: a jail belongs to this daemon iff this daemon hosts its repository's bare
+            // mirror. The container engine is machine-wide and the labels carry no daemon identity, so
+            // without this every daemon on the box would adopt every other one's jails — which the
+            // in-proc test daemons demonstrated immediately by claiming a developer's live agent.
+            ownsRepo: repoHash => !string.IsNullOrEmpty(repoHash)
+                && System.IO.Directory.Exists(
+                    sp.GetRequiredService<IAgentEnvironment>().Repos.BareRepoPathFor(repoHash)),
+            audit: sp.GetRequiredService<IAuditLog>(),
+            log: sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
+                .CreateLogger<Runtime.AgentSessionReconciler>(),
+            // ISSUES-LOG #24: the same pass also corrects merge-queue entries' jail-liveness, off the SAME
+            // listing. Passed here rather than given its own hosted service because the answer is the same
+            // answer — a second Docker timer would poll the engine twice for one fact and then have to
+            // decide which copy wins.
+            queues: sp.GetRequiredService<IMergeQueueRegistry>()));
+        services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 
     /// <summary>
@@ -450,6 +512,50 @@ public static class GatewayServiceRegistration
         return string.IsNullOrEmpty(dir)
             ? Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "verify-artifacts")
             : Path.Combine(dir, "verify-artifacts");
+    }
+
+    /// <summary>
+    /// P2-15: registers <see cref="IAuditLog"/> — the <see cref="ChainedAuditLog"/> over the daemon
+    /// DB when it opened (with <see cref="IChainedAuditLog"/> alongside for the verify RPC/CLI and
+    /// the retention job), the in-memory journal otherwise. The mirror sits beside the DB file and
+    /// the AES-GCM master key lives in a <see cref="Mainguard.Git.Security.SecureKeyring"/> rooted
+    /// beside it too — production puts both under the data root, in-proc test hosts under their
+    /// isolated token directory, with no extra knob to drift.
+    /// </summary>
+    private static void RegisterAuditLog(
+        IServiceCollection services, Func<AppDbContext>? dbFactory, string dbPath, Action<string>? log)
+    {
+        if (dbFactory is not null)
+        {
+            try
+            {
+                var directory = Path.GetDirectoryName(dbPath);
+                var keyringDir = string.IsNullOrEmpty(directory)
+                    ? "audit-keyring"
+                    : Path.Combine(directory, "audit-keyring");
+                var chained = new ChainedAuditLog(
+                    dbFactory,
+                    new AuditCrypto(new Mainguard.Git.Security.SecureKeyring(keyringDir)),
+                    new AuditFileMirror(dbPath + ".audit-mirror"));
+                services.AddSingleton<IAuditLog>(chained);
+                services.AddSingleton<IChainedAuditLog>(chained);
+                // The RFC 3161 anchor queue rides the same DB (heads enqueued by policy, tokens
+                // stored beside the chain); the hosted sweep is a no-op until a TSA URL is set.
+                services.AddSingleton(new AuditAnchorQueue(dbFactory));
+                log?.Invoke("audit chain ready (db-backed, mirror recovered)");
+                return;
+            }
+            catch (Exception ex)
+            {
+                log?.Invoke($"audit chain unavailable → in-memory journal (EVENTS WILL NOT SURVIVE RESTART): {ex.Message}");
+            }
+        }
+        else
+        {
+            log?.Invoke("audit chain on in-memory journal (no daemon db) — EVENTS WILL NOT SURVIVE RESTART");
+        }
+
+        services.AddSingleton<IAuditLog, InMemoryAuditLog>();
     }
 
     /// <summary>How long <see cref="TryPrepareDatabase"/> lets a migration run before falling back
@@ -614,7 +720,7 @@ public static class GatewayServiceRegistration
         {
             try
             {
-                using var docker = new DockerClientConfiguration().CreateClient();
+                using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
                 return await DockerAgentLister.ListAsync(docker, ct).ConfigureAwait(false);
             }
             catch (Exception)

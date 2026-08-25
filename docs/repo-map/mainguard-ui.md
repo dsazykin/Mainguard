@@ -50,10 +50,17 @@ seams over `ProComposition` so the render harnesses' mock-injection is unchanged
 Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
 
 - **`Themes/`** — one `ResourceDictionary` per color theme (`MidnightLoom` default, `DaylightLoom`,
-  `CommandDeck`, `Atelier`, `LoomAurora`), each defining the full token contract (incl. the P2-13
-  `AgentStatus*Brush` micro-badge tokens resolved by the App's `AgentStatusBrushConverter`).
+  `Graphite` — the macOS-native neutral-graphite dark with Apple-semantic-derived colors —
+  `Atelier`), each defining the full token contract (incl. the P2-13 `AgentStatus*Brush`
+  micro-badge tokens resolved by the App's `AgentStatusBrushConverter`). `CommandDeck` and
+  `LoomAurora` were retired in the 4-theme restyle; `ThemeManager`'s `LegacyKeyMap` migrates their
+  persisted keys (→ `Graphite` / `MidnightLoom`) and self-heals the store on first launch
+  (pinned by `Headless/ThemeRetirementMigrationTests`).
   - `App.axaml` seeds `MidnightLoom` and `ThemeManager` swaps it at runtime via
-    `avares://Mainguard.UI/Themes/{key}.axaml`.
+    `avares://Mainguard.UI/Themes/{key}.axaml`. `ThemeManager.SystemKey` ("System") is a follow-
+    the-OS MODE, never a `Themes` entry (the render harnesses sweep that list): it persists as its
+    own key, resolves dark→Midnight Loom / light→Daylight Loom, and re-resolves live on the
+    platform's `ColorValuesChanged`. Pinned by `Headless/SystemThemeModeTests`.
 - **`Styles/Icons.axaml`** — the theme-INDEPENDENT resources: the `FontUi`/`FontMono` families +
   every icon `StreamGeometry` (window-control glyphs, rail/section icons, agent-lifecycle
   micro-badges, severity/signing glyphs). Deliberately NOT under `Themes/` — `ThemeManager.Apply`
@@ -77,16 +84,36 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `Action<string>?` seam (the shell wires it to `App.Settings.Update(p => p.Theme = key)` in
   `App.OnFrameworkInitializationCompleted`) — the base layer never reaches up into `App.Settings`.
   Left null (headless harnesses, which always `Apply(…, persist: false)`) it's a no-op.
+- **`Theming/VibrancyManager.cs`** — the opt-in macOS translucent-chrome switch: `Attach(mainWindow)`
+  + `SetEnabled(bool)`. Sets the window's `TransparencyLevelHint` to AcrylicBlur and, only while the
+  platform actually granted it (tracked via `ActualTransparencyLevel` — the grant is async and
+  Reduce-Transparency can refuse), shadows the `ChromeWindowBackground`/`ChromePanelBackground`
+  indirection tokens at app level with the active theme's `SurfaceWindowVibrant`/`SurfacePanelVibrant`
+  variants (direct app-resource entries survive `ThemeManager`'s "/Themes/" sweep; re-resolves on
+  `ThemeChanged`). Hard no-op off macOS/headless — the opaque defaults are the canonical
+  harness-verified look. Driven by `UserPreferences.MacTranslucentChrome` from the MainWindow ctor
+  and the Settings → General checkbox.
 - **`Charts/ChartTheme.cs`** (T-22) — resolves LiveChartsCore paint colors from the theme tokens so every analytics chart follows the active theme instead of hardcoding hex (categorical graph-lane palette, Success/Danger churn pair, surface→Accent heat ramp). Consumed by the App's `AnalyticsViewModel`.
-- **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly).
-- **`Controls/CustomTitleBar.axaml`(+`.cs`)** — the reusable hand-drawn title bar (drag/minimize/maximize/close) placed in row 0 of every `ChromedWindow`, reading `Title`/state off its ancestor window.
+- **`Views/ChromedWindow.cs`** (#77) — the base `Window` every secondary dialog/panel derives from: extends the client area over the OS decorations (matching MainWindow) and exposes `BeginTitleBarDrag`/`ToggleMaximizeFromTitleBar`. Derived windows stay in `Mainguard.App.Shell/Views/` (same `Mainguard.App.Shell.Views` namespace, cross-assembly). Applies `WindowChromePolicy` after its own `NoChrome` hints.
+- **`Platform/MacNative.cs`** — the one place managed code talks to AppKit directly (raw
+  `objc_msgSend`, no binding package in the supply chain; every member is a safe no-op off macOS
+  and never throws): `TryPostNotification` (Notification Center banner — real attribution only
+  inside the .app bundle; reports false so callers keep their fallback) and `SetDockBadge` (the
+  Dock icon's badge label; UI-thread-sensitive).
+- **`Views/WindowChromePolicy.cs`** — the per-platform chrome policy for client-area-extended
+  windows: Windows/Linux keep the hand-drawn `NoChrome` title bar; macOS overlays the system
+  chrome instead (`NoChrome` would remove the traffic lights — the only close control there),
+  hides the hand-drawn buttons (`CustomButtonsVisible`) and shifts title-bar content past the
+  traffic-light cluster (`TitleBarPadding`). Consumed by `ChromedWindow`, `CustomTitleBar`, and
+  MainWindow's code-behind.
+- **`Controls/CustomTitleBar.axaml`(+`.cs`)** — the reusable hand-drawn title bar (drag/minimize/maximize/close) placed in row 0 of every `ChromedWindow`, reading `Title`/state off its ancestor window; on macOS its buttons hide and its padding insets per `WindowChromePolicy`.
 - **`Converters/`** — the two git-free `IValueConverter`s: `BoolToOpacityConverter` and `ResourceKeyToGeometryConverter` (icon-key → `Icons.axaml`/theme `StreamGeometry`, the control-center badge lookup). Git-model converters (`AgentStatusBrushConverter`, `DiffLineKindToClassConverter`, `FileExtensionToIconConverter`) stayed in `Mainguard.App.Shell/Converters/`.
 - **`Properties/XmlnsDefinitions.cs`** — assembly `XmlnsDefinition`s mapping `Mainguard.UI.Controls`/`.Views`/`.Converters` (+ the `Mainguard.UI` root) onto the standard Avalonia XML namespace, so the moved chrome/converters resolve prefix-free under the default `xmlns` in the shell/Pro-UI XAML (Avalonia's compiled `using:`/`clr-namespace:` otherwise searches only the compiling assembly).
 
 ## Role in the solution
 
 - **`Mainguard.UI`** (step 2c) — the edition-agnostic **design-system base layer** both the shell
-  and (later) the Pro UI render on: `Themes/*.axaml` (the five theme dictionaries + full token
+  and (later) the Pro UI render on: `Themes/*.axaml` (the theme dictionaries + full token
   contract), `Styles/Icons.axaml` (theme-independent fonts + icon `StreamGeometry`s) and
   `Styles/DesignSystem.axaml` (the `Button.*`/`Border.*`/ComboBox/… component-class styles) that
   `App.axaml` `ResourceInclude`s/`StyleInclude`s via `avares://Mainguard.UI/…`, `Theming/ThemeManager`

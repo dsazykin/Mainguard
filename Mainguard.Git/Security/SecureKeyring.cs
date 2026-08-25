@@ -58,6 +58,16 @@ public class SecureKeyring : ISecureKeyring, ISecureKeyStore
                 {
                     options.ProtectKeysWithDpapi();
                 }
+                else if (OperatingSystem.IsMacOS())
+                {
+                    // The macOS analogue: the key ring is wrapped with a master key that lives
+                    // only in the login Keychain (see MacKeychainKeyProtection — fail-open to
+                    // the previous plaintext posture when the Keychain is unavailable).
+                    Microsoft.Extensions.DependencyInjection.OptionsServiceCollectionExtensions
+                        .Configure<Microsoft.AspNetCore.DataProtection.KeyManagement.KeyManagementOptions>(
+                            options.Services,
+                            o => o.XmlEncryptor = new MacKeychainXmlEncryptor());
+                }
             }
         );
         _protector = dataProtectionProvider.CreateProtector("Mainguard.Keyring.v1");

@@ -46,6 +46,18 @@ public sealed class RoleInterceptor : Interceptor
         // flagged, refused, or simply never verified — erasing the evidence instead of clearing the gate.
         // It is also the queue's only human-driven terminal besides the merge itself.
         "/mainguard.v1.MergeQueueService/DiscardEntry",
+        // Rejecting is the review verdict "no" — merge power's other terminal. An agent that could
+        // reject a co-tenant's verified branch would hold veto over work it competes with.
+        "/mainguard.v1.MergeQueueService/RejectEntry",
+        // An agent that could freeze a co-tenant's jail could rig the queue (a paused co-tenant
+        // never re-verifies), and one that could unpause could break the cascade's critical section.
+        "/mainguard.v1.AgentService/PauseAgent",
+        "/mainguard.v1.AgentService/UnpauseAgent",
+        // P2-15: the audit chain carries other agents' prompts/outputs and every plan/merge
+        // decision. A coordinator that could read it would hold a transcript of work it competes
+        // with (and of the human's decisions about it); verify is read power's sibling here.
+        "/mainguard.v1.AuditService/VerifyAudit",
+        "/mainguard.v1.AuditService/ReadAudit",
         // Same boundary: clearing a stalled verification puts a branch back to Working, which is the state
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.
@@ -65,6 +77,14 @@ public sealed class RoleInterceptor : Interceptor
         // two writes are denied, on the same boundary as BeginMerge/DiscardEntry above.
         "/mainguard.v1.PrIntakeService/UpdatePrIntakeSettings",
         "/mainguard.v1.PrIntakeService/SubscribePrIntakeSource",
+        // The dev-only queue seeder composes EnsureEntry + a supplied verification outcome + the
+        // merge walk in one RPC — every power this list denies the coordinator piecemeal, reachable
+        // at once. Denied unconditionally (whether or not the seeding flag is up): the boot flag
+        // decides whether the OPERATOR gets the surface, never whether an agent does.
+        "/mainguard.v1.QueueSeedingService/SeedQueueEntries",
+        "/mainguard.v1.QueueSeedingService/PushCommits",
+        "/mainguard.v1.QueueSeedingService/ClearSeededEntries",
+        "/mainguard.v1.QueueSeedingService/GetSeedingStatus",
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",

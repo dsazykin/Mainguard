@@ -3,15 +3,12 @@ using System.Collections.Generic;
 namespace Mainguard.Git.Audit;
 
 /// <summary>
-/// A thread-safe in-memory <see cref="IAuditLog"/> — the pre-P2-15 journal. Used by
-/// the daemon skeleton and by tests (through <c>AuditProbe</c>). P2-15 replaces this
-/// with the hash-chained, persisted implementation behind the same interface.
-///
-/// <para><b>This is what the shipped daemon registers</b>, so every audited event lives in the daemon
-/// process's heap and nowhere else: it does not survive a restart, and — because
-/// <see cref="IAuditLog.Read"/> has no production caller — it cannot be read even while the process is
-/// alive. See <see cref="IAuditLog.Read"/> for the decision and what an <c>Append</c> may and may not be
-/// relied on for until P2-15 lands.</para>
+/// A thread-safe in-memory <see cref="IAuditLog"/>. Since P2-15 this is the FALLBACK and the test
+/// double, no longer the shipped default: the daemon registers <see cref="ChainedAuditLog"/>
+/// whenever its SQLite DB opens, and lands here only when the DB cannot be prepared — logged
+/// loudly at registration ("EVENTS WILL NOT SURVIVE RESTART"), and flagged on the wire
+/// (<c>AuditService</c> answers <c>persistent=false</c>) so a heap journal can never be mistaken
+/// for tamper-evidence.
 /// </summary>
 public sealed class InMemoryAuditLog : IAuditLog
 {

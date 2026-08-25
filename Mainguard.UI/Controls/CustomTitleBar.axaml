@@ -6,13 +6,13 @@
          chrome so every secondary window/dialog shares one consistent look. Reads Title/CanMinimize/
          CanMaximize straight off its ancestor Window; no per-window wiring needed beyond
          <controls:CustomTitleBar/> in row 0 of a ChromedWindow-derived window's root Auto,* Grid. -->
-    <Border Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1"
+    <Border x:Name="TitleBarRoot" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1"
             Padding="12,0,8,0" MinHeight="40"
             PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
         <Grid ColumnDefinitions="*,Auto">
             <TextBlock Grid.Column="0" Text="{Binding $parent[Window].Title}" Foreground="{DynamicResource TextPrimary}"
                        FontWeight="SemiBold" FontSize="13" VerticalAlignment="Center"/>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Stretch">
+            <StackPanel x:Name="WindowButtons" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Stretch">
                 <Button Classes="WindowButton" ToolTip.Tip="Minimize" Click="MinimizeButton_Click">
                     <PathIcon Data="{StaticResource WindowMinimizeIcon}" Width="11" Height="11" Foreground="{DynamicResource TextMuted}"/>
                 </Button>

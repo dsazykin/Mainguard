@@ -4,10 +4,10 @@
 
 ## The authority ladder
 
-1. [`DESIGN.md`](../../DESIGN.md) and [`PRODUCT.md`](../../PRODUCT.md) (repo root) — the constitution: token roles, the five themes, register, brand personality. Everything below conforms to them.
+1. [`DESIGN.md`](../../DESIGN.md) and [`PRODUCT.md`](../../PRODUCT.md) (repo root) — the constitution: token roles, the themes, register, brand personality. Everything below conforms to them.
 2. [`DesignSystem.md`](DesignSystem.md) — **the foundation specification (law within this folder).** Lane-A rulings with computed verification records: the corrected commit-graph lane palette per theme (Part 1), the state-encoding icon gates + the signature/severity triads (Part 2), the accessibility gates and retunes (Part 3), and the motion vocabulary — six primitives, three grades, the earned-moment ledger (Part 4). Where any other design doc disagrees with it, DesignSystem wins.
 3. Surface & feature specs — conform to DesignSystem:
-   - [`SurfaceDesigns.md`](SurfaceDesigns.md) — the five shipped core surfaces elevated: review cockpit (`RepoDashboardView`), commit graph, diff viewer, staging panel, OOBE/onboarding. Per surface: IA, primary flow, empty/loading/error states, the one signature accent, all five themes.
+   - [`SurfaceDesigns.md`](SurfaceDesigns.md) — the five shipped core surfaces elevated: review cockpit (`RepoDashboardView`), commit graph, diff viewer, staging panel, OOBE/onboarding. Per surface: IA, primary flow, empty/loading/error states, the one signature accent, all themes.
    - [`FeatureDesigns.md`](FeatureDesigns.md) — the client-parity features (P2-C1…C5) designed end-to-end as experiences: bisect assistant, global fuzzy search, multi-repo home + attention lane, split-into-branches wizard, polish pack. Appendix B carries the `ShortcutMap`/`ActionRegistry` keyboard additions.
    - [`ControlCenterDesign.md`](ControlCenterDesign.md) — the phase-2 swarm command surface (Lane E Part 1): activity bar (P2-13), merge-queue rail (P2-10), workspace dock (P2-13/39/44), coordinator + plan approval (P2-14), review cockpit (P2-11), session board (P2-29), telemetry panels (P2-44/45/41), and the §9 shared state/badge vocabulary. **§0 is the revision of record where it disagrees with §1.**
    - [`VibeModeDesign.md`](VibeModeDesign.md) — the zero-knowledge surface (Lane E Part 2): mode toggle, event-cards chat, escalation triage (exactly three actions), one-click deploy, live preview (P3-02/03/04).

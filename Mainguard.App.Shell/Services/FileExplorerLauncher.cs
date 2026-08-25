@@ -20,11 +20,19 @@ public static class FileExplorerLauncher
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
                 Process.Start(new ProcessStartInfo("explorer.exe", $"\"{path}\"") { UseShellExecute = true });
+            }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                Process.Start("xdg-open", $"\"{path}\"");
+            {
+                // ArgumentList, not a pre-quoted argument string: Process.Start(cmd, arg)
+                // passes the arg verbatim, so hand-added quotes become part of the path.
+                Process.Start(new ProcessStartInfo("xdg-open") { ArgumentList = { path } });
+            }
             else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                Process.Start("open", $"\"{path}\"");
+            {
+                Process.Start(new ProcessStartInfo("open") { ArgumentList = { path } });
+            }
         }
         catch
         {

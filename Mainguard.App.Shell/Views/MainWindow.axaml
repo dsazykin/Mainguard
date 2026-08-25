@@ -10,7 +10,7 @@
             Title="Mainguard"
             MinWidth="800" MinHeight="600"
             WindowStartupLocation="CenterScreen"
-            Background="{DynamicResource SurfaceWindow}"
+            Background="{DynamicResource ChromeWindowBackground}"
             ExtendClientAreaToDecorationsHint="True"
             ExtendClientAreaChromeHints="NoChrome"
             ExtendClientAreaTitleBarHeightHint="-1">
@@ -189,13 +189,16 @@
     <Grid Margin="{Binding #Root.OffScreenMargin}">
         <Grid RowDefinitions="Auto, *">
         <!-- UNIFIED CUSTOM TITLE BAR (client-area chrome; whole bar drags the window) -->
-        <Border Grid.Row="0" Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
+        <Border x:Name="TitleBarBorder" Grid.Row="0" Background="{DynamicResource ChromePanelBackground}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="0,0,0,1" Padding="12,0,8,0" MinHeight="44"
                 PointerPressed="TitleBar_PointerPressed" DoubleTapped="TitleBar_DoubleTapped">
             <Grid ColumnDefinitions="Auto, *, Auto, Auto">
 
                 <!-- Left Side: hamburger toggle + compact (Branch/Sync/Repository) or expanded
-                     (Select Repo/Close Repository/Settings/Exit) — JetBrains-style, never both at once. -->
-                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
+                     (Select Repo/Close Repository/Settings/Exit) — JetBrains-style, never both at once.
+                     Hidden entirely on macOS (code-behind, WindowChromePolicy.InWindowMenuVisible):
+                     every item here is a menu/flyout, and on macOS those live in the native menu bar
+                     (Services.MacMenuBar) instead — Windows/Linux keep this exactly as before. -->
+                <StackPanel x:Name="MenuBarGroup" Grid.Column="0" Orientation="Horizontal" Spacing="10" VerticalAlignment="Center">
 
                     <!-- Hamburger: a pure compact/expand toggle now — Select Repo (below) is what opens
                          the repo picker; the old File/Theme/Layout/Keyboard-Shortcuts/Window&amp;Exit
@@ -387,8 +390,9 @@
                     </StackPanel>
                 </StackPanel>
 
-                <!-- Window controls (custom chrome) -->
-                <StackPanel Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Stretch">
+                <!-- Window controls (custom chrome; hidden on macOS, where WindowChromePolicy
+                     overlays the native traffic lights instead) -->
+                <StackPanel x:Name="WindowButtonsPanel" Grid.Column="3" Orientation="Horizontal" VerticalAlignment="Stretch">
                     <Button Classes="WindowButton" ToolTip.Tip="Minimize" Click="MinimizeButton_Click">
                         <PathIcon Data="{StaticResource WindowMinimizeIcon}" Width="11" Height="11" Foreground="{DynamicResource TextMuted}"/>
                     </Button>
@@ -411,7 +415,7 @@
 
             <!-- SECTION RAIL -->
             <Border Grid.Column="0" Classes="sectionRail" Classes.expanded="{Binding IsRailExpanded}"
-                    Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}"
+                    Background="{DynamicResource ChromePanelBackground}" BorderBrush="{DynamicResource BorderHairline}"
                     BorderThickness="1" CornerRadius="12" Margin="8,8,0,8">
                 <Grid RowDefinitions="Auto,*" Margin="4,8">
 
@@ -422,7 +426,8 @@
                          the Attention/Spend adornments below bind the live control center through the
                          window and are gated on the row's adornment kind (nothing binds under Client). -->
                     <StackPanel Grid.Row="0" Spacing="2">
-                        <Button Classes="railItem" Command="{Binding ToggleRailCommand}" ToolTip.Tip="Expand or collapse this sidebar">
+                        <Button Classes="railItem" Command="{Binding ToggleRailCommand}" ToolTip.Tip="Expand or collapse this sidebar"
+                                AutomationProperties.Name="Sections">
                             <StackPanel Orientation="Horizontal" Spacing="8">
                                 <PathIcon Data="{StaticResource MenuIcon}" Width="14" Height="14" Foreground="{DynamicResource TextMuted}"/>
                                 <TextBlock Text="Sections" FontSize="12" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center" IsVisible="{Binding IsRailExpanded}"/>
@@ -442,10 +447,15 @@
                                              restores the shipped 8px below (the item spacing now sits
                                              above the divider, not below it). -->
                                         <Border IsVisible="{Binding ShowsLeadingDivider}" Height="1" Background="{DynamicResource BorderHairline}" Margin="4,6,4,8"/>
+                                        <!-- The label is only RENDERED when the rail is expanded, so a
+                                             collapsed rail item would otherwise announce nothing at all:
+                                             Avalonia never falls back to ToolTip.Tip for the accessible
+                                             name, and the Grid/PathIcon content offers no text. -->
                                         <Button Classes="railItem" Classes.active="{Binding IsActive}"
                                                 IsEnabled="{Binding IsEnabled}"
                                                 Command="{Binding ActivateCommand}"
-                                                ToolTip.Tip="{Binding Tooltip}">
+                                                ToolTip.Tip="{Binding Tooltip}"
+                                                AutomationProperties.Name="{Binding Label}">
                                             <Grid ColumnDefinitions="Auto,*,Auto">
                                                 <!-- icon (+ Coordinator attention dot — Attention adornment only) -->
                                                 <Panel Grid.Column="0" Width="14" Height="14">
@@ -590,6 +600,32 @@
                            VerticalAlignment="Center" MaxWidth="720"/>
                 <PathIcon Classes="spinning" Data="{StaticResource RefreshIcon}" Width="13" Height="13"
                           Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Border>
+
+        <!-- AGENT-PROVISION RETRY CARD: shown when provisioning the opened repo into the daemon
+             failed (reason surfaced verbatim). Bottom-left so it never fights the toast stack;
+             persistent until retried, dismissed, or another repo opens — a failed provision means
+             agents are unavailable for this repo, which must never be a silent nothing. -->
+        <Border Grid.Row="1" ZIndex="450" IsVisible="{Binding IsAgentProvisionRetryVisible}"
+                HorizontalAlignment="Left" VerticalAlignment="Bottom" Margin="20"
+                Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}"
+                BorderThickness="1" CornerRadius="12" Padding="14,12" MaxWidth="380">
+            <StackPanel Spacing="8">
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <PathIcon Data="{StaticResource WarningIcon}" Width="14" Height="14"
+                              Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Center"/>
+                    <TextBlock Text="Agents unavailable for this repo" FontSize="12" FontWeight="SemiBold"
+                               Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
+                </StackPanel>
+                <TextBlock Text="{Binding AgentProvisionFailureReason}" FontSize="11"
+                           Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
+                <StackPanel Orientation="Horizontal" Spacing="8">
+                    <Button Content="Retry" Classes="Primary" Padding="12,4"
+                            Command="{Binding RetryAgentProvisioningCommand}"/>
+                    <Button Content="Dismiss" Classes="Secondary" Padding="12,4"
+                            Command="{Binding DismissAgentProvisionRetryCommand}"/>
+                </StackPanel>
             </StackPanel>
         </Border>
 

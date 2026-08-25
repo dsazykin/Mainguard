@@ -10,6 +10,7 @@ using Avalonia.Rendering.SceneGraph;
 using Avalonia.Skia;
 using Avalonia.Threading;
 using Mainguard.Agents.Terminal;
+using Mainguard.UI.Theming;
 using SkiaSharp;
 
 namespace Mainguard.Agents.UI.Controls;
@@ -75,6 +76,23 @@ public sealed class TerminalGridControl : Control, ITerminalView, ITerminalEngin
 
         AddHandler(TextInputMethodClientRequestedEvent, (_, e) => e.Client = _ime);
     }
+
+    // Same dirty-flag gap as TerminalControl (the other engine behind ITerminalEngineControl): a
+    // theme switch changes no PTY bytes/size, so nothing here asks for a repaint on its own even
+    // though ResolveColor re-reads the current theme's tokens on every call it does make.
+    protected override void OnAttachedToVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnAttachedToVisualTree(e);
+        ThemeManager.ThemeChanged += OnThemeChanged;
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        base.OnDetachedFromVisualTree(e);
+        ThemeManager.ThemeChanged -= OnThemeChanged;
+    }
+
+    private void OnThemeChanged() => InvalidateVisual();
 
     /// <inheritdoc />
     public event Action<byte[]>? InputAvailable;

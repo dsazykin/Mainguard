@@ -344,7 +344,11 @@ public sealed class AgentSpawnService
                 withoutRepositoryAccess: isCoordinator,
                 progress: new InlineProgress(m => _store.MarkState(key, session.State, m)),
                 adoptExistingBranch: adoptExistingBranch,
-                cliSettings: launchSettings).ConfigureAwait(false);
+                cliSettings: launchSettings,
+                // The role goes onto the jail's own labels. The session record that carries it here is
+                // in-memory and dies with the daemon; the container outlives both, so the label is what
+                // lets the next daemon adopt a surviving coordinator back AS a coordinator.
+                agentRole: role).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -579,6 +583,18 @@ public sealed class AgentSpawnService
             // repo hash caches nothing rather than leaking into a repo-less bucket (MG-6).
             _keys.RememberCliCredentials(session.RepoHash ?? string.Empty, session.Kind, credentials);
             await _launcher.TeardownAsync(session.RepoHash, agentId, containerId, ct).ConfigureAwait(false);
+        }
+
+        // MG-10 corollary: a stopped session's jail is gone, but nothing about that touches MergeQueue
+        // state (Stop isn't a queue transition), so the queue's own `Changed` event — the only thing
+        // that makes StreamQueue re-push — never fires here. An already-open rail keeps rendering this
+        // agent's LAST-KNOWN HasLiveSandbox (true, from while it was running) until some unrelated queue
+        // event elsewhere happens to force a fresh snapshot — which means the "Resume" affordance for a
+        // now-genuinely-stranded entry can silently fail to appear for the rest of the session. Republish
+        // (no state moves) so the rail's next paint reflects the sandbox that just went away.
+        if (session?.RepoHash is { Length: > 0 } repoHashForQueue)
+        {
+            _mergeQueues.EnsureQueue(repoHashForQueue)?.Queue.NotifyGateChanged();
         }
 
         _spawnLog.LogInformation(

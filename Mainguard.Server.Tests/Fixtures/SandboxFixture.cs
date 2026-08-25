@@ -36,7 +36,7 @@ public sealed class SandboxFixture : IAsyncDisposable
 
     public SandboxFixture()
     {
-        Docker = new DockerClientConfiguration().CreateClient();
+        Docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         ImageRef = Environment.GetEnvironmentVariable("MAINGUARD_AGENT_IMAGE") ?? "mainguard-agent-base:latest";
         Egress = new EgressProxyConfigurator(Docker, EgressAllowlist.WithDefaults(new Mainguard.Git.Audit.InMemoryAuditLog()));
         Engine = new DockerSandboxEngine(Docker, new SandboxEngineOptions(Egress.NetworkName, Egress.ProxyUrl));
@@ -381,7 +381,7 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// </summary>
     public string NewTempToolchainRoot()
     {
-        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-tc-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(Fixtures.CanonicalTemp.Root, "mainguard-sbx-tc-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(path);
         var interpreter = Path.Combine(path, "interpreter");
         File.WriteAllText(interpreter, "#!/bin/sh\necho genuine\n");
@@ -402,7 +402,7 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// </summary>
     public string NewTempBareMirror()
     {
-        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-mirror-" + Guid.NewGuid().ToString("N") + ".git");
+        var path = Path.Combine(Fixtures.CanonicalTemp.Root, "mainguard-sbx-mirror-" + Guid.NewGuid().ToString("N") + ".git");
         Directory.CreateDirectory(Path.Combine(path, "refs", "heads"));
         Directory.CreateDirectory(Path.Combine(path, "objects"));
         File.WriteAllText(Path.Combine(path, "HEAD"), "ref: refs/heads/main\n");
@@ -426,7 +426,7 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// </summary>
     public string NewTempVmRoot()
     {
-        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-vm-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(Fixtures.CanonicalTemp.Root, "mainguard-sbx-vm-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(path);
         _tempWorktrees.Add(path);
         return path;
@@ -477,7 +477,7 @@ public sealed class SandboxFixture : IAsyncDisposable
     private string NewTempWorktree()
     {
         // A real ext4 path on the Linux CI leg (/tmp) — never /mnt/c or a UNC (G-11).
-        var path = Path.Combine(Path.GetTempPath(), "mainguard-sbx-wt-" + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(Fixtures.CanonicalTemp.Root, "mainguard-sbx-wt-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(path);
         _tempWorktrees.Add(path);
         return path;

@@ -179,12 +179,116 @@ public class KillSwitchTests
         Assert.True(report.QueueFrozen); // the kill still completes
     }
 
+    // ---- ISSUES-LOG #17 — Resume must actually reverse the kill, not just clear a flag ----
+
+    /// <summary>
+    /// The bug, stated as a test: Engage <c>docker pause</c>d every jail and Resume un-paused none of them,
+    /// because <c>Resume()</c> was <c>_gate.Resume()</c> and <see cref="IKillTarget"/> had no release member
+    /// at all. The emergency stop was one-way — the app's own Resource Monitor called the state
+    /// "(recoverable)" while only a raw <c>docker unpause</c> from outside the app could recover it.
+    /// </summary>
+    [Fact]
+    public async Task Resume_UnpausesEveryAgentTheKillPaused_NotJustTheQueueFlag()
+    {
+        var gate = new KillSwitchGate();
+        var target = new FakeKillTarget(new[] { "a", "b", "c" }, yieldsFor: new[] { "a" });
+        var kill = new KillSwitch(gate, target, rttBudget: () => TimeSpan.Zero);
+
+        await kill.EngageAsync();
+        Assert.Equal(new[] { "a", "b", "c" }, target.Paused.OrderBy(x => x, StringComparer.Ordinal));
+
+        var report = await kill.ResumeAsync();
+
+        // The half that did not exist: every paused jail released.
+        Assert.Equal(new[] { "a", "b", "c" }, target.Unpaused.OrderBy(x => x, StringComparer.Ordinal));
+        Assert.All(report.Agents, a => Assert.Equal(KillResumeOutcome.Resumed, a.Outcome));
+
+        // ...and the half that always worked, still working.
+        Assert.False(gate.IsFrozen);
+        Assert.False(report.QueueFrozen);
+        Assert.True(kill.IsEngaged == false);
+    }
+
+    /// <summary>Resume is idempotent: a second press must not re-issue an unpause at an agent that is
+    /// already running (nor throw), the same way Engage's freeze is idempotent.</summary>
+    [Fact]
+    public async Task Resume_Twice_ReleasesOnce()
+    {
+        var gate = new KillSwitchGate();
+        var target = new FakeKillTarget(new[] { "a" }, yieldsFor: Array.Empty<string>());
+        var kill = new KillSwitch(gate, target, rttBudget: () => TimeSpan.Zero);
+
+        await kill.EngageAsync();
+        await kill.ResumeAsync();
+        var second = await kill.ResumeAsync();
+
+        Assert.Equal(new[] { "a" }, target.Unpaused);
+        Assert.Empty(second.Agents);
+        Assert.False(gate.IsFrozen);
+    }
+
+    /// <summary>
+    /// A jail the engine refuses to wake must (a) never be reported as resumed, (b) never abandon the rest
+    /// of the fan-out, (c) never leave the operator stuck behind a frozen queue with no way out, and
+    /// (d) stay in the ledger so pressing Resume again retries exactly it.
+    /// </summary>
+    [Fact]
+    public async Task Resume_WhenUnpauseFails_ClearsTheFreezeAnyway_AndRetriesThatAgentOnTheNextPress()
+    {
+        var gate = new KillSwitchGate();
+        var target = new FakeKillTarget(new[] { "a" }, yieldsFor: Array.Empty<string>());
+        var kill = new KillSwitch(gate, target, rttBudget: () => TimeSpan.Zero);
+
+        await kill.EngageAsync();
+        target.FailUnpauses = true;
+        var failedRun = await kill.ResumeAsync();
+
+        Assert.Equal(KillResumeOutcome.ResumeFailed, Assert.Single(failedRun.Agents).Outcome);
+        Assert.Empty(target.Unpaused);
+        // The queue is NOT held hostage by an engine that would not co-operate.
+        Assert.False(gate.IsFrozen);
+
+        // The engine comes back; the operator presses Resume again and the jail this time is released.
+        target.FailUnpauses = false;
+        var retry = await kill.ResumeAsync();
+        Assert.Equal(KillResumeOutcome.Resumed, Assert.Single(retry.Agents).Outcome);
+        Assert.Equal(new[] { "a" }, target.Unpaused);
+    }
+
+    /// <summary>The release is audited like the stop is — an emergency stop's END is as much of an
+    /// operational fact as its beginning, and RT-D3's "never block on the audit store" applies to both.</summary>
+    [Fact]
+    public async Task Resume_IsAudited_AndNeverBlocksOnTheAuditStore()
+    {
+        var gate = new KillSwitchGate();
+        var audit = new FaultableAuditLog();
+        var target = new FakeKillTarget(new[] { "a" }, yieldsFor: Array.Empty<string>());
+        var kill = new KillSwitch(gate, target, audit: audit, rttBudget: () => TimeSpan.Zero);
+
+        await kill.EngageAsync();
+        audit.Down = true;
+        var duringOutage = await kill.ResumeAsync();
+        // The store being down did not stop the jail from being released.
+        Assert.Equal(new[] { "a" }, target.Unpaused);
+        Assert.Equal(KillResumeOutcome.Resumed, Assert.Single(duringOutage.Agents).Outcome);
+
+        audit.Down = false;
+        await kill.EngageAsync();
+        await kill.ResumeAsync();
+        var resume = Assert.Single(audit.Read(), e => e.Type == "killswitch_resume");
+        Assert.Equal("1", resume.Fields["resumed"]);
+        Assert.Equal("0", resume.Fields["resume_failed"]);
+    }
+
     // ---- fakes ----
 
     private sealed class FakeKillTarget : IKillTarget
     {
         private readonly HashSet<string> _yields;
         public ConcurrentBag<string> Paused { get; } = new();
+
+        /// <summary>Agents this fake released, in the order Resume asked for them.</summary>
+        public ConcurrentBag<string> Unpaused { get; } = new();
 
         public FakeKillTarget(IReadOnlyList<string> ids, IReadOnlyList<string> yieldsFor)
         {
@@ -196,6 +300,9 @@ public class KillSwitchTests
 
         /// <summary>Models a jail the engine could not freeze (MG-39(a) honesty path).</summary>
         public bool FailPauses { get; init; }
+
+        /// <summary>Models a jail the engine could not wake — the release-side honesty path.</summary>
+        public bool FailUnpauses { get; set; }
 
         // The fake short-circuits the deadline wait (virtualized timing): an ignoring agent returns false
         // immediately rather than consuming the wall-clock deadline.
@@ -210,6 +317,17 @@ public class KillSwitchTests
             }
 
             Paused.Add(agentId);
+            return Task.CompletedTask;
+        }
+
+        public Task UnpauseAsync(string agentId, CancellationToken ct)
+        {
+            if (FailUnpauses)
+            {
+                throw new InvalidOperationException("docker daemon unreachable");
+            }
+
+            Unpaused.Add(agentId);
             return Task.CompletedTask;
         }
 
@@ -239,6 +357,8 @@ public class KillSwitchTests
         }
 
         public Task PauseAsync(string agentId, CancellationToken ct) => Task.CompletedTask;
+
+        public Task UnpauseAsync(string agentId, CancellationToken ct) => Task.CompletedTask;
 
         public IReadOnlyDictionary<string, string> CaptureStates() =>
             ActiveAgentIds.ToDictionary(id => id, _ => "Yielded", StringComparer.Ordinal);

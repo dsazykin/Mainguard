@@ -74,7 +74,9 @@
                                                                Foreground="{DynamicResource AccentBrush}"/>
                                                 </Border>
                                             </Grid>
-                                            <TextBlock Text="Installed — verified at the pinned version" FontSize="11" TextWrapping="Wrap"
+                                            <!-- Names the version actually running when it differs from this build's
+                                                 pin (W6: a drifted install used to render as "Not installed"). -->
+                                            <TextBlock Text="{Binding InstalledLabel}" FontSize="11" TextWrapping="Wrap"
                                                        Foreground="{DynamicResource SuccessBrush}" IsVisible="{Binding IsInstalled}"/>
                                             <TextBlock FontSize="11" Foreground="{DynamicResource AccentBrush}"
                                                        IsVisible="{Binding HasUpdate}" Text="{Binding UpdateHint}"/>

@@ -58,7 +58,11 @@
         <ItemsControl ItemsSource="{Binding Agents}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:AgentRowViewModel">
+              <!-- Name it explicitly: the row's text is expanded-state only, and Avalonia does not
+                   use ToolTip.Tip as an accessible-name fallback, so a collapsed rail row would be
+                   an unnamed button to a screen reader. -->
               <Button Classes="railItem" Opacity="{Binding RowOpacity}" ToolTip.Tip="{Binding Tooltip}"
+                      AutomationProperties.Name="{Binding Name}"
                       Command="{Binding $parent[Window].((uivm:IShellRailHost)DataContext).ShowAgentCommand}"
                       CommandParameter="{Binding AgentId}">
                 <Grid ColumnDefinitions="14,*,Auto">
@@ -96,6 +100,7 @@
     <!-- the kill switch, at the rail's foot in every section -->
     <Button Grid.Row="2" Classes="railItem railKill" Classes.frozen="{Binding IsFrozen}"
             Command="{Binding ToggleKillSwitchCommand}"
+            AutomationProperties.Name="{Binding KillSwitchLabel}"
             ToolTip.Tip="Stop all agents and freeze the merge queue — instant, nothing is lost, resume any time">
       <StackPanel Orientation="Horizontal" Spacing="8">
         <PathIcon Data="{StaticResource SeverityBlockerIcon}" Width="13" Height="13"/>

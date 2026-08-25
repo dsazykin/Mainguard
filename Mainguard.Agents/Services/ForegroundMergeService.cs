@@ -12,13 +12,13 @@ namespace Mainguard.Agents.Services;
 /// <summary>
 /// The merge-gate probe the foreground merge consults before it touches a ref — shaped exactly like
 /// <see cref="IMergeQueue.CanMerge"/> so the daemon can hand it the live queue's method and nothing
-/// re-implements the gate. MG-11: without this the Windows-side merge ran with no gate at all, so
+/// re-implements the gate. MG-11: without this the host-side merge ran with no gate at all, so
 /// staleness and every unacknowledged flagged item were enforced only by whichever UI happened to call it.
 /// </summary>
 public delegate bool MergeGateCheck(string agentId, out string reason);
 
 /// <summary>
-/// The Windows-side human-gated foreground merge (P2-10 §3.5). See <see cref="IForegroundMergeService"/>.
+/// The host-side human-gated foreground merge (P2-10 §3.5; substrate-neutral — the user's own checkout on Windows or macOS). See <see cref="IForegroundMergeService"/>.
 ///
 /// <para><b>A5 freshness is a ref-level compare-and-swap on <c>refs/heads/main</c>.</b> Because P2-09
 /// keep-alive-rebases every agent branch onto the exact main it was verified against, a verified branch
@@ -70,7 +70,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// <summary>
     /// The substrate-free constructor: the caller supplies the SC-2 sync-remote resolution directly
     /// (repoHash → <see cref="SyncRemote"/>) instead of the whole daemon-side <see cref="IAgentEnvironment"/>.
-    /// This is what lets the <b>Windows GUI</b> run the human merge leg — it holds the sync-remote binding
+    /// This is what lets the <b>host GUI</b> run the human merge leg — it holds the sync-remote binding
     /// verbatim from <c>ProvisionRepo</c> and has no substrate facade (ESC-I2), and the merge needs nothing
     /// else from it.
     /// </summary>
@@ -80,7 +80,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// The RT-D1 merge-lease store — required only by <see cref="MergeAgentBranch"/>, which drives the whole
     /// begin → merge → confirm conversation itself.
     /// <para><b>Pass null when the caller already holds the repo's lease</b> and only drives
-    /// <see cref="PerformJournaledMerge"/> — the Windows-side leg of the RT-D1 conversation, whose lease was
+    /// <see cref="PerformJournaledMerge"/> — the host-side leg of the RT-D1 conversation, whose lease was
     /// taken over the daemon's <c>BeginMerge</c> RPC. <b>Never hand this parameter a second store just to
     /// satisfy it:</b> one-outstanding-merge-per-repo is only an invariant while every origin contends for
     /// the SAME store, and that store is the daemon's singleton (MG-23).</para>
@@ -200,7 +200,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     /// </summary>
     public ForegroundMergeResult PerformJournaledMerge(ForegroundMergeRequest request, MergeLeaseRow lease)
     {
-        // (0) The same refusal MergeAgentBranch makes, restated on the entry point the Windows GUI drives
+        // (0) The same refusal MergeAgentBranch makes, restated on the entry point the host GUI drives
         // directly under a daemon-granted lease. Both legs are reachable independently, so a guard on one
         // of them is a guard on neither.
         if (request.AllowStaleOverride && _onStaleOverride is null)
@@ -229,7 +229,8 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         // A failed fetch is fatal, not cosmetic: whatever agent/<id> happens to be in this repo is then
         // an unknown-age copy, and merging it would land work the queue never verified.
         var syncRemote = _resolveSyncRemote(request.RepoHash);
-        var (fetchCode, _, fetchErr) = GitService.RunGit(request.RepoPath, "fetch", syncRemote.Name);
+        var (fetchCode, _, fetchErr) = UncRemoteTrust.RunGitTrustingRemote(
+            request.RepoPath, syncRemote.Name, "fetch", syncRemote.Name);
         if (fetchCode != 0)
         {
             return new ForegroundMergeResult(false, null, CasLost: false,
@@ -422,7 +423,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         }
 
         // EVERY package-manager invocation is script-free: "--ignore-scripts" is always present, so a
-        // poisoned dependency lifecycle hook in an agent branch never executes on the Windows host (the canary).
+        // poisoned dependency lifecycle hook in an agent branch never executes on the user's host (the canary).
         var args = new List<string> { "install", "--ignore-scripts" };
         _ = manager; // the manager selects the binary in the runner; the args are identical + script-free.
 
@@ -468,7 +469,7 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
 
     private static int DefaultDepsRefreshRunner(string workingDir, IReadOnlyList<string> args)
     {
-        // The daemon runs the package manager on the Windows host. Best-effort: a missing manager must
+        // The refresh runs the package manager on the user's host. Best-effort: a missing manager must
         // not fail the merge. The first arg selects the binary family; here we default to npm.
         try
         {

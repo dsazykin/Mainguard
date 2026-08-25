@@ -6,9 +6,10 @@
     <Nullable>enable</Nullable>
     <AssemblyName>Mainguard.Server</AssemblyName>
     <RootNamespace>Mainguard.Server</RootNamespace>
-    <!-- The daemon publishes for the WSL2 VM (linux-x64) and runs on Windows for
-         local-dev. Both must build and run (invariant 4). -->
-    <RuntimeIdentifiers>linux-x64;win-x64</RuntimeIdentifiers>
+    <!-- The daemon publishes for the WSL2 VM (linux-x64), runs on Windows for local-dev, and
+         runs natively on the macOS host (osx-arm64) for the macos-host substrate. All must
+         build and run (invariant 4). -->
+    <RuntimeIdentifiers>linux-x64;win-x64;osx-arm64</RuntimeIdentifiers>
 
     <!-- Tier-1 daemon fast-path: GetDaemonInfo reports this assembly's informational version and
          the App refreshes the in-VM daemon when it differs from the App's own. Keep these in
@@ -24,10 +25,14 @@
          `build/mainguardos/VERSION` cut: the images ship beside the app, not inside the MainguardOS
          tarball. Bumped 0.2.6 → 0.2.7 (MG-41): the egress-proxy image sources moved again —
          entrypoint.sh and reload.sh — so `SandboxImageVersions.EgressProxy` moved, and the daemon
-         compares that constant at spawn preflight. Same "no VERSION cut" reasoning as above. -->
-    <Version>0.2.7</Version>
-    <FileVersion>0.2.7.0</FileVersion>
-    <InformationalVersion>0.2.7</InformationalVersion>
+         compares that constant at spawn preflight. Same "no VERSION cut" reasoning as above.
+         Bumped 0.2.7 → 0.2.8: the agent-base image sources moved (TARGETARCH parametrization —
+         per-arch nix-installer/devbox pins so the macos-host substrate builds arm64 jails), so
+         `SandboxImageVersions.AgentBase` moved, and the daemon compares that constant at spawn
+         preflight. Same reasoning again. -->
+    <Version>0.2.8</Version>
+    <FileVersion>0.2.8.0</FileVersion>
+    <InformationalVersion>0.2.8</InformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -41,6 +46,14 @@
   <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.so')">
     <None Include="$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.so"
           Link="libvterm.so"
+          CopyToOutputDirectory="PreserveNewest"
+          CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- The same pinned build under its macOS name — build.sh emits .dylib on Darwin for the
+       macos-host substrate's native daemon; the resolver probes both names beside the binary. -->
+  <ItemGroup Condition="Exists('$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.dylib')">
+    <None Include="$(MSBuildThisFileDirectory)..\build\libvterm\out\libvterm.dylib"
+          Link="libvterm.dylib"
           CopyToOutputDirectory="PreserveNewest"
           CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>

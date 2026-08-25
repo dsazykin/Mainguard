@@ -36,6 +36,30 @@ public sealed class TerminalScrollbackTests
         Assert.Equal("line19995", screen.ScrollbackLineText(screen.ScrollbackCount - 1));
     }
 
+    /// <summary>The renderer's window into history: <c>ScrollbackLine</c> returns the CELLS of a
+    /// retained line, matching the text seam index-for-index — the wheel-scroll view (the terminal
+    /// held 10k lines of scrollback nobody could ever see) renders through this.</summary>
+    [Fact]
+    public void ScrollbackLine_ReturnsTheCellsOfTheRetainedLine()
+    {
+        var screen = new VtScreen(20, 5);
+        for (var i = 0; i < 20; i++)
+        {
+            screen.Feed(Encoding.ASCII.GetBytes($"line{i}\r\n"));
+        }
+
+        Assert.True(screen.ScrollbackCount > 0);
+        for (var i = 0; i < screen.ScrollbackCount; i++)
+        {
+            var cells = screen.ScrollbackLine(i);
+            var text = string.Concat(cells.Select(c => c.Glyph)).TrimEnd();
+            Assert.Equal(screen.ScrollbackLineText(i), text);
+        }
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => screen.ScrollbackLine(-1));
+        Assert.Throws<ArgumentOutOfRangeException>(() => screen.ScrollbackLine(screen.ScrollbackCount));
+    }
+
     [Fact]
     public void ReadGrid_ShouldReflectTextAndSgrColour()
     {
