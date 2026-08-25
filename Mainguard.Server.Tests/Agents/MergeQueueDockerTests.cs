@@ -41,7 +41,7 @@ public class MergeQueueDockerTests
     [RequiresDockerDaemonFact]
     public async Task ForgedVerifyResult_ShouldBeOverriddenByDaemonObservedExit()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
         if (!await EnsureImageAsync(docker, ct))
@@ -93,7 +93,7 @@ public class MergeQueueDockerTests
     [RequiresDockerDaemonFact]
     public async Task Verification_ShouldRunInWorkerSandbox_NeverHost()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
         if (!await EnsureImageAsync(docker, ct))
@@ -129,7 +129,7 @@ public class MergeQueueDockerTests
     [RequiresDockerDaemonFact]
     public async Task TwoWorkers_StaleCascade_WithRealContainerVerification()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
         if (!await EnsureImageAsync(docker, ct))

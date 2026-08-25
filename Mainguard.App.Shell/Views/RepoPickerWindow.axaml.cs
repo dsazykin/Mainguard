@@ -54,10 +54,19 @@ public partial class RepoPickerWindow : Window
     }
 
     // Double-click a repo to open it; the picker closes so the workspace has the stage.
-    private void Repo_DoubleTapped(object? sender, TappedEventArgs e)
+    private void Repo_DoubleTapped(object? sender, TappedEventArgs e) => ActivateRepo(sender);
+
+    // The same open, reached without a mouse: RepoRow raises Activated for Enter/Space and for
+    // UI Automation's InvokePattern (W2 — the rows used to expose no activation path at all).
+    private void Repo_Activated(object? sender, Avalonia.Interactivity.RoutedEventArgs e) => ActivateRepo(sender);
+
+    private void ActivateRepo(object? sender)
     {
         if (sender is Control { DataContext: Repository repo } && DataContext is MainWindowViewModel vm)
         {
+            // The pointer path already selected on press; doing it here too makes the keyboard and
+            // automation paths land in the same state rather than opening an unselected row.
+            vm.SelectedNode = repo;
             vm.OpenRepository(repo);
             Close();
         }

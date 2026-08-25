@@ -530,6 +530,8 @@ public class ToolchainDeclarationFlowTests
           "version": "3.12.13",
           "payloadUrl": "{{PayloadUrl}}",
           "sha256": "{{PayloadSha}}",
+          "payloadUrlArm64": "{{PayloadUrl}}",
+          "sha256Arm64": "{{PayloadSha}}",
           "stripComponents": 1,
           "pathEntries": ["{toolchain}/bin"],
           "probe": {

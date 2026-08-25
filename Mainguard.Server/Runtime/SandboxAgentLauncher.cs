@@ -108,7 +108,8 @@ public sealed class SandboxAgentLauncher
         bool withoutRepositoryAccess = false,
         IProgress<string>? progress = null,
         bool adoptExistingBranch = false,
-        IReadOnlyList<SandboxSettingsFile>? cliSettings = null)
+        IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
+        string agentRole = "")
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -336,7 +337,13 @@ public sealed class SandboxAgentLauncher
                 // infer the path from.
                 WorkspaceIgnorePaths: DeclaredWorkspaceSettingsPaths(adapter),
                 ToolchainsRootPath: mountedToolchainIds.Count > 0 ? _environment.ToolchainsRootPath : null,
-                ToolchainIds: mountedToolchainIds), ct).ConfigureAwait(false);
+                ToolchainIds: mountedToolchainIds,
+                // Stamped onto the jail's labels. The daemon's live session store is in-memory, so after a
+                // restart the container labels are the ONLY record of what this agent is — without these
+                // two, a surviving coordinator is adopted back as an unnamed, role-less worker and the
+                // Coordinator surface reports no coordinator for a repo that plainly has one.
+                AgentKind: agentKind,
+                AgentRole: agentRole), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only

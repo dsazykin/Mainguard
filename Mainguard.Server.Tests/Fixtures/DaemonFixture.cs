@@ -45,6 +45,19 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
     /// </summary>
     public Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler? ResourceSampler { get; init; }
 
+    /// <summary>
+    /// Starts THIS host with dev-only queue seeding enabled (docs/design/queue-seeding.md §7) by
+    /// replacing the boot-captured <c>QueueSeedingOptions</c> singleton in ConfigureTestServices —
+    /// the same seam the AdmissionController pin below uses, and the only one that can differ
+    /// between the enabled and disabled daemons one test process hosts side by side (a process-wide
+    /// env var cannot, and a <c>UseSetting</c> configuration key measurably never reaches
+    /// <c>builder.Configuration</c> during the daemon's ConfigureServices under this minimal-hosting
+    /// factory). Set before the host is built. The default (false) daemon never maps
+    /// <c>QueueSeedingService</c>, which is itself an assertion surface: seeding must be
+    /// UNIMPLEMENTED there.
+    /// </summary>
+    public bool EnableQueueSeeding { get; init; }
+
     /// <summary>An independent, freshly-started in-proc daemon (own token + host).</summary>
     public static DaemonFixture StartNew()
     {
@@ -112,6 +125,14 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
             // its deterministic coverage in CoordinatorSpawnGateTests, which injects its own sampler —
             // this replacement is registered before WiringRig's, so a test that wants to exercise
             // pressure can still override it.
+            // Dev-only queue seeding (see EnableQueueSeeding): the singleton replacement IS the
+            // in-proc boot flag — MapServices reads this instance to decide whether the seeding
+            // service is mapped at all.
+            if (EnableQueueSeeding)
+            {
+                services.Replace(ServiceDescriptor.Singleton(new QueueSeedingOptions(Enabled: true)));
+            }
+
             services.Replace(ServiceDescriptor.Singleton(new AdmissionController(
                 sampler: () => RoomySample,
                 runningAgentCount: () => 0)));

@@ -1,0 +1,51 @@
+# The macos-host substrate leg: build + the non-Docker test tier on an Apple Silicon runner.
+# Deliberately NOT part of ci.yml's per-PR matrix — macOS runner minutes bill at 10× — so it runs
+# on demand and on pushes to the macOS port branch; promote it into the PR matrix when the port
+# merges and the spend is a deliberate decision. Docker-gated tests skip on these runners (no
+# engine); the full RequiresDocker tier's mac evidence is the on-device run recorded in
+# docs/phase-2/Mainguard_Substrate_MacHost.md.
+name: macOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "port/macos" ]
+
+jobs:
+  mac-build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore (locked mode — the committed lockfiles must bind on osx-arm64)
+        run: dotnet restore Mainguard.slnx --locked-mode
+
+      - name: Build (Release)
+        run: dotnet build Mainguard.slnx -c Release --no-restore
+
+      - name: Build the pinned libvterm (.dylib lane)
+        run: bash build/libvterm/build.sh
+
+      - name: Test — Mainguard.Tests (non-Docker)
+        env:
+          MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.dylib
+          MAINGUARD_REQUIRE_LIBVTERM: "1"
+        run: >
+          dotnet test Mainguard.Tests/Mainguard.Tests.csproj -c Release --no-build
+          --filter "Category!=RequiresDocker"
+
+      - name: Test — Mainguard.Server.Tests (non-Docker)
+        env:
+          MAINGUARD_LIBVTERM: ${{ github.workspace }}/build/libvterm/out/libvterm.dylib
+          MAINGUARD_REQUIRE_LIBVTERM: "1"
+        run: >
+          dotnet test Mainguard.Server.Tests/Mainguard.Server.Tests.csproj -c Release --no-build
+          --filter "Category!=RequiresDocker"
+
+      - name: Daemon --local-dev smoke (macos-host substrate composition)
+        run: dotnet run --project Mainguard.Server -c Release --no-build -- --local-dev --smoke

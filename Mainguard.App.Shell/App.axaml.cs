@@ -82,6 +82,17 @@ public partial class App : Application
     {
         AvaloniaXamlLoader.Load(this);
 
+        // Native macOS typography: put the system face ahead of the bundled Inter. FontUi is
+        // consumed via DynamicResource and direct app-resource entries shadow merged-dictionary
+        // values, so this one write restyles every window. ".AppleSystemUIFont" is deliberate:
+        // SF Pro ships only as that hidden CoreText family — "SF Pro Text" is NOT installed, and
+        // Skia's matcher silently substitutes Helvetica for unknown names, so the friendly name
+        // would deliver the wrong font, not a graceful skip. The chain ends in Inter so a macOS
+        // build where the dot-name ever stops resolving degrades to the cross-platform look.
+        if (System.OperatingSystem.IsMacOS())
+            Resources["FontUi"] = new Avalonia.Media.FontFamily(
+                ".AppleSystemUIFont, Helvetica Neue, Inter, sans-serif");
+
         // Load environment variables securely from .env file
         DotNetEnv.Env.TraversePath().Load();
 
@@ -236,25 +247,62 @@ public partial class App : Application
     /// chrome — set up on BOTH launch paths, before the edition branch.</summary>
     private void SetupTrayIcon(IClassicDesktopStyleApplicationLifetime desktop)
     {
+        // A live status row, disabled (informational): refreshed through NativeMenu's own
+        // NeedsUpdate — the one hook that fires right before the menu shows, so the count is
+        // read exactly when a human is about to look at it, never on a poll.
+        var status = new Avalonia.Controls.NativeMenuItem("No agents running") { IsEnabled = false };
+
         var open = new Avalonia.Controls.NativeMenuItem("Open Mainguard");
         open.Click += (_, _) => ShowMainWindow(desktop);
         var exit = new Avalonia.Controls.NativeMenuItem("Exit Mainguard");
         exit.Click += (_, _) => _ = RequestFullExitGuardedAsync();
 
         var menu = new Avalonia.Controls.NativeMenu();
+        menu.Items.Add(status);
+        menu.Items.Add(new Avalonia.Controls.NativeMenuItemSeparator());
         menu.Items.Add(open);
         menu.Items.Add(new Avalonia.Controls.NativeMenuItemSeparator());
         menu.Items.Add(exit);
+        menu.NeedsUpdate += (_, _) =>
+        {
+            var count = LiveAgentCountProvider?.Invoke() ?? 0;
+            status.Header = count switch
+            {
+                0 => "No agents running",
+                1 => "1 agent running",
+                _ => $"{count} agents running",
+            };
+        };
 
+        // The brand PNG on macOS/Linux (a status item wants a small raster; the .ico stays for
+        // the Windows notification area, where ICO is the native currency).
+        var iconUri = OperatingSystem.IsWindows()
+            ? new Uri("avares://Mainguard.App.Shell/Assets/avalonia-logo.ico")
+            : new Uri("avares://Mainguard.App.Shell/Assets/tray-icon.png");
         _trayIcon = new TrayIcon
         {
-            Icon = new Avalonia.Controls.WindowIcon(Avalonia.Platform.AssetLoader.Open(
-                new Uri("avares://Mainguard.App.Shell/Assets/avalonia-logo.ico"))),
+            Icon = new Avalonia.Controls.WindowIcon(Avalonia.Platform.AssetLoader.Open(iconUri)),
             ToolTipText = "Mainguard",
             Menu = menu,
         };
         _trayIcon.Clicked += (_, _) => ShowMainWindow(desktop);
         TrayIcon.SetIcons(this, new TrayIcons { _trayIcon });
+    }
+
+    private static void HandleDeepLink(string uri, IClassicDesktopStyleApplicationLifetime desktop)
+    {
+        var result = Mainguard.Git.Security.DeepLinkParser.Parse(uri);
+        System.Diagnostics.Debug.WriteLine($"[Mainguard] deep link {result.Outcome}: {uri} {result.Reason}");
+        if (result.Outcome != Mainguard.Git.Security.DeepLinkOutcome.Command) return;
+
+        ShowMainWindow(desktop);
+        if (result.Command is Mainguard.Git.Security.DeepLinkCommand.OpenAgent(var agentId)
+            && desktop.MainWindow?.DataContext is ViewModels.MainWindowViewModel vm)
+        {
+            vm.ShowAgentCommand.Execute(agentId);
+        }
+        // OpenRepo/OpenPr: activation only for now — their id semantics live in the agent layer
+        // (RepoPathHasher) and PR surfaces; routing them is a follow-up, the secret guard is not.
     }
 
     private static void ShowMainWindow(IClassicDesktopStyleApplicationLifetime desktop)
@@ -280,6 +328,26 @@ public partial class App : Application
         {
             // The tray icon is shared shell chrome — set up on BOTH paths, before the edition branch.
             SetupTrayIcon(desktop);
+
+            // macOS: the top-of-screen menu bar (no-op elsewhere). Shell-level, edition-agnostic —
+            // it dispatches through the same action registry the shortcuts and palette use.
+            Services.MacMenuBar.Install(this);
+
+            // macOS deep links: the .app bundle declares mainguard:// (Pro head), LaunchServices
+            // routes every link to the ONE running instance, and Avalonia surfaces it here — no
+            // named pipe, no registry, unlike the Windows path. Parsing (and the never-a-secret
+            // guard) is the same pure DeepLinkParser; unroutable verbs still activate the window,
+            // so a clicked link is never a silent nothing.
+            if (OperatingSystem.IsMacOS()
+                && TryGetFeature(typeof(Avalonia.Controls.ApplicationLifetimes.IActivatableLifetime))
+                    is Avalonia.Controls.ApplicationLifetimes.IActivatableLifetime activatable)
+            {
+                activatable.Activated += (_, e) =>
+                {
+                    if (e is Avalonia.Controls.ApplicationLifetimes.ProtocolActivatedEventArgs protocol)
+                        HandleDeepLink(protocol.Uri.ToString(), desktop);
+                };
+            }
 
             // Edition seam (1d, ADR-0001): the Pro/Cloud edition composes the full MainguardOS launch
             // machinery (keep-alive, resume-task sweep, VM-stop-on-exit, the provisioning launch router)

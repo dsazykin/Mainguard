@@ -3,17 +3,43 @@
         xmlns:vm="using:Mainguard.App.Shell.ViewModels"
         x:Class="Mainguard.App.Shell.Views.GeneralSettingsView"
         x:DataType="vm:GeneralSettingsViewModel">
+    <UserControl.Styles>
+        <!-- Selected theme: same convention as Button.Segment.Active — a class carries the state.
+             AccentSelection fill + accent hairline, one per picker (the One Accent Rule reads this
+             as selection tint, not a second CTA). -->
+        <Style Selector="Button.Secondary.selected">
+            <Setter Property="Background" Value="{DynamicResource AccentSelection}"/>
+            <Setter Property="BorderBrush" Value="{DynamicResource AccentBrush}"/>
+            <Setter Property="Foreground" Value="{DynamicResource TextPrimary}"/>
+        </Style>
+    </UserControl.Styles>
     <StackPanel Spacing="24" MaxWidth="560">
 
         <StackPanel Spacing="10">
             <TextBlock Text="Theme" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
-            <WrapPanel>
-                <Button Content="Midnight Loom" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="MidnightLoom"/>
-                <Button Content="Daylight Loom" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="DaylightLoom"/>
-                <Button Content="Command Deck" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="CommandDeck"/>
-                <Button Content="Atelier" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="Atelier"/>
-                <Button Content="Loom Aurora" Classes="Secondary" Margin="0,0,8,8" Padding="12,6" Command="{Binding SetThemeCommand}" CommandParameter="LoomAurora"/>
-            </WrapPanel>
+            <ItemsControl ItemsSource="{Binding ThemeRows}">
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <WrapPanel/>
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="vm:SettingsThemeRowViewModel">
+                        <Button Classes="Secondary" Classes.selected="{Binding IsSelected}"
+                                Margin="0,0,8,8" Padding="12,6"
+                                Command="{Binding $parent[ItemsControl].((vm:GeneralSettingsViewModel)DataContext).SetThemeCommand}"
+                                CommandParameter="{Binding Key}"
+                                ToolTip.Tip="{Binding Tooltip}">
+                            <StackPanel Orientation="Horizontal" Spacing="6">
+                                <PathIcon Data="{StaticResource CheckmarkIcon}" Width="10" Height="10"
+                                          Foreground="{DynamicResource AccentBrush}"
+                                          IsVisible="{Binding IsSelected}"/>
+                                <TextBlock Text="{Binding DisplayName}"/>
+                            </StackPanel>
+                        </Button>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
         </StackPanel>
 
         <StackPanel Spacing="10" IsVisible="{Binding HasAgentPlatform}">
@@ -36,6 +62,9 @@
 
         <StackPanel Spacing="10">
             <TextBlock Text="Window &amp; Exit" FontWeight="SemiBold" FontSize="14" Foreground="{DynamicResource TextPrimary}"/>
+            <CheckBox Content="Translucent window chrome" IsChecked="{Binding MacTranslucentChrome, Mode=TwoWay}"
+                      IsVisible="{Binding IsMacOS}"
+                      ToolTip.Tip="Render the window background, title bar, and sidebar over the system vibrancy blur. Content panels stay opaque."/>
             <CheckBox Content="Close button hides to tray" IsChecked="{Binding CloseToTray, Mode=TwoWay}"/>
             <CheckBox Content="Stop Mainguard OS on exit" IsChecked="{Binding StopVmOnExit, Mode=TwoWay}" IsVisible="{Binding HasAgentPlatform}"/>
         </StackPanel>

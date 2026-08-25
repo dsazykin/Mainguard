@@ -55,7 +55,8 @@ public class SettingsServiceTests : IDisposable
         // Assert
         Assert.NotNull(service.Current);
         Assert.Equal("MidnightLoom", service.Current.Theme);
-        Assert.True(service.Current.EnableGlassmorphism);
+        // Vibrancy is opt-in: a fresh install gets the flat opaque chrome.
+        Assert.False(service.Current.MacTranslucentChrome);
         // App-lifecycle defaults: X hides to the tray; a full exit stops the VM.
         Assert.True(service.Current.CloseToTray);
         Assert.True(service.Current.StopVmOnExit);
@@ -86,7 +87,7 @@ public class SettingsServiceTests : IDisposable
         service.Update(prefs =>
         {
             prefs.Theme = "Light";
-            prefs.EnableGlassmorphism = false;
+            prefs.MacTranslucentChrome = true;
         });
 
         // Assert
@@ -94,7 +95,7 @@ public class SettingsServiceTests : IDisposable
 
         var service2 = new SettingsService(_tempFile);
         Assert.Equal("Light", service2.Current.Theme);
-        Assert.False(service2.Current.EnableGlassmorphism);
+        Assert.True(service2.Current.MacTranslucentChrome);
     }
 
     [Fact]
@@ -109,7 +110,7 @@ public class SettingsServiceTests : IDisposable
         // Assert
         Assert.NotNull(service.Current);
         Assert.Equal("MidnightLoom", service.Current.Theme);
-        Assert.True(service.Current.EnableGlassmorphism);
+        Assert.False(service.Current.MacTranslucentChrome);
     }
 
     [Fact]

@@ -97,7 +97,9 @@ public sealed record SandboxSpawnRequest(
     IReadOnlyList<SandboxSettingsFile>? CliSettingsFiles = null,
     IReadOnlyList<string>? WorkspaceIgnorePaths = null,
     string? ToolchainsRootPath = null,
-    IReadOnlyList<string>? ToolchainIds = null);
+    IReadOnlyList<string>? ToolchainIds = null,
+    string AgentKind = "",
+    string AgentRole = "");
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);
@@ -165,6 +167,12 @@ public interface ISandboxEngine
 
     /// <summary>Resume a paused jail (<c>docker unpause</c>). Called through the yield token on resume.</summary>
     Task UnpauseAsync(string containerId, CancellationToken ct = default);
+
+    /// <summary>Whether the jail is currently frozen (<c>docker inspect .State.Paused</c>). Callers that
+    /// must tolerate "already paused" classify BY THIS STATE, never by error-message substring — engine
+    /// wordings differ per version. Default false: an engine that cannot answer lets the pause/unpause
+    /// call itself be the honest arbiter.</summary>
+    Task<bool> IsPausedAsync(string containerId, CancellationToken ct = default) => Task.FromResult(false);
 
     /// <summary>Stop the jail without removing it (the persistent jail can be re-started later).</summary>
     Task StopAsync(string containerId, CancellationToken ct = default);

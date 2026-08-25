@@ -86,8 +86,13 @@ public sealed class CompositionRootResolutionTests
         Assert.Equal(
             new[]
             {
+                // `syntheticVerifications` is wired UNCONDITIONALLY and empty in production — the
+                // dev-only queue-seeding seam (docs/design/queue-seeding.md §3). Its only writer is
+                // the flag-gated QueueSeedingService, which a shipped daemon never maps, so the gate
+                // lives at the RPC surface rather than in a conditional wiring this exact-set
+                // assertion could not tell from an oversight.
                 "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
-                "publishAgentRef", "publishRebasedAgentRef", "yieldProtocolFor",
+                "publishAgentRef", "publishRebasedAgentRef", "syntheticVerifications", "yieldProtocolFor",
             },
             provisioner.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());
 

@@ -10,6 +10,11 @@ public partial class CustomTitleBar : UserControl
     public CustomTitleBar()
     {
         InitializeComponent();
+        // macOS shows the native traffic lights over the extended client area
+        // (WindowChromePolicy), so the hand-drawn buttons yield and the content
+        // starts past the traffic-light cluster.
+        WindowButtons.IsVisible = WindowChromePolicy.CustomButtonsVisible;
+        TitleBarRoot.Padding = WindowChromePolicy.TitleBarPadding(TitleBarRoot.Padding);
     }
 
     private ChromedWindow? Host => this.VisualRoot as ChromedWindow;

@@ -842,6 +842,22 @@ Contract summary (strategy §G-7.5, binding, with the market promotion of plan-a
 
 ## P2-15 — Tamper-evident audit log (H-8.2, pulled forward)
 
+> **STATUS UPDATE 2026-08-19: the evidence pack SHIPPED on `port/macos`.** `Mainguard.Git/Audit/`
+> now holds the real thing — `HashChain` (pure, property-tested) + `CanonicalJson`,
+> `ChainedAuditLog` behind the unchanged `IAuditLog` seam (canonical-envelope hashing so a flipped
+> timestamp/type/seq column fails verify; AES-GCM at rest via `SecureKeyring`; append-only SQLite
+> triggers; payload-free fsync'd file mirror; chained redaction; 90-day retention-as-redaction),
+> the `AuditService` RPC (`VerifyAudit`/`ReadAudit` — `Read()`'s first production callers,
+> coordinator-denied) and the `mainguardd audit verify` CLI (exit 0/2, run green on a real
+> install), plus RFC 3161 anchoring (queue + real Pkcs client, `MAINGUARD_TSA_URL`-gated sending,
+> round-trip verified once against a live TSA under the new `RequiresNetworkFact`). RT-D3's
+> `killswitch_audit_gap` now lands in the persisted chain (covered end-to-end in
+> `AuditTouchpointCoverageTests`). Still open: the P2-16 SIEM feed (was always P2-16's), and
+> `audit replay <sha>` (the extension composes P2-38/42/43 records that do not exist yet — the
+> scope split below explicitly lets it trail).
+>
+> The paragraph below is the pre-2026-08-19 state, kept for the history it records:
+>
 > **STATUS AS OF 2026-08-11: NOT STARTED.** Verified across every branch. The only implementation of
 > `IAuditLog` is `InMemoryAuditLog` — a `List<AuditEvent>` that dies with the process. There is no hash
 > chain, no `PrevHash`, no persistence, no `mainguardd audit verify`, and no SIEM export anywhere in the

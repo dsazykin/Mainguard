@@ -544,7 +544,8 @@
           "Microsoft.AspNetCore.DataProtection": "[10.0.10, )",
           "Microsoft.AspNetCore.DataProtection.Extensions": "[10.0.10, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[9.0.0, )",
-          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )"
+          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )",
+          "System.Security.Cryptography.Pkcs": "[10.0.10, )"
         }
       },
       "mainguard.protos": {

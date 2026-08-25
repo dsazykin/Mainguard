@@ -133,6 +133,25 @@ public interface IKillTarget
     /// means "containment unconfirmed" and is reported as <see cref="KillAgentOutcome.PauseFailed"/>.</summary>
     Task PauseAsync(string agentId, CancellationToken ct);
 
+    /// <summary>
+    /// Releases <b>exactly and only the containment this target itself applied</b> in the kill epoch —
+    /// the mirror of <see cref="PauseAsync"/>, and the half that did not exist until ISSUES-LOG #17.
+    ///
+    /// <para><b>Asymmetric on purpose.</b> The pause is unconditional (MG-39(a)) because containment must
+    /// never be negotiable; the release is <i>conditional</i> because waking something the kill switch did
+    /// not put to sleep is its own safety failure. A jail already frozen by a human pause or by the
+    /// keep-alive rebase's machine hold when the stop fired must still be frozen after Resume — the
+    /// implementation records what it actually transitioned and reverses that, rather than blanket-calling
+    /// <c>docker unpause</c>. Same rule for the terminal-input sever: a worker whose terminal was locked at
+    /// spawn (a role property) keeps its lock; only a lock the kill switch itself took is released.</para>
+    ///
+    /// <para>A target whose container no longer exists (agent torn down during the freeze) must return
+    /// normally — there is nothing left to release, and one dead agent must not abandon the rest of the
+    /// fan-out. Throwing means "release unconfirmed, the jail may still be frozen" and is reported as
+    /// <see cref="KillResumeOutcome.ResumeFailed"/>.</para>
+    /// </summary>
+    Task UnpauseAsync(string agentId, CancellationToken ct);
+
     /// <summary>A point-in-time state word per agent, for the journal snapshot.</summary>
     IReadOnlyDictionary<string, string> CaptureStates();
 }
@@ -282,6 +301,29 @@ public enum KillAgentOutcome { Yielded, Paused, PauseFailed }
 /// <summary>One agent's line in the kill snapshot.</summary>
 public sealed record KillAgentState(string AgentId, string State, KillAgentOutcome Outcome);
 
+/// <summary>
+/// How one agent ended the RESUME fan-out. <see cref="Resumed"/> means the target reversed the containment
+/// it had applied — including the honest no-op case where the kill switch had nothing of its own to
+/// reverse for that agent (already human-paused when the stop fired, or torn down during the freeze).
+/// <see cref="ResumeFailed"/> is the only word that means "this jail may still be frozen".
+/// </summary>
+public enum KillResumeOutcome { Resumed, ResumeFailed }
+
+/// <summary>One agent's line in the resume report.</summary>
+public sealed record KillAgentResume(string AgentId, KillResumeOutcome Outcome);
+
+/// <summary>
+/// The outcome of <see cref="KillSwitch.ResumeAsync"/> — the emergency stop's release, reported per agent.
+/// </summary>
+/// <param name="KillEpochId">The kill epoch this resume released, or null if nothing was engaged.</param>
+/// <param name="QueueFrozen">The gate AFTER the resume. Always false: the freeze is cleared whatever the
+/// unpause fan-out did, so a jail that refuses to wake can never also trap the operator's queue.</param>
+public sealed record KillResumeReport(
+    string? KillEpochId,
+    DateTimeOffset At,
+    IReadOnlyList<KillAgentResume> Agents,
+    bool QueueFrozen);
+
 /// <summary>The journal snapshot written before the kill returns: agent list + states + queue-frozen fact.</summary>
 /// <param name="RttMeasured">Whether a control-channel RTT was actually measured for this epoch. False
 /// means <see cref="RttSpikeDetected"/>-style reasoning does not apply to this record at all — see
@@ -318,6 +360,10 @@ public sealed record KillReport(
 /// (freeze-then-audit, RT-D3) — a kill NEVER blocks on audit-store availability; on store recovery
 /// <see cref="NotifyAuditStoreRecovered"/> appends the chained <c>killswitch_audit_gap</c> so the carve-out
 /// is tamper-evident rather than silent.</para>
+///
+/// <para><b>And it is reversible</b> (<see cref="ResumeAsync"/>): the epoch's fan-out set is remembered, so
+/// the release un-pauses exactly the jails this kill switch froze and nothing else. Until ISSUES-LOG #17
+/// there was no unpause path at all and every killed agent stayed frozen for the life of the daemon.</para>
 /// </summary>
 public sealed class KillSwitch
 {
@@ -330,6 +376,16 @@ public sealed class KillSwitch
     private readonly Action<string>? _onRttSpike;
     private readonly object _pendingGate = new();
     private readonly List<(string Epoch, DateTimeOffset At)> _pendingAuditGaps = new();
+
+    // ---- The containment ledger: who the LAST kill epoch fanned out to (ISSUES-LOG #17) ----
+    //
+    // Resume used to be `_gate.Resume()` and nothing else, so the emergency stop was one-way: every jail
+    // it froze stayed frozen forever, recoverable only by a raw `docker unpause` from outside the app.
+    // The fix needs to know WHICH agents to release, and the only honest answer is "the ones this kill
+    // switch actually fanned out to", not "everything Docker currently has paused".
+    private readonly object _epochGate = new();
+    private string? _engagedEpochId;
+    private List<string> _fannedOutTo = new();
 
     /// <param name="gate">The shared in-proc freeze flag merge/spawn paths consult.</param>
     /// <param name="target">The fan-out target (agents + yield + pause + state capture).</param>
@@ -431,6 +487,24 @@ public sealed class KillSwitch
         var agentIds = _target.ActiveAgentIds.ToList();
         var results = await Task.WhenAll(agentIds.Select(id => FanOutOneAsync(id, deadline, ct))).ConfigureAwait(false);
 
+        // Record the epoch's fan-out set BEFORE returning, so ResumeAsync has something to reverse even if
+        // the caller never reads the report. Every id the fan-out touched is recorded, including the
+        // PauseFailed ones: a failure is per-agent and can be partial (one repo's jail frozen, another's
+        // refused behind the same id), and the terminal-input sever ran for all of them. What each agent
+        // actually gets released is the TARGET's call — it is the only layer that knows, per container,
+        // whether this kill switch was the party that froze it.
+        lock (_epochGate)
+        {
+            _engagedEpochId = epochId;
+            // A UNION, not a replacement: the ledger means "contained and not yet released". Engaging
+            // twice without a Resume in between is ordinary (the control is a toggle), and so is engaging
+            // again after a Resume that could not wake one jail — in both cases an agent already in the
+            // ledger must stay there, or it would be silently abandoned in the paused state.
+            _fannedOutTo = _fannedOutTo
+                .Union(results.Select(r => r.AgentId), StringComparer.Ordinal)
+                .ToList();
+        }
+
         // ---- Step 3: journal snapshot written BEFORE returning ----
         var states = _target.CaptureStates();
         var agentStates = results
@@ -450,8 +524,67 @@ public sealed class KillSwitch
             QueueFrozen: _gate.IsFrozen, RttMeasured: MeasuresControlChannelRtt);
     }
 
-    /// <summary>Resumes after a kill (the banner action). Clears the freeze; agents are unpaused by their tokens.</summary>
-    public void Resume() => _gate.Resume();
+    /// <summary>
+    /// Resumes after a kill (the banner's one action) — the real mirror of <see cref="EngageAsync"/>.
+    ///
+    /// <para><b>ISSUES-LOG #17.</b> This used to be <c>_gate.Resume()</c> and nothing else. Engage
+    /// <c>docker pause</c>d every live jail; Resume cleared the merge/spawn freeze flag and left every one
+    /// of them frozen, while the Resource Monitor's own row said the state was "(recoverable)". It was not:
+    /// the per-agent Unpause RPC correctly refuses a jail it did not human-pause, so nothing inside the app
+    /// could bring a killed agent back — only a raw <c>docker unpause</c> from outside it. An emergency stop
+    /// you cannot come back from is a worse control than one you hesitate to press.</para>
+    ///
+    /// <para><b>Ordering, and why the freeze clears last but unconditionally.</b> The unpause fan-out runs
+    /// first, under the same RT-D4 deadline as the kill, so the queue is not accepting merges while jails
+    /// are still frozen. The gate is then cleared in a <c>finally</c>: a container engine that refuses to
+    /// wake one jail must never also leave the operator with a permanently frozen queue and no way out.
+    /// Agents whose release could not be confirmed come back as
+    /// <see cref="KillResumeOutcome.ResumeFailed"/> and STAY in the ledger, so pressing Resume again
+    /// retries exactly them.</para>
+    /// </summary>
+    public async Task<KillResumeReport> ResumeAsync(CancellationToken ct = default)
+    {
+        string? epochId;
+        List<string> agentIds;
+        lock (_epochGate)
+        {
+            epochId = _engagedEpochId;
+            agentIds = _fannedOutTo.ToList();
+        }
+
+        var deadline = KillSwitchTiming.FanOutDeadline(_rttBudget());
+        var results = new List<KillAgentResume>();
+        try
+        {
+            results.AddRange(
+                await Task.WhenAll(agentIds.Select(id => ResumeOneAsync(id, deadline, ct))).ConfigureAwait(false));
+        }
+        finally
+        {
+            // Unconditional: the freeze flag is the operator's control, and failing to clear it would make
+            // Resume strictly worse than the broken behaviour this replaces.
+            _gate.Resume();
+        }
+
+        // Keep only what still needs releasing, so a second press retries the failures and is otherwise a
+        // no-op (idempotent, like Engage's freeze).
+        var stillHeld = results
+            .Where(r => r.Outcome == KillResumeOutcome.ResumeFailed)
+            .Select(r => r.AgentId)
+            .ToList();
+        lock (_epochGate)
+        {
+            _fannedOutTo = stillHeld;
+            _engagedEpochId = stillHeld.Count > 0 ? epochId : null;
+        }
+
+        TryAuditResume(epochId, results);
+
+        return new KillResumeReport(
+            epochId, _clock(),
+            results.OrderBy(r => r.AgentId, StringComparer.Ordinal).ToList(),
+            QueueFrozen: _gate.IsFrozen);
+    }
 
     /// <summary>
     /// RT-D3: on audit-store recovery, append a chained <c>killswitch_audit_gap{killEpochId, observedAt}</c>
@@ -517,6 +650,50 @@ public sealed class KillSwitch
             // Note this outranks a cooperative ACK: an agent that said "ready" but whose jail could not
             // be frozen is NOT contained, and the report must not claim otherwise.
             return new KillAgentState(agentId, "PauseFailed", KillAgentOutcome.PauseFailed);
+        }
+    }
+
+    private async Task<KillAgentResume> ResumeOneAsync(string agentId, TimeSpan deadline, CancellationToken ct)
+    {
+        try
+        {
+            // Bounded like the kill's own pause, and for the same reason: an unreachable engine must not
+            // hold the release open indefinitely. It reports ResumeFailed instead — the honest word for
+            // "this jail may still be frozen" — which keeps the agent in the retry ledger.
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            cts.CancelAfter(deadline);
+            await _target.UnpauseAsync(agentId, cts.Token).ConfigureAwait(false);
+            return new KillAgentResume(agentId, KillResumeOutcome.Resumed);
+        }
+        catch (Exception)
+        {
+            // Never thrown onward: one wedged agent must not abandon the rest of the fan-out (the failure
+            // mode that would leave a fleet half-woken with no record of which half).
+            return new KillAgentResume(agentId, KillResumeOutcome.ResumeFailed);
+        }
+    }
+
+    private void TryAuditResume(string? epochId, IReadOnlyList<KillAgentResume> results)
+    {
+        try
+        {
+            _audit.Append(new AuditEvent("killswitch_resume", new Dictionary<string, string>
+            {
+                ["kill_epoch_id"] = epochId ?? string.Empty,
+                ["resumed"] = results.Count(r => r.Outcome == KillResumeOutcome.Resumed).ToString(),
+                ["resume_failed"] = results.Count(r => r.Outcome == KillResumeOutcome.ResumeFailed).ToString(),
+            }));
+        }
+        catch (Exception)
+        {
+            // Same RT-D3 posture as the kill: the release never blocks on the audit store being up.
+            lock (_pendingGate)
+            {
+                if (epochId is not null)
+                {
+                    _pendingAuditGaps.Add((epochId, _clock()));
+                }
+            }
         }
     }
 

@@ -30,14 +30,23 @@ public sealed class ShortcutMap
         }
     }
 
-    /// <summary>The built-in defaults: Ctrl+P palette, Ctrl+Enter commit, Ctrl+Shift+P push, F5 refresh, Ctrl+B new branch.</summary>
+    /// <summary>
+    /// The platform's primary shortcut modifier: <c>Cmd</c> (Avalonia's <c>Meta</c>) on macOS —
+    /// design rule P-7, platform respect — <c>Ctrl</c> everywhere else. Defaults are built from
+    /// this; a user's persisted rebinds are stored literally and never rewritten.
+    /// </summary>
+    public static string PrimaryModifier =>
+        OperatingSystem.IsMacOS() ? "Cmd" : "Ctrl";
+
+    /// <summary>The built-in defaults: primary+P palette, primary+Enter commit, primary+Shift+P push,
+    /// F5 refresh, primary+B new branch — where primary is <see cref="PrimaryModifier"/>.</summary>
     public static ShortcutMap Default => new(new Dictionary<string, string>
     {
-        [ActionIds.OpenCommandPalette] = "Ctrl+P",
-        [ActionIds.Commit] = "Ctrl+Enter",
-        [ActionIds.Push] = "Ctrl+Shift+P",
+        [ActionIds.OpenCommandPalette] = $"{PrimaryModifier}+P",
+        [ActionIds.Commit] = $"{PrimaryModifier}+Enter",
+        [ActionIds.Push] = $"{PrimaryModifier}+Shift+P",
         [ActionIds.Refresh] = "F5",
-        [ActionIds.NewBranch] = "Ctrl+B",
+        [ActionIds.NewBranch] = $"{PrimaryModifier}+B",
     });
 
     /// <summary>id → gesture, in no particular order.</summary>

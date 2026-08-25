@@ -60,19 +60,23 @@ public static class ShellEntryPoint
     /// The ordinary launch: a single-instance guard (two live Mainguard processes would contend for the
     /// SQLite database lock and the second would hang forever on startup migration — the exact bug that
     /// leaves a dead-looking, windowless process), then the classic desktop lifetime. A killed instance
-    /// frees the mutex automatically, so a crash never wedges the next launch. Call this AFTER
+    /// frees the guard automatically (see <see cref="SingleInstanceGuard"/>), so a crash never wedges
+    /// the next launch. Call this AFTER
     /// <see cref="TryHandleShim"/> returned false and the head has selected its edition.
     /// </summary>
     public static void RunDesktop(string[] args)
     {
-        using var singleInstance = new Mutex(initiallyOwned: true, "Mainguard.App.SingleInstance", out bool isOnlyInstance);
-        if (!isOnlyInstance)
+        using var singleInstance = SingleInstanceGuard.TryAcquire();
+        if (singleInstance is null)
         {
             Console.Error.WriteLine("Mainguard is already running.");
             return;
         }
 
-        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+        // ISSUES-LOG #12: install the unhandled-exception net BEFORE the message loop starts, but AFTER
+        // Avalonia's setup (Dispatcher.UIThread is only meaningful once the platform is up) — AfterSetup
+        // is the one hook that is both. Without it a single faulting dispatcher job aborts the process.
+        BuildAvaloniaApp().AfterSetup(_ => CrashGuard.Install()).StartWithClassicDesktopLifetime(args);
     }
 
     // Avalonia configuration, don't remove; also used by visual designer.

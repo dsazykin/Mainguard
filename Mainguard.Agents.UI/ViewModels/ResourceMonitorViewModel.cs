@@ -197,8 +197,21 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
 
     public async Task PauseOrResumeAsync(string agentId, bool isPaused)
     {
-        if (isPaused) await _agents.ResumeAgentAsync(agentId);
-        else await _agents.PauseAgentAsync(agentId);
+        try
+        {
+            if (isPaused) await _agents.ResumeAgentAsync(agentId);
+            else await _agents.PauseAgentAsync(agentId);
+        }
+        catch (Exception ex)
+        {
+            // The daemon's refusal ("no live jail", "the daemon is briefly holding this agent…",
+            // kill-switch engaged) is the answer the human asked for by clicking — before this the
+            // command reported nothing and the exception vanished into the dropped task.
+            Editions.ProComposition.ShowShellToast(ex.Message, true);
+            return;
+        }
+
+        // No optimistic flip: the paused/working state arrives back on the agent-event stream.
         Refresh();
     }
 

@@ -40,7 +40,7 @@ public class SandboxSpawnDockerTests
 
         var environment = new Wsl2AgentEnvironment(vmRoot: vmRoot);
         var launcher = new SandboxAgentLauncher(environment);
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
 
         // Provision the bare mirror (the P2-06 clone-once path), then spawn a real jailed agent against it.
         var provision = environment.Repos.Provision(sourceRepo);
@@ -89,7 +89,7 @@ public class SandboxSpawnDockerTests
         // hand. EnsureReady must treat an existing-but-stopped proxy as restartable, not as ready.
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
         var ct = cts.Token;
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         var egress = new EgressProxyConfigurator(
             docker, EgressAllowlist.WithDefaults(new Mainguard.Git.Audit.InMemoryAuditLog()));
         try

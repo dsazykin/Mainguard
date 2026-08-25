@@ -79,6 +79,31 @@ internal static class AgentGitCommand
         return output;
     }
 
+    /// <summary>
+    /// <see cref="Run"/> with extra environment merged OVER <see cref="HardeningEnv"/> — for the one
+    /// caller that needs a scratch <c>GIT_INDEX_FILE</c> (the queue seeder's plumbing commits,
+    /// docs/design/queue-seeding.md §2). The hardening pins stay: the extra env is additive and the
+    /// hardening keys are re-applied last, so a caller cannot un-pin them.
+    /// </summary>
+    internal static string RunWithEnv(
+        string workingDir, IReadOnlyDictionary<string, string> extraEnv, params string[] args)
+    {
+        var env = new Dictionary<string, string>(extraEnv);
+        foreach (var (key, value) in HardeningEnv)
+        {
+            env[key] = value;
+        }
+
+        var (code, output, err) = GitService.RunGit(workingDir, env, CancellationToken.None, Hardened(args));
+        if (code != 0)
+        {
+            var detail = string.IsNullOrWhiteSpace(err) ? output.Trim() : err.Trim();
+            throw new RepoProvisioningException($"git {Subcommand(args)} failed (exit {code}): {detail}");
+        }
+
+        return output;
+    }
+
     /// <summary>Runs git and returns the raw exit code without throwing (for probe-style checks).</summary>
     internal static int TryRun(string workingDir, out string output, params string[] args)
     {
