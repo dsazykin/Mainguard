@@ -32,7 +32,12 @@ public sealed record SandboxEngineOptions(
     string ProxyUrl,
     string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string ProxyContainerName = EgressProxyConfigurator.ProxyContainerName,
-    TimeSpan? SecretWriteTimeout = null);
+    TimeSpan? SecretWriteTimeout = null,
+    // ESC-I1 made structural: when the substrate names its daemon-owned roots, every bind-mount
+    // SOURCE must sit under one of them — user repos and the rest of the host filesystem can never
+    // be mounted into a jail even by a future caller bug. Null = the substrate has not formalized
+    // its roots (WSL2 today), and the builder's existing per-source rejections stand alone.
+    System.Collections.Generic.IReadOnlyList<string>? AllowedMountRoots = null);
 
 /// <summary>
 /// The Docker implementation of <see cref="ISandboxEngine"/> (P2-07). Builds the hardened create
@@ -202,7 +207,11 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
             request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
             request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
-            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds);
+            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds,
+            _options.AllowedMountRoots,
+            // Carried onto the jail's labels: what this agent IS, so a restarted daemon can adopt it back
+            // as itself rather than as an anonymous worker.
+            request.AgentKind, request.AgentRole);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
@@ -332,6 +341,14 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 
     public Task UnpauseAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.UnpauseContainerAsync(containerId, ct);
+
+    public async Task<bool> IsPausedAsync(string containerId, CancellationToken ct = default)
+    {
+        var inspect = await RunBoundedAsync(
+            token => _docker.Containers.InspectContainerAsync(containerId, token),
+            ControlPlaneTimeout, "inspect (paused?)", containerId, ct).ConfigureAwait(false);
+        return inspect.State?.Paused ?? false;
+    }
 
     public Task StopAsync(string containerId, CancellationToken ct = default) =>
         _docker.Containers.StopContainerAsync(containerId, new ContainerStopParameters(), ct);
@@ -941,7 +958,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
 public sealed class SandboxExecTimeoutException : TimeoutException
 {
     public SandboxExecTimeoutException(string operation, string containerId, TimeSpan timeout, string detail = "")
-        : base($"The sandbox docker exec '{operation}' did not complete within {timeout.TotalSeconds:0.###}s "
+        : base($"The sandbox docker exec '{operation}' did not complete within {timeout.TotalSeconds.ToString("0.###", CultureInfo.InvariantCulture)}s "
              + $"against container '{containerId}'. The exec was created/attached but never finished, which "
              + "means the Docker endpoint is not delivering the exec's streams (a socket proxy that drops "
              + "exec stdin does exactly this) — waiting longer would have hung the spawn forever."

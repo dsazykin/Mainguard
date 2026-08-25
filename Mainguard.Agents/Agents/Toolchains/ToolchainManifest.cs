@@ -63,8 +63,22 @@ public sealed record ToolchainEntry(
     ImmutableArray<string> PathEntries,
     ImmutableArray<KeyValuePair<string, string>> Environment,
     ToolchainProbe Probe,
-    ImmutableArray<string> InstallEgressHosts)
+    ImmutableArray<string> InstallEgressHosts,
+    string? PayloadUrlArm64 = null,
+    string? Sha256Arm64 = null)
 {
+    /// <summary>
+    /// The payload pin for the arch the jails run — the daemon's own arch on every substrate
+    /// (linux-x64 in the WSL2 VM, linux-arm64 on an Apple Silicon macos-host). The base fields ARE
+    /// the x64 pin; the arm64 pair is optional, and an arch with no pin is null so the channel can
+    /// refuse TYPED rather than ever fetching unverified bytes.
+    /// </summary>
+    public (string Url, string Sha256)? PayloadForCurrentArch() =>
+        System.Runtime.InteropServices.RuntimeInformation.OSArchitecture
+            == System.Runtime.InteropServices.Architecture.Arm64
+        ? (PayloadUrlArm64 is { Length: > 0 } u && Sha256Arm64 is { Length: > 0 } s ? (u, s) : null)
+        : (PayloadUrl, Sha256);
+
     /// <summary>The token in a path/env/probe value that expands to this toolchain's install root. It
     /// exists because the SAME entry is used against two different roots — the VM path when the install
     /// is probed, the in-jail mount path when a container is built — and hard-coding either would make
@@ -204,6 +218,33 @@ public sealed class ToolchainManifest
                 $"Toolchain '{id}' has a sha256 that is not 64 hex characters; the payload pin must be a full SHA-256.");
         }
 
+        // The optional arm64 pin pair (macos-host jails are linux-arm64). Held to the same bar as
+        // the base pair: HTTPS-only URL, full SHA-256 — a half-declared pair is a manifest error,
+        // never a silently-x64 install.
+        string? payloadUrlArm64 = null, shaArm64 = null;
+        var hasArmUrl = e.TryGetProperty("payloadUrlArm64", out var armUrlEl) && armUrlEl.ValueKind == JsonValueKind.String;
+        var hasArmSha = e.TryGetProperty("sha256Arm64", out var armShaEl) && armShaEl.ValueKind == JsonValueKind.String;
+        if (hasArmUrl != hasArmSha)
+        {
+            throw new ToolchainManifestException(
+                $"Toolchain '{id}' declares one of payloadUrlArm64/sha256Arm64 without the other; the pin is a pair.");
+        }
+        if (hasArmUrl)
+        {
+            payloadUrlArm64 = armUrlEl.GetString()!;
+            if (!Uri.TryCreate(payloadUrlArm64, UriKind.Absolute, out var armUri) || armUri.Scheme != Uri.UriSchemeHttps)
+            {
+                throw new ToolchainManifestException(
+                    $"Toolchain '{id}' has a non-HTTPS payloadUrlArm64; toolchain payloads are fetched over HTTPS only.");
+            }
+            shaArm64 = armShaEl.GetString()!.ToLowerInvariant();
+            if (shaArm64.Length != 64 || !shaArm64.All(Uri.IsHexDigit))
+            {
+                throw new ToolchainManifestException(
+                    $"Toolchain '{id}' has a sha256Arm64 that is not 64 hex characters; the payload pin must be a full SHA-256.");
+            }
+        }
+
         var probeElement = e.TryGetProperty("probe", out var p) && p.ValueKind == JsonValueKind.Object
             ? p
             : throw new ToolchainManifestException($"Toolchain '{id}' has no 'probe' object.");
@@ -254,7 +295,9 @@ public sealed class ToolchainManifest
             Probe: new ToolchainProbe(probeCommand.ToImmutableArray(), expected),
             InstallEgressHosts: (e.TryGetProperty("installEgressHosts", out _)
                 ? RequireStringArray(e, "installEgressHosts", id)
-                : Array.Empty<string>()).ToImmutableArray());
+                : Array.Empty<string>()).ToImmutableArray(),
+            PayloadUrlArm64: payloadUrlArm64,
+            Sha256Arm64: shaArm64);
     }
 
     private static string RequireString(JsonElement e, string name) =>

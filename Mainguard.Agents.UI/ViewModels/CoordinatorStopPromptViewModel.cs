@@ -43,7 +43,18 @@ public sealed partial class CoordinatorStopPromptViewModel : ViewModelBase
         }
 
         IsBusy = true; // the owner tears down, then clears this prompt (StopPrompt = null)
-        await _confirm();
+        try
+        {
+            await _confirm();
+        }
+        catch (Exception)
+        {
+            // ISSUES-LOG #12: [RelayCommand] awaits this in an `async void` helper, so an escaping
+            // exception is re-thrown onto the synchronization context and aborts the process. The owner's
+            // teardown reports its own failures; all this must do is not be fatal — and not strand the
+            // overlay on a spinner that can never be dismissed.
+            IsBusy = false;
+        }
     }
 
     [RelayCommand]

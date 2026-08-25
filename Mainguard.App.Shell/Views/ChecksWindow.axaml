@@ -72,10 +72,10 @@
                                         <Grid ColumnDefinitions="Auto,*,Auto">
                                             <!-- State icon — one token-colored glyph per state -->
                                             <Panel Grid.Column="0" Width="22" VerticalAlignment="Center">
-                                                <TextBlock Text="✓" FontSize="15" FontWeight="Bold" Foreground="{DynamicResource SuccessBrush}" IsVisible="{Binding IsSuccess}"/>
-                                                <TextBlock Text="✕" FontSize="15" FontWeight="Bold" Foreground="{DynamicResource DangerBrush}" IsVisible="{Binding IsFailure}"/>
-                                                <TextBlock Text="•" FontSize="18" FontWeight="Bold" Foreground="{DynamicResource WarningBrush}" IsVisible="{Binding IsPending}"/>
-                                                <TextBlock Text="–" FontSize="15" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" IsVisible="{Binding IsNeutral}"/>
+                                                <PathIcon Data="{StaticResource CheckmarkIcon}" Width="13" Height="13" Foreground="{DynamicResource SuccessBrush}" IsVisible="{Binding IsSuccess}"/>
+                                                <PathIcon Data="{StaticResource DismissIcon}" Width="13" Height="13" Foreground="{DynamicResource DangerBrush}" IsVisible="{Binding IsFailure}"/>
+                                                <PathIcon Data="{StaticResource StatusDotIcon}" Width="13" Height="13" Foreground="{DynamicResource WarningBrush}" IsVisible="{Binding IsPending}"/>
+                                                <PathIcon Data="{StaticResource StatusDashIcon}" Width="13" Height="13" Foreground="{DynamicResource TextMuted}" IsVisible="{Binding IsNeutral}"/>
                                             </Panel>
 
                                             <StackPanel Grid.Column="1" Spacing="2" VerticalAlignment="Center" Margin="4,0,0,0">

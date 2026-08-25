@@ -34,30 +34,75 @@ public static class ThemeManager
     {
         new ThemeInfo("MidnightLoom", "Midnight Loom", ThemeVariant.Dark),
         new ThemeInfo("DaylightLoom", "Daylight Loom", ThemeVariant.Light),
-        new ThemeInfo("CommandDeck", "Command Deck", ThemeVariant.Dark),
+        new ThemeInfo("Graphite", "Graphite", ThemeVariant.Dark),
         new ThemeInfo("Atelier", "Atelier", ThemeVariant.Dark),
-        new ThemeInfo("LoomAurora", "Loom Aurora", ThemeVariant.Dark),
     };
 
+    /// <summary>
+    /// Retired themes → their nearest surviving relative. A persisted key from before the retirement
+    /// still resolves to a deliberate choice (not the silent default fallback), and
+    /// <see cref="Initialize"/> re-persists the mapped key so the store self-heals on first launch.
+    /// </summary>
+    private static readonly Dictionary<string, string> LegacyKeyMap = new()
+    {
+        ["CommandDeck"] = "Graphite",
+        ["LoomAurora"] = "MidnightLoom",
+    };
+
+    /// <summary>
+    /// The follow-the-OS pseudo-key: not a theme (never in <see cref="Themes"/>, so the render
+    /// harnesses' theme sweep is untouched) but a MODE — the OS appearance resolves to Midnight
+    /// Loom (dark) or Daylight Loom (light), re-resolving live when the system switches. Persisted
+    /// as its own key so the choice survives a restart.
+    /// </summary>
+    public const string SystemKey = "System";
+
     public static string CurrentKey { get; private set; } = DefaultKey;
+
+    /// <summary>True while the OS appearance drives the theme (<see cref="SystemKey"/> applied).</summary>
+    public static bool IsFollowingSystem { get; private set; }
+
+    private static bool _systemSubscriptionInstalled;
 
     /// <summary>Raised after a theme is applied. Code-drawn consumers
     /// (e.g. CommitGraphCanvas) re-resolve their brushes on this.</summary>
     public static event Action? ThemeChanged;
 
-    /// <summary>Apply the persisted (or default) theme at startup, before the main window opens.</summary>
+    /// <summary>Apply the persisted (or default) theme at startup, before the main window opens.
+    /// A retired key maps through <see cref="LegacyKeyMap"/> and persists its replacement (the shell
+    /// wires <see cref="PersistKey"/> before calling this); an unknown key falls back to the default
+    /// without persisting, so a newer build's key survives a downgrade round-trip.</summary>
     public static void Initialize(string? savedKey)
     {
-        var key = Themes.Any(t => t.Key == savedKey) ? savedKey! : DefaultKey;
+        if (savedKey is not null && LegacyKeyMap.TryGetValue(savedKey, out var replacement))
+        {
+            Apply(replacement, persist: true);
+            return;
+        }
+
+        var key = savedKey == SystemKey || Themes.Any(t => t.Key == savedKey) ? savedKey! : DefaultKey;
         Apply(key, persist: false);
     }
 
     public static void Apply(string key, bool persist = true)
     {
+        if (key == SystemKey)
+        {
+            IsFollowingSystem = true;
+            EnsureSystemSubscription();
+            ApplyCore(ResolveSystemTheme(), persist ? SystemKey : null);
+            return;
+        }
+
+        IsFollowingSystem = false;
+        var theme = Themes.FirstOrDefault(t => t.Key == key) ?? Themes[0];
+        ApplyCore(theme, persist ? theme.Key : null);
+    }
+
+    private static void ApplyCore(ThemeInfo theme, string? persistAs)
+    {
         var app = Application.Current;
         if (app is null) return;
-
-        var theme = Themes.FirstOrDefault(t => t.Key == key) ?? Themes[0];
 
         var merged = app.Resources.MergedDictionaries;
         for (int i = merged.Count - 1; i >= 0; i--)
@@ -71,9 +116,35 @@ public static class ThemeManager
         app.RequestedThemeVariant = theme.Variant;
 
         CurrentKey = theme.Key;
-        if (persist)
-            PersistKey?.Invoke(theme.Key);
+        if (persistAs is not null)
+            PersistKey?.Invoke(persistAs);
 
         ThemeChanged?.Invoke();
+    }
+
+    /// <summary>Dark OS appearance → Midnight Loom, light → Daylight Loom. Headless hosts have no
+    /// platform settings; they resolve to the default so harness runs never depend on the CI OS.</summary>
+    private static ThemeInfo ResolveSystemTheme()
+    {
+        var variant = Application.Current?.PlatformSettings?.GetColorValues().ThemeVariant;
+        return variant == Avalonia.Platform.PlatformThemeVariant.Light
+            ? Themes.First(t => t.Key == "DaylightLoom")
+            : Themes.First(t => t.Key == "MidnightLoom");
+    }
+
+    private static void EnsureSystemSubscription()
+    {
+        if (_systemSubscriptionInstalled) return;
+        var settings = Application.Current?.PlatformSettings;
+        if (settings is null) return;
+
+        settings.ColorValuesChanged += (_, _) =>
+        {
+            // Persist nothing here: the user's stored choice stays "System"; only the resolved
+            // theme moves with the OS.
+            if (IsFollowingSystem)
+                ApplyCore(ResolveSystemTheme(), persistAs: null);
+        };
+        _systemSubscriptionInstalled = true;
     }
 }

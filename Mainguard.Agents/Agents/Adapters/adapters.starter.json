@@ -239,7 +239,10 @@
       "payloadUrl": "https://registry.npmjs.org/@anthropic-ai/claude-code/-/claude-code-2.1.218.tgz",
       "installCmd": ["npm", "install", "-g", "--ignore-scripts", "--prefix", "/home/mainguard/mainguard/adapters", "{payload}"],
       "platformBinary": {
-        "sources": ["lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude"],
+        "sources": [
+          "lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-x64/claude",
+          "lib/node_modules/@anthropic-ai/claude-code/node_modules/@anthropic-ai/claude-code-linux-arm64/claude"
+        ],
         "target": "lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
       },
       "healthProbe": {
@@ -320,7 +323,8 @@
       "platformBinary": {
         "sources": [
           "lib/node_modules/opencode-ai/node_modules/opencode-linux-x64/bin/opencode",
-          "lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode"
+          "lib/node_modules/opencode-ai/node_modules/opencode-linux-x64-baseline/bin/opencode",
+          "lib/node_modules/opencode-ai/node_modules/opencode-linux-arm64/bin/opencode"
         ],
         "target": "lib/node_modules/opencode-ai/bin/opencode.exe"
       },

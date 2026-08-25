@@ -29,7 +29,7 @@ namespace Mainguard.Tests.Headless;
 /// window width therefore went to the terminal, the boundary had nothing to grab, and the queue's
 /// identifiers (a 32-hex agent id, its <c>agent/&lt;id&gt;</c> branch) clipped mid-word.
 ///
-/// The existing ControlCenterRenderHarness renders this same surface in all five themes and never
+/// The existing ControlCenterRenderHarness renders this same surface in all themes and never
 /// caught it, because MockOrchestrator's fixtures are friendly short strings ("Loom-3",
 /// "fix/auth-refresh") that fit in 300px. Production entries are not: DaemonBackedOrchestrator
 /// projects <c>Name = entry.AgentId</c> and <c>Branch = $"agent/{entry.AgentId}"</c>. So every
@@ -37,7 +37,7 @@ namespace Mainguard.Tests.Headless;
 /// </summary>
 public class ControlCenterPanelSizingRenderHarness
 {
-    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+    private static readonly string[] ThemeKeys = { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     // The owner's own live container id + the branch the daemon derives from it.
     private const string RealAgentId = "1deb19131adb-ef9fe0bd3390433193896eca5e46145e";
@@ -226,12 +226,12 @@ public class ControlCenterPanelSizingRenderHarness
     }
 
     /// <summary>
-    /// The captures the fix has to be judged on: narrow / default / wide × all five themes, with
+    /// The captures the fix has to be judged on: narrow / default / wide × all themes, with
     /// production-length identifiers in the queue. Daylight Loom is a LIGHT theme — the seam has to be
     /// visible there too, which is why it uses BorderHairline rather than an assumed-dark colour.
     /// </summary>
     [AvaloniaFact]
-    public void Capture_QueueSizing_AllFiveThemes_AtThreeWidths()
+    public void Capture_QueueSizing_AllThemes_AtThreeWidths()
     {
         using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
         foreach (var theme in ThemeKeys)
@@ -264,7 +264,7 @@ public class ControlCenterPanelSizingRenderHarness
     /// assumed-dark hover colour would simply vanish.
     /// </summary>
     [AvaloniaFact]
-    public void Capture_SeamHoverAffordance_IsVisibleInAllFiveThemes()
+    public void Capture_SeamHoverAffordance_IsVisibleInAllThemes()
     {
         using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
         foreach (var theme in ThemeKeys)

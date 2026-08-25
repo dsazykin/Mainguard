@@ -6,7 +6,7 @@ This is the Lane A design-system specification for Mainguard's visual foundation
 
 Non-negotiables inherited by every part:
 
-- **One design system, five switchable themes** — Midnight Watch (default), Day Watch (light), Command Deck, Atelier, Aurora. Never assume "dark"; every value below is specified per theme.
+- **One design system, four switchable themes** — Midnight Loom (default), Daylight Loom (light), Graphite (macOS-native), Atelier. (Command Deck and Loom Aurora, analyzed throughout this document's historical sections, were retired in the 2026-08 restyle.) Never assume "dark"; every value below is specified per theme. The §1.3/§3.2 gates are now executable policy: `Mainguard.Tests/ThemeContrastGateTests.cs` machine-checks key-set completeness, AA contrast, lane separability under deuteranopia, and terminal legibility on every run.
 - **Semantic-role tokens only** (`{DynamicResource}`), never raw color, never `StaticResource` for anything that follows a live theme switch.
 - **Fixed shape/spacing/type scale**: radius 6/8/12/999; spacing 4/5/8/10/15/20; the DESIGN.md §3 type ramp.
 - **The Quiet Gatehouse north star**: quiet, layered, one signature accent per view. No Electron/VS-Code-extension chrome, no enterprise-SaaS scaffolding.

@@ -15,6 +15,13 @@
     <SolidColorBrush x:Key="ButtonBg" Color="#E9EBF1"/>
     <SolidColorBrush x:Key="BorderHairline" Color="#D8DBE4"/>
 
+    <!-- Outer-chrome indirection (macOS vibrancy, opt-in) — see MidnightLoom for the contract.
+         Light vibrancy needs more transparency than dark to read as material at all. -->
+    <SolidColorBrush x:Key="ChromeWindowBackground" Color="#EDEFF4"/>
+    <SolidColorBrush x:Key="ChromePanelBackground" Color="#F7F8FB"/>
+    <SolidColorBrush x:Key="SurfaceWindowVibrant" Color="#BFEDEFF4"/>
+    <SolidColorBrush x:Key="SurfacePanelVibrant" Color="#CCF7F8FB"/>
+
     <!-- Text -->
     <SolidColorBrush x:Key="TextPrimary" Color="#1D2130"/>
     <SolidColorBrush x:Key="TextMuted" Color="#5C6470"/>
@@ -26,10 +33,10 @@
     <SolidColorBrush x:Key="AccentSelection" Color="#266467E8"/>
 
     <!-- Semantic -->
-    <SolidColorBrush x:Key="SuccessBrush" Color="#1F9D55"/>
-    <SolidColorBrush x:Key="SuccessHover" Color="#178246"/>
-    <SolidColorBrush x:Key="DangerBrush" Color="#D64545"/>
-    <SolidColorBrush x:Key="DangerHover" Color="#C43A3A"/>
+    <SolidColorBrush x:Key="SuccessBrush" Color="#187C43"/>
+    <SolidColorBrush x:Key="SuccessHover" Color="#136637"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#C13939"/>
+    <SolidColorBrush x:Key="DangerHover" Color="#B02F2F"/>
     <SolidColorBrush x:Key="WarningBrush" Color="#A9770F"/>
     <SolidColorBrush x:Key="InfoBrush" Color="#0B78CE"/>
 
@@ -37,28 +44,28 @@
          carries state (E1/E2), brush is the second channel. Daylight Loom is light — never assume dark. -->
     <SolidColorBrush x:Key="AgentStatusWorkingBrush" Color="#0B78CE"/>
     <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#6467E8"/>
-    <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#1F9D55"/>
+    <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#187C43"/>
     <SolidColorBrush x:Key="AgentStatusStaleBrush" Color="#A9770F"/>
-    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#C62A83"/>
-    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#D64545"/>
+    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#7E5FB5"/>
+    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#C13939"/>
     <SolidColorBrush x:Key="AgentStatusRateLimitedBrush" Color="#A9770F"/>
-    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#D64545"/>
+    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#C13939"/>
     <SolidColorBrush x:Key="AgentStatusPausedBrush" Color="#5C6470"/>
 
     <!-- Commit-graph lanes -->
     <!-- Lanes decoupled from semantic status tokens (DESIGN.md §2); retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#3232E2"/>
-    <SolidColorBrush x:Key="Lane2" Color="#C62A83"/>
-    <SolidColorBrush x:Key="Lane3" Color="#075B55"/>
-    <SolidColorBrush x:Key="Lane4" Color="#7B420A"/>
+    <SolidColorBrush x:Key="Lane1" Color="#2F2FD6"/>
+    <SolidColorBrush x:Key="Lane2" Color="#AB467B"/>
+    <SolidColorBrush x:Key="Lane3" Color="#054743"/>
+    <SolidColorBrush x:Key="Lane4" Color="#8A4A0B"/>
     <SolidColorBrush x:Key="Lane5" Color="#138BE6"/>
 
     <!-- Diff line backgrounds -->
     <SolidColorBrush x:Key="DiffAddedBg" Color="#DDF3E4"/>
     <SolidColorBrush x:Key="DiffRemovedBg" Color="#FBE2E2"/>
     <!-- Intra-line (word-level) emphasis + trailing-whitespace marker (T-13) -->
-    <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#661F9D55"/>
-    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66D64545"/>
+    <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#66187C43"/>
+    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66C13939"/>
     <SolidColorBrush x:Key="DiffWhitespaceMarker" Color="#55A9770F"/>
 
     <!-- Blame age-heat gutter (T-11): recent → BlameAgeNew, old → BlameAgeOld. -->
@@ -71,20 +78,23 @@
     <SolidColorBrush x:Key="TerminalBackground" Color="#FBFBFD"/>
     <SolidColorBrush x:Key="TerminalForeground" Color="#1F2430"/>
     <SolidColorBrush x:Key="TerminalCursor" Color="#5B5BD6"/>
+    <!-- Light-background ANSI ramp: the dark themes' shared ramp was designed for near-black
+         backgrounds and its bright half (yellow/cyan especially) vanished on #FBFBFD. These are
+         deepened so every color 1-6/9-14 stays legible on the paper terminal. -->
     <SolidColorBrush x:Key="TerminalAnsi0" Color="#000000"/>
-    <SolidColorBrush x:Key="TerminalAnsi1" Color="#CD3131"/>
-    <SolidColorBrush x:Key="TerminalAnsi2" Color="#2AA745"/>
-    <SolidColorBrush x:Key="TerminalAnsi3" Color="#C7C43B"/>
-    <SolidColorBrush x:Key="TerminalAnsi4" Color="#3B6FD6"/>
-    <SolidColorBrush x:Key="TerminalAnsi5" Color="#B454C9"/>
-    <SolidColorBrush x:Key="TerminalAnsi6" Color="#2EC5CE"/>
-    <SolidColorBrush x:Key="TerminalAnsi7" Color="#D0D0D0"/>
-    <SolidColorBrush x:Key="TerminalAnsi8" Color="#6A737D"/>
-    <SolidColorBrush x:Key="TerminalAnsi9" Color="#F14C4C"/>
-    <SolidColorBrush x:Key="TerminalAnsi10" Color="#3FC56B"/>
-    <SolidColorBrush x:Key="TerminalAnsi11" Color="#EAE05B"/>
-    <SolidColorBrush x:Key="TerminalAnsi12" Color="#5C8DF0"/>
-    <SolidColorBrush x:Key="TerminalAnsi13" Color="#D67BEA"/>
-    <SolidColorBrush x:Key="TerminalAnsi14" Color="#4FE0E8"/>
+    <SolidColorBrush x:Key="TerminalAnsi1" Color="#C4231B"/>
+    <SolidColorBrush x:Key="TerminalAnsi2" Color="#007400"/>
+    <SolidColorBrush x:Key="TerminalAnsi3" Color="#826B00"/>
+    <SolidColorBrush x:Key="TerminalAnsi4" Color="#0F52C6"/>
+    <SolidColorBrush x:Key="TerminalAnsi5" Color="#A90D91"/>
+    <SolidColorBrush x:Key="TerminalAnsi6" Color="#0E7C86"/>
+    <SolidColorBrush x:Key="TerminalAnsi7" Color="#BFBFBF"/>
+    <SolidColorBrush x:Key="TerminalAnsi8" Color="#666666"/>
+    <SolidColorBrush x:Key="TerminalAnsi9" Color="#E0301E"/>
+    <SolidColorBrush x:Key="TerminalAnsi10" Color="#1E9E33"/>
+    <SolidColorBrush x:Key="TerminalAnsi11" Color="#9A7D00"/>
+    <SolidColorBrush x:Key="TerminalAnsi12" Color="#2A6FEF"/>
+    <SolidColorBrush x:Key="TerminalAnsi13" Color="#C33FC0"/>
+    <SolidColorBrush x:Key="TerminalAnsi14" Color="#159AA8"/>
     <SolidColorBrush x:Key="TerminalAnsi15" Color="#FFFFFF"/>
 </ResourceDictionary>

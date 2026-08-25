@@ -30,11 +30,38 @@ public static class DockerAgentLister
         }, ct).ConfigureAwait(false);
 
         return containers.Select(c => new AgentContainerState(
-            AgentId: Label(c, "mainguard.agent"),
-            RepoHash: Label(c, "mainguard.repo"),
+            AgentId: Label(c, AgentIdLabel),
+            RepoHash: Label(c, RepoHashLabel),
             ContainerId: c.ID,
-            Running: string.Equals(c.State, "running", StringComparison.OrdinalIgnoreCase))).ToList();
+            Running: string.Equals(c.State, "running", StringComparison.OrdinalIgnoreCase),
+            // Docker reports a frozen container as "paused", NOT as "running" — so a jail the kill switch
+            // or a human paused is present but not Running, and every caller that wanted "still here" has
+            // to read AgentContainerState.Live. Carried separately so the daemon can also correct its own
+            // tracked state toward Docker's (ISSUES-LOG #20).
+            Paused: string.Equals(c.State, "paused", StringComparison.OrdinalIgnoreCase),
+            Kind: Label(c, KindLabel),
+            Role: Label(c, AgentRoleLabel))).ToList();
     }
+
+    /// <summary>The agent id label P2-07 stamps on every jail — also the list filter.</summary>
+    public const string AgentIdLabel = "mainguard.agent";
+
+    /// <summary>The owning repository's handle hash.</summary>
+    public const string RepoHashLabel = "mainguard.repo";
+
+    /// <summary>The agent CLI running in the jail (<c>claude-code</c>, …) — what the daemon's session
+    /// record calls <c>Kind</c>. Empty on a jail created before this label existed.</summary>
+    public const string KindLabel = "mainguard.kind";
+
+    /// <summary>
+    /// The ORCHESTRATION role (<c>""</c> / <c>coordinator</c> / <c>managed</c>).
+    ///
+    /// <para>Deliberately not <c>mainguard.role</c>: that label already means something else — which kind
+    /// of container this is (<c>agent</c> vs the egress proxy's <c>egress-proxy</c>) — and the two answer
+    /// different questions. Without this label a jail adopted after a daemon restart comes back as a
+    /// role-less worker, so the Coordinator surface would find no coordinator for a repo that has one.</para>
+    /// </summary>
+    public const string AgentRoleLabel = "mainguard.agent.role";
 
     private static string Label(ContainerListResponse container, string key) =>
         container.Labels is not null && container.Labels.TryGetValue(key, out var value) ? value : string.Empty;

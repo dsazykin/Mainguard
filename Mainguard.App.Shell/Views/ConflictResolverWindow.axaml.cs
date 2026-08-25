@@ -450,7 +450,7 @@ internal sealed class MergeBandRenderer : IBackgroundRenderer
         var grey = ThemeBrush.Resolve("SurfaceHover", "#252B34");
         var theirsTint = ThemeBrush.Resolve("AccentSelection", "#268B8BF5");
         var filler = ThemeBrush.Resolve("SurfaceCard", "#1A1E24");
-        var word = ThemeBrush.Translucent(ThemeBrush.Resolve("DangerBrush", "#F87171"), 0.28);
+        var word = ThemeBrush.Translucent(ThemeBrush.Resolve("DangerBrush", "#E5484D"), 0.28);
         double width = textView.Bounds.Width;
 
         foreach (var vl in textView.VisualLines)
@@ -577,9 +577,9 @@ public sealed class MergeGutter : Control
         double w = Bounds.Width;
         double lh = LineHeight();
 
-        var accentAvail = ThemeBrush.Resolve("AccentBrush", "#8B8BF5");
+        var accentAvail = ThemeBrush.Resolve("AccentBrush", "#8487F0");
         var accepted = ThemeBrush.Resolve("SuccessBrush", "#42B968");
-        var rejected = ThemeBrush.Resolve("DangerBrush", "#F87171");
+        var rejected = ThemeBrush.Resolve("DangerBrush", "#E5484D");
         var muted = ThemeBrush.Resolve("TextMuted", "#8A93A6");
         var red = ThemeBrush.Resolve("DiffRemovedBg", "#33191E");
         var green = ThemeBrush.Resolve("DiffAddedBg", "#11271B");

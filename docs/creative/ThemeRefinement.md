@@ -394,3 +394,27 @@ together for any shared-token move) — never from this doc.
 - [x] **N-1 cited** for the new name; N-5, DESIGN.md Semantic-Not-Literal / One-Accent, PRODUCT.md P1 &
       Accessibility honored.
 - [x] Two borderline lanes (Atelier L4, Aurora L5) surfaced honestly, not hidden, and routed to the gate.
+
+---
+
+## Addendum — the 2026-08 four-theme restyle
+
+This document's five-theme analysis is preserved as history; the lineup it describes has since
+changed. The 2026-08 restyle ("professional/sleek, macOS-leaning") made these changes:
+
+- **Command Deck and Loom Aurora were retired.** Their Tailwind-400-family palette (neon teal /
+  rose / amber on tinted surfaces) read as generic-AI-website rather than instrument — the
+  anti-reference §1 warns about. `ThemeManager.LegacyKeyMap` migrates persisted keys
+  (CommandDeck → Graphite, LoomAurora → MidnightLoom) and self-heals the store.
+- **Graphite joined**: a macOS-native neutral-graphite dark with Apple-semantic-derived colors
+  (systemBlue-tint accent, systemRed danger), the most restrained theme in the lineup.
+- **Cross-theme retunes**: danger moved from the rose/pink family to true reds per theme
+  (`#E5484D` / `#C13939` / `#FF453A` / `#D65A4A`), awaiting-review dropped its magenta/purple for
+  muted violets, Daylight got its own light-background ANSI ramp (this doc's §5 flagged the shared
+  ramp; the byte-identical block was a real Daylight legibility bug), and the Midnight accent
+  nudged from `#8B8BF5` to `#8487F0`.
+- **§7's shipping gate finally exists as code**: `Mainguard.Tests/ThemeContrastGateTests.cs`
+  machine-checks key-set completeness, AA text contrast (incl. the selection composite), lane
+  floor + pairwise deuteranopic-lightness staircase (Viénot 1999), and terminal legibility. Its
+  first run caught five real defects — including lane pairs in *every* theme that collapse for a
+  deuteranopic reader — all fixed by machine-solved lane ladders that keep each hue's identity.

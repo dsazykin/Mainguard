@@ -375,6 +375,38 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// The post-merge mirror refresh (observed-live defect): after a confirmed human merge, origin's
+    /// main has moved but the mirror's hasn't — and EnsureQueue's reconcile TRUSTS the mirror, so a
+    /// spawn in that window walked the queue's authoritative main BACKWARDS to the pre-merge sha.
+    /// Every later verification was then coherent against the old main and every merge refused with
+    /// "main moved". The refresh pulls origin's main forward into the mirror at confirm time, so the
+    /// reconcile agrees with the merge instead of undoing it.
+    /// </summary>
+    [Fact]
+    public void RefreshMirrorMainAfterMerge_PullsOriginForward_SoEnsureQueueCannotRegressMain()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        var shaBefore = provisioner.EnsureQueue(repoHash)!.Queue.CurrentMainSha;
+
+        // The human's merge lands on ORIGIN's main; the mirror knows nothing yet.
+        WriteAndCommit(_source, "merged.cs", "public class Merged { }\n", "the human merge landing on origin main");
+        string newMain;
+        using (var origin = new Repository(_source))
+        {
+            newMain = origin.Head.Tip.Sha;
+        }
+
+        Assert.NotEqual(shaBefore, newMain);
+
+        Assert.True(provisioner.TryRefreshMirrorMainAfterMerge(repoHash, out var reason), reason);
+
+        // The reconcile now moves FORWARD to the merged sha — before the refresh existed, this same
+        // EnsureQueue call is what regressed the queue back to shaBefore.
+        Assert.Equal(newMain, provisioner.EnsureQueue(repoHash)!.Queue.CurrentMainSha);
+    }
+
+    /// <summary>
     /// The control. Identical declarations on both sides must NOT flag — a gate that fires on every
     /// branch is noise, and noise trains reviewers to acknowledge without reading.
     /// </summary>

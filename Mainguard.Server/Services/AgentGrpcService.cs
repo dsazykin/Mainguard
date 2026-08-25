@@ -43,7 +43,8 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
     public AgentGrpcService(
         AgentSessionStore store, AgentSpawnService spawns, InstalledAdapterCatalog adapters,
         DaemonInfoProvider info, AgentResourceProbe resources, AgentResumeService resumes,
-        Mainguard.Server.Auth.IApproverIdentityResolver identity, ILoggerFactory loggerFactory)
+        Mainguard.Server.Auth.IApproverIdentityResolver identity, ILoggerFactory loggerFactory,
+        AgentPauseService? pauses = null)
     {
         _store = store;
         _spawns = spawns;
@@ -52,8 +53,47 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         _resources = resources;
         _resumes = resumes ?? throw new System.ArgumentNullException(nameof(resumes));
         _identity = identity ?? throw new System.ArgumentNullException(nameof(identity));
+        _pauses = pauses;
         _log = (loggerFactory ?? throw new System.ArgumentNullException(nameof(loggerFactory)))
             .CreateLogger(DaemonLogCategories.Spawn);
+    }
+
+    private readonly AgentPauseService? _pauses;
+
+    /// <summary>Human per-agent pause (docker pause on the jail; NOT containment — no terminal lock).
+    /// Refusal-as-response, same contract as ResumeAgent.</summary>
+    public override async Task<PauseAgentResponse> PauseAgent(PauseAgentRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "agent_id is required."));
+        }
+
+        if (_pauses is null)
+        {
+            return new PauseAgentResponse { Paused = false, Reason = "this daemon has no pause service bound" };
+        }
+
+        var (done, reason) = await _pauses.PauseAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
+        return new PauseAgentResponse { Paused = done, Reason = reason };
+    }
+
+    /// <summary>Human per-agent resume. Refused while the keep-alive rebase holds the jail (seconds,
+    /// self-clearing) or the kill freeze is engaged — see HumanPauseLedger for the arbitration.</summary>
+    public override async Task<UnpauseAgentResponse> UnpauseAgent(UnpauseAgentRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "agent_id is required."));
+        }
+
+        if (_pauses is null)
+        {
+            return new UnpauseAgentResponse { Unpaused = false, Reason = "this daemon has no pause service bound" };
+        }
+
+        var (done, reason) = await _pauses.UnpauseAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
+        return new UnpauseAgentResponse { Unpaused = done, Reason = reason };
     }
 
     public override async Task<SpawnAgentResponse> SpawnAgent(SpawnAgentRequest request, ServerCallContext context)

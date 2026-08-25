@@ -13,7 +13,7 @@ All planning/design/analysis docs live under `docs/`, grouped by purpose. **Put 
 | Folder | What goes here |
 |---|---|
 | **`docs/repo-map/`** | **The per-file index of the whole repo, split by project — start at its `README.md` routing table.** This is where a Repository Map entry goes when you add, move, or delete a file. |
-| `docs/phase-2/` | The active phase-2 agent-platform corpus: **`implementation_plans/Mainguard_Master_Implementation_Document_v2.md` — the binding spec** (where any subordinate doc disagrees, the master doc wins; since the 2026-07-12 consolidation its UI task sections carry **Design decisions (binding)** blocks linking the design hub, and its baseline/invariants reference the Lane-H pass + ADRs), plus `implementation_plans/Mainguard_Test_Implementation_Strategy_v2.md`, plus the Orchestration Protocol Spec, Environment Substrate Contract, WSL2 substrate, Uplift Study, RedTeam plan, Cloud/Vibe companion, Performance Hotspot Register, Risk Register, the Phase-2 Test Implementation Strategy, and **`ADRs.md`** — the client/non-security Architecture Decision Records (Context → Decision → Consequences; ADR-001 handle discipline + index.lock retry, ADR-002 per-HEAD analytics cache, ADR-003 router optimization, ADR-004 diff theme/emphasis policy, ADR-005 property-testing approach, ADR-006 merge blank-line conservation + known limit, ADR-007 bench-vs-test split). |
+| `docs/phase-2/` | The active phase-2 agent-platform corpus: **`implementation_plans/Mainguard_Master_Implementation_Document_v2.md` — the binding spec** (where any subordinate doc disagrees, the master doc wins; since the 2026-07-12 consolidation its UI task sections carry **Design decisions (binding)** blocks linking the design hub, and its baseline/invariants reference the Lane-H pass + ADRs), plus `implementation_plans/Mainguard_Test_Implementation_Strategy_v2.md`, plus the Orchestration Protocol Spec, Environment Substrate Contract, WSL2 substrate, Uplift Study, RedTeam plan, Cloud/Vibe companion, Performance Hotspot Register, Risk Register, the Phase-2 Test Implementation Strategy, and **`ADRs.md`** — the client/non-security Architecture Decision Records (Context → Decision → Consequences; ADR-001 handle discipline + index.lock retry, ADR-002 per-HEAD analytics cache, ADR-003 router optimization, ADR-004 diff theme/emphasis policy, ADR-005 property-testing approach, ADR-006 merge blank-line conservation + known limit, ADR-007 bench-vs-test split, ADR-008 the macos-host substrate). |
 | `docs/planning/` | Roadmaps and older plans: `Mainguard_Roadmap.md`, `Implementation_Plan.md`, `Mainguard_Backlog.md`, the v1 Master Implementation Document, feature-plan triage, git audit, implementation strategy (aspirational — the destination, not the current code). `Agent_Image_Provisioning_And_Daemon_Logging_Backlog.md` — the two structural gaps left open by the 2026-07-17 update-mechanism work (#193–#202): shipping `mainguard-agent-base` to installed VMs, and giving `mainguardd` real journal logging (field evidence, candidate approaches, acceptance criteria). **`Product_Editions_And_Structural_Sequencing.md`** — the plan to separate the three products (free Client / Pro / Cloud) by **edition composition on one trunk** (an `IEditionManifest` seam + per-edition packaging lanes), not by branch; §7 sequences it against the rename and argues the project rename (rebrand Phase 3) and the assembly split should be **one fused merge-freeze operation**. |
 | `docs/adr/` | Repo-wide **Architecture Decision Records** — cross-cutting product/structure/release decisions, standard Status → Context → Decision → Consequences → References headings. **`0001-product-editions.md`** — separate the free **Client** / **Pro** / **Cloud** products by *edition composition on one trunk* (a static `IEditionManifest`/`App.Edition` seam mirroring `App.Settings`, Pro UI moved to a `Mainguard.Agents.UI` assembly behind two thin exe heads, per-edition Velopack lanes, CI reference-graph/twin-harness/manifest gates), never by branch or `#if`; fuses the `Mainguard → Mainguard` rename with the assembly split into one merge-freeze op and retires `phase2` for trunk-based dev. Distinct register from `docs/phase-2/ADRs.md`, which is the client/non-security **Lane-H code-quality** ADR log. |
 | `docs/test_implementation_plan/` | Test strategy (v1) and the manual `Mainguard_User_Testing_Guide.md`. |
@@ -106,6 +106,28 @@ dotnet run --project Mainguard.Pro.App   # launch the app (Pro head; use Maingua
 
 **Always run `dotnet build` after making changes**, and `dotnet test` when you touch Core.
 
+### Developing on macOS (the macos-host substrate)
+
+The whole platform runs on a Mac — daemon natively (`osx-arm64`), sandboxes through whichever
+Docker engine the machine has (Docker Desktop / OrbStack / Colima; `DockerEndpointResolver`
+finds it). See `docs/phase-2/Mainguard_Substrate_MacHost.md` + ADR-008. Mac-specific working
+knowledge:
+
+- **Never spawn a copied apphost.** Current macOS pins an executable name to its first-run
+  location and SIGKILLs a same-named apphost anywhere else ("died of signal 9"); re-signing does
+  not help. Run copied heads through the muxer — `dotnet <app>.dll` — as
+  `Mainguard.Tests/TestTools/SelfInvocation.cs` and `MacDaemonController` do.
+- **`/var` is a symlink to `/private/var`.** Host git canonicalizes paths; a jail has no such
+  symlink. Test fixtures that cross either boundary start from the canonical temp root
+  (`TempRepoFixture.CanonicalTempRoot`, `Server.Tests/Fixtures/CanonicalTemp`).
+- **Lockfiles are RID-stable**: the daemon-graph projects declare
+  `<RuntimeIdentifiers>linux-x64;win-x64;osx-arm64</RuntimeIdentifiers>`, so every restore on any
+  platform evaluates identically and a lockfile diff means a real dependency change.
+- Jail images build **native arm64** (TARGETARCH-parametrized, per-arch pins); libvterm builds as
+  a `.dylib` via the same pinned `build/libvterm/build.sh`.
+- Platform traits: `UnixOnlyFact` (Linux + macOS) vs `LinuxOnlyFact` (genuinely Linux-bound) vs
+  `MacOnlyFact` — a "not Windows" assumption no longer implies Linux.
+
 ### EF Core migrations
 
 `dotnet-ef` is a local tool (`dotnet-tools.json`). The DB is created/migrated automatically on app startup (`App.axaml.cs`). When you change entities in `AppDbContext`:
@@ -129,7 +151,7 @@ Commit the generated migration + snapshot together. Never hand-edit an applied m
 
 ## UI / Design System
 
-Mainguard ships **one design system with switchable color themes**. The shape language, spacing, typography, and component classes are fixed; only the color palette changes per theme. **Midnight Loom** (layered charcoal + violet accent) is the default; **Daylight Loom** (light), **Command Deck**, **Atelier**, and **Loom Aurora** ship alongside it. The user switches themes via **File → Theme**; the choice persists in `UserPreferences.Theme`.
+Mainguard ships **one design system with switchable color themes**. The shape language, spacing, typography, and component classes are fixed; only the color palette changes per theme. **Midnight Loom** (layered charcoal + violet accent) is the default; **Daylight Loom** (light), **Graphite** (macOS-native neutral graphite, Apple-semantic-derived colors), and **Atelier** ship alongside it. (Command Deck and Loom Aurora were retired in the 2026-08 restyle; `ThemeManager.LegacyKeyMap` migrates their persisted keys.) The user switches themes in Settings → General (a data-driven picker over `ThemeManager.Themes`) or the macOS menu bar; the choice persists in `UserPreferences.Theme`, and `Mainguard.Tests/ThemeContrastGateTests.cs` machine-checks every palette (AA contrast, lane separability incl. deuteranopia, terminal legibility).
 
 **Design & voice references.** [`DESIGN.md`](DESIGN.md) is the full design system (colors as roles,
 typography, elevation, components, do's/don'ts); [`PRODUCT.md`](PRODUCT.md) is the register, users,
@@ -182,7 +204,7 @@ criteria, each cited against these rules — ending in a prioritized premium-fee
 punch-list; consult it before working a polish item.
 [`docs/creative/ThemeRefinement.md`](docs/creative/ThemeRefinement.md) is a **color-retune design
 spec (proposed values, no live edits)** that audits `Lane1`–`Lane5` and the diff add/remove tokens
-for color-vision-deficiency separability and lane/lightness overlap across all five themes (computed
+for color-vision-deficiency separability and lane/lightness overlap across all themes (computed
 WCAG contrast + deuteranopia-lightness figures), proposes retuned hexes built on a lightness
 staircase plus an optional sixth theme (**Loom Meridian**, proposed/not wired, full 32-token
 contract + draft `.axaml`), and defines the render-harness + contrast-gate verification any retune
@@ -193,10 +215,11 @@ CVD-sensitive color.
 
 - Each theme is one `ResourceDictionary` in **`Mainguard.UI/Themes/<Key>.axaml`** defining the **full token contract** below. `App.axaml` merges `MidnightLoom.axaml` as the startup default.
 - **`Mainguard.UI/Theming/ThemeManager.cs`** swaps the merged dictionary at runtime, sets `RequestedThemeVariant` (so built-in Fluent chrome follows light/dark), persists the key, and raises `ThemeChanged`.
-- **Color tokens are referenced with `{DynamicResource …}` — never `StaticResource`.** StaticResource is resolved once and will not update on a live theme switch. (`StaticResource` remains correct for theme-independent resources: icons and the `FontUi`/`FontMono` families.)
+- **Color tokens are referenced with `{DynamicResource …}` — never `StaticResource`.** StaticResource is resolved once and will not update on a live theme switch. (`StaticResource` remains correct for theme-independent resources: icons and `FontMono`. `FontUi` is the exception among fonts — it is consumed via `DynamicResource` because the shell overrides it at app level on macOS.)
 - **Code-drawn colors** resolve through `Application.Current.TryGetResource(key, app.ActualThemeVariant, …)` with a literal fallback, and long-lived visuals re-resolve on `ThemeManager.ThemeChanged`. `CommitGraphCanvas` is the reference pattern; `DiffViewerView`'s margin renderer and `AnalyticsViewModel.ThemeSkColor` follow it.
-- **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes`, add a File → Theme menu item. Nothing else.
+- **Adding a theme** = copy `MidnightLoom.axaml`, change values (define *every* token), register it in `ThemeManager.Themes` — the Settings picker and macOS menu build themselves from that list; the theme sweep harness arrays in `Mainguard.Tests/Headless/` list keys explicitly, add it there too. `ThemeContrastGateTests` will hold the new palette to the contrast/CVD gates.
 - **Adding a token** = add it to **all** files in `Themes/` and to the table below. A token missing from one theme is a runtime bug the compiler cannot catch.
+- **macOS vibrancy (opt-in) routes through indirection tokens, never through the Surface tokens.** The main window's outer chrome (window background, title bar, section rail) binds `ChromeWindowBackground`/`ChromePanelBackground` — per-theme opaque duplicates of `SurfaceWindow`/`SurfacePanel` that `Mainguard.UI/Theming/VibrancyManager.cs` shadows with the `SurfaceWindowVibrant`/`SurfacePanelVibrant` translucent variants while the "Translucent window chrome" preference is on AND the platform granted the blur. Content surfaces (cards, diff, terminal) always paint the opaque Surface tokens — never bind the Chrome tokens on a reading surface. See DESIGN.md §4 "The Vibrancy Exception".
 
 ### The golden rule: no raw colors
 
@@ -221,13 +244,15 @@ Reference values are Midnight Loom's.
 | `SurfaceHover` | hover / neutral selection | `#252B34` |
 | `SurfaceHoverGhost` | `SurfaceHover` at 0 alpha — rest background for **ghost** buttons (transparent-looking, hover to `SurfaceHover`) so the fade never flashes white; see Depth & motion | `#00252B34` |
 | `ButtonBg` | neutral button fill | `#1E232B` |
+| `ChromeWindowBackground` / `ChromePanelBackground` | outer-chrome indirection (main-window background / title bar + section rail) — opaque duplicates of `SurfaceWindow`/`SurfacePanel` that `VibrancyManager` shadows on macOS while vibrancy is on; never bind on content surfaces | `#0F1115` / `#14171C` |
+| `SurfaceWindowVibrant` / `SurfacePanelVibrant` | the translucent chrome variants vibrancy swaps in (dark themes ≈ 80/85% alpha, Daylight more transparent) | `#CC0F1115` / `#D914171C` |
 | `BorderHairline` | 1px borders, dividers | `#262B33` |
 | `TextPrimary` / `TextMuted` | body & titles / metadata, hints | `#E6E9EF` / `#8A93A6` |
 | `OnAccent` | text/icons on Accent, Success, Danger fills | `#0B0D10` |
-| `AccentBrush` / `AccentHover` | signature accent, links, current branch / its hover | `#8B8BF5` / `#A5A5F8` |
+| `AccentBrush` / `AccentHover` | signature accent, links, current branch / its hover | `#8487F0` / `#9EA1F5` |
 | `AccentSelection` | translucent accent tint for selected rows/chips | `#268B8BF5` |
 | `SuccessBrush` / `SuccessHover` | success, added | `#42B968` / `#5BCB7F` |
-| `DangerBrush` / `DangerHover` | destructive, removed | `#F87171` / `#FA8C8C` |
+| `DangerBrush` / `DangerHover` | destructive, removed | `#E5484D` / `#EC5D62` |
 | `WarningBrush` | warnings | `#E3B341` |
 | `InfoBrush` | informational accent (T-30 Info-severity findings) | `#58A6FF` |
 | `Lane1`–`Lane5` | commit-graph lanes (decoupled from semantics) | violet · rose · teal · amber · sky |
@@ -235,7 +260,7 @@ Reference values are Midnight Loom's.
 | `DiffAddedEmphasis` / `DiffRemovedEmphasis` | intra-line (word-level) emphasis over an added/removed line (T-13) | `#6642B968` / `#66F87171` |
 | `DiffWhitespaceMarker` | trailing-whitespace tint (T-13) | `#55E3B341` |
 
-Semantics rule: use tokens **by meaning, not by hue** — the same view must look right in all five themes. Never assume the accent is violet or the background is dark (Daylight Loom is light).
+Semantics rule: use tokens **by meaning, not by hue** — the same view must look right in all themes. Never assume the accent is violet or the background is dark (Daylight Loom is light).
 
 ### Shape system — nothing is a bare rectangle
 
@@ -268,7 +293,7 @@ Rules: at most one `Accent` per view; anything destructive is `Danger` (no ad-ho
 
 ### Typography
 
-`FontUi` (Inter → Segoe UI fallback chain) is applied to every `Window` globally. `FontMono` is for SHAs, code, and diff text — use `TextBlock.Mono` or `FontFamily="{StaticResource FontMono}"`. Font sizes: `10–11` metadata/chips, `12–13` body/controls, `14` emphasis, `16–18` titles, `24` hero. Spacing scale: `4 / 5 / 8 / 10 / 15 / 20`.
+`FontUi` (Inter → Segoe UI fallback chain; on macOS the shell overrides it at app level to the system SF Pro face — `.AppleSystemUIFont`, the hidden CoreText family, since "SF Pro Text" is not an installed family and Skia would silently substitute Helvetica — falling back to Inter) is applied to every `Window` globally via `DynamicResource`. `FontMono` is for SHAs, code, and diff text — use `TextBlock.Mono` or `FontFamily="{StaticResource FontMono}"`. Font sizes: `10–11` metadata/chips, `12–13` body/controls, `14` emphasis, `16–18` titles, `24` hero. Spacing scale: `4 / 5 / 8 / 10 / 15 / 20`.
 
 ### Icons
 
@@ -359,7 +384,12 @@ CI restores with `--locked-mode`, so this either fails somebody's build or gets 
   (P2-25); it realizes ESC-I1…ESC-I9 on WSL2, carries the exhaustive WSL stress matrix and the
   filled cold-start/mount-latency budgets, and runs the ESC §4 `SubstrateConformance` suite plus
   the WSL-specific `RequiresWsl` manual-matrix tests; subordinate to the master doc and to the
-  ESC umbrella). The de-jargoned explainer for the cloud + Vibe roadmap is
+  ESC umbrella). The second is `docs/phase-2/Mainguard_Substrate_MacHost.md` (B6 — the
+  `SubstrateId = "macos-host"` realization shipped with the phase2 macOS port: the
+  `MacHostAgentEnvironment` facade, daemon native on the Mac, engine-agnostic Docker endpoint
+  resolution, container-backed CLI/toolchain installs, structural `AllowedMountRoots`, its ESC §4
+  results and §5 measurements; the deviation from the deferred B4 "macos-vm" sketch is ADR-008).
+  The de-jargoned explainer for the cloud + Vibe roadmap is
   `docs/phase-2/Mainguard_Cloud_Vibe_Companion.md` (a companion for a founder/reader without a
   cloud-infrastructure background: a plain-language concepts glossary — mTLS, OIDC, KMS, tenant
   isolation, per-tenant encryption/crypto-shred, pod eviction, metering, egress, PKCE/loopback

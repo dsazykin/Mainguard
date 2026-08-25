@@ -46,6 +46,12 @@ public sealed record VerificationOutcome(bool Ran, bool Passed, string Reason);
 public interface IMergeQueueService
 {
     string MainSha { get; }
+    /// <summary>Fires whenever the daemon's queue projection changes — a spawn's <c>EnsureEntry</c>,
+    /// a state transition, a stale cascade. Field bug (found live 2026-08-20): nothing subscribed a
+    /// rail refresh to this signal, so a fresh spawn's entry sat in <see cref="GetQueue"/>'s answer
+    /// correctly but unrendered until an UNRELATED event (an AgentEvent, a coordinator/kill-switch
+    /// change) happened to trigger one — "the spawned agent never appeared in the queue."</summary>
+    event Action? Changed;
     IReadOnlyList<QueueEntry> GetQueue();
     bool CanMerge(string agentId, out string reason);
     /// <summary>
@@ -83,6 +89,17 @@ public interface IMergeQueueService
     /// <exception cref="InvalidOperationException">The daemon refused; the message is the reason, already
     /// phrased for display, and the queue is unchanged.</exception>
     Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason);
+
+    /// <summary>
+    /// Rejects a VERIFIED (or awaiting-review) entry — the review verdict "no", terminal. Distinct from
+    /// <see cref="DiscardEntryAsync"/>, which is entry housekeeping legal from any non-terminal state:
+    /// rejecting is a judgment about reviewed work, refused for entries that were never verified.
+    /// </summary>
+    /// <param name="reason">The reviewer's verbatim reason; may be empty.</param>
+    /// <returns>The record the daemon wrote.</returns>
+    /// <exception cref="InvalidOperationException">The daemon refused; the message is the reason, already
+    /// phrased for display, and the queue is unchanged.</exception>
+    Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason);
 
     /// <summary>
     /// Clears a <c>Verifying</c> entry that has no run behind it, returning it to <c>Working</c>.
@@ -137,6 +154,10 @@ public sealed record QueueEntryResumeOutcome(
 /// <param name="DiscardedAt">When the daemon recorded it; null when the daemon sent no timestamp.</param>
 public sealed record QueueEntryDiscardOutcome(
     string AgentId, string DiscardedBy, DateTimeOffset? DiscardedAt);
+
+/// <summary>What a reject recorded — same rationale as <see cref="QueueEntryDiscardOutcome"/>.</summary>
+public sealed record QueueEntryRejectOutcome(
+    string AgentId, string RejectedBy, DateTimeOffset? RejectedAt);
 
 /// <summary>The coordinator conversation + the worker-authored plan gate (contract §2).</summary>
 public interface ICoordinatorService

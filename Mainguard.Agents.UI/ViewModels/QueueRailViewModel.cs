@@ -28,6 +28,15 @@ public partial class QueueRailViewModel : ViewModelBase
     [ObservableProperty] private string _gateText = "";
     [ObservableProperty] private bool _isEmpty;
 
+    /// <summary>
+    /// How many rows the rail is holding, split the way its display order splits them. The rail scrolls,
+    /// and its scrollbar is a thin low-contrast thumb inside a dense list — twice during the 2026-08-20
+    /// walkthrough a row that WAS rendering, below the fold, was reported as a missing entry (ISSUES-LOG
+    /// #4, then #13 as a HIGH "rejected entries vanish" regression). A count is the cheapest honest cue
+    /// that the list is taller than the viewport, and it says which half the rest of it is in.
+    /// </summary>
+    [ObservableProperty] private string _countText = "";
+
     /// <param name="report">(message, isWarning) sink for the lifecycle actions' outcomes; null uses the
     /// shell's toast stack. Injected by tests — a discard's refusal is the sentence the human reads, so it
     /// has to be observable somewhere other than a toast.</param>
@@ -81,9 +90,24 @@ public partial class QueueRailViewModel : ViewModelBase
 
         IsEmpty = Entries.Count == 0;
 
-        // The rail's ONE accent: the front-most fresh Verified entry gets the Review CTA.
+        var history = Entries.Count(e => e.IsTerminalRecord);
+        var active = Entries.Count - history;
+        CountText = IsEmpty
+            ? ""
+            : history == 0
+                ? $"{active} in play"
+                : $"{active} in play · {history} in history (merged/rejected, below)";
+
+        // The rail's ONE accent: the front-most fresh Verified entry gets the Review CTA. Every OTHER
+        // reviewable row gets the secondary (non-accent) Review affordance — before it existed, a
+        // second Verified branch had no path to the cockpit at all, and the cockpit is the only place
+        // the Merge button lives, so only one branch was ever mergeable no matter how many verified.
         var first = Entries.FirstOrDefault(e => e.IsReviewable);
-        foreach (var e in Entries) e.ShowReviewAccent = ReferenceEquals(e, first);
+        foreach (var e in Entries)
+        {
+            e.ShowReviewAccent = ReferenceEquals(e, first);
+            e.ShowSecondaryReview = e.IsReviewable && !e.ShowReviewAccent;
+        }
 
         // The gate line mirrors the front entry's CanMerge reason (§3.4).
         if (first is not null && !_queue.CanMerge(first.AgentId, out var reason))
@@ -131,7 +155,17 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private string _verifiedAgainst = "";
     [ObservableProperty] private string _badgeGeometryKey = "AgentWorkingIcon";
     [ObservableProperty] private bool _isReviewable;
+
+    /// <summary>True for a <c>Merged</c>/<c>Rejected</c> row — the permanent record half of the rail,
+    /// which the header counts separately from the work still in play.</summary>
+    [ObservableProperty] private bool _isTerminalRecord;
+
     [ObservableProperty] private bool _showReviewAccent;
+
+    /// <summary>The non-accent Review affordance for reviewable rows BEHIND the front one — the rail's
+    /// one accent stays on the front entry (One Accent Rule), but every verified branch must be able to
+    /// reach the cockpit, because the cockpit is the only place the Merge button exists.</summary>
+    [ObservableProperty] private bool _showSecondaryReview;
 
     /// <summary>Whether the human can ask for a verification run on this entry right now. False while one
     /// is already in flight (the daemon rejects a concurrent run) and on the terminal states.</summary>
@@ -239,8 +273,14 @@ public partial class QueueEntryViewModel : ViewModelBase
             WorkerMergeState.AwaitingReview => "Awaiting review",
             var s => s.ToString(),
         };
-        VerifiedAgainst = entry.Verification is { } v && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
-            ? $"main@{v.MainSha}" : "";
+        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in a
+        // VerificationRecord, which would fabricate a pass/fail verdict the daemon didn't send. The old
+        // read looked only at Verification, which the daemon projection never populates, so the stamp
+        // could never render in the shipped app.
+        var verifiedSha = entry.VerifiedMainSha is { Length: > 0 } wireSha ? wireSha : entry.Verification?.MainSha;
+        VerifiedAgainst = verifiedSha is { Length: > 0 } sha
+            && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
+            ? $"main@{Shorten(sha)}" : "";
         IsReviewable = entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;
 
         // The daemon now owns this row's progress; drop our optimistic in-flight latch.
@@ -249,6 +289,8 @@ public partial class QueueEntryViewModel : ViewModelBase
         _lastState = entry.State;
         _hasLiveSandbox = entry.HasLiveSandbox;
         RecomputeCanVerify();
+
+        IsTerminalRecord = entry.State is WorkerMergeState.Merged or WorkerMergeState.Rejected;
 
         CanDiscard = entry.State
             is not (WorkerMergeState.Merged or WorkerMergeState.Rejected or WorkerMergeState.Discarded);
@@ -427,4 +469,6 @@ public partial class QueueEntryViewModel : ViewModelBase
             _lifecycleRequestInFlight = false;
         }
     }
+
+    private static string Shorten(string sha) => sha.Length > 10 ? sha[..10] : sha;
 }

@@ -1,0 +1,1433 @@
+# Issues log — live UI walkthrough, 2026-08-20
+
+Every bug, inconsistency, visual defect, or "something's off" noticed during the walkthrough,
+regardless of severity. Cross-referenced to `WALKTHROUGH.md` step numbers. Status: **OPEN** (logged,
+not fixed — non-blocking), **FIXED** (blocking, fixed inline this pass, commit noted), or
+**CONFIRMED-EXISTING** (already known from the prior pass's scratchpad findings, re-verified here).
+
+---
+
+### 1. [OPEN, cosmetic/UX] Coordinator error banner has no dismiss/discard affordance in place
+- **Step:** 001
+- The red error banner in the Coordinator panel explains the agent must be discarded, but offers no
+  button to do that from the banner itself — the user has to go find the matching row in the queue
+  rail on the right and click Discard there. Two separate panels for one action.
+- Not blocking; UX polish.
+
+### 2. [CONFIRMED, OPEN] Coordinator-ended error banner never clears once its entry is gone
+- **Steps:** 001, 004
+- After Discarding the queue entry the banner referred to (`agent/2d8b4b1214354f079d7d92ff761d126c`),
+  the Coordinator panel still shows the exact same red "Coordinator ended... discard the entry
+  instead" banner verbatim — even though that entry no longer exists. The advice it's giving ("discard
+  the entry instead") is now stale/impossible since there's nothing left to discard. Needs a fresh
+  coordinator spawn to see whether starting a new one clears it (untested in this pass yet, will
+  revisit).
+- Severity: low-medium — not a correctness bug (no wrong action can be taken), but confusing/stale UI
+  state that persists indefinitely.
+
+### 3. [CONFIRMED, OPEN] Toast and tooltip text is clipped with no way to read the full message
+- **Steps:** 004, 005, 006
+- Multiple toasts/tooltips (the discard-success toast, the resume-refused toast, the Resume button's
+  explanatory tooltip) all get cut off at a fixed width with `...` and no truncation-safe affordance —
+  no hover-to-expand, no click-to-expand (clicking the chevron just dismisses it), no wrap. For
+  anything with a branch/agent id embedded (which is most of these messages, since ids are 32-hex-char
+  GUIDs), the actually-useful identifying part of the message is frequently the part that gets cut.
+- Severity: medium — the refusal reasons are exactly the kind of message the matrix's own philosophy
+  ("never a silent nothing, a typed refusal") depends on being legible; clipping them undermines that
+  even though the daemon-side reason text is correct.
+
+### 4. [FIXED — commit `7497202`] Stale queue clutter pushed new entries below the fold with a near-invisible scroll affordance
+- **Steps:** 025-042 (the fix-attempt interlude)
+- **This is NOT a data bug.** Exhaustive diagnosis (temporary instrumentation in `DaemonBackedOrchestrator.QueuePumpAsync`/`ReconnectLoopAsync` and `ControlCenterViewModel.OnChanged`, reverted before commit) proved conclusively: the daemon sends the correct full entry list, `DaemonBackedOrchestrator._queue` receives it, `ApplyQueueUpdate` populates it, `Changed` fires, `QueueRailViewModel.Refresh()` runs, and `Entries.Count` is correct (11/11) — all within milliseconds of a real spawn. A freshly spawned coordinator (`ac0a1c56...`) landed correctly in the ViewModel's collection every time.
+- **What actually happened:** the Merge Queue panel's `ItemsControl` (`QueueRailView.axaml`) IS wrapped in a working `ScrollViewer` — but 5 leftover `Working` entries from earlier debugging sessions (dead jails, `docker rm -f`'d hours ago, never Discarded through the UI) sat at the top of the list, ahead of the fresh spawn, filling the visible area. The scrollbar thumb is thin/low-contrast and easy to miss — I myself initially concluded the queue was "stuck" and spent a long diagnostic detour before realizing I simply hadn't scrolled down far enough (and my first scroll attempt used the wrong on-screen coordinates, landing on the terminal panel instead of the queue panel, which looked like confirmation the panel didn't scroll at all).
+- **Why this matters:** this is very plausibly exactly what the user experienced ("the spawned agent didn't appear in the merge queue") — not a data/wiring failure, but a real discoverability problem: a handful of accumulated stale/dead entries can bury a brand-new, fully-live entry below the fold with no visual cue ("3 more below", a badge count, sorting live entries to the top) that anything is hidden.
+- Severity: medium-high — no data is wrong or lost, but the practical, observed effect ("my agent isn't in the queue") is identical to a real bug from the user's perspective, and is easy to reproduce simply by letting a few dead entries accumulate (which happens naturally from normal testing/experimentation).
+- **Fixed in a later leg of this same pass (Step 013)**: reproduced a SECOND time on a truly fresh spawn against a confirmed-fresh binary (ruled out a `StreamChannel`-fix regression first, via a `stat`-timestamp check that caught the running app was stale — see Step 013), which made the mechanism obvious: `MergeQueue.Agents` returns stable dictionary-insertion order, and Merged/Rejected rows persist forever by design (E4/E5), so they permanently occupy the front of that order — bottom-of-list is where every fresh spawn lands, always. Fixed with `MergeQueueGrpcService.OrderForDisplay` — a stable partition (actionable states first, terminal last, relative order preserved within each group) — wired into `Snapshot()`. 3 new unit tests in `Mainguard.Server.Tests/QueueDisplayOrderTests.cs` (no daemon/Docker required) pass; full solution rebuild clean. Committed `7497202`, pushed. The remaining, NOT-fixed half of the original suggestion (an explicit "N more" / unread-count affordance, or auto-collapsing long-stranded entries into their own sub-section) is still a legitimate follow-up but no longer required for correctness — the actionable-first sort alone means a user opening the panel always sees live work first, without scrolling. **Update 2026-08-22:** that deferred half went on to cause a second false HIGH report (#13 — a Rejected row read as vanished when it was rendering below the fold), so the count cue was built after all: the rail header now carries `"N in play · N in history (merged/rejected, below)"` (commit `c1e4c3e`).
+
+### 5. [OPEN, real & reproducible] Coordinator terminal's onboarding banner renders badly garbled
+- **Steps:** 008 (screenshots `031`, `033`, `034`, `036`, `037`)
+- The claude-code CLI's two-column startup banner ("Welcome back Daniel!" / "Run /init...", "What's new" / changelog) renders with words split mid-token across lines, and stray disconnected characters/fragments floating away from their source lines (e.g. "n able ith arn ore:" scattered down the left margin). Reproduced across multiple screenshots over ~40 seconds, not a single-frame glitch.
+- Not deeply root-caused (didn't chase into `VtScreen`/the ANSI parser this pass), but it is a real, user-visible rendering defect on a LIVE (not ghost) coordinator, distinct from the previously-known ghost-coordinator garbled-terminal finding — this is a second, independent data point that the terminal renderer has redraw/reflow bugs with claude-code's real multi-column TUI output, not just with stale/replayed scrollback.
+- Severity: medium — cosmetic but genuinely impairs reading what the agent is doing during onboarding; did not block interaction (the agent still received input and worked correctly underneath the garbled display).
+
+### 7. [OPEN, real bug — H3] "Coordinator (<cli>)" review title only works while the coordinator is still alive
+- **Steps:** 048-049
+- Opened Review on the `ac0a1c56...` queue entry (the real claude-code coordinator from step 008,
+  which had since ended — "No coordinator running" showing in the Coordinator panel). The cockpit
+  title read `Review — ac0a1c56b4b94d9b8e6a98c6dc625ef2 · agent/ac0a1c56... → main` — the raw GUID,
+  not `Coordinator (claude-code)` as the earlier session's fix intended and as H3 explicitly asserts.
+- **Root cause** (`Mainguard.Agents.UI/ViewModels/ControlCenterViewModel.cs:1122-1131`,
+  `OpenReviewAsync`): the "Coordinator (name)" label is only synthesized by looking the agent up in
+  `_agents.ListAgents()` (confirmed empty via a diagnostic RPC call — the coordinator process had
+  already torn down, so it no longer appears in the live agent list at all). The label is never
+  persisted onto the queue entry itself, only computed on-the-fly from the currently-live agent
+  roster. Since **queue entries are long-lived by design** (E4/E5's whole point — Merged/Rejected
+  entries stay on the stream permanently, confirmed in step 004), this means: the friendly coordinator
+  label is only ever correct for the brief window the coordinator is still running, and permanently
+  reverts to a bare GUID for the rest of that entry's (indefinite) life — which is the common case,
+  since most coordinators finish and get torn down.
+- Severity: low-medium — cosmetic, not a correctness/data bug (the GUID is still accurate and
+  clickable), but it directly contradicts H3's tested assertion and defeats the point of the earlier
+  fix for anyone reviewing history after the fact.
+- Not fixed this pass (non-blocking): the real fix is a persisted field (store the role/name on the
+  queue entry at spawn time, daemon-side, instead of a live-lookup join at review-open time) — a small
+  design decision, not a one-line patch, so logged rather than rushed.
+
+### 8. [OPEN, testing-methodology note] Tooltip/label clipping mid-word, no ellipsis, confirmed again
+- **Step:** 048
+- Hovering the `506a60e6...` row's id showed a tooltip that clipped mid-character with no `…` marker
+  at all (`506a60e6e700471aa945fc`) — same family as ISSUES-LOG #3, just a second data point that it's
+  not truncation-with-ellipsis, it's a hard pixel/width cutoff with nothing signaling more text exists.
+
+### 9. [OPEN, HIGH — real bug, C4] Composer Send on a jailless/stranded agent silently swallows the prompt
+- **Steps:** 052-057
+- A failed **Resume** click (branch already gone, adversarial E7 case) unexpectedly opened an Agent
+  Document surface for that agent in the left rail (a new red-dot icon that wasn't there before —
+  clicking it opens `Terminal`/`Agent diff`/`Plan`/`Staging` panels for `2664ef9b52...`, a stranded
+  entry with no live sandbox). **Correction to prior-session belief:** the composer/document surface
+  does render in phase-1 — the earlier finding that it "never renders" was specific to a different
+  code path, not universal.
+- **Action:** typed a real prompt ("test prompt for stranded agent") into the "Send a follow-up
+  prompt" composer and clicked **Send**.
+- **Expected** (per matrix C4): either it works (unlikely — no jail exists), or it refuses visibly —
+  "the daemon input-lock surfaces as a `PermissionDenied` rendered under the composer."
+- **Observed:** neither. The text field silently cleared, no toast, no inline error, no message in the
+  Terminal panel, nothing in the Agent diff panel — a complete, silent no-op. This is exactly the
+  failure mode the matrix's own design philosophy explicitly forbids ("never a silent nothing, a typed
+  refusal") and it's a worse instance than the previously-known `SendPromptAsync` cancel-race (which at
+  least sometimes reaches a real jail) — this is a UI affordance that is fully rendered, fully
+  interactive, and fully inert with zero feedback for an agent with no sandbox at all.
+- Severity: HIGH — a user has no way to know their prompt was dropped rather than received; on a
+  stranded entry (which, per ISSUES-LOG #4, are common/easy to accumulate) this is a real trap.
+- Not fixed this pass (non-blocking — did not prevent continuing other rows). Likely the same
+  underlying composer/`SendPromptAsync` code path as the already-known cancel-race bug, but the
+  complete absence of ANY error surfacing (not even a delayed one) suggests the jailless case may not
+  be handled/guarded at all client-side, distinct from the race condition on a live jail.
+
+### 10. [methodology note, not a Mainguard bug] A screen-point click landed on the Claude desktop app, not Mainguard
+- **Step:** between 052 and 054
+- A coordinate-conversion mistake (passed raw screenshot-pixel numbers directly as screen points,
+  skipping the `/2 + origin` conversion `click_at.sh` normally applies) sent a click miles outside the
+  Mainguard window, which happened to land on and focus the Claude desktop app instead, briefly
+  surfacing this very session's own transcript. Caught immediately (the "finding" was obviously not a
+  Mainguard surface), refocused Mainguard via `System Events … set frontmost`, recalibrated, continued.
+  Not logged as a product defect; noted only so this walkthrough's provenance is honest about the slip.
+  (The intermediate screenshot showing the Claude app's own transcript was removed rather than
+  committed — not useful evidence and not something to publish.)
+
+### 6. [OPEN, testing-methodology note, not a Mainguard bug] `System Events keystroke` drops characters on fast/long strings
+- **Step:** 008
+- Typing a full sentence via `osascript -e 'tell application "System Events" to keystroke "..."'` into the terminal dropped several characters/words (rendered as "a on-line comment... top o.js" instead of "a one-line comment... top of src/calc.js"). This is very likely an AppleScript/Accessibility-API typing-speed limitation, not a Mainguard input-handling bug — the terminal reliably received and rendered whatever it was actually sent, and the agent's own excellent handling of the corrupted prompt (asking for disambiguation rather than guessing wrong) is itself a positive data point.
+- Noted for the runbook: future live-agent legs should type in smaller chunks or with inter-keystroke delay, or route through `SendPromptAsync` (once its own known drop-on-cancel-race bug is fixed) rather than raw `System Events keystroke` for long strings.
+
+### 11. [CLOSED — commits `978db19` + `a972b02`] The merge-queue stream silently dies mid-session and never retries, showing "Nothing queued" while the data is intact
+- **Step:** 014 (this leg's resume point)
+- Found the app in a live, previously-running session (not freshly launched) showing **"Nothing queued."** in the Merge Queue panel with no coordinator running and no error banner — looked identical to a real empty/broken queue.
+- **Ruled out as data loss**, decisively: `sqlite3 ~/.mainguard/mainguard-daemon.db` shows **26 total `MergeQueueRows`** (12 Working, 7 Merged, 2 Rejected, 1 Verified, 4 Discarded) — 17 of them for the exact `RepoHash` (`f467e17...`) the daemon's own `rpc.log` confirms is the currently bound repo (`e2e-fixture`, most recent `ProvisionRepo` call at 15:42:09 UTC). The persisted data was completely intact.
+- **Root-caused to the client's queue stream pump, not the server:** `rpc.log` shows exactly one `StreamQueue` call after the crash-relaunch (see #12 below) — `rpc-begin` at 15:45:13.741 UTC, `rpc-end status=OK duration_ms=32`. `MergeQueueGrpcService.StreamQueue` (`Mainguard.Server/Services/MergeQueueGrpcService.cs:54-83`) only ever returns that fast via its `catch (OperationCanceledException)` teardown path — meaning the **client** cancelled the call ~32ms after opening it, before the daemon could push anything past the initial snapshot write (and even that snapshot write may not have completed in time). Confirmed this wasn't a one-off retry that then succeeded: **zero further `StreamQueue` log lines appear for the next 5m45s** of continuous session activity, while the agent-event pump's `ListAgents` polling kept succeeding once a minute the whole time (`rpc.log`, 15:44:53 through 15:50:53) — proving the daemon connection itself was healthy and only the queue pump specifically had stopped.
+- **This contradicts `DaemonBackedOrchestrator.QueuePumpAsync`'s own documented contract**: it's wrapped in `ReconnectLoopAsync` (`DaemonBackedOrchestrator.cs:537-582`), which is supposed to retry every `ReconnectDelay` (2s) after ANY exit from the stream body — success or failure — until cancelled. A stream that cleanly completes (as this one did, `status=OK`) should have been retried within ~2 seconds, indefinitely, forever, per that method's own doc comment ("this is what makes an empty projection **live**"). It did not retry even once in over 5 minutes. This means either (a) `_queuePumpCts` was cancelled by some other code path around 15:45:13 without a matching restart (the rebind guard at `DaemonBackedOrchestrator.cs:401-411` only starts a new pump task when the *repo handle* changes or no pump exists yet — a redundant/duplicate rebind call with the *same* handle while a pump is already in flight would cancel nothing, so this alone doesn't explain it), or (b) the `Task.Run(() => QueuePumpAsync(...))` task itself silently faulted in a way `ReconnectLoopAsync`'s `catch (Exception)` does not catch (e.g. before entering the try, or an `OperationCanceledException` whose `ct.IsCancellationRequested` check evaluates true even though the *outer* `_cts` wasn't meant to be cancelled — worth checking whether `_queuePumpCts`'s linkage to `_cts` could itself already be cancelled at that point for an unrelated reason, e.g. app backgrounding/suspend on macOS).
+- **Not fully root-caused to a single line** — ran out of investigative budget chasing the exact cancellation trigger (suspected, not confirmed: the window losing/regaining focus around the same timestamp, since bringing the app frontmost via `System Events` was one of the actions taken in this same window, but no `Activated`-style client code path was found that would plausibly re-trigger a repo rebind on focus change, so this is circumstantial, not proven).
+- **Practical impact confirmed live**: this is indistinguishable from the user's original complaint ("couldn't even get into the merge queue") from inside the app — no error, no toast, no stale-data indicator, just a permanently empty panel that requires a full app restart to recover (confirmed: restarting cleanly restored all 7 `Working` entries correctly sorted, screenshot `087`).
+- Severity: **HIGH** — this can strand a user's entire merge queue behind a silent, permanent, unrecoverable-without-restart client bug, mid-session, with zero indication anything is wrong (`DaemonClient.State` almost certainly still reports `Connected` since other RPCs work fine — matches the exact class of bug the `AgentPumpAsync` doc comment on the same file already warns about for a *different* pump: "the visible symptom is a list frozen at its last good snapshot, forever, with the app looking healthy").
+- **Recommended follow-up** (not done this pass): add a regression test that cancels an in-flight `StreamQueueAsync` call via a fresh `_queuePumpCts` swap and asserts a new stream attempt starts within `ReconnectDelay`; instrument `QueuePumpAsync`/`ReconnectLoopAsync` with a debug log line on each retry attempt (currently: total silence, which is itself part of why this is hard to diagnose — nothing in any `.mainguard/logs/*.log` file recorded the client giving up).
+- **Update, next leg (Step 015):** found and fixed a real, independent, structurally-related bug that is a strong contributing-cause candidate: `ControlCenterViewModel.ProvisionRepoAsync` unconditionally calls `ClearActiveRepo()` (which synchronously blanks the queue projection) on **every** repo-open call, including a redundant re-open of the already-active repo, then awaits a real RPC with a 5-minute deadline before the pump restarts — with zero UI indication anything is happening in the meantime. Fixed via `DaemonBackedOrchestrator.IsBoundTo` + a short-circuit in `ProvisionRepoAsync` (commit `978db19`), regression-tested, verified live against a fresh launch (screenshot `088`). **Left OPEN, not closed**: this fix removes a real, confirmed-live bug in the same family, but does not itself prove it was the exact trigger for the original #11 incident (whose specific cause — what called `OpenRepositoryAsync` again at 15:45:13 UTC — is still not identified). Re-test: leave a session running for 10+ minutes while periodically re-triggering a repo-open action (command palette "Open &lt;repo&gt;" on the already-open repo, `ReopenLastRepo`, etc.) and confirm the queue rail never blanks.
+
+- **CLOSED, next leg (Step 016) — root-caused by elimination against the surviving daemon log, then fixed (commit `a972b02`).**
+
+  **The reconnect loop was never the bug.** The prior leg's hypothesis (b) — "the `Task.Run(() => QueuePumpAsync(...))` task silently faulted in a way `ReconnectLoopAsync`'s `catch (Exception)` does not catch" — is **ruled out**, and proved so rather than argued: the two new `QueuePumpResilienceTests` drive a queue stream that (i) ends cleanly and (ii) faults, and both assert a second subscription reaches the rail's projection. Both **pass against the pre-fix code**. `ReconnectLoopAsync` retries exactly as its doc comment claims.
+
+  **App backgrounding / suspend / `Dispose` is also ruled out**, from the log itself: `_queuePumpCts` is a *linked* child of the adapter's `_cts`, and so is `LoginHarvestPumpAsync` — whose one-minute `ListAgents` sweep is precisely the "polling kept succeeding" the original entry noticed (`rpc.log`, 15:39:53 → 15:51:53, every 60s on the shared connection, port 60920). If `_cts` had been cancelled that pump would have exited too. It did not, so `_cts` was alive and only the *queue-specific* child token was cancelled.
+
+  **That leaves exactly one possible cancellation source, and it is not a race inside the orchestrator.** `_queuePumpCts` is cancelled in only two places: `SetActiveRepo` with a *different* handle — which immediately starts a replacement pump, and would therefore have written a new `StreamQueue` `rpc-begin` (none exists) — and `ClearActiveRepo()`, whose only caller in the entire repository is `ControlCenterViewModel.ProvisionRepoAsync`. So the stream was torn down by a repo-open call that then **never got back to `SetActiveRepo`**. The log's timing says the same thing unambiguously: `StreamQueue` *begins* at 15:45:13.741 and is cancelled at 15:45:13.765 — a `SetActiveRepo` and a `ClearActiveRepo` **23 ms apart**, i.e. one repo-open binding the pump while another tore it down.
+
+  **The actual defect is that the pump's liveness depended on an external caller finishing a multi-step sequence,** and three separate paths let that sequence stop halfway. All three are now closed:
+  1. **`ProvisionRepoAsync` ran concurrently with itself.** `MainWindowViewModel.OpenRepositoryAsync:775` starts it **fire-and-forget** (`_ = TryRegisterSyncRemoteAsync(repo.Path)`), so two opens a few hundred ms apart really do overlap — and both read `_lastProvisioned` before either wrote it, which defeats `978db19`'s same-repo short-circuit for *both* of them. The interleave is clear → clear → provision → bind → (the loser's clear lands after the winner's bind) → nothing rebinds. Now serialized through a `SemaphoreSlim`, so the second caller sees the first's finished binding and takes the no-op path. This is the 23 ms signature.
+  2. **A failed RE-provision of the already-open repo left the adapter unbound forever.** The clear has already run, and that path never reaches `SetActiveRepo` again — so one transient failure (a daemon hiccup, or a client-side channel fault that never even reaches the wire, which would explain why no `ProvisionRepo` line accompanies the 15:45:13 teardown) permanently blanked a working queue, restart-only recovery, exactly as observed. The previous binding is now re-armed on failure — the handle is the repo's content hash and is stable across provisions — handing the pump back to its own reconnect-forever loop. Guarded on an unchanged repo path so the B4 regression (a failed switch to repo B must not resurrect repo A's queue) stays fixed.
+  3. **`MainWindowViewModel` registered the sync remote *before* binding the queue.** `SyncRemoteRegistrar.Register` is real host-side git work and can throw (a held `.git/index.lock`, a read-only/malformed config); the throw fell to the outer `catch`, toasted, and left the already-torn-down pump dead for the session. Observing the queue never needed the remote — only *merging* does — so the bind now goes first.
+
+  Two smaller things found in the same read and fixed alongside: `ApplyQueueUpdate` raised `Changed` **unisolated** (unlike `ApplyAgentEvent`, which was hardened against exactly this), so a throwing UI subscriber propagated out of the `await foreach` and cycled the stream every `ReconnectDelay`; and `ControlCenterViewModel.Dispose` was missing the `_queue.Changed -= OnChanged` half of its constructor's subscription, so a disposed VM stayed wired to the live queue stream.
+
+  **Regression coverage:** `Mainguard.Tests/QueuePumpResilienceTests.cs` (3 tests — queue-pump re-subscribe after a clean end, after a fault, and survive-a-throwing-subscriber; the first two document that the loop was already correct, the third fails before) plus 2 added to `RepoProvisioningHonestyTests` (concurrent opens are serialized so the second sees the first's binding; a failed re-provision of the same repo restores the binding). **3 of the 5 verified to fail against the pre-fix code**, by temporarily neutering the fix and re-running.
+
+  **Residual unknown, and why it is no longer load-bearing:** which of paths 1–3 fired at 15:45:13 cannot be distinguished from the surviving log — the client emits no line of its own, and a client-side provision failure leaves no daemon-side trace at all. All three are closed, and the failure mode they shared (a torn-down pump with no one left to restart it) is now closed at the source in two independent ways. **Not reproduced live** by GUI automation: the winning interleave needs two repo-opens inside a ~150 ms `ProvisionRepo` window, which is not reliably hand-drivable through the UI — the deterministic fails-before unit tests are the stronger evidence here, and are what would catch a regression. **Follow-up worth doing anyway (not blocking):** the client still logs *nothing* when a pump binds, unbinds or gives up, which is the single biggest reason this took three legs to pin — one debug line per re-subscribe and per `ClearActiveRepo` would have answered it in minutes.
+
+### 12. [FIXED — commit `cc8f4c36`. Root cause found: `[RelayCommand]`'s `async void` rethrow, over a bare leg of Restart. Live re-verification BLOCKED on a locked screen] The Mainguard.app UI client crashed (SIGABRT) once during this session
+- **Step:** 013/014 boundary
+- `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-20-173042.ips`: `Mainguard` (the UI client, not the daemon) crashed with `EXC_CRASH`/`SIGABRT` at 2026-08-20 17:30:42 local time — the crash trace shows `IL_Throw` → `DispatchManagedException` → `abort()`, i.e. an **unhandled .NET managed exception** reached the top of the stack and crashed the process, not a native fault. This was the only Mainguard-attributed crash report from today (a separate `dotnet_...plist` crash-reporter entry from 13:37 is very likely an unrelated `dotnet test` process crash, not the product).
+- The daemon's own `lifecycle.log` shows a normal "shutdown requested — draining" / "stopped" pair at 15:30:28 UTC (matching local 17:30:28, 14s before the crash timestamp) followed by a relaunch at 15:38:50 UTC — consistent with the client crashing and something (the OS or a supervising script) relaunching both processes ~8 minutes later, though this pass did not confirm whether that gap was manual or automatic.
+- **Not root-caused** — the release build strips managed exception type/message from the native crash report, so the actual exception (`NullReferenceException`? something UI-thread-specific?) is not recoverable from this artifact alone without a debug build or attached debugger at the time. Flagging as a real, confirmed crash for follow-up; possibly related to finding #11 above (a crash mid-stream could plausibly be *what* orphaned the queue pump in the first place, though the timestamps don't overlap — the crash was at 17:30:42, the dead-stream `StreamQueue` call was at 17:45:13, ~15 minutes later, i.e. after a full app restart already happened in between — so they are almost certainly independent incidents, not cause-and-effect).
+- **Still open. Re-checked on the 2026-08-22 #18/#19/#20 leg and nothing new surfaced** (a look, not a
+  hunt — the reconciliation work was the priority): `~/Library/Logs/DiagnosticReports/` holds **no**
+  Mainguard-attributed crash report at all since the 08-20 one, so neither the 08-22 disappearance in
+  #19's leg nor anything since produced an artifact. The daemon's `rpc.log` exceptions around the client
+  restarts are all `IOException: The client reset the request stream` / `The request stream was aborted`
+  out of `TerminalGrpcService.PumpBoundAsync` — ordinary client-disconnect teardown of an attach stream,
+  the *consequence* of an app going away rather than a cause, plus one `Input/output error` from reading
+  a PTY whose process was already gone. Worth noting for whoever picks this up: a `SIGABRT` with no crash
+  report and a clean process disappearance are different symptoms, and #19's leg saw the latter — that
+  pattern is more consistent with the process being terminated from outside (or exiting a main loop) than
+  with an unhandled managed exception, which is what produced the 08-20 report.
+- **2026-08-23 — REPRODUCED, with a trigger.** See the "New finding" block at the end of **#37**:
+  clicking **Restart** on the Coordinator panel crashed the client the same way
+  (`Mainguard-2026-08-23-031119.ips`: `SIGABRT`, `abort()`, faulting thread `com.apple.main-thread`,
+  `IL_Throw → DispatchManagedException → DispatchExSecondPass → TerminateProcess → PROCAbort`). The daemon
+  log pins the ORDER: the client died ~90 ms after the follow-up `SpawnAgent` was sent and its death is
+  what cancelled that spawn, not the reverse. `StartCoordinatorCoreAsync` catches everything, so the
+  suspects are `RunStartupAsync` (no catch) and the stop leg it awaits — `[RelayCommand]`'s
+  `AsyncRelayCommand` rethrows onto the synchronization context by default. Next step is named there:
+  reproduce with the head run from a terminal so the managed exception type actually gets printed.
+- **2026-08-23 — ROOT-CAUSED AND FIXED (commit `cc8f4c36`).** The previous leg's hypothesis was right, and
+  the `.ips` proves the mechanism on its own once you read the frames rather than just the symbols.
+
+  **What the crash report actually says.** `Mainguard-2026-08-23-031119.ips`, faulting thread
+  `com.apple.main-thread`: `IL_Throw → DispatchManagedException → DispatchExSecondPass → SfiNextWorker →
+  TerminateProcess → PROCAbort`. Three things follow from that stack, and together they name the bug:
+  1. **`IL_Throw` is present**, so this was an *explicitly thrown* exception (a `throw` statement or an
+     `ExceptionDispatchInfo.Throw`), not a null dereference — an NRE arrives as a converted hardware fault
+     and never goes through `IL_Throw`.
+  2. **`IL_Throw` sits directly on the original frame chain**, so the report shows the real throw site: nine
+     managed frames, `Main` at the bottom, then the Avalonia dispatcher pump, then **exactly ONE frame**
+     above it. A render-path or projection-path throw would show a dozen; this was thrown by the dispatcher
+     callback itself.
+  3. That one frame is JIT'd ~29 MB above every other managed frame on the stack — i.e. compiled for the
+     *first time* at the moment of the crash. `AsyncMethodBuilderCore.ThrowAsync`'s posted rethrow callback
+     is exactly that: a method the process had never executed before, because no `async void` had ever
+     faulted before.
+
+  **So: an `async void` faulted, and its rethrow found no handler.** The `async void` is not ours to see in
+  the source — it is inside `[RelayCommand]`. The generated `AsyncRelayCommand.Execute` — *what a clicked
+  button calls*, unlike the `ExecuteAsync` every existing test used — awaits the command body in a private
+  `async void` helper, so a faulted body is not returned to a caller: it is re-thrown onto the
+  synchronization context. On Avalonia that is a dispatcher job with nothing below it, and .NET aborts. That
+  is why this was undiagnosable from the artifact: the exception's own frames were long gone by the time it
+  was re-thrown, and a `.ips` carries no managed exception type.
+
+  **Which leg.** `StartCoordinatorCoreAsync` catches `OperationCanceledException`, `RpcException` and bare
+  `Exception` around its spawn — but Restart is stop-THEN-start, and `RunStartupAsync` (the wrapper both
+  Start and Restart run through) had **no catch at all**. Everything the stop leg does outside its one inner
+  `try` — the `ListAgents()` projection read that opens `StopCoordinatorCoreAsync`, and the `RefreshAgents()`
+  / `RefreshCoordinatorCli()` re-projections that both halves run — rode straight out of the command body.
+  The daemon log agrees on timing: the client was inside `await host.StartCoordinatorAsync(...)` (the
+  `SpawnAgent` RPC was still open, and only ended `Internal` a second *after* the client was gone), so the
+  fatal throw came from the UI thread while that await was outstanding — not from the spawn call itself,
+  which was guarded.
+
+  **The fix, two layers.**
+  - `RunStartupAsync` and `StopCoordinatorConfirmedAsync` now catch. A start/restart failure renders on the
+    coordinator card as text (cancellation still unwinds quietly), and `CoordinatorStopPromptViewModel`'s
+    confirm no longer strands the overlay on a spinner it can never clear.
+  - New **`Mainguard.App.Shell/CrashGuard.cs`**, installed by `ShellEntryPoint.RunDesktop` for both heads:
+    handles `Dispatcher.UIThread.UnhandledException` so **no** other unguarded `[RelayCommand]` or posted
+    callback can repeat this, appends the full exception to **`<data root>/logs/client-crash.log`**, and
+    raises a shell toast. This is the diagnosability half and it matters as much as the survival half — the
+    client had no file log whatsoever, which is why two crash reports across three days named nothing.
+
+  **Regression tests** (`CoordinatorCliStartTests`, 3 new `[AvaloniaFact]`s): they drive Restart *the way
+  the button does* — `((ICommand)vm.RestartCoordinatorCommand).Execute(null)`, not `ExecuteAsync` — with the
+  projection read throwing, subscribe to `Dispatcher.UIThread.UnhandledException`, and assert nothing
+  reaches it. All three fail on the old code (verified by reverting the catch and re-running: 3 failed / 27
+  passed), all pass on the new. `dotnet build` clean; the 30-test `CoordinatorCliStartTests` suite green.
+
+- **What is NOT verified, and be honest about it.** The exact exception *type and message* is still unknown —
+  the fix removes the crash regardless of which exception it was, but it does not name it. **Live
+  re-verification of the Restart click did not happen: the machine's screen was locked
+  (`CGSSessionScreenIsLocked = 1`) for the whole leg, so no synthetic click could reach the app** (this was
+  checked, then re-polled for five minutes; screenshots of the window still work while locked, which is what
+  made the lock easy to miss — `swift locked.swift` in the session scratchpad is the reliable check, the
+  window-list one is not). The fixed build IS running on-device (relaunched from a terminal so stdout/stderr
+  are captured to the scratchpad's `client2.out`). **Next leg: unlock, click Coordinator → Restart, and
+  confirm two things — the app survives, and if the underlying fault still occurs, `client-crash.log` now
+  names it.** That log is the thing to check first if any client oddity shows up from here on.
+
+- **LIVE RE-VERIFIED, 2026-08-23, screen unlocked.** Regenerated the dev bundle from `cc8f4c36` (`make-bundle.sh
+  --head pro`), killed the stale (Aug 18) app/daemon pair, relaunched clean. Reopened `e2e-fixture`, navigated
+  to the Coordinator panel — it showed the honest `DetachedNotice` message from #23's fix ("No terminal is
+  attached to this agent … Restart the agent to get a terminal you can talk to") for the pre-existing agent
+  `6fef552ade1b46858aa745304c9400ea`, not a stuck spinner. Clicked **Restart** with a real `CGEvent` click at
+  the button's on-screen coordinates (`242-issue12-detached-notice-before-restart.png` →
+  `243-issue12-app-survived-restart-real-claude-code.png`). **The app survived.** `ps aux` confirms both the app (PID 78861) and daemon (PID 78901)
+  processes are still the same PIDs from before the click, unchanged. A real `docker exec … claude` process
+  spawned (PID 79039) and the Coordinator panel rendered a genuine, freshly-started Claude Code v2.1.234
+  session ("Welcome back Daniel!", `daniel.sazykin@gmail.com`'s org) — the preserved OAuth login carried over
+  cleanly. No new file appeared under `~/.mainguard/logs/client-crash.log` (checked, absent — consistent with
+  no crash occurring), and `~/Library/Logs/DiagnosticReports/` has no report newer than the original
+  `Mainguard-2026-08-23-031119.ips` from before the fix. **ISSUES-LOG #12 is CLOSED**, live-confirmed, not
+  just test-confirmed. Bonus: the same screenshot incidentally reconfirms #24 (merge-queue jail-liveness
+  reconciliation) still holding — the three older stale `Working` entries now render the honest "the agent's
+  sandbox is gone — resume the entry to give it one, or discard it" message rather than a false-live Verify
+  affordance.
+
+### 13. [CLOSED — commit `c1e4c3e`. NOT data loss, and not a rendering failure: an ORDERING defect + a missing overflow cue] Rejected queue entries appeared to vanish from the Merge Queue panel
+- **Step:** the live E5 Reject pass this leg (Resume → Verify → Review → Reject on entry `506a60e6e700471aa945fdc53851f492`, real UI clicks throughout).
+- **What happened:** `RejectEntry` succeeded correctly — `rpc.log` confirms `RejectEntryResponse { rejected=True, rejected_by=os:danielsazykin, rejected_at=... }` — and `sqlite3 ~/.mainguard/mainguard-daemon.db` confirms the row is durably persisted as `State='Rejected'`. But the entry vanished from the Merge Queue panel entirely instead of showing as a `Rejected` row. This directly contradicts E5's own spec ("stays on the stream, unlike Discard") and contradicts this SAME walkthrough's own Step 004, which observed a *different* pre-existing Rejected entry (`b5224606390f4de89b205f6982502c67`) rendering correctly in the rail earlier in the session.
+- **Ruled out data loss and stale-push theories, decisively:** `SELECT State, count(*) FROM MergeQueueRows WHERE RepoHash=... GROUP BY State` returns `Discarded|4, Merged|5, Rejected|2, Working|6` — both Rejected rows are durably there. Fully quit and relaunched the app + daemon (a cold `open`, not a soft reconnect) and reopened the repo from scratch: the panel STILL shows exactly 8 rows (6 Working + 2 Merged) and zero Rejected rows on a fresh cold snapshot, ruling out a live-push propagation gap (the class of bug #11 was) — this is either a hydration/query bug or a rendering bug, not a missed event.
+- **Traced the render path without finding the drop point:** `MergeQueue.Agents` (`Mainguard.Agents/Agents/Orchestrator/MergeQueue.cs:327-333`) only excludes `Discarded`, not `Rejected`. `MergeQueueGrpcService.OrderForDisplay` (`Mainguard.Server/Services/MergeQueueGrpcService.cs:573-576`) only reorders Merged/Rejected to the back, never filters them out. Client-side `DaemonBackedOrchestrator.ApplyQueueUpdate` (`Mainguard.Agents.UI/Services/DaemonBackedOrchestrator.cs:793+`) parses `entry.State` generically via `Enum.TryParse<WorkerMergeState>`, no exclusion. `QueueRailViewModel.Refresh()` (`Mainguard.Agents.UI/ViewModels/QueueRailViewModel.cs:51+`) iterates the full snapshot with no state filter either. None of the four layers I read contain an explicit "drop Rejected" line — the bug is either in server-side DB→memory rehydration (not yet located — grepped `MergeQueueProvisioner.cs` for the hydration path and didn't find it in the time available) or somewhere not yet inspected.
+- **Note the two known-Rejected rows differ in one respect that might matter**: `b5224606390f4de89b205f6982502c67` (rendered fine in Step 004, timestamp `2026-08-18`) predates today's `7497202` ordering fix; `506a60e6...` (missing now, timestamp `2026-08-22` today) postdates it. Worth checking directly whether `7497202`'s `OrderForDisplay` — or the `Snapshot()` method around it — was touched in a way that's order-safe but not inclusion-safe, and whether `b5224606...` would STILL render today if re-checked (not re-verified this leg — a fast, valuable next step).
+- Severity: **HIGH** — Reject is supposed to leave a permanent, visible record (that's the whole point of it being different from Discard); if rejected work silently disappears from the panel a reviewer has no way to know a rejection ever happened without going to the database directly, and the user's own emphasis this session was specifically on "already-merged/queue-state entries going missing" as the class of bug that started this whole pass.
+- **Not fixed this leg** — per the standing instruction, a bug this structurally unclear (four ruled-out layers, no located drop point) needs a dedicated deeper investigation rather than a rushed guess; flagged prominently in the final report for a follow-up pass, likely by the same kind of focused investigation that closed #11.
+
+#### Resolution (2026-08-22, dedicated follow-up leg) — **the row was on screen the whole time**
+
+- **There is no drop point, which is why four layers of reading did not find one.** `MergeQueue.Agents`,
+  `OrderForDisplay`, `Snapshot`, `ApplyQueueUpdate` and `QueueRailViewModel.Refresh` are all
+  inclusion-safe exactly as the previous leg concluded. Scrolling the live panel with a real scroll-wheel
+  event found `506a60e6…` rendering correctly as **Rejected / "rejected in review"** — as the **13th of
+  13** rows, four scroll-lines below the fold.
+- **The count that should have caught this earlier:** the DB holds 13 non-Discarded rows for the repo
+  (6 Working + 5 Merged + 2 Rejected). The panel fits **8**. The leg above counted the 8 visible rows
+  (6 Working + 2 Merged), matched "2 Merged" against "5 Merged in the DB" without noticing the shortfall,
+  and read the difference as Rejected-specific loss. It was not Rejected-specific: **three Merged rows
+  were equally "missing"**, by the same mechanism. That arithmetic is the tell, and it is worth
+  remembering — a partial count is not an absence.
+- **`7497202` WAS implicated, but as the other half of its own fix, not as a filter.** It sorts actionable
+  entries ahead of terminal ones (correct, and still correct), but leaves the terminal group in
+  `MergeQueue.Agents`' dictionary order — which is **spawn order, not decision order**. So a branch
+  rejected thirty seconds ago sorts behind every terminal row ever spawned before it: last on any repo
+  with history. That also explains the "one renders, one doesn't" observation exactly — `b5224606…` was
+  spawned early, so it sits near the FRONT of the terminal group and stayed visible; `506a60e6…` was
+  spawned late and went to the very back. Nothing about the newer row's format, DTO shape or round-trip
+  differed at all.
+- **Why it reads as a HIGH data bug from the chair:** the human presses Reject, the row leaves the visible
+  panel at that instant (it moves from the actionable group to the bottom of history), and the rail's
+  scrollbar is a thin low-contrast thumb with no "N more" cue — the un-fixed half of **#4**, now hiding
+  the row the human had just acted on. Two separate false HIGH reports (#4's first diagnosis, then this
+  one) have now come out of that one missing affordance.
+- **Fixed** in `c1e4c3e`: (1) `MergeQueue.LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory
+  and rehydrates it on restart (never restamps — a restart must not flatten history order); (2)
+  `OrderForDisplay` takes that as an optional decision clock and sorts the terminal group **newest verdict
+  first** (unknown timestamps keep their insertion position at the back — never dropped; the actionable
+  group stays oldest-first, because it is a work queue); (3) `QueueRailViewModel.CountText` renders
+  `"6 in play · 7 in history (merged/rejected, below)"` under the rail's `main <sha>` line, so a list
+  taller than its viewport says so.
+- **Tests:** 2 new `QueueDisplayOrderTests` units (a fresh verdict heads history; terminal rows with no
+  timestamp survive at the back) + `QueueEntryLifecycleTests.RejectEntry_PutsTheFreshVerdictAtTheHeadOf…`,
+  an end-to-end positional assertion driving two real `RejectEntry` RPCs and reading the order off
+  `StreamQueue`. 16 queue-display/lifecycle tests, 57 server merge-queue-area tests and 84
+  client-side queue/rail tests all green; full solution builds clean.
+- **Verified live** on the rebuilt Pro app (cold relaunch of app + daemon, repo reopened, real scroll
+  events): header reads `6 in play · 7 in history (merged/rejected, below)`, and `506a60e6…` **Rejected**
+  is now the first history row, immediately under the last Working entry.
+- **Follow-up still open (small):** the fix makes the newest verdict the top of history, but with enough
+  actionable rows a fresh verdict can still start below the fold. The count line now tells the user rows
+  exist down there; an explicit "jump to history" or a sticky section header would tell them where. Not
+  required for correctness.
+
+## 14. [Not a bug — resolved by relaunch] App's own window had closed with the process still running
+
+- **Symptom:** resuming this leg, `com.mainguard.app` (PID 18046) was alive and reported as the frontmost
+  process, but `System Events` returned "Can't get window 1 of process Mainguard — Invalid index" —
+  zero AX windows. `CGWindowListCopyWindowInfo` still listed stale window entries for it, all
+  `onscreen=false`. Cost real time to diagnose: the visible screen content (a Terminal window running
+  this very `claude --continue` session) was mistaken at first for the app's own embedded terminal panel,
+  since Mainguard being "frontmost" with literally nothing to draw let whatever was behind it show through.
+- **Root cause, as far as it's knowable from outside:** the app's main window had been closed (or crashed
+  its window without killing the process) sometime after the prior leg's live-verification pass — not
+  reproduced deliberately, so the exact trigger is unknown. Clicking its Dock icon (the standard macOS
+  "reopen main window" request) did **not** bring a window back, which is a real, if minor, gap: a
+  single-window app should normally respond to the Dock-click reopen event.
+- **Not investigated further** (out of scope for this pass — no crash log correlated, no repro attempt):
+  logged here so the "Dock-click doesn't reopen the window" behavior is on record as worth checking
+  separately, but NOT counted as a confirmed bug — could equally be expected behavior for this app's
+  window-management model, which wasn't verified either way.
+- **Fixed forward by:** `pkill` + `open` (clean relaunch). Confirmed clean recovery — repo picker
+  appeared with a working "Reopen Last Repository?" prompt, reopened the `e2e-fixture` repo correctly,
+  Coordinator panel loaded with the `6 in play · 7 in history` header from `c1e4c3e` rendering correctly.
+
+## 15. [Confirmed via real UI click] Kill-switch freeze/unfreeze button itself works correctly (with 0 live jails)
+
+- Clicked the sidebar kill-switch icon directly (previously only exercised via RPC). Engage: banner
+  reads "All agents paused. The merge queue is frozen. Nothing was lost — resume when ready." /
+  "queue frozen · 0 agents paused" (0 because the 5 stale `Working` rows in this fixture are jailless
+  leftovers with no live container — expected, not a bug). Clicking the same icon again cleanly cleared
+  the banner and returned the icon to its normal state.
+- **This does NOT re-test the already-confirmed HIGH bug** (kill-switch Resume never un-pausing a jail
+  that was actually paused — see the earlier entry in this log) — that needs a live jail, which this
+  fixture's stranded entries don't have. Confirming the button's own freeze/unfreeze UX is correct with
+  zero paused jails is a real, separate, positive result — logged as such, not conflated with the open bug.
+- **Follow-up still needed:** reproduce the actual jail-never-resumes case through the real UI button
+  (not RPC) with a genuinely live jail, to fully close that row.
+
+## 16. [Confirmed via real UI click] Theme switching (H7)
+
+- `View > Theme` menu correctly lists System / Midnight Loom / Daylight Loom / Graphite / Atelier.
+  Selected Daylight Loom: entire app switched to its light palette immediately (background, sidebar,
+  text all correct, no stale-dark-token bleed observed). Selected Graphite: dark palette applied
+  correctly. Restored Midnight Loom. No visual defects observed in the two swaps performed.
+- Atelier and a full System-theme (OS-follow) check were not exercised this leg — minor remaining gap,
+  low risk given the two swaps tested were clean.
+
+## 17. [CLOSED — commit `ee9be50`] Kill-switch Resume does NOT un-pause a real, currently-tracked agent's jail
+
+This closes entry #15's "follow-up still needed" — reproduced end-to-end via real clicks, no RPC, no
+orphan-jail ambiguity.
+
+- **Setup honesty first:** before this test, the two live docker jails already running in this session
+  (`...aab43299...`, `...506a60e6...`) were checked and confirmed to be **orphans from earlier daemon
+  restarts** — `docker inspect .Created` on both predates the current daemon process's start time
+  (`ps -o lstart`) by several minutes. That's why the Resource Monitor legitimately showed **"0 agents"**
+  and the kill switch legitimately paused **"0 agents"** against them (screenshots
+  `148-killswitch-engage-orphan-fixture-0-paused.png`, `149-resource-monitor-zero-agents-despite-2-orphan-jails.png`)
+  — not a bug, just daemon restarts leaking untracked containers with no reconciliation on startup. Logged
+  as its own minor finding below (#18); not conflated with the real bug this entry is about.
+- **To get a clean, tracked jail:** selected `claude-code 2.1.234` in the real CLI dropdown and clicked
+  **Start coordinator** for real. It spawned successfully, authenticated as the already-logged-in account
+  ("Welcome back Daniel!", Opus 5 / Claude Max / `daniel.sazykin@gmail.com`'s Organization), and the
+  Merge queue header incremented `6 in play` → `7 in play` live (screenshot
+  `151-real-claude-code-coordinator-spawned-live-ui.png`). Resource Monitor correctly showed
+  **"1 agents"**, `claude-code` / `Working` / `2% CPU` / `0.5 GB RAM` (`152-resource-monitor-1-agent-tracked-correctly.png`)
+  — confirms Resource Monitor itself is NOT broken; it was correctly reporting zero for zero tracked
+  agents earlier.
+- **Engage, via the real sidebar icon, against this real tracked jail:** `docker inspect` before the
+  click: `Paused=false`. Clicked Engage. `docker inspect` immediately after: **`Paused=true`**
+  (`153-killswitch-engage-real-tracked-jail.png`). Engage half confirmed working correctly for a real
+  agent.
+- **Resume, via the same real sidebar icon:** clicked it a second time. The Coordinator panel's freeze
+  banner cleared (queue-level freeze lifted — `155-coordinator-banner-cleared-jail-still-paused.png`).
+  But `docker inspect` immediately after, and again 3+ seconds later, both still read **`Paused=true`**.
+  The Resource Monitor row itself shows this too, not just Docker: state = **`Paused`**, `0% CPU`, task
+  column reading **"Kill switch engaged — jail paused, terminal input severed (recoverable)."**
+  (`154-killswitch-resume-ui-shows-paused-recoverable.png`) — the UI's own copy claims "(recoverable)"
+  while the click that's supposed to recover it silently does nothing to the container.
+- **Net result:** the queue-level freeze is lifted (Engage/Resume toggles that correctly), but the actual
+  agent is left **permanently paused** — Working became Paused and never came back, confirmed by both
+  Docker ground truth and the app's own Resource Monitor row agreeing with each other. This is the exact
+  structural gap already root-caused via RPC in an earlier leg (`KillSwitch.cs`/`IKillTarget` has no
+  unpause path — `Resume()` only clears the merge-queue freeze flag, nothing fans out an unpause to the
+  paused containers), now proven through the real UI end to end with no possible orphan-jail confound.
+- **No in-app recovery** — same as previously found: the per-agent `Unpause` RPC path refuses ("this
+  agent isn't human-paused", since kill-switch pause and human pause are correctly modeled as distinct
+  by design) and there is no other exposed control. Only a raw `docker unpause` from outside the app (or
+  a daemon restart, which then orphans it per #18) recovers a killed agent today.
+- **Environment left in this state (at the time of the finding):** the real jail spawned this leg
+  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`) was left genuinely paused by this test —
+  `docker ps` showed it `Up ... (Paused)`, recoverable only by a manual `docker unpause`/`docker rm -f`.
+  That sentence is the bug, written down.
+
+### FIXED — commit `ee9be50`
+
+`IKillTarget` gained `UnpauseAsync`, and `KillSwitch.ResumeAsync` is now the real mirror of
+`EngageAsync`: it remembers the kill epoch's fan-out set, releases exactly those agents under the same
+RT-D4 deadline the stop uses, then clears the freeze flag in a `finally` — an engine that refuses to wake
+one jail must never *also* leave the operator behind a permanently frozen queue. An agent whose release
+could not be confirmed comes back `ResumeFailed` and stays in the ledger, so pressing Resume again retries
+exactly it. The release is audited (`killswitch_resume`), with the same RT-D3 never-block-on-the-store
+posture as the kill.
+
+**The human-pause distinction was preserved, not weakened** — this entry's own observation that the
+per-agent `Unpause` RPC refusal is BY DESIGN drove the shape of the fix. The pause stays unconditional
+(MG-39(a): containment is never negotiable); only the *release* is conditional. `SandboxKillTarget` keeps
+a per-agent **causation ledger** of what it actually transitioned — which containers it paused, whether it
+was the party that took the terminal lock / closed the leader's input gate — and reverses only those
+entries. Causation is decided by engine STATE, never by matching Docker's error text: a jail already
+frozen when the stop fires answers 409 to the second pause and the probe that follows confirms it is
+contained, so it is now reported as `Paused` (it used to be mislabelled `Unresponsive`/`PauseFailed`) and
+is deliberately *not* recorded as the kill switch's. The `HumanPauseLedger` is re-consulted at release
+time as well, which wins the race where a human pause lands while the kill's own pause call is in flight.
+Net effect: a human-paused agent goes through a whole Engage/Resume cycle and comes out still paused, and
+the ledger still says human-paused.
+
+The terminal sever had the identical asymmetry and got the identical treatment. The original
+"deliberately no un-containment" note in `SandboxKillTarget` was protecting a real case — a managed
+worker's terminal is locked at *spawn* as a role property, and a blanket unlock would hand an
+operator-locked worker a typeable terminal — so the ledger records the lock/gate only when the kill switch
+was the party that took them. That case is now honoured precisely instead of by refusing to recover at all.
+
+The misleading UI copy is gone with it: the Resource Monitor row now reads "jail paused, terminal input
+severed. Resume to recover." on a jail the kill switch owns, "this jail was already paused; it stays
+paused after Resume." on one it does not, and "Resume FAILED (…) — the jail is STILL paused. Press Resume
+again." when a release genuinely did not land. `ResumeKillResponse` carries per-agent counts, so `resumed`
+now means the whole release succeeded, jails included.
+
+**Evidence.** `Mainguard.Server.Tests/KillSwitchResumeDockerTests.cs` (RequiresDocker) is the end-to-end
+claim that was false before, with Docker as the only witness: a real jail, real `SandboxKillTarget`, real
+`DockerSandboxEngine`; engage → `.State.Paused=true`, resume → `.State.Paused=false`, terminal lock
+released, row back to `Working`. A second Docker leg pins the arbitration (human-paused jail still paused
+after the cycle, while the killed one comes back). Both green against a real OrbStack daemon. Every other
+kill-switch test ran over a fake engine — which is exactly why this survived. Unit coverage added for the
+release fan-out, idempotence, retry-after-failure, the spawn-time lock surviving the cycle, a vanished
+container, and the double-Engage ledger merge. Full non-Docker `Mainguard.Server.Tests`: 568 passed,
+0 failed.
+
+**Not re-verified through live UI clicks this pass** — the running daemon at the time of the fix was an
+older Release payload actively driving a live coordinator jail, and restarting the app to test would have
+destroyed that session (and orphaned the jail per #18). The Docker-tier test exercises every layer the bug
+lived in; the only link above it is the `KillSwitchService.Resume` RPC and the sidebar toggle, both of
+which were already observed working for the freeze half in this walkthrough. Worth one live re-click on
+the next leg for completeness, but not a gap in the fix.
+
+## 18. [CLOSED — commit `67b9cc1`] Daemon restarts orphan any jails they had spawned — no reconciliation on startup
+
+- Both live docker jails found at the start of this leg predate the current daemon process by several
+  minutes (`docker inspect .Created` vs. `ps -o lstart` for the daemon PID) — they're leftovers from a
+  daemon instance that existed before this leg's session (most likely from the `pkill`+`open` recovery in
+  entry #14, or an earlier restart). The current daemon has zero record of them: `ListAgents`-backed
+  surfaces (Resource Monitor, kill switch) correctly show/act on "0 agents" for them, which is *honest*
+  given the daemon's own bookkeeping — but the underlying gap is real: **nothing reconciles Docker's
+  actual state against the daemon's tracked-agent state on startup**, so a restart silently leaks any
+  jails the previous process had running. They keep consuming CPU/RAM/disk indefinitely with no UI
+  visibility and no automatic cleanup.
+- This is the same pattern noted as an environmental aside in the original `findings.md` from an earlier
+  session ("Two orphan mainguard-agent docker jails found... not tracked by the live daemon's agent
+  list") — now precisely root-caused (daemon-restart-without-reconciliation) rather than just observed.
+- Not fixed this leg (architectural — daemon startup would need to enumerate `docker ps --filter
+  label=mainguard.role=agent` and either adopt or reap anything it doesn't recognize). Flagged for a
+  dedicated pass alongside #17, since a real unpause fan-out (#17's fix) and orphan reconciliation (this
+  one) touch the same `KillSwitch`/sandbox-lifecycle code and are worth doing together.
+- **Still open after #17's fix (`ee9be50`), and now the *only* way a killed jail stays stuck.** #17's
+  causation ledger lives in the daemon's memory, so a daemon that dies while the kill switch is engaged
+  loses the record of what it froze along with the record of the jails themselves — the restarted daemon
+  neither adopts nor releases them. Orphan reconciliation on startup is what closes that last hole; it is
+  a smaller job now that the release path itself exists.
+
+### FIXED — commit `67b9cc1`, and the diagnosis above was half right in a misleading way
+
+- **"No reconciliation on startup" was not true — there were two, and neither wrote anywhere the UI
+  reads.** `SwarmReconciler` (P2-08) has always run at boot, listed `mainguard.agent`-labelled containers
+  and *adopted* orphans; `LeaderReattachTask` has always reconciled the durable PTY leader registry. But
+  `SwarmReconciler` writes to the SQLite **`ExpectedAgents`** table and the leader task to
+  `leader.json` — while `ListAgents`, `StreamAgentEvents`, the Resource Monitor and the kill switch are
+  all projections of **`AgentSessionStore`**, which is a plain in-memory `Dictionary` that nothing has
+  ever repopulated. The orphans were being adopted the whole time, into a book nobody reads. That is why
+  the surfaces were "honest" about zero agents and why the jails still leaked.
+- **The fix** is `Mainguard.Server/Runtime/AgentSessionReconciler.cs` + its `BackgroundService`: at
+  startup and every 30 s it adopts live jails the session store has no record of, corrects state toward
+  Docker, and marks a session whose container is gone `Unresponsive`. It **destroys nothing** — no
+  container is stopped or removed. Reaping was considered and rejected: the labels identify every jail's
+  repo and agent, so adoption is always possible, and this area has already paid once for a boot pass
+  that swept user work silently (see `SwarmReconcileTask`'s own remarks). A stopped-but-present jail is
+  also left alone, because the engine re-starts those by name and removing one destroys a resumable
+  session. Adoption is gated on this daemon hosting the repository's bare mirror, since the container
+  engine is machine-wide.
+- **A second, worse defect found on the way in.** Docker reports a *paused* container as `State ==
+  "paused"`, not `"running"` — and `DockerAgentLister` set `Running = (State == "running")`, which both
+  older reconcilers read as "still here". So a daemon restart while **any** agent was paused declared it
+  dead, force-removed its worktree and reaped its PTY. A restart during an engaged kill switch destroyed
+  exactly the work the emergency stop exists to preserve. `AgentContainerState` now carries `Paused` and
+  a computed `Live`, and both reconcilers read `Live`.
+- **Adoption also needed the jail to say what it is.** Containers carried only repo/agent/`role=agent`,
+  so an adopted coordinator came back anonymous. `mainguard.kind` and `mainguard.agent.role` are now
+  stamped at create. **Known limit:** a jail created *before* this change has neither label and adopts as
+  a role-less `unknown` worker — visible, monitorable and stoppable (which is this issue), but not
+  re-bound as the coordinator. New jails do not have that gap.
+- **Verified live, on the real thing.** The orphan `mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`
+  from #19/#20 was still up and still invisible (`ListAgentsResponse { agents=[] }` in `rpc.log` while
+  the container had been running 51 minutes). A production daemon built from this commit, started against
+  the real data root, logged on boot:
+  `agent-session reconcile: adopted=f1574a0ba9b443ffa2a5b2f9345df622 corrected=none lost=none` — while
+  the OLD boot pass in the same startup still said `swarm reconcile: … adopted=none`, which is the
+  "adopted into the wrong book" diagnosis printed side by side. Also covered by
+  `AgentSessionReconcileDockerTests` (RequiresDocker, real containers) and
+  `AgentSessionReconcileTests` (19 unit cases incl. the engine-unreachable case).
+
+## 19. [CLOSED — commit `67b9cc1`] Coordinator panel shows "No coordinator running" after an app relaunch, despite a live, correctly-tagged coordinator agent
+
+- Repro: the app process was found to have exited between two `ps aux` checks a few seconds apart (no
+  crash report generated in `~/Library/Logs/DiagnosticReports/` — this is a *different* symptom from #14's
+  "alive but zero windows"; here the process was simply gone). Recovered with `open
+  .../Mainguard.app`. On the fresh launch, clicked "Reopen" on the "Reopen Last Repository?" prompt
+  (`157-reopen-clicked-branch-overlap-visible.png` — also reconfirms the already-known commit-graph
+  branch-pill/author-text overlap bug, still present), then navigated to the Coordinator panel
+  (`158-no-coordinator-despite-live-role-coordinator-agent.png`).
+- The panel reads **"No coordinator running"** — but `~/.mainguard/logs/rpc.log` shows the daemon's own
+  `ListAgents` RPC continuously returning `AgentInfo { agent_id=f1574a0ba9b443ffa2a5b2f9345df622,
+  agent_kind=claude-code, state=Paused, role=coordinator }` for this exact repo, once a minute, for the
+  entire 20+ minutes surrounding this check — the daemon has never stopped believing this agent is the
+  live coordinator. The header line above it independently confirms the rail *did* rehydrate correctly on
+  this same launch (`7 in play · 7 in history (merged/rejected, below)`, the `c1e4c3e` fix rendering right
+  on a genuinely fresh process) — so this is not a blanket "nothing rehydrates after restart" failure,
+  it's specific to the Coordinator terminal-panel's own binding.
+- `DaemonBackedOrchestrator.CoordinatorAgentId`'s doc comment claims exactly the reconnect-safe behavior
+  that should make this work ("The coordinator is whichever live session carries the role
+  (reconnect-safe); a snapshot without one clears it") and the code backing it
+  (`ApplyAgentEvent`'s `Snapshot` case) does scan `_agents.Values` for `Role ==
+  AgentRoles.Coordinator` on every snapshot — so the mechanism *looks* correct by inspection. Not
+  root-caused past that: did not trace whether the `StreamAgentEvents` snapshot this fresh connection
+  received actually included this agent (vs. `ListAgents`, which is polled by a different subsystem —
+  `LoginHarvestPumpAsync` — and could easily disagree with what the event stream sent), and did not check
+  whether the panel additionally excludes a `Paused`-state agent from being treated as "the" coordinator
+  even when its role matches (see #20 below for why this agent reads `Paused` at all).
+- **Not fixed this leg** — flagged for a dedicated pass. This is matrix row **I1 (restart resume)**, still
+  gapped, and is exactly the shape of bug (`CoordinatorAgentId`/snapshot rehydration path) that the #11
+  investigation turned out to live in — worth the same depth of tracing rather than a guess.
+
+### FIXED — commit `67b9cc1`. The panel's binding was innocent; the projection under it had lost a field
+
+- **The suspicions above were both wrong, and usefully so.** `CoordinatorAgentId` is not what gates the
+  panel — `ShowCoordinatorTerminal` is derived from `_agents.ListAgents().Where(a => a.Role ==
+  "coordinator")`, and `CoordinatorAgentId` only backstops the just-spawned-not-yet-projected window.
+  There is also **no `Paused` exclusion**: `IsTerminalState` is `Merged|Rejected|Dead|TornDown` only, and
+  `MapState("Paused")` parses cleanly. The panel goes to its empty card for exactly one reason — the
+  client's projection holds **zero coordinator-role records**.
+- **Why it held none.** The projection is fed only by `StreamAgentEvents`: one destructive snapshot at
+  subscribe time, then deltas — and **a delta carries neither kind nor role**. `ApplyAgentEvent`'s
+  `State` branch therefore fabricates a **role-less placeholder** for any agent it has not seen, and the
+  one `ListAgents` call meant to repair it (`ResyncAgentsAsync`) `return`ed silently on a single failure
+  and was never retried by anything. A live coordinator stranded that way is invisible to a panel
+  filtering on `Role == "coordinator"` **forever**, while the worker rail shows the same agent happily and
+  the daemon keeps answering correctly. That is the whole discrepancy — and it explains why the rail
+  rehydrated on the same launch: the merge queue is a per-repo, **disk-backed** `StreamQueue`
+  re-subscribed at repo-open, whereas the agent snapshot is process-memory truth taken once at app start.
+- **The `rpc.log` evidence was the fix.** Those once-a-minute `ListAgents` calls returning
+  `role=coordinator` came from the client's OWN login-harvest sweep — which kept only the agent ids and
+  threw the rest away. It now folds the answer into the projection first, so a stranded coordinator is a
+  coordinator again within the sweep interval at **no extra RPC cost**, off the very call that was
+  demonstrably correct throughout the outage. A snapshot is additionally confirmed against `ListAgents`
+  rather than trusted (it is a positional `id:kind:state:role` string split on `,`/`:`, not a second
+  opinion). The merge corrects **role and kind only** — state and `Detail` flow on deltas, which are
+  newer than any poll — and it never deletes.
+- **The other leg closes with #18.** If the daemon really has restarted, its session store is empty and
+  no amount of client-side repair invents a coordinator; `AgentSessionReconciler` re-registering the
+  surviving jail (with its `mainguard.agent.role` label) is what makes the snapshot carry one at all.
+  Matrix row **I1 (restart resume)** needs both halves and now has them.
+- **Pinned by** `Mainguard.Tests/CoordinatorProjectionRepairTests` (5 cases, through the new
+  `AgentListOverride` seam). **Not re-verified through live UI clicks:** the running `Mainguard.app`
+  bundle predates this commit, and the one surviving jail on this machine has no
+  `mainguard.agent.role` label (it was created before the label existed), so it correctly adopts as a
+  role-less worker and could not exercise the coordinator binding either way. Worth one live re-click on
+  the next leg after a bundle rebuild, on a freshly spawned coordinator.
+
+## 20. [CLOSED — commit `67b9cc1`] The daemon's tracked agent state can drift from Docker's actual state and nothing brings it back in sync
+
+- The `state=Paused` reading in #19's `ListAgents` output is not a fresh kill-switch pause — `docker
+  inspect mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622` reports `Paused=false Status=running`
+  right now, confirmed twice. This exact agent was the one kill-switch-paused during the previous leg's
+  #17 repro (**before** today's real fix, `ee9be50`, existed) and then manually recovered via a raw
+  `docker unpause` as out-of-band cleanup — which by construction bypasses any app-mediated RPC that would
+  tell the daemon the physical state changed. `docker events --since 6h` for this container shows no
+  pause/unpause events at all in that window, consistent with the pause having happened slightly earlier
+  and the unpause being an external command Docker doesn't surface the same way through the events API.
+- The result: the daemon has been reporting this agent as `Paused` for 20+ minutes after it was actually
+  made to run again. This is expected in the narrow sense that no software can see a change nobody told it
+  about — but it exposes a real, reasonable-to-hit gap: **there is no reconciliation between the daemon's
+  tracked per-agent state and Docker's live state**, ever, for any reason (a developer's manual
+  intervention, OrbStack/Docker Desktop itself restarting, or any other out-of-band drift). Once tracked
+  state and reality disagree, nothing — not a poll, not a next-touch check — brings them back together;
+  the stale reading can persist indefinitely and, per #19, may be exactly what makes the Coordinator panel
+  refuse to reattach to a perfectly healthy live jail.
+- Did not attempt a live click-through of the *new* `ee9be50` Resume path against this specific stuck
+  agent to see whether pressing Resume today would self-heal it (would have proven whether the fix's
+  causation ledger, or a plain `IsPausedAsync` probe, is enough to correct drift it didn't itself cause) —
+  sidebar navigation and merge-queue-panel scroll clicks stopped registering visible changes partway
+  through this leg (`159-nav-click-did-not-register.png`; the window ID and bounds were confirmed
+  unchanged via a fresh `CGWindowListCopyWindowInfo` probe, so this wasn't a stale-window-reference issue —
+  cause not diagnosed, flagged as its own small methodology note rather than a product bug) and budget
+  ran out before recalibrating. Worth a look bundled with #18 and #19 — all three are "daemon state vs.
+  live Docker/process reality can silently diverge, with no reconciliation path" in different clothes.
+
+### FIXED — commit `67b9cc1`
+
+- `AgentSession.State` was **push-only**: something called `MarkState`, or the word never changed. There
+  was no poller, no next-touch check, nothing. The same
+  `Mainguard.Server/Runtime/AgentSessionReconciler.cs` that closes #18 re-reads Docker every 30 s and
+  moves the word, so drift a human (or the engine, or the OOM killer) caused self-heals within half a
+  minute instead of standing indefinitely.
+- **Only the pause axis is corrected**, deliberately. A live session's state word carries orchestration
+  meaning the container cannot know — `RateLimited`, `Yielding`, `AwaitingReview` — and flattening all of
+  it to `Working` because the process tree happens to be scheduled would destroy more information than
+  the drift did. Docker-says-paused/store-says-not and the reverse are the only two transitions this pass
+  makes to a live session.
+- **The failure mode that would have made this worse than the bug** is guarded explicitly: the container
+  lister is allowed to THROW, and a throwing pass changes nothing. An empty list from a Docker that is
+  merely slow to answer would otherwise read as "every jail vanished" and mark the whole swarm lost.
+  `Reconcile_ShouldChangeNothing_WhenTheContainerEngineCannotBeReached` pins it.
+- **Verified live against the exact agent from this entry.** With a production daemon from this commit
+  running and the jail adopted, `docker pause` was run directly from a shell — bypassing every RPC, the
+  same way the original drift was created — and the next pass logged
+  `agent-session reconcile: adopted=none corrected=f1574a0ba9b443ffa2a5b2f9345df622 lost=none`. A raw
+  `docker unpause` (the #20 repro itself) produced the same correction in the other direction, with
+  `docker inspect` confirming `Status=running Paused=false`. Also covered end to end by
+  `AgentSessionReconcileDockerTests.Reconcile_ShouldFollowAnOutOfBandPauseAndUnpause`.
+
+## 21. [CLOSED — commit `578656d6`] Coordinator terminal renders blank after restart-resume, even once the panel correctly binds to the live agent (#19's own remaining verification step)
+
+- **Repro** (real UI, not RPC): rebuilt the daemon+app from `804ae632` (the #18/#19/#20 fix), started a
+  real `claude-code` coordinator through the UI (authenticated, banner visible), then killed and
+  relaunched just the app process (daemon left running, jail untouched) — the exact "one live click of
+  Engage→Resume-shaped" restart re-test #19's own log entry asked for, applied here to the coordinator
+  terminal instead.
+- **The panel binding itself is correct** (#19's fix holds): "Stop coordinator" is enabled, the agent id
+  is shown, no "No coordinator running" false state. But the terminal pane under it renders **fully
+  blank** — just a cursor, no banner, no output — even though it is bound to a live, correctly-identified
+  agent. Screenshot `164-terminal-blank-despite-correct-binding-new-bug.png`.
+- **Confirmed NOT a daemon/data problem**: a raw `AttachTerminal` RPC against the same agent id, made
+  independently via a headless script, returned 2570 bytes of real scrollback (the full claude-code
+  welcome banner + auto-mode status line) instantly. The daemon replays scrollback correctly; the UI
+  simply never rendered it. A click inside the terminal pane did not force a repaint either
+  (`159`→ wait, see `007`/no-op check) — ruled out as a stale-paint issue, not a data-arrival timing
+  fluke on the daemon side.
+- **Root cause**: `Mainguard.Agents.UI/ViewModels/TerminalViewModel.cs` — `EnsureCoordinatorTerminal`
+  (`ControlCenterViewModel.cs:656`) constructs the `TerminalViewModel` and immediately fires
+  `AttachTerminalAsync`, which opens the gRPC stream and starts pumping `OnOutputReceived` almost
+  instantly for a rehydrated agent (the daemon replays existing scrollback with no CLI-startup delay to
+  wait through). But `TerminalViewModel.AttachView(ITerminalView view)` — which sets the `_view` field
+  that `OnOutputReceived` feeds — is only called later, when Avalonia's `DataContextChanged` binding pass
+  runs in `TerminalView.axaml.cs`'s `Bind()`. On a **fresh spawn**, the CLI's own multi-second startup
+  delay before it prints anything covers this race completely, so the bug was invisible every time this
+  walkthrough tested a fresh spawn. On **restart-resume**, the replay burst can — and, reproduced here,
+  does — arrive before `Bind()` runs, and `_view?.FeedOutput(data)` on a null `_view` silently drops it
+  with no error, log line, or visible symptom besides the blank pane.
+
+### FIXED — commit `578656d6`
+
+- `TerminalViewModel` now buffers output (`List<byte[]>` under a dedicated lock) whenever it's called
+  with `_view` still null, instead of dropping it. `AttachView` flushes anything buffered into the
+  now-real view, in order, the moment it's called — closing the exact race above without changing the
+  fresh-spawn path's behavior at all (the buffer is simply always empty there, since `Bind()` beats the
+  CLI's first byte by seconds).
+- Regression test `TerminalViewModelTests.OutputReceived_BeforeAttachView_ShouldBeBufferedThenFlushed`
+  reproduces the race directly (push output, then attach) and **was confirmed to fail against the
+  pre-fix code** (`Assert.Single() Failure: The collection was empty`) before the fix, green after.
+  A second test, `OutputReceived_AfterAttachView_ShouldStillFeedDirectly_NotDoubled`, guards against the
+  fix accidentally double-feeding output that arrives after a normal attach. All 13
+  `TerminalViewModelTests` green; `dotnet build` clean.
+- **Verified live**, not just by test: killed and relaunched the app again against the same live
+  coordinator jail with the fix built in — the terminal pane now renders real content instead of a blank
+  cursor. Screenshot `165-terminal-buffering-fix-content-renders-but-garbled.png`.
+
+## 22. [CLOSED — commit `d49dcece`] Replayed scrollback renders with corrupted line-wrapping once #21's fix makes it visible at all
+
+- Fixing #21 above makes the replay actually reach the screen — but what reaches it is visibly garbled:
+  words split mid-token onto the next line (`"yourl" / "imit,"` for what should read `"your limit,"`),
+  fragments duplicated/interleaved (`"o| tonuFable"` where the original banner reads `"o Run /model and
+  select"`). Screenshot `165-terminal-buffering-fix-content-renders-but-garbled.png` next to the
+  original raw-RPC capture (`checkterm.fsx` output, same session) confirms the RAW bytes the daemon sent
+  are correct and un-corrupted — the corruption is introduced during rendering, not transport.
+- **This matches an already-logged, older finding** (findings.md, "UI bug — ghost coordinator resurfaces
+  with garbled terminal output") — this is very likely the same underlying defect, now reproduced through
+  a cleaner, more deliberate repro path (a real restart-resume on a known-good agent, not an incidental
+  ghost-coordinator fallback).
+- **Leading hypothesis, not yet implemented or verified**: a column-width mismatch. `AttachView`'s flush
+  (from #21's fix) happens as soon as Avalonia's `DataContextChanged` binding pass runs — but the
+  terminal engine's actual (cols, rows) size is set later, by a **layout-driven** resize
+  (`TerminalView.axaml.cs`'s `OnUserResized` → `TerminalViewModel.OnUserResize` → `_view.Resize(...)`),
+  which cannot fire until the control has real on-screen bounds. If the buffered replay — recorded by
+  the original session at whatever its real terminal width was (visibly 100+ columns wide in the raw
+  capture) — gets fed into a `VtScreen` still at its constructor-default size, every absolute
+  cursor-position escape in that recording would misplace text relative to the narrower buffer, which is
+  exactly the shape of corruption observed (words wrapping early, fragments landing in the wrong place).
+- **Why this wasn't attempted in this pass**: fixing it correctly means changing when the buffered
+  replay is flushed relative to layout-driven resize (e.g. defer the flush until after the first real
+  resize, or resize the screen to a known-correct size before flushing) — timing-sensitive UI-layout
+  work against an "interim" terminal engine (`VtScreen`/`TerminalControl`, explicitly flagged elsewhere
+  in this repo as due for a P2-18 replacement) where getting the ordering wrong risks reintroducing #21's
+  blank-pane bug or breaking live keystrokes on the fresh-spawn path that today works correctly. Per this
+  leg's model-tier instruction, flagging for a dedicated Opus/Fable pass rather than attempting it here.
+- **Concrete next step for that pass**: confirm the column-width hypothesis (log the `VtScreen`'s
+  cols/rows at flush time vs. at the first real resize; or diff against the raw `checkterm.fsx`-style
+  capture's implied width from its cursor-position escapes), then decide between "defer flush until
+  after first resize" vs. "resize to a sane default before flush, then re-resize" — the former is
+  probably correct but needs verifying it doesn't reintroduce a blank-pane window of its own.
+
+### CLOSED — commit `d49dcece`. The column-width hypothesis was CORRECT; the fix went into the engine, not the ViewModel
+
+- **Root cause confirmed — it is a geometry race, not an output race.** `TerminalControl` constructs its
+  `VtScreen` at a hardcoded **80×24 placeholder** and never sizes it itself: the real (cols, rows) only
+  reaches the engine via `ArrangeOverride` → `UserResized` → `TerminalViewModel.OnUserResize` → a **~50 ms
+  debounce** → `ITerminalView.Resize`. The daemon replays its whole ring (`BoundTerminalSession.ReplayCapBytes`
+  = 512 KB, raw PTY bytes, verbatim) within milliseconds of attach, so on a restart-resume the entire
+  recording — made at the previous session's real width — is parsed at 80 columns before layout has happened
+  at all. `VtScreen.Resize` copies the top-left region and does **not reflow**, so that wrap is permanent:
+  every later frame renders around wrongly wrapped rows and misplaced absolute-cursor writes.
+- **Independent confirmation from the existing evidence.** Re-measuring screenshot
+  `165-terminal-buffering-fix-content-renders-but-garbled.png` (and its scratchpad twin
+  `shots/008-coordinator-terminal-after-fix.png`): the text wraps at **~78–80 characters** while the terminal
+  pane is physically wide enough for **~104 columns** — there is visible dead space to the right of every
+  wrapped line, and the overflow characters (`y c c R / a s`) stack in a single vertical column at exactly the
+  80th cell. That is the unmistakable signature of "screen narrower than pane", not of corrupt bytes. The raw
+  `checkterm.fsx` capture had already proved the daemon's bytes are clean.
+- **Fix — deferral in the engine, where bytes and geometry actually meet** (`VtScreen.cs`, `TerminalControl.cs`):
+  `VtScreen` gained an opt-in `awaitGeometry` mode; `Feed()` HOLDS chunks (in arrival order, original
+  boundaries, so the incremental UTF-8 decoder is unaffected) until the first `Resize` establishes real
+  geometry, then parses them against it. `TerminalControl` constructs with `awaitGeometry: true` and now sizes
+  the engine from its **own** `ArrangeOverride` instead of waiting for the ViewModel round trip — the debounce
+  still does its actual job (not spamming the daemon with SIGWINCH during a drag) and `SendResizeAsync` is
+  untouched; the ViewModel's later `Resize` is simply a no-op.
+- **Why not "defer the ViewModel's flush until the first resize"** (the other option named above): that adds a
+  cross-layer ordering dependency in which a missing `UserResized` silently reinstates #21's blank pane — a
+  pane that happens to lay out at exactly 80×24 (the control's dedupe suppresses the event), a control that is
+  never arranged, or the P2-18 `TerminalGridControl`, which has no client-side geometry at all. Putting it in
+  the engine keeps the one object that owns both the bytes and the width owning the ordering, leaves the P2-18
+  path untouched, and leaves #21's ViewModel buffer exactly as it was.
+- **Guards against re-breaking #21.** Three explicit ones: a same-size `Resize` still releases the buffer (the
+  exact-80×24 layout can't strand it); the hold is bounded at 2 MB (4× the daemon ring) and past the cap the
+  engine **parses rather than drops** — wrapped-wrong beats lost; and every new test asserts BOTH failure modes
+  as a pair, content present (#21) *and* content correctly laid out (#22), so neither can be traded for the other.
+- **Tests** — new `Mainguard.Tests/TerminalReplayGeometryTests.cs`, 7 cases: real-width parse equals a native
+  parse at that width; the pre-fix parse-then-resize ordering kept as an explicit **garbled witness**; hold-then-
+  release never loses content; same-size resize releases; chunk boundaries + UTF-8 decoder survive the hold; the
+  2 MB cap parses rather than drops; and an `[AvaloniaFact]` that drives the **whole ordering end to end through a
+  real `TerminalControl` and a real arrange pass** with the replay fed before any layout. That last one was
+  **confirmed to FAIL on pre-fix code** (fix temporarily reverted, rebuilt, re-run) and passes with the fix. All
+  132 `~Terminal` tests green, all 139 headless render harnesses green, `dotnet build` clean.
+- **Live GUI re-verification was NOT possible this leg and is not claimed**: GUI automation input (CGEvent
+  clicks, System Events keystrokes, AX queries) did not reach the app from this agent's process — System Events
+  could not even enumerate the app's windows — so the repo could not be reopened after the relaunch. The
+  pre-existing coordinator (`3cd48ab2…`) had also already ended, so its daemon replay ring came back empty. The
+  evidence above (the re-measured screenshot + the end-to-end `[AvaloniaFact]`) is what closes this. The app was
+  rebuilt in Release and relaunched with the fix in it; it is sitting on the "Reopen Last Repository?" prompt.
+- **Residual, documented not fixed**: the raw attach contract carries no *recording* width, so a replay recorded
+  at a different window size than the one it is rendered into still mis-wraps — including the ~120-column prefix
+  every recording starts with (`AgentCliBinder.DefaultCols` = 120 until the first client resize lands). Same
+  window size ⇒ correct, which is the normal restart-resume case. P2-18's grid engine removes the whole class by
+  construction: the daemon owns the authoritative grid and sends a snapshot on attach.
+- Note this also plausibly explains ISSUES-LOG **#5** (the live onboarding banner garbling) for the window
+  between a pane's first layout and the debounced resize, and the older "ghost coordinator garbled terminal"
+  finding — but #5 was observed on a LIVE coordinator over ~40 s, which the interim engine's known Ink/Yoga gaps
+  (no DECSTBM scroll regions, no insert/delete line, no alt screen — see `docs/repo-map/mainguard-app-shell.md`)
+  can produce on their own. #5 is left OPEN deliberately; it needs its own look, not a claimed fix.
+
+### 23. [CLOSED — commit `ce3eb056`] A coordinator "left running" from a prior session gets permanently stuck on "Still starting the coordinator"
+- **Step:** 022 (2026-08-23 leg, screen-unlock resume)
+- **Repro:** reopened the app after several real days idle (app/daemon processes survived, PID 59432/59441
+  unchanged since 2026-08-20 18:52). Navigated to the Coordinator panel for `e2e-fixture` and it showed:
+  *"Still starting the coordinator — Its sandbox has been starting for a while without drawing a terminal...
+  leave Mainguard running and it should come up on its own... If it never comes up, check the daemon logs
+  (oobe.log)."* Clicked **Restart** — no visible change, message persists identically afterward.
+- **This is NOT actually a stuck/building sandbox.** Verified directly against reality, three ways:
+  1. `docker ps` shows container `c8ee732503d1` (`mainguard-…-3cd48ab2bc1b4678b475749f8e9521dc`) `Up 6 hours`,
+     correctly labeled `mainguard.agent.role=coordinator`, `mainguard.kind=claude-code`.
+  2. `docker top` inside it shows a real `claude` process with **2:22 of accumulated CPU time** — actively
+     alive and doing something, not stuck mid-build.
+  3. `~/.mainguard/logs/rpc.log` shows the daemon's own `ListAgents` responding correctly and continuously
+     (every ~60s, from the client's login-harvest sweep — see #19's investigation) with
+     `AgentInfo { agent_id=3cd48ab2…, agent_kind=claude-code, state=Working, role=coordinator }` — the daemon
+     has known the correct state the entire time.
+  4. `~/.mainguard/logs/spawn.log` shows a `HarvestAgentCredentials` call every minute logging
+     `(agent left running)` for this exact agent id — i.e. the daemon deliberately preserved this container
+     across sessions (this looks like the tail end of an earlier leg's real-claude-code OAuth/credential-harvest
+     flow, intentionally left alive rather than torn down).
+  5. `~/.mainguard/logs/terminal.log` shows the terminal WAS bound once, at spawn time (`16:23:25`,
+     `cli bound agent=3cd48ab2… container=c8ee732503d1… engine=Interim`) — and never again since. No
+     `AttachTerminal` activity since original spawn, days ago.
+- **Read together, this points at a client-side binding bug, not a daemon bug**: the daemon's state (`Working`,
+  `role=coordinator`) has been correct and available via `ListAgents` the whole time, but the Coordinator
+  panel's "has it started" signal appears to depend on something else — plausibly a transition/event it expects
+  to observe live (e.g. a state-change delta, or a first successful `AttachTerminal` draw) rather than the
+  current polled state, the same shape of bug `804ae632`/`67b9cc1f` fixed for #19's rail binding. A coordinator
+  that's already `Working` by the time the panel binds (rather than transitioning to `Working` while the panel
+  watches) may never satisfy that condition. Not chased further into the client code this leg — needs a
+  dedicated pass, same as #19 needed.
+- **Severity: HIGH** — this makes a coordinator's own panel permanently unusable (no terminal, can't send it a
+  prompt, can't see its output) after an app restart if the coordinator itself wasn't restarted at the same
+  time, with no in-app recovery (Restart button click had no effect). The daemon-side data needed to fix it —
+  `ListAgents` returning the correct role/state — is right there; this is a projection/binding bug, not missing
+  data.
+- **Not fixed this leg** (client-side binding investigation, same complexity class as #19) — flagged for a
+  dedicated Opus/Fable pass. **Worked around** by leaving this coordinator alone and spawning a fresh scripted
+  coordinator to continue the walkthrough, rather than force-tearing-down what might be a real, intentionally-
+  preserved OAuth session.
+- Screenshot: `007-coordinator-attempt2.png`, `008-restart-clicked.png` (identical, confirming Restart's no-op).
+
+
+### CLOSED — commit `ce3eb056`. The hypothesis above was RIGHT about the shape and wrong about where the data stops: the panel's signal is an EVENT, and the event is gone because the terminal really is unrecoverable
+
+- **Not the same bug as #19, but the same family.** #19 was a client projection missing a *field* (role).
+  Here the projection is perfect — `IsCoordinatorLive` is true, the agent id renders, Stop/Restart are
+  enabled. What is stuck is one derived boolean:
+  `ControlCenterViewModel.UpdateConnecting()` computed
+  `IsCoordinatorConnecting = IsStartingCoordinator || (IsCoordinatorLive && CoordinatorTerminal is
+  { HasReceivedOutput: false })` — i.e. **"has the coordinator come up?" was answered solely by the
+  terminal's first drawn PTY frame.** That is an event, and an event only fires while you are watching.
+- **And the event genuinely never comes for this agent — the daemon side is not innocent after all.**
+  The `ListAgents`/`spawn.log` evidence in the original entry is correct but was read one step short. The
+  app process and the DAEMON both restarted together at 16:52 UTC (PIDs 59432/59441, the Pro head owns
+  its daemon child) — `agentsessionreconciler.log` records the restart precisely:
+  `16:52:30 agent-session reconcile: adopted=3cd48ab2…,f1574a0b…`. #18's reconciler adopts the surviving
+  jails back into the session store, which is exactly why `ListAgents` kept answering correctly. **The
+  terminal cannot be adopted with them.** The CLI runs under `docker exec -it` beneath a daemon-side
+  forkpty; that PTY died with the old daemon, the in-jail `claude` keeps running with its output going
+  nowhere, and the Docker API has no re-attach for a running exec. So the ring in `BoundTerminalSession`
+  is gone too — there is nothing left to replay.
+- **What the attach then did was the actual defect.** `TerminalGrpcService.Attach` found no bound
+  session, no pending bind, and fell through to the P2-02 **echo**, which writes *nothing at all* until
+  the user types. `rpc.log` shows it exactly: **one** `TerminalService/Attach` from the app at
+  `16:52:30.86` (0.3 s after the reconcile), still open six hours later, having emitted zero frames —
+  and terminal.log's "never bound again" is the same fact from the other side. Silence forever ⇒
+  `HasReceivedOutput` false forever ⇒ connecting forever ⇒ the 45 s watchdog's stall banner, forever.
+  The adoption reason the reconciler writes ("Adopted after a daemon restart — this jail was already
+  running.") made it worse: it lands in `AgentInfo.Detail`, which the loader renders as *launch
+  progress* and which re-arms the watchdog on the **20-minute** working budget.
+- **Fixed in both halves, because either alone leaves a lie on screen:**
+  1. *Daemon* — an attach for an agent the session store KNOWS, with no CLI bound and none coming, now
+     writes `TerminalGrpcService.DetachedNotice` in one unprompted frame and **discards** input instead
+     of echoing it (a terminal that types back looks like it is talking to a CLI while reaching
+     nothing). Ids the daemon has never heard of keep the P2-02 echo — this is a statement about a
+     session we hold, not a catch-all.
+  2. *Client* — `CoordinatorHasStarted` is derived from the coordinator's **current polled state**
+     (live and past `Requested`/`PlanPending`/`Provisioning`), alongside — not instead of — the live
+     first-frame event, so a session we did not watch start still reads as started. The stalled card
+     splits on it: the toolchain-build copy stays for a coordinator that really is still coming up, and
+     a started one gets an honest *"The coordinator is running — its terminal isn't attached"* card
+     **with Restart on it**. A running session's `Detail` is no longer rendered as launch progress nor
+     allowed to buy the 20-minute budget.
+- **Restart's "no-op" was two different things, and only one of them was real.** The real one: `Restart`
+  is stop-then-start, and the start leg `return`ed silently when `SelectedCli` was null — *after* the
+  stop leg had already torn the coordinator down — and the CLI picker is HIDDEN while a coordinator is
+  live, so nothing on screen could set it. That is fixed (falls back to the installed CLI; says why when
+  there is none) and pinned by two tests. The observed one is **not reproducible**: this leg clicked
+  Restart on the very same stuck agent and it worked first time — `rpc.log` shows
+  `StopAgent{agent_id=3cd48ab2…}` → OK → `SpawnAgent` → OK, 1.9 s apart. The original click produced
+  **zero RPCs of any kind**, which no code path explains (the stop leg fires before any CLI lookup), so
+  the most likely explanation is that the click missed the button — note the original entry cites
+  screenshots `007`/`008`, which are unrelated files; the real capture is
+  `168-restart-clicked-no-effect-issue23.png`.
+- **Verified live against the original stuck coordinator, not just by test.** Rebuilt the Release output
+  the bundle symlinks, killed app + daemon (jails left running — the exact repro), relaunched, reopened
+  the repo, opened the Coordinator panel: the panel binds `agent 3cd48ab2bc1b4678b475749f8e9521dc` and
+  its terminal renders the notice immediately, with **no spinner and no stall banner**
+  (`169-issue23-fixed-detached-terminal-notice.png`). Then clicked **Restart** in the header: the old
+  jail was stopped, a fresh coordinator (`1302d3c0feeb40db8e321729eb0fbabb`) spawned, and its terminal
+  drew the real Claude Code banner — **already signed in** ("Welcome back Daniel!"), so the preserved
+  OAuth login survived the teardown intact via the login-harvest sweep
+  (`170-issue23-restart-recovers-fresh-coordinator.png`). The fresh-spawn loader path is unchanged.
+- **Pinned by** `Mainguard.Server.Tests/TerminalDetachedAttachTests` (notice on a known unbound agent,
+  input discarded not echoed, unknown id still echoes), the rewritten
+  `AgentCliWiringTests.UnprovisionedRepo_StaysSessionOnly_AttachSaysThereIsNoTerminal`, and six new
+  cases in `Mainguard.Tests/CoordinatorCliStartTests` — including the exact repro shape (*a coordinator
+  already `Working` the first time the projection sees it reads as started*), its non-vacuous inverse
+  (a `Provisioning` one still reads as not-started), and both Restart legs.
+- **The durable fix this does NOT do:** re-attachable agent terminals. As long as the CLI is a bare
+  `docker exec -it` under a daemon-owned PTY, a daemon restart destroys that terminal permanently and
+  the only honest answer is to say so. Running the in-jail CLI under a multiplexer inside the sandbox
+  (dtach/tmux, or the socket the `SessionLeader`'s unused `SocketPath` field already anticipates) would
+  make a restart survivable end-to-end. Worth its own item; it is an architecture change, not a bug fix.
+
+## 24. [CLOSED — commit `cb713d89`] MergeQueueRows persist stale "Working" state indefinitely with no reconciliation against real Docker jails
+
+- **Repro**: on this live, days-old daemon (system clock 2026-08-20 → 2026-08-23 idle survival), the
+  Merge Queue rail read **"10 in play"** with 5+ distinct agent ids all shown `Working`
+  (`d20687c6714c4818965c9c7fe7a28828`, `757e46572db6442f9a22319f4d3e085b`,
+  `2664ef9b52e14e1d9af67fc9e6d3c09a`, `fa6cfcba128c40a38c276436d9258a9b`,
+  `ba2809387bae47b4a332c0f4fe951156`, plus more below the fold) — screenshots
+  `171-app-activated-state.png` through `185-stop-coordinator-confirmed.png` all show this panel.
+- **Ground truth, checked directly, not inferred**: `docker ps -a --filter label=mainguard.role=agent`
+  shows exactly **one** real agent container on the whole machine
+  (`mainguard-f467e1708a75-f1574a0ba9b443ffa2a5b2f9345df622`, up 9h) — none of the five ids above. The
+  daemon's own `~/.mainguard/mainguard-daemon.db`, table `MergeQueueRows`, confirms this is not a UI
+  cache problem: querying those five ids directly returns `State='Working'` for every one of them, with
+  `UpdatedUtc` timestamps all dated **2026-08-20** — i.e. three real days stale, never touched since.
+  A full tally of the table: `15 Working · 7 Merged · 4 Discarded · 3 Rejected · 1 Verified` — **15 of
+  30 total rows are `Working` with, at most, one live container to back any of them.**
+- **This is the same architectural gap as #18/#20 (daemon state drifts from Docker reality, nothing
+  brings it back), but in a different component.** `67b9cc1f`'s `AgentSessionReconciler` fixed exactly
+  this problem for `AgentSessionStore` (what `ListAgents`/Resource Monitor/kill switch read from) — and
+  it visibly works: the Resource Monitor for this same session correctly shows only **4 agents**, 3
+  correctly `TornDown` and 1 correctly `Working` (the real container, labeled `unknown` per the
+  already-documented role-label gap). **`MergeQueueRows` was never wired into that reconciler or given
+  one of its own.** The merge queue's "is this really still running" belief is apparently permanent
+  once written, unless something explicitly transitions it (Verify/Merge/Reject/Discard) — a vanished
+  container has no such path back to a terminal state.
+- **Likely real-world impact, not just a stale-count cosmetic issue**: every one of these 15 phantom
+  `Working` rows renders live `Verify`/`Resume`/`Discard` buttons in the UI (see the same screenshots) —
+  a user could click `Verify` on an entry with zero backing jail and get an unexplained failure, or
+  `Resume` and get whatever `BringLocal`/resume path does against a branch ref that may or may not still
+  exist. This plausibly explains user-visible confusion of exactly the "the queue doesn't match reality"
+  shape that started this whole testing pass, independent of the specific bugs (#11, #13, #18-20)
+  already found and fixed.
+- **Not fixed this leg** — per the model-tier instruction, this needs the same class of careful,
+  ground-truth-driven work as #18/#20 (decide the reconciliation policy: does a vanished container mean
+  the entry should transition to some new terminal/error state, get re-queued, or something else — this
+  is a real product decision, not just plumbing) and should not be improvised quickly. **Flagged for a
+  dedicated Opus/Fable pass**, with this entry's exact evidence (the 5 ids, the DB query, the docker
+  ground truth) as its starting point. Concrete next step: find whichever component owns `MergeQueueRows`
+  writes (`Mainguard.Agents/Agents/Orchestrator/MergeQueue.cs` and its provisioner) and give it the same
+  treatment `AgentSessionReconciler` gave `AgentSessionStore` — reconcile against Docker on a timer,
+  decide and implement what a vanished-container `Working` row should become.
+
+### CLOSED — commit `cb713d89`. The diagnosis above was right about the gap and wrong about the remedy: the state word was never the lie, the LIVENESS was
+
+- **The gap was exactly as described.** `MergeQueueRows` was never wired into `67b9cc1f`'s reconciler and
+  had no equivalent of its own. Queue state is push-only — something calls a transition or the row never
+  moves — and neither stopping an agent nor a jail dying out of band *is* a transition, so nothing could
+  ever walk a `Working` row back toward reality.
+- **The "real product decision" this entry flagged has an answer, and it is NOT a new terminal state — it
+  is "don't move the merge state at all".** The obvious fix (walk a jail-less entry to `Discarded`) turns
+  out to be actively destructive, and the thing it would destroy is a feature this repo already shipped:
+  `AgentResumeService` exists *precisely* to hand a stranded entry a live jail again on its own branch —
+  same id, same commits, same verification history — in its own words, "so it can be verified and merged
+  instead of only discarded". `Discarded` is terminal, nothing leaves it, and `EnsureEntry` refuses to
+  resurrect an id it already holds. So an auto-discard would have silently converted every one of these 15
+  recoverable entries into a permanently unrecoverable one — a reconcile pass reaping user work while the
+  user looks away, which is the failure mode this area has already paid for once. **The Resume button on
+  those phantom rows was never the bug; it was the correct action.**
+- **What was actually wrong**, once that is seen: liveness was *asserted* from a store nothing corrected.
+  `MergeQueueGrpcService`'s `HasLiveSandbox` read `AgentSessionStore` alone, which is wrong in **both**
+  directions and stays wrong — it is memory-only, so after a daemon restart every surviving entry read as
+  jail-less; and a session `AgentSessionReconciler` marks `Unresponsive` **keeps its container id**, so a
+  dead agent went on reporting a live sandbox and went on offering Verify. Nothing re-published the queue
+  either: the stream re-pushes only on `Changed`, and jail death is not a transition, so the rail served
+  whatever liveness the client last heard, indefinitely.
+- **The fix** (`MergeQueue.ReconcileJails` + `HasLiveJail`, driven from `AgentSessionReconciler`): the
+  existing 30 s pass now also sweeps every registered queue **off the Docker listing it already takes** —
+  no second polling loop, and it runs *after* the session pass so it reads corrected liveness. It marks and
+  un-marks the jail-liveness of non-terminal entries, replaces `CanMerge`'s wording for
+  `Working`/`StaleVerified` (both old sentences promise something impossible without a sandbox: "not
+  verified yet" is about a branch still on its way; "re-verifying" is the cascade's promise and the cascade
+  needs a jail to keep it), audits each move as `queue_entry_jail_reconciled` by `system:reconciler`, and
+  republishes via `NotifyGateChanged`. **No merge state moves, no row is written, no EF migration exists** —
+  liveness is a measurement of the engine, not a decision, and a measurement in SQLite outlives its own
+  truth (the row would keep asserting "stranded" after a resume). `HasLiveJail` is three-valued and answers
+  `null` *per entry* until a pass has actually looked. The client needed no change at all: `QueueRailViewModel`
+  already gates Verify on `!= false` and Resume on `== false` — it was simply being fed a bad answer.
+- **Verified against the REAL stale data.** The fix was run over a *copy* of the live
+  `~/.mainguard/mainguard-daemon.db` (read-only by construction — `ReconcileJails` persists nothing) against
+  the real Docker engine, with this entry's exact 15 rows in it. Result: **15 entries stranded — the 14
+  phantom `Working` rows plus one equally stale `Verified` — and the one genuinely live agent
+  (`f1574a0ba9b443ffa2a5b2f9345df622`, the same single container `docker ps -a` reports) correctly spared**,
+  still reading `live=True` / "not verified yet". Terminal rows were skipped and kept their own wording
+  ("already merged" / "rejected in review"). The DB's state tally after the pass was **byte-identical**
+  (15 Working · 7 Merged · 4 Discarded · 3 Rejected · 1 Verified) — nothing destroyed, which is the point.
+  Every one of those 14 rows now renders with Verify withheld, Resume offered, and the honest sentence
+  *"the agent's sandbox is gone — resume the entry to give it one, or discard it"*.
+- **Tests:** `Mainguard.Tests/MergeQueueJailReconcileTests` (12, unit) pins the rules — including the two
+  that carry the design: merge state never moves, and liveness does not survive a restart.
+  `Mainguard.Server.Tests/MergeQueueJailReconcileDockerTests` (3, `RequiresDocker`) drives the real
+  reconciler over a real registry against real jails killed **out of band**: the killed entry is stranded,
+  the survivor untouched, a returning jail un-strands it, and a merely *paused* jail is not stranded (Docker
+  says `"paused"`, not `"running"`; reading liveness as `Running` would strand every entry the kill switch
+  had frozen). 94 merge-queue + 23 reconcile/resume Docker tests green; full solution build clean.
+- **One flake worth recording for future legs**, since it cost a diagnostic detour: `QueueEntryResumeDockerTests`
+  failed once with `OCI runtime exec failed … current working directory is outside of container mount
+  namespace root -- possible container breakout detected`. That is an OrbStack `docker exec` flake, not a
+  regression — confirmed by stashing the change (passed), restoring it (passed), and running the combined
+  Docker suites (23/23). If you see that message, re-run before chasing it.
+
+## 25. [CLOSED — not a gap. The pause affordance lives on a different surface] Right-clicking a Merge Queue row produces no context menu
+
+- Right-clicked a live queue row (`swift rclick.swift`, real `rightMouseDown`/`rightMouseUp` CGEvents at
+  the row's real screen coordinates, confirmed by cross-checking the window's accessibility-reported
+  position) — no context menu appeared, no visible change at all (`186-rightclick-queue-row.png`).
+- Not chased further this leg (time budget) to determine whether: (a) queue rows simply have no
+  right-click menu by design (all actions are the visible Verify/Resume/Discard buttons, which would
+  make this a non-issue and G1's "the actual right-click context-menu pause" refers to a different
+  surface entirely — e.g. a coordinator/agent row elsewhere, not the merge-queue rail), or (b) a context
+  menu exists but wasn't hit due to a coordinate or hit-testing problem. Needs a deliberate look at
+  wherever pause is actually meant to be triggered by right-click, if that surface exists at all — grep
+  for `ContextMenu`/`ContextFlyout` in the Agents.UI views before assuming this is a real gap.
+
+### CLOSED — answer (a). Queue rows have no context menu **by design**, and G1's right-click pause is a different panel
+
+- `QueueRailView.axaml` contains **zero** `ContextMenu`/`ContextFlyout` — the grep the entry itself
+  suggested. Every queue-row action is a visible button and always has been: `OpenReview`, `Verify`,
+  `Resume`, `ClearStalledVerification`, `BeginDiscard` → `ConfirmDiscard`/`CancelDiscard`. There is nothing
+  a right-click was supposed to reveal, so the null result was the correct behaviour, not a miss.
+- **G1's "right-click context-menu pause" is the Resource Monitor**, not the merge queue:
+  `Mainguard.Agents.UI/Views/ResourceMonitorView.axaml:83-95` puts a `ContextMenu` on each agent row with
+  exactly two items — `{Binding PauseMenuLabel}` → `PauseOrResumeCommand`, and "End task" →
+  `EndTaskCommand`. That is the surface the matrix row means; the walkthrough right-clicked the wrong panel.
+- No code change. Re-test G1 against a Resource Monitor row in a future leg.
+
+## 26. [Confirmed via real UI click] G4 — Stop coordinator, full flow
+
+- Clicked the real "Stop coordinator" button (after first miscalculating the click point as an absolute
+  screen coordinate instead of window-relative + window-origin — corrected via `System Events`'s
+  reported window position, a reusable lesson for future legs: **always re-derive `window origin +
+  relative point` fresh, never assume a screen position holds across app activations**, since this
+  session the window moved from X=449 to X=216 between two activations of the same app).
+- Correctly showed a confirmation dialog first: *"Stop the coordinator? This terminates the
+  coordinator's CLI and its sandbox. Anything running in its terminal ends; its sub-agents keep running
+  until you stop them."* (`184-stop-coordinator-correct-coords.png`) — accurate, honest copy.
+- Confirmed: the coordinator panel cleanly returned to the CLI-picker/"Start coordinator" empty state,
+  and — verifying the dialog's own claim — the Merge Queue's entries were untouched, still showing their
+  prior state immediately after (`185-stop-coordinator-confirmed.png`). Matrix row G4 is now UI-click-
+  verified for the coordinator-stop half. (Note: this session's queue rows turned out to be the stale
+  #24 entries, not real live sub-agents, so "sub-agents keep running" wasn't independently re-provable
+  against a real container this leg — but the panel behavior itself is correct regardless.)
+
+## 27. [Confirmed via real UI click] H7 — remaining two themes (Atelier, System)
+
+- Both selected via `System Events` menu-item clicks (`View > Theme > …`), which proved more reliable
+  than raw CGEvent clicks for submenu tracking (a raw CGEvent click on "Atelier" visually looked like a
+  no-op — see below — while the accessibility-driven click was unambiguous).
+- **Atelier**: confirmed applied via pixel sampling, not just eyeballing — chrome/sidebar background
+  measurably shifted from Midnight Loom's cool `rgb(25,28,33)` to a warm dark `rgb(34,31,27)`
+  (`176`/`178`/`179-atelier-via-systemevents.png`). Worth a note for future legs: Atelier and Midnight
+  Loom are both dark themes close enough in value that a quick visual glance can miss the switch
+  entirely — pixel-sample, don't just eyeball, when confirming theme changes between two dark themes.
+- **System**: confirmed correctly following the OS's current Dark appearance
+  (`defaults read -g AppleInterfaceStyle` → `Dark`; app chrome rendered at Midnight-Loom-equivalent
+  `rgb(25,28,33)`, screenshot `180-system-theme.png`).
+- **All 4 themes + System are now UI-click-verified** across this and earlier legs (Daylight Loom,
+  Graphite from an earlier leg's #16; Atelier and System this leg). H7 is CLOSED as a matrix row.
+
+## 28. [Confirmed via real UI click, with a real finding] G1 — the right-click pause context menu lives on the Resource Monitor row, exactly as #25 concluded
+
+- **Step:** 023. Right-clicked the "unknown / Working" row on the Resource Monitor panel with a real
+  `CGEvent` right-click (`.rightMouseDown`/`.rightMouseUp`) — a native-looking dark popup with **Pause**
+  and **End task** (red) appeared immediately (`189-g1-context-menu-pause-endtask.png`). This is the G1
+  affordance; #25's conclusion (queue rows have no context menu, the pause lives on the Resource Monitor
+  instead) is confirmed correct a second way.
+- **Clicking Pause fired a real RPC** (`~/.mainguard/logs/rpc.log`):
+  `PauseAgent { agent_id=3cd48ab2bc1b4678b475749f8e9521dc }` →
+  `PauseAgentResponse { paused=False, reason=this agent has no live jail to pause }`. Cross-checked
+  against `docker ps -a`: no container for `3cd48ab2…` exists at all (only `f1574a0b…` is a live
+  `mainguard-agent` container). So the RPC's honest refusal is *correct* — that agent really has no jail
+  — but it is almost certainly **not the agent the row visually represented**: `ListAgents` at that exact
+  moment reported exactly one `Working` agent, `f1574a0b…`, not `3cd48ab2…` (`190-g1-pause-honest-
+  refusal-menu-closed.png` — note the row still reads "unknown / Working / 1% / 0.2 GB" after the
+  refusal, i.e. still describing the *live* agent's metrics).
+- **Not filed as a confirmed code bug** — `ResourceMonitorViewModel`/`AgentUsageRowViewModel` were read
+  and look correct (rows are matched and updated by `AgentId`, never reused across ids; a
+  `RelayCommand`'s captured `AgentId` is read from the row instance at invocation time, which is normal
+  correct MVVM binding, not a stale-closure bug). The much more likely explanation: right-click opened
+  the menu against whatever row existed at that instant (very plausibly still `3cd48ab2…`, the just-
+  fixed #23 coordinator, mid-teardown/replacement), and the several-second gap this leg's manual
+  screenshot-crop-recalibrate cycle took before the actual click let the background refresh swap that
+  row out for `f1574a0b…` underneath — while both render as the visually **identical** "unknown /
+  Working" label, so a human (or an agent driving by screenshots) cannot tell them apart by sight. A
+  fast retry (right-click → click within ~0.6s) produced no RPC at all, consistent with a narrow timing
+  window rather than a reproducible binding defect.
+- **Worth fixing regardless of root cause, flagged for a future pass, not chased further here**: two
+  different agents rendering with the exact same "unknown" label (because neither has a
+  `mainguard.agent.role`/`mainguard.kind` tag) is itself a real usability gap — a human has no way to
+  distinguish which "unknown" row is which agent, which is exactly what made this investigation
+  ambiguous. Once every jail this app spawns carries proper labels (new jails already do, per #19/#20's
+  fix), this specific ambiguity naturally goes away; it only affects pre-label-era orphans.
+- **Matrix row G1 is UI-click-verified**: the context menu exists, is reachable by right-click, and
+  Pause/End task both wire to real RPCs with honest (non-crashing, non-silent) responses.
+
+## 29. [Methodology note, not a Mainguard bug] Settings-sidebar "navigation failure" was environmental, not a defect
+
+- A prior leg observed CGEvent clicks landing on the correct Settings sidebar item (confirmed via
+  accessibility coordinates) with the main panel never switching content — logged tentatively as a
+  possible navigation bug pending confirmation, since it would have blocked reaching H2/I2/B1 entirely.
+- The user manually reproduced the same Settings sidebar navigation on their own machine immediately
+  after and confirmed it switches panels correctly every time. The root cause was the user actively
+  using their own mouse/keyboard on the same machine at the same time automation was running — competing
+  real input intermittently stole focus/clicks from the synthetic ones, producing an apparent "click
+  landed, nothing happened" symptom that had nothing to do with the app.
+- **Not a product defect. Standing methodology rule going forward: live-UI automation legs should not
+  run while the user is concurrently using the machine for anything else** — if a click's effect can't be
+  confirmed by screenshot content change, prefer re-running cleanly over concluding a bug, especially for
+  navigation-only interactions that are cheap to retry.
+
+## 30. [Confirmed via real UI click, real repro] I2 — daemon skew refresh confirmed with a genuine orphaned daemon
+
+- Found a live, naturally-occurring version skew in Settings → About: the running app reported a newer
+  commit than its still-alive child daemon process (which hadn't been restarted across several
+  intervening commits). Deliberately reproduced I2's exact scenario rather than just observing it: killed
+  only the app process (`kill -TERM`), confirmed via `ps` that the daemon survived as an orphan
+  (reparented to PID 1), then relaunched the app fresh.
+- **Result: the new app instance correctly detected and killed the stale orphaned daemon and spawned a
+  new one.** `ps` before/after confirmed the old daemon PID gone, a new daemon PID parented to the new app
+  PID. Reopened the repo — the Merge Queue rebuilt correctly (including the `c1e4c3e` jail-liveness
+  wording rendering live), and Settings → About showed the App's own version now matching current HEAD.
+- **Residual, build-tooling-only, NOT a live product bug**: even after the successful relaunch, the
+  daemon's own version stamp still lagged the app's — the on-disk payload DLL the daemon spawns from
+  hadn't been rebuilt to the latest commit despite a full `dotnet build Mainguard.slnx -c Release` (likely
+  MSBuild's incremental-skip logic or a separate bundle/publish step not triggered by plain `dotnet
+  build`). Not chased further — this is a local dev-build artifact; a real release pipeline builds app and
+  daemon payload atomically, so this specific mismatch couldn't occur outside a dev loop like this one.
+- **Matrix row I2 is UI-click-verified**: the core claim (a skewed/stale daemon gets killed and refreshed
+  on app launch, and the queue rebuilds against the fresh daemon) holds.
+
+## 31. [Confirmed via real UI click] H2 — egress allowlist fully confirmed (view, add, remove, live re-render)
+
+- Opened the real "Agent Network Allowlist" window via the Coordinator panel's "Network..." button.
+  Confirmed the pre-allowlisted hosts render (Anthropic API, NuGet, OpenAI, crates.io, npm, PyPI, more).
+  Filled the "Allow a host" form with real synthetic keystrokes (Name="Test Host",
+  Host="test-egress-check.example.com"), confirmed the text landed correctly via screenshot before
+  submitting, clicked Allow — the form cleared and the new host rendered live in the list, correctly
+  tagged "Custom". Removed it again via its own Remove button, confirmed gone — left the environment
+  clean.
+- **Matrix row H2 is UI-click-verified for the allowlist CRUD + live-re-render half.** The adversarial
+  half (curl a non-allowlisted host from inside a live jail → confirm it's actually blocked + a
+  Sandbox-health event) was NOT exercised this leg — no live jail was running with an active shell to
+  drive it; needs a follow-up leg with a real agent attached.
+
+## 32. [Confirmed via real UI click, real broken test] D2 — verify FAIL path confirmed live (one of three legs)
+
+- Built a new adapter (`scripted-fail`, `~/mainguard/adapters/bin/scripted-fail` +
+  `registry/scripted-fail.json`) that commits a change genuinely breaking `calc.js`'s `add()` (returns
+  `a + b + 1`) against the e2e-fixture's real `test.js`, which asserts `add(2,3) === 5`.
+- **Methodology note, not a bug**: the daemon's adapter registry is scanned at daemon startup, not
+  live-reloaded — the newly-created `scripted-fail.json` wasn't selectable until a full app+daemon
+  restart. Consistent with how #23's investigation described daemon-side state generally; worth knowing
+  for future scripted-adapter work.
+- **Methodology note, not chased as a bug**: the CLI-picker ComboBox's dropdown popup never visibly
+  rendered under either raw CGEvent clicks or AppleScript `System Events click at` — tried both, several
+  coordinate variations, across a fresh app relaunch. What DID work reliably: clicking the control once to
+  give it focus, then driving selection with the Down arrow key via `System Events key code 125`, checking
+  the displayed value after each press. This is a legitimate accessible interaction path (not a hack), so
+  it wasn't logged as a confirmed defect — but the popup itself never being visible is worth a look in a
+  dedicated pass since it may indicate an Avalonia `ComboBox` popup rendering/hit-test issue specific to
+  synthetic input.
+- Selected `scripted-fail` via the above method, clicked "Start coordinator" — the agent spawned,
+  committed the deliberately-broken change, and a new queue entry (`c03bfe83…`) appeared. Clicked its
+  **Verify** button.
+- **Result: the entry correctly returned `tests failed — node test.js` as the reason and stayed in
+  `Working` state** — not silently retried, not falsely marked Verified. This is exactly what D2's core
+  claim requires.
+- **Matrix row D2 is PARTIALLY UI-click-verified**: the genuine-test-failure leg is confirmed. The other
+  two legs of the 3-way trap — a mis-tokenized verify command, and a missing toolchain — still need their
+  own scripted adapters and haven't been exercised live yet.
+
+## 33. [Confirmed via real UI click; also a confirmed automation-methodology finding] D2 — mis-tokenized verify command leg, plus the CLI-picker dropdown genuinely won't commit a selection under any tested technique
+
+- Built `scripted-badcmd` (`~/mainguard/adapters/bin/scripted-badcmd` + `registry/scripted-badcmd.json`)
+  that commits `.mainguard/verify: node test.js && echo done` — a `&&` token that survives argv
+  tokenization and needs a shell.
+- **Automation finding, escalated from #32's "methodology note"**: this leg tried FOUR distinct techniques
+  to select `scripted-badcmd` in the CLI-picker ComboBox — (1) a raw CGEvent click on the dropdown, (2)
+  `System Events key code 125` (Down arrow) after clicking to focus, (3) `System Events click` on the
+  actual accessibility-tree menu item (confirmed via `entire contents of window 1` that the popup really
+  does open and really does list `scripted-badcmd 1.0.0` as a real `menu item` element), and (4) a direct
+  `perform action "AXPress"` on that same menu item. **All four left the bound value reading
+  `claude-code 2.1.234`, unchanged, with the popup accessibility tree still showing itself open afterward.**
+  #32's "arrow-key selection works reliably" conclusion does not reproduce this leg — worth re-testing
+  fresh in case it's state-dependent (e.g. only reproducible with a specific set of adapters registered, or
+  only after several prior selections in the same session), but as observed this is a real, repeatable
+  automation dead-end, not a fluke.
+  - Worked around by using `SpawnAgentAsync` via RPC for the CLI-selection step only (setup/plumbing, not
+    the interaction under test), then doing the actual assertion — clicking the row's real Verify button —
+    via genuine UI automation, consistent with the pass's own "RPC only for setup, never for the thing under
+    test" rule.
+    - **Caveat learned the hard way in #37 — read this before reusing the workaround.** The harness builds
+      the `SpawnAgentRequest` by hand, so it carries **none** of what the real client attaches to a spawn:
+      no `extra_env` (the user's `llm_env_*` custom BYOK keys), no `cli_credentials`, no `cli_settings`.
+      That is invisible and harmless while the thing under test is downstream of the spawn (Verify, the
+      queue, a flagged change), and it silently becomes the measurement the moment the claim is about what
+      a spawn CARRIES into the jail — which is exactly how #37 was logged as a MEDIUM product defect that
+      does not exist. When in doubt, check the request in `~/.mainguard/logs/rpc.log`: the real client
+      multiplexes every call onto one connection, so a `SpawnAgent` that is request `:00000001` on its own
+      fresh peer port is the harness, not the app.
+  - **Worth a dedicated look**: if a screen-reader or switch-control user hits the same wall via real
+    assistive tech (not just synthetic automation), this ComboBox has a real accessibility defect, not just
+    an automation-friendliness one — the AX tree exposing correct `menu item` elements that don't actually
+    commit on click/AXPress is exactly the shape of bug that would manifest that way.
+- Clicked **Verify** on the resulting `6fef552a…` entry. **Result**: `Can't verify — The verification
+  command contains '&&', which needs a shell — and this command is run argv-style with no shell, so '&&'
+  would be passed to 'node' as an ordinary argument and the rest of the line would never run. Nothing was
+  executed and no verification was recorded... Wrap it in a shell instead: sh -c "node test.js && echo
+  done"` — a third wording, clearly distinguishable from both the genuine-failure message (#32) and the
+  missing-toolchain message (#34 below).
+- Discarded the entry afterward via a real UI click (confirm dialog + "Yes, discard").
+- **Matrix row D2, mis-tokenized-command leg: CONFIRMED.**
+
+## 34. [Confirmed via real UI click] D2 — missing-toolchain leg
+
+- Declared `.mainguard/toolchain: rust-stable` directly on the fixture's `main` branch (a real, catalogued
+  toolchain id — `ToolchainCatalog.cs` — that the base jail image does not actually carry pre-installed).
+  Pushed straight to the daemon's bare mirror via the `mainguard-local` remote; confirmed this needed no
+  daemon restart, since the toolchain baseline is read live off the mirror at verify time (`git show
+  main:.mainguard/toolchain`), not cached — unlike the CLI-adapter registry (#32).
+- Clicked **Verify** on the already-`Working` `c03bfe83…` entry. **Result**: `Can't verify — Could not
+  provision the verification toolchain [rust-stable] declared by repo '...': 'rust-stable' is declared but
+  absent from the worker's jail — the probe \`cargo --version\` exited 127. Verification was NOT run; this
+  is a provisioning failure, not a failing test.` — a third, clearly distinct wording.
+- **Reverted the toolchain declaration on `main` immediately after** (a follow-up commit removing
+  `.mainguard/toolchain`, pushed to the mirror) so it wouldn't silently block every later verification this
+  session — confirmed via the next spawn's successful `Working`→`Verified` transition that the revert took.
+- **Matrix row D2, missing-toolchain leg: CONFIRMED.** All three legs of D2's 3-way trap are now
+  UI-click-verified with genuinely distinguishable wording, satisfying the row's full requirement.
+
+## 35. [Confirmed via real UI click, full loop] D5 — flagged-change (P2-11)
+
+- Built `scripted-ci` (`~/mainguard/adapters/bin/scripted-ci` + `registry/scripted-ci.json`) that commits a
+  new `.github/workflows/ci.yml`.
+- Spawned via the RPC-for-setup-only workaround (#33), clicked **Verify**: entry reached **Verified** but
+  the rail immediately showed "1 flagged change needs acknowledgment" with no Merge affordance on the row.
+- Opened **Review**: cockpit renders a red "FLAGGED — acknowledge each to enable merge" banner naming
+  `.github/workflows/ci.yml`, reason "CI workflow changed (runs with repo credentials)", the real diff
+  content in the right-hand pane, and the footer's **Merge** button visibly disabled.
+- Clicked **Acknowledge**: the flagged-item badge flips to "Acknowledged", the footer text changes to
+  "ready to merge", and **Merge** becomes enabled (purple, clickable) — confirmed via screenshot, not
+  inferred.
+- **Matrix row D5: CONFIRMED, full block→acknowledge→unblock loop**, not just the initial flag.
+
+## 36. [Methodology note, not a bug] E6 — Clear stalled verification: structurally hard to force-reproduce live
+
+- Read `MergeQueue.RunVerificationAsync` closely: BOTH exit paths (the successful-run branch and the
+  exception-catch branch) unconditionally move the entry out of `Verifying` before the method returns —
+  there is no code path where a run ends and leaves the entry stuck in `Verifying` with `_verifying` no
+  longer containing its id.
+- Read `ResumeAfterRestartAsync`: a daemon restart that catches an entry mid-run explicitly either re-drives
+  the verification (if the jail is still there) or strands the entry back to **Working** (if the jail is
+  confirmed gone) — never leaves it sitting in `Verifying` for a human to `Clear`.
+- `TryClearStalledVerification`'s own doc comment names the actual audience this exists for: a repo whose
+  queue is never rebuilt after a restart (so no resume pass ever runs against it), a container-runtime probe
+  that cannot even execute, or some other freeze mechanism entirely — none of which are honestly
+  reproducible via realistic, bounded-time live UI actions.
+- **Conclusion: this is a legitimate coverage gap arising from the system's own thoroughness, not a
+  discovered defect.** The ordinary "verification interrupted" path self-heals reliably in both directions
+  (re-run or strand-to-Working), which is exactly why forcing E6's specific precondition live is hard — the
+  escape hatch exists for failure modes the self-healing code can't detect, not for the common case.
+- **Concrete next step for whoever revisits this with more time budget**: try `docker kill -SIGSTOP` (not
+  `-SIGKILL`) on a jail mid-`exec` to see whether the daemon-side probe call hangs indefinitely rather than
+  throwing promptly — that's the one shape of failure the current self-healing code might not catch, since
+  both settle-paths in `RunVerificationAsync` require the awaited call to actually complete (successfully or
+  by exception) to run at all.
+
+## 37. [CLOSED — NOT A DEFECT, commit `72e878d4`. The measurement, not the product, was wrong] B1 (adjacent) — the "Custom key" credential is saved but never delivered to the agent's environment
+
+- Row B1 asks about the primary Anthropic BYOK path (`Settings → AI Providers → Store an API key`), which
+  validates against the live Anthropic API before saving — no real Anthropic key was available this
+  session, so that specific path's save-then-isolate claim is still genuinely open. Settings window itself
+  was reached and confirmed rendering correctly via `Cmd+,` (a real separate window, not a popup — clicks
+  landed reliably on it unlike the CLI-picker ComboBox).
+- Used the adjacent, explicitly-not-health-checked **Custom key (any environment variable)** field instead,
+  since it doesn't require a real credential to test: saved `TEST_CUSTOM_MARKER` = a recognizable fake
+  value via real keystrokes + a real click. UI confirmed: `Stored TEST_CUSTOM_MARKER (custom keys are
+  stored without provider validation) — it is injected into every agent's environment.` The "Stored" badge
+  persisted correctly across a later full app+daemon restart, confirming the keyring save itself works.
+- Spawned a fresh `scripted` coordinator, checked ground truth on the host:
+  - `docker exec <jail> env` — the marker does **not** appear anywhere in the container's process
+    environment. Correct, no leak, matches the B5 secrets-delivery contract (secrets shouldn't sit in plain
+    container env).
+  - `/run/secrets/agent/agent.env` (the documented delivery path per an earlier session's adapter script
+    convention) — present, correctly `-r-------- agent:agent` (0400), but **the file is empty**.
+- **Ruled out timing/caching**: killed and relaunched the app+daemon fully (fresh daemon process, fresh read
+  of the OS keyring), spawned a second fresh agent against the same stored key — `agent.env` still empty.
+- **Confirmed as a real defect, not a security leak**: the credential saves correctly and does NOT leak into
+  the container environment (fails safe), but the feature's own UI claim — "injected into every agent's
+  environment" — does not hold for a `scripted`-class adapter. The secrets file the delivery mechanism is
+  supposed to populate exists but is never written to for this credential type/adapter combination.
+- **Severity: MEDIUM.** Not a security issue (nothing leaks), but a real user relying on this for an
+  OpenRouter/custom-provider CLI would have a silently non-functional integration — the agent's process
+  would fail to authenticate with no error pointing at the actual cause (an empty secrets file it never
+  checks the emptiness of).
+- **Not chased further**: whether this is scoped correctly for `claude-code`-class adapters (which declare
+  a real `apiKeyEnvVar` in their registry manifest, unlike `scripted`'s empty one) wasn't tested — worth a
+  follow-up with a manifest that actually declares a custom env var name to see if THAT path works and only
+  the unconditional "every agent" framing in the UI copy is what's wrong, versus the delivery mechanism
+  itself being broken for all adapters regardless of declaration.
+
+### CLOSED — commit `72e878d4`. The delivery mechanism works; the spawns that were measured never carried the key in the first place
+
+The above is a careful, correct set of observations with one wrong join: **the agents it inspected were
+not spawned by the client.** #33 introduced an RPC workaround for the CLI-picker ComboBox ("use
+`SpawnAgentAsync` via RPC for the CLI-selection step only"), and that harness constructs a
+`SpawnAgentRequest` by hand. It has no keyring and never populates `extra_env`. Every jail examined here
+therefore had, correctly and by construction, an empty `agent.env`.
+
+**How that was established, in order:**
+
+- **The daemon's own `rpc.log` distinguishes the two callers.** The running client multiplexes every RPC
+  onto ONE connection — around the spawns in question that is `peer=127.0.0.1:54543`, request ids
+  `0HNO0M77PN5UU:00000003 … :00000025` (six stream pumps, ListAgents, HarvestAgentCredentials, …). Both
+  spawns cited above arrived on their own fresh connections (`:54481` and `:54575`) whose **first and only
+  request was `SpawnAgent`** — the harness's signature, not the app's. Both logged `extra_env=[]`.
+- **The keyring entry was genuinely there and genuinely readable.** `~/.mainguard/Keyring/
+  llm_env_TEST_CUSTOM_MARKER.keyring` was written at `00:58:26Z`, i.e. *before* both spawns (`00:58:52Z`
+  and `01:00:08Z`) — so "the key existed but did not travel" was true, and the reason was the caller.
+- **The client leg was then run in isolation**, against the real user keyring, in a throwaway harness that
+  reflects into `DaemonBackedOrchestrator.CollectCustomEnvKeys()`: it returned
+  `TEST_CUSTOM_MARKER = <39 chars>`. The client reads the keyring correctly.
+- **Confirmed live through the real UI, which is the decisive leg.** Reopened the fixture repo, opened the
+  Coordinator panel, clicked **Restart** — a genuine UI click, no RPC shortcut — and the daemon logged:
+  `SpawnAgentRequest { … agent_kind=claude-code, role=coordinator, extra_env=[EnvEntry { name=TEST_CUSTOM_MARKER, value=*** }], … }`.
+  The custom key does reach the wire on a real spawn.
+- The daemon-side remainder (`AgentGrpcService` → `AgentSpawnService` → `SandboxAgentLauncher.BuildSecrets`
+  → `DockerSandboxEngine.WriteSecretFileAsync`) is straight-line and unconditional for `extraEnv`, and is
+  now **proved rather than read**: see the new tests below.
+
+**What was actually wrong, and is fixed:** the page's own sentence — "it is injected into every agent's
+environment" — is the one claim on that surface that is not literally true. A jail running an **external
+pull request's** code is spawned `withoutHostCredentials` and deliberately inherits neither the user's
+`llm_env_*` entries nor any harvested CLI login (`AgentSpawnService.SpawnAsync`; the comment there calls it
+the untrusted-agent boundary). The copy now names that exception, in both the ViewModel's confirmation
+message and the page's blurb.
+
+**What was missing, and is added:** nothing covered the hop between "the keyring holds `llm_env_*`" and
+"the jail's env-file holds `NAME=value`", which is exactly why this took a live-UI leg plus a log
+forensics pass to answer. Two new tests close it:
+
+- `Mainguard.Tests/CustomEnvKeyDeliveryTests.cs` — the client leg over an in-memory keyring and an
+  uncontacted `DaemonClient`: the `llm_env_` prefix is stripped before the wire (a variable named
+  `llm_env_FOO` inside the jail is invisible to the CLI and would look exactly like this bug), every
+  stored entry travels, the other keyring families (`llm_<provider>`, `cli_login_*`, `token_*`) are never
+  injected as environment variables, an unreadable value is skipped rather than shipped as an empty
+  variable, and "nothing stored" yields an empty set rather than the `null` that means *fall back to the
+  daemon's per-repo cache*.
+- A fourth `[RequiresDockerFact]` in `Mainguard.Server.Tests/Agents/SecretDeliveryDockerTests.cs` — the
+  end-to-end leg into a **real jail**, for precisely the combination doubted above: an installed adapter
+  declaring **no** `apiKeyEnvVar` (the `scripted` shape) and no model key, so the custom entry is the only
+  thing in the file. The production `BuildSecrets` composes it (a hand-rolled dictionary would still pass
+  if `BuildSecrets` dropped `extraEnv`), and the sentinel-framed in-jail probe asserts the file is
+  non-empty and carries the whole `NAME=<nonce>` line at `0400` owned by the agent uid — with a paired
+  negative control that `llm_env_` does not survive into the name. **Passes against a real jail.**
+
+**Methodology lesson, worth more than the entry itself:** the RPC-for-setup workaround from #33 was
+correctly scoped for *that* leg ("RPC only for setup, never for the thing under test"), and silently
+became the thing under test here — the spawn's payload *was* the measurement. When a leg's claim is about
+what a spawn CARRIES, the spawn itself has to be a real UI action, or the request must be inspected in
+`~/.mainguard/logs/rpc.log` before any conclusion is drawn about the jail. `rpc.log` answers this in one
+grep and would have closed the entry in minutes.
+
+**Row B1 status is unchanged:** the primary Anthropic BYOK path still needs a real key to exercise its
+validate-then-store leg, and remains genuinely open.
+
+### New finding while verifying this entry: a reproducible client SIGABRT (adds to #12)
+
+Restarting the coordinator from the Coordinator panel crashed the client, and this is the first repro with
+a trigger attached:
+
+- Real UI clicks: Coordinator → **Restart**. The daemon logged `StopAgent` OK, then the follow-up
+  `SpawnAgent` **at `01:11:17.25Z`**, and ~90 ms later every one of the client's six stream RPCs ended at
+  once (`01:11:17.345Z`) and `TerminalService/Attach` faulted with *"Can't write the message because the
+  request is complete."* The spawn then failed `Internal` at `01:11:18.36Z` with a Docker
+  `TaskCanceledException` — i.e. the **client died first** and its death cancelled the in-flight spawn,
+  not the other way round.
+- `~/Library/Logs/DiagnosticReports/Mainguard-2026-08-23-031119.ips`: `EXC_CRASH (SIGABRT)`, `abort()
+  called`, faulting thread `com.apple.main-thread`, stack
+  `IL_Throw → DispatchManagedException → DispatchExSecondPass → TerminateProcess → PROCAbort` — an
+  **unhandled managed exception on the UI thread**, which is the .NET "no handler anywhere" abort.
+- Not from `StartCoordinatorCoreAsync`: that method catches `OperationCanceledException`,
+  `RpcException` and bare `Exception` on every path. The unguarded neighbours are `RunStartupAsync` (no
+  catch) and the stop leg it awaits, and `[RelayCommand]`'s default `AsyncRelayCommand` rethrows onto the
+  synchronization context rather than swallowing — so an exception escaping `StopCoordinatorCoreAsync`
+  during a Restart would land exactly here. **Hypothesis, not yet confirmed** — the crash report carries no
+  managed exception type, so the next leg should reproduce it with the client's stderr captured (run the
+  head from a terminal rather than the .app bundle) to name the exception before changing anything.
+- Severity: **HIGH** — it takes the whole app down, and Restart is an ordinary, unremarkable action.
+- **2026-08-23 — root-caused and fixed under #12 (commit `cc8f4c36`).** The hypothesis above was correct:
+  the unguarded neighbour was `RunStartupAsync`, and `[RelayCommand]`'s `AsyncRelayCommand` rethrow is
+  indeed what turned it fatal — the `.ips` frame layout proves it without needing the terminal repro (see
+  #12's 2026-08-23 block for the reading). Two layers of fix plus three `[AvaloniaFact]` regressions that
+  drive the command through `ICommand.Execute`, the async-void path a click actually takes. Live
+  re-verification is still outstanding — the screen was locked for this leg.
+
+## 38. [Confirmed via real UI click, real feature] H6 — deep link activation
+
+- Verified the `mainguard://` scheme end to end, not just parsed. `Info.plist` in the built bundle
+  (`build/macos-bundle/out/Mainguard.app/Contents/Info.plist`) declares `CFBundleURLTypes` for scheme
+  `mainguard`; `lsregister -dump` confirmed macOS LaunchServices has it bound to this exact bundle
+  (`trustedCodeSignatures` present, `roles: Viewer`). Code path is real too:
+  `Mainguard.App.Shell/App.axaml.cs:341-350` wires `IActivatableLifetime.Activated` →
+  `ProtocolActivatedEventArgs` → `HandleDeepLink`, which parses via the pure `DeepLinkParser`
+  (`Mainguard.Git/Security/DeepLink.cs`) and, for `open-agent/<id>`, calls
+  `vm.ShowAgentCommand.Execute(agentId)` (`open-repo`/`open-pr` are activation-only today — explicitly
+  documented in the source as a deliberate follow-up, not a bug).
+- **Repro**: navigated to Repo viewer via a real click (`248`), confirming a clean starting state distinct
+  from any agent view. Ran `open "mainguard://open-agent/b5c89f5588764f808e952cd3bc97156b"` (a real live
+  coordinator's id) from a terminal — a genuine OS-level protocol activation, not an in-process bypass.
+  Result (`249`): the window switched to a full three-column agent-detail layout (Terminal + Agent
+  diff/Plan/Merge-to-main + Staging) scoped to that exact agent id, header reading
+  `scripted · agent/b5c89f5588764f808e952cd3bc97156b...` — visually and structurally distinct from both the
+  plain Repo viewer and the plain Coordinator panel (compare `247`). The Coordinator sidebar item is also
+  highlighted as active.
+- **H6 is genuinely working** for the one command it implements. No bug found; `open-repo`/`open-pr`
+  activation-only behavior is pre-existing, intentional, and documented in the source — not re-logged here.
+
+## 39. [Confirmed via real UI click, real feature] C3 — OSC 52 clipboard
+
+- Verified real OSC 52 support end to end, through the actual composer UI, not a background RPC bypass.
+  Implementation lives in `Mainguard.Agents.UI/Controls/VtScreen.cs:336-373` — the VT/ANSI parser
+  recognizes an OSC string starting `52;`, decodes the base64 payload (ignoring `?` query payloads, which
+  is the correct security posture — never echo the *current* clipboard back to the jail), and raises
+  `ClipboardCopyRequested`.
+- **Repro**: set a known clipboard baseline (`PRE-C3-BASELINE`, confirmed via `pbpaste`). Clicked the
+  Coordinator's composer text field, pasted (`Cmd+V`, via the system clipboard, to avoid AppleScript's
+  backslash-escaping breaking a literal `printf '\033]52;...'` string — a keystroke-layer limitation, not
+  an app issue) `printf '\033]52;c;T1NDNTItVEVTVC1WQUxVRQ==\a'` (`250`/`251`, base64 of
+  `OSC52-TEST-VALUE`), reset the system clipboard to a second distinct baseline
+  (`PRE-C3-BASELINE-2`) so any change could only be attributed to the app, then clicked **Send** — a real
+  click on the real composer button, which delivers into the agent's live shell exactly like the C2 leg's
+  confirmed-working prompt delivery.
+- **Result (`252`)**: the terminal echoed `$ printf '\033]52;c;T1NDNTItVEVTVC1WQUxVRQ==\a'` and returned to
+  a clean `$` prompt (the command ran without error). `pbpaste` immediately after: `OSC52-TEST-VALUE` — the
+  macOS system clipboard was genuinely overwritten by the jail's terminal output, through the app's real
+  rendering path.
+- **C3 is genuinely working.** No bug found. Leftover: the real system clipboard was left holding the test
+  marker `OSC52-TEST-VALUE` at the end of this test — harmless, safe to overwrite, not the user's own prior
+  clipboard content (which was not captured before this leg started and could not be restored).

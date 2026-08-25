@@ -180,7 +180,7 @@ public partial class AnalyticsViewModel : ViewModelBase, IDisposable
             .Select(w => new DateTimePoint(w.WeekStart.ToDateTime(TimeOnly.MinValue), w.Removed)).ToList();
 
         var success = ChartTheme.Color("SuccessBrush", "#42B968");
-        var danger = ChartTheme.Color("DangerBrush", "#F87171");
+        var danger = ChartTheme.Color("DangerBrush", "#E5484D");
 
         ChurnSeries = new ISeries[]
         {
@@ -230,7 +230,7 @@ public partial class AnalyticsViewModel : ViewModelBase, IDisposable
         var counts = top.Select(c => c.Commits).ToArray();
         var names = top.Select(c => c.Name).ToArray();
 
-        var accent = ChartTheme.Color("AccentBrush", "#8B8BF5");
+        var accent = ChartTheme.Color("AccentBrush", "#8487F0");
         var textPrimary = new SolidColorPaint(ChartTheme.Color("TextPrimary", "#E6E9EF"));
         var muted = new SolidColorPaint(ChartTheme.Color("TextMuted", "#8A93A6")) { StrokeThickness = 1 };
         var hairline = new SolidColorPaint(ChartTheme.Color("BorderHairline", "#262B33")) { StrokeThickness = 1 };

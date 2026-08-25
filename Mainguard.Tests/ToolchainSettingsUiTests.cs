@@ -261,6 +261,8 @@ public class ToolchainSettingsUiTests
               "version": "3.12.13",
               "payloadUrl": "https://example.invalid/cpython-3.12.13.tar.gz",
               "sha256": "{{PythonSha}}",
+              "payloadUrlArm64": "https://example.invalid/cpython-3.12.13.tar.gz",
+              "sha256Arm64": "{{PythonSha}}",
               "stripComponents": 1,
               "pathEntries": ["{toolchain}/bin"],
               "probe": {
@@ -275,6 +277,8 @@ public class ToolchainSettingsUiTests
               "version": "22.14.0",
               "payloadUrl": "https://example.invalid/node-22.14.0.tar.gz",
               "sha256": "{{NodeSha}}",
+              "payloadUrlArm64": "https://example.invalid/node-22.14.0.tar.gz",
+              "sha256Arm64": "{{NodeSha}}",
               "stripComponents": 1,
               "pathEntries": ["{toolchain}/bin"],
               "probe": {

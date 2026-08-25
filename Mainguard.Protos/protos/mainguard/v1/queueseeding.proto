@@ -1,0 +1,149 @@
+syntax = "proto3";
+
+package mainguard.v1;
+
+option csharp_namespace = "Mainguard.Protos.V1";
+
+// DEV-ONLY merge-queue seeding (docs/design/queue-seeding.md). Produces legitimate queue entries in
+// any target WorkerMergeState instantly — no agent, no jail, no tokens — by driving the REAL
+// MergeQueue state-machine methods with synthetic input. Nothing is fabricated: every transition is
+// legality-checked, persisted and audited exactly as a real one, every entry is backed by a real
+// branch/commit in the bare mirror, and the one synthetic fact (the verification OUTCOME) is
+// visibly synthetic in its own immutable record ("[seeded — not executed]").
+//
+// GATING — this whole service is unreachable in a shipped build. It is mapped by the daemon only
+// when MAINGUARD_ENABLE_QUEUE_SEEDING=1 was set at process startup (the in-proc test tier replaces
+// the captured options singleton instead — DaemonFixture.EnableQueueSeeding): disabled means
+// UNIMPLEMENTED, with a SeedingGateInterceptor prefix-deny as the belt behind that primary. Every method is additionally
+// on RoleInterceptor.CoordinatorDeniedMethods unconditionally — seeding composes EnsureEntry +
+// verification + merge power, none of which a coordinator credential may hold. Seeding is never an
+// in-jail IPC op; it exists on the operator gRPC surface only.
+service QueueSeedingService {
+  // Seeds entries in order. Ordering is semantic: a Merged spec performs a REAL ff-only merge in
+  // the origin checkout (full lease walk) and thereby really stales every previously-seeded — and
+  // every real — Verified entry in the repo, so a stale-cascade pair is simply
+  // [{Verified}, {Merged}]. Refusals are per-entry and verbatim (refusal-as-response), never a
+  // status code: one entry failing to reach its target does not fault the batch.
+  rpc SeedQueueEntries(SeedQueueEntriesRequest) returns (SeedQueueEntriesResponse);
+  // Appends a REAL commit to an existing seeded branch and drives the real new-commits
+  // invalidation (MergeQueue.NotifyNewCommits — the same public transition the ref watcher path
+  // drives, with the same guards). The orchestrator-dynamics primitive: Verified→Working on
+  // demand, pushes landing mid-verification, "commits from multiple places at once".
+  rpc PushCommits(PushCommitsRequest) returns (PushCommitsResponse);
+  // Removes every seeded entry for a repo: discard-or-drain first (a hold completing after the row
+  // is deleted would re-mint it — the Cancel-ordering rule in the design doc), then Cancel, then
+  // the mirror ref, then the synthetic plan. Structurally scoped to the `seed-` id prefix — it
+  // cannot touch a real entry.
+  rpc ClearSeededEntries(ClearSeededEntriesRequest) returns (ClearSeededEntriesResponse);
+  // The dev panel's visibility probe (and the enumeration of what is currently seeded). A daemon
+  // with seeding disabled never maps this service, so the client reads UNIMPLEMENTED as "hide the
+  // panel" — no capability flag travels anywhere else.
+  rpc GetSeedingStatus(GetSeedingStatusRequest) returns (GetSeedingStatusResponse);
+}
+
+message SeedQueueEntriesRequest {
+  string repo_handle = 1; // opaque repo handle (never a daemon filesystem path, G-14)
+  // Processed strictly in order (see the rpc comment for why order is semantic).
+  repeated SeedEntrySpec entries = 2;
+}
+
+// One seeded entry (or `count` clones of it). The daemon assigns ids: `seed-<n>`, prefix enforced
+// server-side — a caller cannot choose an id that collides with (or masquerades as) a real agent.
+message SeedEntrySpec {
+  // Target WorkerMergeState name: Working | Verifying | Verified | StaleVerified | AwaitingReview |
+  // Merged | Rejected | Discarded. The seeder reaches it exclusively through the state machine's
+  // own public transitions (the legal-path walk per state is in docs/design/queue-seeding.md §3–5).
+  string target_state = 1;
+  // 0 or 1 = one entry; N > 1 = N clones (overflow/ordering reproductions).
+  int32 count = 2;
+  // What the seeded branch's real commit changes — this is what makes gate classification REAL
+  // rather than injected: PLAIN (default; an inert seed/<id>.txt), FLAGGED (adds a CI workflow
+  // file the real risk classifier must flag), CHANGED_TEST_COMMAND (edits .mainguard/verify so the
+  // real RT-D2 gate arms).
+  string flavor = 3;
+  // The verify-FAIL entry: the synthetic outcome is a failure, and the real settle path returns
+  // the entry to Working carrying a failed record — exactly as a genuinely red suite would.
+  bool verification_fails = 4;
+  // Verifying target only: how long the synthetic run stays GENUINELY in flight (the entry is
+  // Verifying with verification_in_flight=true; ClearStalledVerification refuses with "wait").
+  // Clamped daemon-side to [0, 600]. Overlapping holds across entries are how race windows are
+  // made reproducible.
+  int32 hold_seconds = 5;
+  // What the real stale cascade's re-queue does with this entry once main moves:
+  // HOLD (default) — rest at StaleVerified, indistinguishable from awaiting its FIFO turn;
+  // CASCADE — fall through the real requeue path, which for a jail-less entry ends at Working
+  // with the real "no live sandbox" reason. Both are behaviors production exhibits.
+  string stale_behavior = 6;
+  // Verbatim reason recorded for Rejected/Discarded targets (may be empty, same policy as
+  // DiscardEntryRequest.reason). No actor field anywhere on this surface: the acting identity is
+  // daemon-derived from the connection (IApproverIdentityResolver), exactly as DiscardEntry.
+  string reason = 7;
+
+  // Reserved for the coordinator phase-2/3 plan dimension (branches
+  // feat/coordinator-phase-2-worker-authored-plans / feat/coordinator-phase-3-role-lock):
+  //   8 = with_plan (drive the real WorkerPlanGate.Hold → PlanApprovalService.Present → approve
+  //       for the synthetic id, so plan-gated merge/auto-verify flows become seedable),
+  //   9 = scope (the approved TaskPlan.Scope paths for the out-of-approved-scope arm).
+  // SeedingCompatibilityTests fails on those branches' merge until these are implemented — the
+  // seeder must not silently stop covering the flows the queue grows.
+  reserved 8, 9;
+  reserved "with_plan", "scope";
+}
+
+message SeedQueueEntriesResponse {
+  repeated SeedResult results = 1;
+  // The queue's authoritative main@sha after the batch (it moves when a Merged/StaleVerified spec
+  // really moved main).
+  string main_sha = 2;
+  // True when the seeder had to commit a .mainguard/verify (content `true`) to origin main because
+  // the repo had none — said loudly here because it is the one write the seeder makes outside any
+  // state walk, and a repo whose real state is "no verification command" can no longer be seeded
+  // AS that repo.
+  bool provisioned_verify_config = 3;
+}
+
+// One seeded entry's outcome. `refusal` is empty on success and verbatim otherwise (§3.4-style
+// vocabulary) — e.g. the origin checkout not being on main for a Merged target, or a state the
+// walk could not legally reach.
+message SeedResult {
+  string agent_id = 1;      // the daemon-assigned seed-<n> id
+  string reached_state = 2; // WorkerMergeState name actually reached (empty when nothing was created)
+  string refusal = 3;
+}
+
+message PushCommitsRequest {
+  string repo_handle = 1;
+  string agent_id = 2; // must be an existing seeded (`seed-`) entry of this repo
+  int32 count = 3;     // 0/1 = one commit; N = N commits (each a real, distinct commit)
+}
+
+message PushCommitsResponse {
+  bool pushed = 1;
+  string refusal = 2;   // verbatim when pushed is false (unknown/non-seeded id, terminal entry)
+  string new_tip_sha = 3;
+  string state = 4;     // the entry's WorkerMergeState after the real NotifyNewCommits
+}
+
+message ClearSeededEntriesRequest {
+  string repo_handle = 1;
+}
+
+message ClearSeededEntriesResponse {
+  // Every seeded id that was removed (entry gone, mirror ref deleted, plan dropped).
+  repeated string cleared_agent_ids = 1;
+  // Ids that could not be fully removed, with verbatim reasons (e.g. a merge lease outstanding).
+  repeated SeedResult failures = 2;
+}
+
+message GetSeedingStatusRequest {}
+
+message GetSeedingStatusResponse {
+  // Always true when this RPC answers at all — the service is unmapped when seeding is disabled,
+  // so the panel's real probe is UNIMPLEMENTED-vs-answer. Carried anyway so a future transport
+  // that cannot see status codes still has the fact.
+  bool enabled = 1;
+  // The currently-seeded ids across every repo this daemon has a live queue for, as
+  // "repoHandle/agentId" — the panel's Clear button enumerates from the daemon's truth, not a
+  // client-side echo.
+  repeated string seeded_entries = 2;
+}

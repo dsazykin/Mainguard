@@ -329,8 +329,87 @@
           "Microsoft.AspNetCore.DataProtection": "[10.0.10, )",
           "Microsoft.AspNetCore.DataProtection.Extensions": "[10.0.10, )",
           "Microsoft.EntityFrameworkCore.Sqlite": "[9.0.0, )",
-          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )"
+          "SQLitePCLRaw.bundle_e_sqlite3": "[3.0.3, )",
+          "System.Security.Cryptography.Pkcs": "[10.0.10, )"
         }
+      }
+    },
+    "net10.0/linux-x64": {
+      "Porta.Pty": {
+        "type": "Direct",
+        "requested": "[1.0.7, )",
+        "resolved": "1.0.7",
+        "contentHash": "ARvF8LQTu9qPK7O+i9Mb0bZPuYTt7tdBhhFdCq3FmghIEasJYN3hHToKX6uWaSI6SEOpe2kmhinV74RzdN6gJg==",
+        "dependencies": {
+          "Vanara.PInvoke.Kernel32": "4.2.1"
+        }
+      },
+      "LibGit2Sharp.NativeBinaries": {
+        "type": "Transitive",
+        "resolved": "2.0.322",
+        "contentHash": "EWQaEevzc8uS1ZGS6T83jqUPBY//2WUSCHwbZHBoHOjlfSehqr30nm/VAhJPzjam/69sv7nlLKVcho9t2XuR/Q=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.50.4.5",
+        "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      }
+    },
+    "net10.0/osx-arm64": {
+      "Porta.Pty": {
+        "type": "Direct",
+        "requested": "[1.0.7, )",
+        "resolved": "1.0.7",
+        "contentHash": "ARvF8LQTu9qPK7O+i9Mb0bZPuYTt7tdBhhFdCq3FmghIEasJYN3hHToKX6uWaSI6SEOpe2kmhinV74RzdN6gJg==",
+        "dependencies": {
+          "Vanara.PInvoke.Kernel32": "4.2.1"
+        }
+      },
+      "LibGit2Sharp.NativeBinaries": {
+        "type": "Transitive",
+        "resolved": "2.0.322",
+        "contentHash": "EWQaEevzc8uS1ZGS6T83jqUPBY//2WUSCHwbZHBoHOjlfSehqr30nm/VAhJPzjam/69sv7nlLKVcho9t2XuR/Q=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.50.4.5",
+        "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
+      }
+    },
+    "net10.0/win-x64": {
+      "Porta.Pty": {
+        "type": "Direct",
+        "requested": "[1.0.7, )",
+        "resolved": "1.0.7",
+        "contentHash": "ARvF8LQTu9qPK7O+i9Mb0bZPuYTt7tdBhhFdCq3FmghIEasJYN3hHToKX6uWaSI6SEOpe2kmhinV74RzdN6gJg==",
+        "dependencies": {
+          "Vanara.PInvoke.Kernel32": "4.2.1"
+        }
+      },
+      "LibGit2Sharp.NativeBinaries": {
+        "type": "Transitive",
+        "resolved": "2.0.322",
+        "contentHash": "EWQaEevzc8uS1ZGS6T83jqUPBY//2WUSCHwbZHBoHOjlfSehqr30nm/VAhJPzjam/69sv7nlLKVcho9t2XuR/Q=="
+      },
+      "SourceGear.sqlite3": {
+        "type": "Transitive",
+        "resolved": "3.50.4.5",
+        "contentHash": "UtnipXhJYZKQOQIfpws/msLK7IRhMplE1CZCaZLIQXRnGD474QVpO/J9nMlQQY8NZueGz1aidjoxDRnrC1NT3Q=="
+      },
+      "System.Security.Cryptography.Pkcs": {
+        "type": "Transitive",
+        "resolved": "10.0.10",
+        "contentHash": "KG8t5RHczdgB3IWvRndpI0nE1DSo7ikDYSDbITxfgRFyIvnYiKzuPjaZOsPnwFQ1aOGUl9sEulJul9wlHLEUoA=="
       }
     }
   }

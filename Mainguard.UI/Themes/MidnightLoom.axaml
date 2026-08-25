@@ -17,21 +17,32 @@
     <SolidColorBrush x:Key="ButtonBg" Color="#1E232B"/>
     <SolidColorBrush x:Key="BorderHairline" Color="#262B33"/>
 
+    <!-- Outer-chrome indirection (macOS vibrancy, opt-in). The main window binds its window
+         background / title bar / section rail to Chrome* instead of Surface* so VibrancyManager
+         can swap ONLY the outer chrome to the *Vibrant translucent variants — SurfacePanel also
+         paints floating cards, which always stay opaque. Defaults are exact opaque duplicates
+         of SurfaceWindow/SurfacePanel: with vibrancy off (and everywhere the harness renders)
+         these are pixel-identical to the flat look. -->
+    <SolidColorBrush x:Key="ChromeWindowBackground" Color="#0F1115"/>
+    <SolidColorBrush x:Key="ChromePanelBackground" Color="#14171C"/>
+    <SolidColorBrush x:Key="SurfaceWindowVibrant" Color="#CC0F1115"/>
+    <SolidColorBrush x:Key="SurfacePanelVibrant" Color="#D914171C"/>
+
     <!-- Text -->
     <SolidColorBrush x:Key="TextPrimary" Color="#E6E9EF"/>
     <SolidColorBrush x:Key="TextMuted" Color="#8A93A6"/>
     <SolidColorBrush x:Key="OnAccent" Color="#0B0D10"/>       <!-- text on Accent/Success/Danger fills -->
 
     <!-- Signature accent -->
-    <SolidColorBrush x:Key="AccentBrush" Color="#8B8BF5"/>
-    <SolidColorBrush x:Key="AccentHover" Color="#A5A5F8"/>
-    <SolidColorBrush x:Key="AccentSelection" Color="#268B8BF5"/> <!-- translucent selection tint -->
+    <SolidColorBrush x:Key="AccentBrush" Color="#8487F0"/>
+    <SolidColorBrush x:Key="AccentHover" Color="#9EA1F5"/>
+    <SolidColorBrush x:Key="AccentSelection" Color="#268487F0"/> <!-- translucent selection tint -->
 
     <!-- Semantic -->
     <SolidColorBrush x:Key="SuccessBrush" Color="#42B968"/>
     <SolidColorBrush x:Key="SuccessHover" Color="#5BCB7F"/>
-    <SolidColorBrush x:Key="DangerBrush" Color="#F87171"/>
-    <SolidColorBrush x:Key="DangerHover" Color="#FA8C8C"/>
+    <SolidColorBrush x:Key="DangerBrush" Color="#E5484D"/>
+    <SolidColorBrush x:Key="DangerHover" Color="#EC5D62"/>
     <SolidColorBrush x:Key="WarningBrush" Color="#E3B341"/>
     <SolidColorBrush x:Key="InfoBrush" Color="#58A6FF"/>
 
@@ -39,23 +50,23 @@
          by key; the App.axaml AgentStatus* glyph carries the state (E1/E2), brush is the second
          channel. New token = add here in every Themes/*.axaml. -->
     <SolidColorBrush x:Key="AgentStatusWorkingBrush" Color="#58A6FF"/>
-    <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#8B8BF5"/>
+    <SolidColorBrush x:Key="AgentStatusVerifyingBrush" Color="#8487F0"/>
     <SolidColorBrush x:Key="AgentStatusVerifiedBrush" Color="#42B968"/>
     <SolidColorBrush x:Key="AgentStatusStaleBrush" Color="#E3B341"/>
-    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#E860A4"/>
-    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#F87171"/>
+    <SolidColorBrush x:Key="AgentStatusAwaitingReviewBrush" Color="#A48FD1"/>
+    <SolidColorBrush x:Key="AgentStatusConflictBrush" Color="#E5484D"/>
     <SolidColorBrush x:Key="AgentStatusRateLimitedBrush" Color="#E3B341"/>
-    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#F87171"/>
+    <SolidColorBrush x:Key="AgentStatusDeadBrush" Color="#E5484D"/>
     <SolidColorBrush x:Key="AgentStatusPausedBrush" Color="#8A93A6"/>
 
     <!-- Commit-graph lanes (decoupled from semantics) -->
     <!-- Lanes are deliberately decoupled from the semantic status tokens (DESIGN.md §2): none of
          Lane1-5 is hex-identical to AccentBrush/WarningBrush/InfoBrush/SuccessBrush, so graph
          topology never accidentally implies status. Retuned per ThemeRefinement Finding B. -->
-    <SolidColorBrush x:Key="Lane1" Color="#9A9AF4"/>
-    <SolidColorBrush x:Key="Lane2" Color="#E860A4"/>
+    <SolidColorBrush x:Key="Lane1" Color="#9F9FFC"/>
+    <SolidColorBrush x:Key="Lane2" Color="#D0709F"/>
     <SolidColorBrush x:Key="Lane3" Color="#C0EAE3"/>
-    <SolidColorBrush x:Key="Lane4" Color="#E8A217"/>
+    <SolidColorBrush x:Key="Lane4" Color="#F2A918"/>
     <SolidColorBrush x:Key="Lane5" Color="#0B87F5"/>
 
     <!-- Diff line backgrounds -->
@@ -63,7 +74,7 @@
     <SolidColorBrush x:Key="DiffRemovedBg" Color="#33191E"/>
     <!-- Intra-line (word-level) emphasis + trailing-whitespace marker (T-13) -->
     <SolidColorBrush x:Key="DiffAddedEmphasis" Color="#6642B968"/>
-    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66F87171"/>
+    <SolidColorBrush x:Key="DiffRemovedEmphasis" Color="#66E5484D"/>
     <SolidColorBrush x:Key="DiffWhitespaceMarker" Color="#55E3B341"/>
 
     <!-- Blame age-heat gutter (T-11): recent edits interpolate toward BlameAgeNew,
@@ -76,7 +87,7 @@
          Loom stays readable; the 256-colour cube (16-255) is computed in code. -->
     <SolidColorBrush x:Key="TerminalBackground" Color="#0B0D10"/>
     <SolidColorBrush x:Key="TerminalForeground" Color="#E6E9EF"/>
-    <SolidColorBrush x:Key="TerminalCursor" Color="#8B8BF5"/>
+    <SolidColorBrush x:Key="TerminalCursor" Color="#8487F0"/>
     <SolidColorBrush x:Key="TerminalAnsi0" Color="#000000"/>
     <SolidColorBrush x:Key="TerminalAnsi1" Color="#CD3131"/>
     <SolidColorBrush x:Key="TerminalAnsi2" Color="#2AA745"/>

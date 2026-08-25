@@ -21,13 +21,20 @@ public partial class ToastViewModel : ViewModelBase, IDisposable
     [ObservableProperty]
     private bool _isExpanded;
 
+    /// <summary>Test seam: the headless render harness stacks toasts and then pumps for an
+    /// unbounded amount of WALL-CLOCK time on a loaded CI runner, so the 6 s auto-dismiss firing
+    /// mid-capture turns its count assertion into a race. The harness parks this high and resets
+    /// it; production never sets it.</summary>
+    internal static int? AutoDismissOverrideMs;
+
     public ToastViewModel(string message, bool isError, Action<ToastViewModel> onDismiss, int autoDismissMs = 6000)
     {
         Message = message;
         IsError = isError;
         _onDismiss = onDismiss;
+        var effectiveMs = AutoDismissOverrideMs ?? autoDismissMs;
         _timer = new System.Threading.Timer(_ =>
-            Avalonia.Threading.Dispatcher.UIThread.Post(Dismiss), null, autoDismissMs, System.Threading.Timeout.Infinite);
+            Avalonia.Threading.Dispatcher.UIThread.Post(Dismiss), null, effectiveMs, System.Threading.Timeout.Infinite);
     }
 
     [RelayCommand]

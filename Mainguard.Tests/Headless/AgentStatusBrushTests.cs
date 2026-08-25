@@ -12,12 +12,12 @@ using Xunit;
 namespace Mainguard.Tests.Headless;
 
 // P2-13 test 1 (§5) / TI-P2-13.1: exactly one AgentStatus → brush converter, and EVERY status
-// resolves a design token in EVERY one of the five themes (Daylight Loom included). We assert the
+// resolves a design token in EVERY registered theme (Daylight Loom included). We assert the
 // resource-key lookup succeeds, never a color value — the token IS the contract.
 public class AgentStatusBrushTests
 {
     private static readonly string[] ThemeKeys =
-        { "MidnightLoom", "DaylightLoom", "CommandDeck", "Atelier", "LoomAurora" };
+        { "MidnightLoom", "DaylightLoom", "Graphite", "Atelier" };
 
     [AvaloniaFact]
     public void StatusBrush_MappingComplete()

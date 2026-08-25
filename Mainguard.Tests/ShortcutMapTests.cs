@@ -15,12 +15,14 @@ public class ShortcutMapTests
     [Fact]
     public void Default_ShouldCarryTheFiveDocumentedGestures()
     {
+        // The primary modifier is per-platform (design rule P-7): Cmd on macOS, Ctrl elsewhere.
+        var m = ShortcutMap.PrimaryModifier;
         var map = ShortcutMap.Default;
-        Assert.Equal("Ctrl+P", map.GestureFor(ActionIds.OpenCommandPalette));
-        Assert.Equal("Ctrl+Enter", map.GestureFor(ActionIds.Commit));
-        Assert.Equal("Ctrl+Shift+P", map.GestureFor(ActionIds.Push));
+        Assert.Equal($"{m}+P", map.GestureFor(ActionIds.OpenCommandPalette));
+        Assert.Equal($"{m}+Enter", map.GestureFor(ActionIds.Commit));
+        Assert.Equal($"{m}+Shift+P", map.GestureFor(ActionIds.Push));
         Assert.Equal("F5", map.GestureFor(ActionIds.Refresh));
-        Assert.Equal("Ctrl+B", map.GestureFor(ActionIds.NewBranch));
+        Assert.Equal($"{m}+B", map.GestureFor(ActionIds.NewBranch));
         Assert.False(map.HasConflicts);
     }
 
@@ -60,9 +62,10 @@ public class ShortcutMapTests
     [Fact]
     public void ActionFor_ShouldResolveGestureToActionId()
     {
+        var m = ShortcutMap.PrimaryModifier.ToLowerInvariant();
         var map = ShortcutMap.Default;
-        Assert.Equal(ActionIds.Push, map.ActionFor("ctrl+shift+p"));
-        Assert.Null(map.ActionFor("Ctrl+Q"));
+        Assert.Equal(ActionIds.Push, map.ActionFor($"{m}+shift+p"));
+        Assert.Null(map.ActionFor($"{m}+Q"));
     }
 
     [Fact]
@@ -72,7 +75,7 @@ public class ShortcutMapTests
         var map = ShortcutMap.FromPreferences(overrides);
 
         Assert.Equal("Ctrl+R", map.GestureFor(ActionIds.Refresh));    // overridden
-        Assert.Equal("Ctrl+P", map.GestureFor(ActionIds.OpenCommandPalette)); // default retained
+        Assert.Equal($"{ShortcutMap.PrimaryModifier}+P", map.GestureFor(ActionIds.OpenCommandPalette)); // default retained
     }
 
     [Fact]
@@ -89,7 +92,7 @@ public class ShortcutMapTests
         var restoredMap = ShortcutMap.FromPreferences(restored.ShortcutBindings);
         Assert.Equal("Ctrl+R", restoredMap.GestureFor(ActionIds.Refresh));
         // Untouched defaults still resolve after the round-trip.
-        Assert.Equal("Ctrl+P", restoredMap.GestureFor(ActionIds.OpenCommandPalette));
+        Assert.Equal($"{ShortcutMap.PrimaryModifier}+P", restoredMap.GestureFor(ActionIds.OpenCommandPalette));
     }
 
     [Fact]

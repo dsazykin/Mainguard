@@ -71,6 +71,38 @@ public sealed class TerminalViewModelTests
     }
 
     [Fact]
+    public void OutputReceived_BeforeAttachView_ShouldBeBufferedThenFlushed()
+    {
+        // ISSUES-LOG #21 — a rehydrated coordinator's daemon-replayed scrollback can arrive within
+        // milliseconds of AttachAsync, before Avalonia's DataContext-changed pass calls AttachView.
+        // A fresh spawn's multi-second CLI-startup delay masks this; restart-resume does not.
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+
+        gateway.PushOutput(new byte[] { (byte)'r', (byte)'e', (byte)'p', (byte)'l', (byte)'a', (byte)'y' });
+
+        var view = new FakeTerminalView();
+        vm.AttachView(view);
+
+        Assert.Single(view.Fed);
+        Assert.Equal("replay"u8.ToArray(), view.Fed[0]);
+    }
+
+    [Fact]
+    public void OutputReceived_AfterAttachView_ShouldStillFeedDirectly_NotDoubled()
+    {
+        var view = new FakeTerminalView();
+        var gateway = new FakeTerminalGateway();
+        using var vm = new TerminalViewModel(gateway);
+        vm.AttachView(view);
+
+        gateway.PushOutput(new byte[] { (byte)'l', (byte)'i', (byte)'v', (byte)'e' });
+
+        Assert.Single(view.Fed);
+        Assert.Equal("live"u8.ToArray(), view.Fed[0]);
+    }
+
+    [Fact]
     public async Task AttachAsync_ShouldSetAgentId_AndAttachGateway()
     {
         var gateway = new FakeTerminalGateway();
