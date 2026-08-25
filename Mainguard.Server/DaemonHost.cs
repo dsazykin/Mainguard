@@ -83,7 +83,10 @@ public static class DaemonHost
         builder.Services.AddSingleton(transportCertificates);
         lifecycle.LogInformation("session transport credentials ready (mutual TLS, pinned)");
 
-        builder.Services.AddSingleton<IAuditLog, InMemoryAuditLog>();
+        // P2-15: IAuditLog is registered by GatewayServiceRegistration.Register below — the audit
+        // chain rides the same daemon-DB posture decision as the gateway stores (ChainedAuditLog
+        // when the DB opens, InMemoryAuditLog fallback so the daemon always starts). Everything
+        // here resolves it lazily through DI, so the later registration point changes nothing.
         builder.Services.AddSingleton<AgentSessionStore>();
 
         // P2-14 governance spine: role registry + terminal-lock registry (the RoleInterceptor enforces
@@ -113,6 +116,11 @@ public static class DaemonHost
         builder.Services.AddSingleton(_ => new Mainguard.Agents.Agents.Orchestrator.CoordinatorConversationService());
 
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Orchestrator.KillSwitchGate>();
+
+        // Human per-agent Pause/Resume (PauseAgent/UnpauseAgent) + the arbiter every repo's
+        // YieldProtocol consults so the human's pause and the cascade's pause never fight.
+        builder.Services.AddSingleton<Runtime.HumanPauseLedger>();
+        builder.Services.AddSingleton<Runtime.AgentPauseService>();
         // MG-8: the wired kill target must CONTAIN, not relabel. SandboxKillTarget severs terminal input
         // (TerminalLockRegistry + SessionLeader) and docker-pauses the jail through the substrate's sandbox
         // engine, then marks the state — the state mark alone (the old SessionStoreKillTarget) left every
@@ -125,6 +133,10 @@ public static class DaemonHost
                 sandboxes: sp.GetRequiredService<IAgentEnvironment>().Sandboxes,
                 leader: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.SessionLeader>(),
                 locks: sp.GetRequiredService<Auth.TerminalLockRegistry>(),
+                // ISSUES-LOG #17: the release path consults the human-pause ledger, so a jail the human
+                // holds paused stays paused through a whole kill/resume cycle. The two pause reasons stay
+                // distinct — the kill switch reverses only its own.
+                arbiter: sp.GetRequiredService<Runtime.HumanPauseLedger>(),
                 loggerFactory: sp.GetRequiredService<ILoggerFactory>()));
         // The DURABLE kill journal. Registered (rather than inlined) so something holds the reference: the
         // previous composition passed no journal at all, and KillSwitch's `?? new InMemoryKillJournal()`
@@ -174,22 +186,26 @@ public static class DaemonHost
 
         // P2-06/P2-07: one substrate facade resolved per platform; RepoSyncGrpcService obtains the
         // provisioner/worktree manager, and the P2-07 spawn path obtains the hardened sandbox engine +
-        // default-deny egress policy, from it. WSL2 for now. (The A6 DaemonGitProxy is constructed
-        // per-repo from its allowlisted prefixes when the sandbox spawn path wires it in.)
+        // default-deny egress policy, from it. The per-platform choice lives in
+        // AgentEnvironmentFactory (macOS → macos-host, everything else → WSL2 exactly as before).
+        // (The A6 DaemonGitProxy is constructed per-repo from its allowlisted prefixes when the
+        // sandbox spawn path wires it in.)
         // MG-4: the substrate is told the gateway address the daemon actually bound, so the egress proxy
         // PERMITS it. Without that entry a confined jail is pointed at an endpoint Mainguard's own
         // default-deny filter refuses — the confinement would break the agent instead of metering it.
         builder.Services.AddSingleton<IAgentEnvironment>(sp =>
-            new Wsl2AgentEnvironment(
-                auditLog: sp.GetRequiredService<IAuditLog>(),
-                gatewayEndpoint: Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
+            AgentEnvironmentFactory.CreateForHost(
+                sp.GetRequiredService<IAuditLog>(),
+                Gateway.GatewayServiceRegistration.BuildGatewayUpstream(options)));
 
         // P2-47 #8: the real sandboxed-spawn chain behind AgentService.SpawnAgent (provision worktree →
         // ensure default-deny egress → start hardened jail). Kept out of the gRPC class (validation+dispatch
         // only); degrades to a session-only record when the repo handle is not provisioned.
         // The installed-CLI catalog is shared (launcher + the ListInstalledAdapters RPC); it reads the
-        // VM registry fresh per call, so a singleton carries no staleness.
-        builder.Services.AddSingleton<Mainguard.Agents.Agents.Adapters.InstalledAdapterCatalog>();
+        // daemon-side registry fresh per call, so a singleton carries no staleness. CreateForHost
+        // resolves the registry per substrate (the VM layout in the VM, ~/mainguard/adapters on mac).
+        builder.Services.AddSingleton(
+            _ => Mainguard.Agents.Agents.Adapters.InstalledAdapterCatalog.CreateForHost());
         builder.Services.AddSingleton<Runtime.SandboxAgentLauncher>();
 
         // Tier-1 daemon fast-path: the GetDaemonInfo skew probe's data source (daemon assembly
@@ -220,7 +236,14 @@ public static class DaemonHost
         // The Docker client is built here and shared rather than per call: this one is consulted on a poll
         // loop, and a fresh client per tick would churn connections to the daemon socket for no reason.
         builder.Services.AddSingleton<Docker.DotNet.IDockerClient>(
-            _ => new Docker.DotNet.DockerClientConfiguration().CreateClient());
+            _ => Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient());
+
+        // macos-host: hold a sleep assertion while any jail runs (App Nap / idle sleep must not
+        // stall a verification); tied to the daemon's own lifetime via caffeinate -w.
+        if (OperatingSystem.IsMacOS())
+        {
+            builder.Services.AddHostedService<Runtime.MacSleepAssertion>();
+        }
         builder.Services.AddSingleton<Mainguard.Agents.Agents.Sandbox.IContainerResourceSampler>(sp =>
         {
             try
@@ -281,6 +304,29 @@ public static class DaemonHost
             log: message => migration.LogInformation("{Milestone}", message),
             options: options);
 
+        // P2-15 retention: 90-day expiry as chained redactions (once at boot + daily). No-op on the
+        // in-memory fallback journal.
+        builder.Services.AddHostedService<Runtime.AuditRetentionService>();
+        // P2-15 anchoring: hourly best-effort RFC 3161 sweep — heads queue by policy; nothing is
+        // sent unless MAINGUARD_TSA_URL names an endpoint (no default third-party traffic).
+        builder.Services.AddHostedService<Runtime.AuditAnchorService>();
+
+        // Dev-only queue seeding (docs/design/queue-seeding.md §7): the enablement is captured HERE,
+        // once, at startup, from the boot env flag — immutable for the process's life. The in-proc
+        // test tier flips it by REPLACING this singleton in ConfigureTestServices (DaemonFixture.
+        // EnableQueueSeeding): a UseSetting configuration key measurably never reaches
+        // builder.Configuration at this point under the minimal-hosting test factory, and a
+        // process-wide env var cannot differ between two side-by-side test hosts. Announced loudly:
+        // a seeding daemon must never be mistaken for a production one.
+        var queueSeeding = new QueueSeedingOptions(options.QueueSeedingEnabled);
+        builder.Services.AddSingleton(queueSeeding);
+        if (queueSeeding.Enabled)
+        {
+            lifecycle.LogWarning(
+                "QUEUE SEEDING ENABLED (MAINGUARD_ENABLE_QUEUE_SEEDING) — dev only: this daemon accepts "
+                + "synthetic merge-queue entries. Never run a real repository against it.");
+        }
+
         builder.Services.AddGrpc(o =>
         {
             // EVERY RPC is authenticated (no public-method allowlist), then role/terminal-lock enforced
@@ -288,6 +334,10 @@ public static class DaemonHost
             // access-logged through the secret field mask. Order: authenticate, authorize, log.
             o.Interceptors.Add<BearerTokenInterceptor>();
             o.Interceptors.Add<RoleInterceptor>();
+            // The seeding belt sits AFTER authentication and role enforcement: it exists to refuse the
+            // dev-only QueueSeedingService on a daemon not started for seeding, even if a refactor ever
+            // made that service's mapping unconditional (the primary gate is that it is not mapped).
+            o.Interceptors.Add<SeedingGateInterceptor>();
             o.Interceptors.Add<SecretMaskingInterceptor>();
         });
 
@@ -455,6 +505,16 @@ public static class DaemonHost
         app.MapGrpcService<KillSwitchGrpcService>();
         app.MapGrpcService<CoordinatorGrpcService>();
         app.MapGrpcService<EgressGrpcService>();
+        app.MapGrpcService<AuditGrpcService>();
+
+        // Dev-only queue seeding — the PRIMARY gate (docs/design/queue-seeding.md §7): a daemon not
+        // started with the boot flag never maps the service, so every call is UNIMPLEMENTED — the
+        // service structurally is not there. SeedingGateInterceptor is the belt behind this line, and
+        // the client reads UNIMPLEMENTED-vs-answer as "hide/show the dev panel".
+        if (app.Services.GetRequiredService<Auth.QueueSeedingOptions>().Enabled)
+        {
+            app.MapGrpcService<QueueSeedingGrpcService>();
+        }
     }
 
     /// <summary>

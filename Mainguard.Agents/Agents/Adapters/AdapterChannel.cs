@@ -113,6 +113,22 @@ public static class AdapterPaths
     /// (the tarball's <c>/etc/wsl.conf</c> pins <c>default=mainguard</c>).</summary>
     public const string VmRoot = "/home/mainguard/mainguard/adapters";
 
+    /// <summary>
+    /// The DAEMON-side adapters root on the current host: <see cref="VmRoot"/> where the daemon runs
+    /// inside the VM (WSL2 — the constant IS a local path there), <c>~/mainguard/adapters</c> on the
+    /// macos-host substrate. Install commands still speak <see cref="VmRoot"/> everywhere — the
+    /// container install host mounts this directory AT that path — so markers and argv stay
+    /// substrate-invariant; only where the daemon READS the tree differs.
+    /// </summary>
+    public static string DaemonSideRoot() =>
+        OperatingSystem.IsMacOS()
+            ? System.IO.Path.Combine(Mainguard.Git.MainguardPaths.HomeDirectory(), "mainguard", "adapters")
+            : VmRoot;
+
+    /// <summary>The daemon-side registry dir under <see cref="DaemonSideRoot"/>.</summary>
+    public static string DaemonSideRegistryDir() =>
+        System.IO.Path.Combine(DaemonSideRoot(), "registry");
+
     /// <summary>Where <see cref="VmRoot"/> appears inside every agent sandbox (read-only).</summary>
     public const string SandboxMount = "/opt/mainguard/adapters";
 
@@ -667,7 +683,7 @@ public sealed class WslAdapterInstallHost : IAdapterInstallHost
                 $"Staging the verified payload into the VM failed (tee exit {upload.ExitCode}): {upload.StdErr}".Trim());
 
         var decode = await _wsl.RunAsync(
-            WslCommands.InDistro("bash", "-c", $"base64 -d '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'"),
+            WslCommands.InDistro("bash", "-c", $"base64 -d < '{b64Path}' > '{finalPath}' && rm -f '{b64Path}'"),
             stdin: null, ct).ConfigureAwait(false);
         if (!decode.Succeeded)
             throw new AdapterChannelException(AdapterChannelError.InstallFailed,

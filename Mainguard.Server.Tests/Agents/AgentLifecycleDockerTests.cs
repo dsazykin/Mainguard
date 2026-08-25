@@ -30,7 +30,7 @@ public class AgentLifecycleDockerTests
     [RequiresDockerDaemonFact]
     public async Task Yield_Timeout_ShouldDockerPause_ThenTokenResumeUnpauses()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
         if (!await EnsureTrivialImageAsync(docker, ct))
@@ -70,7 +70,7 @@ public class AgentLifecycleDockerTests
     [RequiresDockerDaemonFact]
     public async Task Leader_ReattachAcrossRegistryReload_ConvergesOnDockerTruth()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
         if (!await EnsureTrivialImageAsync(docker, ct))

@@ -100,15 +100,20 @@ public sealed class DaemonTransportCredentials : IDisposable
     /// <summary>
     /// Loads a PKCS#12 blob so its private key is usable by <see cref="SslStream"/> on this OS.
     /// On Windows, Schannel cannot use an ephemeral key set for TLS client authentication, so the key
-    /// must be loaded into a key set; elsewhere an ephemeral (memory-only) key is both usable and
-    /// preferable, since it never touches disk.
+    /// must be loaded into a key set. On macOS, ephemeral keys are not supported at all
+    /// (<see cref="X509KeyStorageFlags.EphemeralKeySet"/> throws: Security.framework can only hand
+    /// SslStream a keychain-backed key), so the default set is used — .NET imports it into a
+    /// process-temporary keychain, not the user's login keychain. Elsewhere an ephemeral
+    /// (memory-only) key is both usable and preferable, since it never touches disk.
     /// </summary>
     public static X509Certificate2 LoadPkcs12(byte[] blob)
     {
         ArgumentNullException.ThrowIfNull(blob);
         var flags = OperatingSystem.IsWindows()
             ? X509KeyStorageFlags.UserKeySet | X509KeyStorageFlags.Exportable
-            : X509KeyStorageFlags.EphemeralKeySet;
+            : OperatingSystem.IsMacOS()
+                ? X509KeyStorageFlags.DefaultKeySet | X509KeyStorageFlags.Exportable
+                : X509KeyStorageFlags.EphemeralKeySet;
         return X509CertificateLoader.LoadPkcs12(blob, password: null, keyStorageFlags: flags);
     }
 

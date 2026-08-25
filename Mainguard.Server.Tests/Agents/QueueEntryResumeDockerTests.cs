@@ -372,7 +372,7 @@ public sealed class QueueEntryResumeDockerTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         foreach (var id in _containers)
         {
             try { await docker.Containers.RemoveContainerAsync(id, new ContainerRemoveParameters { Force = true }); }

@@ -90,6 +90,29 @@ public static class MergeActionRunner
         }
     }
 
+    /// <summary>Drives one human reject (the review verdict "no", terminal) to a reported conclusion.
+    /// Same contract as <see cref="DiscardAsync"/>: never throws, refusal-as-warning-toast.</summary>
+    public static async Task RejectAsync(
+        IMergeQueueService queue, string agentId, string reason, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            var outcome = await queue.RejectEntryAsync(agentId, reason ?? string.Empty).ConfigureAwait(false);
+            sink($"Rejected agent/{outcome.AgentId} in review (by {outcome.RejectedBy}) — the entry is closed.", false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutting down — not an outcome to report.
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
     /// <summary>Drives one "clear the stalled verification" to a reported conclusion. Never throws.</summary>
     public static async Task ClearStalledVerificationAsync(
         IMergeQueueService queue, string agentId, Action<string, bool>? report = null)

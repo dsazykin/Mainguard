@@ -93,6 +93,7 @@ public class SandboxImageProvisionerTests : IDisposable
             new[]
             {
                 "-d", "MainguardEnv", "--", "docker", "build",
+                "--build-arg", "TARGETARCH=amd64",
                 "--label", "mainguard.image.version=" + SandboxImageVersions.AgentBase,
                 "-t", "mainguard-agent-base:latest",
                 "/mnt/c/Program Files/Mainguard/payload/images/mainguard-agent-base",
@@ -227,6 +228,7 @@ public class SandboxImageProvisionerTests : IDisposable
                 new[]
                 {
                     "-d", "MainguardEnv", "--", "docker", "build",
+                    "--build-arg", "TARGETARCH=amd64",
                     "--label", "mainguard.image.version=" + SandboxImageVersions.AgentBase,
                     "-t", "mainguard-agent-base:latest",
                     SandboxImageProvisioner.ToVmPath(Path.Combine(root, "mainguard-agent-base")),
@@ -234,6 +236,7 @@ public class SandboxImageProvisionerTests : IDisposable
                 new[]
                 {
                     "-d", "MainguardEnv", "--", "docker", "build",
+                    "--build-arg", "TARGETARCH=amd64",
                     "--label", "mainguard.image.version=" + SandboxImageVersions.EgressProxy,
                     "-t", "mainguard-egress-proxy:latest",
                     SandboxImageProvisioner.ToVmPath(Path.Combine(root, "mainguard-egress-proxy")),

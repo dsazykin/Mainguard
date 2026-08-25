@@ -31,13 +31,7 @@ public class InteractiveRebaseServiceTests : IDisposable
 
     public InteractiveRebaseServiceTests()
     {
-        // Prefer the apphost (a direct absolute path, no dependency on `dotnet`
-        // being on PATH); fall back to `dotnet <dll>` if the apphost was not copied.
-        var apphost = Path.Combine(AppContext.BaseDirectory,
-            OperatingSystem.IsWindows() ? "Mainguard.Client.App.exe" : "Mainguard.Client.App");
-        GitService.SelfInvocationOverride = File.Exists(apphost)
-            ? $"\"{apphost}\""
-            : $"\"dotnet\" \"{Path.Combine(AppContext.BaseDirectory, "Mainguard.Client.App.dll")}\"";
+        GitService.SelfInvocationOverride = TestTools.SelfInvocation.ClientAppPrefix();
     }
 
     public void Dispose()

@@ -267,7 +267,7 @@ public class DiffMarginRenderer : IBackgroundRenderer
 
         // Resolve from the active theme so gutter bars follow theme switches.
         var addedBrush = _addedBrush ??= ResolveThemeBrush("SuccessBrush", "#42B968");
-        var modifiedBrush = _modifiedBrush ??= ResolveThemeBrush("AccentBrush", "#8B8BF5");
+        var modifiedBrush = _modifiedBrush ??= ResolveThemeBrush("AccentBrush", "#8487F0");
 
         textView.EnsureVisualLines();
         foreach (var visualLine in textView.VisualLines)

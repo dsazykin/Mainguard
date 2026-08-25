@@ -503,6 +503,8 @@ public class ToolchainChannelTests
               "version": "1.2.3",
               "payloadUrl": "{{PayloadUrl}}",
               "sha256": "{{sha256 ?? SixtyFourHex}}",
+              "payloadUrlArm64": "{{PayloadUrl}}",
+              "sha256Arm64": "{{sha256 ?? SixtyFourHex}}",
               "stripComponents": 1,
               "pathEntries": ["{toolchain}/bin"],
               "environment": { "TOOL_X_HOME": "{toolchain}" },

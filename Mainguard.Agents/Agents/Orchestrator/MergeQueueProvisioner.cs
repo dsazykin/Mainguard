@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Sandbox;
@@ -93,6 +94,8 @@ public sealed class MergeQueueProvisioner
     private readonly IAgentSupervisor _agentStates;
     private readonly Func<string, string, bool>? _publishRebasedAgentRef;
     private readonly OsvSnapshot _osv;
+    private readonly string _artifactDir;
+    private readonly SyntheticVerificationRegistry? _synthetic;
 
     /// <summary>
     /// The phase-2 plan gate, ANDed into every repo's queue: a worker whose own plan was never approved
@@ -128,12 +131,17 @@ public sealed class MergeQueueProvisioner
     /// agent has none. Supplying it turns on the <c>out-of-approved-scope</c> arm of the detector: every
     /// file the branch touches outside <c>TaskPlan.Scope</c> becomes its own must-acknowledge item.
     ///
-    /// <para><b>Null in the daemon today, and that is a statement of fact rather than a default.</b> There is
-    /// no agent→approved-plan binding anywhere in the running daemon: <c>PlanApprovalService.PlanApproved</c>
-    /// has no production subscriber, no spawn path accepts or records a plan id, and <c>AgentSession</c>
-    /// carries none — so no honest implementation of this callback exists yet to pass. The scope comparison
-    /// is therefore wired, tested and inert, waiting on the plan-authorship pipeline; it is NOT reported as
-    /// enforced. See the PR body and <c>docs/design/coordinator-phase-2-decisions.md</c> §3a.</para>
+    /// <para><b>Wired by the daemon since phase 2, and the history is the point.</b> It used to be null for
+    /// a stated reason: there was no agent→approved-plan binding anywhere in the running daemon, so any
+    /// callback passed here would have compared diffs against a GUESSED scope and reported that as
+    /// enforcement — worse than the honest gap. Worker-authored plans supply the exact binding, because a
+    /// plan is keyed by the WORKER's own agent id, which is the same id the plan gate holds and the same
+    /// id the merge queue tracks the branch under. The composition root reads it through
+    /// <c>PlanStatus.Approved</c> only (a pending or rejected plan's scope has authorised nothing), and an
+    /// agent with no approved plan still resolves null — unmanaged, scope comparison skipped, exactly as
+    /// before. See <c>docs/design/coordinator-phase-2-decisions.md</c> §3a and
+    /// <c>docs/design/queue-seeding.md</c> §9 (the seeder's <c>with_plan</c>/<c>scope</c> specs are how
+    /// this arm is exercised without spawning an agent).</para>
     /// </param>
     /// <param name="publishAgentRef">
     /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
@@ -200,6 +208,18 @@ public sealed class MergeQueueProvisioner
     /// nothing would read an empty CVE column as a clean bill of health. Passing a snapshot here is for
     /// tests that need the missing/stale states without a hand-edited assembly.</para>
     /// </param>
+    /// <param name="syntheticVerifications">
+    /// The dev-only queue-seeding seam (docs/design/queue-seeding.md §3): a registry of seeded ids
+    /// whose verification OUTCOME is supplied instead of executed. An unregistered id — every id, in
+    /// a shipped daemon — takes the real path untouched. <b>Always wired by the daemon and empty in
+    /// production</b>: the registry's only writer is the flag-gated <c>QueueSeedingService</c>, so
+    /// the gate lives at the RPC surface (one place, loudly) rather than in a conditional wiring
+    /// here that the composition root's exact-set assertion could not distinguish from an oversight.
+    /// For a registered id the mirror-read half of the verification (RT-D2 provenance, gate arming,
+    /// flagged-change review) still runs for real; only the jail half is replaced, and the record it
+    /// produces is REQUIRED to be visibly synthetic
+    /// (<see cref="SyntheticVerificationPlan.SeededProvenanceMarker"/>).
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -220,7 +240,8 @@ public sealed class MergeQueueProvisioner
         Func<string, string, string?>? locateAgentWorktree = null,
         IAgentSupervisor? agentStates = null,
         Func<string, string, bool>? publishRebasedAgentRef = null,
-        OsvSnapshot? osvSnapshot = null)
+        OsvSnapshot? osvSnapshot = null,
+        SyntheticVerificationRegistry? syntheticVerifications = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -244,6 +265,8 @@ public sealed class MergeQueueProvisioner
         _agentStates = agentStates ?? NullAgentSupervisor.Instance;
         _publishRebasedAgentRef = publishRebasedAgentRef;
         _osv = osvSnapshot ?? OsvSnapshot.Default;
+        _artifactDir = artifactDirectory;
+        _synthetic = syntheticVerifications;
 
         // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
         // is here rather than only the one that happened to get a test.
@@ -258,6 +281,7 @@ public sealed class MergeQueueProvisioner
         if (agentStates is not null) { wired.Add(nameof(agentStates)); }
         if (publishRebasedAgentRef is not null) { wired.Add(nameof(publishRebasedAgentRef)); }
         if (osvSnapshot is not null) { wired.Add(nameof(osvSnapshot)); }
+        if (syntheticVerifications is not null) { wired.Add(nameof(syntheticVerifications)); }
         WiredOptionalControls = wired;
     }
 
@@ -514,6 +538,30 @@ public sealed class MergeQueueProvisioner
     private async Task RequeueStaleAsync(
         string repoHandle, string agentId, MergeQueue queue, IKeepAliveRebaser? rebaser, CancellationToken ct)
     {
+        // Dev-only seeding (docs/design/queue-seeding.md §5): the cascade's re-queue for a SEEDED
+        // entry ends at one of the two termini production itself exhibits, chosen per plan. Hold
+        // leaves the entry resting at StaleVerified — indistinguishable from awaiting its FIFO turn,
+        // which is the state a human seeds in order to look at. Cascade takes the real no-jail
+        // terminus directly: a seeded entry has no sandbox by construction, so it must NOT fall into
+        // the null-rebaser convenience below, whose re-verify would mint a fresh Verified for a
+        // branch that no longer descends from main — the exact loop-forever defect the reparenting
+        // cascade exists to end.
+        if (_synthetic?.TryGet(repoHandle, agentId) is { } seeded)
+        {
+            if (seeded.StaleBehavior == SyntheticStaleBehavior.Hold)
+            {
+                _log?.Invoke(
+                    $"merge queue repo={repoHandle} agent={agentId} seeded entry HELD at StaleVerified "
+                    + "(stale-behavior Hold)");
+                return;
+            }
+
+            Block(repoHandle, agentId, queue,
+                "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent",
+                "seeded-no-jail");
+            return;
+        }
+
         if (rebaser is null)
         {
             // No rebase capability was wired (the pure-unit paths). Preserve the historical behaviour
@@ -707,52 +755,16 @@ public sealed class MergeQueueProvisioner
         string repoHandle, string agentId, MergeQueue queue, ChangedTestCommandGate changedGate,
         FlaggedChangeGate flaggedGate, CancellationToken ct)
     {
-        var containerId = _resolveContainerId(repoHandle, agentId);
-        if (string.IsNullOrEmpty(containerId))
-        {
-            // Host execution is a rejection trigger (§3.2). No jail ⇒ no verification, loudly.
-            throw new InvalidOperationException(
-                $"Agent '{agentId}' has no live sandbox — verification runs in the worker's own jail, never on the host.");
-        }
+        // Dev-only seeding (docs/design/queue-seeding.md §3): a registered seeded id skips the JAIL
+        // half of this path — there is no agent repository to publish from and no sandbox to run in —
+        // while the mirror-read half below (RT-D2 provenance, gate arming, flagged-change review)
+        // runs for real against the seeded branch's committed tree. Every id a shipped daemon ever
+        // sees resolves to null here and takes the path unchanged.
+        var syntheticPlan = _synthetic?.TryGet(repoHandle, agentId);
 
-        // MG-3 (design §7, "fetch trigger: both"): re-publish the agent's branch from its OWN repository
-        // into the mirror right now, so what is about to be verified is the agent's current tip rather
-        // than whatever the ref watcher last happened to see. The daemon names the source ref and the
-        // destination; the agent cannot name a ref at all.
-        _publishAgentRef?.Invoke(repoHandle, agentId);
-
-        // ...and now say so if that publish carried nothing because the agent's work is not on the branch
-        // the daemon carries. The restriction to refs/heads/agent/<id> is deliberate and stays (see
-        // AgentRefMediator): what was wrong is that a branch outside it was ignored SILENTLY, which is
-        // byte-for-byte the same observation as an agent that has done nothing at all. Verification is the
-        // point the work is proposed as ready, so it is the point the difference has to be stated.
-        //
-        // This deliberately does NOT fast-forward agent/<id> onto whatever HEAD happens to be. See
-        // docs/design/agent-branch-confinement.md §4: the trust argument for auto-recovery is sound, but
-        // the daemon has no signal that the branch the agent is standing on is the branch it means to
-        // submit, and replacing a silent no-op with a silent yes-op keeps the property that made this
-        // defect invisible.
-        var alignment = _checkAgentBranch?.Invoke(repoHandle, agentId);
-        if (alignment is { Drifted: true })
-        {
-            var report = alignment.Describe(agentId);
-            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} verification REFUSED — {report}");
-            _audit.Append(new AuditEvent(AgentBranchGuard.DriftEvent, new Dictionary<string, string>
-            {
-                ["repo"] = repoHandle,
-                ["agent"] = agentId,
-                ["expected"] = alignment.ExpectedBranch,
-                ["actual"] = alignment.ActualBranch ?? "(detached HEAD)",
-                ["head"] = alignment.HeadSha ?? string.Empty,
-                ["agent_branch"] = alignment.AgentBranchSha ?? string.Empty,
-                ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
-            }));
-
-            // InvalidOperationException, like the no-jail refusal above: MergeQueueGrpcService maps it to
-            // FAILED_PRECONDITION carrying this text, so the operator reads the measurement rather than
-            // "Exception was thrown by handler".
-            throw new InvalidOperationException(report);
-        }
+        var containerId = syntheticPlan is null
+            ? ResolveJailAndPublishForVerification(repoHandle, agentId)
+            : null;
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);
@@ -781,6 +793,16 @@ public sealed class MergeQueueProvisioner
         // that pushes new work re-verifies, re-classifies, and drops every ack that covered the old bytes.
         ArmFlaggedChangeReview(repoHandle, agentId, flaggedGate);
 
+        // The seeded arm ends here, AFTER every gate above was armed for real: the outcome is
+        // supplied instead of executed, and the record it produces says so about itself
+        // (SeededProvenanceMarker) — a value-supplied pass that claimed to be a container exit is
+        // the forgery P2-10 exists to prevent, so the one synthetic fact is the one labeled fact.
+        if (syntheticPlan is not null)
+        {
+            return await RunSyntheticVerificationAsync(
+                repoHandle, agentId, queue, syntheticPlan, resolution, ct).ConfigureAwait(false);
+        }
+
         // ...and before running anything, confirm the jail REALLY carries what main declared. This is a
         // daemon-observed exec in the worker's own container, not a lookup in the daemon's own
         // bookkeeping: the failure being defended against is precisely the one where our records say the
@@ -796,6 +818,124 @@ public sealed class MergeQueueProvisioner
                 agentId, containerId!, queue.CurrentMainSha,
                 resolution.Command, resolution.ResolvedCommand, resolution.ConfigHash),
             ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The jail half's preflight for a REAL verification: resolve the agent's live sandbox (no jail ⇒
+    /// refuse loudly — host execution is a rejection trigger, §3.2), re-publish the agent's branch
+    /// from its own repository into the mirror (MG-3, design §7 "fetch trigger: both" — what is about
+    /// to be verified must be the agent's current tip, not whatever the ref watcher last saw), and
+    /// refuse with the measurement when the agent's worktree is not on the branch the daemon carries
+    /// (a branch outside refs/heads/agent/&lt;id&gt; was previously ignored SILENTLY, byte-for-byte the
+    /// same observation as an agent that has done nothing; deliberately NOT auto-recovered — see
+    /// docs/design/agent-branch-confinement.md §4). Skipped entirely for a seeded id, which has no
+    /// agent repository and no sandbox by construction.
+    /// </summary>
+    private string ResolveJailAndPublishForVerification(string repoHandle, string agentId)
+    {
+        var containerId = _resolveContainerId(repoHandle, agentId);
+        if (string.IsNullOrEmpty(containerId))
+        {
+            throw new InvalidOperationException(
+                $"Agent '{agentId}' has no live sandbox — verification runs in the worker's own jail, never on the host.");
+        }
+
+        _publishAgentRef?.Invoke(repoHandle, agentId);
+
+        var alignment = _checkAgentBranch?.Invoke(repoHandle, agentId);
+        if (alignment is { Drifted: true })
+        {
+            var report = alignment.Describe(agentId);
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} verification REFUSED — {report}");
+            _audit.Append(new AuditEvent(AgentBranchGuard.DriftEvent, new Dictionary<string, string>
+            {
+                ["repo"] = repoHandle,
+                ["agent"] = agentId,
+                ["expected"] = alignment.ExpectedBranch,
+                ["actual"] = alignment.ActualBranch ?? "(detached HEAD)",
+                ["head"] = alignment.HeadSha ?? string.Empty,
+                ["agent_branch"] = alignment.AgentBranchSha ?? string.Empty,
+                ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            }));
+
+            // InvalidOperationException, like the no-jail refusal above: MergeQueueGrpcService maps it to
+            // FAILED_PRECONDITION carrying this text, so the operator reads the measurement rather than
+            // "Exception was thrown by handler".
+            throw new InvalidOperationException(report);
+        }
+
+        return containerId!;
+    }
+
+    /// <summary>
+    /// The seeded arm of a verification (docs/design/queue-seeding.md §3–4): the plan's outcome in
+    /// place of a sandboxed run, everything else real. The hold keeps the run GENUINELY in flight —
+    /// the queue's in-flight set, the wire's <c>verification_in_flight</c> and
+    /// <c>ClearStalledVerification</c>'s "wait" refusal all measure this await — and a cancellation
+    /// (the clear path's drain, or the RPC's own token) surfaces out of the delegate for the queue's
+    /// real failure path to settle; nothing here ever fabricates an outcome for a run that was
+    /// interrupted. The artifact and the provenance marker are the record's own statement that no
+    /// run happened.
+    /// </summary>
+    private async Task<VerificationRecord> RunSyntheticVerificationAsync(
+        string repoHandle, string agentId, MergeQueue queue, SyntheticVerificationPlan plan,
+        VerificationCommandResolver.Resolution resolution, CancellationToken ct)
+    {
+        if (plan.HoldSeconds > 0)
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, plan.HoldCancellation.Token);
+            await Task.Delay(TimeSpan.FromSeconds(plan.HoldSeconds), linked.Token).ConfigureAwait(false);
+        }
+
+        var when = DateTimeOffset.UtcNow;
+        var artifactPath = WriteSyntheticArtifact(agentId, queue.CurrentMainSha, plan, resolution, when);
+        _log?.Invoke(
+            $"merge queue repo={repoHandle} agent={agentId} SEEDED verification settled "
+            + $"(requested {(plan.Passed ? "PASS" : "FAIL")}; no run was executed)");
+
+        // Pinned to the queue's authoritative main exactly as the real runner pins it, with the REAL
+        // resolved provenance — plus the marker that keeps this record from ever claiming a run.
+        return new VerificationRecord(
+            agentId,
+            queue.CurrentMainSha,
+            plan.Passed,
+            artifactPath,
+            resolution.ResolvedCommand + SyntheticVerificationPlan.SeededProvenanceMarker,
+            resolution.ConfigHash,
+            when);
+    }
+
+    // Mirrors VerificationRunner.WriteArtifact's shape so the log view renders familiarly; the body
+    // is the honest statement of what did (not) happen. Best-effort like the real one.
+    private string WriteSyntheticArtifact(
+        string agentId, string mainSha, SyntheticVerificationPlan plan,
+        VerificationCommandResolver.Resolution resolution, DateTimeOffset when)
+    {
+        var name = $"verify_{new string(agentId.Select(c => char.IsLetterOrDigit(c) ? c : '-').ToArray())}"
+            + $"_{when.UtcDateTime:yyyyMMddTHHmmssfff}_{mainSha}.log";
+        var path = System.IO.Path.Combine(_artifactDir, name);
+        var body =
+            $"agent: {agentId}\n"
+            + $"main@sha: {mainSha}\n"
+            + $"resolved-command: {resolution.ResolvedCommand}{SyntheticVerificationPlan.SeededProvenanceMarker}\n"
+            + $"config-hash: {resolution.ConfigHash}\n"
+            + $"seeded: true — NO RUN WAS EXECUTED; requested outcome: {(plan.Passed ? "PASS" : "FAIL")}\n"
+            + $"when-utc: {when.UtcDateTime:O}\n"
+            + "---- stdout ----\n"
+            + "(seeded verification — produced by the dev-only queue seeder; the daemon executed nothing. "
+            + "See docs/design/queue-seeding.md.)\n";
+
+        try
+        {
+            System.IO.Directory.CreateDirectory(_artifactDir);
+            System.IO.File.WriteAllText(path, body);
+        }
+        catch (System.IO.IOException)
+        {
+            // Best-effort, same posture as VerificationRunner: losing the artifact must not lose the record.
+        }
+
+        return path;
     }
 
     /// <summary>
@@ -992,6 +1132,42 @@ public sealed class MergeQueueProvisioner
     // the typed "no verification command configured" edge; an absent main-side baseline counts as drift).
     private static string? ShowFile(string barePath, string reference, string path)
         => TryGit(barePath, out var output, "show", $"{reference}:{path}") ? output : null;
+
+    /// <summary>
+    /// Pulls the origin checkout's main forward into the bare mirror, called on a CONFIRMED human
+    /// merge. Without it the mirror's main stays wherever the last provision-fetch left it, and the
+    /// window between a merge and the next repo-open is a trap the E2E suite never walks (it verifies
+    /// every agent before merging): a spawn in that window bases its worktree on the stale mirror
+    /// main AND — worse — <see cref="EnsureQueue"/>'s reconcile trusts the mirror, so it walked the
+    /// queue's authoritative main BACKWARDS to the pre-merge sha. Verifications then ran coherently
+    /// against the old main, CanMerge said yes, and the client-side <c>--ff-only</c> refused every
+    /// one of them with "main moved" — a permanently unmergeable Verified entry, observed live.
+    ///
+    /// <para>Forced single-refspec fetch (origin's main is authoritative the moment a human merge is
+    /// confirmed — that is what "confirmed" means), narrow on purpose: agent refs stay mediated by
+    /// MG-3, and tags/other branches are not this path's business. Failure is reported, not thrown —
+    /// the merge has already landed; the mirror catches up at the next provision either way.</para>
+    /// </summary>
+    public bool TryRefreshMirrorMainAfterMerge(string repoHandle, out string reason)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        var mainBranch = ResolveDefaultBranch(barePath);
+        if (string.IsNullOrEmpty(RevParse(barePath, mainBranch)))
+        {
+            reason = $"no mirror main at '{barePath}'";
+            return false;
+        }
+
+        if (!TryGit(barePath, out var output,
+                "fetch", "--no-tags", "origin", $"+refs/heads/{mainBranch}:refs/heads/{mainBranch}"))
+        {
+            reason = $"git fetch origin {mainBranch} failed: {output.Trim()}";
+            return false;
+        }
+
+        reason = "";
+        return true;
+    }
 
     private static string RevParse(string barePath, string reference)
         => TryGit(barePath, out var output, "rev-parse", "--verify", reference) ? output.Trim() : string.Empty;

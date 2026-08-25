@@ -274,7 +274,7 @@ public sealed class DockerSuiteFixture : IDisposable
         IDockerClient docker;
         try
         {
-            docker = new DockerClientConfiguration().CreateClient();
+            docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         }
         catch
         {

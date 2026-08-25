@@ -137,10 +137,10 @@ Infinite, Timeout.Infinite);
     {
         var full = Path.GetFullPath(path);
         var fullRoot = Path.GetFullPath(root);
-        if (string.Equals(full, fullRoot, StringComparison.Ordinal)) return true;
+        if (string.Equals(full, fullRoot, FileSystemPaths.Comparison)) return true;
 
         var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
-        return full.StartsWith(prefix, StringComparison.Ordinal);
+        return full.StartsWith(prefix, FileSystemPaths.Comparison);
     }
 
     private void OnFileSystemEvent(object sender, FileSystemEventArgs e)
@@ -205,13 +205,27 @@ Infinite, Timeout.Infinite);
         var full = Path.GetFullPath(fullPath);
         foreach (var root in _gitRoots)
         {
-            if (string.Equals(full, root, StringComparison.Ordinal)) return string.Empty;
+            if (string.Equals(full, root, FileSystemPaths.Comparison)) return string.Empty;
 
             var prefix = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
-            if (full.StartsWith(prefix, StringComparison.Ordinal))
+            if (full.StartsWith(prefix, FileSystemPaths.Comparison))
             {
                 return full.Substring(prefix.Length).Replace('\\', '/');
             }
+        }
+
+        // Same-namespace fallback. The roots above are canonical (libgit2 resolves symlinks),
+        // but events from the working-tree watcher arrive in the namespace of the path the
+        // watcher was GIVEN — reach the repo through a symlink (macOS's /var → /private/var
+        // temp dir, any symlinked checkout) and no canonical prefix ever matches, so a
+        // mid-operation index.lock would masquerade as a working-tree change and fire a
+        // refresh. Within one namespace the gitdir of an ordinary repo is textually the
+        // watched root's ".git" entry, so classify by that; the ".git" entry itself (or the
+        // pointer FILE of a linked worktree) stays null for the caller's bare-touch guard.
+        var relative = Path.GetRelativePath(_repoPath, full).Replace('\\', '/');
+        if (relative.StartsWith(".git/", FileSystemPaths.Comparison))
+        {
+            return relative.Substring(".git/".Length);
         }
         return null;
     }

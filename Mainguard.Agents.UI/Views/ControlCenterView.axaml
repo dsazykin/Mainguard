@@ -218,11 +218,36 @@
                            recommend the destructive one. Stop stays reachable above for a real hang. -->
                       <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="10" MaxWidth="440"
                                   IsVisible="{Binding CoordinatorConnectTimedOut}">
-                        <TextBlock Text="Still starting the coordinator" FontSize="14" FontWeight="SemiBold"
-                                   HorizontalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
-                        <TextBlock TextWrapping="Wrap" TextAlignment="Center" FontSize="12"
-                                   Foreground="{DynamicResource TextMuted}"
-                                   Text="Its sandbox has been starting for a while without drawing a terminal. The first start for a repository also builds its toolchain image, which takes several minutes — leave Mainguard running and it should come up on its own. Stopping now cancels that build and the next attempt starts it over. If it never comes up, check the daemon logs (oobe.log)."/>
+                        <!-- (a) the daemon has NOT yet said this coordinator finished starting — the
+                             toolchain-build case above. -->
+                        <StackPanel Spacing="10" IsVisible="{Binding !CoordinatorHasStarted}">
+                          <TextBlock Text="Still starting the coordinator" FontSize="14" FontWeight="SemiBold"
+                                     HorizontalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
+                          <TextBlock TextWrapping="Wrap" TextAlignment="Center" FontSize="12"
+                                     Foreground="{DynamicResource TextMuted}"
+                                     Text="Its sandbox has been starting for a while without drawing a terminal. The first start for a repository also builds its toolchain image, which takes several minutes — leave Mainguard running and it should come up on its own. Stopping now cancels that build and the next attempt starts it over. If it never comes up, check the daemon logs (oobe.log)."/>
+                        </StackPanel>
+
+                        <!-- (b) ISSUES-LOG #23: the daemon says this coordinator is RUNNING and its terminal
+                             still drew nothing. Telling the user it is "still starting" here is simply
+                             false, and it hid the one recovery that works. The usual cause is a daemon
+                             restart under a surviving jail: the CLI keeps running inside its sandbox, but
+                             the terminal that was attached to it belonged to the previous daemon process
+                             and cannot be re-bound (there is no re-attach for a `docker exec` whose client
+                             is gone). Restart is offered right here because the header button is the only
+                             other route to it and nothing on this card pointed at it. -->
+                        <StackPanel Spacing="10" IsVisible="{Binding CoordinatorHasStarted}">
+                          <TextBlock Text="The coordinator is running — its terminal isn't attached"
+                                     FontSize="14" FontWeight="SemiBold"
+                                     HorizontalAlignment="Center" Foreground="{DynamicResource TextPrimary}"/>
+                          <TextBlock TextWrapping="Wrap" TextAlignment="Center" FontSize="12"
+                                     Foreground="{DynamicResource TextMuted}"
+                                     Text="Mainguard's daemon still reports this coordinator's sandbox as running, but nothing is drawing in its terminal. That happens when the daemon restarted while the coordinator kept running: the CLI is alive inside its sandbox, but the terminal it was started with belonged to the old daemon and can't be reconnected. Restart gives you a fresh coordinator you can talk to; the old sandbox is torn down with it."/>
+                          <Button Classes="Primary" Content="Restart the coordinator" FontSize="12"
+                                  HorizontalAlignment="Center"
+                                  Command="{Binding RestartCoordinatorCommand}"
+                                  IsEnabled="{Binding !IsStartingCoordinator}"/>
+                        </StackPanel>
                       </StackPanel>
                     </Panel>
                   </Border>
@@ -255,6 +280,8 @@
           <RowDefinition Height="Auto"/>
           <!-- the telemetry row; resized by TelemetrySeam, collapsed by the code-behind when hidden -->
           <RowDefinition Height="Auto"/>
+          <!-- the dev-only seeding card; the row is zero unless the daemon enabled seeding -->
+          <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
         <Border Grid.Row="0" MinHeight="160" Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
@@ -274,6 +301,15 @@
                 Background="{DynamicResource SurfacePanel}" CornerRadius="12"
                 BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
           <views:TelemetryPanelView DataContext="{Binding Telemetry}"/>
+        </Border>
+        <!-- DEV-ONLY queue seeding (docs/design/queue-seeding.md): the card EXISTS only when the
+             daemon answered the availability probe — a daemon without the boot flag never maps the
+             service, QueueSeeding stays null, and this row collapses to nothing. -->
+        <Border Grid.Row="3" Margin="0,8,0,0"
+                IsVisible="{Binding QueueSeeding, Converter={x:Static ObjectConverters.IsNotNull}}"
+                Background="{DynamicResource SurfacePanel}" CornerRadius="12"
+                BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
+          <views:QueueSeedingPanelView DataContext="{Binding QueueSeeding}"/>
         </Border>
       </Grid>
     </Grid>

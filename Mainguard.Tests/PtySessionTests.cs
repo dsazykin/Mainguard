@@ -13,13 +13,13 @@ namespace Mainguard.Tests;
 
 /// <summary>
 /// TI-P2-03 §3–4 / plan §6 rows 3–6 + §5 invariant 1 — the PTY shim: isatty, echo round-trip,
-/// Ctrl+C interrupt, kill, resize propagation. The Unix probes are Linux-only (forkpty) and skip
-/// on Windows with a reason; a ConPTY smoke exercises the Windows path during self-verify. The
-/// authoritative Linux run is the Docker/Linux CI leg.
+/// Ctrl+C interrupt, kill, resize propagation. The Unix probes run on Linux AND macOS (forkpty —
+/// the macos-host substrate spawns daemon-side PTYs on the Mac) and skip on Windows with a
+/// reason; a ConPTY smoke exercises the Windows path during self-verify.
 /// </summary>
 public sealed class PtySessionTests
 {
-    [LinuxOnlyFact]
+    [UnixOnlyFact]
     public async Task PtySession_Spawn_CatEcho_ShouldRoundTripBytes()
     {
         using var session = PtyProcessShim.Spawn("/bin/cat", Array.Empty<string>(), TempDir(), Env(), 80, 24);
@@ -32,7 +32,7 @@ public sealed class PtySessionTests
         Assert.Contains("mainguard-pty-echo", output);
     }
 
-    [LinuxOnlyFact]
+    [UnixOnlyFact]
     public async Task PtySession_Isatty_ShouldBeTrue()
     {
         using var session = PtyProcessShim.Spawn(
@@ -42,7 +42,7 @@ public sealed class PtySessionTests
         Assert.Contains("ISATTY_YES", output);
     }
 
-    [LinuxOnlyFact]
+    [UnixOnlyFact]
     public async Task PtySession_CtrlC_ShouldInterruptForegroundProcess()
     {
         // /bin/cat blocks forever reading stdin — with no interrupt it never exits, so its ExitCode
@@ -63,7 +63,7 @@ public sealed class PtySessionTests
             "0x03 (Ctrl+C) did not interrupt the foreground process — its ExitCode never completed.");
     }
 
-    [LinuxOnlyFact]
+    [UnixOnlyFact]
     public async Task PtySession_Kill_ShouldCompleteExitCode()
     {
         // 'sleep 30' would run for 30s if left alone; Kill() (SIGKILL) reaping it makes ExitCode
@@ -79,7 +79,7 @@ public sealed class PtySessionTests
             "Kill() did not reap the child — its ExitCode never completed.");
     }
 
-    [LinuxOnlyFact]
+    [UnixOnlyFact]
     public async Task PtySession_Resize_ShouldPropagateToWinsize()
     {
         using var session = PtyProcessShim.Spawn(

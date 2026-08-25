@@ -45,10 +45,33 @@ public sealed class KillSwitchGrpcService : KillSwitchService.KillSwitchServiceB
         };
     }
 
-    public override Task<ResumeKillResponse> Resume(ResumeKillRequest request, ServerCallContext context)
+    public override async Task<ResumeKillResponse> Resume(ResumeKillRequest request, ServerCallContext context)
     {
-        _killSwitch.Resume();
-        _log.LogInformation("Resume: unfrozen");
-        return Task.FromResult(new ResumeKillResponse { Resumed = true });
+        var report = await _killSwitch.ResumeAsync(context.CancellationToken).ConfigureAwait(false);
+        var resumed = report.Agents.Count(a => a.Outcome == KillResumeOutcome.Resumed);
+        var failed = report.Agents.Count(a => a.Outcome == KillResumeOutcome.ResumeFailed);
+
+        // Logged at Warning when anything is still frozen: "Resume: unfrozen" was previously the daemon's
+        // ONLY word about a release that had not un-paused a single jail (ISSUES-LOG #17).
+        if (failed > 0)
+        {
+            _log.LogWarning(
+                "Resume: queue unfrozen but {Failed} agent(s) could NOT be unpaused (epoch={Epoch}, resumed={Resumed})",
+                failed, report.KillEpochId, resumed);
+        }
+        else
+        {
+            _log.LogInformation("Resume: unfrozen — {Resumed} agent(s) released (epoch={Epoch})",
+                resumed, report.KillEpochId);
+        }
+
+        return new ResumeKillResponse
+        {
+            // The freeze is always cleared; `resumed` now means the WHOLE release succeeded, jails included.
+            Resumed = failed == 0,
+            QueueUnfrozen = !report.QueueFrozen,
+            AgentsResumed = resumed,
+            AgentsResumeFailed = failed,
+        };
     }
 }

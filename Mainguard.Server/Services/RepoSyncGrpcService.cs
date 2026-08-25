@@ -14,7 +14,7 @@ namespace Mainguard.Server.Services;
 /// the actual bare-mirror provision, agent worktrees, and quarantine remotes live in the daemon
 /// services held by <see cref="IAgentEnvironment"/>. Only opaque handles cross the wire (G-14) —
 /// the repo hash, agent ids, and the Windows-facing <see cref="SyncRemote"/> URL; daemon
-/// filesystem paths never leave the VM.
+/// daemon-side filesystem paths never cross the wire (on WSL they stay in the VM; on macOS they stay the daemon's own).
 /// </summary>
 public sealed class RepoSyncGrpcService : RepoSyncService.RepoSyncServiceBase
 {

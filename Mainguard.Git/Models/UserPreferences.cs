@@ -5,7 +5,13 @@ public class UserPreferences
     // Theme key from the app's theme catalog (see Mainguard.UI/Themes);
     // unknown/legacy values fall back to the default theme at startup.
     public string Theme { get; set; } = "MidnightLoom";
-    public bool EnableGlassmorphism { get; set; } = true;
+    // macOS-only: render the main window's OUTER chrome (window background, title bar, section
+    // rail) over the system vibrancy blur. Off = the flat opaque look, which stays the canonical
+    // harness-verified rendering on every platform. Replaces the never-read EnableGlassmorphism
+    // key (deliberately NOT reused — it defaulted to true, and a stale persisted `true` would
+    // silently switch existing installs to the new translucent chrome; unknown keys left in an
+    // existing settings file are ignored on load).
+    public bool MacTranslucentChrome { get; set; } = false;
     public string AutoDetectPath { get; set; } = string.Empty;
     public string LastOpenedRepoPath { get; set; } = string.Empty;
     public System.Collections.Generic.Dictionary<string, bool> SidebarExpandedStates { get; set; } = new System.Collections.Generic.Dictionary<string, bool>();

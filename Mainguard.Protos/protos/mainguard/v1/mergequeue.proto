@@ -42,6 +42,12 @@ service MergeQueueService {
   // Merged). Denied to the coordinator role at the interceptor, alongside the merge RPCs: an
   // agent-invokable discard is a way for a branch to erase the evidence blocking it.
   rpc DiscardEntry(DiscardEntryRequest) returns (DiscardEntryResponse);
+  // Rejects a VERIFIED (or awaiting-review) entry in review — the human judged the work itself and
+  // said no. Terminal, like the state machine's Rejected has always been; distinct from DiscardEntry,
+  // which is entry housekeeping legal from any non-terminal state. Refused for entries that were never
+  // verified ("discard the entry instead"): rejecting is a review verdict, and there is nothing to
+  // review before a verification ran.
+  rpc RejectEntry(RejectEntryRequest) returns (RejectEntryResponse);
   // Clears a `Verifying` state that has no run behind it, returning the entry to `Working` so it can be
   // verified again. The daemon persists state per transition but tracks in-flight runs in memory, so a
   // restart mid-verification rehydrates `Verifying` with nothing executing — and ResumeAfterRestartAsync
@@ -202,6 +208,24 @@ message DiscardEntryResponse {
   // The record that was written, echoed back so the surface can say what it did rather than assume.
   string discarded_by = 3;
   string discarded_at = 4; // ISO-8601 (round-trip "O"); empty when nothing was discarded
+}
+
+message RejectEntryRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+  // The reviewer's reason, recorded verbatim on the entry and in the audit event. May be empty, same
+  // policy as DiscardEntryRequest.reason.
+  string reason = 3;
+  // Deliberately NO actor field — the rejecting identity is daemon-derived from the connection
+  // (IApproverIdentityResolver), same as DiscardEntry: a client-populated attribution is forgeable.
+}
+
+message RejectEntryResponse {
+  bool rejected = 1;
+  // Rendered verbatim when rejected is false (unknown entry, not verified, already terminal).
+  string reason = 2;
+  string rejected_by = 3;
+  string rejected_at = 4; // ISO-8601 (round-trip "O"); empty when nothing was rejected
 }
 
 message ClearStalledVerificationRequest {

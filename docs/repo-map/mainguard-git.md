@@ -42,8 +42,9 @@ The all-editions base. Git logic goes here.
   `HasTosAcknowledgment(provider)` query helper, case-insensitive, that P2-15 chains. `MergeQueueRow`
   carries a P2-12 `Origin` column (`Local`/`External`) and the discard record —
   `DiscardedBy`/`DiscardedAtUtc`/`DiscardReason`, all null except on a `Discarded` row. The record
-  lives on the row rather than only in the audit log because the daemon's `IAuditLog` is in-memory
-  today, so the row is what actually survives a restart; `DiscardedBy` is daemon-derived at the RPC
+  lives on the row rather than only in the audit log — decided when the daemon's `IAuditLog` was
+  in-memory (pre-P2-15), and kept: the row is the queue's own queryable state, the chain is the
+  evidence trail; `DiscardedBy` is daemon-derived at the RPC
   (there is no actor field on the wire) and attributes the host session, not a distinguishable human —
   see `IApproverIdentityResolver`. Migrations live in `Migrations/` (P2-10 adds
   `AddMergeQueue`; P2-12 adds `AddPrIntake` — the two intake tables + the `Origin` column; P2-13 adds
@@ -51,7 +52,15 @@ The all-editions base. Git logic goes here.
   three discard columns; `AddPrIntakeConfig` adds `PrIntakeConfig`, the intake's **singleton** (`Id = 1`,
   `ValueGeneratedNever`) daemon-wide configuration row — `Enabled`, `PollIntervalSeconds` and a
   comma-separated `BotAuthors`, read and written whole, which is why the author list is one column and
-  not a child table).
+  not a child table; P2-15 adds `AddAuditChain` — the `AuditRecords` table (`Models/AuditRecordRow.cs`:
+  `Seq` chain-assigned PK, `TimestampText` stored as the exact hashed ISO-O string, encrypted
+  `PayloadCiphertext`, `KeyId`, `PrevHash`/`Hash`, `Redacted`) **plus the two append-only SQLite
+  triggers** — any `DELETE` aborts, and the only legal `UPDATE` is the redaction tombstone transition,
+  so even raw SQL must first drop a trigger to rewrite history, which the hash chain then catches;
+  `AddAuditAnchors` adds `AuditAnchors` (`Models/AuditAnchorRow.cs` — one row per RFC 3161-anchored
+  chain head: head seq/hash, request/anchor times, the DER token or null while pending; NOT
+  append-only — a forged anchor only invalidates itself, the TSA signature cannot be re-made to
+  match a rewritten chain)).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +
@@ -122,6 +131,10 @@ The all-editions base. Git logic goes here.
     `UseStructuredCommitComposer` flag (plain ⇄ structured commit-composer mode; JSON, no migration),
     and the T-18 `ShortcutBindings` (id → gesture overrides layered on the `ShortcutMap` defaults; empty
     string clears a default; JSON-persisted, no migration).
+  - `UserPreferences.MacTranslucentChrome` (default false) drives the macOS vibrancy chrome via
+    `Mainguard.UI/Theming/VibrancyManager`; it replaced the never-read `EnableGlassmorphism` key
+    (deliberately not reused — it defaulted to true, and a stale persisted `true` would silently
+    switch existing installs to translucent chrome; unknown JSON keys are ignored on load).
   - `GitDiffLine` carries the T-13 intra-line `HighlightSpans` (changed-word char ranges into `Content`)
     + `TrailingWhitespaceSpan` + `EmphasisKey`.
   - `TosAcknowledgment` (P2-01: a recorded provider-ToS acknowledgment — `Provider` + `AcknowledgedAt` —
@@ -221,7 +234,13 @@ The all-editions base. Git logic goes here.
     "not yet supported for <host>" and report `IsImplemented=false`).
 - **`Security/`** — `SecureKeyring.cs` (OS keyring / DataProtection secret storage; T-14 added a
   storage-directory-override constructor for testability, `Retrieve` returns null on a corrupt/foreign
-  payload), `GitHostDetector.cs` + `Models/HostKind.cs` (classify a remote as GitHub/GitLab/etc.;
+  payload; the key ring is DPAPI-wrapped on Windows and Keychain-wrapped on macOS),
+  `MacKeychainKeyProtection.cs` (the macOS DPAPI analogue: the DataProtection key XML is
+  AES-256-GCM-encrypted with a master key living ONLY in the login Keychain, accessed through
+  `/usr/bin/security` so the item's ACL names the Apple-signed CLI and ad-hoc-rebuilt dev
+  binaries never trigger per-build prompts; fail-open to the previous plaintext posture when the
+  Keychain is unavailable — secrets must survive, hardening is best-effort),
+  `GitHostDetector.cs` + `Models/HostKind.cs` (classify a remote as GitHub/GitLab/etc.;
   `UsernameForToken` is the **single source** for the host→token-username convention; `ParseOwnerRepo`
   extracts the `owner/repo` slug from a remote URL — HTTPS/ssh/scp forms, `.git`-stripped, subgroups
   folded into owner — for the T-23 PR API), `SshKeyService.cs` (T-14 SSH key manager: generate ed25519
@@ -423,7 +442,7 @@ The all-editions base. Git logic goes here.
   MiB tmpfs `$HOME` and dies at `ENOSPC` — which the merge queue would record as an ordinary failed
   verification). Throw these from Core; catch in ViewModels to drive dialogs.
 - **`Migrations/`** — generated EF migrations + `AppDbContextModelSnapshot.cs`. Never hand-edit an applied one.
-- **`Audit/`** (P2-02) — the minimal G-17 audit seam: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 supplies the hash-chained implementation behind this same interface), `InMemoryAuditLog.cs` (thread-safe pre-P2-15 journal; used by the daemon skeleton and the `AuditProbe` fixture). **Read the remarks on `IAuditLog.Read` before adding an `Append` call site:** there are 28 `Append` calls across 13 production files and ZERO production readers — no RPC, no ViewModel — and the shipped implementation is in-memory, so an audited event is unreachable during and after the incident it describes. P2-15 is the plan and this interface is the seam it lands behind; until then an `Append` is evidence for a later investigation and never the user-visible record of anything, so any path that destroys work pairs it with a log line, a typed refusal or a UI notice.
+- **`Audit/`** (P2-02, P2-15) — the G-17 audit seam and the P2-15 tamper-evident chain: `IAuditLog.cs` (append/read + the flat `AuditEvent(Type, Fields)` record; deliberately narrow — P2-15 lands behind this same interface), `InMemoryAuditLog.cs` (thread-safe in-memory journal; the test/no-DB-fallback implementation), `HashChain.cs` (P2-15 pure chain: the `AuditRecord(Seq, Timestamp, Type, PayloadJson, PrevHash, Hash)` record, `ComputeHash` = SHA-256(prevHash ‖ canonicalPayload) lowercase hex, `Verify` walking seq contiguity + linkage + recomputed hashes, first-bad-seq exact; mid-chain slices anchor on their first record, seq 1 pins to `GenesisHash`), `CanonicalJson.cs` (the one serialization the chain hashes: ordinal-sorted keys recursively, invariant culture, equivalent-number collapse, UTF-8 no BOM — hashing non-canonical JSON is a spec rejection trigger), `IChainedAuditLog.cs` (the P2-15 contract surface over the narrow seam: `Append(type, payload, osIdentity)→seq`, `Read(fromSeq, take)`, `VerifyAll`, `Redact`), `ChainedAuditLog.cs` (the tamper-evident implementation: hashes the canonical ENVELOPE `{identity, payload, seq, timestamp, type}` so a flipped timestamp/type/seq column fails verify; AES-GCM payloads at rest; DB commits first, mirror second, with a test-only fault seam between; `VerifyAll` = linkage + recomputed hashes + column↔envelope cross-check + redaction vouching + mirror comparison; `Append` THROWS on store failure — the kill switch's RT-D3 gap path depends on that; `ApplyRetention` = redaction, never deletion, redaction events exempt), `AuditCrypto.cs` (AES-256-GCM, master key `audit-payload-key` in the OS keyring via `ISecureKeyStore`, generated on first use; nonce‖tag‖ciphertext blobs, `KeyId` stamped per row), `AuditFileMirror.cs` (the payload-FREE append-only file mirror — length-prefixed canonical-JSON chain columns, fsync'd, one-write frames so concurrent writers interleave but never tear; `Recover` repairs only torn/missing TAILS from DB truth and reports a content disagreement as a `ConflictSeq` instead of repairing it — the witness must not be quietly rewritten to match a tampered DB), `Rfc3161Anchor.cs` (P2-15 external anchoring: `IRfc3161TimestampClient` + the real `Rfc3161TimestampClient` (System.Security.Cryptography.Pkcs; POSTs a nonce'd timestamp-query, `ProcessResponse` rejects a token for any other hash), `Rfc3161AnchorValidation` (offline structural check: token decodes + message imprint IS the recorded head hash), and `AuditAnchorQueue` — heads enqueued by policy (every 1000 records / 24 h, idempotent per head), pending anchors retried best-effort (an unreachable TSA queues; chaining never waits — edge row 4), stored tokens validated for the verify CLI). **Since P2-15 (2026-08-19) the store is real and read:** the daemon registers `ChainedAuditLog` whenever its DB opens, and the readers are the `AuditService` RPCs + the `mainguardd audit verify` CLI. The standing rule on `IAuditLog.Read` remains: an `Append` is evidence for a later investigation, never the user-visible record of anything — any path that destroys work still pairs it with a log line, a typed refusal or a UI notice.
 - **`Services/`** — the service layer every ViewModel talks to. Interface-first:
   - `IGitService.cs` / `GitServices.cs` — the core git engine. **All** LibGit2Sharp access goes
     through `GitServices.ExecuteWithRepo(...)`, which owns the **bounded index.lock retry** (4 attempts,
@@ -481,6 +500,28 @@ The all-editions base. Git logic goes here.
       remote-tracking ref gets a local tracking branch created first).
     - `GetRemoteUrl` reads the **raw** `remote.<name>.url` config (not `Remotes[..].Url`) so a
       `url.insteadOf` transport rewrite never hides the user's real host from host/token detection.
+  - `UncRemoteTrust.cs` — lets ONE git invocation read a repository behind a Windows **UNC** path
+    (`\\server\share\…`) without touching the user's own git config (walkthrough W4). The WSL2
+    substrate's sync remote is a bare mirror inside the VM addressed as
+    `\\wsl.localhost\MainguardEnv\…\<hash>.git`; its files carry the VM's owner SID, so every client
+    fetch died with `fatal: detected dubious ownership in repository at '\\wsl.localhost\…'` and
+    blocked the first merge for every Windows+WSL2 user. `RunGitTrustingRemote(repoPath, remoteName,
+    args…)` reads `remote.<name>.url`, and **only** when it is a UNC repository path writes a
+    throwaway config file naming that one exact directory in `safe.directory`, passing it as
+    `GIT_CONFIG_SYSTEM` for that single child process; the shim `include.path`s the real system config
+    so nothing the user configured is lost. Everything else — an https host remote, the macOS
+    substrate's plain local mirror, any non-Windows host — takes an early return to an unmodified
+    `GitService.RunGit`. **Two measured git facts the implementation is built on** (git
+    2.45.1.windows.1, live against a real mirror): (1) `safe.directory` is read through
+    `read_very_early_config()`, which sets `ignore_cmdline = 1`, so `git -c safe.directory=…` and
+    `GIT_CONFIG_COUNT/KEY_0/VALUE_0` are **silently ignored — including the `*` wildcard**; only the
+    file-based system/global scopes work, which is why the obvious `-c` one-liner does nothing.
+    (2) The value must be the literal Windows spelling with backslashes (`\\wsl.localhost\…`);
+    the forward-slash form does not match, and because `\` is a config-file escape character every
+    backslash must be written doubled — an under-escaped value reads back as `\wsl.localhost\…` and
+    never matches while looking identical to git's error text. Pinned by
+    `Mainguard.Tests/UncRemoteTrustTests` (config-file round-trip against real git); the UNC failure
+    itself needs a live WSL2 VM and was verified by hand.
   - `BlameCache.cs` — bounded LRU (~32 entries) keyed `(repoPath, path, headSha)` for T-11 blame results; invalidated per-repo on `RepositoryWatcher.RepositoryChanged`. Never unbounded (rejection trigger).
   - `AutoFetchService.cs` — background auto-fetch (T-10). One `PeriodicTimer` loop over the watched
     repo set fetches (prune) off the UI thread on the `UserPreferences.AutoFetchMinutes` cadence (0 =
@@ -536,6 +577,13 @@ The all-editions base. Git logic goes here.
     `GitService.ResolveGitDir` + `ResolveCommonGitDir` and are matched longest-first, so a
     per-worktree `HEAD` is not misread as `worktrees/<name>/HEAD` under the common dir. An ordinary
     repo is unchanged — `.git` is already inside the watched tree, so no extra watcher is created.
+    Metadata classification also has a same-namespace textual `.git/` fallback: the resolved roots
+    are canonical (libgit2 resolves symlinks), but events arrive in the namespace of the path the
+    watcher was given, so a repo reached through a symlink (macOS's `/var` temp dir, any symlinked
+    checkout) would otherwise see `index.lock` churn as a working-tree change and refresh mid-op.
+  - `FileSystemPaths.cs` — the path-comparison policy: `OrdinalIgnoreCase` on Windows **and**
+    macOS (NTFS/APFS are case-insensitive), `Ordinal` on Linux. Purely textual — symlink identity
+    still needs one namespace or canonical paths; used by `RepositoryWatcher` prefix checks.
   - `IInteractiveRebaseService.cs` / `InteractiveRebaseService.cs` — interactive rebase sequence
     controller. All rebase-state reads go through `GitService.GitDirPath`, never
     `Path.Combine(repoPath, ".git", …)`.

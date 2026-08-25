@@ -135,6 +135,72 @@ public class SecretDeliveryDockerTests
     }
 
     /// <summary>
+    /// The BYOK <b>"Custom key"</b> leg, end to end into a real jail (ISSUES-LOG #37).
+    ///
+    /// <para>A walkthrough leg saved a custom key, spawned a <c>scripted</c>-class agent, found
+    /// <c>agent.env</c> present-but-empty in the jail and logged the whole feature as silently
+    /// non-functional. It was measuring spawns made through a raw <c>SpawnAgent</c> RPC that never
+    /// carried <c>extra_env</c> — but the daemon-side half of the claim ("a custom key survives
+    /// BuildSecrets and reaches the file the launch wrapper sources") was genuinely untested, and the
+    /// combination it doubted is the awkward one: an adapter declaring <b>no</b> <c>apiKeyEnvVar</c> at
+    /// all, so the custom entry is the ONLY thing in the file and an off-by-one in the mapping would
+    /// produce exactly the empty file that was reported.</para>
+    ///
+    /// <para>The production <see cref="SandboxAgentLauncher.BuildSecrets"/> composes the env-file here
+    /// rather than the test hand-rolling one — a hand-rolled dictionary would still pass if BuildSecrets
+    /// dropped <c>extraEnv</c> on the floor, which is the defect under test.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task Spawn_DeliversACustomEnvKey_ForAnAdapterThatDeclaresNoApiKeyVariable()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
+        var ct = cts.Token;
+        await using var fixture = new SandboxFixture();
+
+        const string envVarName = "MG_BYOK_PROBE";
+        var nonce = "MG-CUSTOM-" + Guid.NewGuid().ToString("N");
+
+        // The `scripted` shape: an installed adapter with no apiKeyEnvVar (its CLI logs in
+        // interactively, or not at all), and NO model key. The custom entry is all there is.
+        var marker = new Mainguard.Agents.Agents.Adapters.InstalledAdapterMarker(
+            "scripted", "1.0.0", new[] { "/opt/mainguard/adapters/bin/scripted" }, ApiKeyEnvVar: null);
+        var secrets = Mainguard.Server.Runtime.SandboxAgentLauncher.BuildSecrets(
+            modelApiKey: null,
+            adapter: marker,
+            extraEnv: new Dictionary<string, string> { [envVarName] = nonce });
+
+        var handle = await fixture.SpawnAsync(
+            agentId: "secret-delivery-4", agentEnv: secrets.AgentEnv, ct: ct);
+
+        // The needle is the whole `NAME=value` line, so this fails both ways a delivery can go wrong:
+        // a value that arrived under the wrong name, and a name that arrived with no value.
+        var facts = await ReadFileFactsAsync(
+            fixture, handle.ContainerId, SecretPath, ct, needle: envVarName + "=" + nonce);
+
+        Assert.True(facts.Ran,
+            $"the in-jail probe produced no {FactFrame} frame, so nothing about '{SecretPath}' was "
+            + "observed. Raw output: " + facts.Raw);
+        Assert.True(facts.Exists, $"'{SecretPath}' does not exist in the jail. Raw: {facts.Raw}");
+        Assert.NotEqual("0", facts.Bytes); // the exact symptom #37 reported: present but empty
+        Assert.True(facts.HasNonce,
+            $"'{SecretPath}' exists and is non-empty but does not carry '{envVarName}=<nonce>', so the "
+            + "custom BYOK key did not survive the trip into the jail. Raw: " + facts.Raw);
+        Assert.Equal("400", facts.Mode);
+        Assert.Equal("1000", facts.Uid);
+
+        // Negative control on the NAME: the keyring stores this under `llm_env_MG_BYOK_PROBE`, and the
+        // prefix must be stripped before the wire. A file carrying `llm_env_MG_BYOK_PROBE=...` would
+        // satisfy every assertion above except this one, while being invisible to the CLI.
+        var prefixed = await ReadFileFactsAsync(
+            fixture, handle.ContainerId, SecretPath, ct,
+            needle: Mainguard.Agents.UI.Services.ApiKeyProviderMap.CustomEnvKeyPrefix + envVarName);
+        Assert.True(prefixed.Ran, "the in-jail probe did not run for the prefix control. Raw: " + prefixed.Raw);
+        Assert.False(prefixed.HasNonce,
+            "the jail's env-file carries the keystore's `llm_env_` prefix in the variable NAME, so no CLI "
+            + "will ever read it. Raw: " + prefixed.Raw);
+    }
+
+    /// <summary>
     /// Pins <b>why</b> the obvious replacement is not available, so nobody re-derives it.
     ///
     /// <para><c>PUT /containers/{id}/archive</c> is the natural way to put a file in a container, and it

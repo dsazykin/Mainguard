@@ -174,7 +174,7 @@ public class MirrorReadOnlyDockerTests
 
         var environment = new Wsl2AgentEnvironment(vmRoot: vmRoot);
         var launcher = new SandboxAgentLauncher(environment);
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
 
         var provision = environment.Repos.Provision(sourceRepo);
         const string agentId = "mg3-agent-1";
@@ -403,7 +403,7 @@ public class MirrorReadOnlyDockerTests
 
     private static string NewTempDir(string prefix)
     {
-        var path = Path.Combine(Path.GetTempPath(), prefix + Guid.NewGuid().ToString("N"));
+        var path = Path.Combine(Fixtures.CanonicalTemp.Root, prefix + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(path);
         return path;
     }

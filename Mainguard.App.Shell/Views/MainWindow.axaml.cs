@@ -17,6 +17,23 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         UpdateMaximizeIcon();
+        // macOS: overlay the system chrome (the axaml asks for NoChrome, which would remove
+        // the traffic lights), hide the hand-drawn buttons, clear the traffic-light cluster.
+        Mainguard.UI.Views.WindowChromePolicy.Apply(this);
+        // The macOS menu bar follows the key window — attach the shared menu (no-op elsewhere).
+        Services.MacMenuBar.Attach(this);
+        WindowButtonsPanel.IsVisible = Mainguard.UI.Views.WindowChromePolicy.CustomButtonsVisible;
+        MenuBarGroup.IsVisible = Mainguard.UI.Views.WindowChromePolicy.InWindowMenuVisible;
+        TitleBarBorder.Padding = Mainguard.UI.Views.WindowChromePolicy.TitleBarPadding(TitleBarBorder.Padding);
+        // Opt-in macOS vibrancy: attach in the ctor so EVERY construction path (client shell,
+        // client first-run handoff, Pro startup handoff) applies the persisted preference.
+        // VibrancyManager tracks the window's ACTUAL transparency level, so the token overrides
+        // land only once the platform grants the blur (post-show, asynchronously). No-op off
+        // macOS and in headless runs (Settings may not exist there — harnesses construct
+        // windows directly).
+        Mainguard.UI.Theming.VibrancyManager.Attach(this);
+        if (System.OperatingSystem.IsMacOS() && App.Settings is not null)
+            Mainguard.UI.Theming.VibrancyManager.SetEnabled(App.Settings.Current.MacTranslucentChrome);
     }
 
     /// <summary>Close-to-tray: the X hides the window (the app — and any running agents — keep

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
 using Docker.DotNet.Models;
@@ -188,7 +189,15 @@ public sealed record ContainerSpecRequest(
     string? PackageCachePath = null,
     bool WithoutRepositoryAccess = false,
     string? ToolchainsRootPath = null,
-    IReadOnlyList<string>? ToolchainIds = null);
+    IReadOnlyList<string>? ToolchainIds = null,
+    // ESC-I1: the substrate's daemon-owned roots; when supplied, every bind-mount source must sit
+    // under one of them (see SandboxEngineOptions.AllowedMountRoots).
+    IReadOnlyList<string>? AllowedMountRoots = null,
+    // Stamped onto the container as mainguard.kind / mainguard.agent.role so a daemon that restarts can
+    // adopt this jail back as the agent it actually is. Default "" keeps every existing caller (and the
+    // ad-hoc harnesses) compiling and simply yields an unlabelled jail, which adopts as a role-less worker.
+    string AgentKind = "",
+    string AgentRole = "");
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -393,6 +402,22 @@ public static class ContainerSpecBuilder
             });
         }
 
+        // ESC-I1 made structural: when the substrate declared its daemon-owned roots, every bind
+        // source must sit under one of them. The per-source guards above reject known-bad SHAPES
+        // (drvfs/UNC/drive-letter, a cache outside a caches/ tree); this one rejects everything
+        // that is not known-good — a user repo, the host home, any path a future caller bug names.
+        if (request.AllowedMountRoots is { Count: > 0 } roots)
+        {
+            foreach (var mount in mounts)
+            {
+                if (mount.Type == "bind" && !IsUnderAnyRoot(mount.Source, roots))
+                    throw new SandboxSpecException(
+                        $"ESC-I1: refusing bind source '{mount.Source}' — it is outside every daemon-owned "
+                        + $"substrate root ({string.Join(", ", roots)}). Only substrate-owned state may be "
+                        + "mounted into a jail; user repos and the host filesystem never are.");
+            }
+        }
+
         return mounts;
     }
 
@@ -478,6 +503,21 @@ public static class ContainerSpecBuilder
         }
 
         return tmpfs;
+    }
+
+    /// <summary>True when <paramref name="path"/> equals a root or sits inside one (textual, in the
+    /// daemon's own namespace — mount sources are daemon-produced paths, never user input).</summary>
+    private static bool IsUnderAnyRoot(string path, IReadOnlyList<string> roots)
+    {
+        var full = Path.GetFullPath(path);
+        foreach (var root in roots)
+        {
+            var fullRoot = Path.GetFullPath(root);
+            if (string.Equals(full, fullRoot, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
+            var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) ? fullRoot : fullRoot + Path.DirectorySeparatorChar;
+            if (full.StartsWith(prefix, Mainguard.Git.Services.FileSystemPaths.Comparison)) return true;
+        }
+        return false;
     }
 
     /// <summary>Builds the hardened create request; throws typed on any invariant violation.</summary>
@@ -581,11 +621,18 @@ public static class ContainerSpecBuilder
             User = request.Credentials.AgentUid.ToString(System.Globalization.CultureInfo.InvariantCulture),
             WorkingDir = WorkspaceTarget,
             Env = env,
+            // The jail's own identity card. It is the ONLY thing that survives a daemon restart — the live
+            // session store is in-memory — so everything the daemon needs to adopt this jail back into a
+            // real, correctly-typed session has to be on it. Before the kind/role pair was stamped here, a
+            // restart could recover THAT a jail existed but not WHAT it was, and a surviving coordinator
+            // came back as an anonymous worker.
             Labels = new Dictionary<string, string>
             {
                 ["mainguard.repo"] = request.RepoHash,
                 ["mainguard.agent"] = request.AgentId,
                 ["mainguard.role"] = "agent",
+                [DockerAgentLister.KindLabel] = request.AgentKind,
+                [DockerAgentLister.AgentRoleLabel] = request.AgentRole,
             },
             HostConfig = hostConfig,
         };

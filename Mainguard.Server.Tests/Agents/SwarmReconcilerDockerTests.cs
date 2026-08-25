@@ -43,7 +43,7 @@ public class SwarmReconcilerDockerTests
     [RequiresDockerDaemonFact]
     public async Task Reconciler_OutOfBandDockerRm_ShouldConvergeOnBoot()
     {
-        using var docker = new DockerClientConfiguration().CreateClient();
+        using var docker = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
         using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(3));
         var ct = cts.Token;
 

@@ -78,3 +78,50 @@ Equivalence is enforced, not assumed: `CommitGraphRouterWideDagTests` keeps a ve
 **Decision.** Until `Mainguard.Benchmarks` (BenchmarkDotNet + checked-in baseline JSON, outside `Mainguard.slnx`) exists, perf-sensitive tests assert **structure** (counts, bounds, equivalence) and **print** measurements tagged `[H1]`/`[H2]` for the log. Where a before/after claim matters, the test carries the frozen old implementation and times both in the same run — same build, same machine, same input — so the comparison stays honest on every machine it runs on (`CommitGraphRouterWideDagTests.RouteCommits_PathologicalWideDag_*`).
 
 **Consequences.** CI stays deterministic; regressions are visible in test logs immediately and become hard gates when [PERF-2] lands. The oracle-copy pattern doubles as the equivalence net (ADR-003).
+
+---
+
+## ADR-008 — The macos-host substrate: daemon native on the Mac, sandboxes through the machine's own Docker engine
+
+**Context.** The ESC anticipated macOS as B4 "macos-vm" — mainguardd inside a Mainguard-owned Linux
+VM, mirroring WSL2's topology — and deferred it. Porting phase2 to a real Apple Silicon machine
+showed that topology buys nothing there: every macOS Docker engine (Docker Desktop, OrbStack,
+Colima) already IS a managed Linux VM with host file sharing, and a second Mainguard-owned VM would
+add lifecycle plumbing (import, keep-alive, upgrade) around a problem the engine already solves.
+The owner's requirement was explicit: the substrate must work with whichever engine the machine
+runs, not one vendor's.
+
+**Decision.** `MacHostAgentEnvironment`, `SubstrateId = "macos-host"`: mainguardd runs natively on
+the Mac (osx-arm64), daemon state lives under `~/mainguard`, and sandboxes run through the resolved
+Docker endpoint (`DockerEndpointResolver`: `DOCKER_HOST` → the docker CLI's current context read
+from disk → the well-known engine sockets → library default; on this dev machine the library
+default was a DANGLING `/var/run/docker.sock` symlink while the live engine was OrbStack — the
+resolver is not a nicety). The substrate-neutral collaborators are shared with WSL2 through
+`AgentEnvironmentComposition`; `AgentEnvironmentFactory` makes the per-platform choice at the one
+composition root. In-jail CLIs and toolchains install through `ContainerAdapterInstallHost` — a
+disposable agent-base container with the daemon-owned roots mounted at their VM paths — never on
+the macOS host. ESC-I1 is enforced STRUCTURALLY here: the substrate declares `AllowedMountRoots`
+(`~/mainguard`, the data root) and `ContainerSpecBuilder` refuses any bind source outside them.
+
+**Deviations from the ESC's B4 sketch, and their compensating controls.**
+- *The daemon shares the host OS with the user.* The WSL2 design isolates mainguardd in the VM;
+  here it is a user process. Compensated by the same pinned-mTLS/token control plane, and the jail
+  boundary is unchanged — agents still run in hardened containers, not on the host.
+- *`kernel.yama.ptrace_scope` is best-effort.* The engine's LinuxKit VM is not ours to provision;
+  the boot sysctl is applied one-shot (privileged container) where the kernel carries Yama and
+  tolerated absent, exactly as WSL2's FirstBootStep already tolerates it. Quartet members (1),(3),
+  (4) remain fully structural per-container.
+- *userns-remap is engine-dependent* (Docker Desktop lacks it). The spec keeps
+  `UsernsMode = inherit` — identical posture to a WSL2 daemon with no remap configured — and
+  virtiofs uid-squash means in-jail writes surface as the Mac user, never root.
+- *The MG-4 gateway's `auto` bind picks a LAN-reachable address* so jails can reach it through the
+  engine's NAT. On a laptop that is a broader listen surface than the WSL2 relay; the gateway's
+  own per-agent token auth bounds it. Follow-up: bind the engine's bridge address specifically.
+- *B4 "macos-vm" stays deferred*, unchanged: this ADR adds a sibling substrate, it does not
+  redefine B4.
+
+**Consequences.** The full agent pipeline runs on a Mac with any Docker engine and no elevation,
+no VM import, no keep-alive; `wsl.exe`-shaped machinery stays Windows-only behind the existing
+seams (`HostCommandRunner` interprets the in-distro command shapes on the host). The ESC §4 suite
+subset (`SubstrateConformanceTests`) and the full RequiresDocker tier are green on-device; the §5
+measurements live in `docs/phase-2/Mainguard_Substrate_MacHost.md`.

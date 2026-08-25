@@ -94,7 +94,7 @@ internal static class DockerAvailability
 
         try
         {
-            using var client = new DockerClientConfiguration().CreateClient();
+            using var client = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             client.Images.InspectImageAsync(AgentImage, cts.Token).GetAwaiter().GetResult();
             return (true, string.Empty);
@@ -109,7 +109,7 @@ internal static class DockerAvailability
     {
         try
         {
-            using var client = new DockerClientConfiguration().CreateClient();
+            using var client = Mainguard.Agents.Agents.Sandbox.DockerEndpointResolver.CreateClient();
             using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             client.System.PingAsync(cts.Token).GetAwaiter().GetResult();
             return (true, string.Empty);

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Grpc.Core;
 using Mainguard.Agents.Agents;
 using Proto = Mainguard.Protos.V1;
 
@@ -63,6 +64,29 @@ public sealed class DaemonBackedOrchestrator :
     /// <see cref="ReconnectLoopAsync"/> made permanent.</para>
     /// </summary>
     internal Func<CancellationToken, IAsyncEnumerable<Proto.AgentEvent>>? AgentEventStreamOverride { get; set; }
+
+    /// <summary>
+    /// Test seam: the merge-queue stream <see cref="QueuePumpAsync"/> subscribes to — the exact analogue
+    /// of <see cref="AgentEventStreamOverride"/>, and it exists for the same reason. Never set in
+    /// production, where it is <c>DaemonClient.StreamQueueAsync</c>.
+    ///
+    /// <para>The property under test is <b>re-subscription of the QUEUE stream specifically</b>. ISSUES-LOG
+    /// #11 (found live 2026-08-20) was a merge-queue rail that went to "Nothing queued" mid-session and
+    /// stayed there: the daemon's log recorded exactly ONE <c>StreamQueue</c> call, ended after 32 ms, and
+    /// not one retry over the next 5m45s while every other RPC on the same daemon kept succeeding. The
+    /// agent pump's reconnect property had a regression test; this one did not, so nothing pinned it.</para>
+    /// </summary>
+    internal Func<string, CancellationToken, IAsyncEnumerable<Proto.QueueUpdate>>? QueueStreamOverride { get; set; }
+
+    /// <summary>
+    /// Test seam: the authoritative <c>ListAgents</c> answer <see cref="MergeAgentListing"/> folds in.
+    /// Never set in production, where it is <c>DaemonClient.ListAgentsAsync</c>.
+    ///
+    /// <para>It exists because the property under test is the ISSUES-LOG #19 repair itself: that a
+    /// projection which has lost an agent's ROLE — the one field no delta ever carries — gets it back
+    /// from the listing, rather than stranding a live coordinator as an anonymous worker forever.</para>
+    /// </summary>
+    internal Func<CancellationToken, Task<IReadOnlyList<Proto.AgentInfo>>>? AgentListOverride { get; set; }
 
     /// <summary>
     /// How often the login-harvest pump sweeps every live agent's CLI login state into the host OS
@@ -176,7 +200,7 @@ public sealed class DaemonBackedOrchestrator :
     /// at a temp database; it redirects only where the journal is written, never what the merge does.</param>
     /// <param name="hostPullRequests">
     /// The host PR seam an <see cref="MergeEntryOrigin.External"/> merge drives (P2-12). Defaults to the
-    /// audited T-23 transport reading this Windows host's keyring.
+    /// audited T-23 transport reading this host's keyring.
     /// <para><b>Why the client and not the daemon:</b> the host token lives only in the host OS keychain —
     /// nothing copies <c>token_&lt;host&gt;</c> into the VM — so the daemon simply has no credential to
     /// merge a pull request with. The lease and the gate stay daemon-side regardless; only the transport
@@ -259,8 +283,16 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>The user's custom env-var keys (<c>llm_env_*</c>) as name→value pairs, ready for
-    /// SpawnAgent's <c>extra_env</c>. Values come fresh from the keyring per spawn.</summary>
-    private IReadOnlyDictionary<string, string> CollectCustomEnvKeys()
+    /// SpawnAgent's <c>extra_env</c>. Values come fresh from the keyring per spawn.
+    ///
+    /// <para><b>Internal, not private, on purpose (ISSUES-LOG #37).</b> This is the leg that decides
+    /// whether a "Custom key" saved in AI Providers reaches an agent at all, and nothing covered it:
+    /// a walkthrough leg that spawned agents through a raw <c>SpawnAgent</c> RPC (bypassing this
+    /// method entirely) saw an empty <c>agent.env</c> in the jail and read it as a delivery defect in
+    /// the product. It is not — but "the client really does read the keyring and really does put the
+    /// pairs on the wire" was unprovable without a test, so `CustomEnvKeyDeliveryTests` pins it.</para>
+    /// </summary>
+    internal IReadOnlyDictionary<string, string> CollectCustomEnvKeys()
     {
         var extra = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var keystoreKey in _keystoreList(ApiKeyProviderMap.CustomEnvKeyPrefix))
@@ -316,6 +348,13 @@ public sealed class DaemonBackedOrchestrator :
     /// open it at all.</summary>
     public IPrIntakeGateway CreatePrIntakeGateway() => new DaemonPrIntakeGateway(_client);
 
+    /// <summary>The DEV-ONLY queue-seeding seam (docs/design/queue-seeding.md), same factory shape as
+    /// the gateways above. The repo handle is read live so the panel always seeds the repo the rail is
+    /// showing. On a daemon without the seeding boot flag the gateway's availability probe answers
+    /// false (the service is unmapped) and the panel never appears.</summary>
+    public IQueueSeedingGateway CreateQueueSeedingGateway()
+        => new DaemonQueueSeedingGateway(_client, () => _repoHandle);
+
     /// <summary>Fix 2: raised when a spawned agent's CLI DIED on a host the default-deny proxy refused,
     /// so the operator can unblock it and retry. Fired from the agent-event pump thread (the consumer
     /// marshals to the UI thread).</summary>
@@ -341,10 +380,56 @@ public sealed class DaemonBackedOrchestrator :
     ///
     /// <para><paramref name="localRepoPath"/> and <paramref name="syncRemoteName"/> are the OTHER half of
     /// the same <c>ProvisionRepo</c> answer, and they are what makes the merge button able to merge: the
-    /// human foreground merge lands on the user's own Windows checkout (never the VM mirror, which is
+    /// human foreground merge lands on the user's own host checkout (never the daemon mirror, which is
     /// staging), fetching the agent branch over the SC-2-resolved sync remote registered on it. Without
     /// them the queue is observable but not mergeable, and <see cref="ConfirmMergeAsync"/> says so rather
     /// than recording a merge it never performed.</para></summary>
+    /// <summary>Provision <paramref name="repoPath"/> into the daemon over THIS adapter's shared
+    /// mTLS channel, with the same 5-minute deadline the OOBE/Add-Repos path uses — a cold bare
+    /// clone of a real repository routinely outlives the 5-second budget the old per-call client
+    /// gave it, and that timeout was swallowed, which made the whole agent platform look dead on
+    /// any non-trivial repo. Throws on failure; the caller owns surfacing the reason.</summary>
+    public Task<ProvisionedRepo> ProvisionRepoAsync(string repoPath, CancellationToken ct) =>
+        _client.ProvisionRepoAsync(repoPath, ct, deadline: TimeSpan.FromMinutes(5));
+
+    /// <summary>Detach the merge-queue projection from its repo: stop the queue pump and empty the
+    /// queue/gate/origin state so the rail reflects NOTHING rather than the previously opened repo.
+    /// Called before provisioning a newly opened repo — without it, a failed or slow provision left
+    /// this adapter pointed at the old repo while the user looked at the new one, and a Merge would
+    /// have fast-forwarded the OLD checkout.</summary>
+    public void ClearActiveRepo()
+    {
+        lock (_gate)
+        {
+            _queuePumpCts?.Cancel();
+            _queuePumpCts?.Dispose();
+            _queuePumpCts = null;
+            _queuePump = null;
+            _repoHandle = null;
+            _repoLocalPath = null;
+            _syncRemoteName = string.Empty;
+            _queue.Clear();
+            _gate_.Clear();
+            _origins.Clear();
+            _mainSha = string.Empty;
+        }
+
+        RaiseIsolated(() => Changed?.Invoke());
+    }
+
+    /// <summary>True when this adapter is already bound to <paramref name="repoHandle"/> with its queue
+    /// pump alive — lets a caller skip a redundant <see cref="ClearActiveRepo"/>+re-provision round trip
+    /// for a repo that's already open and working (see <see cref="SetActiveRepo"/>'s same-handle no-op,
+    /// which this mirrors for callers that sit above it and don't have a live handle to compare against
+    /// without asking first).</summary>
+    public bool IsBoundTo(string repoHandle)
+    {
+        lock (_gate)
+        {
+            return _repoHandle == repoHandle && _queuePump is not null;
+        }
+    }
+
     public void SetActiveRepo(string repoHandle, string? localRepoPath = null, string? syncRemoteName = null)
     {
         if (string.IsNullOrWhiteSpace(repoHandle))
@@ -504,14 +589,20 @@ public sealed class DaemonBackedOrchestrator :
 
     private async Task QueuePumpAsync(string repoHandle, CancellationToken ct)
     {
+        var stream = QueueStreamOverride ?? ((handle, token) => _client.StreamQueueAsync(handle, token));
         await ReconnectLoopAsync(async token =>
         {
-            await foreach (var update in _client.StreamQueueAsync(repoHandle, token).ConfigureAwait(false))
+            await foreach (var update in stream(repoHandle, token).ConfigureAwait(false))
             {
                 ApplyQueueUpdate(update);
             }
         }, ct).ConfigureAwait(false);
     }
+
+    /// <summary>Runs the merge-queue pump against <paramref name="ct"/> for a test, so its reconnect
+    /// property is asserted without going through <see cref="SetActiveRepo"/>'s binding bookkeeping.</summary>
+    internal Task RunQueuePumpForTestAsync(string repoHandle, CancellationToken ct)
+        => QueuePumpAsync(repoHandle, ct);
 
     /// <summary>Runs a single-shot stream body, reconnecting with a fixed delay on any fault (an
     /// unreachable daemon, a NOT_FOUND queue, a dropped stream) until cancelled. This is what makes an
@@ -571,6 +662,14 @@ public sealed class DaemonBackedOrchestrator :
                     _coordinatorAgentId = _agents.Values
                         .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId;
                 }
+
+                // ISSUES-LOG #19: confirm the snapshot against ListAgents. The snapshot is not the same
+                // data by another route — the daemon builds it as a positional `id:kind:state:role`
+                // string split on ',' and ':', while ListAgents sends typed fields — and it is the ONLY
+                // thing that ever repopulates this projection wholesale. When the two disagree the RPC
+                // wins, and it is newer besides (it is issued after the snapshot was taken). One extra
+                // unary call per stream connect, which happens on connect and reconnect, not per event.
+                _ = ResyncAgentsAsync();
                 break;
 
             case Proto.AgentEvent.EventOneofCase.State:
@@ -726,7 +825,7 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
-    private void ApplyQueueUpdate(Proto.QueueUpdate update)
+    internal void ApplyQueueUpdate(Proto.QueueUpdate update)
     {
         lock (_gate)
         {
@@ -777,7 +876,12 @@ public sealed class DaemonBackedOrchestrator :
             }
         }
 
-        Changed?.Invoke();
+        // Isolated for the same reason ApplyAgentEvent's raises are (see RaiseIsolated): this runs ON the
+        // queue pump thread, so a throwing subscriber propagated straight out of the `await foreach` and
+        // tore the queue stream down. The reconnect loop caught it and re-subscribed, which meant the rail
+        // silently lost every push in the gap and re-threw on the next one — a stream cycling every
+        // ReconnectDelay for as long as the handler kept faulting, with no banner and no log line.
+        RaiseIsolated(() => Changed?.Invoke());
     }
 
     private void ApplyPlanUpdate(Proto.PlanUpdate update)
@@ -926,37 +1030,104 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
-    /// Fetches the authoritative agent list (kind + role) after a state delta arrived for an agent
-    /// the projection had never seen — the delta carries neither, and the coordinator's role must
-    /// never be dropped on the floor. Merges by agent id (a merge never deletes: removal is the
-    /// snapshot's job) and recomputes the live-coordinator pointer. Best-effort: a daemon hiccup
-    /// leaves the placeholder until the next snapshot corrects it.
+    /// Fetches the authoritative agent list (kind + role) and folds it into the projection.
+    ///
+    /// <para>Driven from three places, and each is load-bearing: after a state delta for an agent the
+    /// projection had never seen (the delta carries neither kind nor role), after every stream
+    /// <b>snapshot</b>, and once a minute from <see cref="PersistLiveAgentLoginsAsync"/> — see
+    /// <see cref="MergeAgentListing"/> for why the projection needs a standing repair path at all.</para>
+    ///
+    /// <para>Best-effort: a daemon hiccup simply leaves the projection as it was, and the next caller
+    /// tries again within the minute.</para>
     /// </summary>
     private async Task ResyncAgentsAsync()
     {
         IReadOnlyList<Proto.AgentInfo> listed;
         try
         {
-            listed = await _client.ListAgentsAsync(_cts.Token).ConfigureAwait(false);
+            listed = await ListAgentsFromDaemonAsync(_cts.Token).ConfigureAwait(false);
         }
         catch (Exception)
         {
-            return; // next snapshot resyncs
+            return; // the periodic repair pass retries
         }
 
+        if (MergeAgentListing(listed))
+        {
+            RaiseIsolated(() => Changed?.Invoke());
+        }
+    }
+
+    /// <summary>
+    /// ISSUES-LOG #19 — folds an authoritative <c>ListAgents</c> answer into the projection, and is the
+    /// projection's only way back from being wrong.
+    ///
+    /// <para><b>Why this exists.</b> The projection is fed by <c>StreamAgentEvents</c>, whose snapshot is
+    /// one destructive replacement taken at subscribe time; after that only deltas arrive, and a delta
+    /// carries <b>neither kind nor role</b>. A delta for an unseen agent therefore fabricates a
+    /// <b>role-less</b> placeholder, and the single <c>ListAgents</c> call that was supposed to repair it
+    /// gave up permanently on one failure. That is enough to strand a live coordinator in the projection
+    /// as an anonymous worker: the Coordinator panel filters on <c>Role == "coordinator"</c> and finds
+    /// nothing, so it reports "No coordinator running" — for 20+ minutes, while the daemon's own
+    /// <c>ListAgents</c> answered <c>role=coordinator</c> for that agent once a minute the whole time, to
+    /// this same client, on a call whose answer was thrown away except for the ids.</para>
+    ///
+    /// <para><b>What it will and will not overwrite.</b> Kind and role are identity — the listing is
+    /// authoritative for them and they are always corrected. <see cref="AgentInfo.State"/> and the live
+    /// <c>Detail</c> are NOT: those flow on deltas, which are newer than any poll, and a listing taken a
+    /// moment ago would otherwise walk a just-Dead agent back to Working and wipe the exit tail the
+    /// surface is showing. An agent the projection has never seen is added whole.</para>
+    ///
+    /// <para>A merge never deletes — removal stays the snapshot's job (and a stop's own delta), so a
+    /// listing that raced a spawn cannot make a live agent disappear.</para>
+    /// </summary>
+    /// <summary>The authoritative listing, through the test seam when one is set.</summary>
+    private Task<IReadOnlyList<Proto.AgentInfo>> ListAgentsFromDaemonAsync(CancellationToken ct) =>
+        AgentListOverride is { } listing ? listing(ct) : _client.ListAgentsAsync(ct);
+
+    /// <returns>True when something changed, so the caller can raise <see cref="Changed"/>.</returns>
+    private bool MergeAgentListing(IReadOnlyList<Proto.AgentInfo> listed)
+    {
+        var changed = false;
         lock (_gate)
         {
             foreach (var a in listed)
             {
-                _agents[a.AgentId] = MapInfo(a);
+                if (string.IsNullOrEmpty(a.AgentId))
+                {
+                    continue;
+                }
+
+                var kind = string.IsNullOrEmpty(a.AgentKind) ? a.AgentId : a.AgentKind;
+                var role = a.Role ?? string.Empty;
+
+                if (!_agents.TryGetValue(a.AgentId, out var existing))
+                {
+                    _agents[a.AgentId] = MapInfo(a);
+                    changed = true;
+                    continue;
+                }
+
+                if (string.Equals(existing.Name, kind, StringComparison.Ordinal)
+                    && string.Equals(existing.Role, role, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                _agents[a.AgentId] = existing with { Name = kind, Role = role };
+                changed = true;
             }
 
-            _coordinatorAgentId = _agents.Values
-                .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId
-                ?? _coordinatorAgentId;
+            var coordinator = _agents.Values
+                .FirstOrDefault(a => a.Role == Mainguard.Agents.Agents.AgentRoles.Coordinator)?.AgentId;
+            if (coordinator is not null && !string.Equals(coordinator, _coordinatorAgentId, StringComparison.Ordinal))
+            {
+                _coordinatorAgentId = coordinator;
+                changed = true;
+            }
         }
 
-        Changed?.Invoke();
+        return changed;
     }
 
     private static AgentInfo MapInfo(Proto.AgentInfo a) =>
@@ -1033,18 +1204,30 @@ public sealed class DaemonBackedOrchestrator :
     /// </summary>
     public async Task PersistLiveAgentLoginsAsync(CancellationToken ct = default)
     {
-        List<string> agentIds;
+        IReadOnlyList<Proto.AgentInfo> listed;
         try
         {
-            agentIds = (await _client.ListAgentsAsync(ct).ConfigureAwait(false))
-                .Select(a => a.AgentId)
-                .Where(id => !string.IsNullOrWhiteSpace(id))
-                .ToList();
+            listed = await ListAgentsFromDaemonAsync(ct).ConfigureAwait(false);
         }
         catch (Exception)
         {
             return; // daemon unreachable — surfaced via ConnectionState, never an app crash.
         }
+
+        // ISSUES-LOG #19: this sweep already holds the authoritative kind/role for every live agent and
+        // used to keep only the ids. Folding it into the projection first makes this the projection's
+        // standing repair pass — a coordinator that lost its role on a fabricated placeholder is a
+        // coordinator again within the sweep interval, with no extra RPC, off the very answer that was
+        // demonstrably correct throughout the outage.
+        if (MergeAgentListing(listed))
+        {
+            RaiseIsolated(() => Changed?.Invoke());
+        }
+
+        var agentIds = listed
+            .Select(a => a.AgentId)
+            .Where(id => !string.IsNullOrWhiteSpace(id))
+            .ToList();
 
         foreach (var agentId in agentIds)
         {
@@ -1104,11 +1287,132 @@ public sealed class DaemonBackedOrchestrator :
         _cliSettings.Save(outcome.RepoHandle, outcome.AgentKind, outcome.CliSettings);
     }
 
-    // No per-agent pause/prompt/plan-tree RPCs exist on the daemon contract yet — these steer nothing.
-    // They stay no-ops/empty (never fabricated); the terminal attach stream carries the live PTY instead.
-    public Task PauseAgentAsync(string agentId) => Task.CompletedTask;
-    public Task ResumeAgentAsync(string agentId) => Task.CompletedTask;
-    public Task SendPromptAsync(string agentId, string prompt) => Task.CompletedTask;
+    /// <summary>Whether ANY credential is stored for this CLI — a BYOK key for its provider, a custom
+    /// llm_env_* key, or a harvested interactive login. False means the CLI will ask the human to sign
+    /// in inside its terminal after the spawn; the start surface says so up front rather than leaving
+    /// the first-run coordinator looking stuck at a login prompt nobody mentioned.</summary>
+    public bool HasStoredCredentialFor(InstalledCliOption cli)
+    {
+        if (ApiKeyProviderMap.ProviderForEnvVar(cli.ApiKeyEnvVar) is { } provider
+            && !string.IsNullOrEmpty(_keystoreLookup(ApiKeyProviderMap.KeystoreKeyFor(provider))))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrEmpty(_keystoreLookup(CliLoginVault.KeystoreKeyPrefix + cli.Id)))
+        {
+            return true;
+        }
+
+        return _keystoreList(ApiKeyProviderMap.CustomEnvKeyPrefix).Count > 0;
+    }
+
+    /// <summary>Human per-agent pause over the PauseAgent RPC (docker pause on the jail). A refusal —
+    /// no live jail, kill switch engaged — is thrown with the daemon's reason; an old daemon that
+    /// predates the RPC answers Unimplemented, mapped to an honest sentence (the GetDaemonInfo
+    /// convention). The state flip arrives back on the agent-event stream; nothing is set optimistically.</summary>
+    public async Task PauseAgentAsync(string agentId)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        Proto.PauseAgentResponse response;
+        try
+        {
+            response = await _client.PauseAgentAsync(agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            throw new InvalidOperationException("Can't pause — this daemon predates per-agent pause; update it.");
+        }
+
+        if (!response.Paused)
+        {
+            throw new InvalidOperationException($"Can't pause — {response.Reason}.");
+        }
+    }
+
+    /// <summary>Human per-agent resume over the UnpauseAgent RPC. The daemon refuses (self-clearingly)
+    /// while the keep-alive rebase briefly holds the jail — the reason says to try again in a moment.</summary>
+    public async Task ResumeAgentAsync(string agentId)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        Proto.UnpauseAgentResponse response;
+        try
+        {
+            response = await _client.UnpauseAgentAsync(agentId, cts.Token).ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.Unimplemented)
+        {
+            throw new InvalidOperationException("Can't resume — this daemon predates per-agent pause; update it.");
+        }
+
+        if (!response.Unpaused)
+        {
+            throw new InvalidOperationException($"Can't resume — {response.Reason}.");
+        }
+    }
+
+    /// <summary>How long a one-shot prompt delivery may take end to end (attach + write + close).</summary>
+    internal static TimeSpan SendPromptBudget { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>Test seam: replaces the attach call the prompt delivery writes through.</summary>
+    internal Func<CancellationToken, Grpc.Core.AsyncDuplexStreamingCall<Proto.TerminalInput, Proto.TerminalOutput>>?
+        AttachTerminalOverride
+    { get; set; }
+
+    /// <summary>
+    /// Delivers the agent document's composer prompt into the agent's LIVE PTY — a short-lived attach
+    /// on the same <c>TerminalService.Attach</c> bidi stream the terminal pane uses (a bound session
+    /// multiplexes subscribers, so this never steals the pane's attach): frame 1 selects the agent
+    /// (raw mode), frame 2 writes the prompt + CR, then the write side completes and the call closes.
+    /// A managed worker's daemon-side input lock arrives as <c>PermissionDenied</c> and is PROPAGATED —
+    /// the caller renders the refusal; for most of this method's life it was a hardcoded no-op that
+    /// reported success and typed nothing.
+    /// </summary>
+    public async Task SendPromptAsync(string agentId, string prompt)
+    {
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrEmpty(prompt))
+        {
+            return;
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        cts.CancelAfter(SendPromptBudget);
+
+        var attach = AttachTerminalOverride ?? (token => _client.AttachTerminal(token));
+        using var call = attach(cts.Token);
+
+        // Drain responses in the background so a server that pushes scrollback before our write can't
+        // fill the window and stall the request stream.
+        var drain = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var _ in call.ResponseStream.ReadAllAsync(cts.Token).ConfigureAwait(false)) { }
+            }
+            catch { /* the drain ends when the call does; its errors surface on the write below */ }
+        });
+
+        try
+        {
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput { AgentId = agentId })
+                .ConfigureAwait(false);
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput
+            {
+                Data = Google.Protobuf.ByteString.CopyFromUtf8(prompt + "\r"),
+            }).ConfigureAwait(false);
+            await call.RequestStream.CompleteAsync().ConfigureAwait(false);
+        }
+        catch (Grpc.Core.RpcException ex) when (ex.StatusCode == Grpc.Core.StatusCode.PermissionDenied)
+        {
+            throw new InvalidOperationException(
+                "Can't send — the daemon has this terminal locked (a managed worker's input is read-only).");
+        }
+        finally
+        {
+            cts.Cancel();
+            try { await drain.ConfigureAwait(false); } catch { /* drained */ }
+        }
+    }
     public IReadOnlyList<string> GetQueuedPrompts(string agentId) => Array.Empty<string>();
     public Task CancelQueuedPromptAsync(string agentId, int index) => Task.CompletedTask;
     public IReadOnlyList<string> GetTerminalTail(string agentId) => Array.Empty<string>();
@@ -1211,7 +1515,7 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>
     /// The human foreground merge — the whole RT-D1 conversation (P2-10 §3.7), driven from the Merge
     /// button: <c>BeginMerge</c> (the daemon takes the repo's one lease and enforces <c>CanMerge</c> under
-    /// it) → <b>the real Windows-side <c>git merge --ff-only</c> on the user's own checkout</b> →
+    /// it) → <b>the real host-side <c>git merge --ff-only</c> on the user's own checkout</b> →
     /// <c>ConfirmMerge</c> with the sha main ACTUALLY moved to, or <c>AbandonMerge</c> when nothing landed.
     ///
     /// <para><b>The middle leg used to be missing.</b> This method took the lease and then went straight to
@@ -1342,7 +1646,7 @@ public sealed class DaemonBackedOrchestrator :
     }
 
     /// <summary>
-    /// The Windows-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
+    /// The host-side merge leg, bound to this repo's SC-2 sync remote and the app's T-19 journal.
     /// Built per merge because the sync-remote binding is per active repo.
     /// </summary>
     private Mainguard.Agents.Services.IJournaledMergeExecutor CreateMergeExecutor(string syncRemoteName)
@@ -1432,6 +1736,64 @@ public sealed class DaemonBackedOrchestrator :
             System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
 
         return new QueueEntryDiscardOutcome(agentId, response.DiscardedBy ?? "", at);
+    }
+
+    /// <summary>The cockpit's Bring local: fetch <c>agent/&lt;id&gt;</c> from the sync remote into the
+    /// user's checkout as a local branch (journaled, non-forced — see <see cref="Mainguard.Agents.Services.BringLocalService"/>).
+    /// Refuses when no repo binding exists, in the same wording family as <see cref="ConfirmMergeAsync"/>.</summary>
+    public async Task<Mainguard.Agents.Services.BringLocalResult> BringBranchLocalAsync(
+        string agentId, CancellationToken ct)
+    {
+        string? repoPath;
+        string syncRemote;
+        lock (_gate)
+        {
+            repoPath = _repoLocalPath;
+            syncRemote = _syncRemoteName;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoPath) || string.IsNullOrWhiteSpace(syncRemote))
+        {
+            return Mainguard.Agents.Services.BringLocalResult.Refused(
+                "this repository isn't bound to a local checkout yet — reopen it so Mainguard can register the sync remote");
+        }
+
+        var service = new Mainguard.Agents.Services.BringLocalService(_journalFactory());
+        return await Task.Run(() => service.BringLocal(repoPath!, syncRemote, agentId), ct)
+            .ConfigureAwait(false);
+    }
+
+    /// <summary>Rejects a verified entry in review — same refusal discipline as
+    /// <see cref="DiscardEntryAsync"/>: the daemon's "no" is thrown with its reason, never swallowed.</summary>
+    public async Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't reject — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .RejectEntryAsync(repoHandle!, agentId, reason ?? string.Empty, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Rejected)
+        {
+            throw new InvalidOperationException($"Can't reject — {response.Reason}.");
+        }
+
+        DateTimeOffset? at = DateTimeOffset.TryParse(
+            response.RejectedAt, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed) ? parsed : null;
+
+        return new QueueEntryRejectOutcome(agentId, response.RejectedBy ?? "", at);
     }
 
     /// <summary>
@@ -1810,12 +2172,19 @@ public sealed class DaemonBackedOrchestrator :
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
         try
         {
-            await _client.ResumeKillAsync(cts.Token).ConfigureAwait(false);
+            var report = await _client.ResumeKillAsync(cts.Token).ConfigureAwait(false);
             lock (_gate)
             {
+                // The queue freeze is always lifted (the daemon clears it whatever the unpause fan-out
+                // did), so the banner state follows the queue. A jail that refused to wake is NOT hidden:
+                // the daemon marks that session Unresponsive with "the jail is STILL paused. Press Resume
+                // again", which is what the Resource Monitor row renders — the surface that carried the
+                // false "(recoverable)" claim in ISSUES-LOG #17.
                 _frozen = false;
                 _phase = KillSwitchPhase.Armed;
-                _phaseText = string.Empty;
+                _phaseText = report.AgentsResumeFailed > 0
+                    ? $"{report.AgentsResumeFailed} jail(s) did not resume — press again to retry"
+                    : string.Empty;
             }
         }
         catch (Exception)

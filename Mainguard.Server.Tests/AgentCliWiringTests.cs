@@ -158,9 +158,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // …and the audit carries the exit code AND the cleaned output tail — the diagnosis the
         // field never had (a bare "CLI exited (N)" names no cause).
-        var audit = (Mainguard.Git.Audit.InMemoryAuditLog)rig.Host.Services
-            .GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
-        await WaitForAsync(() => audit.Read().Any(ev => ev.Type == "cli_exited"));
+        // The seam, not the class: since P2-15 the daemon registers the chained log when the DB
+        // opens, and that DB is run-shared across in-proc hosts — so the wait is agent-scoped too.
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId));
         var exited = audit.Read().Single(ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId);
         Assert.Equal("137", exited.Fields["exit_code"]);
         // VT color sequences stripped, text intact — a human-readable diagnosis, character-exact.
@@ -203,9 +205,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var store = rig.Host.Services.GetRequiredService<AgentSessionStore>();
         await WaitForAsync(() => store.Find(spawn.AgentId)?.State == "Dead");
 
-        var audit = (Mainguard.Git.Audit.InMemoryAuditLog)rig.Host.Services
-            .GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
-        await WaitForAsync(() => audit.Read().Any(ev => ev.Type == "cli_exited"));
+        // The seam, not the class: since P2-15 the daemon registers the chained log when the DB
+        // opens, and that DB is run-shared across in-proc hosts — so the wait is agent-scoped too.
+        var audit = rig.Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
+        await WaitForAsync(() => audit.Read().Any(
+            ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId));
         var exited = audit.Read().Single(ev => ev.Type == "cli_exited" && ev.Fields["agent_id"] == spawn.AgentId);
 
         // Cursor-column moves read as word separators; the sentence survives human-readable…
@@ -216,8 +220,19 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
             Mainguard.Agents.Agents.Sandbox.EgressBlockDetector.TryDetectBlockedHost(exited.Fields["output_tail"]));
     }
 
+    /// <summary>
+    /// Honest degradation for an agent that never got a CLI: the spawn stays session-only and the attach
+    /// SAYS there is no terminal.
+    ///
+    /// <para>This used to assert the P2-02 echo — the attach reflected keystrokes back, which looked like
+    /// a working terminal that was in fact connected to nothing. ISSUES-LOG #23 is what that costs: the
+    /// client's only "the CLI is up" signal is the first output frame, so an attach that stays silent
+    /// until you type reads as a CLI still starting, forever. A known session with no bound CLI now gets
+    /// <see cref="TerminalGrpcService.DetachedNotice"/> instead; the echo remains for ids the daemon has
+    /// never heard of.</para>
+    /// </summary>
     [Fact]
-    public async Task UnprovisionedRepo_StaysSessionOnly_AttachFallsBackToEcho()
+    public async Task UnprovisionedRepo_StaysSessionOnly_AttachSaysThereIsNoTerminal()
     {
         using var rig = WiringRig.Create(_daemon);
 
@@ -228,17 +243,24 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
             AgentKind = "claude-code",
         }, rig.Auth);
 
-        // No jail, no CLI, no bound session — honest degradation, and the attach echo still works.
+        // No jail, no CLI, no bound session — honest degradation, and the attach says so unprompted.
         Assert.Null(rig.Terminals.TryGetBound(spawn.AgentId));
         Assert.Empty(rig.Sessions);
 
         using var attach = rig.Attach(spawn.AgentId, out var cts);
+        var seen = await ReadUntilAsync(attach, s => s.Contains("No terminal is attached"), cts.Token);
+        Assert.Contains("No terminal is attached", seen);
+
+        // …and typing into it is discarded rather than reflected: a terminal that types back would look
+        // like it is talking to a CLI while reaching nothing at all. Completing the request stream ends
+        // the attach, so the read below drains to completion instead of waiting on a timeout.
         await attach.RequestStream.WriteAsync(new TerminalInput
         {
             Data = ByteString.CopyFrom(Encoding.UTF8.GetBytes("echo-me")),
         });
-        var seen = await ReadUntilAsync(attach, s => s.Contains("echo-me"), cts.Token);
-        Assert.Contains("echo-me", seen);
+        await attach.RequestStream.CompleteAsync();
+        var after = await ReadUntilAsync(attach, _ => false, cts.Token);
+        Assert.DoesNotContain("echo-me", after);
         cts.Cancel();
     }
 
