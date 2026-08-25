@@ -134,7 +134,7 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   verified agent branch actually reaching `main`) for every Windows+WSL2 user, on the very first
   merge, with an unhelpful raw git error and no Mainguard-authored guidance pointing at the fix.
 
-### W5. [OPEN, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
+### W5. [FIXED, low, cosmetic] Rejected/discarded-by actor renders as a bare `uid:1000`, not a human-readable identity
 
 - **Where:** `RejectEntryResponse.rejected_by` / `DiscardEntryResponse.discarded_by`.
 - On the Mac run this field read `os:danielsazykin` (ISSUES-LOG #13, 2026-08-20). On this machine
@@ -144,6 +144,27 @@ separately in WALKTHROUGH.md's running log as each one is actually re-driven liv
   Windows-side implementation) — flagged for follow-up. Correctness is unaffected (the value is
   still a real, stable actor identifier), only its human-readability regresses on this substrate.
 - Severity: low.
+- **Root cause + fix (follow-up pass).** `PeerCredentialIdentityResolver` branched on
+  `IsOSPlatform(Linux)` and returned `uid:{geteuid()}` there, `os:{Environment.UserName}`
+  everywhere else. On Windows/WSL2 mainguardd runs *inside* the VM, so it took the Linux branch;
+  the Mac daemon runs natively on a non-Linux host, so it took the other. **The framing above is
+  half wrong and worth correcting:** this is not an "identity regression", because the resolved
+  value is not the caller's identity on *either* platform — loopback TCP carries no peer
+  credential, so it is the daemon's own account, a constant. `os:danielsazykin` only looked like a
+  human because on macOS the daemon happens to run as one. The real defect was narrower and real:
+  the `uid:` shape was a leftover of the original (retracted in MG-16) `SO_PEERCRED` framing — a
+  peer credential is a *number* — and MG-16 fixed only the documentation, leaving the format. No
+  technical reason survived it: `Environment.UserName` resolves through `getpwuid`, not
+  `$USER`/`$LOGNAME` (verified — it ignores those even when set to another value, so it is not
+  env-spoofable), and the VM image gives the service account a real passwd entry
+  (`useradd … mainguard`) that the unit runs as (`User=mainguard`). Unified on `os:<name>` for all
+  platforms; on Windows/WSL2 this now reads `os:mainguard` — **the service account, not the
+  Windows user**, which is the honest answer and all this field ever meant. `uid:<euid>` survives
+  only as a last resort for a euid with no passwd entry, where `Environment.UserName` returns `""`
+  (verified) and a bare `os:` would be a blank actor.
+- Status: **FIXED** (`Mainguard.Server/Auth/ApproverIdentityResolver.cs`; regression pinned by
+  `ApproverIdentityDaemonDerivedTests.PeerCredentialResolver_ReportsTheDaemonsOwnIdentity_ConstantForEveryCaller`,
+  which previously asserted the `uid:` literal on Linux).
 
 ### Note — `full-test-matrix.md`'s G3 wording is stale, not the kill-switch code
 
