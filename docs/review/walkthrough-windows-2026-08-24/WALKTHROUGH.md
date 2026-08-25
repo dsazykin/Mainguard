@@ -561,3 +561,46 @@ current coordinator + the claude-code entry). `mouse_event(MOUSEEVENTF_WHEEL, ..
 visible scroll — consistent with, not a new instance of, this session's standing finding that no
 synthetic mouse input of any kind reaches this app. Not logged as a new bug — filed under the same
 root cause as the rest of the mouse-input gap.
+
+## 11. Re-verifying the new queue-seeding feature (`feat/queue-seeding`, merged mid-session) on Windows/WSL2
+
+A third session pushed a brand-new dev-only merge-queue seeding tool to `port/macos` while this
+pass was running (§8 above — merged cleanly). Its own design doc
+(`docs/design/queue-seeding.md` §10) records a live macOS verification from earlier the same day.
+Since this is exactly the kind of cross-platform re-verification this whole pass is for, tested it
+here too:
+
+- **Enabling it required a systemd unit edit** (`MAINGUARD_ENABLE_QUEUE_SEEDING=1` on
+  `mainguardd.service` inside `MainguardEnv`, as root) — flagged to the user first since it's a
+  system-level change to the VM; approved, then reverted cleanly after testing.
+- **The daemon binary needed rebuilding first**: the running `mainguardd` predated the merge (no
+  seeding banner, no `QueueSeedingService`). Rebuilt `Mainguard.Pro.App` (which republishes the
+  in-VM daemon payload) and relaunched — the client's own tier-1 daemon auto-update mechanism
+  picked up the new binary automatically, confirmed via the boot log: `daemon auto-update:
+  refreshing skewed daemon`, followed by `QUEUE SEEDING ENABLED (MAINGUARD_ENABLE_QUEUE_SEEDING) —
+  dev only...` and `GetSeedingStatusResponse { enabled=True, seeded_entries=[] }`. **This is itself
+  a live confirmation of I2 (daemon auto-update)** — a real skewed→current daemon refresh, not
+  simulated.
+- **The dev card appeared correctly and immediately** — confirms the design doc's own noted fix
+  ("the panel's availability probe was one-shot and raced the app-spawned daemon's bind... now
+  retries transport errors patiently") holds on this substrate too: the card was there on first
+  load, no stale/absent card.
+- **"One of each" preset** (real click): seeded 7 entries in one shot, all landing in their
+  correct final states — `Working ×2, Verified ×2, AwaitingReview ×1, Rejected ×1, Discarded ×1` —
+  the rail's count went from `8 in play · 5 in history` to `13 in play · 6 in history`, arithmetic
+  consistent with Discarded leaving the rail (per E4) while Rejected stays visible (per E5).
+- **"Merge during verify" preset** (real click): `main` genuinely advanced (confirmed via the sha
+  shown changing, `27ee4817...`) — a real merge landed through the real three-step path while a
+  sibling held in a genuine synthetic-verification hold, exactly the race-window reproduction the
+  design doc describes.
+- **"Clear seeded"** (real click): *"Cleared 10 seeded entries."* and the rail census returned to
+  **exactly** `8 in play · 5 in history` — the precise pre-seeding baseline, byte-for-byte matching
+  the macOS run's own "restored EXACTLY to its pre-seeding... census" claim.
+- **Terminal correctly showed the honest detached-coordinator message** (matching Mac ISSUES-LOG
+  #12's fix family) after the daemon restart picked up the new binary: *"No terminal is attached to
+  this agent — nothing you type here reaches a CLI. This is usually a daemon restart... Restart the
+  agent to get a terminal you can talk to."*
+
+**No new bugs found in this feature on this substrate** — every claim in its own design doc's live
+macOS verification held here too. Cleaned up (`Clear seeded`, confirmed `Cleared 10`) and disabled
+the flag (reverted the systemd edit) before continuing.
