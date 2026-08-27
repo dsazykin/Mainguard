@@ -56,6 +56,13 @@ public sealed class PlanGateRig : IDisposable
 
     public AgentSessionStore Sessions => _host.Services.GetRequiredService<AgentSessionStore>();
 
+    /// <summary>
+    /// The bound-terminal registry, so a test can give a worker a writable session. Without one,
+    /// <c>send_worker_prompt</c> can only ever be observed FAILING on this substrate — which is part of
+    /// how two of the contract's four tools ended up with no positive coverage anywhere.
+    /// </summary>
+    public TerminalSessionManager Terminals => _host.Services.GetRequiredService<TerminalSessionManager>();
+
     public void Dispose()
     {
         _host.Dispose();

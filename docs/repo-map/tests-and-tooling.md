@@ -1702,6 +1702,19 @@
   unit tier had not: the raw-errno prompt failure, and that NOTHING anywhere asserts `send_worker_prompt`
   or `request_verification` SUCCEEDING — every assertion about either in the 29-test role-lock suite is a
   refusal, so a handler failing both unconditionally would pass it),**
+  **`CoordinatorToolPositivesTests` (the half of the four-tool surface nothing proved: that
+  `send_worker_prompt` and `request_verification` can SUCCEED. Every assertion about either in the
+  29-test `CoordinatorRoleLockTests` is a refusal, so a handler failing both unconditionally passed that
+  whole suite — demonstrated, not asserted: stubbing the pty write to a silent no-op that still reports
+  success fails this file and leaves all 31 role-lock tests green. A prompt needs a bound pty, which the
+  plan-gate substrate lacks, so a real `BoundTerminalSession` over a readable stub is bound through
+  `PlanGateRig.Terminals` and the assertion is on the BYTES that arrive — `"prefer the stdlib\n"`,
+  trailing newline included, since without it the text sits in the agent's input buffer and looks
+  delivered to everything upstream. The paired negative RELEASES the binding rather than assuming none,
+  because a spawn binds one. `request_verification` is honest about its limit: it asserts the call gets
+  PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
+  fake environment goes — a true verification positive needs a real repo and belongs to the Docker
+  tier),**
   **`CoordinatorRoleLockTests` (phase 3, contract §8 — THE ROLE LOCK, over the same real Unix socket. The
   coordinator's surface is now the contract's four tools and the allow-list is asserted as an object
   (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4
