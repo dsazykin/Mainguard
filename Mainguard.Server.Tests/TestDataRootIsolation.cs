@@ -31,9 +31,11 @@ namespace Mainguard.Server.Tests;
 /// sets the same <see cref="MainguardPaths.DataRootOverrideVariable"/> that PR #287 added, and because
 /// it is an environment variable the spawned daemons, harnesses and jails inherit the sandbox too.</para>
 ///
-/// <para>The sandbox root stays under <c>%TEMP%</c>, which matters here beyond tidiness: the agent-IPC
-/// root is bind-mounted into real jails, and <c>ContainerSpecBuilder</c>'s G-11 gate rejects
-/// <c>/mnt/&lt;drive&gt;/</c> and <c>&lt;letter&gt;:\</c> mount sources. A temp path is neither.</para>
+/// <para>The sandbox root stays under <c>%TEMP%</c> wherever a Unix socket can be bound inside it, which
+/// matters beyond tidiness: the agent-IPC root is bind-mounted into real jails, and
+/// <c>ContainerSpecBuilder</c>'s G-11 gate rejects <c>/mnt/&lt;drive&gt;/</c> and <c>&lt;letter&gt;:\</c>
+/// mount sources. A temp path is neither — and neither is the short home-directory fallback
+/// <see cref="ResolveSandboxRoot"/> uses when <c>%TEMP%</c> is too long, which is every run on macOS.</para>
 ///
 /// <para>An externally set <c>MAINGUARD_DATA_ROOT</c> is respected — pin it to inspect what a run wrote
 /// — and <see cref="DataRootIsolationTests"/> still fails the run if that value is the real user
@@ -47,6 +49,27 @@ internal static class TestDataRootIsolation
     /// one suite's abandoned-run sweep from ever walking the other's live directories.
     /// </summary>
     private const string ContainerName = "mainguard-server-tests";
+
+    /// <summary>
+    /// The container used when <c>%TEMP%</c> cannot hold a bindable socket — see
+    /// <see cref="ResolveSandboxRoot"/>. Deliberately NOT under <c>~/.mainguard</c>:
+    /// <see cref="DataRootIsolationTests"/> fails a root that IS, or sits INSIDE, the real user root.
+    /// </summary>
+    private const string ShortContainerName = ".mg-server-tests";
+
+    /// <summary>
+    /// <c>&lt;root&gt;/agent-ipc/&lt;agentId&gt;/daemon.sock</c> — the longest path the daemon binds
+    /// beneath a data root. <c>AgentIpcServer</c> truncates the agent id to 12 characters, so this is a
+    /// fixed 35 rather than a guess.
+    /// </summary>
+    internal const int AgentIpcSocketSuffixLength = 35;
+
+    /// <summary>
+    /// <c>sockaddr_un.sun_path</c> holds <b>104</b> bytes on macOS/BSD and <b>108</b> on Linux — a hard
+    /// kernel limit, and <see cref="System.Net.Sockets.UnixDomainSocketEndPoint"/> throws rather than
+    /// truncating past it.
+    /// </summary>
+    internal static int MaxUnixSocketPathLength => OperatingSystem.IsMacOS() ? 104 : 108;
 
     [ModuleInitializer]
     internal static void RedirectDataRootToTempDirectory()
@@ -70,8 +93,7 @@ internal static class TestDataRootIsolation
             return;
         }
 
-        var container = Path.Combine(Path.GetTempPath(), ContainerName);
-        var root = Path.Combine(container, $"run-{Environment.ProcessId}-{Guid.NewGuid():N}");
+        var (container, root) = ResolveSandboxRoot();
         Directory.CreateDirectory(root);
         PruneAbandonedRuns(container, root);
 
@@ -80,6 +102,49 @@ internal static class TestDataRootIsolation
         // Best effort: a run that is killed hard leaves its directory behind under %TEMP%, which is inert
         // and eventually swept by the OS. Never let cleanup failure fail a test run.
         AppDomain.CurrentDomain.ProcessExit += (_, _) => TryDelete(root);
+    }
+
+    /// <summary>
+    /// Picks a throwaway root that a Unix-domain socket can still be BOUND inside.
+    ///
+    /// <para>The obvious root — <c>%TEMP%/mainguard-server-tests/run-&lt;pid&gt;-&lt;guid&gt;</c> — is
+    /// unbindable on macOS, and nothing about the failure says so. <c>Path.GetTempPath()</c> there is the
+    /// per-user <c>/var/folders/&lt;..&gt;/T/</c>, <b>49 characters before anything is appended</b>; the
+    /// agent-IPC socket lands near 149 against a 104-byte <c>sun_path</c>, and every socket-binding test
+    /// in the suite dies on <c>ArgumentOutOfRangeException</c> naming a path length, far from the code
+    /// that chose the path. On Linux the same root comes to 105 against 108 — it fits, but by three
+    /// characters nobody picked, which is why the budget is asserted here and in
+    /// <c>DataRootIsolationTests</c> rather than left to hold by luck.</para>
+    ///
+    /// <para>So: keep the temp root wherever it fits (Linux and Windows are untouched), and fall back to
+    /// a short home-directory container when it does not. The fallback is still per-run, still swept, and
+    /// still G-11 legal — a home path is neither <c>/mnt/&lt;drive&gt;/</c> nor <c>&lt;letter&gt;:\</c>,
+    /// which is the property the class comment above requires of a bind-mount source.</para>
+    /// </summary>
+    private static (string Container, string Root) ResolveSandboxRoot()
+    {
+        var budget = MaxUnixSocketPathLength - AgentIpcSocketSuffixLength;
+
+        var tempContainer = Path.Combine(Path.GetTempPath(), ContainerName);
+        var tempRoot = Path.Combine(tempContainer, $"run-{Environment.ProcessId}-{Guid.NewGuid():N}");
+        if (tempRoot.Length <= budget)
+            return (tempContainer, tempRoot);
+
+        // The guid only has to keep concurrent runs apart, and paired with the pid eight hex digits do
+        // that as well as thirty-two for a directory that lives minutes.
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var shortContainer = Path.Combine(home, ShortContainerName);
+        var shortId = Guid.NewGuid().ToString("N")[..8];
+        var shortRoot = Path.Combine(shortContainer, $"run-{Environment.ProcessId}-{shortId}");
+        if (shortRoot.Length <= budget)
+            return (shortContainer, shortRoot);
+
+        throw new InvalidOperationException(
+            $"No sandbox data root fits: an agent-IPC socket needs {AgentIpcSocketSuffixLength} characters "
+            + $"beneath the root and this platform allows {MaxUnixSocketPathLength} in total, leaving "
+            + $"{budget} for the root itself. Tried '{tempRoot}' ({tempRoot.Length}) and '{shortRoot}' "
+            + $"({shortRoot.Length}). Set {MainguardPaths.DataRootOverrideVariable} to a shorter absolute "
+            + "path to run the suite.");
     }
 
     /// <summary>

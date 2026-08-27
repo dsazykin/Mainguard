@@ -37,6 +37,32 @@
 | Sourcing playbook | [`sales/Mainguard_Company_Sourcing_Playbook.md`](sales/Mainguard_Company_Sourcing_Playbook.md) | The three-segment ICP, six sourcing plays (Twente/Enschede map, Sales Navigator, GitHub signals, job posts, communities, inbound), the 40-candidate list |
 | Outreach & pitch kit | [`sales/Mainguard_Outreach_And_Pitch_Kit.md`](sales/Mainguard_Outreach_And_Pitch_Kit.md) | Per-persona pitches + sequences (Dutch for Tier 1/2), discovery→demo→pilot→close, pricing talking points, the sales objection table |
 
+## 3b · The August 2026 beta lane (current, and it re-sequences §4)
+
+Added 2026-08-20. The layers above were written in July for a **launch**: two acts, a Show HN at each, and a
+discovery → demo → pilot → close sales motion. The current stage is narrower and the assets below are the
+ones actually in use. **Where they conflict with the July material, these win for now**; the July assets
+resume when the launch gate opens.
+
+| Asset | File | What it is |
+|---|---|---|
+| Target company list | [`sales/Target_Company_List_2026-08.md`](sales/Target_Company_List_2026-08.md) | The built, scored, contactable list the Sourcing Playbook always described but never contained. ~35 companies on the A/B/C/R/S model, fact-checked, with named contacts, deprioritisations-with-reasons, and five corrections to the playbook's tier list |
+| Beta outreach sequences | [`sales/Beta_Outreach_Sequences_2026-08.md`](sales/Beta_Outreach_Sequences_2026-08.md) | Four openers (peer / quote-back / greenfield / neighbour), EN + NL, email + LinkedIn. **Supersedes the Outreach Kit §3 and §4.5 for this stage** — the ask is a conversation, not a pilot |
+| Publishing calendar | [`marketing/Beta_Publishing_Calendar_2026-08.md`](marketing/Beta_Publishing_Calendar_2026-08.md) | Six weeks, LinkedIn-primary, with the manifesto moved to week 1 and **Show HN explicitly held in reserve**. Includes the per-channel adaptations of the anchor essay |
+| Founding user program | [`Founding_User_Program_2026-08.md`](Founding_User_Program_2026-08.md) | Defines what the site already promises but never specified. Two tiers, the discount decision, and the waitlist copy that replaces the current lede |
+
+**Three sequencing changes this lane makes, on the record:**
+
+1. **The manifesto moves from L2 − 1 week to first.** It is finished, it is pure argument, and it needs no
+   demo — which makes it the only anchor available while the pipeline is in integration. The rest of the
+   calendar then runs *toward* a launch rather than away from one.
+2. **Both Show HN bodies stay in the drawer.** Show HN is one shot; spending it before there is a
+   reproducible end-to-end run converts the best distribution event into a mediocre one. **The gate is a
+   working spawn → verify → review → merge, not a date.** When it exists, switch back to
+   [`marketing/LaunchCampaignPlan.md`](marketing/LaunchCampaignPlan.md) and the reserve.
+3. **Nothing is sold.** Paid pilots and the Team tier remain gated exactly as §4 and GTM Plan §3.2 say.
+   Anyone offering to pay is deferred, with a reason.
+
 ## 4 · The unified timeline (gates before dates)
 
 The four source calendars, reconciled. Each stage is entered by its gate, not its date; "an act slips before an asset lies" (LaunchCampaignPlan) governs everything downstream of L1.
