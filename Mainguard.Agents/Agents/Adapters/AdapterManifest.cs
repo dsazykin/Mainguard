@@ -148,6 +148,27 @@ public sealed record AdapterSpec(
     /// enforced fail-closed by <see cref="NpmProvenancePolicy"/>; the string is the wire form of
     /// <see cref="AdapterProvenanceLevel"/>.</summary>
     [property: JsonPropertyName("provenance")] string? Provenance = null,
+    /// <summary>
+    /// The file THIS CLI reads unprompted from its working directory (<c>CLAUDE.md</c> for claude-code).
+    /// The daemon writes the role's operating instructions there for agents whose working directory is a
+    /// real host path — i.e. workers, whose <c>/workspace</c> is the bind-mounted worktree.
+    ///
+    /// <para>Without this the instructions exist in the jail and are never opened, which is not
+    /// hypothetical: they are also staged at <c>/opt/mainguard/ipc/MAINGUARD.md</c>, a path no CLI reads
+    /// on its own, so that half of the delivery is inert until this names somewhere the CLI actually
+    /// looks. Null = this CLI reads no such file, and only <see cref="SystemPromptArg"/> can reach it.</para>
+    /// </summary>
+    [property: JsonPropertyName("instructionsFile")] string? InstructionsFile = null,
+    /// <summary>
+    /// The launch flag THIS CLI accepts instruction text on (<c>--append-system-prompt</c> for
+    /// claude-code), appended to the launch argv with the rendered instructions as its value.
+    ///
+    /// <para>Load-bearing for a COORDINATOR, and not interchangeable with
+    /// <see cref="InstructionsFile"/> there: the role lock gives a coordinator an empty tmpfs at
+    /// <c>/workspace</c> with no host side to write to, so a file cannot be pre-placed and the flag is
+    /// the only delivery that reaches it. Null = this CLI takes no such flag.</para>
+    /// </summary>
+    [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's

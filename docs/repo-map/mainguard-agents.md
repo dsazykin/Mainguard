@@ -133,7 +133,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     NOT that string, which is written for the in-process `spawn_worker(...)` API the shipped coordinator
     does not have. `AgentOperatingInstructionsTests` pins the coordinator text against
     `AgentIpcRequest.CoordinatorOps` in both directions, so a tool the contract grants but the text omits
-    — a capability the agent would then never use — fails a test).
+    — a capability the agent would then never use — fails a test. **Delivered two ways, neither
+    redundant**, via `AdapterSpec`/`InstalledAdapterMarker` `instructionsFile` + `systemPromptArg`
+    (claude-code: `CLAUDE.md` + `--append-system-prompt`): the launcher appends the FLAG to the launch
+    argv, which is the ONLY channel that reaches a coordinator — the role lock leaves it an empty tmpfs
+    at `/workspace` with no host side to write a file to — and writes the FILE into a worker's worktree,
+    which is what a CLI opens unprompted. The `MAINGUARD.md` staged beside the shim is inspectable but
+    is NOT a delivery: nothing reads that path on its own, which is why naming the CLI's own convention
+    is load-bearing rather than cosmetic. Both fields optional; an adapter declaring neither spawns
+    exactly as before).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one

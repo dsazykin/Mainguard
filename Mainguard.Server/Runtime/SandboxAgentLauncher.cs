@@ -7,6 +7,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Ipc;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Git.Exceptions;
 using Mainguard.Server.Logging;
@@ -213,6 +214,24 @@ public sealed class SandboxAgentLauncher
         var adapter = _adapters.TryGet(agentKind);
         var launchCommand = adapter?.Launch;
 
+        // The role's operating instructions, rendered once and delivered two ways — neither redundant.
+        //
+        // The FLAG is the only delivery that reaches a coordinator: the role lock gives it an empty tmpfs
+        // at /workspace, so there is no host side on which to pre-place a file. The FILE is what a CLI
+        // opens unprompted, and is written into the worktree below for the roles that have one. An
+        // adapter declaring neither spawns exactly as before, silently: a CLI with no instruction channel
+        // is a limitation of that CLI, not a spawn failure.
+        var instructionsRole = string.Equals(agentRole, AgentRoles.Coordinator, StringComparison.Ordinal)
+            ? AgentIpcEndpointRole.Coordinator
+            : AgentIpcEndpointRole.Worker;
+        var instructions = AgentOperatingInstructions.For(
+            instructionsRole, AgentIpcPaths.SandboxShimPath(instructionsRole));
+
+        if (launchCommand is { Count: > 0 } && adapter?.SystemPromptArg is { Length: > 0 } promptArg)
+        {
+            launchCommand = launchCommand.Append(promptArg).Append(instructions).ToList();
+        }
+
         // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
         //
         // Coordinator contract §2: a coordinator has no worktree. Note this skips CREATING one, not just
@@ -245,6 +264,27 @@ public sealed class SandboxAgentLauncher
                 ? "repository-less jail (coordinator role): no worktree, no agent repo, no mirror, no cache"
                 : "worktree ready: {Path} agentRepo={AgentRepo}",
             worktreePath, agentRepoPath);
+
+        // The file half, where the working directory is a real host path. This is what a CLI opens on its
+        // own — the copy staged in the IPC dir sits at a path nothing reads unprompted — so an adapter
+        // that names no instructions file simply has no file-side delivery and relies on the flag.
+        // Best-effort: an agent that starts without its briefing is worse off, not broken, and a spawn
+        // that fails because a markdown file could not be written would be the worse trade.
+        if (!withoutRepositoryAccess
+            && worktreePath is { Length: > 0 }
+            && adapter?.InstructionsFile is { Length: > 0 } instructionsFile)
+        {
+            try
+            {
+                File.WriteAllText(
+                    Path.Combine(worktreePath, instructionsFile), instructions.Replace("\r\n", "\n"));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                _log.LogWarning(
+                    ex, "could not stage {File} into the worktree for agent={Agent}", instructionsFile, agentId);
+            }
+        }
         try
         {
             // MG-43: this agent's own package cache on ext4, prepared BEFORE the container exists (its

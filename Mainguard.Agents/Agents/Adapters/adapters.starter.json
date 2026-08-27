@@ -233,6 +233,8 @@
     {
       "id": "claude-code",
       "displayName": "Claude Code",
+      "instructionsFile": "CLAUDE.md",
+      "systemPromptArg": "--append-system-prompt",
       "version": "2.1.218",
       "provenance": "npm-registry-signature",
       "sha256": "3a434c8bcb493e9ca87315d9aa6064835c5987e8fbc85c181bb76157dd5c45d8",

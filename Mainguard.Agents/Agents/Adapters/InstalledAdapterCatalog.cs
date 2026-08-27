@@ -44,12 +44,19 @@ public sealed record InstalledAdapterMarker(
     /// harvest from a jail's throwaway trees, so a permission grant survives the next spawn. Client-
     /// supplied entries are filtered against this list exactly as credential paths are. Null on markers
     /// written before this field existed — re-install the CLI to backfill it.</summary>
-    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null)
+    [property: JsonPropertyName("settingsPaths")] IReadOnlyList<AdapterSettingsPath>? SettingsPaths = null,
+    /// <summary>The file this CLI reads unprompted from its working directory (see
+    /// <see cref="AdapterSpec.InstructionsFile"/>). Null on markers written before this field existed —
+    /// re-install the CLI to backfill it.</summary>
+    [property: JsonPropertyName("instructionsFile")] string? InstructionsFile = null,
+    /// <summary>The launch flag this CLI takes instruction text on (see
+    /// <see cref="AdapterSpec.SystemPromptArg"/>) — the ONLY delivery that reaches a coordinator, whose
+    /// /workspace is an empty tmpfs with no host side to write a file to. Null on older markers.</summary>
+    [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     public string SerializeInstance() => JsonSerializer.Serialize(this, Options);
-
     public static string Serialize(InstalledAdapterMarker marker) => marker.SerializeInstance();
 
     public static InstalledAdapterMarker? TryDeserialize(string json)
