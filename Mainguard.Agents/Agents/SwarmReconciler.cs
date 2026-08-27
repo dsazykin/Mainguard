@@ -319,6 +319,30 @@ public sealed class SwarmReconcileTask : IBootTask
     /// <summary>The G-17 audit type for one boot swarm-reconcile pass.</summary>
     public const string ReconciledEvent = "boot_swarm_reconcile";
 
+    /// <summary>
+    /// Switches this pass off — the SAME variable the periodic
+    /// <c>AgentSessionReconcilerService</c> reads, deliberately one string rather than two.
+    ///
+    /// <para><b>Why it has to cover this step too.</b> Both passes reconcile daemon state against a
+    /// container engine that is <b>machine-wide</b>, and the Mac substrate's mirror root
+    /// (<c>~/mainguard</c>) is not governed by <c>MAINGUARD_DATA_ROOT</c> — so an in-proc daemon on an
+    /// isolated data root still answers "yes, I host that repository" for a developer's real jails.
+    /// <c>Mainguard.Server.Tests</c>' module initializer set this expecting it to hold "for the whole
+    /// assembly", but only the periodic pass read it: the boot pass kept adopting live jails, wrote
+    /// <c>boot_swarm_reconcile</c> into the test audit log naming the developer's own containers, and
+    /// with <see cref="OrphanPolicy"/> free to prune it could as easily have declared them Dead and
+    /// force-removed their worktrees. A switch that covers one of two identical exposures is the
+    /// control-that-is-not-reached shape, so it now covers both.</para>
+    ///
+    /// <para>Nothing in production sets it; the RequiresDocker tier drives the reconciler directly
+    /// against containers it created itself rather than through boot.</para>
+    /// </summary>
+    public const string DisableVariable = "MAINGUARD_DISABLE_SESSION_RECONCILE";
+
+    /// <summary>Whether the boot pass is switched off for this process.</summary>
+    public static bool Disabled =>
+        Environment.GetEnvironmentVariable(DisableVariable) == "1";
+
     private readonly SwarmReconciler _reconciler;
     private readonly IAuditLog? _audit;
     private readonly Action<string>? _log;
@@ -347,6 +371,14 @@ public sealed class SwarmReconcileTask : IBootTask
 
     public async Task RunAsync(CancellationToken ct)
     {
+        if (Disabled)
+        {
+            // Deliberately leaves LastReport null: no pass ran, and an empty report would claim one did
+            // and found nothing — which is the thing this step exists to stop being indistinguishable.
+            _log?.Invoke($"swarm reconcile disabled by {DisableVariable}");
+            return;
+        }
+
         var report = await _reconciler.ReconcileAsync(ct).ConfigureAwait(false);
         LastReport = report;
 
