@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
@@ -228,7 +229,22 @@ public sealed class AgentCliBinder
         // sits in the agent's input buffer and nothing happens — a silent no-op that would look like a
         // delivered prompt to everything upstream.
         var line = prompt.EndsWith('\n') ? prompt : prompt + "\n";
-        await bound.WriteInputAsync(System.Text.Encoding.UTF8.GetBytes(line), ct).ConfigureAwait(false);
+        try
+        {
+            await bound.WriteInputAsync(System.Text.Encoding.UTF8.GetBytes(line), ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
+        {
+            // `TryGetBound` succeeding only means a session EXISTS, not that its pty is still writable —
+            // a jail can die between the lookup and the write, and the write then throws EIO. Letting
+            // that escape made a bool-returning Try method throw, and the coordinator saw the raw errno
+            // ("Input/output error") instead of the actionable refusal its caller already had ready
+            // ("<id> has no live CLI to steer."). Undelivered is exactly what `false` means.
+            _log.LogWarning(
+                ex, "coordinator prompt to worker={Agent} could not be written to its pty", key.AgentId);
+            return false;
+        }
+
         _log.LogInformation("coordinator prompt delivered to worker={Agent} ({Bytes} bytes)", key.AgentId, line.Length);
         return true;
     }
