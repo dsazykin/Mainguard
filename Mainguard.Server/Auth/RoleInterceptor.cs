@@ -96,6 +96,17 @@ public sealed class RoleInterceptor : Interceptor
         // coordinator token authenticate, so this check is reached instead of being dead code.
         // Per-agent ownership scoping (one connection ↔ its own agents) remains a separate concern.
         "/mainguard.v1.TerminalService/GetScrollback",
+        // Phase 3 §6: StreamPlans filters on a CLIENT-ASSERTED coordinator_id, so any caller may name any
+        // coordinator — or omit the field and receive every pending plan on the daemon, across every
+        // repository and every coordinator. That is the read GetScrollback is denied for, arriving by a
+        // different door: plans carry other agents' scope, approach and task prompts, plus the human's
+        // decisions about work this coordinator competes with. The durable fix is a DERIVED caller
+        // identity rather than a trusted field — the same missing-identity root cause as
+        // IssueCoordinatorToken having no production callers — and that is a change to the daemon's
+        // authentication model, not this one. Denying the role closes the coordinator-shaped half now.
+        // It is unreachable today (the in-jail coordinator has no gRPC route), which is precisely the
+        // condition under which a control quietly stops being true (MG-12).
+        "/mainguard.v1.PlanApprovalService/StreamPlans",
     };
 
     private const string AttachMethod = "/mainguard.v1.TerminalService/Attach";

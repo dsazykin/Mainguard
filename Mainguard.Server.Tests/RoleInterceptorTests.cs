@@ -195,6 +195,52 @@ public class RoleInterceptorTests
         Assert.Contains(RoleDenialMarker, ex.Status.Detail);
     }
 
+    /// <summary>
+    /// Phase 3 §6: <c>StreamPlans</c> filters on a client-asserted <c>coordinator_id</c>, so a caller may
+    /// name any coordinator — or omit the field and receive EVERY pending plan on the daemon, across
+    /// every repository. That is the disclosure <c>GetScrollback</c> is denied for, arriving by another
+    /// door: plans carry other agents' scope, approach and task prompts, and the human's decisions about
+    /// work this coordinator competes with.
+    ///
+    /// <para>The durable fix is a DERIVED caller identity rather than a trusted field, which is a change
+    /// to the authentication model; this closes the coordinator-shaped half. The test matters more than
+    /// usual because the RPC is unreachable by the in-jail coordinator today (it has no gRPC route), and
+    /// an untested denial on an unreachable path is exactly how the previous one quietly stopped being
+    /// true (MG-12).</para>
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesPlanStreamToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        using var call = plans.StreamPlans(new StreamPlansRequest(), fixture.AuthHeaders(CoordinatorToken));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => call.ResponseStream.MoveNext(CancellationToken.None));
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    /// <summary>The paired positive: the operator drives the plan gate in the UI and must still receive
+    /// the stream. Without it the denial above could be a broken RPC rather than a role boundary.</summary>
+    [Fact]
+    public async Task Operator_MayStreamPlans()
+    {
+        using var fixture = new DaemonFixture();
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        using var call = plans.StreamPlans(new StreamPlansRequest(), fixture.AuthHeaders());
+
+        Assert.True(
+            await call.ResponseStream.MoveNext(CancellationToken.None),
+            "the operator's plan stream produced no snapshot");
+    }
+
     // The operator drives the UI and legitimately reads any agent's scrollback.
     [Fact]
     public async Task Operator_MayReadScrollback()

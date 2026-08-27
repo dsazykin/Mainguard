@@ -460,7 +460,11 @@ lock and each deserves its own reviewed change:
   again — a control that looks present and is never reached — and it should either be wired or deleted.
   Left alone here because doing either is a change to the daemon's authentication model, not a role lock.
 - **`PlanApprovalGrpcService.StreamPlans` trusts a client-asserted `coordinator_id`.** Any caller may name
-  any coordinator, or omit it and receive every plan on the daemon. It is not in `CoordinatorDeniedMethods`.
+  any coordinator, or omit it and receive every plan on the daemon. **Half closed**: it is now in
+  `CoordinatorDeniedMethods` (`RoleInterceptor_DeniesPlanStreamToCoordinator`, with the operator's
+  positive beside it, mutation-checked). The field is still trusted for callers that are not the
+  coordinator role — the durable fix is a DERIVED caller identity, which is the same missing-identity
+  root cause as the item above and a change to the authentication model rather than to this branch.
   Not reachable by the in-jail coordinator (no gRPC route), so it is an operator-surface issue rather than
   a coordinator-surface one — but it is the same missing-identity root cause as the item above.
 - **`PlanApprovalService` is still keyed by bare worker/coordinator id.** `WorkerPlanGate` now fails closed
@@ -470,8 +474,18 @@ lock and each deserves its own reviewed change:
   larger than this one and unrelated to the role lock.
 - **The "a coordinator never gets a merge-queue row" guard is untested.** The guard is one `if` in
   `AgentSpawnService`; the in-proc fake substrate never provisions a merge queue, so there is no
-  observable to assert against without a Docker-tier rig (§3.1).
-- **`FlaggedChangeGate` has no production wiring** — unchanged from phase 2 §3a, being fixed separately.
+  observable to assert against (§3.1). **The Docker-tier claim is now too pessimistic**: the queue-seeding
+  posture (`QueueSeedingRpcTests` — real composition root, real origin repo, the shipped `ProvisionRepo`
+  RPC) builds a REAL merge queue in the non-Docker tier, which is the observable §3.1 said did not exist.
+  `MergeQueueProvisioner` is `sealed`, so it is that posture rather than a spy. Still open, but cheap and
+  no longer blocked on Docker.
+- ~~**`FlaggedChangeGate` has no production wiring**~~ — **this entry was stale when written and is now
+  wrong.** Phase 2 §3a records the resolution: the gate is registered and ANDed into the queue's `gates`,
+  armed at verification time by `MergeQueueProvisioner.ArmFlaggedChangeReview`, and the composition root
+  passes `resolveApprovedPlan` (`GatewayServiceRegistration`). The rows reach a human too —
+  `MergeQueueGrpcService.FlaggedItemsFor` yields the P2-11 risk-hunk / lockfile / out-of-approved-scope
+  items from `FlaggedChanges.PeekStore`, not `ChangedTestCommandGate` alone. Left visible rather than
+  deleted, because §6 understating the branch is the kind of error a reviewer inherits.
 
 ---
 
