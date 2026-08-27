@@ -1702,6 +1702,16 @@
   unit tier had not: the raw-errno prompt failure, and that NOTHING anywhere asserts `send_worker_prompt`
   or `request_verification` SUCCEEDING — every assertion about either in the 29-test role-lock suite is a
   refusal, so a handler failing both unconditionally would pass it),**
+  **`PlanGateSurvivesRestartTests` (phase 2 hands-on step 7, which existed only as a manual instruction
+  to the reviewer. The gate's claim is that the DAEMON withholds the task, so the interesting case is
+  the daemon being the thing that went away — and both failure directions are invisible on a fresh boot:
+  a pending plan dropped leaves the worker blocked forever on a decision no human can see a card for,
+  and a pending plan rehydrated as APPROVED hands out a task nobody cleared, which is the one outcome
+  the gate exists to prevent. Drives the shipped `JsonPlanApprovalStore` across two service instances
+  over one file: pending stays pending and un-approved, approved stays approved so nobody is asked to
+  decide twice, and the revision counter survives — a reset counter would grant unlimited revisions with
+  the cap still described everywhere and enforced nowhere. Mutation-checked: a `LoadAll` that returns
+  empty fails all three),**
   **`CoordinatorToolPositivesTests` (the half of the four-tool surface nothing proved: that
   `send_worker_prompt` and `request_verification` can SUCCEED. Every assertion about either in the
   29-test `CoordinatorRoleLockTests` is a refusal, so a handler failing both unconditionally passed that
