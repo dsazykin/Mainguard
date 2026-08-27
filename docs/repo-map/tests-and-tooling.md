@@ -1688,6 +1688,20 @@
   is its own class, and therefore its own rig, because it asserts a daemon-global population: the cap is
   refused **in the daemon's shim handler, on the wire, counting workers that are doing nothing but
   waiting on the human**, with the refusal naming that),**
+  **`BackendWorkflowSimulation` (the whole loop as ONE continuous run over the shipped path, in the order
+  a session happens, each stage narrated through `ITestOutputHelper` so a failure names the stage it
+  reached rather than only the assertion that tripped. It exists because
+  `ScriptedCoordinatorEndToEndTests` walks the same loop through `CoordinatorTools` — the in-process
+  surface phase 3 §1.1 found "is NOT wired to the shipped coordinator at all" — so the loop it proves and
+  the loop a user gets are different objects, and a break in the seam BETWEEN two green unit tests had
+  nowhere to show up. Covers: brief → gate holds → reject with feedback → revise → approve → the task
+  arriving on the approval response; the four tools in coordinator order, including that `prompt`/`verify`
+  are gate-refused BEFORE approval and past the gate after; the refusals (unknown op by name, a worker's
+  channel cannot spawn, a hostile `AgentId` is minted over not adopted, shims role-scoped on disk, each
+  jail carrying its `MAINGUARD.md`); and the cap filling with blocked workers. It found two things the
+  unit tier had not: the raw-errno prompt failure, and that NOTHING anywhere asserts `send_worker_prompt`
+  or `request_verification` SUCCEEDING — every assertion about either in the 29-test role-lock suite is a
+  refusal, so a handler failing both unconditionally would pass it),**
   **`CoordinatorRoleLockTests` (phase 3, contract §8 — THE ROLE LOCK, over the same real Unix socket. The
   coordinator's surface is now the contract's four tools and the allow-list is asserted as an object
   (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4
