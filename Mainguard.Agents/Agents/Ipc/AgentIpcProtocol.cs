@@ -45,6 +45,23 @@ public static class AgentIpcPaths
 
     /// <summary>The socket path as the jail sees it (what the shims dial by default).</summary>
     public const string SandboxSocketPath = SandboxMount + "/" + SocketFileName;
+
+    /// <summary>
+    /// The role's operating instructions, written beside its shim. Phase 3 found that nothing ever told
+    /// a jailed CLI its shim existed (see <see cref="AgentOperatingInstructions"/>), and the IPC dir is
+    /// where the file goes because it is the one location already staged per-agent, per-role, and mounted
+    /// into every jail. A worker additionally gets a copy at its worktree root, where a CLI that reads
+    /// only its working directory will find it; a coordinator's <c>/workspace</c> is an empty tmpfs with
+    /// no host side to write to, so for that role this path plus the launch flag are the delivery.
+    /// </summary>
+    public const string InstructionsFileName = "MAINGUARD.md";
+
+    /// <summary>The instructions path as the jail sees it.</summary>
+    public const string SandboxInstructionsPath = SandboxMount + "/" + InstructionsFileName;
+
+    /// <summary>The in-jail shim path for a role — what the instructions tell that CLI to run.</summary>
+    public static string SandboxShimPath(AgentIpcEndpointRole role) =>
+        SandboxMount + "/" + (role == AgentIpcEndpointRole.Worker ? PlanShimFileName : SpawnShimFileName);
 }
 
 /// <summary>Which shim an IPC endpoint publishes, and therefore which ops the daemon will serve on it.</summary>

@@ -123,6 +123,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker
     does not start before approval" a property of the system rather than a request in a prompt).
+    `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** — `Coordinator(shimPath)` /
+    `Worker(shimPath)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
+    `AgentIpcServer`. Phase 3 §1.2 recorded that the coordinator's boundary prompt "is never delivered";
+    it was worse — **nothing ran at spawn for either role**, so neither was told its shim existed, and
+    since a worker's approved task arrives as the RETURN VALUE of the blocking `mainguard-plan` call, a
+    worker that never runs the shim never presents a plan and correctly receives nothing, forever.
+    Describes, never enforces — same standing rule as `CoordinatorAgent.SystemPrompt`, and deliberately
+    NOT that string, which is written for the in-process `spawn_worker(...)` API the shipped coordinator
+    does not have. `AgentOperatingInstructionsTests` pins the coordinator text against
+    `AgentIpcRequest.CoordinatorOps` in both directions, so a tool the contract grants but the text omits
+    — a capability the agent would then never use — fails a test).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one

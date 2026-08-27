@@ -328,7 +328,11 @@
     it now serves both roles and being named for one of its two clients would mislead about which agents
     have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
     daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un limit) that also carries **the one shim
-    that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker.
+    that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker —
+    **and beside it the role's `MAINGUARD.md` operating instructions** (`AgentOperatingInstructions`),
+    written in the same call so the shim and the text that makes it discoverable cannot be staged
+    independently: a shim is useless to a CLI that was never told it exists, which is what every jail was
+    until now.
     The dir is created BEFORE the jail (it is a read-only mount source) and removed on stop. Identity is
     positional — only that agent's jail has the mount — and the **role is fixed on the endpoint**, so a
     worker cannot reach a coordinator op by naming it and vice versa. One newline-delimited JSON request

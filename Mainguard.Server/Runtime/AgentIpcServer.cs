@@ -135,6 +135,13 @@ public sealed class AgentIpcServer : IDisposable
             var shimPath = Path.Combine(dir, shimName);
             File.WriteAllText(shimPath, shimScript.Replace("\r\n", "\n"));
 
+            // A shim is useless to a CLI that was never told it exists. Phase 3 §1.2 recorded this as
+            // "the prompt was never delivered", which understated it — nothing ran at spawn at all, for
+            // either role. Written beside the shim so the two cannot be staged independently.
+            File.WriteAllText(
+                Path.Combine(dir, AgentIpcPaths.InstructionsFileName),
+                AgentOperatingInstructions.For(role, AgentIpcPaths.SandboxShimPath(role)).Replace("\r\n", "\n"));
+
             var socketPath = Path.Combine(dir, AgentIpcPaths.SocketFileName);
             File.Delete(socketPath); // a stale socket from a crashed daemon blocks bind
 
