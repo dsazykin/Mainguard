@@ -1622,9 +1622,14 @@
   module initializer: PR #287 flagged this assembly as "likely" affected without proving it, and it
   was — every `DaemonHost.Resolve*` store path falls back to `MainguardPaths.DataRoot()` when handed
   no token path, and one clean run rewrote the real mTLS identity, held `mainguard-daemon.db` open and
-  left 13 live agent-IPC sockets in the user's data root) and
+  left 13 live agent-IPC sockets in the user's data root; `ResolveSandboxRoot` also keeps the root short
+  enough to BIND a socket in — `%TEMP%` where it fits, a short home container where it does not, which
+  on macOS is always, since `/var/folders/<..>/T/` costs 49 characters against a 104-byte `sun_path` and
+  used to take out every socket-binding test at once) and
   **`Mainguard.Server.Tests/DataRootIsolationTests.cs`** (its teeth, and more: besides proving the run
-  is not on the real root, `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
+  is not on the real root, `The_isolated_root_leaves_room_to_bind_an_agent_ipc_socket` holds whatever
+  root is in force to that budget — the Linux default clears `sun_path` by three characters nobody
+  chose — and `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
   the SHIPPED resolver set that each one both TAKES and USES a token path — the case a hand-widened
   exact-set list would wave through, and the one that would make every concurrent in-proc host share a
   single file). Test classes: `DaemonAuthTests` (auth
