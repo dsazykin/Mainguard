@@ -1091,7 +1091,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `boot_swarm_reconcile` audit entry naming every pruned/adopted/stopped agent when the pass changed
       something — narrowing it to a bare `Task` left a user whose agents were destroyed overnight with no
       artifact at all; `RecordsOutcome` pins the daemon's audit wiring, `DaemonBootSequence.Tasks`
-      exposes the steps to assert it); **no PID/lock-file reads**).
+      exposes the steps to assert it; `DisableVariable`/`Disabled` switch the pass off — the SAME string
+      `AgentSessionReconcilerService` reads, because a test daemon must stay off a machine-wide container
+      engine and gating only the periodic pass left this one adopting the developer's live jails);
+      **no PID/lock-file reads**).
     - `GatewayPersistence.cs` (SQLite-backed `DbSpendStore`/`DbExpectedAgentStore`/`DbBudgetStore` + the
       `IBudgetStore`/`InMemoryBudgetStore` seam, each op on a short-lived `AppDbContext`;
       `IBudgetStore.Set` takes per-agent AND per-day caps — P2-13 carried-in from P2-08). Models
