@@ -988,6 +988,32 @@
   driven through the real `AdapterChannel.EnsureAsync`, because **dropping it from the marker the
   channel writes left the entire suite green** (phase 3's M7 shape: a correct launcher nobody calls
   correctly). A pre-field marker and an unreadable one both degrade to "no turn" rather than throwing.
+- **`Mainguard.Tests/AdapterMarkerProjectionTests.cs`** — defect D5a: an install that predates a manifest
+  field must pick it up with no re-install. The measured state on the reporting machine was a
+  `claude-code` marker carrying none of `preApprovedCommandArg`, `preApprovedCommandFormat` or
+  `initialPromptStyle`, so two shipped fixes were inert there while every test stayed green. Asserts that
+  an old marker reads back with the shipped fields; that the projection applies even when the INSTALLED
+  version has moved past the shipped pin (the reporting install had — which is why the obvious
+  "re-derive when the versions match" migration was rejected, and that rejection is a test rather than a
+  comment); that `version` and `launch` are never overwritten, because only the install knows which ones
+  probed green; that a field the manifest STOPS declaring is removed rather than inherited (this set
+  contains a grant of execution, so a revocation an old marker could veto would not be one); that an
+  adapter the shipped manifest does not name is returned verbatim; that `FromSpec` carries every declared
+  field (phase 3's K6 shape, now one mapping shared by the writer and the projector); and — over the REAL
+  bundled manifest and the default catalog — that every shipped adapter projects, so none of the above can
+  pass by a fixture agreeing with itself. Mutations watched red: projection removed (4), gated on version
+  equality (3), nulls inherited instead of revoking (1), manifest overwriting version+launch (2).
+- **`Mainguard.Tests/CliSettingsGrantScrubTests.cs`** — defect D5b: the least-privilege boundary on what a
+  harvested settings file may carry. The exact file found in the owner's per-repo store
+  (`Bash(/opt/mainguard/ipc/mainguard-agent *)` beside `Bash(node *)`) loses the first and keeps the
+  second; both roles' shims and any spelling of the mount go, at any depth, as array elements and as
+  property keys; a DENY naming the mount goes too (its own test, because it is the one direction of the
+  change a reviewer should argue with — what replaces it is the daemon's per-jail one-path grant, not
+  "anything goes"); a file that never names the mount is returned BYTE-IDENTICAL, since this is the
+  owner's own config and a security scrub must not reformat it; and a file that names the mount and will
+  not parse as JSON does not travel at all. Mutations watched red: keyed on one shim filename instead of
+  the mount (5), fail-open on unparseable content (1); plus, in the daemon suite, the scrub removed from
+  each direction (1 each) and dropping the whole file instead of the rule (1).
 - **`Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`** — defect D1, over the real Unix socket an
   in-jail shim writes to. A coordinator's `spawn coder` used to answer `Ok, Status: AwaitingPlan` while
   creating a jail with no CLI in it; it is now refused, mints no session, creates no jail, and the refusal
@@ -1015,7 +1041,13 @@
   refuses, not merely because the caller passed nothing. An inherited allowlist is inherited execution.
   **OUT:** `StoppingAnUnattendedWorker_PersistsNothing_EvenThoughTheFileIsRightThere` — the fake jail
   HAS the settings file (the attended test above harvests it from the same engine), so an empty result
-  can only be `CliSettingsHarvestPolicy`. Plus the declared-path filter (a right-path/wrong-root entry
+  can only be `CliSettingsHarvestPolicy`.
+  **ROLE (defect D5b):** `AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail` +
+  `StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant` — a stored grant naming
+  `AgentIpcPaths.SandboxMount` is scrubbed on the way IN (which is what neutralises an already-poisoned
+  store, with no migration) and never harvested on the way OUT, while the owner's own approvals ride
+  through untouched in both directions.
+  Plus the declared-path filter (a right-path/wrong-root entry
   and an undeclared `.ssh/authorized_keys` are both dropped) and the 256 KiB harvest ceiling. Docker-free:
   a fake substrate whose sandbox engine RECORDS every `SandboxSpawnRequest`, so what actually reaches a
   jail is observable. The real-jail leg is `Agents/CliSettingsRoundTripDockerTests.cs`.

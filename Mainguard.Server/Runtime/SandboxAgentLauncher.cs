@@ -829,6 +829,14 @@ public sealed class SandboxAgentLauncher
     /// different in kind: these files carry a PERMISSION ALLOWLIST, so an unfiltered path would let a
     /// compromised client plant a pre-approved-command file anywhere in the agent's home or checkout.
     /// No marker / no declared settings paths ⇒ nothing is restored.
+    ///
+    /// <para><b>D5b — and the grant a stored file must not carry in.</b> Every kept file is put through
+    /// <see cref="CliSettingsGrantScrub"/>, which removes any rule naming the daemon-owned IPC mount. A
+    /// per-repo store that predates this carries exactly such a rule on this machine
+    /// (<c>Bash(/opt/mainguard/ipc/mainguard-agent *)</c>, harvested from an attended coordinator), and
+    /// restoring it hands one role's tool grant to every later jail of that repository — workers included.
+    /// Scrubbing on the way IN is what makes an already-poisoned store harmless with no migration; the
+    /// harvest side (see <see cref="HarvestCliSettingsAsync"/>) is what stops it re-acquiring one.</para>
     /// </summary>
     internal static IReadOnlyList<SandboxSettingsFile>? FilterCliSettings(
         IReadOnlyList<SandboxSettingsFile>? supplied, InstalledAdapterMarker? adapter)
@@ -844,6 +852,11 @@ public sealed class SandboxAgentLauncher
             .Where(f => f.Content is { Length: > 0 }
                         && f.Content.Length <= AdapterSettingsPolicy.MaxFileBytes
                         && allowed.Contains((f.Root, f.RelativePath)))
+            .Select(f => CliSettingsGrantScrub.Scrub(f.Content) is { Length: > 0 } clean
+                ? f with { Content = clean }
+                : null)
+            .Where(f => f is not null)
+            .Select(f => f!)
             .ToArray();
         return kept.Length > 0 ? kept : null;
     }
@@ -1064,6 +1077,31 @@ public sealed class SandboxAgentLauncher
 
                 var content = Convert.FromBase64String(
                     string.Concat(result.Stdout.Where(c => !char.IsWhiteSpace(c))));
+
+                // D5b: a rule naming the daemon-owned IPC mount does not leave the jail. Those grants are
+                // issued per jail and per role at launch, so nothing a jail records about them means
+                // anything in the next one — and a coordinator's `Bash(<its shim> *)`, persisted per REPO,
+                // is one role's tool grant queued up for every later jail of that repository. An
+                // unparseable file that names the mount is dropped whole rather than carried unread.
+                var scrubbed = CliSettingsGrantScrub.Scrub(content);
+                if (scrubbed is null)
+                {
+                    _log.LogWarning(
+                        "cli settings harvest refused (names {Mount} and could not be scrubbed): kind={Kind} root={Root} path={Path}",
+                        CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
+                        AdapterSettingsPath.SpellRoot(root), entry.Path);
+                    continue;
+                }
+
+                if (scrubbed.Length != content.Length)
+                {
+                    _log.LogInformation(
+                        "cli settings harvest scrubbed a role-scoped grant for {Mount}: kind={Kind} root={Root} path={Path}",
+                        CliSettingsGrantScrub.DaemonOwnedPathPrefix, agentKind,
+                        AdapterSettingsPath.SpellRoot(root), entry.Path);
+                }
+
+                content = scrubbed;
                 if (content.Length is > 0 and <= AdapterSettingsPolicy.MaxFileBytes)
                 {
                     harvested.Add(new SandboxSettingsFile(root, entry.Path, content));

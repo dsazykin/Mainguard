@@ -80,6 +80,56 @@ public sealed record InstalledAdapterMarker(
             ? style
             : AdapterInitialPromptStyle.None;
 
+    /// <summary>
+    /// The marker an <see cref="AdapterSpec"/> describes — the <b>one</b> place a spec's fields are mapped
+    /// onto a marker's.
+    ///
+    /// <para>It used to be a 14-argument positional constructor call inside <c>AdapterChannel</c>, which is
+    /// how a manifest field reaches the daemon by being copied correctly at exactly one call site nobody
+    /// is watching. Phase 3's mutation K6 already caught one such omission (<c>initialPromptStyle</c>
+    /// declared, carried and honoured, and never written to the marker the daemon reads). Naming the
+    /// mapping makes adding a field one edit rather than two, and makes the reverse direction — projecting
+    /// the shipped manifest back over an older marker, see
+    /// <see cref="WithShippedDescription"/> — the same function read backwards.</para>
+    /// </summary>
+    public static InstalledAdapterMarker FromSpec(AdapterSpec spec) => new(
+        spec.Id,
+        spec.Version,
+        spec.Launch ?? Array.Empty<string>(),
+        spec.ApiKeyEnvVar,
+        spec.EgressHosts,
+        spec.CredentialPaths,
+        spec.BaseUrlEnvVar,
+        spec.ModelHost,
+        spec.SettingsPaths,
+        spec.InstructionsFile,
+        spec.SystemPromptArg,
+        spec.PreApprovedCommandArg,
+        spec.PreApprovedCommandFormat,
+        spec.InitialPromptStyle);
+
+    /// <summary>
+    /// This marker with every <b>manifest-declared</b> field taken from <paramref name="spec"/>, keeping
+    /// only the two things that are facts about the INSTALL rather than about the CLI: the
+    /// <see cref="Version"/> that probed green and the <see cref="Launch"/> argv that probed green.
+    ///
+    /// <para><b>Why the manifest wins.</b> Everything else on a marker — which env var carries the key,
+    /// which files are credentials, which are settings, which flag takes instructions, which flag takes a
+    /// pre-approved command — is a description of the vendor's CLI, and a marker only ever held a COPY of
+    /// the shipped manifest's answer, taken on the day the CLI was installed. That copy goes stale the
+    /// moment Mainguard learns something new about a CLI it already installed, and a stale copy is read as
+    /// truth: on this machine, <c>preApprovedCommandArg</c> and <c>initialPromptStyle</c> were both shipped
+    /// and both absent from a marker written a day earlier, so two fixes were inert on the only install
+    /// that mattered while every test stayed green.</para>
+    ///
+    /// <para><b>Including nulls, deliberately.</b> A field the shipped manifest no longer declares is
+    /// REMOVED here rather than inherited from the marker. This set contains a grant of execution
+    /// (<see cref="PreApprovedCommandArg"/>), and a revocation that an old marker could veto would not be
+    /// a revocation.</para>
+    /// </summary>
+    public InstalledAdapterMarker WithShippedDescription(AdapterSpec spec) =>
+        FromSpec(spec) with { Version = Version, Launch = Launch };
+
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     public string SerializeInstance() => JsonSerializer.Serialize(this, Options);
@@ -108,7 +158,31 @@ public sealed record InstalledAdapterMarker(
 /// </summary>
 public sealed class InstalledAdapterCatalog
 {
+    /// <summary>
+    /// The shipped manifest's adapters by id, parsed once per process. The embedded
+    /// <c>adapters.starter.json</c> is a compiled-in resource, so this cannot change under a running
+    /// daemon and cannot fail for an environmental reason.
+    ///
+    /// <para>A manifest that will not parse yields an EMPTY map rather than throwing: this is read on the
+    /// spawn path, and the pre-projection behaviour (markers used exactly as written) is a working
+    /// daemon. <c>AgentCliCatalogTests.StarterManifest_ShouldParse_AndPinEveryAdapter</c> is what makes a
+    /// bad edit fail CI instead of degrading here.</para>
+    /// </summary>
+    private static readonly Lazy<IReadOnlyDictionary<string, AdapterSpec>> ShippedSpecs = new(() =>
+    {
+        try
+        {
+            return AdapterManifest.Parse(BundledAdapterChannelSource.StarterManifestJson())
+                .Adapters.ToDictionary(a => a.Id, a => a, StringComparer.Ordinal);
+        }
+        catch (Exception)
+        {
+            return new Dictionary<string, AdapterSpec>(StringComparer.Ordinal);
+        }
+    });
+
     private readonly string _registryDir;
+    private readonly IReadOnlyDictionary<string, AdapterSpec> _shipped;
 
     /// <summary>The daemon default: the fixed VM layout (<see cref="AdapterPaths.VmRegistryDir"/>).</summary>
     public InstalledAdapterCatalog() : this(AdapterPaths.VmRegistryDir)
@@ -121,9 +195,13 @@ public sealed class InstalledAdapterCatalog
     public static InstalledAdapterCatalog CreateForHost() =>
         new(AdapterPaths.DaemonSideRegistryDir());
 
-    public InstalledAdapterCatalog(string registryDir)
+    /// <param name="shippedSpecs">The manifest this catalog projects over the markers it reads; null uses
+    /// the app's own embedded starter manifest, which is what every composition root wants. Supplied
+    /// explicitly only by the tests that need a manifest they control.</param>
+    public InstalledAdapterCatalog(string registryDir, IReadOnlyDictionary<string, AdapterSpec>? shippedSpecs = null)
     {
         _registryDir = registryDir;
+        _shipped = shippedSpecs ?? ShippedSpecs.Value;
         // The adapters ROOT is the registry's parent, because that is the layout the installer creates
         // (`<root>/registry/<id>.json` beside `<root>/bin`). Derived rather than hardcoded so the root
         // and the registry cannot disagree: the spawn path bind-mounts this root read-only into every
@@ -142,7 +220,24 @@ public sealed class InstalledAdapterCatalog
     /// </summary>
     public string Root { get; }
 
-    /// <summary>All currently installed agent adapters (empty when none / dir absent).</summary>
+    /// <summary>
+    /// All currently installed agent adapters (empty when none / dir absent), each <b>projected through
+    /// the shipped manifest</b> — see <see cref="InstalledAdapterMarker.WithShippedDescription"/>.
+    ///
+    /// <para><b>Why the projection lives on the READ and not in a migration.</b> The alternative designs
+    /// were to re-derive markers when the version matches, or to rewrite them on daemon start. Both keep
+    /// the marker as a second source of truth and therefore keep the failure: version-matching would not
+    /// even have repaired the install that reported this defect (the CLI had been updated forward of the
+    /// shipped pin, so the versions differ and every new field would have stayed masked), and a
+    /// start-time rewrite is a write that can fail, that can race the installer, and that leaves a window
+    /// in which the stale copy is still authoritative. Projecting on read has no window, no write, no
+    /// ordering, and nothing left to migrate: a field the app learns about reaches the daemon on the very
+    /// next spawn, on installs that predate it, with no re-install and no user action.</para>
+    ///
+    /// <para>An adapter the shipped manifest does not name — a CLI installed from a future hosted channel
+    /// — is returned exactly as its marker was written. There is nothing to project it through, and
+    /// inventing a description for it would be worse than carrying its own.</para>
+    /// </summary>
     public IReadOnlyList<InstalledAdapterMarker> List()
     {
         if (!Directory.Exists(_registryDir))
@@ -154,7 +249,7 @@ public sealed class InstalledAdapterCatalog
             try
             {
                 if (InstalledAdapterMarker.TryDeserialize(File.ReadAllText(file)) is { } marker)
-                    markers.Add(marker);
+                    markers.Add(_shipped.TryGetValue(marker.Id, out var spec) ? marker.WithShippedDescription(spec) : marker);
             }
             catch (IOException)
             {

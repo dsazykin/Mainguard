@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Ipc;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Server.Runtime;
 using Mainguard.Server.Tests.Fixtures;
@@ -58,9 +59,21 @@ public sealed class CliSettingsBoundaryTests
     /// records "don't ask again" grants, so the test rides the root that matters.</summary>
     private static readonly AdapterSettingsPath Declared = new("workspace", ".probe/settings.local.json");
 
-    private static SandboxSettingsFile NewGrant(string command) =>
+    /// <summary>The grant found in the reporting machine's per-repo store: the coordinator's shim, spelled
+    /// as claude-code records a "don't ask again" answer.</summary>
+    private const string CoordinatorShimGrant =
+        "Bash(" + AgentIpcPaths.SandboxMount + "/" + AgentIpcPaths.SpawnShimFileName + " *)";
+
+    private static SandboxSettingsFile NewGrant(string command) => NewGrants(command);
+
+    /// <summary>One stored settings file whose allowlist holds these commands — the shape the per-repo
+    /// store actually has (one file per declared path, many rules inside it).</summary>
+    private static SandboxSettingsFile NewGrants(params string[] commands) =>
         new(AdapterSettingsRoot.Workspace, Declared.Path,
-            Encoding.UTF8.GetBytes("{\"permissions\":{\"allow\":[\"" + command + "\"]}}"));
+            Encoding.UTF8.GetBytes(
+                "{\"permissions\":{\"allow\":["
+                + string.Join(",", System.Array.ConvertAll(commands, c => "\"" + c + "\""))
+                + "]}}"));
 
     // ---- gate 1: IN ---------------------------------------------------------------------------
 
@@ -146,6 +159,59 @@ public sealed class CliSettingsBoundaryTests
         Assert.True(CliSettingsHarvestPolicy.MayHarvest(string.Empty));
         Assert.True(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Coordinator));
         Assert.False(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Managed));
+    }
+
+    // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------
+
+    /// <summary>
+    /// <b>The defect.</b> The per-repo store on the reporting machine held
+    /// <c>Bash(/opt/mainguard/ipc/mainguard-agent *)</c> — the COORDINATOR's shim — harvested from an
+    /// attended coordinator terminal where the owner answered "yes, don't ask again". That store seeds
+    /// every later jail in the repository, so a WORKER was being handed a standing grant for the
+    /// coordinator's tool. It also meant the live coordinator only worked because of a stale file rather
+    /// than because of its own per-role launch grant.
+    ///
+    /// <para>Restoring is scrubbed as well as harvesting, and that is the half that matters for an install
+    /// that already has one: the poisoned entry is on disk today, and scrubbing the way IN neutralises it
+    /// with no migration. The owner's own approval rides through untouched — carrying those is the whole
+    /// point of the store.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail()
+    {
+        using var rig = SettingsRig.Create();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None,
+            cliSettings: new[] { NewGrants("Bash(npm test:*)", CoordinatorShimGrant) });
+
+        var delivered = Assert.Single(rig.Engine.LastSpawn!.CliSettingsFiles!);
+        var text = Encoding.UTF8.GetString(delivered.Content);
+        Assert.DoesNotContain(AgentIpcPaths.SandboxMount, text, StringComparison.Ordinal);
+        Assert.Contains("npm test", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the store stops acquiring one: an attended stop harvests the file with the mount's grant
+    /// removed, so the very next stop repairs an already-poisoned store rather than rewriting it.
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant()
+    {
+        const string WithGrant =
+            "{\"permissions\":{\"allow\":[\"Bash(git status:*)\",\"" + CoordinatorShimGrant + "\"]}}";
+        using var rig = SettingsRig.Create(WithGrant);
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var harvested = Assert.Single(result.CliSettings);
+        var text = Encoding.UTF8.GetString(harvested.Content);
+        Assert.DoesNotContain(AgentIpcPaths.SandboxMount, text, StringComparison.Ordinal);
+        // The negative control: the harvest still WORKS. Without this, a scrub that dropped the whole
+        // file — or a harvest that had quietly stopped running — would pass the assertion above.
+        Assert.Contains("git status", text, StringComparison.Ordinal);
     }
 
     // ---- the filter the client's own paths pass through ----------------------------------------
@@ -264,7 +330,10 @@ public sealed class CliSettingsBoundaryTests
 
         public AgentSpawnService Spawns => Host.Services.GetRequiredService<AgentSpawnService>();
 
-        public static SettingsRig Create()
+        /// <param name="inJailSettings">What the fake jail's declared settings file holds. Defaults to the
+        /// ordinary allowlist; a test that cares about the role-scoped-grant boundary (D5b) puts a jail's
+        /// own IPC grant in it, which is exactly what the reporting machine's store was found holding.</param>
+        public static SettingsRig Create(string? inJailSettings = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-settings-gate-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -276,7 +345,7 @@ public sealed class CliSettingsBoundaryTests
                 InstalledAdapterMarker.Serialize(new InstalledAdapterMarker(
                     AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared })));
 
-            var engine = new RecordingSandboxEngine();
+            var engine = new RecordingSandboxEngine(inJailSettings ?? InJailSettings);
             var host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             {
                 services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine));
@@ -303,6 +372,10 @@ public sealed class CliSettingsBoundaryTests
         public sealed class RecordingSandboxEngine : ISandboxEngine
         {
             private readonly ConcurrentQueue<SandboxSpawnRequest> _spawns = new();
+            private readonly string _inJailSettings;
+
+            public RecordingSandboxEngine(string? inJailSettings = null) =>
+                _inJailSettings = inJailSettings ?? InJailSettings;
 
             /// <summary>The most recent spawn request — what the jail would really have received.</summary>
             public SandboxSpawnRequest? LastSpawn => _spawns.LastOrDefault();
@@ -322,7 +395,7 @@ public sealed class CliSettingsBoundaryTests
                 var wanted = ContainerSpecBuilder.WorkspaceTarget + "/" + Declared.Path;
                 return Task.FromResult(command.Contains(wanted)
                     ? new SandboxExecResult(
-                        0, Convert.ToBase64String(Encoding.UTF8.GetBytes(InJailSettings)), string.Empty)
+                        0, Convert.ToBase64String(Encoding.UTF8.GetBytes(_inJailSettings)), string.Empty)
                     : new SandboxExecResult(1, string.Empty, string.Empty));
             }
 

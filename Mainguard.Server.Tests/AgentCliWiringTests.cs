@@ -59,8 +59,14 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         }, rig.Auth);
 
         // The launcher resolved the marker's argv and the binder got the container + launch command.
+        // A PREFIX rather than an equality: `claude-code` is a shipped adapter, and the daemon projects
+        // the shipped manifest's description over an installed marker (D5a), so this jail's line also
+        // carries the delivery flags that manifest declares — the worker's operating instructions here.
+        // The marker's own argv is what this test is about, and it is what the line starts with.
         var session = Assert.Single(rig.Sessions.Values);
-        Assert.Equal(new[] { "claude", "--permission-mode", "plan" }, rig.LastSpec!.Launch);
+        Assert.Equal(
+            new[] { "claude", "--permission-mode", "plan" },
+            rig.LastSpec!.Launch!.Take(3).ToArray());
         Assert.StartsWith("ctr-", rig.LastSpec.ContainerId, StringComparison.Ordinal);
 
         // The TTY contract for the EXACT spec the composition root produced (field, 2026-07-17: a

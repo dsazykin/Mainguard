@@ -164,7 +164,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     nothing. The manifest never names the granted command, so no manifest edit can widen it — only change
     how a grant is spelled. A launch flag rather than a merge into `.claude/settings.local.json` on
     purpose: that file is harvested back into the per-repo host store, so a grant written there would be
-    re-injected into every later jail for the repository, workers and untrusted PR heads included.
+    re-injected into every later jail for the repository, workers and untrusted PR heads included — and a
+    store written before that reasoning existed already held exactly such a grant, which `CliSettingsGrantScrub`
+    now removes in both directions (defect D5b).
     **A coordinator is also told which agent kinds exist (defect D1).** The text said
     `spawn <agent-kind>` and never said what a kind was, so a real coordinator's first move was
     `spawn coder` — no such adapter, a jail created with no CLI in it, and `Ok, Status: AwaitingPlan`
@@ -1629,6 +1631,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       it in, and `RenderPreApproval` answers null rather than something half-formed for every missing
       input — "no grant" is a working agent that asks a human; a mis-rendered grant is a permission rule
       nobody chose).
+    - `CliSettingsGrantScrub.cs` (**defect D5b — role-scoped tool grants never persist**. A CLI's settings
+      file is harvested out of a human-attended jail into a PER-REPO host store that seeds every later jail
+      for that repository, and the owner's store was found holding
+      `Bash(/opt/mainguard/ipc/mainguard-agent *)` — the COORDINATOR's shim — which was then being restored
+      into worker jails. `AgentIpcPaths.SandboxMount` is Mainguard's own mount and its grants are issued
+      per jail and per role at launch (`SandboxAgentLauncher.ApplyShimPreApproval`), so nothing a jail
+      writes about that directory may persist: `Scrub` removes every JSON string naming the mount and every
+      property keyed by one, at any depth, in ALLOW and DENY alike (what replaces a dropped rule is the
+      daemon's own one-path per-role grant, not "anything goes"). A file that never names the mount is
+      returned BYTE-IDENTICAL; one that names it and will not parse as JSON does not travel at all.
+      Applied in BOTH directions by `SandboxAgentLauncher` — on restore (`FilterCliSettings`), which
+      neutralises an already-poisoned store with no migration, and on harvest
+      (`HarvestCliSettingsAsync`), which stops the store re-acquiring one and makes it self-heal at the
+      next attended stop. Covered by `Mainguard.Tests/CliSettingsGrantScrubTests.cs` +
+      `CliSettingsBoundaryTests` gate 3).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
@@ -1692,11 +1709,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
       boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
       `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
-      `preApprovedCommandFormat`. All are null on markers written before their field existed, so an
-      un-reinstalled CLI degrades to its old behaviour rather than crashing; the daemon reads the MARKER,
-      not the manifest, so a field that stops at the manifest reaches no jail at all. `InstalledKinds()`
-      is the ordinal-sorted set of launchable `agentKind`s — the single set the coordinator's instructions
-      name and its `spawn` refusal enforces (defect D1)).
+      `preApprovedCommandFormat`. **Defect D5a — the marker is no longer a second source of truth.**
+      Those fields being null on an older marker was documented as "re-install to backfill", and on a real
+      install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
+      `preApprovedCommandArg`, `preApprovedCommandFormat` or `initialPromptStyle`, so two shipped fixes
+      were completely inert on the only install that mattered while every test stayed green. `List()` now
+      PROJECTS the shipped `adapters.starter.json` over every marker it reads
+      (`InstalledAdapterMarker.WithShippedDescription`): the marker keeps the two facts only the install
+      knows — the `version` that probed green and the `launch` argv that probed green — and every
+      manifest-declared field comes from the manifest, nulls included, so a withdrawn grant is really
+      withdrawn. Projection is by adapter ID and NOT gated on version, because the reporting install had
+      been updated forward of the shipped pin (2.1.234 vs 2.1.218) and a version gate would have repaired
+      nothing there; an adapter the shipped manifest does not name is returned exactly as written.
+      `InstalledAdapterMarker.FromSpec` is the one spec→marker mapping, shared by the projector and by
+      `AdapterChannel`'s writer. `InstalledKinds()` is the ordinal-sorted set of launchable `agentKind`s —
+      the single set the coordinator's instructions name and its `spawn` refusal enforces (defect D1).
+      Covered by `Mainguard.Tests/AdapterMarkerProjectionTests.cs`).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI

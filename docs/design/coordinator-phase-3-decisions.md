@@ -720,3 +720,122 @@ M1 is the verification: with the guard removed the daemon reproduces the report 
 answers `Ok`, a session is minted, and a jail is requested for a kind nothing can launch. M4 is the one
 worth reading: every prose assertion about the instructions stayed green while the launcher handed them an
 empty list, which is why the binding is asserted at the launcher and not only at the string function.
+
+## 10. Defect D5 — the pre-approval fix was inert on a real install, and the fallback granted the wrong shim
+
+### 10.1 What was measured, before anything was changed
+
+Two files on the owner's machine.
+
+`~/mainguard/adapters/registry/claude-code.json` — no `preApprovedCommandArg`, no
+`preApprovedCommandFormat`, no `initialPromptStyle`. It was written the day before those fields existed,
+and the daemon reads the **marker**, not the manifest. So §8's first-turn fix and the C2 pre-approval fix
+were both **completely inert on the only install that matters**, with every test green.
+
+`~/.mainguard/cli-settings/<repo>/claude-code.json` — a harvested
+`workspace/.claude/settings.local.json` holding:
+
+```json
+{ "permissions": { "allow": [ "Bash(node *)", "Bash(/opt/mainguard/ipc/mainguard-agent *)" ] } }
+```
+
+That is the **coordinator's** shim, recorded when the owner answered "yes, don't ask again" in an attended
+coordinator terminal. It is restored into every later jail for that repository — workers included. So the
+live coordinator worked only because of a stale file, and that same file was queued to hand a worker the
+coordinator's tool grant.
+
+### 10.2 (a) The migration: the marker stops being a second source of truth
+
+The obvious mechanisms were considered and rejected in this order:
+
+- **Re-derive the marker when the version matches.** It would not have repaired *this* install. The CLI had
+  been updated forward of the shipped pin (installed 2.1.234, manifest 2.1.218), so the versions differ and
+  every new field stays masked. `AdapterMarkerProjectionTests.TheProjectionAppliesEvenWhenTheInstalledVersionHasMovedPastTheShippedPin`
+  is that rejection written down as a test rather than as a comment.
+- **Rewrite markers on daemon start.** A write that can fail, that can race the installer, and that leaves a
+  window in which the stale copy is still authoritative. It also leaves the marker as a second source of
+  truth, so the next field to be added has the same failure available to it.
+- **Write the marker on `EnsureAsync`'s `AlreadyHealthy` path.** Correct as far as it goes, and useless
+  here: nothing re-runs an install on a healthy CLI.
+
+What shipped instead: `InstalledAdapterCatalog.List()` **projects the shipped manifest over every marker it
+reads**. A marker is a record of an install, so it keeps the two things only the install knows — the
+`version` that probed green and the `launch` argv that probed green — and every manifest-declared field
+(which is a description of the *vendor's CLI*, and was only ever a dated copy of the manifest's answer)
+comes from the manifest. No migration, no window, no write, no ordering; an install that predates a field
+picks it up on the very next spawn, and the class of defect is gone rather than instanced.
+
+Two consequences stated deliberately:
+
+- **Projection is by adapter id, not by version.** A marker's copy of these fields came from an *older*
+  manifest, so preferring the current one is never worse than preferring the stale one.
+- **Nulls project too.** A field the shipped manifest stops declaring is *removed*, not inherited. This set
+  contains a grant of execution (`preApprovedCommandArg`), and a revocation an old marker could veto would
+  not be a revocation.
+
+`InstalledAdapterMarker.FromSpec` is now the single spec→marker mapping, shared by `AdapterChannel`'s writer
+and by the projector. It replaced a 14-argument positional constructor call — which is exactly the shape
+mutation K6 caught last time.
+
+### 10.3 (b) The wrong-shim grant: what changed about who can run what
+
+**Stated exactly.** `/opt/mainguard/ipc` is Mainguard's own mount, and the grants for it are issued per
+jail and per role at launch by `SandboxAgentLauncher.ApplyShimPreApproval` — one absolute path, the shim
+that jail's role was actually given. Therefore **no persisted settings file may say anything about that
+mount**. `CliSettingsGrantScrub.Scrub` removes every JSON string naming it and every property keyed by one,
+at any depth.
+
+Who can run what, before and after:
+
+| | before | after |
+|---|---|---|
+| coordinator jail | `mainguard-agent` — via a stale harvested file, on repos that happened to have one | `mainguard-agent` — via its own launch flag, on every repo |
+| worker jail | carried the **coordinator's** `mainguard-agent` grant from the repo store | `mainguard-plan` only, from its own launch flag |
+| external-PR head | no IPC dir ⇒ no grant (unchanged) | unchanged |
+| anything else in `/opt/mainguard/ipc` | whatever the repo store had accumulated | nothing, ever |
+
+**Applied in both directions, and the restore direction is the one that matters today.** Scrubbing only the
+harvest would have fixed nothing already on disk — the poisoned entry is in the owner's store now, and would
+keep being restored until some later attended stop happened to overwrite it. Scrubbing the restore
+neutralises every stored file immediately, with no migration; scrubbing the harvest stops the store
+re-acquiring one and makes it self-heal at the next attended stop, since a harvested file replaces its
+stored copy.
+
+**A DENY naming the mount is dropped too**, and that is the one direction of this change a reviewer should
+argue with. It is not a widening: what replaces a dropped rule is not "anything goes" but the daemon's own
+per-jail, per-role, one-absolute-path grant. Mainguard is the authority on its own mount, and a rule from an
+agent-writable file cannot be a boundary anyway — it is indistinguishable from one the agent wrote itself.
+
+**Fail closed, and lossless otherwise.** A file that names the mount and will not parse as JSON does not
+travel at all (refusing costs a re-approval; carrying bytes nobody can read is how a grant survives unseen).
+A file that never names the mount is returned **byte-identical** — it is the owner's own configuration, and
+reformatting it as a side effect of a security scrub would be its own defect.
+
+### 10.4 The mutation log
+
+| # | enforcement removed | result |
+|---|---|---|
+| M6 | the manifest projection (the pre-change behaviour) | **4 failed** / 17 passed |
+| M7 | projection gated on version equality (the design NOT chosen) | **3 failed** / 18 passed |
+| M8 | a null manifest field inherits the marker's instead of revoking | **1 failed** / 20 passed |
+| M9 | the manifest also overwrites `version` + `launch` | **2 failed** / 19 passed |
+| M10 | the scrub removed from the RESTORE direction | **1 failed** / 11 passed |
+| M11 | the scrub removed from the HARVEST direction | **1 failed** / 11 passed |
+| M12 | the scrub keyed on one shim filename instead of the mount | **5 failed** / 16 passed |
+| M13 | fail OPEN on an unparseable file that names the mount | **1 failed** / 20 passed |
+| M14 | the post-serialisation re-check | **0 failed — see below** |
+| M15 | the restore scrub drops the whole file instead of the rule | **1 failed** / 11 passed |
+
+**M14 is recorded as untested, not as enforced.** Removing the final `Mentions(bytes)` check left the suite
+green, and no input reaches it: `Strip` handles every JSON node kind, so nothing that names the mount can
+survive the walk. It stays as a fail-closed backstop against a future edit to `Strip` — cheap, and the
+alternative is that such an edit ships silently — but it is not evidence of anything today and is not
+presented as such.
+
+### 10.5 Found and NOT fixed here
+
+- **The owner's stored file still contains the stale grant.** It is inert — the restore scrub removes it on
+  every spawn, and the next attended stop rewrites the file without it — but the bytes are on disk until
+  then. Rewriting a user's store from the daemon at startup is a separate, reviewable change, and this one
+  deliberately does not write to it.
+- **§8.5's folder-trust dialog is still open**, unchanged by either defect here.
