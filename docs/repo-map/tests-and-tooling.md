@@ -1751,6 +1751,18 @@
   deleted unread; and that nothing half-finished is left in a directory the jail can also write. Seven
   mutations watched red — loop removed, claim by copy instead of rename, claim never deleted, size cap
   dropped, handler not awaited, malformed branch removed, outbox dir not created),**
+  **`AgentIpcObservabilityTests` (defect C3 — a jail that cannot reach the daemon left NO daemon-side
+  evidence. `AgentIpcServer` had no logger at all, so three refused connections from a live jail produced
+  zero entries and the outage read as a model sitting idle. Shaped by the fact that a refused `connect()`
+  is refused by the JAIL's kernel and never reaches the daemon: the evidence for that case has to be the
+  ABSENCE of contact, so the silence watch is pinned alongside the negative controls that keep it from
+  becoming a false-alarm generator — a channel that WAS used, and one torn down inside the grace window,
+  say nothing, and a healthy call emits nothing above Debug. Malformed requests are pinned on BOTH
+  framings, and the rejection cap is tested as a security guard rather than as tidiness: the outbox is
+  jail-writable, so an uncapped warning-per-rejection would hand a sandbox's occupant a log-flood and
+  audit-flood primitive. Five mutations watched red — watch never started, `HasServed` check dropped, cap
+  removed, `Echo` sanitiser bypassed (a `\n` in a jail-supplied op then reaches the log line), served
+  calls promoted to Information),**
   **`ShimPreApprovalTests` (defect C2 — the coordinator's ONLY tool was not pre-approved: a real
   claude-code coordinator ran its shim as its first action and got "This command requires approval", in a
   jail with no human to answer. Asserts what is GRANTED, not that a flag is present — a coordinator gets

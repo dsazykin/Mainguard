@@ -347,6 +347,22 @@
     per connection (`AgentIpcProtocol`); malformed input gets an error response. Each connection is served
     on its own task, which is what lets a worker's plan presentation **park on the socket for hours**
     without blocking the accept loop or another agent's request.
+    **It also says things out loud now (defect C3).** This class had NO logger at all, so three refused
+    connections from a live jail produced zero daemon-side entries and the outage was indistinguishable
+    from a model sitting idle. `ChannelObserver` is the one place that changed, and the split inside it is
+    the honest part: a REFUSED `connect()` is refused by the jail's own kernel and can never be logged
+    here, so its only daemon-side shadow is **silence** — an endpoint that has served nothing after
+    `DefaultFirstContactGrace` (90 s) reports itself ONCE, naming the agent, its role, its shim and both
+    framings, and logs again if contact later arrives so a recovered channel is never left described as
+    dead. An endpoint torn down inside the grace window says nothing. Malformed / oversize /
+    handler-thrown requests that DO arrive are logged at Warning and audited (`ipc_request_rejected`),
+    **capped** at five lines and ONE audit event per endpoint — the outbox is jail-writable, so an
+    uncapped warning-per-rejection would be a log-flood and audit-flood primitive handed to a sandbox.
+    Jail-supplied text (the `op`) is control-stripped and truncated before it reaches a line, and
+    everything a healthy channel does stays at Debug. Registered from the DI provider (not
+    instance-registered) so it gets the daemon's `ILoggerFactory` + `IAuditLog`, under the same
+    `Coordinator` category `AgentSpawnService` already logs this subsystem's endpoint lifecycle to.
+    Pinned by `AgentIpcObservabilityTests`.
   - **`Runtime/AgentPauseService.cs`** — the human per-agent Pause/Resume bodies behind
     `AgentService.PauseAgent`/`UnpauseAgent`, plus **`HumanPauseLedger`** (the `IPauseArbiter`
     singleton every repo's `YieldProtocol` consults). Not containment: no terminal lock, one agent.

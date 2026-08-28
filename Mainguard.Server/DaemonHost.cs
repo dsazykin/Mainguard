@@ -224,7 +224,16 @@ public static class DaemonHost
         builder.Services.AddSingleton(Terminal.TerminalEngineConfig.Resolve(options.TerminalEngine));
         builder.Services.AddSingleton<Runtime.AgentCliBinder>();
         // One endpoint per agent: the coordinator's spawn shim, and (phase 2) each worker's plan shim.
-        builder.Services.AddSingleton(new Runtime.AgentIpcServer(ResolveAgentIpcRoot(tokenPath)));
+        // Resolved from the provider rather than instance-registered so the channel gets the daemon's
+        // LOGGER and AUDIT CHAIN. It had neither, and that was a real outage: three refused connections
+        // from inside a jail produced ZERO daemon-side entries, so nothing could distinguish a dead
+        // control path from a model sitting idle. The Coordinator category is the one AgentSpawnService
+        // already logs this subsystem's endpoint lifecycle under, so one grep still follows the chain.
+        builder.Services.AddSingleton(sp => new Runtime.AgentIpcServer(
+            ResolveAgentIpcRoot(tokenPath),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
+                .CreateLogger(Logging.DaemonLogCategories.Coordinator),
+            sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>()));
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
         // The human-only resume path for a stranded merge-queue entry (AgentService.ResumeAgent). It
         // depends on the merge-queue registry registered by GatewayServiceRegistration below — DI resolves
