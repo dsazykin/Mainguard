@@ -404,7 +404,8 @@ public sealed class AdapterChannel
                         spec.Id, spec.Version, spec.Launch, spec.ApiKeyEnvVar, spec.EgressHosts,
                         spec.CredentialPaths, spec.BaseUrlEnvVar, spec.ModelHost, spec.SettingsPaths,
                         spec.InstructionsFile, spec.SystemPromptArg,
-                        spec.PreApprovedCommandArg, spec.PreApprovedCommandFormat)),
+                        spec.PreApprovedCommandArg, spec.PreApprovedCommandFormat,
+                        spec.InitialPromptStyle)),
                 ct).ConfigureAwait(false);
         }
 

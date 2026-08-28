@@ -509,3 +509,153 @@ the code", so this is the contract working as designed rather than a regression.
 coordinators producing briefs too vague for a worker to plan against, the fix is a better *brief*
 (operator-side), not a repository read — and if the owner ever concludes otherwise, that is a §3 change and
 their call.
+
+---
+
+## 8. The first turn — the deadlock a live run found, and the fix
+
+§4 said the live four-tool run was the one open item of contract §8 and that the loop should be treated as
+unproven until someone watched it. Someone watched it. It does not run.
+
+### 8.1 What was observed, and why it is a deadlock rather than a bug
+
+A worker jail launched `claude --append-system-prompt <worker operating instructions>` **and nothing
+else**. The CLI sat interactive with an empty input box, banner only. Six minutes later: outbox empty, no
+session transcript, `mainguard-plan` never run.
+
+The cause is one sentence of vendor behaviour that §7 of this document did not think to ask about: **a CLI
+does not act on a system prompt. It needs a user turn.** §1.2 and the change that added
+`AgentOperatingInstructions` fixed "nobody told the agent what it is". Nothing fixed "nobody ever asked it
+to start".
+
+What makes it a *deadlock* and not merely a slow start is the interaction with the two controls this
+branch is about:
+
+1. The task the worker would work on lives in the plan gate (phase 2 §2.2 — "the daemon never gives the
+   worker its task"), so there is nothing in the jail to react to.
+2. The only mechanism that delivers text to a worker's CLI is `AgentCliBinder.TrySendPromptAsync`, reached
+   only through `send_worker_prompt`, which is plan-gated. Verbatim, from a coordinator trying:
+   `<worker-id> has not presented a plan yet — no work is authorised.`
+3. A worker's terminal is input-locked daemon-side (P2-14/MG-5), so a human cannot rescue it either.
+
+So the worker could not present a plan without a first turn, and nothing could send it a first turn until
+it had presented a plan. **Phase 2's worker-authored-plan loop could not start once on a real CLI**, and
+neither phase noticed, because the end-to-end test drives `CoordinatorTools` — the in-process surface §1.1
+found is not wired to the shipped coordinator at all.
+
+Verified independently before anything was changed, and stated as measurements rather than as reasoning:
+
+| probe (real claude-code 2.1.250, outside Mainguard, under a real pty) | result |
+|---|---|
+| system prompt + `--allowedTools` grant, no turn | banner, empty input box; shim **never ran** in 60 s |
+| the same, plus the turn appended LAST | shim **never ran** in 90 s — see §8.3 |
+| the same, turn as the FIRST positional | ran `brief`, read the code, wrote a plan, ran `present` — unattended |
+
+### 8.2 The fix, and the invariant it rests on
+
+The first turn is delivered as a **launch argument**: `AgentKickoffPrompt.For(role, shimPath)`, placed on
+the launch line by `SandboxAgentLauncher.ApplyInitialPrompt`, declared per adapter as
+`initialPromptStyle` — the same shape as `systemPromptArg` and `preApprovedCommandArg` beside it, because
+this too is vendor knowledge.
+
+**The invariant relied on: the withheld thing is the TASK, and it stays withheld.** The kickoff text is a
+compile-time constant of `(role, shimPath)`. It has no task parameter, no title, no agent id, no
+coordinator id — look at the signature — so it cannot carry the work even by mistake, and a test asserts
+that structurally (by the parameter types, not by sampling today's strings, which would keep passing the
+day someone threads the task in). What the text *says* is "run `mainguard-plan brief`", which is exactly
+what phase 2 §2.2 already gives a worker up front: *"the worker gets a brief (the title — enough to know
+what part of the repo to inspect), never the task."*
+
+All four enforcement points from §2.2 are untouched and still answer no. A worker that follows the turn to
+the letter arrives at the gate and blocks, which is where phase 2 wanted it:
+
+- `TryReleaseTask` still requires `HasApprovedPlan` and still has no override parameter;
+- `send_worker_prompt` and `request_verification` are still refused at the gate;
+- `WorkerPlanGate` is still ANDed into every repo's merge queue as an `IMergeGate`.
+
+**Why not the two other candidates.**
+
+- *Write the turn into the worker's pty at spawn.* This creates a **second, ungated writer to an agent's
+  stdin**. The moment it exists it is capable of carrying the task, and only convention keeps it from
+  doing so — which is the exact reasoning §5 and MG-12 say not to accept. As a launch argument there is no
+  runtime delivery path at all: `TrySendPromptAsync` remains the only way to write to a worker's CLI,
+  still `internal`, still plan-gated.
+- *Let the plan gate permit an initial turn whose content is provably the brief.* This means adding a
+  bypass branch to the gate. Phase 2 §2.2 point 2 is explicit — *"There is no override parameter; an
+  override is how a gate becomes decorative"* — and an override that admits "provably the brief" is one
+  refactor away from admitting more. The chosen fix required **no change to `WorkerPlanGate` at all**,
+  which is the strongest form of "the gate was not weakened".
+
+**The coordinator deliberately gets no first turn**, and the asymmetry is a decision. Its terminal is not
+input-locked (only `AgentRoles.Managed` is), so a human *can* type into it — which is what makes the
+worker's missing turn a deadlock and the coordinator's merely a wait. And a coordinator's real first turn
+is the operator's request, which the daemon does not have and must not invent: a synthetic one would set a
+coordinator fanning out workers for work nobody asked for.
+
+### 8.3 The trap: the obvious spelling of this fix ships the fix and keeps the bug
+
+Every other field on this launch line is **appended**. Appending the turn does not work.
+`--allowedTools` is variadic (`<tools...>` in claude-code's own usage), so it swallows every positional
+that follows it: the turn becomes another tool pattern and the CLI idles exactly as it did with none.
+Measured, not reasoned — 90 seconds, shim never run.
+
+So the turn goes **first**, ahead of every flag the daemon appends, the wire value says so
+(`first-positional` rather than a truthful-but-useless `positional`), and `BuildLaunchArgv` is the single
+place that knows the order. `WorkerFirstTurnTests` asserts POSITION and not merely presence for this
+reason: with the turn appended last, the presence-only test stays **green** against a build that is still
+deadlocked (mutation K2 below).
+
+### 8.4 The mutation log
+
+Each enforcement was removed from a real build, the suite was run, the failure was watched, and the
+enforcement was restored.
+
+| # | enforcement removed | result |
+|---|---|---|
+| K1 | the first turn is never delivered (pre-change behaviour) | **3 failed** / 30 passed |
+| K2 | the turn appended LAST instead of first | **2 failed** / 31 passed |
+| K3 | the `ipcDirPath` gate on the turn | **2 failed** / 31 passed |
+| K4 | the role gate (a coordinator gets the worker's turn) | **1 + 1 failed** |
+| K5 | the `BadInitialPrompt` parse refusal | **4 failed** / 91 passed |
+| K6 | the field stops at the manifest (marker never carries it) | **0 failed — see below** |
+| K7 | the `brief` step deleted from the turn | **1 + 2 failed** |
+
+**K2 is the one worth reading.** `APlanGatedWorkerJail_IsLaunchedWithAFirstUserTurn` stayed **green**
+while the build was still deadlocked, because the turn was on the line — just where the CLI would never
+read it. That is why the ordering assertion is a separate test with its own reason written on it.
+
+**K6 found a real gap and is the reason this log is worth keeping.** Dropping `spec.InitialPromptStyle`
+from the marker `AdapterChannel` writes left **the entire suite green**: the manifest declared it, the
+spec carried it, the launcher honoured it, and no jail ever saw it, because the daemon reads the marker
+and not the manifest. That is phase 3's own M7 shape reproduced by accident — a correct builder nobody
+calls correctly — and it is now caught by
+`AdapterInitialPromptTests.TheInstallChannel_WritesTheFieldIntoTheMarkerTheDaemonReads`, driven through
+the real `AdapterChannel.EnsureAsync`. Re-run after adding it: **1 red.**
+
+### 8.5 Found and NOT fixed here — two further unattended stalls on the same loop
+
+Both were measured during the probes above, both are outside the defect this change is for, and each
+deserves its own reviewed change. Recorded so a reviewer does not inherit the impression that a live run
+is now guaranteed to work.
+
+- **The folder-trust dialog.** In a directory claude-code has not been trusted for, the CLI shows a
+  blocking "Is this a project you trust?" prompt **before** the banner, and the first turn does not run —
+  reproduced with the turn present and correctly positioned. Trust is recorded per project path in
+  `.claude.json`, which IS restored into the jail from the host store (`credentialPaths`), and the jail's
+  path is always `/workspace` — so a box whose stored `.claude.json` already trusts `/workspace` never
+  sees it, which is consistent with the live run reporting "banner only". A fresh install may not be so
+  lucky. The fix is to seed that trust in the restored config, which is a change to what the daemon writes
+  into an agent's home, not to a launch line.
+- **Nothing else stalls.** Worth stating because it was checked rather than assumed: writing the plan file
+  does NOT require a permission a jail cannot answer. In the unattended probe the CLI wrote its plan into
+  its own scratchpad and passed that path to `mainguard-plan present`, and the whole `brief` → read →
+  `present` loop completed with no human. The single `Bash(<shim>:*)` grant from defect C2 is sufficient.
+
+### 8.6 What this does and does not close of §4
+
+It does not perform the live four-tool acceptance run either — that still requires replacing the owner's
+installed daemon (§4). What it removes is the reason such a run could not have succeeded. The claim made
+here is narrower and stated exactly: **the launch line a worker jail receives now carries a first user
+turn, and a real claude-code driven with that line ran the full brief → inspect → present loop
+unattended.** What has still not been watched is that loop over the real daemon's socket, in a real jail,
+with a real human approving.

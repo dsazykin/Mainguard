@@ -165,6 +165,25 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     how a grant is spelled. A launch flag rather than a merge into `.claude/settings.local.json` on
     purpose: that file is harvested back into the per-repo host store, so a grant written there would be
     re-injected into every later jail for the repository, workers and untrusted PR heads included).
+    `AgentKickoffPrompt.cs` (**the FIRST USER TURN — the defect that stopped the loop starting at all**.
+    `Worker(shimPath)` / `For(role, shimPath)`, and a coordinator gets NULL. A vendor CLI does not act on
+    a system prompt: a live worker jail launched `claude --append-system-prompt <instructions>` and sat
+    at an empty input box — six minutes, empty outbox, no transcript, `mainguard-plan` never run — and
+    nothing could start it, because the only writer to a worker's CLI is the coordinator's
+    `send_worker_prompt`, which `WorkerPlanGate` refuses until a plan is approved. No first turn without
+    a plan; no plan without a first turn. The turn is a compile-time constant of `(role, shimPath)`:
+    there is no task/title/agent-id parameter, so it CANNOT carry the work, and what it says is "run
+    `mainguard-plan brief`" — the one thing phase 2 §2.2 gives a worker up front. Every gate is untouched
+    and still answers no. A coordinator gets none deliberately: its terminal is not input-locked, so a
+    human can type into it, and its real first turn is the operator's request, which the daemon does not
+    have and must not invent. Delivered by the third per-adapter field, `initialPromptStyle`
+    (`AdapterInitialPromptStyle`; claude-code: `first-positional`), rendered by
+    `SandboxAgentLauncher.BuildLaunchArgv` — which is the one place that knows the argv ORDER, because
+    the turn must precede every flag the daemon appends: measured against claude-code 2.1.250, appended
+    LAST it is swallowed by the variadic `--allowedTools <tools...>` and never reaches the model at all,
+    so the obvious spelling of this fix ships the fix and keeps the bug. Gated on `ipcDirPath` like the
+    pre-approval beside it, and an unreadable style is REFUSED at parse (`BadInitialPrompt`) rather than
+    defaulted, because degrading to "no first turn" is the deadlock).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one

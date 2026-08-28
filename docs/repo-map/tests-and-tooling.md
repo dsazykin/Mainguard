@@ -969,6 +969,25 @@
   `AdapterManifestError.BadPreApproval` — this is the only manifest field that grants EXECUTION inside a
   sandbox, so every degraded reading fails closed. Plus marker round-trip and the pre-field legacy marker.
   Mutations watched red: both refusals removed (4 red), and widening the shipped format to a wildcard.
+- **`Mainguard.Tests/AgentKickoffPromptTests.cs`** — the worker's FIRST USER TURN, and the boundary it
+  must not cross. A vendor CLI does not act on a system prompt: on a live run a worker jail launched
+  `claude --append-system-prompt <instructions>` and sat at an empty input box for six minutes with an
+  empty outbox, and nothing could start it (the only writer to a worker's CLI is the coordinator's
+  `send_worker_prompt`, refused until the plan it will never present is approved). Asserts the turn
+  exists and names `mainguard-plan brief`; that it is a PURE function of `(role, shimPath)` so it cannot
+  carry the task; that it says in as many words that the worker does not have the task; the MG-12 drift
+  pin (every op the turn names is one the worker's own shim serves, and never a coordinator op); and
+  that a COORDINATOR gets none — its terminal is not input-locked and its real first turn is the
+  operator's request. Mutations watched red: the role gate removed (1 red here, 1 in the daemon suite),
+  the `brief` step deleted (2 red).
+- **`Mainguard.Tests/AdapterInitialPromptTests.cs`** — the manifest half of the first turn:
+  `initialPromptStyle`, which only `claude-code` declares (`first-positional`; asserted that no other
+  shipped adapter does). Every unreadable spelling is REFUSED at parse with
+  `AdapterManifestError.BadInitialPrompt` rather than defaulted, because degrading to "no first turn" IS
+  the deadlock; an explicit `"none"` is legitimate; and the field survives the host/VM crossing —
+  driven through the real `AdapterChannel.EnsureAsync`, because **dropping it from the marker the
+  channel writes left the entire suite green** (phase 3's M7 shape: a correct launcher nobody calls
+  correctly). A pre-field marker and an unreadable one both degrade to "no turn" rather than throwing.
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
@@ -1771,6 +1790,17 @@
   is granted nothing at all. Reads the pair from the SHIPPED `adapters.starter.json` rather than retyping
   it, so it cannot pass against a declaration the product no longer makes. Two mutations watched red:
   dropping the `ipcDirPath` gate, and hardcoding the coordinator role into the granted shim path),**
+  **`WorkerFirstTurnTests` (the deadlock that stopped phase 2's loop from ever starting, and the one test
+  that would have caught it: a plan-gated worker's jail is launched WITH a first user turn. Asserts
+  POSITION and not merely presence, because the obvious fix does not work — appended last, the turn is
+  swallowed by the variadic `--allowedTools <tools...>` and never reaches the model, so a
+  presence-only test passes a build that is still deadlocked. Also: a coordinator jail gets no turn, a
+  jail with no IPC dir gets neither turn nor grant, an adapter declaring nothing launches
+  byte-identically, and — structurally, by reflection over the parameter types rather than by sampling
+  today's strings — nothing on the first-turn path can even be handed the withheld task. Mutations
+  watched red: no turn delivered (3 red), the turn appended last (2 red, with the presence-only test
+  staying green — the reason the ordering assertion exists), the `ipcDirPath` gate dropped (2 red), the
+  role gate removed (1 red)),**
   **`CoordinatorOutboxWiringTests` (the wiring half: on a substrate declaring
   `SupportsBindMountedUnixSockets: false`, the real spawn path hands the jail its outbox — the dir the
   daemon created, `AgentIpcPaths.OutboxIn` of it, existing on disk before the container would be. The

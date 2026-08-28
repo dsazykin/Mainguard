@@ -236,16 +236,10 @@ public sealed class SandboxAgentLauncher
         var instructions = AgentOperatingInstructions.For(
             instructionsRole, AgentIpcPaths.SandboxShimPath(instructionsRole));
 
-        if (launchCommand is { Count: > 0 } && adapter?.SystemPromptArg is { Length: > 0 } promptArg)
-        {
-            launchCommand = launchCommand.Append(promptArg).Append(instructions).ToList();
-        }
-
-        // Telling a CLI its shim exists is not the same as letting it run one. A real coordinator followed
-        // the instructions above exactly, ran its shim as its first action, and got "This command requires
-        // approval" — in a jail with no human to answer. Every tool the role has is that one command, so
-        // the whole feature stalled on its first action. This grants that command, and only that command.
-        launchCommand = ApplyShimPreApproval(launchCommand, adapter, ipcDirPath, instructionsRole);
+        // The launch line the jail's CLI is actually started with: the first turn, the instructions, and
+        // the one pre-approved command, assembled in ONE place because their ORDER is load-bearing (see
+        // BuildLaunchArgv).
+        launchCommand = BuildLaunchArgv(launchCommand, adapter, ipcDirPath, instructionsRole, instructions);
 
         // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
         //
@@ -854,6 +848,89 @@ public sealed class SandboxAgentLauncher
                 .Select(d => d.Path)
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
+
+    /// <summary>
+    /// Assembles the complete launch line a jailed CLI is started with — the first user turn, the role's
+    /// operating instructions, and the one pre-approved command — and is the <b>single place that knows
+    /// their order</b>, because the order is what makes the first turn arrive at all.
+    ///
+    /// <para><b>The turn goes FIRST, before every flag the daemon appends.</b> Measured against a real
+    /// claude-code 2.1.250, not assumed: appended last — the position every other field on this line uses
+    /// — the turn never reached the model, because <c>--allowedTools</c> is variadic
+    /// (<c>&lt;tools...&gt;</c>) and swallows every positional that follows it. The CLI idled at an empty
+    /// input box for the full probe, indistinguishable from having no turn at all. Placed first, the same
+    /// text ran the shim as its first action. Appending it here — the obvious implementation, and the one
+    /// this file's three neighbouring fields would have suggested — would therefore have shipped the fix
+    /// and kept the bug.</para>
+    ///
+    /// <para>Everything stays optional and silent: an adapter that declares no channel launches
+    /// byte-for-byte as it did before, and a CLI with no instruction or first-turn surface is a limitation
+    /// of that CLI rather than a spawn failure.</para>
+    /// </summary>
+    internal static IReadOnlyList<string>? BuildLaunchArgv(
+        IReadOnlyList<string>? launchCommand,
+        InstalledAdapterMarker? adapter,
+        string? ipcDirPath,
+        AgentIpcEndpointRole role,
+        string instructions)
+    {
+        launchCommand = ApplyInitialPrompt(launchCommand, adapter, ipcDirPath, role);
+
+        if (launchCommand is { Count: > 0 } && adapter?.SystemPromptArg is { Length: > 0 } promptArg)
+        {
+            launchCommand = launchCommand.Append(promptArg).Append(instructions).ToList();
+        }
+
+        // Telling a CLI its shim exists is not the same as letting it run one. A real coordinator followed
+        // the instructions above exactly, ran its shim as its first action, and got "This command requires
+        // approval" — in a jail with no human to answer. Every tool the role has is that one command, so
+        // the whole feature stalled on its first action. This grants that command, and only that command.
+        return ApplyShimPreApproval(launchCommand, adapter, ipcDirPath, role);
+    }
+
+    /// <summary>
+    /// Places the daemon's FIRST USER TURN on the launch line, as this CLI declares it takes one
+    /// (<see cref="InstalledAdapterMarker.InitialPromptStyle"/>). Returns
+    /// <paramref name="launchCommand"/> untouched whenever any part of that is absent.
+    ///
+    /// <para><b>The deadlock this closes.</b> A vendor CLI does not act on a system prompt — it needs a
+    /// user turn. A worker jail launched with only <c>--append-system-prompt</c> drew its banner and
+    /// waited: six minutes, empty outbox, no transcript, <c>mainguard-plan</c> never run. And no other
+    /// mechanism could start it, because the only writer to a worker's CLI is the coordinator's
+    /// <c>send_worker_prompt</c>, which <see cref="Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate"/>
+    /// refuses until that worker has an approved plan. No first turn, no plan; no plan, no first turn.</para>
+    ///
+    /// <para><b>This does not hand the worker its task.</b> The text comes from
+    /// <see cref="AgentKickoffPrompt"/>, a pure function of the role and the shim path — the task, the
+    /// title and the agent id are not parameters of it and are not in scope where it is built, so it
+    /// cannot carry the work even by accident. What it says is "ask the daemon what you are here to plan",
+    /// i.e. run the <c>brief</c> op, which is precisely what phase 2 gives a worker up front. Every gate
+    /// still answers no afterwards: the task is released only by <c>TryReleaseTask</c> on an approved
+    /// plan, steering and verification are still refused, and the plan gate is still ANDed into the merge
+    /// queue.</para>
+    ///
+    /// <para><b><paramref name="ipcDirPath"/> is the gate, for the same reason it gates the pre-approval.</b>
+    /// A jail with no IPC dir has no <c>mainguard-plan</c> in it, so a turn telling its CLI to run one
+    /// would spend a request to produce "command not found" and an agent with no idea what to do next.
+    /// That is every external-PR head and every manually spawned worker — none of which the plan gate
+    /// holds, and none of which is deadlocked, because nothing is being withheld from them.</para>
+    /// </summary>
+    internal static IReadOnlyList<string>? ApplyInitialPrompt(
+        IReadOnlyList<string>? launchCommand,
+        InstalledAdapterMarker? adapter,
+        string? ipcDirPath,
+        AgentIpcEndpointRole role)
+    {
+        if (launchCommand is not { Count: > 0 }
+            || string.IsNullOrEmpty(ipcDirPath)
+            || adapter?.InitialPromptDelivery != AdapterInitialPromptStyle.FirstPositional)
+        {
+            return launchCommand;
+        }
+
+        var turn = AgentKickoffPrompt.For(role, AgentIpcPaths.SandboxShimPath(role));
+        return turn is null ? launchCommand : launchCommand.Append(turn).ToList();
+    }
 
     /// <summary>
     /// Appends the ONE pre-approval this jail gets: the absolute in-jail path of the shim THIS agent's

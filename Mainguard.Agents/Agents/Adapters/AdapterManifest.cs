@@ -32,6 +32,13 @@ public enum AdapterManifestError
     /// other than the shim — possibly something much broader).</summary>
     BadPreApproval,
 
+    /// <summary>The <c>initialPromptStyle</c> names a delivery this build does not know. Its own code
+    /// because this field decides whether a jailed worker is ever asked to START: an unrecognised value
+    /// degrading to "no first turn" restores the exact deadlock the field exists to close — a CLI idling
+    /// at an empty input box, in a jail whose terminal is input-locked, forever. A refusal at parse is
+    /// loud; a degraded reading is a feature that looks wired and is not.</summary>
+    BadInitialPrompt,
+
     /// <summary>The <c>provenance</c> rung is absent or names a level this build does not know (MG-9).
     /// Its own code because "the maintainer forgot to say what origin assurance this CLI carries" is a
     /// different failure from a malformed field — and it must be a REFUSAL, not a default, or an
@@ -46,6 +53,34 @@ public sealed class AdapterManifestException : Exception
 
     public AdapterManifestException(AdapterManifestError error, string message)
         : base(message) => Error = error;
+}
+
+/// <summary>
+/// How a CLI accepts the <b>first user turn</b> the daemon starts it with — the turn without which a
+/// jailed worker sits at an empty input box and the phase-2 plan loop never begins.
+///
+/// <para>Vendor knowledge, declared per adapter exactly like <c>systemPromptArg</c> and
+/// <c>preApprovedCommandArg</c>, because only the CLI's own author knows how it takes one.</para>
+/// </summary>
+public enum AdapterInitialPromptStyle
+{
+    /// <summary>This CLI is not started with a first turn (the default, and every adapter that declares
+    /// nothing). Such an agent launches byte-identically to before.</summary>
+    None,
+
+    /// <summary>
+    /// The turn is a bare positional argument placed <b>first</b>, immediately after the CLI's own launch
+    /// argv and before every flag the daemon appends — <c>claude "&lt;turn&gt;" --append-system-prompt …</c>.
+    ///
+    /// <para><b>"First" is the load-bearing half of the name, measured rather than assumed.</b> Against a
+    /// real claude-code 2.1.250, the same turn appended LAST — the position every other field on this
+    /// launch line uses — never reached the model at all: <c>--allowedTools</c> is variadic
+    /// (<c>&lt;tools...&gt;</c>), so it swallows every following positional, and the CLI idled at an empty
+    /// input box for the full 90-second probe exactly as it does with no turn. Placed first, the same
+    /// text ran the shim on the first action. A style that says only "positional" would therefore be a
+    /// declaration that is true and still does not work.</para>
+    /// </summary>
+    FirstPositional,
 }
 
 /// <summary>A file written into the VM before the health probe (e.g. a non-interactive config so the
@@ -207,6 +242,24 @@ public sealed record AdapterSpec(
     /// field could widen a jail's capability rather than narrow it.</para>
     /// </summary>
     [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null,
+    /// <summary>
+    /// How THIS CLI takes the daemon's <b>first user turn</b> — the wire spelling of
+    /// <see cref="AdapterInitialPromptStyle"/> (<c>"first-positional"</c> for claude-code). Absent or
+    /// <c>"none"</c> = this CLI is started with no first turn, exactly as before.
+    ///
+    /// <para><b>Why this exists.</b> A vendor CLI does not act on a system prompt. Started with the
+    /// operating instructions and nothing else, claude-code renders its banner and waits at an empty
+    /// input box — so a jailed worker never ran its shim, never presented a plan, and could never be sent
+    /// a first turn either, because <c>send_worker_prompt</c> is refused until a plan is approved. The
+    /// loop could not start once. This field is the channel that starts it.</para>
+    ///
+    /// <para><b>What it may carry, and nothing else.</b> The daemon renders the turn itself
+    /// (<see cref="Ipc.AgentKickoffPrompt"/>) from the agent's ROLE and its shim path — nothing in a
+    /// manifest names or influences the text, so a manifest edit can change how a turn is delivered but
+    /// never what it says. The task the worker was spawned for is not in scope at the point the text is
+    /// built and stays where phase 2 put it: behind the plan gate.</para>
+    /// </summary>
+    [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
@@ -220,6 +273,15 @@ public sealed record AdapterSpec(
     /// nothing, rather than to anything that would read as verified.</summary>
     public AdapterProvenanceLevel ProvenanceLevel =>
         AdapterManifest.TryParseProvenance(Provenance, out var level) ? level : AdapterProvenanceLevel.None;
+
+    /// <summary>The parsed <see cref="InitialPromptStyle"/>. Only ever reached after
+    /// <see cref="AdapterManifest.Parse"/> refused every unrecognised spelling, so a miss here means the
+    /// adapter declared nothing — which is <see cref="AdapterInitialPromptStyle.None"/>, the reading that
+    /// changes no launch line.</summary>
+    public AdapterInitialPromptStyle InitialPromptDelivery =>
+        AdapterManifest.TryParseInitialPromptStyle(InitialPromptStyle, out var style)
+            ? style
+            : AdapterInitialPromptStyle.None;
 }
 
 /// <summary>The <c>adapters.json</c> channel manifest: the full set of pinned agent CLIs.
@@ -347,6 +409,18 @@ public sealed record AdapterManifest(
                     + "own in-jail path there; without it the CLI would be handed a fixed grant naming "
                     + "something other than this agent's shim.");
 
+            // The first-turn delivery. Refused rather than defaulted for the same reason the pair above
+            // is: a declaration this build cannot read must not quietly become "no first turn", because
+            // that is the deadlock — a worker idling at an empty input box in a jail whose terminal is
+            // input-locked, with the coordinator's only steering tool refused until it presents the plan
+            // it will never present. An unreadable value is a manifest bug and says so at parse.
+            if (a.InitialPromptStyle is not null
+                && !TryParseInitialPromptStyle(a.InitialPromptStyle, out _))
+                throw new AdapterManifestException(AdapterManifestError.BadInitialPrompt,
+                    $"Adapter '{a.Id}' initialPromptStyle '{a.InitialPromptStyle}' is not a delivery this "
+                    + "build knows. Use 'first-positional' (the turn is a bare positional argument placed "
+                    + "before every flag the daemon appends) or 'none'.");
+
             if (a.Launch is not null && (a.Launch.Count == 0 || a.Launch.Any(string.IsNullOrWhiteSpace)))
                 throw new AdapterManifestException(AdapterManifestError.MissingField,
                     $"Adapter '{a.Id}' has an empty 'launch' command.");
@@ -456,6 +530,25 @@ public sealed record AdapterManifest(
     {
         level = AdapterProvenanceLevel.None;
         return value is not null && ProvenanceNames.TryGetValue(value, out level);
+    }
+
+    /// <summary>The wire spellings of <see cref="AdapterInitialPromptStyle"/>. Ordinal and exact, for the
+    /// same reason as the provenance rungs: a fuzzy match would let a typo become a different
+    /// behaviour.</summary>
+    private static readonly IReadOnlyDictionary<string, AdapterInitialPromptStyle> InitialPromptStyleNames =
+        new Dictionary<string, AdapterInitialPromptStyle>(StringComparer.Ordinal)
+        {
+            ["first-positional"] = AdapterInitialPromptStyle.FirstPositional,
+            ["none"] = AdapterInitialPromptStyle.None,
+        };
+
+    /// <summary>Maps a manifest <c>initialPromptStyle</c> string to its delivery. False for anything
+    /// unrecognised — including null, which the caller reads as "not declared" rather than as a
+    /// refusal.</summary>
+    public static bool TryParseInitialPromptStyle(string? value, out AdapterInitialPromptStyle style)
+    {
+        style = AdapterInitialPromptStyle.None;
+        return value is not null && InitialPromptStyleNames.TryGetValue(value, out style);
     }
 
     /// <summary>A version is pinned iff it is concrete: has a digit, and carries no range/wildcard/tag.</summary>

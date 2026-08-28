@@ -470,7 +470,16 @@
   launch argv of the CLI the user dynamically installed (returned on
   `SandboxLaunchResult.LaunchCommand`), and passes `AdaptersRootPath` so the jail bind-mounts the
   shared CLI root read-only whenever any CLI is installed. An unknown kind still spawns a correct jail
-  with no launch command rather than failing the spawn. **v1 spawn preflight (field failure
+  with no launch command rather than failing the spawn. **`BuildLaunchArgv` is the one place that knows
+  the launch line's ORDER** — `ApplyInitialPrompt` (the worker's first user turn,
+  `AgentKickoffPrompt`) FIRST, then the role's operating instructions on `systemPromptArg`, then
+  `ApplyShimPreApproval`'s single grant. The order is the fix, not a style choice: measured against
+  claude-code 2.1.250, a turn appended last is swallowed by the variadic `--allowedTools <tools...>`
+  and never reaches the model, so the CLI idles at an empty input box exactly as it did with no turn —
+  which is the deadlock that stopped phase 2's plan loop from ever starting (a worker cannot present a
+  plan without a first turn, and `send_worker_prompt` is refused until it has). All three channels are
+  gated on `ipcDirPath` + the adapter's own declaration, so a jail with no shim, and every CLI that
+  declares nothing, launches byte-identically to before. **v1 spawn preflight (field failure
   2026-07-17, twice):** before any worktree/jail work it verifies BOTH jail images present AND current
   — `ISandboxEngine.ImageExistsAsync` for presence, then `ISandboxEngine.ImageVersionAsync` (Docker
   `Config.Labels["mainguard.image.version"]`) vs `SandboxImageVersions.For(ref)` for staleness

@@ -63,8 +63,23 @@ public sealed record InstalledAdapterMarker(
     /// <summary>How this CLI spells one pre-approved command (see
     /// <see cref="AdapterSpec.PreApprovedCommandFormat"/>) — a template containing
     /// <see cref="AdapterManifest.PreApprovedCommandPlaceholder"/>. Null on older markers.</summary>
-    [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null)
+    [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null,
+    /// <summary>How this CLI takes the daemon's FIRST USER TURN (see
+    /// <see cref="AdapterSpec.InitialPromptStyle"/>). Carried across the host/VM boundary because the
+    /// daemon reads the MARKER, not the manifest — a field that stopped at the manifest would leave every
+    /// worker jail launching with no first turn, which is the deadlock this field exists to close. Null
+    /// on markers written before this field existed; re-install the CLI to backfill it, and until then
+    /// those jails behave exactly as they did before.</summary>
+    [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null)
 {
+    /// <summary>The parsed <see cref="InitialPromptStyle"/>; <see cref="AdapterInitialPromptStyle.None"/>
+    /// for an older marker or an unreadable spelling. Unlike the manifest, a marker cannot refuse — it is
+    /// already on disk — so the safe reading here is the one that changes no launch line.</summary>
+    public AdapterInitialPromptStyle InitialPromptDelivery =>
+        AdapterManifest.TryParseInitialPromptStyle(InitialPromptStyle, out var style)
+            ? style
+            : AdapterInitialPromptStyle.None;
+
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 
     public string SerializeInstance() => JsonSerializer.Serialize(this, Options);
