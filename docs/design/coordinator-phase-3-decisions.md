@@ -995,3 +995,182 @@ likes.
   session in a fresh repository restores nothing. If edits also stall on approval, the fix is the same
   shape as this one and is a separate, reviewable change.
 - **§8.5's folder-trust dialog is still open.**
+
+## 12. The first end-to-end run's next two defects (F1, F2)
+
+§11 got a worker to commit. The very next run got the commit all the way to `Verified` — and then threw
+it away.
+
+### 12.1 F1 — stopping a worker DESTROYED the commit that had just been verified
+
+Observed, then reproduced against real git before anything was changed:
+
+```
+commit 34adf55 on agent/25e17f73…  → published to the mirror
+                                    → auto-verification PASSED
+                                    → merge-queue row Verified, primary CTA "Review"
+git log refs/heads/agent/25e17f73…  → 34adf55
+StopAgent                           → RemoveAgentWorktree(force: true) → `branch -D agent/<id>`
+                                    → MirrorMaintenance.AfterAgentDetached prunes unreachable objects
+git log refs/heads/agent/25e17f73…  → fatal: ambiguous argument … unknown revision
+```
+
+The commit is dangling and gc-eligible. The row still says `Verified` and still offers `Review` on a
+branch that no longer exists, and `AgentResumeService` — the "resume the entry" affordance the queue rail
+offers a stranded row — refuses it with `AgentBranchMissingException`, because there is nothing to adopt.
+
+**The lifecycle deleted its own output.** `AgentOperatingInstructions.Worker` tells a worker to commit,
+report and stop. §11's `commit_work` made the commit possible; the stop those same instructions ask for is
+what removed it.
+
+**The boundary: a measurement, not a memory.** `branch -D` may run only when it destroys nothing, and that
+question has one exact answer — is this branch's tip already contained in the mirror's own integration
+branch? If yes, every object it names is reachable from main and the delete removes a name. If no, the ref
+is the only name for at least one commit.
+
+Asked as `AgentRefMediator.MayReap` → `AgentBranchReapVerdict`, and asked there because that class already
+owns both halves of the arithmetic: rule 2's `merge-base --is-ancestor`, and rule 4's "the mirror's OWN
+default branch, never the literal `main`". A second copy of either is how one of them becomes decorative.
+`Undecidable` (git could not answer) refuses the delete: this value gates a destructive operation, so the
+unknown answer is "no" — and the failure mode being prevented is a probe that errors and reads as
+"contained in main", which would delete on exactly the repositories git is unhappy with.
+
+**Why not the merge queue's state, which was the obvious answer.** Because `Working` is the queue's state
+for BOTH an agent that never committed and one that committed a second ago: the readiness trigger fires on
+`AgentRefWatcher.Advanced`, which happens on the watcher's own clock, and §11.2 already states the
+consequence — "a worker that never commits is indistinguishable, to every mechanism downstream, from one
+that did nothing." A rule keyed on the queue would therefore go on destroying work for the whole window
+between the commit and the verification, which is the widest window in the loop. Queue state records a
+decision that was taken; the git fact records what exists, and only the second can answer "will this delete
+lose a commit". (`MergeQueue`, `MergeQueueProvisioner` and `AgentRefMediator` were all read for this; the
+mediator is the one that can decide.)
+
+**"No residue" is not deleted, it is scoped to what it was written about.** The rule exists because a
+mirror that accumulates a ref per agent forever can never be pruned — MG-3 §4 only deletes unreachable
+objects, and a live ref makes them reachable. That argument applies in full to a branch that never left the
+base commit: every coordinator, every failed spawn, every worker that did nothing. Those are still reaped.
+It does not apply to a branch carrying a commit, where the ref is not residue but the only name for work.
+And a branch becomes reapable again the moment its work reaches main, so the ordinary lifecycle still
+cleans up after itself — `Teardown_ReapsABranchOnceItsWorkIsContainedInMain`.
+
+**A kept branch is not silent**: a warning through the same sink MG-3's refusals use, plus the G-17
+`agent_branch_kept` event carrying the sha, the outcome and the reason. An operator who stops an agent and
+finds a branch left behind can find out why.
+
+**The one deletion taken on a caller's word: `DiscardAgentBranch`.** The external-PR intake's
+`ReleaseWorkerAsync` runs when a pull request closed upstream or a human discarded its entry, and there the
+new rule is wrong twice over — those commits were fetched FROM the pull request and still live there, and
+`pr-<n>` is a REUSED id, so a kept branch makes the next intake of that number collide with
+`CreateAgentWorktree`'s duplicate refusal on every poll, forever. Shipping F1 without this would have
+traded a data-loss bug for a silent, permanent intake failure. It is a separate, named method rather than a
+`force` flag, audited with the sha it removed, and it is the only path that deletes work without first
+proving the delete is free. The release path's early `return` after a successful stop was removed in the
+same change: a discard behind it would have been unreachable on exactly the case it exists for.
+
+**Blast radius.** Three production callers reach `RemoveAgentWorktree` and all three improve:
+`SandboxAgentLauncher.TeardownAsync` (the stop — F1 itself), `SwarmReconciler` (a jail whose container
+vanished — its entry becomes genuinely resumable rather than only nominally so), and
+`RepoSyncGrpcService.RemoveWorktree` (the operator asked to remove a *worktree*, not to delete a branch).
+
+### 12.2 F2 — the coordinator could never be told the job finished
+
+After the branch reached `Verified`, the coordinator reported: *"Worker 25e17f73 (claude-code) — Working …
+it's past the pre-plan stage and actively working."* `ListAgents` agreed (`state=Working`).
+
+It was not wrong about what it could see. `AgentSession.State` is a **liveness** word, written once by
+`AttachSandbox`, and nothing in the session's own world ever learns that a branch verified. Contract §3's
+`get_worker_status` is the coordinator's only window onto its fan-out, so a status that cannot ever say
+"done" makes a coordinator structurally unable to report the completion of its own work.
+
+**The honest states are the ones the queue already has**, and the transition belongs where the state
+actually moves: `MergeQueue.SetStateLocked`, surfaced as an `onStateChanged(agentId, newState)` seam that
+`MergeQueueProvisioner` wires to the SAME `IAgentSupervisor` its keep-alive `MarkRunState` already writes
+through. No parallel state machine: the words are `WorkerMergeState`'s own, the queue remains the only
+thing that decides them, and each carries the sentence a human reads ("Verified against the current main —
+waiting for a human to review and merge it").
+
+The session store already treats those words as first class, and says so: `AgentSessionReconciler`'s drift
+pass corrects **only the pause axis**, refusing to flatten "orchestration meaning the container cannot know
+— RateLimited, Yielding, AwaitingReview" back to `Working`. `AwaitingReview` is a `WorkerMergeState`. This
+change is the writer that member was already written for.
+
+Three properties, each with a test rather than a comment:
+
+- it fires on REAL moves only (a `EnsureEntry` row write moves nothing and reports nothing) — a
+  notification for a transition that did not happen describes something other than the state machine;
+- it carries the agent id, so two workers under one coordinator cannot be told each other's outcome;
+- **it can never damage a transition.** The row is persisted before the sink runs, so an exception escaping
+  would leave the store and memory disagreeing about a branch's merge eligibility. A throwing sink is
+  driven directly (`AThrowingStateSink_CannotBreakATransition`) rather than assumed.
+
+The paired negative is the one that matters most: a RED verification returns the entry to `Working` and
+must never report `Verified`. A status that can say "done" is only worth anything if it declines to.
+
+**Called under the queue's lock, deliberately.** The alternative — deferring to the ~15 sites that raise
+`Changed` outside it — is a second, hand-maintained list of transition points, and the one that gets
+forgotten is the one that silently stops reporting. The sink is a bounded, non-blocking in-memory write
+(`AgentSessionStore.MarkState` → `TryWrite`), strictly cheaper than the SQLite `Save` the same method
+already performs under the same lock, and nothing in the session store ever calls back into a queue.
+
+### 12.3 The ~20 pre-existing dead rows: a coherent story, and no migration
+
+They are the branch-never-moved case. A worker that never committed left `agent/<id>` pointing exactly at
+the base commit, so the old unconditional `branch -D` and the new conditional one do the same thing to it —
+it is reaped, correctly, and there was never anything on it to lose. Those rows are honest: no work is
+recoverable, `Resume` correctly refuses ("that branch no longer exists — discard the entry instead"), and
+`Discard` is the right action, which the queue already reaches from every non-terminal state.
+
+So: **no migration, and none is possible for anything else.** If any of those rows *did* once carry a
+commit, its objects were pruned by `AfterAgentDetached` on the same teardown; nothing in a database brings
+back a git object that is not on disk. What the fix buys is that no NEW row of that shape hides destroyed
+work — and `WhenTheBranchIsGoneToo_ResumeRefusesAndNamesIt_AndBuildsNoJail` now constructs that exact state
+the way it really arose (stop an agent that never committed) instead of the way it used to (stop an agent
+that had).
+
+### 12.4 The mutation log
+
+Every guard was removed, the suite watched failing, and the file **touched** on restore — a `mv`-style
+restore preserves the original mtime, MSBuild then skips the rebuild, and the next run tests the MUTATED
+binary and reports green. §11.2 recorded that trap; every number below was measured with a touching
+restore, and the whole set was re-run green afterwards from a clean tree.
+
+| # | enforcement removed | result |
+|---|---|---|
+| N1 | `branch -D` unconditional again (the pre-change behaviour) | **4 failed** / 18 passed |
+| N2 | `Undecidable` counts as permission to delete | **1 failed** / 21 passed |
+| N3 | the reap dropped entirely — nothing is ever deleted ("no residue" gone) | **3 failed** / 19 passed |
+| N4 | a kept branch leaves no `agent_branch_kept` audit event | **1 failed** / 21 passed |
+| N4b | the kept-branch warning no longer names the branch it kept | **1 failed** / 21 passed |
+| N5 | `DiscardAgentBranch` refuses a branch that carries work | **1 failed** / 42 passed |
+| N6 | the intake's release stops discarding the branch | **2 failed** / 19 passed |
+| N7 | the intake's release keeps its early `return` after a successful stop | **1 failed** / 20 passed |
+| N8 | `onStateChanged` is not passed to the queue at all | **2 failed** / 28 passed |
+| N9 | the notice fires on every row write, not only on a real transition | **1 failed** / 35 passed |
+| N10 | the state sink is unguarded, so a throwing sink aborts the transition | **1 failed** / 35 passed |
+| N11 | a FAILED verification is reported as `Verified` | **1 failed** / 29 passed |
+
+**One mutation survived and was replaced, which is worth recording.** The first N4 spelling gated the audit
+on `Outcome != CarriesWork` — but `CarriesWork` is the only outcome the test reaches that line with, so the
+guard was a no-op and the suite stayed green. That is a defect in the mutation, not evidence about the
+code: a mutation has to change behaviour on the path the test actually walks, or its green says nothing.
+Re-spelled as an unconditional early return, it went red.
+
+### 12.5 Deliberately left
+
+- **`MirrorMaintenance` is unchanged.** A kept branch makes its objects reachable, so the prune two lines
+  later has nothing to take. The size guard already surfaces a mirror that grows, and the natural
+  reclamation is 12.1's "a branch becomes reapable once main carries it" rather than a new sweeper.
+- **The teardown still does not commit a dirty worktree** — unchanged from §11.2's recorded decision. A
+  human's Stop means stop. What changed is that a worker which DID commit no longer loses the commit.
+- **A stopped worker leaves the coordinator's fan-out entirely** (the session record is removed), so
+  `get_worker_status` answers "no worker '<id>'" rather than a terminal state. F2 fixes the reported defect
+  — a LIVE worker whose branch verified — and this is a different, larger question about how long a
+  coordinator can see a finished worker. It needs the session record to outlive the jail, which is a
+  lifecycle change, not a reporting one.
+- **`QueueEntryResumeDockerTests` is intermittently red in the FULL `RequiresDocker` run** (3 of 5 passes
+  green; the two reds named *different* tests in that class, and the class is green every time it is run on
+  its own). This is the docker-suite ordering flake `e42ebea8` and `9f629dc2` both recorded and neither
+  diagnosed. This change made it likelier by adding a third jail-spawning test to the class, then less
+  likely again by having each test stop the jail it leaves running — the class's own cleanup runs only
+  after every test in it, so a jail left standing competes with the next spawn for admission headroom and
+  the bridge pool. Reported as still-open rather than as fixed.

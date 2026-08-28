@@ -43,9 +43,15 @@ namespace Mainguard.Server.Tests.Agents;
 ///
 /// <para><b>How the stranding is constructed.</b> The container is removed through the engine and the
 /// daemon's session record is dropped, which is the state a VM stop or a daemon crash leaves: no jail, no
-/// session, worktree and <c>agent/&lt;id&gt;</c> still on disk, queue entry still persisted. Deliberately
-/// NOT the <c>StopAgent</c> RPC — a clean stop deletes the branch, so it produces a different (and
-/// genuinely unrecoverable) state, which the branch-is-gone case asserts separately.</para>
+/// session, worktree and <c>agent/&lt;id&gt;</c> still on disk, queue entry still persisted.</para>
+///
+/// <para><b>A clean <c>StopAgent</c> now reaches the same recoverable state, and that is F1.</b> The
+/// teardown used to end in <c>branch -D</c> unconditionally, so the documented end of a worker's life
+/// (commit, report, stop) destroyed the commit it had just published and verified — while the queue row
+/// went on saying <c>Verified</c> and offering Review on a branch that no longer existed. A stop may now
+/// reap only a branch that carries nothing main does not already have. Both halves are asserted below:
+/// a stop AFTER a commit keeps the branch and the entry stays resumable, and a stop with nothing on the
+/// branch still leaves no residue — which is how the ~20 dead rows in the owner's queue got there.</para>
 /// </summary>
 [Trait("Category", "RequiresDocker")]
 [Collection(DockerSuiteCollection.Name)]
@@ -136,22 +142,69 @@ public sealed class QueueEntryResumeDockerTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// The branch-is-gone case, honestly. A clean <c>StopAgent</c> deletes <c>agent/&lt;id&gt;</c> with the
-    /// worktree, so there is nothing left to resume — and the one behaviour that would be worse than the
-    /// refusal is a jail started on a fresh empty branch under the old name, reported as success.
+    /// <b>F1, against a real jail.</b> A worker commits and is then stopped — the documented end of its
+    /// lifecycle. The teardown must not be what destroys its output: the branch survives at the tip, and
+    /// the entry the queue still holds is still resumable, reviewable and mergeable.
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ACleanStopAfterACommit_KeepsTheBranch_AndTheEntryIsStillResumable()
+    {
+        await using var world = await ResumeWorld.BuildAsync(this);
+
+        var agent = await world.SpawnJailedAgentAsync();
+        var tip = world.Commit(agent, "src/calc.js",
+            FixtureRepo.CalcJs + "exports.sub = (a, b) => a - b;\n", "feat: subtraction");
+        await world.WaitForQueueProjectionAsync(agent.Id);
+
+        await world.AgentRpc.StopAgentAsync(new StopAgentRequest { AgentId = agent.Id }, world.Headers);
+
+        // The jail and its worktree are gone — this is still a teardown…
+        Assert.Null(world.SessionFor(agent.Id));
+        Assert.False(Directory.Exists(agent.WorktreePath));
+
+        // …and the commit is not. The ref still names it and the object is still there, which is what the
+        // queue row's Review action, the human's merge and a resume all depend on.
+        Assert.Contains(agent.Id, world.Queue.Agents);
+        Assert.Equal(tip, world.Git(world.MirrorPath, "rev-parse", "refs/heads/agent/" + agent.Id));
+        Assert.Equal("commit", world.Git(world.MirrorPath, "cat-file", "-t", tip));
+
+        // Proven by using it: the entry resumes onto its own branch with the work present.
+        var resumed = await world.ResumeAsync(agent.Id);
+        Assert.True(resumed.Resumed, resumed.Reason);
+        Assert.Equal("agent/" + agent.Id, resumed.Branch);
+        Assert.Equal(tip, world.Git(agent.WorktreePath, "rev-parse", "HEAD"));
+        Assert.Contains("exports.sub", File.ReadAllText(Path.Combine(agent.WorktreePath, "src", "calc.js")));
+
+        // Leave this box as this test found it. The class's own cleanup only runs after EVERY test in it,
+        // so a jail left standing here is a jail the NEXT test's spawn competes with for the admission
+        // controller's memory headroom and the bridge pool — which is how a Docker suite acquires an
+        // ordering flake. The branch is deliberately left: that is the fix under test.
+        await world.AgentRpc.StopAgentAsync(new StopAgentRequest { AgentId = agent.Id }, world.Headers);
+    }
+
+    /// <summary>
+    /// The other half of the boundary: an agent stopped with NOTHING on its branch still leaves no
+    /// residue, and the resume that finds no branch refuses honestly rather than starting a jail on a
+    /// fresh empty branch under the old name and reporting success.
+    ///
+    /// <para>This is the shape of the ~20 dead rows the first end-to-end run left behind: the worker never
+    /// committed, so <c>agent/&lt;id&gt;</c> named exactly what main already had, and the teardown reaped
+    /// it — correctly. Those rows have no work to recover, and Discard is the honest action on them.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task WhenTheBranchIsGoneToo_ResumeRefusesAndNamesIt_AndBuildsNoJail()
     {
         await using var world = await ResumeWorld.BuildAsync(this);
 
+        // No commit: the branch is created off main and published there, and never moves.
         var agent = await world.SpawnJailedAgentAsync();
-        world.Commit(agent, "src/calc.js",
-            FixtureRepo.CalcJs + "exports.sub = (a, b) => a - b;\n", "feat: subtraction");
-        await world.WaitForQueueProjectionAsync(agent.Id);
+        Assert.Contains(agent.Id, world.Queue.Agents);
+        Assert.Equal(0, world.GitCode(world.MirrorPath, "rev-parse", "--verify", "--quiet",
+            "refs/heads/agent/" + agent.Id));
 
-        // The clean stop: jail, worktree AND branch. The queue entry survives it, as it always has — which
-        // is the whole reason a stranded entry exists to be acted on at all.
+        // The clean stop: jail, worktree AND — because there is nothing on it to lose — the branch. The
+        // queue entry survives it, as it always has, which is the whole reason a stranded entry exists to
+        // be acted on at all.
         await world.AgentRpc.StopAgentAsync(new StopAgentRequest { AgentId = agent.Id }, world.Headers);
         Assert.Contains(agent.Id, world.Queue.Agents);
         Assert.NotEqual(0, world.GitCode(world.MirrorPath, "rev-parse", "--verify", "--quiet",

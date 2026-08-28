@@ -88,6 +88,66 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.Equal(new[] { "npm", "test" }, engine.LastCommand);
     }
 
+    // ---- F2: the branch's merge state, reported back onto the agent ------
+    //
+    // A coordinator's ONLY window onto its fan-out is `get_worker_status` (contract §3), which reads the
+    // agent session's state word. That word was written once, by the sandbox attach ("Working"), and no
+    // merge outcome ever moved it — so a coordinator whose worker had committed, verified green and
+    // reached `Verified` still reported "Working ... actively working", permanently. A status that cannot
+    // ever say "done" makes a coordinator structurally unable to report the completion of its own work.
+
+    /// <summary>
+    /// The whole point: a green run reaches the AGENT, in the queue's own words, in order.
+    /// </summary>
+    [Fact]
+    public async Task AGreenVerification_ReportsVerifying_ThenVerified_OnTheAgentItself()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var supervisor = new RecordingSupervisor();
+        var ctx = NewRebasingProvisioner(out _, _ => ContainerId, supervisor).EnsureQueue(repoHash)!;
+
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.True(record.Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        // Both transitions, in the order the state machine made them — not just the final word. A report
+        // that only ever lands on the terminal state cannot tell a coordinator that anything is happening.
+        Assert.Equal(
+            new[] { nameof(WorkerMergeState.Verifying), nameof(WorkerMergeState.Verified) },
+            supervisor.Marks.Where(m => m.Agent == AgentId).Select(m => m.State).ToArray());
+
+        // …and it carries the sentence a human reads, which is what makes the state actionable rather
+        // than a word to look up.
+        var verified = supervisor.Marks.Last(m => m.State == nameof(WorkerMergeState.Verified));
+        Assert.Contains("waiting for a human to review", verified.Reason);
+    }
+
+    /// <summary>
+    /// The paired negative, and the one that matters most: a RED run must not tell a coordinator its
+    /// worker is done. The queue returns the entry to <c>Working</c>, and that is what the agent says.
+    /// </summary>
+    [Fact]
+    public async Task AFailedVerification_NeverReportsVerified_AndReturnsTheAgentToWorking()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var supervisor = new RecordingSupervisor();
+        var ctx = NewRebasingProvisioner(out _, _ => ContainerId, supervisor, exitCode: 1)
+            .EnsureQueue(repoHash)!;
+
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.False(record.Passed);
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
+
+        Assert.DoesNotContain(supervisor.Marks, m => m.State == nameof(WorkerMergeState.Verified));
+        Assert.Equal(
+            new[] { nameof(WorkerMergeState.Verifying), nameof(WorkerMergeState.Working) },
+            supervisor.Marks.Where(m => m.Agent == AgentId).Select(m => m.State).ToArray());
+    }
+
     [Fact]
     public async Task AFailingRealExit_LeavesTheBranchUnmergeable()
     {
@@ -767,7 +827,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
 
         var states = new List<(string Agent, string State)>();
-        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId, states: states);
+        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId, supervisor: new RecordingSupervisor(states));
         var ctx = provisioner.EnsureQueue(repoHash)!;
 
         await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
@@ -827,9 +887,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// <param name="jailFor">agentId → its live jail, or null when the agent has been stopped.</param>
     private MergeQueueProvisioner NewRebasingProvisioner(
         out FakeSandboxEngine engine, Func<string, string?> jailFor,
-        List<(string Agent, string State)>? states = null)
+        RecordingSupervisor? supervisor = null, int exitCode = 0)
     {
-        var sandbox = new FakeSandboxEngine(exitCode: 0);
+        var sandbox = new FakeSandboxEngine(exitCode);
         engine = sandbox;
         var vmRoot = _vmRoot;
         return new MergeQueueProvisioner(
@@ -857,7 +917,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             locateAgentWorktree: (repoHash, agentId) => new WorktreeManager(vmRoot).WorktreePathFor(repoHash, agentId),
             publishRebasedAgentRef: (repoHash, agentId) =>
                 new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId),
-            agentStates: states is null ? null : new RecordingSupervisor(states));
+            agentStates: supervisor);
     }
 
     /// <summary>Lands the agent's work on the agent branch, exactly as <see cref="CommitOnAgentBranch"/>
@@ -870,12 +930,18 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             $"{agentId}'s actual work");
     }
 
-    /// <summary>Records every run state the keep-alive cycle reflects on an agent.</summary>
+    /// <summary>Records every state the daemon reflects on an agent — the keep-alive cycle's run states
+    /// and the merge queue's own, which are the two things a coordinator's <c>get_worker_status</c> can
+    /// see. The reason is kept because it is what a human reads.</summary>
     private sealed class RecordingSupervisor : IAgentSupervisor
     {
         private readonly List<(string Agent, string State)> _states;
 
-        public RecordingSupervisor(List<(string Agent, string State)> states) => _states = states;
+        public RecordingSupervisor(List<(string Agent, string State)>? states = null)
+            => _states = states ?? new List<(string Agent, string State)>();
+
+        /// <summary>Every mark, with its reason, in order.</summary>
+        public List<(string Agent, string State, string? Reason)> Marks { get; } = new();
 
         public void PauseInput(string agentId) { }
 
@@ -883,7 +949,11 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         public void MarkState(string agentId, string state, string? reason)
         {
-            lock (_states) { _states.Add((agentId, state)); }
+            lock (_states)
+            {
+                _states.Add((agentId, state));
+                Marks.Add((agentId, state, reason));
+            }
         }
     }
 

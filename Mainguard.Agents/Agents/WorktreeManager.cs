@@ -49,8 +49,36 @@ public interface IAgentWorktreeManager
             $"This worktree manager cannot adopt an existing branch, so agent '{agentId}' in repo "
             + $"'{repoHash}' cannot be resumed here.");
 
-    /// <summary>Remove an agent's worktree; <paramref name="force"/> discards a dirty tree, otherwise a dirty tree is refused (typed).</summary>
+    /// <summary>
+    /// Remove an agent's worktree; <paramref name="force"/> discards a dirty tree, otherwise a dirty tree
+    /// is refused (typed).
+    ///
+    /// <para><b>The mirror's <c>agent/&lt;id&gt;</c> goes with it only when deleting it destroys
+    /// nothing</b> — i.e. when the branch tip is already contained in the mirror's integration branch. A
+    /// branch that carries a commit of its own survives the teardown, because this is the documented end
+    /// of a worker's life (commit, report, stop) and the ref is the only name its commits have. The
+    /// difference from <see cref="RemoveAgentWorktreeKeepingBranch"/> is therefore no longer "does it
+    /// delete the branch" but "is it allowed to ask": a teardown may reap what is spent, a resume's
+    /// rollback may not reap at all.</para>
+    /// </summary>
     void RemoveAgentWorktree(string repoHash, string agentId, bool force);
+
+    /// <summary>
+    /// Deletes <c>refs/heads/agent/&lt;id&gt;</c> from the mirror <b>because the thing it represented was
+    /// withdrawn</b> — the external-PR intake's pull request closed upstream or was discarded by a human.
+    /// Returns true when the mirror no longer carries the branch.
+    ///
+    /// <para><b>This is the one deletion taken on a caller's word.</b> <see cref="RemoveAgentWorktree"/>
+    /// proves first that a delete costs nothing; this one is called where the commits provably live
+    /// somewhere else (the pull request they were fetched from) and the entry has already left the queue,
+    /// so keeping the ref would only make the next intake of that same <c>pr-&lt;n&gt;</c> collide with a
+    /// branch nobody is coming back for. It is audited with the sha for that reason.</para>
+    ///
+    /// <para>The default returns false — a manager with no mirror deleted nothing and says so. Not a
+    /// throw: a failure to tidy must never take an intake poll down, and residue here is residue, never
+    /// lost work.</para>
+    /// </summary>
+    bool DiscardAgentBranch(string repoHash, string agentId) => false;
 
     /// <summary>
     /// Clears an agent's worktree + per-agent repository while <b>leaving
@@ -289,6 +317,14 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// <summary>The G-17 audit type for a resume whose rescue publish found nothing to carry, recorded
     /// because the very next step deletes the repository it looked in.</summary>
     public const string AgentRescueEmptyEvent = "agent_rescue_empty";
+
+    /// <summary>The G-17 audit type for a teardown that left <c>agent/&lt;id&gt;</c> standing because the
+    /// branch carried commits the mirror's integration branch does not.</summary>
+    public const string AgentBranchKeptEvent = "agent_branch_kept";
+
+    /// <summary>The G-17 audit type for the one deletion that is taken on a caller's word rather than on a
+    /// proof that it costs nothing — <see cref="IAgentWorktreeManager.DiscardAgentBranch"/>.</summary>
+    public const string AgentBranchDiscardedEvent = "agent_branch_discarded";
 
     // A refusal is the interesting half: it means an agent rewrote history the mirror had already
     // published (or aimed at something that is not its own branch), and it must not pass silently just
@@ -764,11 +800,14 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             }
         }
 
-        // Prune any dangling metadata and delete the agent branch so no residue survives either way.
-        // The mirror's copy of agent/<id> is what the merge queue consumed, so it is deleted too.
+        // Prune any dangling metadata. Always safe: metadata names no objects.
         AgentGitCommand.TryRun(owner, out _, "worktree", "prune");
         AgentGitCommand.TryRun(barePath, out _, "worktree", "prune");
-        AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch);
+
+        // ...and then delete agent/<id> ONLY when deleting it destroys nothing. See ReapBranch: this line
+        // used to be unconditional, which made the documented end of a worker's life — commit, report,
+        // stop — delete the commit it had just published and verified.
+        ReapBranch(repoHash, agentId, branch, barePath);
 
         // MG-3: the agent's own repository goes with it. Its objects were already COPIED into the mirror
         // by every publish (a fetch across a local transport transfers objects; the mirror borrows from
@@ -784,6 +823,88 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // §4 gc policy: this is the natural idle point — if that was the last borrower, unreachable
         // objects in the mirror may finally be pruned.
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
+    }
+
+    /// <summary>
+    /// The teardown's last act: delete <c>agent/&lt;id&gt;</c> from the mirror <b>iff</b> the mediator says
+    /// deleting it destroys nothing, and leave a durable record when it does not.
+    ///
+    /// <para><b>The boundary.</b> "No residue" exists because a mirror that accumulates a ref per agent
+    /// forever is a mirror nothing can ever prune (MG-3 §4: unreachable objects are only deleted while no
+    /// borrower is attached, and a live ref makes them reachable, not unreachable). That reason applies in
+    /// full to a branch that never left the base commit — every coordinator, every failed spawn, every
+    /// worker that did nothing — and it is those that the rule still reaps. It does not apply to a branch
+    /// that carries a commit: there the ref is not residue, it is the only name for work, and
+    /// <see cref="MirrorMaintenance.AfterAgentDetached"/> runs a prune two lines later.</para>
+    ///
+    /// <para><b>A kept branch is not silent.</b> An operator who stops an agent and finds a branch left
+    /// behind must be able to see why, and a queue row that offers Review for a branch has to be able to
+    /// trust the branch is there. The warning and the G-17 audit event are that record.</para>
+    /// </summary>
+    private void ReapBranch(string repoHash, string agentId, string branch, string barePath)
+    {
+        var verdict = _refs.MayReap(repoHash, agentId);
+        if (verdict.MayDelete)
+        {
+            AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch);
+            return;
+        }
+
+        _warningSink?.Invoke(
+            $"MG-3: kept '{branch}' in repo '{repoHash}' through teardown — {verdict.Reason}. "
+            + "The agent is gone; the branch stays so its commits do, and a human can still review, merge "
+            + "or discard it.");
+
+        _audit?.Append(new AuditEvent(AgentBranchKeptEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = branch,
+            ["outcome"] = verdict.Outcome.ToString(),
+            ["sha"] = verdict.Sha ?? string.Empty,
+            ["reason"] = verdict.Reason ?? string.Empty,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+    }
+
+    /// <inheritdoc />
+    public bool DiscardAgentBranch(string repoHash, string agentId)
+    {
+        var barePath = BareRepoPathFor(repoHash);
+        var branch = BranchFor(agentId);
+        if (!Directory.Exists(barePath))
+        {
+            return false;
+        }
+
+        var sha = AgentGitCommand.TryRun(barePath, out var head, "rev-parse", "--verify", "--quiet",
+            "refs/heads/" + branch) == 0 ? head.Trim() : string.Empty;
+
+        // Nothing there is success: the caller asked for the branch to be gone and it is.
+        if (sha.Length == 0)
+        {
+            return true;
+        }
+
+        if (AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch) != 0)
+        {
+            return false;
+        }
+
+        // Audited, and this one is not optional. Every OTHER way a branch is deleted now proves first that
+        // the delete costs nothing; this is the single path that deletes work on a caller's say-so, so the
+        // say-so has to be on the record with the sha it destroyed.
+        _audit?.Append(new AuditEvent(AgentBranchDiscardedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = branch,
+            ["sha"] = sha,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
+        return true;
     }
 
     /// <inheritdoc />

@@ -31,6 +31,13 @@ public class MergeQueueStateMachineTests
 
         public void FailFor(string agentId) => _fails.Add(agentId);
 
+        /// <summary>Every transition reported through the queue's <c>onStateChanged</c> seam, in order.</summary>
+        public List<(string Agent, WorkerMergeState State)> Notices = new();
+
+        /// <summary>Makes the reporting sink throw, so "reporting a state may never fail a transition" is
+        /// a property under test rather than a comment.</summary>
+        public bool NoticeSinkThrows;
+
         public MergeQueue Build(bool withRequeue = true, bool withChangedGate = false)
         {
             MergeQueue queue = null!;
@@ -49,7 +56,15 @@ public class MergeQueueStateMachineTests
             : (id, ct) => Task.CompletedTask;
 
             var gates = withChangedGate ? new IMergeGate[] { ChangedGate } : Array.Empty<IMergeGate>();
-            queue = new MergeQueue("repo", "sha0", StateStore, VerStore, run, requeue, gates, Audit);
+            queue = new MergeQueue("repo", "sha0", StateStore, VerStore, run, requeue, gates, Audit,
+                onStateChanged: (id, state) =>
+                {
+                    Notices.Add((id, state));
+                    if (NoticeSinkThrows)
+                    {
+                        throw new InvalidOperationException("the reporting sink is unavailable");
+                    }
+                });
             Queue = queue;
             return queue;
         }
@@ -866,5 +881,58 @@ public class MergeQueueStateMachineTests
         Assert.Equal(new[] { "npm", "run", "verify" }, pinned.Command);
 
         Assert.Throws<NoVerificationCommandException>(() => VerificationCommandResolver.Resolve(null, "npm test"));
+    }
+
+    // ---- the state-report seam (F2) --------------------------------------
+    //
+    // The queue is the only thing that decides a branch's merge state, so it is the only thing that may
+    // announce one. These pin the two properties that make the announcement trustworthy: it describes
+    // REAL transitions, and it can never damage one.
+
+    /// <summary>
+    /// One notice per real move, in order, and none for a write that moved nothing — seeding an entry
+    /// writes a row without transitioning. A report for a transition that did not happen is a report
+    /// about something other than the state machine.
+    /// </summary>
+    [Fact]
+    public async Task StateNotices_DescribeRealTransitions_AndNothingElse()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+        Assert.Empty(h.Notices);
+
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(
+            new[] { WorkerMergeState.Verifying, WorkerMergeState.Verified },
+            h.Notices.Where(n => n.Agent == "a").Select(n => n.State).ToArray());
+
+        // A second agent's transitions are its own — the notice carries the id, so two workers under one
+        // coordinator cannot be told each other's outcome.
+        await h.Queue.RunVerificationAsync("b", CancellationToken.None);
+        Assert.Equal(2, h.Notices.Count(n => n.Agent == "a"));
+        Assert.Equal(2, h.Notices.Count(n => n.Agent == "b"));
+    }
+
+    /// <summary>
+    /// Reporting a state may never fail a transition. The row is already persisted when the sink runs, so
+    /// an exception escaping would leave the store and memory disagreeing about a branch's merge
+    /// eligibility — a worse outcome than the report nobody got.
+    /// </summary>
+    [Fact]
+    public async Task AThrowingStateSink_CannotBreakATransition()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.NoticeSinkThrows = true;
+
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState("a"));
+        // ...and the persisted row agrees, which is the half a failure escaping mid-write would break.
+        Assert.Equal(
+            nameof(WorkerMergeState.Verified),
+            Assert.Single(h.StateStore.LoadAll("repo"), r => r.AgentId == "a").State);
     }
 }

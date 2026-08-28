@@ -465,7 +465,13 @@ public sealed class MergeQueueProvisioner
             // one, and rebuilding the array inline here would drop it — the exact silent-deletion this
             // forward merge had to resolve, since both sides edited this argument list.
             gates: gates,
-            audit: _audit);
+            audit: _audit,
+            // The branch's merge state, reported back onto the AGENT — the seam a coordinator's
+            // `get_worker_status` and the client's agent stream both read. Without it a worker whose
+            // branch verified green stayed at the liveness word its sandbox attach wrote ("Working")
+            // for the rest of its life, so the coordinator could never report that its own fan-out had
+            // finished. Same sink and same posture as MarkRunState, one line above the same supervisor.
+            onStateChanged: (agentId, state) => MarkMergeState(repoHandle, agentId, state));
 
         return new MergeQueueContext(queue, _leases)
         {
@@ -704,6 +710,52 @@ public sealed class MergeQueueProvisioner
         {
             // Reporting a state must never be able to fail a rebase.
             _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} state mark FAILED ({ex.Message})");
+        }
+    }
+
+    /// <summary>
+    /// Reflects a branch's MERGE state on the agent that produced it, so "is this worker done?" has an
+    /// answer anywhere outside the queue's own projection.
+    ///
+    /// <para><b>The states are the queue's, verbatim.</b> <see cref="WorkerMergeState"/>'s names are the
+    /// vocabulary already carried on the wire, rendered on the rail and persisted on the row; re-spelling
+    /// them here would be a second vocabulary for one fact, which is how the two drift. The session store
+    /// treats them as first-class already — <c>AgentSessionReconciler</c>'s drift pass says so out loud,
+    /// refusing to flatten "orchestration meaning the container cannot know — RateLimited, Yielding,
+    /// AwaitingReview" back to <c>Working</c>, and correcting only the pause axis.</para>
+    ///
+    /// <para><b>What it is NOT.</b> Not a lifecycle claim: the jail may be running, paused or long gone,
+    /// and the reconciler still owns that axis. It is the branch's standing, on the agent, which is the
+    /// one thing a coordinator can act on and the one thing it could not see.</para>
+    /// </summary>
+    private void MarkMergeState(string repoHandle, string agentId, WorkerMergeState state)
+    {
+        var detail = state switch
+        {
+            WorkerMergeState.Working =>
+                "Back at work — this branch is not verified against the current main.",
+            WorkerMergeState.Verifying =>
+                "Verifying this branch against main, in the agent's own jail.",
+            WorkerMergeState.Verified =>
+                "Verified against the current main — waiting for a human to review and merge it.",
+            WorkerMergeState.StaleVerified =>
+                "Main moved, so this branch's verification no longer counts; it is being re-queued.",
+            WorkerMergeState.AwaitingReview => "Waiting for your review.",
+            WorkerMergeState.Merged => "Merged into main.",
+            WorkerMergeState.Rejected => "Rejected in review.",
+            WorkerMergeState.Discarded => "Dropped from the merge queue.",
+            _ => null,
+        };
+
+        try
+        {
+            _agentStates.MarkState(agentId, state.ToString(), detail);
+        }
+        catch (Exception ex)
+        {
+            // Reporting a state must never be able to fail a queue transition — the row is already
+            // written by the time this runs.
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} merge-state mark FAILED ({ex.Message})");
         }
     }
 

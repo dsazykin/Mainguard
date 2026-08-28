@@ -138,6 +138,16 @@ These four already exist as `CoordinatorTools`. The contract is that this list i
 Anything not on this list is denied. Adding to this list is a deliberate contract change, reviewed as
 such — not an implementation detail.
 
+**`get_worker_status` must be able to say "done".** It is the coordinator's only window onto its own
+fan-out, so a status that can only ever describe the jail's liveness makes a coordinator structurally
+unable to report completion — which is what it was: the session's state word was written once by the
+sandbox attach ("Working") and no merge outcome ever moved it, so a worker whose branch had committed,
+verified green and reached `Verified` still reported "Working … actively working", permanently. A branch's
+merge state is therefore reported onto its agent as it moves, in `WorkerMergeState`'s own words
+(`Verifying`, `Verified`, `StaleVerified`, `AwaitingReview`, `Merged`, `Rejected`, `Discarded`, and back to
+`Working`). It is a report, not a second state machine: the merge queue remains the only thing that decides
+those words, and jail liveness remains the reconciler's axis.
+
 ### 3.1 The WORKER's surface, which is a different exhaustive list
 
 A worker's jail carries `mainguard-plan`, never `mainguard-agent`, and the daemon dispatches on the

@@ -287,7 +287,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Unchanged`), because the loop discarded `PollOnce`'s return value and so "this agent's work moved"
       was computed once a second and reachable by nothing. `WorkerReadinessTrigger` is the subscriber; the
       mediator's own observer is deliberately NOT the seam, since it also sees the merge queue's
-      pre-verification publish and would feed a trigger the consequences of its own runs).
+      pre-verification publish and would feed a trigger the consequences of its own runs. Also
+      `MayReap(repoHash, agentId)` → `AgentBranchReapVerdict`/`AgentBranchReapOutcome` — the question a
+      teardown asks before `branch -D`: is this branch's tip already contained in the mirror's own
+      integration branch, i.e. would deleting the ref destroy nothing? `Reapable`/`NoBranch` permit the
+      delete; `CarriesWork` and `Undecidable` refuse it, the second because an unanswerable safety
+      question gating a destructive operation is a "no". Lives here because this class already owns both
+      halves of the arithmetic — rule 2's `merge-base --is-ancestor` and rule 4's "the mirror's own
+      default branch, never the literal name" — and a second copy of either is how one becomes
+      decorative).
     - `MirrorMaintenance.cs` (**MG-3 §4** — the object-lifetime policy for a mirror other repos borrow
       from: **pruning breaks borrowers, repacking does not**. `ApplyGcPolicy` (`gc.auto=0` +
       `maintenance.auto=false` — BOTH checked: the second exists because a newer git's background
@@ -317,8 +325,23 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Committed` so a clean tree is never reported as recorded work, and pointedly NOT publishing —
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
       `WorkerReadinessTrigger` for the very commit it exists to react to);
-      `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force` +
-      `branch -D` + delete the whole per-agent repo + the `MirrorMaintenance` idle hook, no residue);
+      `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
+      `ReapBranch` — `branch -D` **only when `AgentRefMediator.MayReap` proves the delete destroys
+      nothing**, i.e. the tip is already contained in the mirror's integration branch — then delete the
+      whole per-agent repo + the `MirrorMaintenance` idle hook. That conditional IS defect F1: the
+      `branch -D` was unconditional, so the documented end of a worker's life (commit, report, stop)
+      deleted the commit it had just published and verified, leaving it dangling for the prune that runs
+      two lines later while the queue row still said `Verified` and still offered Review. "No residue"
+      survives for the case it was written about — a branch that never left the base, which is every
+      coordinator, every failed spawn and every worker that did nothing — and a KEPT branch is not
+      silent: it warns and raises the G-17 `agent_branch_kept` event);
+      **`DiscardAgentBranch(repoHash, agentId)`** (the ONE deletion taken on a caller's word rather than
+      on a proof that it costs nothing — the external-PR intake's release, where the commits provably
+      live in the pull request they were fetched from and `pr-<n>` is a REUSED id, so a kept branch would
+      make the next intake of that number collide with `CreateAgentWorktree`'s duplicate refusal on every
+      poll forever. Audited with the sha it removed (`agent_branch_discarded`); idempotent — an already
+      absent branch is success; interface default returns false, since a manager with no mirror deleted
+      nothing and residue here is residue, never lost work);
       **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a
       jail spawned for a stranded queue entry starts on that entry's existing branch with its commits
       intact: rescue-publish the dead jail's own repo into the mirror first (a crash can leave commits the
@@ -1274,7 +1297,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`stale_override_used` audit; `CanMerge` stays false); the `Orchestrator`-namespace
       `VerificationRecord` (with RT-D2 `ResolvedCommand`/`ConfigHash`) is distinct from the UI-prototype
       `Agents.VerificationRecord`; reuses `Agents.WorkerMergeState`;
-      `IMergeQueueStore`/`InMemoryMergeQueueStore`; **P2-12** adds a per-entry `MergeEntryOrigin`
+      `IMergeQueueStore`/`InMemoryMergeQueueStore`; **`onStateChanged(agentId, newState)`** is the
+      report seam the daemon reflects a branch's merge state back onto its AGENT through — fired from
+      `SetStateLocked` after the row is persisted and only for a REAL move, and wrapped so a throwing
+      sink can never abort a transition mid-write. It is defect F2: an agent session's state word is a
+      liveness word ("Working", written once by the sandbox attach), so a coordinator asking
+      `get_worker_status` after a green verification was told "Working" permanently while the queue said
+      `Verified` — a status that cannot ever say "done" makes a coordinator structurally unable to report
+      the completion of its own fan-out. Not a second state machine: the words are `WorkerMergeState`'s
+      own and this queue stays the only thing that decides them; **P2-12** adds a per-entry
+      `MergeEntryOrigin`
       (`EnsureEntry(agentId, origin)` enters a new PR at `Working` + stamps origin, `GetOrigin`, `Cancel`
       — the closed-PR path that forgets an entry rather than reaching a terminal state — and
       `IMergeQueueStore.Delete`; origin is persisted + hydrated so the merge dispatch routes correctly
@@ -1398,7 +1430,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       REQUIRED `[seeded — not executed]` provenance marker + an honest artifact log; `RequeueStaleAsync`
       likewise ends a seeded entry at one of the two real termini — Hold (rest at `StaleVerified`) or the
       no-jail `Block` to `Working` — never the null-rebaser re-verify, which would mint fresh evidence
-      for a branch not on top of main.)
+      for a branch not on top of main.) **Merge state, reported onto the agent:** `MarkMergeState` is
+      passed to every queue it builds as `onStateChanged`, and marks the agent session with the
+      `WorkerMergeState` name plus the sentence a human reads ("Verified against the current main —
+      waiting for a human to review and merge it"). Same sink and same posture as the keep-alive
+      `MarkRunState` beside it: through the optional `agentStates` `IAgentSupervisor`, wrapped so a
+      reporting failure can never fail a transition. This is what makes a coordinator's
+      `get_worker_status` — and the client's agent stream — able to say a branch is done; before it, a
+      worker whose branch verified green kept the liveness word its sandbox attach wrote.)
     - `QueueSeeder.cs` (the dev-only merge-queue seeder — docs/design/queue-seeding.md; only caller
       is the flag-gated `QueueSeedingService`. `SeedAsync` walks each spec to its target state through
       the REAL `MergeQueue` public transitions over a REAL plumbing-fabricated `agent/seed-<n>` branch

@@ -231,18 +231,24 @@ public sealed class ExternalPrWorkerHost : IPrWorkerHost
             // closing repo A's pull request #7 cannot tear down repo B's still-open pull request #7.
             var result = await _spawns.StopAsync(new AgentSessionKey(repoHash, agentId), ct)
                 .ConfigureAwait(false);
-            if (result.Stopped)
-            {
-                return;
-            }
 
             // No session (a restart forgot it) but the jail may still be up — tear it down by the same
             // teardown, or the container and its network segment leak for the life of the VM. The bridge
             // pool is ~32 deep; a segment leaked per closed pull request exhausts it.
-            if (_resolveRunningJail(repoHash, agentId) is { Length: > 0 } containerId)
+            if (!result.Stopped
+                && _resolveRunningJail(repoHash, agentId) is { Length: > 0 } containerId)
             {
                 await _launcher.TeardownAsync(repoHash, agentId, containerId, ct).ConfigureAwait(false);
             }
+
+            // ...and THEN the branch, on every release path rather than only the second one, because this
+            // method is reached only when the pull request has gone from upstream or a human discarded its
+            // entry. The teardown above now PRESERVES any branch carrying a commit — right for a worker
+            // whose work exists nowhere else, wrong here twice over: these commits were fetched FROM the
+            // pull request and still live there, and `pr-<n>` is a reused id, so a kept branch would make
+            // the next intake of that same number collide with `CreateAgentWorktree`'s duplicate refusal
+            // on every poll, forever.
+            _worktrees.DiscardAgentBranch(repoHash, agentId);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

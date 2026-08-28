@@ -128,7 +128,8 @@ public sealed class AgentWorktreeManagerTests
         Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/a1").Trim());
 
         // The dead jail's residue: worktree + per-agent repo still on disk, container gone. This is the
-        // state a crash leaves — NOT the state a clean stop leaves, which deletes the branch too.
+        // state a crash leaves; a clean stop reaches the same branch by a different route (it may reap,
+        // and declines to because this branch carries a commit).
         env.Worktrees.RemoveAgentWorktreeKeepingBranch(hash, "a1");
         Assert.False(Directory.Exists(first));
         Assert.Equal("commit", AgentTestGit.RunChecked(bare, "cat-file", "-t", "refs/heads/agent/a1").Trim());
@@ -265,12 +266,13 @@ public sealed class AgentWorktreeManagerTests
     }
 
     /// <summary>
-    /// The two removals differ in exactly one thing, and it is the thing that matters: a teardown ends the
-    /// agent (branch deleted, no residue), while a resume's rollback must leave the branch standing —
-    /// running the teardown there would destroy the only surviving copy of the work being recovered.
+    /// The two removals differ in exactly one thing, and it is no longer "does it delete the branch": a
+    /// teardown may reap a SPENT branch, while a resume's rollback may not reap at all. Both leave a
+    /// branch that carries a commit standing — the rollback because it is recovering that work, the
+    /// teardown because it would otherwise be destroying it.
     /// </summary>
     [Fact]
-    public void RemoveKeepingBranch_LeavesTheBranch_WhereTheOrdinaryRemovalDeletesIt()
+    public void NeitherRemoval_TouchesABranchThatCarriesACommit()
     {
         using var env = new WorktreeEnv();
         var hash = env.Provision();
@@ -280,27 +282,184 @@ public sealed class AgentWorktreeManagerTests
         var keptTip = CommitInWorktree(keptPath, "k.txt", "k", "feat: kept");
         env.Worktrees.PublishAgentBranch(hash, "kept");
 
-        var gonePath = env.Worktrees.CreateAgentWorktree(hash, "gone");
-        CommitInWorktree(gonePath, "g.txt", "g", "feat: gone");
-        env.Worktrees.PublishAgentBranch(hash, "gone");
+        var tornDownPath = env.Worktrees.CreateAgentWorktree(hash, "torndown");
+        var tornDownTip = CommitInWorktree(tornDownPath, "g.txt", "g", "feat: also work");
+        env.Worktrees.PublishAgentBranch(hash, "torndown");
 
         env.Worktrees.RemoveAgentWorktreeKeepingBranch(hash, "kept");
-        env.Worktrees.RemoveAgentWorktree(hash, "gone", force: true);
+        env.Worktrees.RemoveAgentWorktree(hash, "torndown", force: true);
 
         // Both worktrees and both per-agent repositories are gone…
         Assert.False(Directory.Exists(keptPath));
-        Assert.False(Directory.Exists(gonePath));
+        Assert.False(Directory.Exists(tornDownPath));
         Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "kept")));
-        Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "gone")));
+        Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "torndown")));
 
-        // …and only the teardown took the branch with it.
+        // …and neither took a commit with it.
         Assert.Equal(keptTip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/kept").Trim());
-        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/gone").Code);
+        Assert.Equal(tornDownTip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/torndown").Trim());
 
-        // The kept branch is therefore adoptable and the deleted one is not — which is the whole
-        // difference these two methods exist to express.
+        // Which makes both adoptable — i.e. the merge queue's "Resume the entry" affordance can actually
+        // give either one a jail again. Under the unconditional `branch -D` the torn-down one could not be
+        // resumed, reviewed or merged, and its row went on offering all three.
         env.Worktrees.AdoptAgentWorktree(hash, "kept");
-        Assert.Throws<AgentBranchMissingException>(() => env.Worktrees.AdoptAgentWorktree(hash, "gone"));
+        env.Worktrees.AdoptAgentWorktree(hash, "torndown");
+    }
+
+    /// <summary>
+    /// <b>F1, the data loss.</b> A worker commits, the commit publishes, verification passes, the row goes
+    /// to <c>Verified</c> — and then the worker is stopped, which is the documented end of its lifecycle
+    /// (<c>AgentOperatingInstructions.Worker</c> tells it to commit, report and stop). The teardown must
+    /// not be what destroys the output of the lifecycle it ends.
+    ///
+    /// <para>Measured before the fix: <c>rev-parse refs/heads/agent/&lt;id&gt;</c> answered the tip before
+    /// the stop and "unknown revision" after it, leaving the commit dangling and gc-eligible while the
+    /// queue row still said Verified and still offered Review on a branch that no longer existed.</para>
+    /// </summary>
+    [Fact]
+    public void Teardown_KeepsTheCommitAWorkerJustPublished_BecauseNothingElseNamesIt()
+    {
+        var audit = new Mainguard.Git.Audit.InMemoryAuditLog();
+        var warnings = new List<string>();
+        using var env = new WorktreeEnv(audit: audit, warningSink: warnings.Add);
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "w1");
+        var tip = CommitInWorktree(path, "work.txt", "the approved work", "feat: the work");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "w1"));
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/w1").Trim());
+
+        env.Worktrees.RemoveAgentWorktree(hash, "w1", force: true);
+
+        // The ref still names the tip…
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/w1").Trim());
+        // …and the commit is genuinely still there, not merely a ref pointing at a pruned object.
+        Assert.Equal("commit", AgentTestGit.RunChecked(bare, "cat-file", "-t", tip).Trim());
+        Assert.Contains("work.txt", AgentTestGit.RunChecked(bare, "show", "--name-only", "--format=", tip));
+
+        // The jail leaves nothing else behind: this is a teardown, not a rollback.
+        Assert.False(Directory.Exists(path));
+        Assert.False(Directory.Exists(env.Worktrees.AgentRepoPathFor(hash, "w1")));
+
+        // …and a kept branch is never silent. An operator who stops an agent and finds a branch left
+        // standing has to be able to find out why, and the row that still offers Review needs the fact on
+        // the record rather than only in a log line that dies with the process.
+        var kept = Assert.Single(audit.Read(), e => e.Type == WorktreeManager.AgentBranchKeptEvent);
+        Assert.Equal(tip, kept.Fields["sha"]);
+        Assert.Equal("agent/w1", kept.Fields["branch"]);
+        Assert.Equal(nameof(AgentBranchReapOutcome.CarriesWork), kept.Fields["outcome"]);
+        Assert.Contains(warnings, w => w.Contains("kept 'agent/w1'"));
+    }
+
+    /// <summary>
+    /// The other half of the boundary, and the reason "no residue" is not simply deleted: an agent that
+    /// never committed leaves a branch that names nothing main does not already have, and THAT is reaped.
+    /// This is every coordinator, every failed spawn, and the ~20 dead rows the first end-to-end run left.
+    /// </summary>
+    [Fact]
+    public void Teardown_StillReapsABranchThatNeverLeftTheBase()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "idle");
+        // Dirty, but never committed — exactly the state the run report describes, and exactly the state
+        // in which there is nothing on the branch to protect.
+        File.WriteAllText(Path.Combine(path, "draft.txt"), "uncommitted\n");
+
+        env.Worktrees.RemoveAgentWorktree(hash, "idle", force: true);
+
+        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/idle").Code);
+        Assert.DoesNotContain(env.Worktrees.List(hash), w => w.Branch == "agent/idle");
+    }
+
+    /// <summary>
+    /// …and the branch becomes reapable again the moment its work reaches main, which is what keeps the
+    /// mirror from accumulating a ref per agent forever: a merged branch is spent, and a teardown after
+    /// the merge cleans it up with nothing lost.
+    /// </summary>
+    [Fact]
+    public void Teardown_ReapsABranchOnceItsWorkIsContainedInMain()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "merged");
+        var tip = CommitInWorktree(path, "m.txt", "m", "feat: merged work");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "merged"));
+
+        // The mirror-side result of a human's `git merge --ff-only agent/merged`.
+        var mainRef = "refs/heads/" + AgentTestGit.RunChecked(bare, "symbolic-ref", "--short", "HEAD").Trim();
+        AgentTestGit.RunChecked(bare, "update-ref", mainRef, tip);
+
+        env.Worktrees.RemoveAgentWorktree(hash, "merged", force: true);
+
+        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/merged").Code);
+        // The work itself is untouched — it is main's now.
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", mainRef).Trim());
+    }
+
+    /// <summary>
+    /// The one deletion taken on a caller's word: an intake'd pull request that closed upstream. Deletes a
+    /// branch that carries commits — which every other path now refuses — because those commits live in
+    /// the pull request they were fetched from and <c>pr-&lt;n&gt;</c> is a reused id.
+    /// </summary>
+    [Fact]
+    public void DiscardAgentBranch_DeletesEvenABranchCarryingWork_AndSaysSoInTheAudit()
+    {
+        var audit = new Mainguard.Git.Audit.InMemoryAuditLog();
+        using var env = new WorktreeEnv(audit: audit);
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "pr-7");
+        var tip = CommitInWorktree(path, "p.txt", "p", "feat: the pull request");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "pr-7"));
+
+        env.Worktrees.RemoveAgentWorktree(hash, "pr-7", force: true);
+        // The ordinary teardown kept it — this is the state the discard has to be able to clear.
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/pr-7").Trim());
+
+        Assert.True(env.Worktrees.DiscardAgentBranch(hash, "pr-7"));
+        Assert.NotEqual(0, AgentTestGit.Run(bare, "rev-parse", "--verify", "--quiet", "refs/heads/agent/pr-7").Code);
+
+        var record = Assert.Single(audit.Read(), e => e.Type == WorktreeManager.AgentBranchDiscardedEvent);
+        Assert.Equal(tip, record.Fields["sha"]);
+        Assert.Equal("agent/pr-7", record.Fields["branch"]);
+
+        // Idempotent: asking again for a branch that is already gone is success, not a failure to retry.
+        Assert.True(env.Worktrees.DiscardAgentBranch(hash, "pr-7"));
+    }
+
+    /// <summary>
+    /// A teardown that could NOT establish the ancestry keeps the branch. An unanswerable safety question
+    /// is not a yes — and the failure mode being prevented is a probe that errors and reads as "already
+    /// contained in main", which deletes on exactly the repositories git is unhappy with.
+    /// </summary>
+    [Fact]
+    public void Teardown_KeepsTheBranch_WhenTheAncestryProbeCannotAnswer()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "u1");
+        var tip = CommitInWorktree(path, "u.txt", "u", "feat: unanswerable");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "u1"));
+
+        // The mirror's HEAD now names a branch that does not exist, so "what does main contain" has no
+        // answer at all. The branch's own commit is untouched and still worth protecting.
+        AgentTestGit.RunChecked(bare, "symbolic-ref", "HEAD", "refs/heads/no-such-branch");
+
+        var verdict = env.Worktrees.RefMediator.MayReap(hash, "u1");
+        Assert.Equal(AgentBranchReapOutcome.Undecidable, verdict.Outcome);
+        Assert.False(verdict.MayDelete);
+
+        env.Worktrees.RemoveAgentWorktree(hash, "u1", force: true);
+        Assert.Equal(tip, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/u1").Trim());
     }
 
     /// <summary>Commits a file in an agent worktree the way the agent's CLI would, and returns the tip.</summary>
@@ -643,12 +802,15 @@ public sealed class AgentWorktreeManagerTests
     {
         private readonly string _vmRoot;
 
-        public WorktreeEnv(string syncRemoteName = "mainguard-vm")
+        public WorktreeEnv(
+            string syncRemoteName = "mainguard-vm",
+            Mainguard.Git.Audit.IAuditLog? audit = null,
+            System.Action<string>? warningSink = null)
         {
             Fixture = new DualRepoFixture();
             _vmRoot = AgentTestGit.NewVmRoot();
             var provisioner = new RepoProvisioner(_vmRoot);
-            Worktrees = new WorktreeManager(_vmRoot);
+            Worktrees = new WorktreeManager(_vmRoot, audit: audit, warningSink: warningSink);
             Env = new FakeAgentEnvironment(syncRemoteName, provisioner, Worktrees);
         }
 

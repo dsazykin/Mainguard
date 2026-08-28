@@ -42,6 +42,38 @@ public sealed record AgentRefPublishResult(
     public bool Refused => Outcome is AgentRefPublishOutcome.RefusedNonFastForward or AgentRefPublishOutcome.RefusedTarget;
 }
 
+/// <summary>What a teardown is allowed to do with the mirror's <c>refs/heads/agent/&lt;id&gt;</c>.</summary>
+public enum AgentBranchReapOutcome
+{
+    /// <summary>The branch names nothing the mirror's own integration branch does not already contain, so
+    /// deleting it makes no object unreachable. This is the residue case the "no residue" rule is for.</summary>
+    Reapable,
+
+    /// <summary>The branch is the only name for at least one commit. Deleting it makes that commit dangling
+    /// and gc-eligible — i.e. destroys it.</summary>
+    CarriesWork,
+
+    /// <summary>There is no such ref in the mirror; there is nothing to delete and nothing to lose.</summary>
+    NoBranch,
+
+    /// <summary>Git could not answer the ancestry question (unreadable mirror, a missing HEAD, a race).
+    /// <b>Never a permission to delete</b> — an unanswerable safety question is not a yes.</summary>
+    Undecidable,
+}
+
+/// <summary>
+/// One reap verdict, with the branch tip when there is one so a refusal can name what it protected.
+/// </summary>
+/// <param name="Outcome">What was established about the branch.</param>
+/// <param name="Sha">The branch tip; null when there is no branch or it could not be read. Never a guess.</param>
+/// <param name="Reason">Human-readable why, for the warning and the audit event a kept branch leaves.</param>
+public sealed record AgentBranchReapVerdict(AgentBranchReapOutcome Outcome, string? Sha = null, string? Reason = null)
+{
+    /// <summary>True only when deleting the ref can destroy nothing. <see cref="AgentBranchReapOutcome.Undecidable"/>
+    /// is deliberately false: this value gates a destructive operation, so the unknown answer is "no".</summary>
+    public bool MayDelete => Outcome is AgentBranchReapOutcome.Reapable or AgentBranchReapOutcome.NoBranch;
+}
+
 /// <summary>
 /// MG-3 stage 2 — the ONE path by which anything an agent produced reaches the shared mirror.
 ///
@@ -322,6 +354,88 @@ public sealed class AgentRefMediator
 
         return dropped.ToArray();
     }
+
+    /// <summary>
+    /// Asks whether a teardown may delete this agent's branch from the mirror — i.e. whether
+    /// <c>branch -D agent/&lt;id&gt;</c> would destroy anything.
+    ///
+    /// <para><b>The question is measured, not remembered.</b> A branch is reapable exactly when its tip is
+    /// an ancestor of the mirror's own integration branch: every object it names is then reachable from
+    /// main and the delete removes a name, not a commit. Anything else is the only name for at least one
+    /// commit, and deleting it makes that commit dangling and gc-eligible — which
+    /// <see cref="MirrorMaintenance.AfterAgentDetached"/> then acts on, in the same teardown.</para>
+    ///
+    /// <para><b>Why not the merge queue's state.</b> The queue's <c>Working</c> is the state of BOTH an
+    /// agent that never committed and one that committed a second ago — the readiness trigger has not
+    /// fired yet, and phase-3 §11.2 says so in as many words ("a worker that never commits is
+    /// indistinguishable, to every mechanism downstream, from one that did nothing"). A rule keyed on the
+    /// queue would therefore keep destroying work for the whole window between the commit and the
+    /// verification, which is the widest window in the loop. Queue state records a decision; this records
+    /// what exists, and only the second can answer "will this delete lose a commit".</para>
+    ///
+    /// <para>Asked HERE because this class already owns both halves of the arithmetic — rule 2's
+    /// <c>merge-base --is-ancestor</c> and rule 4's "the mirror's own default branch, not the literal
+    /// name" — and a second copy of either is how one of them becomes decorative.</para>
+    ///
+    /// <para>Never throws: every caller is a best-effort teardown.</para>
+    /// </summary>
+    public AgentBranchReapVerdict MayReap(string repoHash, string agentId)
+    {
+        string target;
+        string barePath;
+        try
+        {
+            target = AgentRepoLayout.RefFor(agentId);
+            barePath = _bareRepoPathFor(repoHash);
+        }
+        catch (Exception ex)
+        {
+            return new AgentBranchReapVerdict(AgentBranchReapOutcome.Undecidable, Reason: ex.Message);
+        }
+
+        if (!Directory.Exists(barePath))
+        {
+            return new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.NoBranch, Reason: $"no provisioned mirror at '{barePath}'");
+        }
+
+        var sha = RevParse(barePath, target);
+        if (sha.Length == 0)
+        {
+            return new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.NoBranch, Reason: $"the mirror has no '{target}'");
+        }
+
+        var mainSha = RevParse(barePath, "refs/heads/" + DefaultBranch(barePath));
+        if (mainSha.Length == 0)
+        {
+            return new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.Undecidable, sha,
+                "the mirror's integration branch could not be resolved, so whether this branch carries "
+                + "work of its own is unknown");
+        }
+
+        // git's own three-valued answer: 0 = yes, 1 = no, anything else = it could not tell. The third is
+        // kept distinct from the second on purpose — an error that read as "not an ancestor" would be safe
+        // here, but an error that read as "is an ancestor" would delete on a failed probe, and the two are
+        // one typo apart if they share a branch.
+        var code = AgentGitCommand.TryRun(barePath, out _, "merge-base", "--is-ancestor", sha, mainSha);
+        return code switch
+        {
+            0 => new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.Reapable, sha,
+                $"{Short(sha)} is already contained in the mirror's integration branch {Short(mainSha)}"),
+            1 => new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.CarriesWork, sha,
+                $"{Short(sha)} is not contained in the mirror's integration branch {Short(mainSha)} — "
+                + "this ref is the only name for at least one commit"),
+            _ => new AgentBranchReapVerdict(
+                AgentBranchReapOutcome.Undecidable, sha,
+                $"the ancestry probe against {Short(mainSha)} could not run (git exit {code})"),
+        };
+    }
+
+    private static string Short(string sha) => sha.Length > 8 ? sha[..8] : sha;
 
     private static void TryDeleteRef(string gitDir, string refName)
         => AgentGitCommand.TryRun(gitDir, out _, "update-ref", "-d", refName);

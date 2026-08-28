@@ -191,7 +191,12 @@
   `verification_restart_resume outcome=stranded` rather than a human's `stalled_verification_cleared`,
   and a genuinely in-flight run is skipped by both arms; plus the discard-wins-the-race pair — a discard
   landing inside the jail probe is not reported as re-run, and `RunVerificationAsync` on an entry that went
-  terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`),
+  terminal throws WITHOUT leaving a phantom `IsVerificationInFlight`; plus the **state-report seam
+  (F2)** — `StateNotices_DescribeRealTransitions_AndNothingElse` (one notice per real move, in order,
+  none for a `EnsureEntry` write that moved nothing, and carrying the agent id so two workers under one
+  coordinator cannot be told each other's outcome) and `AThrowingStateSink_CannotBreakATransition` (the
+  row is persisted before the sink runs, so an escaping exception would leave store and memory
+  disagreeing about merge eligibility)),
   `SeedingCompatibilityTests` (in `Mainguard.Server.Tests` — **the queue-seeding COMPATIBILITY
   CONTRACT**, docs/design/queue-seeding.md §9: the gate defaults seeding depends on pinned in BOTH
   directions (`ChangedTestCommandGate` passes unknown ids, `FlaggedChangeGate` MG-40-denies them —
@@ -1149,15 +1154,24 @@
 - **`Mainguard.Server.Tests/Agents/QueueEntryResumeDockerTests.cs`** (`RequiresDocker`) — the decisive
   end-to-end for resume, against a real jail. A real agent spawned by the shipped chain commits in its
   real worktree; the container is then removed through the engine and the daemon's session record
-  dropped, which is the state a VM stop or a crash leaves (deliberately NOT `StopAgent`, whose clean
-  teardown also deletes the branch). The entry is then exactly the dead end from the field report:
+  dropped, which is the state a VM stop or a crash leaves. The entry is then exactly the dead end from
+  the field report:
   present, `Working`, `has_live_sandbox=false`, and a `RunVerification` that refuses with "no live
   sandbox". The resume then has to produce a **different, real container** for the same `(repo, agent)`,
   a worktree standing on `agent/<id>` at the commit the dead jail made, a passing verification run by
   real `docker exec` of the command read out of `.mainguard/verify`, `CanMerge` true **on the daemon's
-  own gate**, and a `queue_entry_resumed` audit event naming the actor and the from-state. The second
-  case is the honest refusal: after a clean `StopAgent` the branch is gone, so the resume must refuse and
-  build nothing rather than start a jail on a fresh empty branch under the old name.
+  own gate**, and a `queue_entry_resumed` audit event naming the actor and the from-state.
+  `ACleanStopAfterACommit_KeepsTheBranch_AndTheEntryIsStillResumable` is **defect F1 against a real
+  jail**: the documented end of a worker's life (commit, report, stop) used to end in an unconditional
+  `branch -D`, so the teardown destroyed the commit it had just published while the row still said
+  `Verified` and still offered Review. The branch now survives at the tip, the object is still there,
+  and the entry resumes onto it with the work present.
+  `WhenTheBranchIsGoneToo_ResumeRefusesAndNamesIt_AndBuildsNoJail` is the paired half: an agent stopped
+  with NOTHING on its branch still leaves no residue — the shape of the ~20 dead rows the first
+  end-to-end run left — and the resume that finds no branch refuses and builds nothing rather than
+  starting a jail on a fresh empty branch under the old name. Each test stops the jail it leaves
+  running, because the class's own cleanup runs only after every test in it and a jail left standing is
+  one the next spawn competes with for admission headroom and the bridge pool.
   `Agents/FixtureRepo.cs` — the tiny **Node** project both Docker merge-queue suites verify (shared
   rather than copied: the verify command and marker are what the assertions compare against, so two
   copies would drift and the stale one would assert provenance against a command the repo no longer
@@ -1638,7 +1652,13 @@
   `BranchInsideItsApprovedScope_IsNotFlagged` as its paired negative control, `ANewPayloadOnTheBranch_…`
   (a new payload + the stale cascade's re-verify produces a new content hash and drops the ack), and
   `AGreenBranchWhoseReviewCouldNotRun_IsDenied` (fail-closed: an otherwise perfectly mergeable branch
-  whose diff could not be classified is denied, and the verification result is untouched). **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
+  whose diff could not be classified is denied, and the verification result is untouched). **F2, the
+  merge state reported onto the agent:** `AGreenVerification_ReportsVerifying_ThenVerified_OnTheAgentItself`
+  (both transitions in the order the state machine made them — a report that only ever lands on the
+  terminal word cannot tell a coordinator anything is happening — plus the sentence a human reads) with
+  `AFailedVerification_NeverReportsVerified_AndReturnsTheAgentToWorking` as the paired negative, which
+  is the one that matters most: a red run must never tell a coordinator its worker is done.
+  **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
   holder — distro-scoped argv with no lifecycle verbs (G-12), restart-on-exit with capped backoff,
   start failures swallowed and retried, Dispose cancels a live holder session promptly). **Daemon
   fast-path:** `DaemonUpdaterTests` (the tier-1 skew decision + `/mnt` translation + the exact
@@ -1914,7 +1934,11 @@
   not an existence oracle. Also: a coordinator is never a merge-queue member, cannot name itself, and the
   daemon really does spawn it with `WithoutRepositoryAccess` while a worker keeps its worktree — asserted
   on the recorded `SandboxSpawnRequest`, because a correct spec builder nobody passes the flag to is the
-  MG-12 shape. Over its own two-repo `RoleLockRig`),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
+  MG-12 shape. Also **`GetWorkerStatus_ReportsTheBranchsMergeState_NotOnlyTheJailsLiveness`** — F2's
+  last leg: a merge-state word written onto the session through the daemon's own `IAgentSupervisor`
+  comes back out of `get_worker_status` in both its forms (one worker, and the whole fan-out), with a
+  pre-write control so a `Verified` cannot be something the rig produces on its own. Over its own
+  two-repo `RoleLockRig`),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
   sequence), `FixtureAcceptanceTests` (the TI-P2-00 fixture smokes),
   **`DockerSuiteDiagnosticsTests` (the RequiresDocker sweep's diagnosis contract, all daemon-free: the
   refusal names the engine, the evidence (`/etc/mainguardos-release`), what it would have destroyed by
@@ -1952,7 +1976,10 @@
   its duplicate-id refusal; `EnsureWorkerAsync` adopting a live session and a restart-orphaned jail;
   the MG-2 managed-worker cap refusing an intake spawn over the SAME population an ordinary managed
   worker fills, with the under-cap control proving the refusal was the cap; an unprovisioned mirror
-  failing and reclaiming its session; and `PrIntakeTargetResolver` over REAL repos, real mirrors and
+  failing and reclaiming its session; `ReleaseWorker_DiscardsTheBranch_*` on BOTH release paths — the
+  teardown keeps a branch carrying commits now, which is wrong for a withdrawn pull request whose work
+  lives upstream and whose `pr-<n>` id is reused, and the second test exists because the live-session
+  path used to `return` before anything else could run; and `PrIntakeTargetResolver` over REAL repos, real mirrors and
   the production `GitService.GetRemotes` — right repo among two, one-component-off negatives each
   paired with a matching-source control, case-insensitivity, empty index, unreadable repo),
   **`AgentSessionRepoScopingTests`** (a session's identity is `(repo, agent id)`: two repos each
@@ -2205,8 +2232,17 @@
   adoption with `AgentBranchRescueFailedException` when that rescue publish fails transiently (driven by
   a stale `.lock` on the mirror's ref), leaving the unpublished commit on disk for a retry instead of
   deleting the only copy;
-  plus the decisive contrast between `RemoveAgentWorktreeKeepingBranch` and `RemoveAgentWorktree`, one of
-  which leaves the branch adoptable and the other of which does not — **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
+  plus the **F1 teardown boundary**: `Teardown_KeepsTheCommitAWorkerJustPublished_BecauseNothingElseNamesIt`
+  (the data loss — the ref, the object and the file all still there after the stop),
+  `Teardown_StillReapsABranchThatNeverLeftTheBase` (the "no residue" half kept, on a dirty-but-never-
+  committed worktree), `Teardown_ReapsABranchOnceItsWorkIsContainedInMain` (spent branches are cleaned
+  up again once main carries them, so the mirror does not accumulate a ref per agent),
+  `Teardown_KeepsTheBranch_WhenTheAncestryProbeCannotAnswer` (mirror HEAD pointed at a non-existent
+  branch ⇒ `Undecidable`, and an unanswerable safety question gating a delete is a "no"),
+  `DiscardAgentBranch_DeletesEvenABranchCarryingWork_AndSaysSoInTheAudit` (the one deletion taken on a
+  caller's word, with the sha in `agent_branch_discarded`, idempotent), and
+  `NeitherRemoval_TouchesABranchThatCarriesACommit` — the two removals now differ in whether they may
+  ASK to reap, not in whether they delete — **MG-3** quarantine-only remotes pointing at the agent's OWN repo (never the shared
   mirror), `AgentRepo_BorrowsObjectsThroughAlternates_NeverCopiesHistory` (the alternates file names
   the mirror's object store and the agent repo owns literally zero objects of its own),
   `AgentPush_LandsInItsOwnRepo_AndOnlyTheDaemonPublishesToTheMirror` (an agent push moves its own ref

@@ -61,6 +61,11 @@ public sealed class RoleLockRig : IDisposable
 
     public MergeQueueRegistry Queues => _host.Services.GetRequiredService<MergeQueueRegistry>();
 
+    /// <summary>The daemon's own state sink — the one <c>MergeQueueProvisioner</c> reports a branch's
+    /// merge transitions through, and therefore the one whose writes have to reach a coordinator.</summary>
+    public Mainguard.Agents.Agents.IAgentSupervisor Supervisor =>
+        _host.Services.GetRequiredService<Mainguard.Agents.Agents.IAgentSupervisor>();
+
     public void Dispose()
     {
         _host.Dispose();
@@ -495,6 +500,45 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
     }
 
     // ---- helpers -------------------------------------------------------------------------------
+
+    /// <summary>
+    /// <b>F2, through the coordinator's own window.</b> Contract §3's <c>get_worker_status</c> is the only
+    /// thing a coordinator can see its fan-out with, and it renders the agent SESSION's state word. That
+    /// word was written once, by the sandbox attach ("Working"), and no merge outcome ever moved it — so a
+    /// coordinator whose worker had committed, verified green and reached <c>Verified</c> reported
+    /// "Working ... actively working", permanently. A status that cannot ever say "done" makes a
+    /// coordinator structurally unable to report the completion of its own work.
+    ///
+    /// <para>This is the last leg: the queue's word, once written onto the session through the daemon's
+    /// supervisor, has to come back out of the tool. The leg before it — a real green verification writing
+    /// that word — is <c>MergeQueueProvisionerTests</c>'s, and the composition root's exact-tail assertion
+    /// pins that the daemon gives the provisioner the real supervisor rather than a null one.</para>
+    /// </summary>
+    [Fact]
+    public async Task GetWorkerStatus_ReportsTheBranchsMergeState_NotOnlyTheJailsLiveness()
+    {
+        var coordinator = await SpawnCoordinatorAsync(RoleLockRig.RepoA);
+        var worker = await ShimSpawnAsync(coordinator, "the task");
+
+        // The control first: before anything verifies, the coordinator sees the liveness word — so a
+        // "Verified" below is the transition and not a state this rig produces on its own.
+        var before = await CallAsync(coordinator, new AgentIpcRequest(AgentIpcRequest.StatusOp, AgentId: worker));
+        Assert.True(before.Ok, before.Error);
+        Assert.DoesNotContain(nameof(WorkerMergeState.Verified), Assert.Single(before.Agents!));
+
+        // The same sink MergeQueueProvisioner reports a merge transition through.
+        _rig.Supervisor.MarkState(worker, nameof(WorkerMergeState.Verified), "Verified — waiting for review.");
+
+        var after = await CallAsync(coordinator, new AgentIpcRequest(AgentIpcRequest.StatusOp, AgentId: worker));
+        Assert.True(after.Ok, after.Error);
+        Assert.Contains(nameof(WorkerMergeState.Verified), Assert.Single(after.Agents!));
+
+        // …and the whole-fan-out form answers the same way, because that is the call a coordinator makes
+        // when it is asked to report on everything it started.
+        var all = await CallAsync(coordinator, new AgentIpcRequest(AgentIpcRequest.ListOp));
+        Assert.True(all.Ok, all.Error);
+        Assert.Contains(all.Agents!, row => row.Contains(worker) && row.Contains(nameof(WorkerMergeState.Verified)));
+    }
 
     private async Task<string> SpawnCoordinatorAsync(string repo)
     {

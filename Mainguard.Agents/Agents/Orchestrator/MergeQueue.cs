@@ -265,6 +265,7 @@ public sealed class MergeQueue : IMergeQueue
     private readonly IReadOnlyList<IMergeGate> _gates;
     private readonly IAuditLog _audit;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Action<string, WorkerMergeState>? _onStateChanged;
 
     private readonly Dictionary<string, WorkerMergeState> _states = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VerificationRecord?> _lastVerification = new(StringComparer.Ordinal);
@@ -427,6 +428,22 @@ public sealed class MergeQueue : IMergeQueue
     /// <param name="gates">Composable merge gates ANDed into <see cref="CanMerge"/> (P2-11/P2-35 hooks).</param>
     /// <param name="audit">Audit sink for the loud override path (<c>stale_override_used</c>).</param>
     /// <param name="clock">Injectable clock (tests use a virtual one).</param>
+    /// <param name="onStateChanged">
+    /// Called with <c>(agentId, newState)</c> after every REAL transition — the seam the daemon reports a
+    /// branch's merge state back onto its agent session through.
+    ///
+    /// <para><b>Why the queue has to say it and the session cannot infer it.</b> An agent session's state
+    /// word is a liveness word: the store writes <c>Working</c> when the sandbox attaches and nothing in
+    /// the session's own world ever learns that the branch verified. So a coordinator asking
+    /// <c>get_worker_status</c> after a green verification was told <c>Working</c> — permanently, and
+    /// while the queue said <c>Verified</c> — which makes a coordinator structurally unable to report the
+    /// completion of its own fan-out (coordinator contract §3). It is deliberately a notification and not
+    /// a second state machine: the words are <see cref="WorkerMergeState"/>'s own, and this queue stays
+    /// the only thing that decides them.</para>
+    ///
+    /// <para>Null in every test that does not care. Never allowed to fail a transition — see the guard at
+    /// the call site.</para>
+    /// </param>
     public MergeQueue(
         string repoHash,
         string currentMainSha,
@@ -436,7 +453,8 @@ public sealed class MergeQueue : IMergeQueue
         Func<string, CancellationToken, Task>? requeue = null,
         IReadOnlyList<IMergeGate>? gates = null,
         IAuditLog? audit = null,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        Action<string, WorkerMergeState>? onStateChanged = null)
     {
         _repoHash = repoHash ?? throw new ArgumentNullException(nameof(repoHash));
         _currentMainSha = currentMainSha ?? string.Empty;
@@ -447,6 +465,7 @@ public sealed class MergeQueue : IMergeQueue
         _gates = gates ?? Array.Empty<IMergeGate>();
         _audit = audit ?? new InMemoryAuditLog();
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _onStateChanged = onStateChanged;
 
         Hydrate();
     }
@@ -1586,6 +1605,47 @@ public sealed class MergeQueue : IMergeQueue
 
         _states[agentId] = target;
         SaveRowLocked(agentId, verifiedAt);
+
+        // AFTER the row is persisted, so nothing can be told a state the store does not yet hold — and
+        // only for a REAL move, because a notification for a transition that did not happen is how a
+        // reporting seam starts describing something other than the state machine.
+        if (from != target)
+        {
+            NotifyStateChangedLocked(agentId, target);
+        }
+    }
+
+    /// <summary>
+    /// Reports one transition to <c>onStateChanged</c>, swallowing anything it throws.
+    ///
+    /// <para><b>Reporting a state may never fail a transition.</b> The row is already written when this
+    /// runs; letting an exception out would abort the caller mid-move and leave the persisted state and
+    /// the in-memory state disagreeing about a branch's merge eligibility. Same posture, for the same
+    /// reason, as <c>MergeQueueProvisioner.MarkRunState</c>.</para>
+    ///
+    /// <para>Called under <c>_gate</c>, deliberately. The alternative — deferring to the ~15 sites that
+    /// raise <see cref="Changed"/> outside the lock — is a second, hand-maintained list of transition
+    /// points, and the one that gets forgotten is the one that stops reporting. The sink is a bounded,
+    /// non-blocking in-memory write (<c>AgentSessionStore.MarkState</c> → <c>TryWrite</c>), strictly
+    /// cheaper than the SQLite <c>Save</c> this method already performs under the same lock, and nothing
+    /// in the session store ever calls back into a queue.</para>
+    /// </summary>
+    private void NotifyStateChangedLocked(string agentId, WorkerMergeState target)
+    {
+        if (_onStateChanged is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _onStateChanged(agentId, target);
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed and deliberately not logged from here: this type has no log sink,
+            // and the only caller that supplies a sink (MergeQueueProvisioner) logs its own failures.
+        }
     }
 
     // Persists the current row for an agent (state + origin) without moving state. Used by EnsureEntry

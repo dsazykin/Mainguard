@@ -468,7 +468,14 @@
     keyed by `(repo, id)` to match, so two subscribed repositories that each have a pull request #n each
     get their own session and their own jail — the second is no longer `Failed` by name. Every lookup
     here carries the repo (`EnsureWorkerAsync`/`ReleaseWorkerAsync` both take `repoHash`), so one repo's
-    release can never stop, adopt or unlock another's worker.
+    release can never stop, adopt or unlock another's worker. It then calls
+    `IAgentWorktreeManager.DiscardAgentBranch` on **every** release path — the teardown itself now keeps
+    any branch carrying a commit, which is right for a worker whose work exists nowhere else and wrong
+    here twice over: an intake'd branch's commits were fetched FROM the pull request and still live
+    there, and `pr-<n>` is a reused id, so a kept branch would make the next intake of that number
+    collide with `CreateAgentWorktree`'s duplicate refusal on every poll forever. The early `return` on
+    the stopped-a-live-session path was removed for that reason: a discard behind it would have been
+    unreachable on exactly the case it exists for.
 - **`Runtime/ActiveRepoIndex.cs`** — which repositories this daemon has provisioned, and where the
   user's copy of each one is (`ActiveRepo(Handle, RepoPath)`; recorded by
   `RepoSyncGrpcService.ProvisionRepo` in the daemon-openable form). Everything daemon-side is keyed by
