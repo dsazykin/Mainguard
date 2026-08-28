@@ -117,6 +117,50 @@ public class AdapterInstructionDeliveryTests
         Assert.Null(round.SystemPromptArg);
     }
 
+    /// <summary>
+    /// The declared name is a path the daemon WRITES, at the root of the user's own checkout, and the
+    /// name it then excludes from the agent's commits. Both halves need it to be a plain relative path:
+    /// <c>Path.Combine(worktree, "../../x")</c> writes outside the worktree, and a name git cannot match
+    /// as a pattern is an exclusion that silently covers nothing.
+    ///
+    /// <para>Refused rather than sanitized, for the same reason the other delivery fields are: a quietly
+    /// rewritten name would be delivered to a path the CLI does not read — the exact inert delivery this
+    /// field exists to fix — and a quietly dropped one takes the exclusion with it.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("/etc/CLAUDE.md")]
+    [InlineData("../../escape.md")]
+    [InlineData("~/CLAUDE.md")]
+    [InlineData("sub/../../escape.md")]
+    [InlineData("CLAUDE.md ")]
+    public void AnInstructionsFileThatEscapesTheWorktree_IsRefusedAtParse(string declared)
+    {
+        var error = Assert.Throws<AdapterManifestException>(
+            () => AdapterManifest.Parse(ManifestDeclaring(declared)));
+
+        Assert.Equal(AdapterManifestError.Malformed, error.Error);
+        Assert.Contains("instructionsFile", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>The paired positive: an ordinary name — including one in a subdirectory — still parses,
+    /// so the refusal above is about escaping and not about rejecting the field.</summary>
+    [Theory]
+    [InlineData("CLAUDE.md")]
+    [InlineData("AGENTS.md")]
+    [InlineData(".config/instructions.md")]
+    public void AnOrdinaryInstructionsFileName_Parses(string declared)
+    {
+        Assert.Equal(
+            declared, AdapterManifest.Parse(ManifestDeclaring(declared)).Adapters.Single().InstructionsFile);
+    }
+
+    private static string ManifestDeclaring(string instructionsFile) =>
+        MinimalManifest().Replace(
+            "\"displayName\": \"Toolless\",",
+            "\"displayName\": \"Toolless\",\n      \"instructionsFile\": \""
+            + instructionsFile.Replace("\\", "\\\\", StringComparison.Ordinal) + "\",",
+            StringComparison.Ordinal);
+
     private static string MinimalManifest() => """
     {
       "adapters": [

@@ -256,6 +256,76 @@ public class CliSettingsRoundTripDockerTests
         }
     }
 
+    /// <summary>
+    /// The settings file is not the only thing Mainguard writes into the tree the agent commits — the
+    /// launcher also stages the role's operating instructions at the worktree root, under the name the
+    /// adapter declares (<c>CLAUDE.md</c> for claude-code). That half was delivered and never ignored.
+    ///
+    /// <para><b>The live evidence.</b> In the first end-to-end coordinator run the worker jail's
+    /// <c>info/exclude</c> carried only <c>/.claude/settings.local.json</c>,
+    /// <c>git check-ignore CLAUDE.md</c> answered rc=1, and <c>git status</c> showed <c>?? CLAUDE.md</c>
+    /// — so the worker's own <c>git add -A</c> would have committed Mainguard's briefing into the user's
+    /// branch. The worker noticed and said so in its report.</para>
+    ///
+    /// <para>Asserted the way its sibling above is: from inside the container, against real git, with the
+    /// declared name passed through <c>WorkspaceIgnorePaths</c> exactly as the launcher now passes it. A
+    /// unit test on the path list cannot see whether git agrees.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task TheInstructionsFileMainguardWrites_IsNeverCommittedIntoTheUsersRepository()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(4));
+        var ct = cts.Token;
+        await using var fixture = new SandboxFixture();
+
+        await fixture.EnsureEgressReadyAsync(ct);
+        var repoHash = "sbxinstr" + Guid.NewGuid().ToString("N")[..8];
+        var worktree = fixture.NewJailWritableTempWorktree();
+
+        var first = await fixture.Engine.SpawnAsync(Request(repoHash, worktree, fixture, null), ct);
+        try
+        {
+            await MakeWorkspaceAGitRepoAsync(fixture, first.ContainerId);
+
+            var second = await fixture.Engine.SpawnAsync(
+                Request(repoHash, worktree, fixture, null) with
+                {
+                    // What the launcher now sends: the settings path AND the adapter's instructions file.
+                    WorkspaceIgnorePaths = new[] { WorkspaceEntry.Path, InstructionsFile },
+                },
+                ct);
+            Assert.True(second.Reused, "the second spawn must have reused the first jail");
+
+            // The daemon's own write, at the worktree root — the same place the launcher puts it.
+            await WriteInJailAsync(
+                fixture, first.ContainerId, "/workspace/" + InstructionsFile, "# You are a Mainguard worker");
+
+            // It really is there: a clean status against a missing file would prove nothing.
+            Assert.NotEqual(
+                string.Empty,
+                await ReadInJailAsync(fixture, first.ContainerId, "/workspace/" + InstructionsFile));
+
+            // git's own opinion, not ours. check-ignore is the direct question; status is the one the
+            // agent's `git add -A` actually acts on.
+            var ignored = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
+                $"cd /workspace && git check-ignore -q {InstructionsFile}; echo \"rc=$?\"");
+            Assert.Equal("rc=0", ignored.Stdout.Trim());
+
+            var status = await fixture.ExecAsync(first.ContainerId, "sh", "-c",
+                "cd /workspace && printf 'BEGIN['; git status --porcelain; printf ']END'");
+            Assert.Equal(0, status.ExitCode);
+            Assert.Equal("BEGIN[]END", status.Stdout.Trim());
+        }
+        finally
+        {
+            try { await fixture.Engine.RemoveAsync(first.ContainerId, CancellationToken.None); }
+            catch { /* never fail a test from cleanup */ }
+        }
+    }
+
+    /// <summary>The name claude-code reads unprompted — the shipped adapter's own declaration.</summary>
+    private const string InstructionsFile = "CLAUDE.md";
+
     /// <summary>A spawn request for a FIXED (repo, agent, worktree), so two calls address one jail.</summary>
     private static SandboxSpawnRequest Request(
         string repoHash, string worktree, SandboxFixture fixture, IReadOnlyList<SandboxSettingsFile>? settings) =>

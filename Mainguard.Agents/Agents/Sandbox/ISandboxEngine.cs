@@ -70,13 +70,14 @@ public sealed record SandboxSecrets(
 /// <c>settingsPaths</c>) to restore into the jail's throwaway trees, write-if-absent exactly like the
 /// credential restore. Null/empty = none, which is what an UNTRUSTED jail always gets: an external
 /// pull request's code must never inherit the user's approved-command list.</param>
-/// <param name="WorkspaceIgnorePaths">The workspace-rooted settings paths this agent's CLI is
-/// DECLARED to use, whether or not anything is being restored into them. They are added to the agent
-/// repository's local <c>info/exclude</c>, because <c>/workspace</c> is the tree the agent commits and
-/// the CLI writes its approvals there itself — so on a first-ever session, with nothing to restore,
-/// the agent's own <c>git add -A</c> would otherwise commit the user's permission allowlist into their
-/// repository. Separate from <see cref="CliSettingsFiles"/> precisely because that case has no
-/// restore payload to derive it from.</param>
+/// <param name="WorkspaceIgnorePaths">Everything MAINGUARD writes into <c>/workspace</c>: the
+/// workspace-rooted settings paths this agent's CLI is DECLARED to use (whether or not anything is
+/// being restored into them) and the adapter's operating-instructions file. They are added to the agent
+/// repository's local <c>info/exclude</c>, because <c>/workspace</c> is the tree the agent commits — so
+/// without them the agent's own <c>git add -A</c> commits the user's permission allowlist, and
+/// Mainguard's own briefing, into the user's branch. Separate from <see cref="CliSettingsFiles"/>
+/// precisely because the session that matters most (a first-ever one) has no restore payload to derive
+/// it from.</param>
 public sealed record SandboxSpawnRequest(
     string RepoHash,
     string AgentId,

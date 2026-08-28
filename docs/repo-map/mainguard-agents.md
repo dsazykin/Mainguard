@@ -152,7 +152,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     which is what a CLI opens unprompted. The `MAINGUARD.md` staged beside the shim is inspectable but
     is NOT a delivery: nothing reads that path on its own, which is why naming the CLI's own convention
     is load-bearing rather than cosmetic. Both fields optional; an adapter declaring neither spawns
-    exactly as before.
+    exactly as before. `instructionsFile` is **refused at manifest parse** unless it is a plain relative
+    path (`Path.Combine(worktree, "../../x")` writes outside the worktree) and re-checked in the launcher,
+    because an installed marker is a JSON file on disk that no manifest parse re-reads. The name is also
+    what gets excluded from the agent's commits — one field decides both — and the launcher **never
+    overwrites** a file the worktree already has: a git exclude does not cover a TRACKED file, so in any
+    repository that keeps its own `CLAUDE.md` the write would replace the user's project instructions and
+    `git add -A` would stage it.
     **Telling a CLI its shim exists is not the same as letting it run one (defect C2).** A real
     claude-code coordinator followed these instructions exactly, ran `/opt/mainguard/ipc/mainguard-agent`
     as its first action, and got "This command requires approval" — in a jail with no human to answer,
@@ -811,14 +817,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
       older copy clobbering a live jail's fresher tokens or approvals. **`SettingsRootPath(root)`** is the
       ONE `AdapterSettingsRoot`→in-jail-directory mapping, shared with the harvest side so the two legs of
-      the round trip cannot drift apart. **`ApplyWorkspaceSettingsIgnoreAsync`** appends the WORKSPACE
-      settings paths to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and agents run
-      `git add -A`, so without this the feature would commit the user's permission allowlist into their
-      repository and merge it to main. Driven by `SandboxSpawnRequest.WorkspaceIgnorePaths` (the
-      adapter's DECLARATION) unioned with anything restored, because the session that most needs the
-      ignore is the FIRST one — nothing to restore, and the CLI creates the file itself. The exclude file
-      lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is touched and no
-      state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the round trip cannot drift apart. **`ApplyWorkspaceIgnoreAsync`** (was
+      `ApplyWorkspaceSettingsIgnoreAsync`; renamed because it is no longer about settings) appends
+      EVERYTHING MAINGUARD WRITES INTO `/workspace` to `$GIT_DIR/info/exclude` — `/workspace` IS the
+      agent's git worktree and agents run `git add -A`, so without this the daemon commits the user's
+      permission allowlist, and its own operating-instructions file, into their branch. Driven by
+      `SandboxSpawnRequest.WorkspaceIgnorePaths` (the adapter's DECLARATION — settings paths **and**
+      `instructionsFile`) unioned with anything restored, because the session that most needs the ignore
+      is the FIRST one — nothing to restore, and the CLI creates the file itself. This method learns no
+      filename: the union is `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`. The instructions half
+      was found in production — `git check-ignore CLAUDE.md` answered rc=1 in a live worker jail and the
+      worker's own report flagged the stray `?? CLAUDE.md`. The exclude file lives in the per-agent repo
+      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared

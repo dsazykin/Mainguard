@@ -958,7 +958,11 @@
   (`instructionsFile` + `systemPromptArg`), the file named is one the CLI opens UNPROMPTED (the copy
   staged beside the shim at `/opt/mainguard/ipc/MAINGUARD.md` is not a delivery, because nothing reads it
   on its own), an adapter may declare neither, and the install marker carries both across the host/VM
-  boundary — the daemon reads the marker, so a field that stopped at the manifest reaches no jail.
+  boundary — the daemon reads the marker, so a field that stopped at the manifest reaches no jail. Plus
+  the escape refusal: `instructionsFile` is a path the daemon WRITES at the root of the user's own
+  checkout and the name it then excludes from the agent's commits, so a rooted, `~`-rooted, `..`-bearing
+  or whitespace-padded name is refused AT PARSE with a paired positive (`CLAUDE.md`, `AGENTS.md`, a
+  subdirectory) proving the refusal is about escaping rather than about the field.
 - **`Mainguard.Tests/AdapterPreApprovalTests.cs`** — the manifest half of defect C2's fix: how a CLI
   spells "this one command needs no approval" (`preApprovedCommandArg` + `preApprovedCommandFormat`), and
   the refusals that stop the declaration widening into more than it says. The shipped `claude-code`
@@ -1051,6 +1055,20 @@
   and an undeclared `.ssh/authorized_keys` are both dropped) and the 256 KiB harvest ceiling. Docker-free:
   a fake substrate whose sandbox engine RECORDS every `SandboxSpawnRequest`, so what actually reaches a
   jail is observable. The real-jail leg is `Agents/CliSettingsRoundTripDockerTests.cs`.
+  **The settings file is not the only thing Mainguard writes into the tree the agent commits:**
+  `TheInstructionsFileTheLauncherStages_IsAlsoWhatTheJailIsToldToIgnore` drives the REAL spawn and
+  asserts both halves of it — the file really was staged at the worktree root AND its name really is in
+  `WorkspaceIgnorePaths` — because the defect was precisely that the two disagreed, and a unit test on
+  the path list alone would stay green while the spawn kept sending the old one.
+  `AFileTheRepositoryAlreadyHas_IsNotReplacedByMainguardsBriefing` seeds every created worktree with a
+  file of that name (a repository that TRACKS one) and asserts the user's bytes survive.
+- **`Mainguard.Server.Tests/InstructionFileHygieneTests.cs`** — the pure halves of "Mainguard's own
+  instruction file must not become part of the user's history": which paths the jail is told to ignore
+  (the union follows the DECLARED name, never a hardcoded `CLAUDE.md`, and a malformed declaration never
+  reaches a git ignore file) and what is written where (into an empty slot yes; over a file the worktree
+  already has never; an escaping name writes nothing anywhere). `WhateverIsStaged_IsAlsoIgnored` states
+  the coupling as one assertion rather than two independently-true facts. The in-jail leg — whether git
+  AGREES the file is ignored — is `Agents/CliSettingsRoundTripDockerTests`.
 - **`Mainguard.Server.Tests/MergeExecutionPathTests.cs`** — the GUI Merge button actually merges,
   end to end through the real composition (in-proc daemon + shipped `DaemonClient` + shipped
   `DaemonBackedOrchestrator` + a real git repo on disk). **Asserts repository state, never RPC
@@ -2355,7 +2373,12 @@
   `SandboxFixture.NewJailWritableTempWorktree()`: a default-mode temp worktree measures the RUNNER's
   uid mapping rather than the feature, which is exactly how the first CI run failed with
   `mkdir: cannot create directory '/workspace/.probe': Permission denied` after passing locally. The
-  gates that decide WHEN any of this runs are `CliSettingsBoundaryTests`),
+  gates that decide WHEN any of this runs are `CliSettingsBoundaryTests`. A third ignore leg,
+  `TheInstructionsFileMainguardWrites_IsNeverCommittedIntoTheUsersRepository`, asks git itself about the
+  OTHER file the daemon writes into `/workspace` — `git check-ignore CLAUDE.md` must answer rc=0 and
+  `git status` must stay empty with the file present. Measured in a live jail before the fix:
+  `info/exclude` held only the settings path, `check-ignore` answered rc=1, and the worker's own report
+  flagged the stray `?? CLAUDE.md`),
   `SpawnImagePreflightTests.cs` (the v1 spawn preflight, in-proc — no docker: both images present
   proceeds to the engine; a missing `mainguard-agent-base`/`mainguard-egress-proxy` answers
   `FailedPrecondition` naming exactly that image + the repair BEFORE any worktree/jail work — the

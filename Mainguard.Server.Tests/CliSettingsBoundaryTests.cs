@@ -278,6 +278,54 @@ public sealed class CliSettingsBoundaryTests
         Assert.Equal(new[] { Declared.Path }, rig.Engine.LastSpawn!.WorkspaceIgnorePaths);
     }
 
+    /// <summary>
+    /// The settings path is not the only thing Mainguard writes into the tree the agent commits: the
+    /// launcher also stages the adapter's declared instructions file at the worktree root. Driven through
+    /// the REAL spawn, and asserting both halves of the same spawn, because the failure this closes is
+    /// exactly a disagreement between them — the file was written and the ignore list did not name it.
+    ///
+    /// <para>A test on <c>DeclaredWorkspaceIgnorePaths</c> alone would stay green while the spawn kept
+    /// sending the old list: phase 3's own M7 shape, a correct function nobody calls correctly.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheInstructionsFileTheLauncherStages_IsAlsoWhatTheJailIsToldToIgnore()
+    {
+        using var rig = SettingsRig.Create(instructionsFile: "PROBE_INSTRUCTIONS.md");
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None);
+
+        Assert.Equal(
+            new[] { Declared.Path, "PROBE_INSTRUCTIONS.md" }, rig.Engine.LastSpawn!.WorkspaceIgnorePaths);
+
+        // …and it really was written, at the root of the worktree that spawn created.
+        var staged = Path.Combine(rig.Engine.LastSpawn!.WorktreePath, "PROBE_INSTRUCTIONS.md");
+        Assert.True(File.Exists(staged), $"the launcher staged nothing at {staged}");
+    }
+
+    /// <summary>
+    /// The one case an exclude cannot cover, driven through the real spawn: the repository already has a
+    /// file of that name, so it is tracked, so <c>info/exclude</c> is inert for it and a write is a
+    /// modification <c>git add -A</c> stages. Mainguard replacing the user's own project instructions is
+    /// a worse outcome than the stray untracked file this change is about.
+    /// </summary>
+    [Fact]
+    public async Task AFileTheRepositoryAlreadyHas_IsNotReplacedByMainguardsBriefing()
+    {
+        var theirs = "# the user's own instructions\n";
+        // Every worktree this rig creates arrives already carrying that file — the way a real checkout of
+        // a repository that tracks one does.
+        using var rig = SettingsRig.Create(
+            instructionsFile: "PROBE_INSTRUCTIONS.md",
+            seedWorktreeFile: ("PROBE_INSTRUCTIONS.md", theirs));
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None);
+
+        var path = Path.Combine(rig.Engine.LastSpawn!.WorktreePath, "PROBE_INSTRUCTIONS.md");
+        Assert.Equal(theirs, File.ReadAllText(path));
+    }
+
     [Fact]
     public void OnlyWorkspaceRootedDeclarations_BecomeIgnoreEntries()
     {
@@ -333,7 +381,15 @@ public sealed class CliSettingsBoundaryTests
         /// <param name="inJailSettings">What the fake jail's declared settings file holds. Defaults to the
         /// ordinary allowlist; a test that cares about the role-scoped-grant boundary (D5b) puts a jail's
         /// own IPC grant in it, which is exactly what the reporting machine's store was found holding.</param>
-        public static SettingsRig Create(string? inJailSettings = null)
+        /// <param name="instructionsFile">The adapter's declared instructions file, if any — the second
+        /// thing Mainguard writes into <c>/workspace</c>. Null keeps the pre-existing shape (an adapter
+        /// with no file-side delivery), which is what every other test here wants.</param>
+        /// <param name="seedWorktreeFile">A file every created worktree already carries, so a test can
+        /// stand where the user's own repository tracks the name the adapter declares.</param>
+        public static SettingsRig Create(
+            string? inJailSettings = null,
+            string? instructionsFile = null,
+            (string Path, string Content)? seedWorktreeFile = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-settings-gate-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -343,12 +399,13 @@ public sealed class CliSettingsBoundaryTests
             File.WriteAllText(
                 Path.Combine(registry, AgentKind + ".json"),
                 InstalledAdapterMarker.Serialize(new InstalledAdapterMarker(
-                    AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared })));
+                    AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared },
+                    InstructionsFile: instructionsFile)));
 
             var engine = new RecordingSandboxEngine(inJailSettings ?? InJailSettings);
             var host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             {
-                services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine));
+                services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine, seedWorktreeFile));
                 services.AddSingleton(new InstalledAdapterCatalog(registry));
                 services.AddSingleton(sp => new AgentCliBinder(
                     sp.GetRequiredService<TerminalSessionManager>(),
@@ -412,12 +469,13 @@ public sealed class CliSettingsBoundaryTests
         {
             private readonly string _root;
 
-            public FakeEnvironment(string root, ISandboxEngine sandboxes)
+            public FakeEnvironment(
+                string root, ISandboxEngine sandboxes, (string Path, string Content)? seedWorktreeFile = null)
             {
                 _root = root;
                 Sandboxes = sandboxes;
                 Repos = new FakeProvisioner(root);
-                Worktrees = new FakeWorktrees(root);
+                Worktrees = new FakeWorktrees(root, seedWorktreeFile);
             }
 
             public string SubstrateId => "fake";
@@ -449,13 +507,24 @@ public sealed class CliSettingsBoundaryTests
             private sealed class FakeWorktrees : IAgentWorktreeManager
             {
                 private readonly string _root;
+                private readonly (string Path, string Content)? _seed;
 
-                public FakeWorktrees(string root) => _root = root;
+                public FakeWorktrees(string root, (string Path, string Content)? seed = null)
+                {
+                    _root = root;
+                    _seed = seed;
+                }
 
                 public string CreateAgentWorktree(string repoHash, string agentId)
                 {
                     var path = Path.Combine(_root, "wt", repoHash, agentId);
                     Directory.CreateDirectory(path);
+                    if (_seed is { } seed)
+                    {
+                        // A checkout that already carries this file — i.e. the repository tracks it.
+                        File.WriteAllText(Path.Combine(path, seed.Path), seed.Content);
+                    }
+
                     return path;
                 }
 

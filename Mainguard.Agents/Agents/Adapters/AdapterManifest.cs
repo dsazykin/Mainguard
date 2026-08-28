@@ -440,6 +440,18 @@ public sealed record AdapterManifest(
                 }
             }
 
+            // The instructions file is a path the daemon WRITES, at the root of the user's own checkout,
+            // and whose name is also what gets excluded from the agent's commits. Both halves need it to
+            // be a plain relative path: `Path.Combine(worktree, "../../x")` writes outside the worktree,
+            // and a name git cannot match as a pattern is an exclusion that silently covers nothing.
+            // Refused rather than sanitized — a quietly rewritten name would be delivered to a path the
+            // CLI does not read, which is the exact inert delivery this field was added to fix.
+            if (a.InstructionsFile is not null && !IsHomeRelativeFilePath(a.InstructionsFile))
+                throw new AdapterManifestException(AdapterManifestError.Malformed,
+                    $"Adapter '{a.Id}' instructionsFile '{a.InstructionsFile}' must be a plain relative file "
+                    + "path inside the worktree (no leading '/', '~', '..' segments, backslashes, or control "
+                    + "characters) — the daemon writes it at the worktree root and excludes it by that name.");
+
             if (a.SettingsPaths is not null)
             {
                 // The credential list, as the SHAPE GATE already accepted it — the comparison below has

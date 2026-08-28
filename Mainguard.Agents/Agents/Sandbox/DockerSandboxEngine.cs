@@ -193,7 +193,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
                 // Same reason, same write-if-absent rule: a relaunched jail's home came back empty, so
                 // the user's approved-command list has to be put back or every command is re-prompted.
                 await RestoreCliSettingsAsync(existing.ID, request, ct).ConfigureAwait(false);
-                await ApplyWorkspaceSettingsIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
+                await ApplyWorkspaceIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
                 // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
                 // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
                 // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
@@ -259,7 +259,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // Driven by the adapter's DECLARATION, so it also covers the first-ever session — the one
             // with nothing to restore, where the CLI creates the file itself the moment the user
             // approves something. That is the session the ignore matters most in.
-            await ApplyWorkspaceSettingsIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
+            await ApplyWorkspaceIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
         }
         catch
         {
@@ -633,15 +633,23 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     }
 
     /// <summary>
-    /// Keeps the CLI's WORKSPACE settings file out of the agent's commits.
+    /// Keeps <b>everything Mainguard itself writes into <c>/workspace</c></b> out of the agent's commits:
+    /// the CLI's workspace settings file, and the operating-instructions file the launcher stages at the
+    /// worktree root.
     ///
-    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so that
-    /// file is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c>
-    /// (their own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the
-    /// user's permission allowlist would start committing it into their repository and merging it to
-    /// main: a convenience feature quietly writing to the user's history. The MG-43 package cache was
-    /// moved out of the worktree for exactly this reason; this file cannot move, because it is where
-    /// the CLI reads it from.</para>
+    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so each of
+    /// those is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c> (their
+    /// own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the user's
+    /// permission allowlist would start committing it into their repository and merging it to main: a
+    /// convenience feature quietly writing to the user's history. The MG-43 package cache was moved out
+    /// of the worktree for exactly this reason; neither of these files can move, because they are where
+    /// the CLI reads them from.</para>
+    ///
+    /// <para><b>The instructions file is here because it was missed, and it was found in production.</b>
+    /// In a live worker jail <c>info/exclude</c> carried only the settings path, <c>git check-ignore
+    /// CLAUDE.md</c> answered rc=1, and the worker's own report flagged the stray <c>?? CLAUDE.md</c>.
+    /// The caller (<c>SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths</c>) is what unions the two, so
+    /// this method stays a list-of-paths applier and never learns any filename.</para>
     ///
     /// <para><b>Why it is driven by the DECLARATION and not by the restore.</b> On a first-ever session
     /// there is nothing to restore — the CLI creates the file itself the moment the user approves
@@ -659,7 +667,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// here must never fail a spawn — the settings are already in place, which is the user-visible
     /// half.</para>
     /// </summary>
-    private async Task ApplyWorkspaceSettingsIgnoreAsync(
+    private async Task ApplyWorkspaceIgnoreAsync(
         string containerId, SandboxSpawnRequest request, CancellationToken ct)
     {
         var workspacePaths = (request.WorkspaceIgnorePaths ?? Array.Empty<string>())

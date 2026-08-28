@@ -839,3 +839,64 @@ presented as such.
   then. Rewriting a user's store from the daemon at startup is a separate, reviewable change, and this one
   deliberately does not write to it.
 - **§8.5's folder-trust dialog is still open**, unchanged by either defect here.
+
+---
+
+## 11. The first end-to-end run's two defects (E1, E2 in the run report; E1/E3 here)
+
+The coordinator loop ran end to end for the first time. It reached the merge queue's doorstep and did
+two things wrong on the way, both of which the *worker* noticed before we did.
+
+### 11.1 Mainguard's own instruction file was polluting the user's branch
+
+`ab8234b7` made the daemon write the adapter's declared `instructionsFile` (claude-code: `CLAUDE.md`)
+into the worker's worktree root, because that is what the CLI opens unprompted. That worked. Nothing
+ignored it.
+
+Measured in the live jail, and reproduced in a container against real git before anything was changed:
+
+```
+.git/info/exclude            → only "/.claude/settings.local.json"
+git check-ignore CLAUDE.md   → rc=1
+git status --porcelain       → ?? CLAUDE.md
+git add -A                   → stages CLAUDE.md
+```
+
+So every worker's own `git add -A` would commit Mainguard's briefing into the user's branch, forever.
+The worker in that run flagged the stray file in its report unprompted — the shape of a defect a user
+finds first.
+
+**The fix follows the declared name, not `CLAUDE.md`.** `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`
+unions the adapter's workspace settings paths with its `instructionsFile`, and one field now decides both
+what is written and what is excluded. Hardcoding today's filename would have kept every test green and
+silently stopped covering the next CLI (MG-12's standing shape). The engine method that applies the list
+learns no filename at all and was renamed `ApplyWorkspaceIgnoreAsync` to stop claiming it is about
+settings.
+
+**The second half, which the exclude cannot do.** *A git exclude does not apply to a tracked file.*
+Probed in a container: in a repository that tracks `CLAUDE.md` — this one, and every repository with
+project instructions — with `/CLAUDE.md` present in `info/exclude`, `check-ignore` still answers rc=1,
+`status` reports `M CLAUDE.md`, and `git add -A` stages the daemon's text OVER the user's own. So for
+exactly the repositories most likely to hit it, the ignore is inert and the write is destructive. The
+launcher therefore **never overwrites**: it stages into an empty slot or logs and skips. `File.Exists`
+rather than "is it tracked", because on a freshly created worktree those are the same question and it is
+the destructive case the rule has to be right about; on a resumed worktree the file is this daemon's own
+dropping, already excluded, and for claude-code the launch flag re-delivers the current text anyway.
+
+**Also closed, found while doing it:** `instructionsFile` was never validated. `Path.Combine(worktree,
+"../../x")` writes outside the worktree. It is now refused at manifest parse *and* re-checked in the
+launcher, because an `InstalledAdapterMarker` is a JSON file on disk that no manifest parse re-reads.
+
+**Deliberately left:** nothing else the daemon writes into `/workspace` was found. The package cache is
+outside the worktree (MG-43), credentials go to the tmpfs `$HOME`, and the shim and IPC copy of the
+instructions live under the read-only `/opt/mainguard/ipc` mount.
+
+| # | enforcement removed | result |
+|---|---|---|
+| M1 | the ignore list drops the instructions file (the pre-change behaviour) | **6 failed** / 23 passed |
+| M2 | the ignore list hardcodes `CLAUDE.md` instead of the declared name | **4 failed** / 25 passed |
+| M3 | the ignore list drops the `IsHomeRelativeFilePath` filter | **3 failed** / 26 passed |
+| M4 | the staging step drops the no-clobber refusal | **2 failed** / 27 passed |
+| M5 | the staging step drops the escaping-name check | **2 failed** / 27 passed |
+| M6 | the spawn reverts to the settings-only list (a correct function nobody calls correctly) | **1 failed** / 28 passed |
+| M7 | the manifest parse refusal removed | **5 failed** / 8 passed |

@@ -49,6 +49,7 @@ public sealed class SandboxAgentLauncher
     private const string LegacyApiKeyEnvVar = "ANTHROPIC_API_KEY";
 
     private readonly IAgentEnvironment _environment;
+
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly ILogger _log;
@@ -293,20 +294,9 @@ public sealed class SandboxAgentLauncher
         // that names no instructions file simply has no file-side delivery and relies on the flag.
         // Best-effort: an agent that starts without its briefing is worse off, not broken, and a spawn
         // that fails because a markdown file could not be written would be the worse trade.
-        if (!withoutRepositoryAccess
-            && worktreePath is { Length: > 0 }
-            && adapter?.InstructionsFile is { Length: > 0 } instructionsFile)
+        if (!withoutRepositoryAccess && worktreePath is { Length: > 0 })
         {
-            try
-            {
-                File.WriteAllText(
-                    Path.Combine(worktreePath, instructionsFile), instructions.Replace("\r\n", "\n"));
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                _log.LogWarning(
-                    ex, "could not stage {File} into the worktree for agent={Agent}", instructionsFile, agentId);
-            }
+            TryStageInstructionsFile(worktreePath, adapter, instructions, agentId);
         }
         try
         {
@@ -401,12 +391,13 @@ public sealed class SandboxAgentLauncher
                 // paths on the wire. An untrusted spawn never reaches here with any (the caller passes
                 // none), so this filter is the second gate, not the only one.
                 CliSettingsFiles: FilterCliSettings(cliSettings, adapter),
-                // The DECLARED workspace settings paths, sent whether or not anything is being restored
-                // into them: /workspace is the tree the agent commits, and on a first-ever session the
-                // CLI creates its own settings file there the moment the user approves something. That
-                // file must never reach the user's history, and that session has no restore payload to
-                // infer the path from.
-                WorkspaceIgnorePaths: DeclaredWorkspaceSettingsPaths(adapter),
+                // EVERYTHING Mainguard writes into /workspace: the DECLARED workspace settings paths, sent
+                // whether or not anything is being restored into them (on a first-ever session the CLI
+                // creates its own settings file there the moment the user approves something, and that
+                // session has no restore payload to infer the path from), AND the instructions file
+                // staged a few dozen lines above. /workspace is the tree the agent commits; nothing
+                // Mainguard put there may reach the user's history.
+                WorkspaceIgnorePaths: DeclaredWorkspaceIgnorePaths(adapter),
                 ToolchainsRootPath: mountedToolchainIds.Count > 0 ? _environment.ToolchainsRootPath : null,
                 ToolchainIds: mountedToolchainIds,
                 // Stamped onto the jail's labels. The daemon's live session store is in-memory, so after a
@@ -875,6 +866,109 @@ public sealed class SandboxAgentLauncher
                 .Select(d => d.Path)
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
+
+    /// <summary>
+    /// <b>Everything Mainguard itself writes into <c>/workspace</c></b>, and therefore everything the
+    /// jail's local <c>info/exclude</c> must carry: the adapter's declared workspace settings paths
+    /// <i>and</i> its <see cref="InstalledAdapterMarker.InstructionsFile"/>.
+    ///
+    /// <para><b>The defect this closes.</b> The instructions file was delivered and never ignored.
+    /// Measured in a live worker jail: <c>info/exclude</c> held only <c>/.claude/settings.local.json</c>,
+    /// <c>git check-ignore CLAUDE.md</c> answered rc=1, and every worker's <c>git status</c> showed
+    /// <c>?? CLAUDE.md</c> — so the agent's own <c>git add -A</c> would commit MAINGUARD'S OWN briefing
+    /// into the user's branch, in every repository. The worker in that run noticed unprompted and said so
+    /// in its report, which is the shape of a defect the user finds first.</para>
+    ///
+    /// <para><b>Why the DECLARED name rather than <c>CLAUDE.md</c>.</b> The filename is vendor knowledge
+    /// carried per adapter (<c>instructionsFile</c>), and the daemon writes whatever that field says. An
+    /// exclusion hardcoded to today's value would keep passing its tests and silently stop covering the
+    /// next CLI Mainguard ships — the "a description that outlived the thing it described" failure (MG-12)
+    /// this codebase keeps re-finding. One field decides both what is written and what is ignored.</para>
+    ///
+    /// <para>Filtered through <see cref="AdapterManifest.IsHomeRelativeFilePath"/> for the same reason the
+    /// settings half is: this list is written verbatim into a git ignore file, and an installed marker is
+    /// a JSON file on disk that no manifest parse re-validates.</para>
+    /// </summary>
+    internal static IReadOnlyList<string> DeclaredWorkspaceIgnorePaths(InstalledAdapterMarker? adapter) =>
+        DeclaredWorkspaceSettingsPaths(adapter)
+            .Concat(AdapterManifest.IsHomeRelativeFilePath(adapter?.InstructionsFile)
+                ? new[] { adapter!.InstructionsFile! }
+                : Array.Empty<string>())
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+    /// <summary>
+    /// Writes the role's operating instructions to the adapter's declared file at the worktree root —
+    /// <b>and only where there is nothing of the user's to destroy</b>. Returns the relative path written,
+    /// or null when nothing was written (which is not a failure).
+    ///
+    /// <para><b>Why it refuses to overwrite, measured rather than reasoned.</b> The obvious reading of
+    /// "keep it out of the user's history" is the <c>info/exclude</c> entry — and a git exclude does not
+    /// apply to a TRACKED file. Probed in a container against real git: in a repository that tracks
+    /// <c>CLAUDE.md</c>, with <c>/CLAUDE.md</c> present in <c>info/exclude</c>,
+    /// <c>git check-ignore CLAUDE.md</c> still answers rc=1, <c>git status</c> reports <c>M CLAUDE.md</c>,
+    /// and <c>git add -A</c> stages the daemon's text over the user's own instructions as an ordinary
+    /// modification. So for exactly the repositories most likely to declare one — anything with a
+    /// <c>CLAUDE.md</c> at its root, this one included — the ignore is inert and the write is destructive.
+    /// A briefing is worth writing into an empty slot; it is not worth silently replacing a file the user
+    /// wrote and tracks.</para>
+    ///
+    /// <para><b>File.Exists, not "is it tracked".</b> On a freshly created worktree the two are the same
+    /// question, and that is the case that destroys something. On an ADOPTED (resumed) worktree the file
+    /// may instead be this daemon's own dropping from the previous spawn — already excluded, and already
+    /// carrying this text — so skipping it costs nothing, while for claude-code the launch flag delivers
+    /// the current text on every start regardless. One rule, no git process, and the destructive case is
+    /// the one it is right about.</para>
+    ///
+    /// <para><b>The path is re-validated here</b> even though the manifest parser now refuses a malformed
+    /// <c>instructionsFile</c>: an <see cref="InstalledAdapterMarker"/> is a JSON file on disk written at
+    /// install time and read back at spawn, so nothing re-parses it through the manifest. Without this,
+    /// <c>Path.Combine</c> with a rooted or <c>..</c>-bearing name writes OUTSIDE the worktree.</para>
+    /// </summary>
+    internal string? TryStageInstructionsFile(
+        string worktreePath, InstalledAdapterMarker? adapter, string instructions, string agentId)
+    {
+        if (adapter?.InstructionsFile is not { Length: > 0 } instructionsFile)
+        {
+            return null;
+        }
+
+        if (!AdapterManifest.IsHomeRelativeFilePath(instructionsFile))
+        {
+            _log.LogWarning(
+                "adapter {Adapter} declares instructionsFile '{File}', which is not a plain relative path — "
+                + "nothing was written for agent={Agent}", adapter.Id, instructionsFile, agentId);
+            return null;
+        }
+
+        var target = Path.Combine(worktreePath, instructionsFile);
+        if (File.Exists(target))
+        {
+            _log.LogInformation(
+                "not staging {File} for agent={Agent}: the worktree already has one, and a git exclude "
+                + "does not cover a tracked file — overwriting would put Mainguard's text into the user's "
+                + "own history", instructionsFile, agentId);
+            return null;
+        }
+
+        try
+        {
+            var parent = Path.GetDirectoryName(target);
+            if (parent is { Length: > 0 })
+            {
+                Directory.CreateDirectory(parent);
+            }
+
+            File.WriteAllText(target, instructions.Replace("\r\n", "\n"));
+            return instructionsFile;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _log.LogWarning(
+                ex, "could not stage {File} into the worktree for agent={Agent}", instructionsFile, agentId);
+            return null;
+        }
+    }
 
     /// <summary>
     /// The operating instructions a jail of this role is handed, <b>bound to this daemon's catalog</b>.

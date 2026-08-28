@@ -228,7 +228,13 @@
     pre-approved commands anywhere in the home or the checkout — and `HarvestCliSettingsAsync` reads
     them back out (size-checked in the shell, so an oversized file never enters daemon memory),
     resolving each root through `DockerSandboxEngine.SettingsRootPath` so restore and harvest cannot
-    address different directories.
+    address different directories. It also owns what Mainguard WRITES into a worker's checkout:
+    `TryStageInstructionsFile` puts the role's operating instructions at the adapter's declared
+    `instructionsFile` — validated as a plain relative path, and **never over a file the worktree already
+    has**, because a git exclude does not cover a tracked file and the write would otherwise replace a
+    user's own `CLAUDE.md` — and `DeclaredWorkspaceIgnorePaths` is the union (settings paths + that
+    filename) the jail's `info/exclude` is built from, so what the daemon writes and what git ignores are
+    decided by one field.
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
