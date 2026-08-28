@@ -142,6 +142,14 @@ public sealed record CredTmpfsSpec(
 /// <param name="IpcDirPath">The VM-side per-agent IPC dir (coordinator jails only), bind-mounted
 /// READ-ONLY at <see cref="Ipc.AgentIpcPaths.SandboxMount"/>; same G-11 ext4-only rejection as every
 /// other mount. Null/empty = no IPC mount (workers).</param>
+/// <param name="IpcOutboxPath">The <c>outbox/</c> child of <paramref name="IpcDirPath"/>, bind-mounted
+/// READ-WRITE at <see cref="Ipc.AgentIpcPaths.SandboxOutboxPath"/> — nested inside the read-only IPC
+/// mount, which leaves the shim and the instructions unwritable while giving the jail a mailbox.
+/// <para>Supplied ONLY where the substrate cannot carry a Unix socket across the container mount
+/// boundary — which today is macOS, where the daemon runs on the host and jails run in the engine's
+/// Linux VM, and Docker's file sharing does not proxy AF_UNIX: the socket bind-mounts in as an inert
+/// inode and every <c>connect()</c> fails ECONNREFUSED. Null/empty everywhere else, and then the jail
+/// has no writable bind mount at all, exactly as before.</para></param>
 /// <param name="BareRepoPath">The VM-side <b>shared mirror</b>, bind-mounted at its <b>identical</b> VM
 /// path so the per-agent repo's <c>objects/info/alternates</c> (an absolute VM path into
 /// <c>&lt;bare&gt;/objects</c>) resolves inside the jail — without it in-jail git cannot read a single
@@ -183,6 +191,7 @@ public sealed record ContainerSpecRequest(
     string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
+    string? IpcOutboxPath = null,
     string? BareRepoPath = null,
     string? DnsServerAddress = null,
     string? AgentRepoPath = null,
@@ -372,6 +381,8 @@ public static class ContainerSpecBuilder
             });
         }
 
+        AddIpcOutboxMount(request, mounts);
+
         if (!string.IsNullOrEmpty(request.PackageCachePath))
         {
             RejectNonExt4Source(request.PackageCachePath);
@@ -454,8 +465,61 @@ public static class ContainerSpecBuilder
             });
         }
 
+        AddIpcOutboxMount(request, mounts);
+
         return mounts;
     }
+
+    /// <summary>
+    /// The read-write outbox, nested inside the read-only IPC mount. On the substrates that need it this
+    /// is the coordinator jail's ONLY writable bind mount, which is why the guard is exact rather than
+    /// shaped: the source must be the <c>outbox/</c> child of THIS request's IPC dir, so the field can
+    /// never be edited into a second writable path at the mirror, the per-agent git dir, or anywhere else
+    /// under the daemon's home (MG-3, and the same reasoning as the package cache's <c>caches/</c> gate).
+    ///
+    /// <para>Nested rather than a separate top-level target so the read-only mount keeps covering the
+    /// shim and the operating instructions: an agent that could rewrite its own shim would be harming
+    /// only itself, but "the thing the CLI executes is the daemon's file" is worth keeping structural.
+    /// The engine sorts mounts by target depth, so the nesting resolves regardless of list order.</para>
+    /// </summary>
+    private static void AddIpcOutboxMount(ContainerSpecRequest request, List<Mount> mounts)
+    {
+        if (string.IsNullOrEmpty(request.IpcOutboxPath))
+        {
+            return;
+        }
+
+        RejectNonExt4Source(request.IpcOutboxPath);
+
+        var expected = string.IsNullOrEmpty(request.IpcDirPath)
+            ? null
+            : Ipc.AgentIpcPaths.OutboxIn(request.IpcDirPath);
+        if (expected is null || !SamePath(request.IpcOutboxPath, expected))
+        {
+            throw new SandboxSpecException(
+                $"Refusing '{request.IpcOutboxPath}' as an IPC outbox source. The outbox mount is "
+                + "READ-WRITE, so it may only ever name the '" + Ipc.AgentIpcPaths.OutboxDirName
+                + "' directory inside THIS agent's own IPC dir"
+                + (expected is null ? " — and this request names no IPC dir at all." : $" ('{expected}').")
+                + " Any other source would be a second writable path into daemon-owned state (MG-3).");
+        }
+
+        mounts.Add(new Mount
+        {
+            Type = "bind",
+            Source = request.IpcOutboxPath,
+            Target = Ipc.AgentIpcPaths.SandboxOutboxPath,
+            // READ-WRITE by definition: this IS the channel on a substrate whose mount cannot carry a
+            // socket. The jail drops a request file here and polls for its answer.
+            ReadOnly = false,
+        });
+    }
+
+    private static bool SamePath(string left, string right) =>
+        string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar),
+            Mainguard.Git.Services.FileSystemPaths.Comparison);
 
     /// <summary>
     /// The writable surfaces, all tmpfs (the rootfs is read-only and every bind mount that is not the

@@ -59,6 +59,61 @@ public static class AgentIpcPaths
     /// <summary>The instructions path as the jail sees it.</summary>
     public const string SandboxInstructionsPath = SandboxMount + "/" + InstructionsFileName;
 
+    // ---- The outbox: the same channel, framed as files, for substrates whose mount cannot carry a
+    // socket ---------------------------------------------------------------------------------------
+    //
+    // Docker's macOS file sharing (virtiofs / gRPC-FUSE) does NOT proxy AF_UNIX across the host/VM
+    // boundary. The daemon runs natively on the Mac while jails run in the engine's Linux VM, so
+    // <see cref="SocketFileName"/> is bind-mounted into the jail as an inert inode: it stat()s as a
+    // socket and every connect() to it fails ECONNREFUSED. Measured, not inferred — a jail could not
+    // reach a listening daemon at all, which made every coordinator tool dead on that platform.
+    //
+    // The outbox is that channel re-framed as regular files, which the same mount DOES carry in both
+    // directions: the shim drops one request file and polls for its answer, the daemon polls for
+    // requests and writes answers. Same JSON, same daemon handler, same blocking semantics (a plan
+    // presentation still parks for as long as the human takes, because the answer file is simply not
+    // written until the handler returns). What it costs is one READ-WRITE mount, nested inside the
+    // read-only IPC dir, on the substrates that need it — see the mount's comment in
+    // ContainerSpecBuilder for why that dir and nothing else.
+
+    /// <summary>The outbox directory's name (inside the IPC dir).</summary>
+    public const string OutboxDirName = "outbox";
+
+    /// <summary>The outbox as the jail sees it — the ONE writable path in a coordinator jail.</summary>
+    public const string SandboxOutboxPath = SandboxMount + "/" + OutboxDirName;
+
+    /// <summary>Suffix of a request the shim has finished writing and the daemon may claim.</summary>
+    public const string OutboxRequestSuffix = ".req";
+
+    /// <summary>Suffix the shim stages a request under before renaming it to <see cref="OutboxRequestSuffix"/>
+    /// — the rename is what makes "the daemon never reads half a request" structural rather than lucky.</summary>
+    public const string OutboxStagingSuffix = ".tmp";
+
+    /// <summary>Suffix a claimed request carries while its handler runs. Claiming by rename is what stops
+    /// a second poll pass dispatching the same request again while the first is parked on a human.</summary>
+    public const string OutboxClaimSuffix = ".busy";
+
+    /// <summary>Suffix the daemon stages a response under, distinct from <see cref="OutboxStagingSuffix"/>
+    /// so the two writers never name the same file.</summary>
+    public const string OutboxResponseStagingSuffix = ".out";
+
+    /// <summary>Suffix of a response the shim may read.</summary>
+    public const string OutboxResponseSuffix = ".res";
+
+    /// <summary>
+    /// The largest request the daemon will read off the outbox. A request line is a few hundred bytes;
+    /// this is the bound on the one new thing a writable mount grants a jail — the ability to put bytes
+    /// in the daemon's data root. Anything larger is deleted unread.
+    /// </summary>
+    public const int MaxOutboxRequestBytes = 64 * 1024;
+
+    /// <summary>
+    /// The daemon-side outbox directory inside an agent's IPC dir. One function, used by the daemon that
+    /// creates it, the launcher that names it as a mount source, and the spec builder that vets it — so
+    /// "the read-write mount is that dir and nothing else" is a single fact rather than three spellings.
+    /// </summary>
+    public static string OutboxIn(string ipcDir) => System.IO.Path.Combine(ipcDir, OutboxDirName);
+
     /// <summary>The in-jail shim path for a role — what the instructions tell that CLI to run.</summary>
     public static string SandboxShimPath(AgentIpcEndpointRole role) =>
         SandboxMount + "/" + (role == AgentIpcEndpointRole.Worker ? PlanShimFileName : SpawnShimFileName);

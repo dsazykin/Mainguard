@@ -9,14 +9,18 @@ namespace Mainguard.Agents.Agents.Ipc;
 /// <para>python3 is part of the pre-baked jail toolchain (P2-07 — verified by
 /// <c>PrebakedToolchain_ShouldBeAvailableInLiveSession</c>), so the shim needs no compiled binary
 /// baked into the image (G-16 stays intact). It speaks the newline-delimited JSON of
-/// <see cref="AgentIpcProtocol"/> over the jail's bind-mounted Unix socket — no network egress is
-/// involved, keeping the channel A6-clean. <c>MAINGUARD_IPC_SOCKET</c> overrides the socket path for
-/// tests only; inside a jail the default mount path is the one that exists.</para>
+/// <see cref="AgentIpcProtocol"/> over the jail's bind-mounted Unix socket — or, where the mount
+/// cannot carry a socket (macOS), over the file-framed outbox. Neither involves network egress, so the
+/// channel stays A6-clean either way; see <see cref="AgentIpcShimTransport"/> for which is chosen and
+/// why. <c>MAINGUARD_IPC_SOCKET</c> / <c>MAINGUARD_IPC_OUTBOX</c> override the paths for tests only;
+/// inside a jail the default mount paths are the ones that exist.</para>
 /// </summary>
 public static class AgentSpawnShim
 {
-    /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon).</summary>
-    public const string Script = """"
+    /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon). Composed
+    /// from the shared <see cref="AgentIpcShimTransport"/>, which is the ONLY place either shim's
+    /// transport is written.</summary>
+    public static readonly string Script = """"
 #!/usr/bin/env python3
 """mainguard-agent: the Mainguard Coordinator's complete set of operations.
 
@@ -36,27 +40,8 @@ A spawned worker does NOT receive its task until a human approves the plan the w
 itself authors after inspecting the repository. Until then `prompt` and `verify` are
 refused for it, and that is the gate working, not an error to route around.
 """
-import json
-import os
-import socket
-import sys
-
-SOCKET_PATH = os.environ.get("MAINGUARD_IPC_SOCKET", "/opt/mainguard/ipc/daemon.sock")
-
-
-def call(request):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(60)
-        sock.connect(SOCKET_PATH)
-        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
-        data = b""
-        while not data.endswith(b"\n"):
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-    return json.loads(data.decode("utf-8"))
-
+""""
+        + "\n" + AgentIpcShimTransport.PythonSource + "\n" + """"
 
 def main(argv):
     if len(argv) >= 3 and argv[1] == "spawn":

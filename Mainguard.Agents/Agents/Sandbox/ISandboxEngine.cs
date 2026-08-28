@@ -88,6 +88,9 @@ public sealed record SandboxSpawnRequest(
     int SupervisorUid,
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
+    // The read-write outbox inside IpcDirPath — supplied only where the substrate cannot carry a Unix
+    // socket across the container mount boundary (macOS). See ContainerSpecRequest.IpcOutboxPath.
+    string? IpcOutboxPath = null,
     string? BareRepoPath = null,
     string? NetworkName = null,
     string? ProxyUrl = null,

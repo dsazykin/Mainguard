@@ -102,7 +102,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `AgentRoles.cs` — the shared role-string contract (""/`coordinator`/`managed`) for
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
-    with `daemon.sock` + **the one shim that agent's role is allowed** — plus `AgentIpcEndpointRole`
+    with `daemon.sock` + **the one shim that agent's role is allowed**, and — **macOS fix** — the nested
+    read-write `outbox/` plus its request/claim/response suffixes and `MaxOutboxRequestBytes` — plus `AgentIpcEndpointRole`
     (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
     `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`.
     **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
@@ -114,6 +115,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     bare `switch`, so an added `case` served an unlisted fifth coordinator tool with the suite green.
     `AgentSpawnService` now builds its handler tables against these sets at construction and **throws**
     on an unlisted handler),
+    `AgentIpcShimTransport.cs` (**macOS fix** — the ONE python3 `call(request, timeout)` both shims embed.
+    The socket is the channel; on macOS it is not one, because the daemon runs natively on the Mac while
+    jails run in the container engine's Linux VM and Docker's file sharing does not proxy AF_UNIX across
+    that boundary — the bind-mounted `daemon.sock` stat()s as a socket and every `connect()` returns
+    ECONNREFUSED with the daemon listening, which made all four coordinator tools and the whole worker
+    plan gate unreachable on that platform with the suite green. So the shim tries the socket and, only
+    when it fails AND `/opt/mainguard/ipc/outbox` is WRITABLE, re-frames the same JSON as a file drop it
+    polls for an answer. The writability gate is load-bearing: where the socket is real the outbox sits
+    inside the read-only mount, so a dead daemon still reports as a dead daemon instead of parking the CLI
+    on a poll loop. Shared rather than duplicated because the two copies of `call()` had already drifted),
     `AgentSpawnShim.cs` (the `mainguard-agent` python3 shim script the daemon writes into the
     **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
     G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
@@ -278,7 +289,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `IAgentEnvironment.cs` (the substrate facade + `SyncRemote`/`SubstrateCapabilities` records: holds
       `Repos`/`Worktrees` and — **added by P2-07** — `Sandboxes` (`ISandboxEngine`) + `Egress`
       (`IEgressPolicy`), plus `ResolveSyncRemote(hash)`; the Health/Upgrade/Teardown lifecycle stays
-      deferred to a future task — documented on the interface).
+      deferred to a future task — documented on the interface. `SubstrateCapabilities` also carries
+      **`SupportsBindMountedUnixSockets`** (default `true`): whether a Unix socket the daemon binds is
+      REACHABLE from a jail that bind-mounts it. False only on macOS, where the daemon is on the host and
+      jails are in the engine's Linux VM and virtiofs does not proxy AF_UNIX — the flag the agent-IPC
+      spawn path reads to decide whether the jail also needs the file-framed outbox).
     - `Wsl2AgentEnvironment.cs` (the WSL2 impl: `SubstrateId="wsl2"`, capabilities
       `(false,false,"9p","wsl")`, resolves the sync remote to a `\\wsl.localhost\…\repos\<hash>.git` UNC
       handle — **the only place the `mainguard-vm` name literal lives**, SC-2; the substrate-neutral
@@ -290,7 +305,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       allowlist-persistence invariants are documented HERE and bind both substrates. The Docker
       client is lazily created via `DockerEndpointResolver`, so construction needs no live engine).
     - `MacHostAgentEnvironment.cs` (the macos-host impl: `SubstrateId="macos-host"`, capabilities
-      `(false,false,"virtiofs","docker")`, daemon natively on the Mac with state under `~/mainguard`,
+      `(false,false,"virtiofs","docker", SupportsBindMountedUnixSockets: false)` — the last one measured,
+      not assumed: a daemon-bound Unix socket bind-mounted from this host is inert inside a jail
+      (ECONNREFUSED against a listening daemon), which is why the agent-IPC channel ships an outbox, daemon natively on the Mac with state under `~/mainguard`,
       sandboxes through the resolved Docker engine — Docker Desktop / OrbStack / Colima. Resolves the
       sync remote to the plain local bare path — **the only place the `mainguard-local` name literal
       lives**, SC-2. `Toolchains` installs through `ContainerAdapterInstallHost` (in-jail CLIs and
@@ -564,7 +581,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
-    - `ContainerSpecBuilder.cs` (**P2-48**: also mounts the dynamic-CLI root `AdapterPaths.VmRoot`
+    - `ContainerSpecBuilder.cs` (**macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
+      `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
+      instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the
+      guard is exact rather than shaped — the source must be the `outbox/` child of THIS request's IPC dir
+      (`AgentIpcPaths.OutboxIn`), the same MG-3 reasoning as the package cache's `caches/` gate.
+      **P2-48**: also mounts the dynamic-CLI root `AdapterPaths.VmRoot`
       **read-only** at `/opt/mainguard/adapters` when `AdaptersRootPath` is supplied (same G-11 ext4
       rejection as the worktree), and the `/home/agent` tmpfs now carries `uid=`/`gid=` — **without them
       the tmpfs is root-owned and mode 0700 locked the agent out of its OWN $HOME**, so every agent CLI

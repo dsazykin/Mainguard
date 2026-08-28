@@ -332,7 +332,15 @@
     **and beside it the role's `MAINGUARD.md` operating instructions** (`AgentOperatingInstructions`),
     written in the same call so the shim and the text that makes it discoverable cannot be staged
     independently: a shim is useless to a CLI that was never told it exists, which is what every jail was
-    until now.
+    until now. **Every endpoint also serves an `outbox/`** — the same JSON, the same handler, the same
+    role, framed as request/response FILES the daemon polls every 100 ms — because on macOS the socket
+    half is unreachable from a jail (daemon on the host, jail in the engine's Linux VM; virtiofs does not
+    proxy AF_UNIX, so `connect()` is ECONNREFUSED against a listening daemon). Requests are claimed by
+    RENAME, so a handler parked on a human for hours is never re-dispatched by the next sweep; responses
+    are staged then renamed, so a shim can only observe a complete one; oversize requests are deleted
+    unread, which is the bound on the one thing a writable mount grants a jail. The directory is created
+    on every platform — whether the jail can WRITE it is the container spec's decision — so the code path
+    is exercised everywhere rather than only where it is load-bearing.
     The dir is created BEFORE the jail (it is a read-only mount source) and removed on stop. Identity is
     positional — only that agent's jail has the mount — and the **role is fixed on the endpoint**, so a
     worker cannot reach a coordinator op by naming it and vice versa. One newline-delimited JSON request

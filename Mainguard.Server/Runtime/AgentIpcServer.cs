@@ -36,9 +36,20 @@ public delegate Task<AgentIpcResponse> AgentIpcHandler(
 /// newline-delimited JSON request per connection (<see cref="AgentIpcProtocol"/>); malformed input gets an
 /// honest error response, never a dropped connection.</para>
 ///
+/// <para><b>Two framings, one channel.</b> Alongside the socket every endpoint also serves an
+/// <c>outbox/</c> directory: the same JSON, the same handler, the same role — framed as request/response
+/// FILES the daemon polls. It exists because Docker's macOS file sharing does not proxy AF_UNIX across
+/// the host/VM boundary, so on that substrate the bind-mounted socket is an inert inode and every
+/// coordinator tool was unreachable (see <see cref="Mainguard.Agents.Agents.Ipc.AgentIpcShimTransport"/>).
+/// The directory is created on every platform so this code path is exercised everywhere rather than only
+/// where it is load-bearing; whether a jail can WRITE to it is decided by the container spec, which
+/// mounts it read-write only on substrates that need it.</para>
+///
 /// <para><b>Long-blocking calls are expected here.</b> A worker's plan presentation parks on the socket
 /// until a human decides, which may be hours. Each connection is served on its own task, so a parked
-/// worker never blocks the accept loop or another agent's request.</para>
+/// worker never blocks the accept loop or another agent's request — and a claimed outbox request is
+/// renamed out of the way before its handler runs, so a parked file-framed call is never dispatched
+/// twice by the next poll pass.</para>
 /// </summary>
 public sealed class AgentIpcServer : IDisposable
 {
@@ -82,6 +93,10 @@ public sealed class AgentIpcServer : IDisposable
         return endpoint.Dir;
     }
 
+    /// <summary>The agent's outbox dir — the file-framed channel's directory, and the ONE read-write
+    /// mount source a coordinator jail is ever given.</summary>
+    public string OutboxFor(string agentId) => AgentIpcPaths.OutboxIn(DirFor(agentId));
+
     /// <summary>The role an existing endpoint was created with (null when there is no such endpoint).</summary>
     public AgentIpcEndpointRole? RoleOf(string agentId) =>
         agentId is not null && _endpoints.TryGetValue(agentId, out var endpoint) ? endpoint.Role : null;
@@ -113,6 +128,9 @@ public sealed class AgentIpcServer : IDisposable
 
     private sealed class Endpoint : IDisposable
     {
+        /// <summary>How often the outbox is swept for new requests.</summary>
+        private static readonly TimeSpan OutboxPollInterval = TimeSpan.FromMilliseconds(100);
+
         private readonly Socket _listener;
         private readonly CancellationTokenSource _cts = new();
 
@@ -142,6 +160,11 @@ public sealed class AgentIpcServer : IDisposable
                 Path.Combine(dir, AgentIpcPaths.InstructionsFileName),
                 AgentOperatingInstructions.For(role, AgentIpcPaths.SandboxShimPath(role)).Replace("\r\n", "\n"));
 
+            // The outbox: the file-framed form of this same channel. Created before the listener so
+            // the directory exists by the time the container is created (it is a mount source too).
+            var outbox = Path.Combine(dir, AgentIpcPaths.OutboxDirName);
+            Directory.CreateDirectory(outbox);
+
             var socketPath = Path.Combine(dir, AgentIpcPaths.SocketFileName);
             File.Delete(socketPath); // a stale socket from a crashed daemon blocks bind
 
@@ -162,10 +185,18 @@ public sealed class AgentIpcServer : IDisposable
                 File.SetUnixFileMode(socketPath, UnixFileMode.UserRead | UnixFileMode.UserWrite
                     | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
                     | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                // World-writable, and it has to be: the jail's agent uid is not the daemon's, and on the
+                // macOS substrate the two are not even in the same kernel. Nothing is shared — one jail
+                // mounts this directory and no other — so the reach of the mode is one agent's own
+                // mailbox. Same reasoning as the socket's mode directly above.
+                File.SetUnixFileMode(outbox, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                    | UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+                    | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute);
             }
 
             var endpoint = new Endpoint(dir, listener, role);
             _ = endpoint.AcceptLoopAsync(agentId, handler);
+            _ = endpoint.OutboxLoopAsync(outbox, agentId, handler);
             return endpoint;
         }
 
@@ -185,6 +216,132 @@ public sealed class AgentIpcServer : IDisposable
                 }
 
                 _ = ServeConnectionAsync(connection, agentId, handler, ct);
+            }
+        }
+
+        /// <summary>
+        /// The outbox poll loop: claim every request file that has appeared, serve each on its own task.
+        /// Polling rather than a filesystem watcher on purpose — on the substrate that needs the outbox
+        /// the directory is a virtiofs/gRPC-FUSE share, and change notifications do not cross that
+        /// boundary reliably. A 100 ms sweep of a directory that is empty almost always is not a cost
+        /// worth trading correctness for.
+        /// </summary>
+        private async Task OutboxLoopAsync(string outbox, string agentId, AgentIpcHandler handler)
+        {
+            var ct = _cts.Token;
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    foreach (var path in Directory.EnumerateFiles(outbox, "*" + AgentIpcPaths.OutboxRequestSuffix))
+                    {
+                        var ticket = Path.GetFileNameWithoutExtension(path);
+                        if (string.IsNullOrEmpty(ticket))
+                        {
+                            continue;
+                        }
+
+                        // The bound on the one capability a writable mount grants: a jail can put bytes in
+                        // the daemon's data root. A request line is a few hundred of them; anything past
+                        // the cap is deleted unread rather than read into the daemon's memory.
+                        if (new FileInfo(path).Length > AgentIpcPaths.MaxOutboxRequestBytes)
+                        {
+                            TryDelete(path);
+                            continue;
+                        }
+
+                        // Claim by rename: the request stops matching the poll's filter the instant it is
+                        // claimed, so a handler parked on a human for hours is never re-dispatched.
+                        var claim = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxClaimSuffix);
+                        try
+                        {
+                            File.Move(path, claim, overwrite: false);
+                        }
+                        catch (IOException)
+                        {
+                            continue; // already claimed, or gone
+                        }
+
+                        _ = ServeOutboxRequestAsync(outbox, ticket, claim, agentId, handler, ct);
+                    }
+                }
+                catch (Exception)
+                {
+                    // The directory is gone (teardown) or momentarily unreadable — the delay below and the
+                    // cancellation check are this loop's exit; a poll pass is never worth throwing on.
+                }
+
+                try
+                {
+                    await Task.Delay(OutboxPollInterval, ct).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return;
+                }
+            }
+        }
+
+        /// <summary>Serves one claimed outbox request — the exact <see cref="ServeConnectionAsync"/>
+        /// contract, with files where that one has a stream.</summary>
+        private static async Task ServeOutboxRequestAsync(
+            string outbox, string ticket, string claim, string agentId, AgentIpcHandler handler, CancellationToken ct)
+        {
+            AgentIpcResponse response;
+            try
+            {
+                var line = (await File.ReadAllTextAsync(claim, ct).ConfigureAwait(false)).Trim();
+                var request = AgentIpcProtocol.TryParseRequest(line);
+                response = request is null
+                    ? new AgentIpcResponse(Ok: false, Error: "malformed request (expected one JSON line)")
+                    : await handler(request, agentId, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception ex)
+            {
+                response = new AgentIpcResponse(Ok: false, Error: ex.Message);
+            }
+
+            try
+            {
+                // Staged then renamed, under a suffix the shim never writes: the shim polls for the final
+                // name, so it can only ever observe a response that is complete.
+                var staged = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseStagingSuffix);
+                var final = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix);
+                await File.WriteAllTextAsync(
+                    staged, AgentIpcProtocol.SerializeResponse(response) + "\n", ct).ConfigureAwait(false);
+                if (!OperatingSystem.IsWindows())
+                {
+                    File.SetUnixFileMode(staged, UnixFileMode.UserRead | UnixFileMode.UserWrite
+                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
+                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                }
+
+                File.Move(staged, final, overwrite: true);
+            }
+            catch (Exception)
+            {
+                // The client is gone, or the endpoint is being torn down — nothing to salvage, exactly as
+                // when a socket client hangs up mid-response.
+            }
+            finally
+            {
+                TryDelete(claim);
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception)
+            {
+                // Best effort; the whole directory goes at teardown.
             }
         }
 

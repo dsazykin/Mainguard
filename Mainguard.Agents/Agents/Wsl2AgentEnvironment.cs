@@ -78,7 +78,11 @@ public sealed class Wsl2AgentEnvironment : IAgentEnvironment
 
     public SubstrateCapabilities Capabilities { get; } =
         new(SupportsMaxIsolationBackend: false, SupportsWarmPoolPrestart: false,
-            FilesystemTransport: "9p", LifecycleDialect: "wsl");
+            FilesystemTransport: "9p", LifecycleDialect: "wsl",
+            // Stated rather than inherited from the default: mainguardd runs INSIDE the VM here, so the
+            // agent-IPC socket is a native ext4 path on both sides of the mount and a jail can dial it.
+            // That is why this defect never surfaced on this substrate.
+            SupportsBindMountedUnixSockets: true);
 
     public IRepoProvisioner Repos { get; }
 

@@ -328,6 +328,41 @@ public class ContainerSpecBuilderTests
         Assert.True(mount.ReadOnly); // the jail can dial the socket, never replace shim/socket
     }
 
+    /// <summary>
+    /// A plan-gated WORKER also has an IPC endpoint (the plan gate is a real block on a real channel), so
+    /// the outbox has to reach the repository-bearing mount set too — not only the coordinator's
+    /// capability-only one. Two builders, one mount: this is the second of them.
+    /// </summary>
+    [Fact]
+    public void Build_WithAnOutbox_MountsItReadWrite_NestedInTheReadOnlyIpcMount()
+    {
+        var create = ContainerSpecBuilder.Build(ValidRequest() with
+        {
+            IpcDirPath = "/home/mainguard/.mainguard/agent-ipc/agent-1",
+            IpcOutboxPath = "/home/mainguard/.mainguard/agent-ipc/agent-1/outbox",
+        });
+
+        var mount = Assert.Single(create.HostConfig.Mounts,
+            m => m.Target == Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SandboxOutboxPath);
+        Assert.Equal("/home/mainguard/.mainguard/agent-ipc/agent-1/outbox", mount.Source);
+        Assert.False(mount.ReadOnly); // the jail drops request files here — that IS the channel
+
+        var ipc = Assert.Single(create.HostConfig.Mounts,
+            m => m.Target == Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SandboxMount);
+        Assert.True(ipc.ReadOnly);
+    }
+
+    [Fact]
+    public void Build_WithAnOutboxOutsideItsOwnIpcDir_IsRejected()
+    {
+        Assert.Throws<Mainguard.Git.Exceptions.SandboxSpecException>(() =>
+            ContainerSpecBuilder.Build(ValidRequest() with
+            {
+                IpcDirPath = "/home/mainguard/.mainguard/agent-ipc/agent-1",
+                IpcOutboxPath = "/home/mainguard/.mainguard/agent-ipc/agent-2/outbox",
+            }));
+    }
+
     [Fact]
     public void Build_WithoutIpcDir_CarriesNoIpcMount()
     {

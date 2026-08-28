@@ -203,16 +203,34 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
         }
 
+        // Named, not positional: this is the one production caller of a record whose optional
+        // parameters have grown five times, and a positional call here silently re-binds every argument
+        // after the one that was inserted.
         var spec = new ContainerSpecRequest(
-            request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
-            request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
-            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
-            request.PackageCachePath, request.WithoutRepositoryAccess,
-            request.ToolchainsRootPath, request.ToolchainIds,
-            _options.AllowedMountRoots,
+            RepoHash: request.RepoHash,
+            AgentId: request.AgentId,
+            WorktreePath: request.WorktreePath,
+            ImageRef: request.ImageRef,
+            Limits: request.Limits,
+            NetworkName: networkName,
+            Credentials: credentials,
+            ProxyUrl: proxyUrl,
+            UsernsMode: _options.UsernsMode,
+            AdaptersRootPath: request.AdaptersRootPath,
+            IpcDirPath: request.IpcDirPath,
+            IpcOutboxPath: request.IpcOutboxPath,
+            BareRepoPath: request.BareRepoPath,
+            DnsServerAddress: dnsServer,
+            AgentRepoPath: request.AgentRepoPath,
+            PackageCachePath: request.PackageCachePath,
+            WithoutRepositoryAccess: request.WithoutRepositoryAccess,
+            ToolchainsRootPath: request.ToolchainsRootPath,
+            ToolchainIds: request.ToolchainIds,
+            AllowedMountRoots: _options.AllowedMountRoots,
             // Carried onto the jail's labels: what this agent IS, so a restarted daemon can adopt it back
             // as itself rather than as an anonymous worker.
-            request.AgentKind, request.AgentRole);
+            AgentKind: request.AgentKind,
+            AgentRole: request.AgentRole);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

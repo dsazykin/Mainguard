@@ -8,11 +8,24 @@ namespace Mainguard.Agents.Agents;
 public sealed record SyncRemote(string Name, string Url);
 
 /// <summary>Declares which MAY-vary features a substrate implementation offers (§3). Opaque labels.</summary>
+/// <param name="SupportsBindMountedUnixSockets">
+/// Whether a Unix-domain socket the daemon binds is REACHABLE from inside a jail that bind-mounts it.
+/// True wherever the daemon and the containers share a kernel (WSL2: the daemon runs inside the VM, so
+/// the mount source is a native path on both sides). <b>False on macOS</b>, where the daemon runs on the
+/// host and jails run in the container engine's Linux VM: Docker's file sharing (virtiofs / gRPC-FUSE)
+/// does not proxy AF_UNIX across that boundary, so the socket bind-mounts in as an inert inode — it
+/// stat()s as a socket and every <c>connect()</c> to it fails ECONNREFUSED with the daemon demonstrably
+/// listening. Measured on a live jail, not inferred, and it is why the agent-IPC channel also ships a
+/// file-framed form (<c>AgentIpcPaths</c>' outbox) that this flag selects.
+/// <para>Defaulted true because it is the property every substrate had until macOS arrived, and a test
+/// double that does not think about sockets should describe the world it is standing in.</para>
+/// </param>
 public sealed record SubstrateCapabilities(
     bool SupportsMaxIsolationBackend,
     bool SupportsWarmPoolPrestart,
     string FilesystemTransport,
-    string LifecycleDialect);
+    string LifecycleDialect,
+    bool SupportsBindMountedUnixSockets = true);
 
 /// <summary>
 /// The per-platform substrate facade (ESC §1). Exactly one conforming implementation per platform;

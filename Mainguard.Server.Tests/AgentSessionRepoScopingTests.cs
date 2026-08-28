@@ -490,17 +490,24 @@ public sealed class AgentSessionRepoScopingTests
     {
         private readonly RecordingEngine _engine;
 
-        public FakeAgentEnvironment(string root, RecordingEngine engine)
+        /// <param name="supportsBindMountedUnixSockets">The macOS substrate answers FALSE here — its
+        /// daemon runs on the host while jails run in the engine's Linux VM, and a bind-mounted Unix
+        /// socket is inert across that boundary. A test that wants to stand where that is true (the
+        /// agent-IPC outbox wiring) passes false; everything else keeps the world every other substrate
+        /// lives in.</param>
+        public FakeAgentEnvironment(
+            string root, RecordingEngine engine, bool supportsBindMountedUnixSockets = true)
         {
             _engine = engine;
             Sandboxes = engine;
             Repos = new FakeProvisioner(root);
             Worktrees = new FakeWorktrees(root);
+            Capabilities = new(false, false, "none", "test", supportsBindMountedUnixSockets);
         }
 
         public string SubstrateId => "fake";
 
-        public SubstrateCapabilities Capabilities { get; } = new(false, false, "none", "test");
+        public SubstrateCapabilities Capabilities { get; }
 
         public IRepoProvisioner Repos { get; }
 

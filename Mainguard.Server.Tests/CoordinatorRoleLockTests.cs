@@ -438,6 +438,11 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
         Assert.Null(coordinatorRequest.AgentRepoPath);
         Assert.Null(coordinatorRequest.PackageCachePath);
 
+        // ...and no outbox either, because this substrate's bind-mounted Unix socket WORKS. The outbox is
+        // the coordinator jail's only writable bind mount, so it is granted where the socket cannot be
+        // dialled and nowhere else — see CoordinatorOutboxWiringTests for the substrate that needs it.
+        Assert.Null(coordinatorRequest.IpcOutboxPath);
+
         // The paired negative control: a worker is untouched by this change.
         var workerRequest = Assert.Single(_rig.Engine.Requests, r => r.AgentId == worker);
         Assert.False(workerRequest.WithoutRepositoryAccess);

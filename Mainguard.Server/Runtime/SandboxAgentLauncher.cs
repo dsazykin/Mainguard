@@ -114,6 +114,15 @@ public sealed class SandboxAgentLauncher
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
+        // The file-framed half of the agent-IPC channel, mounted read-write ONLY where the socket half
+        // cannot work. Derived here rather than passed in: the caller supplies the endpoint dir, and the
+        // outbox is a fixed child of it (AgentIpcPaths.OutboxIn) that the spec builder re-derives and
+        // checks — so the read-write mount cannot be pointed anywhere else by a caller bug.
+        var ipcOutboxPath = string.IsNullOrEmpty(ipcDirPath)
+            || _environment.Capabilities.SupportsBindMountedUnixSockets
+                ? null
+                : Mainguard.Agents.Agents.Ipc.AgentIpcPaths.OutboxIn(ipcDirPath);
+
         var barePath = _environment.Repos.BareRepoPathFor(repoHandle);
         if (!Directory.Exists(barePath))
         {
@@ -346,6 +355,14 @@ public sealed class SandboxAgentLauncher
                 AdaptersRootPath: _adapters.HasAny() ? _adapters.Root : null,
                 // Coordinator-role jails only: the daemon-served spawn-channel dir (read-only mount).
                 IpcDirPath: ipcDirPath,
+                // ...and, ONLY where the substrate cannot carry a Unix socket across the mount boundary,
+                // that dir's outbox read-write so the jail has a channel at all. On macOS the daemon runs
+                // on the host while jails run in the engine's Linux VM, and Docker's file sharing does not
+                // proxy AF_UNIX: the socket mounts in as an inert inode and every coordinator tool was
+                // unreachable. Decided here, from the substrate's own declaration, rather than from an
+                // OS check — the property that matters is "can a bind-mounted socket be dialled", and the
+                // substrate is the only thing that knows it.
+                IpcOutboxPath: ipcOutboxPath,
                 // The shared mirror at its identical VM path so the per-agent repo's alternates pointer
                 // resolves in-jail (field bug 2026-07-23: every in-jail git command died "not a git
                 // repository"). MG-3 stage 3 makes this mount read-only.

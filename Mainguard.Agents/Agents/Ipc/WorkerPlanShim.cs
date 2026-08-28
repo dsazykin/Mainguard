@@ -5,8 +5,10 @@ namespace Mainguard.Agents.Agents.Ipc;
 /// (on the launch wrapper's PATH). It is the worker's half of the phase-2 plan gate: the worker inspects
 /// its repository, writes the plan it authored, presents it, and <b>blocks</b> until a human decides.
 ///
-/// <para>The block is real, not advisory: <c>await</c> holds the socket open until the daemon answers, and
-/// the daemon answers only on a human decision. On approval the response carries the task prompt the
+/// <para>The block is real, not advisory: <c>await</c> holds the channel open until the daemon answers,
+/// and the daemon answers only on a human decision. That is as true of the file-framed outbox transport
+/// as of the socket — the answer file is not written until the handler returns (see
+/// <see cref="AgentIpcShimTransport"/>). On approval the response carries the task prompt the
 /// daemon had been withholding — which is why a worker cannot meaningfully start early. It does not have
 /// the task.</para>
 ///
@@ -15,13 +17,15 @@ namespace Mainguard.Agents.Agents.Ipc;
 /// other's operations even by sending the other's op name (<c>WorkerIpcRoleScopingTests</c> pins that).</para>
 ///
 /// <para>python3 is part of the pre-baked jail toolchain (P2-07), so the shim needs no compiled binary
-/// baked into the image (G-16 stays intact). <c>MAINGUARD_IPC_SOCKET</c> overrides the socket path for
-/// tests only; inside a jail the default mount path is the one that exists.</para>
+/// baked into the image (G-16 stays intact). <c>MAINGUARD_IPC_SOCKET</c> / <c>MAINGUARD_IPC_OUTBOX</c>
+/// override the paths for tests only; inside a jail the default mount paths are the ones that exist.</para>
 /// </summary>
 public static class WorkerPlanShim
 {
-    /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon).</summary>
-    public const string Script = """"
+    /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon). Composed
+    /// from the shared <see cref="AgentIpcShimTransport"/>, which is the ONLY place either shim's
+    /// transport is written.</summary>
+    public static readonly string Script = """"
 #!/usr/bin/env python3
 """mainguard-plan: present the plan YOU authored, and wait for the human.
 
@@ -39,27 +43,8 @@ plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}.
 output includes TASK: followed by the work you are cleared to do — the daemon withholds
 it until then, so there is nothing to start on before approval.
 """
-import json
-import os
-import socket
-import sys
-
-SOCKET_PATH = os.environ.get("MAINGUARD_IPC_SOCKET", "/opt/mainguard/ipc/daemon.sock")
-
-
-def call(request, timeout):
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-        sock.settimeout(timeout)
-        sock.connect(SOCKET_PATH)
-        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
-        data = b""
-        while not data.endswith(b"\n"):
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-    return json.loads(data.decode("utf-8"))
-
+""""
+        + "\n" + AgentIpcShimTransport.PythonSource + "\n" + """"
 
 def read_plan(path):
     with open(path, "r", encoding="utf-8") as handle:

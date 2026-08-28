@@ -1725,6 +1725,23 @@
   PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
   fake environment goes — a true verification positive needs a real repo and belongs to the Docker
   tier),**
+  **`AgentIpcOutboxTests` (the file-framed half of the agent-IPC channel, at the daemon — the macOS fix.
+  Nothing here dials the socket: it puts bytes in the outbox exactly as an in-jail shim does (stage,
+  rename, poll) and reads what comes back, because dialling the socket from the daemon's own process is
+  what let a completely unreachable channel keep complete coverage. Pins that the same handler serves it
+  with the same POSITIONAL identity; that a parked request is dispatched EXACTLY once however many 100 ms
+  sweeps elapse and answers only when its handler returns (claim-by-rename, and the plan gate's whole
+  block); that a malformed line gets an honest error rather than silence; that an oversize request is
+  deleted unread; and that nothing half-finished is left in a directory the jail can also write. Seven
+  mutations watched red — loop removed, claim by copy instead of rename, claim never deleted, size cap
+  dropped, handler not awaited, malformed branch removed, outbox dir not created),**
+  **`CoordinatorOutboxWiringTests` (the wiring half: on a substrate declaring
+  `SupportsBindMountedUnixSockets: false`, the real spawn path hands the jail its outbox — the dir the
+  daemon created, `AgentIpcPaths.OutboxIn` of it, existing on disk before the container would be. The
+  paired negative lives in `CoordinatorRoleLockTests`, where a socket-capable substrate sets no outbox and
+  the coordinator jail keeps ZERO writable bind mounts. Both directions mutation-checked: never setting
+  the field, and setting it unconditionally. A correct mechanism nobody passes the flag to is the MG-12
+  shape the role lock already shipped as once),**
   **`CoordinatorRoleLockTests` (phase 3, contract §8 — THE ROLE LOCK, over the same real Unix socket. The
   coordinator's surface is now the contract's four tools and the allow-list is asserted as an object
   (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4
@@ -2093,7 +2110,8 @@
   world-writable host trees so an in-jail refusal proves the MOUNT and not a file mode, the same
   argument `NewTempCache` and `NewJailWritableTempWorktree` already make;
   `CreateAndStartFromImageWithoutUserOverrideAsync` starts a container with NO `User` on the create
-  request, which is the only way to observe an image layer's own `USER` directive),
+  request, which is the only way to observe an image layer's own `USER` directive; `ipcDirPath`/
+  `ipcOutboxPath` mount a real agent-IPC endpoint so the channel can be measured from inside the jail),
   `Fixtures/JailSyscallProbe.cs` (tickets #59/#60 — attempts `process_vm_readv`/`ptrace` for real
   through libc inside a live jail, framing every call's return value AND errno so a probe that never ran
   is a MISSING frame rather than an absence that reads as a refusal; each cross-process call is paired
@@ -2248,7 +2266,16 @@
   `ptrace_scope=1` refuses it anyway. Plus `JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused`, whose legacy
   container is byte-identical to a real one **except** its tmpfs — a hand-built stand-in with no mounts
   and no network is recreated by the checks that already existed, and that first version stayed green
-  with the new check disabled). `Agents/JailRuntimePostureDockerTests.cs` (**tickets #59/#60** — the
+  with the new check disabled). `Agents/AgentIpcJailDockerTests.cs` (**the macOS agent-IPC defect, turned into a guard** — the channel
+  measured from INSIDE a real jail by running the real shim, which is the only arrangement that could have
+  caught it. Four facts: the production path answers (`mainguard-agent status` → the daemon's own string
+  on stdout); the outbox specifically carries it when `MAINGUARD_IPC_SOCKET` names a path that cannot
+  exist, so the Linux CI leg exercises the macOS transport too rather than letting it rot; with neither
+  transport the shim reports an unreachable daemon PROMPTLY rather than parking on a poll loop; and the
+  outbox is writable while the rest of the IPC mount — the shim included — is not. Mutation-checked by
+  removing the outbox mount, which reproduces the reported failure verbatim:
+  `cannot reach the Mainguard daemon: [Errno 111] Connection refused`),
+  `Agents/JailRuntimePostureDockerTests.cs` (**tickets #59/#60** — the
   jail's posture read FROM INSIDE A RUNNING CONTAINER rather than from the create request that asked
   for it, because seven controls were measured removable from a real jail with the whole 98-test suite
   green: the capability **bounding** set from `/proc/self/status` — never `CapEff`, which is empty for
