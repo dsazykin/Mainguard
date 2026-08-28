@@ -54,9 +54,12 @@ public static class AgentKickoffPrompt
         1. Run `{{shimPath}} brief` to learn what you are here to plan.
         2. Read the code in /workspace that the brief points at. Actually read it: your plan is judged on
            whether it describes THIS repository.
-        3. Write the plan you author to a JSON file — `{"scope": ["path", ...], "approach": "...",
-           "testStrategy": "..."}` — and run `{{shimPath}} present <that file>`. It blocks until a human
-           decides, and prints the decision.
+        3. Write the plan you author to a JSON file OUTSIDE the repository — /tmp/plan.json —
+           `{"scope": ["path", ...], "approach": "...", "testStrategy": "..."}` — and run
+           `{{shimPath}} present /tmp/plan.json`. It blocks until a human decides, and prints the decision.
+        4. Once your plan is approved and the work is done, run `{{shimPath}} commit <message>`. That is
+           the only way your work leaves this jail: the worktree is deleted when the agent stops, so
+           anything you have not committed is lost.
 
         You do not have the task yet and must not start work. The daemon withholds it until your plan is
         approved, and `present` prints it after `TASK:` on approval. Nobody is watching this terminal, so

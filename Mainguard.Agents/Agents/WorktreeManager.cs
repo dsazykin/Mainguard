@@ -125,6 +125,67 @@ public interface IAgentWorktreeManager
     AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
         => new(AgentBranchAlignmentState.Unknown, AgentRepoLayout.BranchPrefix + agentId,
             Detail: "this worktree manager has no worktree to inspect");
+
+    /// <summary>
+    /// Records everything in an agent's worktree as one commit on <c>agent/&lt;id&gt;</c> — the step that
+    /// makes a worker's work outlive its jail, and the only thing the verification trigger can observe.
+    ///
+    /// <para><b>Why the daemon does this rather than the agent's CLI.</b> Not for want of permission on
+    /// the repository: <see cref="CreateAgentWorktree"/> exists precisely so <c>git commit</c> stays
+    /// available to an agent. It is that the agent supplies a MESSAGE and nothing else — repository,
+    /// worktree and branch are computed here, from the id the endpoint already proves. An agent cannot
+    /// commit onto another branch, into another agent's tree, or with a pathspec of its choosing: the
+    /// same structural argument that makes <see cref="AgentRefMediator"/> safe.</para>
+    ///
+    /// <para><b>The default is a refusal.</b> A manager with no substrate has no worktree to commit, and
+    /// answering "committed" for a commit that did not happen is the failure this codebase keeps paying
+    /// for — the caller would report success to the worker while the branch stayed empty.</para>
+    /// </summary>
+    /// <param name="message">The commit subject. It travels as one argv element through the audited
+    /// arg-list git primitive, never through a shell.</param>
+    AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+        => new(AgentWorkCommitOutcome.Unsupported, AgentRepoLayout.BranchPrefix + agentId,
+            Detail: "this worktree manager has no worktree to commit");
+}
+
+/// <summary>What one <see cref="IAgentWorktreeManager.CommitAgentWork"/> did, or why it refused.</summary>
+public enum AgentWorkCommitOutcome
+{
+    /// <summary>A new commit exists on <c>agent/&lt;id&gt;</c>. The ref moved.</summary>
+    Committed,
+
+    /// <summary>The worktree was clean — nothing to record. Not an error, and deliberately distinct from
+    /// <see cref="Committed"/>: the ref did NOT move, so nothing downstream observes anything, and a
+    /// caller that reported this as a commit would be telling a worker its work is safe while the branch
+    /// sits exactly where it was.</summary>
+    NothingToCommit,
+
+    /// <summary>HEAD is not <c>agent/&lt;id&gt;</c> (another branch, or detached). Refused: a commit made
+    /// there is stranded where nothing — the mediator, the queue, the trigger — ever looks.</summary>
+    RefusedBranch,
+
+    /// <summary>There is no worktree for this agent (never created, or already torn down).</summary>
+    NoWorktree,
+
+    /// <summary>Git itself failed. Nothing is claimed about what did or did not land.</summary>
+    Failed,
+
+    /// <summary>This worktree manager cannot commit at all (the substrate-less test doubles).</summary>
+    Unsupported,
+}
+
+/// <summary>The outcome of one agent-work commit, with the sha when there is one.</summary>
+/// <param name="Outcome">What happened.</param>
+/// <param name="Branch">The branch the commit was aimed at — always <c>agent/&lt;id&gt;</c>, computed by
+/// the daemon, echoed here so a refusal can name it.</param>
+/// <param name="Sha">The new tip on success; null otherwise. Never a guess.</param>
+/// <param name="Detail">Human-readable reason, for a refusal or a failure.</param>
+public sealed record AgentWorkCommitResult(
+    AgentWorkCommitOutcome Outcome, string Branch, string? Sha = null, string? Detail = null)
+{
+    /// <summary>True only when the branch actually moved — i.e. when there is something for the ref
+    /// watcher to see.</summary>
+    public bool Committed => Outcome == AgentWorkCommitOutcome.Committed;
 }
 
 /// <summary>
@@ -483,6 +544,105 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     public AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
         => AgentBranchGuard.Probe(
             WorktreePathFor(repoHash, agentId), _agentRepos.PathFor(repoHash, agentId), agentId);
+
+    /// <summary>
+    /// Daemon-side identity for an agent's work commit. The agent id is IN the name, so a reader of the
+    /// user's history can tell which agent produced a commit without consulting anything else, and the
+    /// address is under <c>.invalid</c> (RFC 2606) so it can never be mistaken for a mailbox. Passed with
+    /// <c>-c</c> rather than configured, so the commit never depends on the worktree having an identity —
+    /// the same choice <see cref="Orchestrator.KeepAliveRebaser"/> made for the same reason.
+    /// </summary>
+    private static string[] IdentityFor(string agentId) => new[]
+    {
+        "-c", "user.name=Mainguard agent " + agentId,
+        "-c", "user.email=" + agentId + "@agents.mainguard.invalid",
+    };
+
+    /// <inheritdoc />
+    public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+    {
+        var branch = BranchFor(agentId);
+        var worktreePath = WorktreePathFor(repoHash, agentId);
+        if (!Directory.Exists(worktreePath))
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.NoWorktree, branch,
+                Detail: $"agent '{agentId}' has no worktree in repo '{repoHash}' — nothing to commit.");
+        }
+
+        // The alignment authority is the EXISTING one. A second opinion about which branch an agent is on
+        // is how one of the two becomes decorative (MG-12), and this one already knows how to answer
+        // "detached", "some other branch" and "could not tell" as three different things. `Unknown` is
+        // refused with the rest: an unread state is not evidence of alignment, which is the whole reason
+        // AgentBranchGuard has that member at all.
+        var alignment = CheckAgentBranch(repoHash, agentId);
+        if (alignment.State != AgentBranchAlignmentState.OnAgentBranch)
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.RefusedBranch, branch,
+                Detail: $"this worktree's HEAD is not {branch} ({alignment.State}"
+                    + (alignment.ActualBranch is { Length: > 0 } actual ? $": {actual}" : string.Empty)
+                    + "). A commit made there would be reachable from no branch the merge queue reads.");
+        }
+
+        try
+        {
+            // `add -A` honours the agent repository's local info/exclude, which is where the daemon's own
+            // droppings in /workspace are listed (the CLI's settings file and the operating-instructions
+            // file). That is not incidental: this method is what would otherwise commit them, and the
+            // exclusion and this call ship together for exactly that reason.
+            AgentGitCommand.Run(worktreePath, "add", "-A");
+
+            // Ask git whether there is anything staged BEFORE committing, so "nothing to commit" is an
+            // outcome rather than a swallowed non-zero exit that also hides real failures.
+            if (AgentGitCommand.TryRun(worktreePath, out _, "diff", "--cached", "--quiet") == 0)
+            {
+                return new AgentWorkCommitResult(
+                    AgentWorkCommitOutcome.NothingToCommit, branch,
+                    Sha: HeadShaOrNull(worktreePath),
+                    Detail: "the worktree is clean — there is no change to record.");
+            }
+
+            var args = new List<string>(IdentityFor(agentId));
+            args.AddRange(new[] { "commit", "-m", CommitSubject(message, agentId) });
+            AgentGitCommand.Run(worktreePath, args.ToArray());
+
+            var sha = HeadShaOrNull(worktreePath);
+
+            // NOT published here, and that is load-bearing rather than an omission. AgentRefWatcher's
+            // sweep raises `Advanced` only for an outcome of `Published` — a publish that already happened
+            // makes the sweep's own publish `Unchanged`, which is `Current` (so the snapshot is recorded)
+            // and NOT `Published` (so no event is raised). Publishing eagerly here would therefore
+            // silently disarm WorkerReadinessTrigger for the very commit it exists to react to. The
+            // watcher carries it across within its tick, and the pre-verification re-fetch is the other
+            // half; both were already there.
+            return new AgentWorkCommitResult(AgentWorkCommitOutcome.Committed, branch, sha);
+        }
+        catch (RepoProvisioningException ex)
+        {
+            return new AgentWorkCommitResult(AgentWorkCommitOutcome.Failed, branch, Detail: ex.Message);
+        }
+    }
+
+    /// <summary>The commit subject: what the worker said, or a truthful default when it said nothing
+    /// usable. Trimmed to one line and bounded, because a subject is one argv element that ends up in the
+    /// user's history — a newline would turn the rest into a body nobody chose, and an unbounded one is a
+    /// log line an operator cannot read.</summary>
+    internal static string CommitSubject(string? message, string agentId)
+    {
+        var single = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
+        if (single.Length == 0)
+        {
+            return $"wip: work by agent {agentId}";
+        }
+
+        return single.Length <= 200 ? single : single[..200].TrimEnd();
+    }
+
+    private static string? HeadShaOrNull(string worktreePath) =>
+        AgentGitCommand.TryRun(worktreePath, out var sha, "rev-parse", "HEAD") == 0
+            ? sha.Trim() is { Length: > 0 } trimmed ? trimmed : null
+            : null;
 
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;

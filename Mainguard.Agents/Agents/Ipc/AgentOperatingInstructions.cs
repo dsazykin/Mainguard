@@ -119,9 +119,19 @@ public static class AgentOperatingInstructions
         """;
 
     /// <summary>
-    /// A worker's operating instructions. The load-bearing sentence is that the task does not exist yet:
-    /// a worker that starts guessing at work before approval is the exact behaviour the plan gate was
-    /// built to make impossible, and it will simply be refused.
+    /// A worker's operating instructions. Two sentences are load-bearing, and they are the two ends of the
+    /// loop — each of which was found missing in production, a run apart.
+    ///
+    /// <para>At the start: the task does not exist yet. A worker that starts guessing at work before
+    /// approval is the exact behaviour the plan gate was built to make impossible, and it will simply be
+    /// refused.</para>
+    ///
+    /// <para>At the end: <b>work that is not committed does not exist.</b> The first end-to-end run ended
+    /// with a worker that had done the approved work and stopped on a 20-line uncommitted diff — its
+    /// instructions had never mentioned committing — and stopping the agent deleted the worktree with the
+    /// work still in it. The daemon's readiness signal is the agent's branch advancing and then going
+    /// quiet, so a worker that never commits is indistinguishable, to every mechanism downstream, from a
+    /// worker that did nothing at all.</para>
     /// </summary>
     public static string Worker(string shimPath) =>
         $$"""
@@ -145,7 +155,9 @@ public static class AgentOperatingInstructions
         {{shimPath}} await <id>                  block until the human decides
         ```
 
-        `plan.json` is `{"scope": ["path", ...], "approach": "...", "testStrategy": "..."}`.
+        `plan.json` is `{"scope": ["path", ...], "approach": "...", "testStrategy": "..."}`. Write it
+        **outside the repository** — `/tmp/plan.json` — because everything in `/workspace` is what your
+        commit records, and your plan file is not part of the change.
 
         ## The part that matters
 
@@ -157,6 +169,27 @@ public static class AgentOperatingInstructions
         A rejection is feedback, not death: it comes back with the reason, and you revise and re-present.
         Your revision budget is finite and the daemon reports what is left; when it is spent the task
         escalates to the human rather than looping.
+
+        ## When the work is done, commit it — nothing else will
+
+        ```
+        {{shimPath}} commit <message>            record your work on your own branch
+        ```
+
+        **This is the only way your work leaves this jail.** Your worktree is deleted when the agent is
+        stopped, so an uncommitted change is simply lost: no review, no merge-queue entry, no record that
+        you did anything at all. That has already happened once — a worker finished its task, stopped
+        with the diff uncommitted, and the work went with the sandbox.
+
+        What that command does, so you know what you are asking for: the daemon commits **everything in
+        `/workspace`** onto **your own branch** — the one already checked out, and the only one you have.
+        You supply the message and nothing else. It never pushes, never merges, and never touches the
+        user's main branch; a human decides all of that later, after reading your diff.
+
+        Commit at meaningful points as you go, not only at the end, and commit again after any further
+        change. Once your branch stops moving the daemon runs the repository's tests against it on its
+        own and puts it in front of a human — so the last thing you do is commit, then report what you
+        did, then stop.
         """;
 
     /// <summary>Renders the instructions for a role. Unknown roles get the worker text: the conservative

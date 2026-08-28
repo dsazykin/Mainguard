@@ -400,7 +400,7 @@ public sealed class QueueEntryLifecycleTests
         Assert.Equal(
             new[]
             {
-                "await_decision", "brief", "list", "present_plan", "prompt",
+                "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
                 "revise_plan", "spawn", "status", "verify",
             },
             ops);
@@ -416,6 +416,11 @@ public sealed class QueueEntryLifecycleTests
         // erases the evidence blocking its own branch, clearing a stalled verification puts a branch back
         // into the state a re-verification starts from, and merging is the decision this whole subsystem
         // exists to keep with a person. Asking for a measurement is safe; editing the record of one is not.
+        //
+        // `commit_work` sits on the same side of that line as `verify`, for the same reason. It records a
+        // worker's own work on the worker's OWN branch — the INPUT this queue reads — and changes no
+        // entry's state, no verification record, and nothing on main. It is what gives a human something
+        // to decide about; it decides nothing.
         foreach (var forbidden in new[] { "discard", "clear", "stalled", "resume", "merge" })
         {
             Assert.DoesNotContain(ops, op => op.Contains(forbidden, StringComparison.OrdinalIgnoreCase));

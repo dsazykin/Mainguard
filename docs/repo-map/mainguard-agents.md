@@ -105,7 +105,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     with `daemon.sock` + **the one shim that agent's role is allowed**, and — **macOS fix** — the nested
     read-write `outbox/` plus its request/claim/response suffixes and `MaxOutboxRequestBytes` — plus `AgentIpcEndpointRole`
     (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
-    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`.
+    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`,
+    and **`commit_work`** — the rung the loop was missing: a worker records its approved work on its own
+    branch (message on the wire, repo/worktree/branch computed daemon-side), because the readiness trigger
+    observes `refs/heads/agent/<id>` advancing and a finished worker used to stop on an uncommitted diff
+    that died with its worktree.
     **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
     object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
     two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
@@ -130,7 +134,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
     <text>` / `verify <id>`, with `list` kept as an alias of `status` — and its docstring says plainly that
     there is no fifth) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
-    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>`.
+    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
+    **`commit <message>`** (the only route a jailed CLI has to a commit — measured against claude-code
+    2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`).
     `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker
     does not start before approval" a property of the system rather than a request in a prompt).
@@ -305,6 +311,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       runner delegate + warning sink); `AgentRepoPathFor` (the read-write mount the jail gets) and
       `PublishAgentBranch` (the daemon-side carry of `refs/heads/agent/<id>` from the agent's repo into
       the mirror — the daemon names BOTH refs, so the agent never proposes a ref update at all);
+      **`CommitAgentWork(repoHash, agentId, message)`** → `AgentWorkCommitResult` /
+      `AgentWorkCommitOutcome` (`git add -A` + commit onto `agent/<id>`, refused unless
+      `CheckAgentBranch` says HEAD really is that branch, `NothingToCommit` kept distinct from
+      `Committed` so a clean tree is never reported as recorded work, and pointedly NOT publishing —
+      `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
+      `WorkerReadinessTrigger` for the very commit it exists to react to);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force` +
       `branch -D` + delete the whole per-agent repo + the `MirrorMaintenance` idle hook, no residue);
       **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a

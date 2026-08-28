@@ -1047,6 +1047,7 @@ public sealed class AgentSpawnService
             [AgentIpcRequest.PresentPlanOp] = PresentPlanAsync,
             [AgentIpcRequest.RevisePlanOp] = RevisePlanAsync,
             [AgentIpcRequest.AwaitDecisionOp] = AwaitDecisionAsync,
+            [AgentIpcRequest.CommitWorkOp] = (r, w, _) => Task.FromResult(CommitWork(r, w)),
         };
 
         return LockToContract(table, AgentIpcRequest.WorkerOps, "worker");
@@ -1054,6 +1055,70 @@ public sealed class AgentSpawnService
 
     /// <summary>Exactly what a worker endpoint will serve; must set-equal <see cref="AgentIpcRequest.WorkerOps"/>.</summary>
     internal IReadOnlySet<string> ServedWorkerOps => _workerHandlers.Keys.ToHashSet(StringComparer.Ordinal);
+
+    /// <summary>
+    /// <c>commit_work</c> — record the approved work on this worker's own branch. The rung the loop was
+    /// missing: without it a finished worker stopped on an uncommitted diff, its worktree was deleted at
+    /// teardown, and the branch the merge queue reads never carried a single commit.
+    ///
+    /// <para><b>The gate is asked first, and it is the same gate.</b> <c>MayWork</c> is what answers
+    /// whether a worker has an approved plan; steering and verification already route through it, and a
+    /// commit is the act those two are about. A worker still at the gate has no authorised work, so it has
+    /// nothing legitimate to record — and the refusal reads verbatim to a human because that string is
+    /// written for one.</para>
+    ///
+    /// <para><b>This handler is transport.</b> Everything about WHAT is committed, WHERE and onto WHICH
+    /// branch lives in <c>WorktreeManager.CommitAgentWork</c>, which computes all three from the agent id.
+    /// Re-deriving any of it here would be the "one policy, two places" shape the plan gate's own release
+    /// logic was already caught in.</para>
+    /// </summary>
+    private AgentIpcResponse CommitWork(AgentIpcRequest request, string workerAgentId)
+    {
+        if (!_planGate.MayWork(workerAgentId, out var refusal))
+        {
+            _audit.Append(new AuditEvent("worker_commit_denied", new Dictionary<string, string>
+            {
+                ["agent_id"] = workerAgentId,
+                ["reason"] = refusal,
+            }));
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: refusal);
+        }
+
+        var session = _store.Find(workerAgentId);
+        if (session?.RepoHash is not { Length: > 0 } repoHash)
+        {
+            return new AgentIpcResponse(
+                Ok: false, AgentId: workerAgentId, Error: "this worker session is no longer live");
+        }
+
+        var result = _launcher.Worktrees.CommitAgentWork(repoHash, workerAgentId, request.Message);
+        _audit.Append(new AuditEvent("worker_commit", new Dictionary<string, string>
+        {
+            ["agent_id"] = workerAgentId,
+            ["repo"] = repoHash,
+            ["branch"] = result.Branch,
+            ["outcome"] = result.Outcome.ToString(),
+            ["sha"] = result.Sha ?? string.Empty,
+        }));
+
+        return result.Outcome switch
+        {
+            AgentWorkCommitOutcome.Committed => new AgentIpcResponse(
+                Ok: true, AgentId: workerAgentId, Status: result.Branch,
+                CommitSha: result.Sha, Committed: true),
+
+            // Not an error — the worker asked correctly and there was nothing to record. Answered
+            // truthfully rather than as a commit, because "committed" would tell a worker its work is
+            // safe while the branch sits exactly where it was.
+            AgentWorkCommitOutcome.NothingToCommit => new AgentIpcResponse(
+                Ok: true, AgentId: workerAgentId, Status: result.Branch,
+                CommitSha: result.Sha, Committed: false, Feedback: result.Detail),
+
+            _ => new AgentIpcResponse(
+                Ok: false, AgentId: workerAgentId, Committed: false,
+                Error: result.Detail ?? $"could not commit on {result.Branch} ({result.Outcome})"),
+        };
+    }
 
     /// <summary>What am I here to plan? The brief and the live plan's state — never the task prompt.</summary>
     private AgentIpcResponse Brief(string workerAgentId)

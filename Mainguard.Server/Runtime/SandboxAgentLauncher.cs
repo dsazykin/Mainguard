@@ -50,6 +50,12 @@ public sealed class SandboxAgentLauncher
 
     private readonly IAgentEnvironment _environment;
 
+    /// <summary>This daemon's worktree manager — the one that created the worktrees this launcher's jails
+    /// are mounted on. Exposed so an in-daemon caller acting on a LIVE agent's worktree (the worker's
+    /// <c>commit_work</c> op) reaches the same instance rather than constructing a second one over the
+    /// same directories, which is how two managers come to disagree about a repository's state.</summary>
+    public IAgentWorktreeManager Worktrees => _environment.Worktrees;
+
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly ILogger _log;

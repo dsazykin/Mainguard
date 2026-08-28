@@ -115,8 +115,8 @@ public sealed class QueueEntryResumeTests
         Assert.Equal(
             new[]
             {
-                "await_decision", "brief", "list", "present_plan", "prompt", "revise_plan", "spawn",
-                "status", "verify",
+                "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
+                "revise_plan", "spawn", "status", "verify",
             },
             ops);
 

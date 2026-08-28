@@ -513,6 +513,19 @@ public sealed class AgentSessionRepoScopingTests
 
         public IAgentWorktreeManager Worktrees { get; }
 
+        /// <summary>The <c>commit_work</c> calls this substrate received — the observable behind "the
+        /// daemon committed for the worker, on the worker's own (repo, agent)".</summary>
+        public IReadOnlyList<(string RepoHash, string AgentId, string? Message)> WorkerCommits =>
+            ((FakeWorktrees)Worktrees).Commits;
+
+        /// <summary>What this substrate's next <c>commit_work</c> will answer, so each outcome's mapping
+        /// onto a response can be exercised at the channel.</summary>
+        public AgentWorkCommitOutcome NextCommitOutcome
+        {
+            get => ((FakeWorktrees)Worktrees).NextCommitOutcome;
+            set => ((FakeWorktrees)Worktrees).NextCommitOutcome = value;
+        }
+
         public ISandboxEngine Sandboxes { get; }
 
         public IEgressPolicy Egress { get; } = new FakeEgress();
@@ -565,6 +578,27 @@ public sealed class AgentSessionRepoScopingTests
 
             public IReadOnlyList<Mainguard.Git.Models.WorktreeItem> List(string repoHash) =>
                 Array.Empty<Mainguard.Git.Models.WorktreeItem>();
+
+            /// <summary>Every <c>commit_work</c> this substrate was asked to perform, in order. Recorded
+            /// rather than performed: what git does with such a commit is pinned against real git in
+            /// <c>Mainguard.Tests.AgentWorkCommitTests</c>, and what belongs here is whether the daemon
+            /// asked for the right (repo, agent) and passed the worker's message through unchanged.</summary>
+            public List<(string RepoHash, string AgentId, string? Message)> Commits { get; } = new();
+
+            /// <summary>What the next commit will answer. Settable so the daemon's mapping of each
+            /// outcome onto a response is testable at the channel — the mapping is where "nothing to
+            /// commit" could quietly become "committed", which is the original defect wearing a success
+            /// message.</summary>
+            public AgentWorkCommitOutcome NextCommitOutcome { get; set; } = AgentWorkCommitOutcome.Committed;
+
+            public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+            {
+                Commits.Add((repoHash, agentId, message));
+                return new AgentWorkCommitResult(
+                    NextCommitOutcome, "agent/" + agentId,
+                    Sha: NextCommitOutcome == AgentWorkCommitOutcome.Committed ? new string('a', 40) : null,
+                    Detail: NextCommitOutcome == AgentWorkCommitOutcome.Committed ? null : NextCommitOutcome.ToString());
+            }
         }
 
         private sealed class FakeEgress : IEgressPolicy

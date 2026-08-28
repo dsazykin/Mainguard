@@ -36,12 +36,18 @@ Usage:
   mainguard-plan present <plan.json>    present the plan you authored, then wait
   mainguard-plan revise <id> <plan.json>  re-present after a rejection, then wait
   mainguard-plan await <id>             block until the human decides
+  mainguard-plan commit <message ...>   record the approved work on your own branch
 
-plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}.
+plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}. Write it
+OUTSIDE the repository (/tmp/plan.json) — /workspace is the tree your commit records.
 
 `present` and `revise` block until the decision arrives and print it. On approval the
 output includes TASK: followed by the work you are cleared to do — the daemon withholds
 it until then, so there is nothing to start on before approval.
+
+`commit` is how finished work leaves this jail. The daemon commits everything in
+/workspace onto your own branch; you supply only the message. Work you have not
+committed does not survive the agent being stopped.
 """
 """"
         + "\n" + AgentIpcShimTransport.PythonSource + "\n" + """"
@@ -56,6 +62,10 @@ def report(response):
     if status == "Approved":
         print("APPROVED: plan %s" % response.get("planId", ""))
         print("TASK: %s" % (response.get("taskPrompt") or ""))
+        # Said HERE, at the one moment the worker is cleared to start, because this is the only
+        # output it is guaranteed to read after the gate opens. A finished worker that never
+        # commits leaves nothing behind: the worktree goes with the jail.
+        print("WHEN DONE: mainguard-plan commit <message>  (uncommitted work is lost)")
         return 0
     if status == "Rejected":
         remaining = response.get("revisionsRemaining")
@@ -86,6 +96,11 @@ def main(argv):
                    "title": " ".join(argv[4:]) or None}
     elif len(argv) >= 3 and argv[1] == "await":
         request = {"op": "await_decision", "planId": argv[2]}
+    elif len(argv) >= 2 and argv[1] == "commit":
+        # The message is ALL the worker contributes. The repo, the worktree and the branch are the
+        # daemon's to compute from this endpoint's identity, so there is nothing else to send.
+        request = {"op": "commit_work", "message": " ".join(argv[2:])}
+        timeout = 300
     else:
         sys.stderr.write(__doc__ or "usage: mainguard-plan present <plan.json>\n")
         return 2
@@ -99,6 +114,16 @@ def main(argv):
     if response.get("ok"):
         if response.get("brief") is not None:
             print(response["brief"])
+            return 0
+        if response.get("committed") is not None:
+            # Distinguished, not collapsed: "nothing to commit" is an ok answer, and reporting it as a
+            # commit would tell a worker its work is safe while its branch has not moved.
+            if response.get("committed"):
+                print("COMMITTED: %s on %s"
+                      % (response.get("commitSha", ""), response.get("status", "")))
+            else:
+                print("NOTHING TO COMMIT: %s"
+                      % (response.get("feedback") or "the worktree is clean"))
             return 0
         return report(response)
 

@@ -140,6 +140,9 @@ public enum AgentIpcEndpointRole
 /// an existence oracle for other coordinators' fan-out.
 /// </param>
 /// <param name="Prompt">The steering text of a <c>prompt</c> op (contract §3 <c>send_worker_prompt</c>).</param>
+/// <param name="Message">The commit subject of a <c>commit_work</c> op. The ONLY thing a worker
+/// contributes to that commit: what is committed, where, and onto which branch are all computed
+/// daemon-side from the endpoint's identity.</param>
 public sealed record AgentIpcRequest(
     [property: JsonPropertyName("op")] string Op,
     [property: JsonPropertyName("agentKind")] string? AgentKind = null,
@@ -148,7 +151,8 @@ public sealed record AgentIpcRequest(
     [property: JsonPropertyName("title")] string? Title = null,
     [property: JsonPropertyName("planJson")] string? PlanJson = null,
     [property: JsonPropertyName("agentId")] string? AgentId = null,
-    [property: JsonPropertyName("prompt")] string? Prompt = null)
+    [property: JsonPropertyName("prompt")] string? Prompt = null,
+    [property: JsonPropertyName("message")] string? Message = null)
 {
     // ---- Coordinator ops — coordinator contract §3, and the list is EXHAUSTIVE -----------------
     //
@@ -211,6 +215,32 @@ public sealed record AgentIpcRequest(
     public const string AwaitDecisionOp = "await_decision";
 
     /// <summary>
+    /// <c>commit_work</c> — record the approved work on this worker's own branch, so it exists after the
+    /// jail does.
+    ///
+    /// <para><b>The defect this closes.</b> In the first end-to-end run a worker did the approved work and
+    /// stopped with a 20-line UNCOMMITTED diff. Stopping it deleted the worktree, the diff went with it,
+    /// <c>agent/&lt;id&gt;</c> carried no commit, and its merge-queue row joined the dead "the agent's
+    /// sandbox is gone" entries. The verification trigger observes <c>refs/heads/agent/&lt;id&gt;</c>
+    /// ADVANCING and then going quiet (<c>AgentRefWatcher</c> → <c>WorkerReadinessTrigger</c>); with no
+    /// commit there was never anything to observe, so the loop ended one step short of the merge queue,
+    /// silently. The worker's operating instructions had never mentioned committing.</para>
+    ///
+    /// <para><b>Why an op, and not "tell the worker to run git".</b> Measured against claude-code 2.1.251
+    /// under the jail's real posture — default permission mode, one <c>--allowedTools</c> grant, for its
+    /// own shim — a worker asked to commit could not even run <c>git status</c>: both attempts came back
+    /// refused and it stopped without committing. In an interactive jail that is not a refusal but an
+    /// approval prompt nobody can answer, which is the stall <c>preApprovedCommandArg</c> exists to fix.
+    /// Widening the grant to raw <c>git</c> was the alternative and is strictly worse: the daemon would
+    /// then be trusting a CLI to name the right branch. Here the worker supplies a MESSAGE and nothing
+    /// else — repository, worktree and branch are computed daemon-side from the endpoint's own identity,
+    /// the shape that makes <c>AgentRefMediator</c> safe (the agent cannot name a ref at all). It grants
+    /// no capability the worker lacked: <c>WorktreeManager</c> gives every agent its own repository
+    /// precisely so that committing is available to it.</para>
+    /// </summary>
+    public const string CommitWorkOp = "commit_work";
+
+    /// <summary>
     /// The complete set of ops a worker endpoint will serve. Disjoint from <see cref="CoordinatorOps"/>
     /// by construction — the two sets share no member, and a test pins that, because the whole point of
     /// fixing the role on the endpoint is that neither role can reach the other's operations.
@@ -218,7 +248,7 @@ public sealed record AgentIpcRequest(
     public static readonly System.Collections.Generic.IReadOnlySet<string> WorkerOps =
         new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
         {
-            BriefOp, PresentPlanOp, RevisePlanOp, AwaitDecisionOp,
+            BriefOp, PresentPlanOp, RevisePlanOp, AwaitDecisionOp, CommitWorkOp,
         };
 }
 
@@ -242,7 +272,9 @@ public sealed record AgentIpcResponse(
     [property: JsonPropertyName("maxRevisions")] int? MaxRevisions = null,
     [property: JsonPropertyName("brief")] string? Brief = null,
     [property: JsonPropertyName("taskPrompt")] string? TaskPrompt = null,
-    [property: JsonPropertyName("planErrors")] string[]? PlanErrors = null);
+    [property: JsonPropertyName("planErrors")] string[]? PlanErrors = null,
+    [property: JsonPropertyName("commitSha")] string? CommitSha = null,
+    [property: JsonPropertyName("committed")] bool? Committed = null);
 
 /// <summary>
 /// The pure wire codec for the coordinator→daemon spawn channel: newline-delimited JSON, one

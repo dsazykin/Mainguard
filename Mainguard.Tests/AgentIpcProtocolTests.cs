@@ -68,6 +68,76 @@ public class AgentIpcProtocolTests
         Assert.Contains("(\"status\", \"list\")", AgentSpawnShim.Script, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Every op the DAEMON serves a worker has a way for the worker to reach it. An exhaustiveness check
+    /// over <see cref="AgentIpcRequest.WorkerOps"/> rather than one assertion per op, because the failure
+    /// it guards against is the one this branch keeps finding: a complete handler with nothing able to
+    /// call it. <c>commit_work</c> is the newest instance — a daemon that can commit for a worker is worth
+    /// nothing if the worker's only executable has no subcommand for it.
+    /// </summary>
+    [Fact]
+    public void TheWorkerShim_CanReachEveryOpTheDaemonServesAWorker()
+    {
+        foreach (var op in AgentIpcRequest.WorkerOps)
+        {
+            Assert.Contains($"\"op\": \"{op}\"", WorkerPlanShim.Script, StringComparison.Ordinal);
+        }
+
+        // …and the command line a worker actually types for the newest one.
+        Assert.Contains("argv[1] == \"commit\"", WorkerPlanShim.Script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Both shims are Python living inside a C# string literal, so nothing in the C# build has an opinion
+    /// about whether they parse. A syntax error would ship to every jail and surface as a worker that
+    /// cannot reach the daemon at all — indistinguishable, from the daemon's side, from a worker that
+    /// simply never called. Compiled with the real interpreter; skipped where there is none, because a
+    /// missing python3 on a dev box is not evidence about the script.
+    /// </summary>
+    [Fact]
+    public void BothShims_AreValidPython()
+    {
+        foreach (var (name, source) in new[]
+                 {
+                     ("mainguard-agent", AgentSpawnShim.Script),
+                     ("mainguard-plan", WorkerPlanShim.Script),
+                 })
+        {
+            var path = System.IO.Path.Combine(
+                System.IO.Path.GetTempPath(), $"mg-shim-{Guid.NewGuid():N}-{name}.py");
+            System.IO.File.WriteAllText(path, source);
+            try
+            {
+                var start = new System.Diagnostics.ProcessStartInfo("python3")
+                {
+                    RedirectStandardError = true,
+                    RedirectStandardOutput = true,
+                };
+                start.ArgumentList.Add("-m");
+                start.ArgumentList.Add("py_compile");
+                start.ArgumentList.Add(path);
+
+                using var process = System.Diagnostics.Process.Start(start);
+                if (process is null)
+                {
+                    return; // no python3 on this box — nothing measured, nothing claimed
+                }
+
+                var stderr = process.StandardError.ReadToEnd();
+                process.WaitForExit();
+                Assert.True(process.ExitCode == 0, $"{name} is not valid python: {stderr}");
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                return; // python3 is not installed here
+            }
+            finally
+            {
+                try { System.IO.File.Delete(path); } catch { /* best effort */ }
+            }
+        }
+    }
+
     [Fact]
     public void IpcPaths_AreTheFixedInJailLayout()
     {

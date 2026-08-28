@@ -984,6 +984,23 @@
   that a COORDINATOR gets none — its terminal is not input-locked and its real first turn is the
   operator's request. Mutations watched red: the role gate removed (1 red here, 1 in the daemon suite),
   the `brief` step deleted (2 red).
+- **`Mainguard.Tests/AgentWorkCommitTests.cs`** — the rung the coordinator loop was missing: a worker's
+  finished work becoming a commit on `agent/<id>`. On the first end-to-end run a worker did the approved
+  work and stopped with a 20-line UNCOMMITTED diff; stopping it deleted the worktree, the branch carried
+  no commit, and the readiness trigger — which fires on that ref advancing and then going quiet — had
+  nothing to observe. Run against REAL git through the real `WorktreeManager`, and every "the branch
+  moved" assertion is made on the AGENT REPOSITORY's ref, because that is the ref `AgentRefWatcher`
+  snapshots. Covers: the commit lands and the ref moves to the sha the caller was told; the message and
+  an identity naming the agent; files the worker CREATED are in it (`git add -A`, so a test that only
+  edited a tracked file would pass against a `commit -a` that drops them); files the daemon excluded are
+  NOT (the coupling with the `info/exclude` half — this commit is the thing that would otherwise carry
+  them into the user's history); the commit does NOT publish, observed as the mirror still lagging (an
+  eager publish would make the watcher's own publish `Unchanged` and so raise no `Advanced` at all,
+  silently disarming the trigger for the very commit it exists to react to); a clean tree answers
+  `NothingToCommit` and the branch does not move; a worktree on another branch is REFUSED, not committed
+  onto; no worktree and a substrate-less manager each report as such rather than as success; and the
+  message — the one thing a worker supplies — is flattened to a single bounded subject, with an absent
+  one defaulting rather than losing the work.
 - **`Mainguard.Tests/AdapterInitialPromptTests.cs`** — the manifest half of the first turn:
   `initialPromptStyle`, which only `claude-code` declares (`first-positional`; asserted that no other
   shipped adapter does). Every unreadable spelling is REFUSED at parse with
@@ -1779,7 +1796,12 @@
   plan, and a foreign plan id gets the same answer as a nonexistent one so the channel is not an
   existence oracle; a schema-invalid plan never reaches a human; and a Managed session the gate is NOT
   holding — an external-PR head, a manual worker — gets **no channel at all**, and is not merge-blocked
-  either. Over a shared `PlanGateRig` (one in-proc host per class; each test stops the agents it spawned,
+  either. **`commit_work` (the rung the loop was missing)** is asserted on the same wire: a worker still
+  at the gate may not commit and nothing is committed; an approved one commits on its own (repo, agent)
+  with its own message and gets the sha back; a request carrying ANOTHER worker's `agentId` still lands
+  on the caller's own branch (the field exists because coordinator ops need it, so the guarantee is
+  behavioural rather than structural); a clean tree answers `committed:false` rather than a commit; and a
+  refused commit is reported as a failure, not as done. Over a shared `PlanGateRig` (one in-proc host per class; each test stops the agents it spawned,
   because `MaxActiveWorkers` is daemon-global and leaked workers make a later test hit the cap — which is
   how the first run failed, and a pleasant way to be reminded the cap is real). **`WorkerCapDaemonEnforcementTests`**
   is its own class, and therefore its own rig, because it asserts a daemon-global population: the cap is

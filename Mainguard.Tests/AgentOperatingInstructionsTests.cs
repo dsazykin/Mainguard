@@ -95,6 +95,41 @@ public class AgentOperatingInstructionsTests
         Assert.Contains(AgentIpcPaths.PlanShimFileName, text, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// The other sentence a worker cannot be allowed to miss — the one that was missing. In the first
+    /// end-to-end run a worker did the approved work and stopped with an UNCOMMITTED diff; its worktree
+    /// went with the jail, its branch carried no commit, and the readiness trigger — which fires on that
+    /// branch advancing and then going quiet — had nothing to observe. These instructions had never
+    /// mentioned committing at all.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldToCommit_AndThatUncommittedWorkIsLost()
+    {
+        var text = Flatten(Worker());
+
+        // The command, spelled with the shim path this role's jail actually has.
+        Assert.Contains(
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker) + " commit",
+            text, StringComparison.Ordinal);
+
+        // …and WHY, which is the half that makes an agent act on it rather than note it.
+        Assert.Contains("lost", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A worker's plan file must not land in the tree its own commit records. That commit is
+    /// <c>git add -A</c> over <c>/workspace</c>, and the shim takes a path — so an unqualified "write the
+    /// plan to a JSON file" puts it in the working directory, which IS the repository.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldToWriteItsPlanOutsideTheRepository()
+    {
+        var shim = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        Assert.Contains("/tmp/plan.json", Flatten(Worker()), StringComparison.Ordinal);
+        Assert.Contains("/tmp/plan.json", Flatten(AgentKickoffPrompt.Worker(shim)), StringComparison.Ordinal);
+    }
+
     private static string Flatten(string text) =>
         string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 

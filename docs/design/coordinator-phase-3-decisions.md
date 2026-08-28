@@ -900,3 +900,98 @@ instructions live under the read-only `/opt/mainguard/ipc` mount.
 | M5 | the staging step drops the escaping-name check | **2 failed** / 27 passed |
 | M6 | the spawn reverts to the settings-only list (a correct function nobody calls correctly) | **1 failed** / 28 passed |
 | M7 | the manifest parse refusal removed | **5 failed** / 8 passed |
+
+### 11.2 The loop ended one step short of the merge queue
+
+The worker did the approved work and stopped with a **20-line uncommitted diff**. Stopping the agent
+deleted the worktree, so the diff went with it; `agent/<id>` carried no commit; and its merge-queue row
+joined ~19 dead "the agent's sandbox is gone" entries. `AgentOperatingInstructions.Worker` had never
+mentioned committing.
+
+**Why nothing rescued it.** The readiness trigger observes `refs/heads/agent/<id>` *advancing* and then
+going quiet (`AgentRefWatcher.Advanced` → `WorkerReadinessTrigger` → `MergeQueue.RunVerificationAsync`).
+With no commit there was nothing to observe, and the failure is silent by construction: a worker that
+never commits is indistinguishable, to every mechanism downstream, from one that did nothing.
+
+**Why telling the worker to run `git` does not work — measured, not reasoned.** claude-code 2.1.251,
+under the jail's real posture (`--permission-mode default`, one `--allowedTools` grant for its own shim),
+asked to commit finished work:
+
+| launch line | result |
+|---|---|
+| the user's own `defaultMode: auto` (the confounded first probe) | committed — and proved nothing about a jail |
+| `--permission-mode default` + `Bash(<shim>:*)` only | **refused twice; could not even run `git status`; stopped without committing** |
+
+In a real jail that is not a refusal but an approval prompt with nobody to answer it — the exact stall
+`100e0227` added `preApprovedCommandArg` to end.
+
+**So the delivery is the shim, which is already the one command a worker may run.** `commit_work` on the
+worker endpoint; `mainguard-plan commit <message>` on the command line; the commit performed daemon-side
+by `WorktreeManager.CommitAgentWork`.
+
+- **Rejected: widen the grant to `Bash(git commit:*)`.** Strictly worse. It costs a second standing
+  grant in every worker jail and leaves the daemon trusting a CLI to name the right branch. Here the
+  worker supplies a *message* and nothing else — repo, worktree and branch are computed from the id the
+  endpoint already proves, which is the same structural argument that makes `AgentRefMediator` safe.
+- **Rejected: commit for the worker at teardown.** It would rescue this exact diff and is the wrong
+  rule: a human's Stop means stop, and a commit nobody asked for entering the merge queue is a worse
+  default than a lost draft. Not done, and recorded as such below.
+- **No new capability.** `CreateAgentWorktree` gives every agent its own repository *specifically* so the
+  mirror's mount can be read-only "without taking `git commit` away from the agent". What was missing was
+  a permitted route, not the permission.
+
+**The gate is the existing one.** `commit_work` asks `WorkerPlanGate.MayWork` — the same predicate
+`send_worker_prompt` and `request_verification` ask. A worker still at the gate has no authorised work to
+record, and the refusal is the sentence a human reads elsewhere rather than a second opinion about what
+"approved" means.
+
+**Two traps, both load-bearing:**
+
+1. **The commit must NOT publish.** `AgentRefWatcher.PollOnce` raises `Advanced` only for an outcome of
+   `Published`; publishing eagerly makes the sweep's own publish `Unchanged`, which is `Current` (so the
+   snapshot is recorded) and not `Published` (so no event fires). An eager publish would therefore
+   silently disarm the trigger for the very commit it exists to react to. The watcher carries the tip
+   across on its own tick, exactly as before.
+2. **`git add -A` is why 11.1 had to ship with this.** This commit is the thing that would otherwise
+   carry Mainguard's own files into the user's history, and the worker's plan file was the other one —
+   the instructions and the kickoff turn now both say to write it to `/tmp/plan.json`, outside the tree
+   the commit records.
+
+**"Nothing to commit" is not "committed".** A clean tree answers truthfully and the response says
+`committed: false`; reporting it as a commit would tell a worker its work is safe while its branch sits
+exactly where it was — the original defect wearing a success message.
+
+| # | enforcement removed | result |
+|---|---|---|
+| M8 | the worker instructions never mention committing (the pre-change behaviour) | **1 failed** / 22 passed |
+| M8b | the kickoff turn stops steering the plan file out of the worktree | **1 failed** / 22 passed |
+| M9 | the plan gate is not asked before committing | **1 failed** / 12 passed |
+| M10 | the commit uses `request.AgentId` instead of the endpoint's own id | **1 failed** / 12 passed |
+| M11 | the branch-alignment refusal removed (commit onto whatever HEAD is) | **1 failed** / 14 passed |
+| M12 | "nothing to commit" answered as a commit, at the channel | **1 failed** / 12 passed |
+| M12b | …and at the worktree | **1 failed** / 14 passed |
+| M13 | the commit publishes to the mirror itself (disarming the trigger) | **1 failed** / 15 passed |
+| M14 | `git add -A` narrowed to tracked files only | **4 failed** / 11 passed |
+| M15 | the shim loses its `commit` subcommand (a handler nothing can reach) | **1 failed** / 13 passed |
+| M16 | the shim ships syntactically invalid python | **1 failed** / 13 passed |
+
+**A note on how these were measured, because it nearly produced a false result.** The first pass ran M12
+and reported it GREEN. It was not: the harness restored each mutated file with `mv`, which put back the
+ORIGINAL mtime — older than the assembly just built from the mutation — so MSBuild considered the project
+up to date and the next run tested the *mutated* binary. Every number above was re-measured with the
+restore touching the file. A mutation harness that cannot restore is a harness that reports whatever it
+likes.
+
+**Found and NOT fixed here**
+
+- **Teardown still does not commit a dirty worktree.** Deliberate, per the rejected option above. The
+  worker is now told, in three places, that uncommitted work is lost.
+- **M13 is guarded indirectly, and the test says so.** No test drives a live watcher sweep over
+  wall-clock time; what is asserted instead is the fact an eager publish would destroy — that straight
+  after a commit the MIRROR still lags the agent's own repository, and that the ordinary publish is what
+  closes the gap. That is the precondition `Advanced` needs, measured; the event itself is not.
+- **Whether a jailed CLI can EDIT files unattended is still unmeasured.** The live run produced a real
+  diff, so it could — but that jail restored the owner's own workspace settings, and a first-ever
+  session in a fresh repository restores nothing. If edits also stall on approval, the fix is the same
+  shape as this one and is a separate, reviewable change.
+- **§8.5's folder-trust dialog is still open.**

@@ -138,6 +138,31 @@ These four already exist as `CoordinatorTools`. The contract is that this list i
 Anything not on this list is denied. Adding to this list is a deliberate contract change, reviewed as
 such — not an implementation detail.
 
+### 3.1 The WORKER's surface, which is a different exhaustive list
+
+A worker's jail carries `mainguard-plan`, never `mainguard-agent`, and the daemon dispatches on the
+endpoint's role — so the two lists are disjoint and neither role can reach the other's operations
+(phase 2 §2.7). The worker's list is exhaustive on the same terms, and `AgentIpcRequest.WorkerOps` is the
+object the daemon builds its handler table against.
+
+| op | purpose | gates applied |
+|---|---|---|
+| `brief` | what am I here to plan? | never yields the task prompt |
+| `present_plan` | present the plan I authored, then block | one live plan per worker |
+| `revise_plan` | re-present after a rejection, then block | plan ownership · revision budget |
+| `await_decision` | re-attach and block on my own plan | plan ownership |
+| `commit_work` | record my approved work on my own branch | **approved plan** (`MayWork`) |
+
+`commit_work` is the step that makes a worker's work outlive its jail, and it is where the loop used to
+end one rung short: a worker finished, stopped on an uncommitted diff, and the worktree was deleted with
+the jail. It is gated by the same `MayWork` predicate as steering and verification, because a worker still
+at the gate has no authorised work to record.
+
+**The worker names only the message.** Which repository, which worktree and which branch are computed
+daemon-side from the endpoint's own identity — the same structure that stops an agent naming a ref at all
+(`AgentRefMediator`). It grants no capability a worker lacked: every agent already owns the repository its
+worktree is linked off, precisely so that committing stays available to it.
+
 ## 4. What the coordinator may never do
 
 Denied **at the daemon**, not by convention:

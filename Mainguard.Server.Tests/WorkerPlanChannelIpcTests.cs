@@ -37,12 +37,17 @@ public sealed class PlanGateRig : IDisposable
     {
         _root = Path.Combine(Path.GetTempPath(), "mg-plangate-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(Path.Combine(_root, "repos", RepoHandle)); // "provisioned"
-        var environment = new AgentSessionRepoScopingTests.FakeAgentEnvironment(
+        Environment = new AgentSessionRepoScopingTests.FakeAgentEnvironment(
             _root, new AgentSessionRepoScopingTests.RecordingEngine());
+        var environment = Environment;
         _host = _daemon.WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             services.AddSingleton<IAgentEnvironment>(environment)));
         _ = _host.Services; // build once, here, not inside the first test
     }
+
+    /// <summary>The substrate this daemon was built over — the only way to see what the daemon asked it
+    /// to do (which worktree it committed on, and on whose behalf).</summary>
+    internal AgentSessionRepoScopingTests.FakeAgentEnvironment Environment { get; }
 
     public AgentSpawnService Spawns => _host.Services.GetRequiredService<AgentSpawnService>();
 
@@ -283,6 +288,148 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         Assert.NotNull(refused.PlanErrors);
         Assert.Contains("testStrategy is required", refused.PlanErrors!);
         Assert.Null(Rig.Plans.LiveForWorker(workerId)); // nothing reached the approval queue
+    }
+
+    // ---- commit_work: the rung the loop was missing ------------------------
+    //
+    // The first end-to-end run ended with a worker holding a 20-line UNCOMMITTED diff. Its worktree was
+    // deleted with the jail, agent/<id> carried no commit, and the readiness trigger — which fires on
+    // that ref advancing and then going quiet — had nothing to observe. Everything below drives the same
+    // bytes an in-jail shim writes, over the real socket.
+
+    /// <summary>
+    /// The gate answers commit exactly as it answers steering and verification. A worker whose plan is
+    /// not approved has no authorised work, so it has nothing legitimate to record — and the refusal is
+    /// the same sentence a human reads elsewhere, because it is the same gate rather than a second
+    /// opinion about what "approved" means.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerStillAtThePlanGate_MayNotCommit()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("fix the clock");
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work nobody approved"));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("has not presented a plan yet", refused.Error);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count); // and nothing was committed
+    }
+
+    /// <summary>
+    /// The positive: once a human approves, the worker's own shim channel records the work. The daemon
+    /// commits on the worker's (repo, agent) and answers with the sha — which is what makes
+    /// <c>refs/heads/agent/&lt;id&gt;</c> move and therefore what the readiness trigger can see.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorker_CommitsItsWorkThroughItsOwnChannel()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite TokenClock");
+        await ApproveAsync(workerId);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock"));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.True(response.Committed);
+        Assert.False(string.IsNullOrEmpty(response.CommitSha));
+        Assert.Equal("agent/" + workerId, response.Status);
+
+        var commit = Assert.Single(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+        Assert.Equal(PlanGateRig.RepoHandle, commit.RepoHash);
+        Assert.Equal("feat: rewrite the clock", commit.Message);
+    }
+
+    /// <summary>
+    /// <b>The worker names only the message.</b> <c>AgentIpcRequest.AgentId</c> exists because the
+    /// coordinator's ops need it, so a worker CAN put another agent's id on the wire — and it must have
+    /// no effect whatsoever. The commit's (repo, agent) come from the endpoint the request arrived on,
+    /// the same way <c>AgentRefMediator</c> refuses to let an agent name a ref at all.
+    ///
+    /// <para>Asserted behaviourally rather than by field-absence, for the reason
+    /// <c>QueueEntryResumeTests</c> writes down: a structural proof that stops being available has to be
+    /// replaced by one that survives the field existing.</para>
+    /// </summary>
+    [Fact]
+    public async Task ACommitIgnoresAnyAgentIdTheRequestCarries_AndLandsOnTheCallersOwnBranch()
+    {
+        var (_, mine) = await SpawnCoordinatorAndWorkerAsync("my task");
+        var (_, theirs) = await SpawnCoordinatorAndWorkerAsync("their task");
+        await ApproveAsync(mine);
+        await ApproveAsync(theirs);
+
+        var response = await CallAsync(mine, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch"));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal("agent/" + mine, response.Status);
+        Assert.Contains(Rig.Environment.WorkerCommits, c => c.AgentId == mine);
+        Assert.DoesNotContain(Rig.Environment.WorkerCommits, c => c.AgentId == theirs);
+    }
+
+    /// <summary>
+    /// A clean tree answers truthfully. The worker asked correctly and there was nothing to record, so
+    /// the call succeeds — and says <c>committed: false</c>, because the branch did not move. Reporting
+    /// it as a commit would tell a worker its work is safe while its branch sits exactly where it was:
+    /// the original defect wearing a success message, and no longer visible to anyone.
+    /// </summary>
+    [Fact]
+    public async Task ACleanTree_AnswersNothingToCommit_RatherThanClaimingACommit()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("nothing to do");
+        await ApproveAsync(workerId);
+        Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.NothingToCommit;
+        try
+        {
+            var response = await CallAsync(workerId, new AgentIpcRequest(
+                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened"));
+
+            Assert.True(response.Ok, response.Error);
+            Assert.False(response.Committed);
+            Assert.Null(response.CommitSha);
+        }
+        finally
+        {
+            Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.Committed;
+        }
+    }
+
+    /// <summary>
+    /// A worktree that has wandered off <c>agent/&lt;id&gt;</c> is a refusal the worker is told about, not
+    /// a silent success. A commit made on some other branch is reachable from nothing the mediator
+    /// publishes, the queue reads or the trigger watches — lost exactly as an uncommitted diff is.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedCommit_IsReportedAsAFailure_NotAsDone()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("work on the wrong branch");
+        await ApproveAsync(workerId);
+        Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.RefusedBranch;
+        try
+        {
+            var response = await CallAsync(workerId, new AgentIpcRequest(
+                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else"));
+
+            Assert.False(response.Ok);
+            Assert.False(response.Committed);
+            Assert.False(string.IsNullOrEmpty(response.Error));
+        }
+        finally
+        {
+            Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.Committed;
+        }
+    }
+
+    /// <summary>Presents a plan and has a human approve it, so the worker is past the gate.</summary>
+    private async Task ApproveAsync(string workerId)
+    {
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.PresentPlanOp, PlanJson: PlanJson("src/a.cs"), Title: "T"));
+        var pending = await WaitForAsync(() => Rig.Plans.LiveForWorker(workerId));
+        Rig.Plans.Approve(pending.PlanId, "uid:1000");
+        var approved = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("Approved", approved.Status);
     }
 }
 

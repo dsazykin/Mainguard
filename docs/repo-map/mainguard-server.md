@@ -234,7 +234,8 @@
     has**, because a git exclude does not cover a tracked file and the write would otherwise replace a
     user's own `CLAUDE.md` — and `DeclaredWorkspaceIgnorePaths` is the union (settings paths + that
     filename) the jail's `info/exclude` is built from, so what the daemon writes and what git ignores are
-    decided by one field.
+    decided by one field. `Worktrees` exposes this daemon's own worktree manager for the in-daemon
+    caller that acts on a live agent's worktree (the worker's `commit_work`).
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
@@ -282,6 +283,13 @@
     `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
     and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
     merge-ready).
+    **`CommitWork`** is the worker table's fifth op (`commit_work`) and the rung the loop was missing: a
+    finished worker used to stop on an uncommitted diff that died with its worktree, leaving
+    `agent/<id>` empty and the readiness trigger — which fires on that ref advancing — with nothing to
+    observe. Pure transport: `WorkerPlanGate.MayWork` (the SAME predicate `prompt` and `verify` ask) then
+    `WorktreeManager.CommitAgentWork`, which owns what/where/onto-which-branch. The worker supplies only
+    a message; the (repo, agent) come from the endpoint, never from `request.AgentId`. `NothingToCommit`
+    answers `ok:true, committed:false` rather than a commit.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
