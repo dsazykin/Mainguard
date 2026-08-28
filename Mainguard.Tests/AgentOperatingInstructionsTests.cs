@@ -17,10 +17,15 @@ namespace Mainguard.Tests;
 /// </summary>
 public class AgentOperatingInstructionsTests
 {
+    /// <summary>Stand-ins for "what this daemon has installed" — deliberately not the shipped ids, so a
+    /// test that passes only because it recognised a real adapter name cannot exist.</summary>
+    private static readonly string[] Kinds = { "alpha-cli", "beta-cli" };
+
     private static string Coordinator() =>
         AgentOperatingInstructions.For(
             AgentIpcEndpointRole.Coordinator,
-            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator));
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator),
+            Kinds);
 
     private static string Worker() =>
         AgentOperatingInstructions.For(
@@ -119,6 +124,59 @@ public class AgentOperatingInstructionsTests
         var text = Coordinator();
         Assert.Contains("no repository", text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("deliberate", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// <b>Defect D1's other half.</b> A coordinator is told which agent kinds exist. It was not, and its
+    /// natural first move — <c>spawn coder</c>, a plausible reading of <c>spawn &lt;agent-kind&gt;</c> —
+    /// produced a jail with no CLI in it that reported success.
+    ///
+    /// <para>The list is rendered from what the daemon has installed, never written into the prose: a
+    /// hardcoded list stops describing the machine the first time a CLI is added or removed, which is the
+    /// MG-12 shape this file's header is already about.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldWhichAgentKindsExist()
+    {
+        var text = Coordinator();
+
+        foreach (var kind in Kinds)
+        {
+            Assert.Contains(kind, text, StringComparison.Ordinal);
+        }
+
+        // And the list is the ONE the caller supplied — not a shipped set that happens to be around.
+        Assert.DoesNotContain("claude-code", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The permissive box states itself rather than rendering an empty list. "One of: " followed by
+    /// nothing reads to an agent as a broken prompt, which is the failure mode this whole file exists to
+    /// avoid; a dev box with no CLIs installed is a real state, and spawns there are deliberately not
+    /// refused.
+    /// </summary>
+    [Fact]
+    public void ACoordinatorOnABoxWithNothingInstalled_IsToldThat_NotAnEmptyList()
+    {
+        var text = AgentOperatingInstructions.For(
+            AgentIpcEndpointRole.Coordinator,
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator),
+            Array.Empty<string>());
+
+        Assert.Contains("none installed", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>A worker has no <c>spawn</c>, so nothing about what is installed belongs in its text —
+    /// and the kinds argument must not leak into it by being threaded through one shared renderer.</summary>
+    [Fact]
+    public void TheWorkerTextDoesNotDependOnWhatIsInstalled()
+    {
+        Assert.Equal(
+            Worker(),
+            AgentOperatingInstructions.For(
+                AgentIpcEndpointRole.Worker,
+                AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker),
+                Kinds));
     }
 
     /// <summary>An unknown role gets the text that cannot start work without a human.</summary>

@@ -659,3 +659,64 @@ here is narrower and stated exactly: **the launch line a worker jail receives no
 turn, and a real claude-code driven with that line ran the full brief → inspect → present loop
 unattended.** What has still not been watched is that loop over the real daemon's socket, in a real jail,
 with a real human approving.
+
+## 9. Defect D1 — an unknown agent-kind produced a CLI-less jail and reported SUCCESS
+
+### 9.1 What was observed
+
+A real coordinator, on its first move, ran:
+
+```
+mainguard-agent spawn coder "<the task>"
+```
+
+`coder` is not an installed adapter — the box has `claude-code` and five `scripted-*`. So
+`InstalledAdapterCatalog.TryGet` answered null, `launchCommand` stayed null, and the jail was created
+with **nothing to run**: `docker top` showed `sleep infinity` and no CLI. The shim answered
+`Ok, Status: AwaitingPlan`, so the coordinator believed it had a worker, and that dead jail held a slot
+against `MaxActiveWorkers` for the rest of the session.
+
+**This was the instructions being followed, not ignored.** `AgentOperatingInstructions.Coordinator` said
+`spawn <agent-kind>` and never said what a kind was. `coder` is the obvious guess.
+
+### 9.2 The two halves, and why the second is not prose
+
+**(a) The refusal.** `CoordinatorSpawnGate.RefuseUnknownKind`, called from
+`AgentSpawnService.SpawnWorkerAsync` before anything is minted, so a bad kind costs no session, no jail
+and no cap slot. It names the kind and every installed one.
+
+It is **not** in `SandboxAgentLauncher`, deliberately. A CLI-less jail is a legitimate, wanted outcome of
+two other paths and the launcher's call site already says so: the operator spawning an unknown kind gets a
+bare sandbox **with a human on its PTY**, and `ExternalPrWorkerHost` spawns kind `external-pr`, which no
+adapter answers to by design. What makes it never legitimate *here* is attendance: a coordinator's workers
+are `Managed`, their terminals are daemon-locked read-only (P2-14), so nobody can ever type into the shell
+such a spawn produces. Moving the check into `SpawnAsync` would have fixed the coordinator by breaking
+both of those.
+
+An **empty** catalog stays permissive. That is the documented meaning of `InstalledAdapterCatalog.HasAny`
+("a dev/unprovisioned box"), and it is also the only honest option: the entire value of this refusal is
+the list of alternatives it carries, and with nothing installed there is no list.
+
+**(b) The instructions.** `Coordinator(shimPath, installedKinds)` now renders the kinds, per spawn, from
+`InstalledAdapterCatalog.InstalledKinds()`. Writing them into the prose would have been the same defect
+one layer up — a hardcoded list stops describing the machine the first time a CLI is installed or removed
+(MG-12), and this repo has paid for that shape repeatedly. The instructions and the refusal render through
+one function (`AgentOperatingInstructions.SpellKinds`) over one set, so they cannot be edited apart.
+
+`InstalledKinds()` exists as a named member for exactly that reason, and
+`CoordinatorSpawnKindTests.TheInstructionsAndTheRefusal_ReadTheSameSet` is the assertion that keeps it so.
+
+### 9.3 The mutation log
+
+| # | enforcement removed | result |
+|---|---|---|
+| M1 | the kind guard (the pre-change behaviour) | **2 failed** / 5 passed |
+| M2 | the empty-catalog carve-out | **1 failed** / 6 passed |
+| M3 | the refusal stops naming the installed kinds | **2 failed** / 5 passed |
+| M4 | the launcher passes no kinds to the instructions | **2 failed** / 5 passed |
+| M5 | the kind list hardcoded in the prose | **3 + 2 failed** |
+
+M1 is the verification: with the guard removed the daemon reproduces the report exactly — `spawn coder`
+answers `Ok`, a session is minted, and a jail is requested for a kind nothing can launch. M4 is the one
+worth reading: every prose assertion about the instructions stayed green while the launcher handed them an
+empty list, which is why the binding is asserted at the launcher and not only at the string function.

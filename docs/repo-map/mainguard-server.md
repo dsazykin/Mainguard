@@ -420,6 +420,18 @@
   the generic wording rather than asserting a cause it never checked. **It also has a second caller:
   `Runtime/ExternalPrWorkerHost.cs`**, so both daemon-driven spawn paths are admitted by one evaluator
   over one population.
+  **Defect D1 — `RefuseUnknownKind(agentKind, installedKinds)`.** A real coordinator's first move was
+  `mainguard-agent spawn coder "…"`; `coder` is no adapter id, so the launcher resolved no CLI, the jail
+  came up running `sleep infinity` and nothing else, and the shim answered `Ok, Status: AwaitingPlan` —
+  a dead worker the coordinator believed in, holding a slot against the worker cap. The refusal names the
+  kind and every installed one, rendered by the same `AgentOperatingInstructions.SpellKinds` the
+  coordinator's instructions use, so the text and the enforcement read one set. It is called ONLY from
+  `AgentSpawnService.SpawnWorkerAsync` and deliberately not from `SpawnAsync`: a CLI-less jail is a wanted
+  outcome of the operator path (a bare sandbox with a human on the PTY) and of `ExternalPrWorkerHost`
+  (kind `external-pr`, which no adapter answers to by design), and neither may be taken away. An EMPTY
+  catalog stays permissive — the documented meaning of `InstalledAdapterCatalog.HasAny`, and the only
+  honest behaviour when there is no list of alternatives to offer. Covered by
+  `Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`.
 - **`Runtime/ExternalPrWorkerHost.cs`** — the daemon's `IPrWorkerHost`: gives an intake'd upstream
   pull request a REAL jail by running the ONE spawn chain (`AgentSpawnService.SpawnAsync`) under the
   id `pr-<n>`, kind `external-pr` (no installed adapter answers to it ⇒ no CLI, no launch command),

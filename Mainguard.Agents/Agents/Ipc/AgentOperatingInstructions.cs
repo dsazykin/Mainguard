@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents.Ipc;
 
@@ -33,11 +35,37 @@ public static class AgentOperatingInstructions
     public const string DefaultFileName = "AGENT_INSTRUCTIONS.md";
 
     /// <summary>
+    /// How the installed agent kinds are spelled wherever they are named — in the coordinator's operating
+    /// instructions, and in the refusal it gets for naming one that is not installed.
+    ///
+    /// <para>Shared on purpose: those are the same claim about the same set, made to the same reader
+    /// seconds apart, and two renderings of one set is how they come to disagree. An empty set renders as
+    /// a sentinel rather than as nothing, because "one of: " followed by silence reads as a bug in the
+    /// text rather than as the real (and deliberately permissive) state of an unprovisioned box.</para>
+    /// </summary>
+    public static string SpellKinds(IReadOnlyCollection<string>? installedKinds) =>
+        installedKinds is { Count: > 0 }
+            ? string.Join(", ", installedKinds.Select(k => $"`{k}`"))
+            : "(none installed on this machine)";
+
+    /// <summary>
     /// The shipped coordinator's operating instructions: the four tools as the CLI actually spells them,
     /// the boundary, and the two behaviours a coordinator otherwise gets wrong (writing plans itself, and
     /// retrying into a cap that is full because humans have not decided yet).
     /// </summary>
-    public static string Coordinator(string shimPath) =>
+    /// <param name="installedKinds">
+    /// The agent kinds this daemon can actually launch (<c>InstalledAdapterCatalog.InstalledKinds</c>).
+    ///
+    /// <para><b>Why the list is a parameter and not prose.</b> The first thing a real coordinator did with
+    /// these instructions was run <c>spawn coder</c> — a natural reading of <c>spawn &lt;agent-kind&gt;</c>
+    /// when nothing anywhere says what a kind is. <c>coder</c> is not an installed adapter, so its jail
+    /// came up with no CLI in it at all and the shim answered <c>Ok</c> anyway. Writing the kinds into this
+    /// text as prose would have been the other half of the same defect: a hardcoded list stops describing
+    /// the machine the first time a user installs or removes a CLI (MG-12). It is rendered per spawn from
+    /// the same catalog the daemon's <c>spawn</c> refusal reads, so the text and the enforcement cannot
+    /// say different things.</para>
+    /// </param>
+    public static string Coordinator(string shimPath, IReadOnlyCollection<string>? installedKinds = null) =>
         $"""
         # You are the Mainguard Coordinator
 
@@ -58,6 +86,14 @@ public static class AgentOperatingInstructions
         ```
 
         Run `{shimPath}` with no arguments for the full usage text.
+
+        ## `<agent-kind>` is one of the CLIs installed on this machine
+
+        {SpellKinds(installedKinds)}
+
+        That is the complete list. Any other name — including plausible ones like `coder`, `worker` or
+        `engineer` — is refused, and the refusal names the list again. Do not invent a kind, and do not
+        pick one by what the task sounds like: pick the CLI you want to do the work.
 
         ## How the work actually flows
 
@@ -125,6 +161,9 @@ public static class AgentOperatingInstructions
 
     /// <summary>Renders the instructions for a role. Unknown roles get the worker text: the conservative
     /// default is the one that cannot start work without a human.</summary>
-    public static string For(AgentIpcEndpointRole role, string shimPath) =>
-        role == AgentIpcEndpointRole.Coordinator ? Coordinator(shimPath) : Worker(shimPath);
+    /// <param name="installedKinds">Only a coordinator has a <c>spawn</c>, so this is only ever read by
+    /// the coordinator text; a worker's instructions do not change with what is installed.</param>
+    public static string For(
+        AgentIpcEndpointRole role, string shimPath, IReadOnlyCollection<string>? installedKinds = null) =>
+        role == AgentIpcEndpointRole.Coordinator ? Coordinator(shimPath, installedKinds) : Worker(shimPath);
 }

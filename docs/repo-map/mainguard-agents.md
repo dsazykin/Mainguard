@@ -134,8 +134,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker
     does not start before approval" a property of the system rather than a request in a prompt).
-    `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** — `Coordinator(shimPath)` /
-    `Worker(shimPath)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
+    `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
+    `Coordinator(shimPath, installedKinds)` / `Worker(shimPath)` / `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
     `AgentIpcServer`. Phase 3 §1.2 recorded that the coordinator's boundary prompt "is never delivered";
     it was worse — **nothing ran at spawn for either role**, so neither was told its shim existed, and
     since a worker's approved task arrives as the RETURN VALUE of the blocking `mainguard-plan` call, a
@@ -164,7 +164,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     nothing. The manifest never names the granted command, so no manifest edit can widen it — only change
     how a grant is spelled. A launch flag rather than a merge into `.claude/settings.local.json` on
     purpose: that file is harvested back into the per-repo host store, so a grant written there would be
-    re-injected into every later jail for the repository, workers and untrusted PR heads included).
+    re-injected into every later jail for the repository, workers and untrusted PR heads included.
+    **A coordinator is also told which agent kinds exist (defect D1).** The text said
+    `spawn <agent-kind>` and never said what a kind was, so a real coordinator's first move was
+    `spawn coder` — no such adapter, a jail created with no CLI in it, and `Ok, Status: AwaitingPlan`
+    returned. `Coordinator(shimPath, installedKinds)` renders the list per spawn from
+    `InstalledAdapterCatalog.InstalledKinds()` via the shared `SpellKinds`, which is the same set
+    `CoordinatorSpawnGate.RefuseUnknownKind` enumerates — the text and the enforcement cannot say
+    different things, and no list is hardcoded anywhere to rot (MG-12)).
     `AgentKickoffPrompt.cs` (**the FIRST USER TURN — the defect that stopped the loop starting at all**.
     `Worker(shimPath)` / `For(role, shimPath)`, and a coordinator gets NULL. A vendor CLI does not act on
     a system prompt: a live worker jail launched `claude --append-system-prompt <instructions>` and sat
@@ -1687,7 +1694,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
       `preApprovedCommandFormat`. All are null on markers written before their field existed, so an
       un-reinstalled CLI degrades to its old behaviour rather than crashing; the daemon reads the MARKER,
-      not the manifest, so a field that stops at the manifest reaches no jail at all).
+      not the manifest, so a field that stops at the manifest reaches no jail at all. `InstalledKinds()`
+      is the ordinal-sorted set of launchable `agentKind`s — the single set the coordinator's instructions
+      name and its `spawn` refusal enforces (defect D1)).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI

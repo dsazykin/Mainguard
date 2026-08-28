@@ -177,4 +177,20 @@ public sealed class InstalledAdapterCatalog
     /// <summary>True when at least one agent CLI is installed — the gate for strict agentKind
     /// validation (an empty catalog means a dev/unprovisioned box; spawns stay permissive there).</summary>
     public bool HasAny() => List().Count > 0;
+
+    /// <summary>
+    /// Every <c>agentKind</c> this daemon can actually launch, ordinal-sorted.
+    ///
+    /// <para><b>Why this is a named member and not a LINQ line at each call site.</b> Two things have to
+    /// agree about which kinds exist: the operating instructions a coordinator is handed at spawn, and the
+    /// refusal it gets when it names one that is not installed. Those two disagreeing is the MG-12 shape
+    /// this repo keeps re-finding, and it is what let a real coordinator burn its first move on
+    /// <c>spawn coder</c> — instructions that said <c>spawn &lt;agent-kind&gt;</c> and never said which.
+    /// Both now read this, so neither can describe an install that does not exist.</para>
+    /// </summary>
+    public IReadOnlyList<string> InstalledKinds() =>
+        List().Select(m => m.Id)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(id => id, StringComparer.Ordinal)
+            .ToArray();
 }

@@ -718,7 +718,29 @@ public sealed class AgentSpawnService
     {
         if (string.IsNullOrWhiteSpace(request.AgentKind))
         {
-            return new AgentIpcResponse(Ok: false, Error: "an agent kind is required (mainguard-agent spawn <agent-kind>)");
+            var installed = _launcher.InstalledAgentKinds;
+            return new AgentIpcResponse(
+                Ok: false,
+                Error: "an agent kind is required (mainguard-agent spawn <agent-kind>): "
+                     + Mainguard.Agents.Agents.Ipc.AgentOperatingInstructions.SpellKinds(installed));
+        }
+
+        // D1: a kind that maps to no installed CLI is refused HERE, before anything is minted. Left to
+        // run, it produced a jail with no CLI in it — the launcher deliberately allows that for the
+        // operator's bare-shell path — and the coordinator was told it had a worker. Checked before the
+        // caps so a typo is never reported as "the worker cap is full", and before SpawnAsync so it costs
+        // no session record, no jail and no worker slot.
+        if (CoordinatorSpawnGate.RefuseUnknownKind(request.AgentKind, _launcher.InstalledAgentKinds) is { } unknownKind)
+        {
+            _coordLog.LogWarning(
+                "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, unknownKind);
+            _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
+            {
+                ["coordinator_id"] = coordinatorAgentId,
+                ["agent_kind"] = request.AgentKind,
+                ["reason"] = unknownKind,
+            }));
+            return new AgentIpcResponse(Ok: false, Error: unknownKind);
         }
 
         // Id-only by necessity: the shim's identity is positional (only that coordinator's jail

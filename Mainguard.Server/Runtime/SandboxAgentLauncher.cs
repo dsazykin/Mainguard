@@ -76,6 +76,14 @@ public sealed class SandboxAgentLauncher
     }
 
     /// <summary>
+    /// The agent kinds this daemon can actually launch — read fresh, because a CLI installed while the
+    /// daemon runs must be spawnable without a restart. Surfaced here rather than by injecting the catalog
+    /// a second time into <see cref="AgentSpawnService"/>: one catalog instance means the refusal a
+    /// coordinator gets and the jail the launcher would have built cannot be answering different registries.
+    /// </summary>
+    internal IReadOnlyList<string> InstalledAgentKinds => _adapters.InstalledKinds();
+
+    /// <summary>
     /// Provisions the worktree and starts the hardened jail for <paramref name="agentId"/> against the
     /// repo identified by <paramref name="repoHandle"/>. Returns the real container handle, or <c>null</c>
     /// when the repo is not provisioned (session-only path). On a failure <i>after</i> the worktree exists,
@@ -220,6 +228,13 @@ public sealed class SandboxAgentLauncher
         // agentKind → the CLI the user dynamically installed. Resolved BEFORE the worktree so an
         // unknown kind costs nothing; the jail still spawns without a launch command (the operator
         // gets a shell in a correct sandbox rather than a failed spawn), and the caller surfaces it.
+        //
+        // That CLI-less jail is a real, wanted outcome of the OPERATOR path and only of that path — there
+        // is a human on its PTY, which is the entire reason a bare sandbox is worth having. It is never a
+        // wanted outcome of a COORDINATOR's spawn, where the worker's terminal is daemon-locked read-only
+        // and nobody can ever type into it; a real coordinator spawned `coder`, got exactly this, and was
+        // told the spawn succeeded. That refusal belongs to the coordinator's channel and lives in
+        // AgentSpawnService.SpawnWorkerAsync, so this path keeps the behaviour it wants.
         var adapter = _adapters.TryGet(agentKind);
         var launchCommand = adapter?.Launch;
 
@@ -233,8 +248,7 @@ public sealed class SandboxAgentLauncher
         var instructionsRole = string.Equals(agentRole, AgentRoles.Coordinator, StringComparison.Ordinal)
             ? AgentIpcEndpointRole.Coordinator
             : AgentIpcEndpointRole.Worker;
-        var instructions = AgentOperatingInstructions.For(
-            instructionsRole, AgentIpcPaths.SandboxShimPath(instructionsRole));
+        var instructions = InstructionsFor(instructionsRole, _adapters);
 
         // The launch line the jail's CLI is actually started with: the first turn, the instructions, and
         // the one pre-approved command, assembled in ONE place because their ORDER is load-bearing (see
@@ -848,6 +862,18 @@ public sealed class SandboxAgentLauncher
                 .Select(d => d.Path)
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
+
+    /// <summary>
+    /// The operating instructions a jail of this role is handed, <b>bound to this daemon's catalog</b>.
+    ///
+    /// <para>Named and internal so the binding is testable as a fact about the launcher rather than as a
+    /// fact about the string function. The interesting failure is not "the text can name kinds" — it is
+    /// "the text names the kinds this box actually has", and passing an empty list from the one call site
+    /// would leave every prose assertion about the instructions perfectly green.</para>
+    /// </summary>
+    internal static string InstructionsFor(AgentIpcEndpointRole role, InstalledAdapterCatalog adapters) =>
+        AgentOperatingInstructions.For(
+            role, AgentIpcPaths.SandboxShimPath(role), adapters.InstalledKinds());
 
     /// <summary>
     /// Assembles the complete launch line a jailed CLI is started with — the first user turn, the role's

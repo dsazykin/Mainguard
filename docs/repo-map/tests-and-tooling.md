@@ -988,6 +988,18 @@
   driven through the real `AdapterChannel.EnsureAsync`, because **dropping it from the marker the
   channel writes left the entire suite green** (phase 3's M7 shape: a correct launcher nobody calls
   correctly). A pre-field marker and an unreadable one both degrade to "no turn" rather than throwing.
+- **`Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`** — defect D1, over the real Unix socket an
+  in-jail shim writes to. A coordinator's `spawn coder` used to answer `Ok, Status: AwaitingPlan` while
+  creating a jail with no CLI in it; it is now refused, mints no session, creates no jail, and the refusal
+  names the kind and every installed one. The carve-out is pinned too: the OPERATOR path still gets its
+  bare jail for an unknown kind (there is a human on that PTY — a coordinator's worker terminal is
+  daemon-locked read-only, which is why the same outcome is never wanted there), and a box with NO
+  adapters installed stays permissive. `TheInstructionsAndTheRefusal_ReadTheSameSet` is the MG-12 guard:
+  both read `InstalledAdapterCatalog.InstalledKinds()`, so no hardcoded list exists to rot. Uses a temp
+  registry rather than the host's `~/mainguard/adapters/registry`, so nothing depends on what the
+  developer happens to have installed. Mutations watched red: the guard removed (2 — the pre-change
+  behaviour), the empty-catalog carve-out removed (1), the refusal not naming the kinds (2), the launcher
+  passing no kinds to the instructions (2), and the kind list hardcoded in the prose (3 + 2).
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
