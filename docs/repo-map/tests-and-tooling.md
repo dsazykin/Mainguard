@@ -953,6 +953,22 @@
   path that escapes its root is refused, and — the storage boundary — a path listed in BOTH
   `credentialPaths` and `settingsPaths` is refused, because credentials go to the OS keychain and
   settings to a plaintext per-repo file.
+- **`Mainguard.Tests/AdapterInstructionDeliveryTests.cs`** — the two channels by which a role's operating
+  instructions reach a CLI, and why there have to be two: the shipped `claude-code` adapter declares both
+  (`instructionsFile` + `systemPromptArg`), the file named is one the CLI opens UNPROMPTED (the copy
+  staged beside the shim at `/opt/mainguard/ipc/MAINGUARD.md` is not a delivery, because nothing reads it
+  on its own), an adapter may declare neither, and the install marker carries both across the host/VM
+  boundary — the daemon reads the marker, so a field that stopped at the manifest reaches no jail.
+- **`Mainguard.Tests/AdapterPreApprovalTests.cs`** — the manifest half of defect C2's fix: how a CLI
+  spells "this one command needs no approval" (`preApprovedCommandArg` + `preApprovedCommandFormat`), and
+  the refusals that stop the declaration widening into more than it says. The shipped `claude-code`
+  adapter declares the pair, **no other shipped adapter declares one** (asserted, because the fix's claim
+  to being minimal is that exactly one CLI's jails were widened), the format carries the `{command}`
+  placeholder the daemon substitutes, and the rendered grant is one absolute path rather than a
+  directory wildcard. Half-declaring the pair and a placeholder-free format are each refused with
+  `AdapterManifestError.BadPreApproval` — this is the only manifest field that grants EXECUTION inside a
+  sandbox, so every degraded reading fails closed. Plus marker round-trip and the pre-field legacy marker.
+  Mutations watched red: both refusals removed (4 red), and widening the shipped format to a wildcard.
 - **`Mainguard.Tests/CliSettingsStoreTests.cs`** — the host store's scope decision, made testable:
   `ApprovingSomethingInOneRepository_DoesNotApproveItInAnother` is the per-repo rule itself; plus
   per-adapter isolation, a blank scope never acting as a wildcard, merge-not-replace on save, an empty
@@ -1735,6 +1751,14 @@
   deleted unread; and that nothing half-finished is left in a directory the jail can also write. Seven
   mutations watched red — loop removed, claim by copy instead of rename, claim never deleted, size cap
   dropped, handler not awaited, malformed branch removed, outbox dir not created),**
+  **`ShimPreApprovalTests` (defect C2 — the coordinator's ONLY tool was not pre-approved: a real
+  claude-code coordinator ran its shim as its first action and got "This command requires approval", in a
+  jail with no human to answer. Asserts what is GRANTED, not that a flag is present — a coordinator gets
+  `Bash(/opt/mainguard/ipc/mainguard-agent:*)`, a worker gets the plan shim, NEITHER ever gets the
+  other's, and a jail with no IPC dir (every external-PR head, every worker the plan gate is not holding)
+  is granted nothing at all. Reads the pair from the SHIPPED `adapters.starter.json` rather than retyping
+  it, so it cannot pass against a declaration the product no longer makes. Two mutations watched red:
+  dropping the `ipcDirPath` gate, and hardcoding the coordinator role into the granted shim path),**
   **`CoordinatorOutboxWiringTests` (the wiring half: on a substrate declaring
   `SupportsBindMountedUnixSockets: false`, the real spawn path hands the jail its outbox — the dir the
   daemon created, `AgentIpcPaths.OutboxIn` of it, existing on disk before the container would be. The

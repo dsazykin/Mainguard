@@ -241,6 +241,12 @@ public sealed class SandboxAgentLauncher
             launchCommand = launchCommand.Append(promptArg).Append(instructions).ToList();
         }
 
+        // Telling a CLI its shim exists is not the same as letting it run one. A real coordinator followed
+        // the instructions above exactly, ran its shim as its first action, and got "This command requires
+        // approval" — in a jail with no human to answer. Every tool the role has is that one command, so
+        // the whole feature stalled on its first action. This grants that command, and only that command.
+        launchCommand = ApplyShimPreApproval(launchCommand, adapter, ipcDirPath, instructionsRole);
+
         // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
         //
         // Coordinator contract §2: a coordinator has no worktree. Note this skips CREATING one, not just
@@ -848,6 +854,47 @@ public sealed class SandboxAgentLauncher
                 .Select(d => d.Path)
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
+
+    /// <summary>
+    /// Appends the ONE pre-approval this jail gets: the absolute in-jail path of the shim THIS agent's
+    /// role was actually given, spelled the way <paramref name="adapter"/> declares
+    /// (<see cref="InstalledAdapterMarker.PreApprovedCommandArg"/> +
+    /// <see cref="InstalledAdapterMarker.PreApprovedCommandFormat"/>). Returns
+    /// <paramref name="launchCommand"/> untouched whenever any part of that is absent.
+    ///
+    /// <para><b>What is being granted, stated plainly.</b> This is a capability grant inside a sandbox
+    /// whose point is least privilege, so it is written to be readable as one. It widens exactly one
+    /// thing: the CLI may run <c>/opt/mainguard/ipc/&lt;its own shim&gt;</c> without asking a human. It
+    /// grants no other command, no wildcard, no directory, and no second shim — a coordinator gets
+    /// <c>mainguard-agent</c> and a worker gets <c>mainguard-plan</c>, because
+    /// <see cref="AgentIpcPaths.SandboxShimPath"/> is the same function that decides which shim the
+    /// daemon WROTE into that jail. Neither role can be given the other's grant without changing which
+    /// shim it has.</para>
+    ///
+    /// <para><b><paramref name="ipcDirPath"/> is the gate, and it is the load-bearing argument.</b> A
+    /// session with no IPC dir has no shim at all: that is every external-PR head and every manually
+    /// spawned worker the plan gate is not holding. Deriving the grant from the ROLE STRING alone would
+    /// have handed those jails a standing pre-approval for a path that does not exist in them — harmless
+    /// today, and exactly the kind of latent grant that stops being harmless the day something else is
+    /// mounted at that path. No dir, no shim, no grant.</para>
+    /// </summary>
+    internal static IReadOnlyList<string>? ApplyShimPreApproval(
+        IReadOnlyList<string>? launchCommand,
+        InstalledAdapterMarker? adapter,
+        string? ipcDirPath,
+        AgentIpcEndpointRole role)
+    {
+        if (launchCommand is not { Count: > 0 }
+            || string.IsNullOrEmpty(ipcDirPath)
+            || adapter?.PreApprovedCommandArg is not { Length: > 0 } arg)
+        {
+            return launchCommand;
+        }
+
+        var grant = AdapterManifest.RenderPreApproval(
+            adapter.PreApprovedCommandFormat, AgentIpcPaths.SandboxShimPath(role));
+        return grant is null ? launchCommand : launchCommand.Append(arg).Append(grant).ToList();
+    }
 
     /// <summary>
     /// Harvests the CLI's SETTINGS files (the installed adapter's declared <c>settingsPaths</c>) out of

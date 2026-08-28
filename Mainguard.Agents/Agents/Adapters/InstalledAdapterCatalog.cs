@@ -52,7 +52,18 @@ public sealed record InstalledAdapterMarker(
     /// <summary>The launch flag this CLI takes instruction text on (see
     /// <see cref="AdapterSpec.SystemPromptArg"/>) — the ONLY delivery that reaches a coordinator, whose
     /// /workspace is an empty tmpfs with no host side to write a file to. Null on older markers.</summary>
-    [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null)
+    [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null,
+    /// <summary>The launch flag this CLI takes a PRE-APPROVED COMMAND list on (see
+    /// <see cref="AdapterSpec.PreApprovedCommandArg"/>). Carried across the host/VM boundary because the
+    /// daemon reads the MARKER, not the manifest — a field that stopped at the manifest would leave every
+    /// jail's only tool stalled on an approval prompt no human is watching. Null on markers written
+    /// before this field existed; re-install the CLI to backfill it, and until then those jails behave
+    /// exactly as they did before.</summary>
+    [property: JsonPropertyName("preApprovedCommandArg")] string? PreApprovedCommandArg = null,
+    /// <summary>How this CLI spells one pre-approved command (see
+    /// <see cref="AdapterSpec.PreApprovedCommandFormat"/>) — a template containing
+    /// <see cref="AdapterManifest.PreApprovedCommandPlaceholder"/>. Null on older markers.</summary>
+    [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null)
 {
     private static readonly JsonSerializerOptions Options = new() { WriteIndented = true };
 

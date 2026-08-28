@@ -24,6 +24,14 @@ public enum AdapterManifestError
     /// a path that is not a plain relative path under the adapters prefix.</summary>
     BadPlatformBinary,
 
+    /// <summary>The pre-approval pair (<c>preApprovedCommandArg</c> + <c>preApprovedCommandFormat</c>) is
+    /// half-declared, or the format carries no <c>{command}</c> placeholder. Its own code because this
+    /// pair GRANTS EXECUTION inside a sandbox. A half-declared pair must not degrade to "grant nothing"
+    /// (the jail's only tool then stalls on an approval prompt no human is watching), and a
+    /// placeholder-free format must not degrade to a literal (which would emit a grant naming something
+    /// other than the shim — possibly something much broader).</summary>
+    BadPreApproval,
+
     /// <summary>The <c>provenance</c> rung is absent or names a level this build does not know (MG-9).
     /// Its own code because "the maintainer forgot to say what origin assurance this CLI carries" is a
     /// different failure from a malformed field — and it must be a REFUSAL, not a default, or an
@@ -169,6 +177,36 @@ public sealed record AdapterSpec(
     /// the only delivery that reaches it. Null = this CLI takes no such flag.</para>
     /// </summary>
     [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null,
+    /// <summary>
+    /// The launch flag THIS CLI takes a PRE-APPROVED COMMAND list on (<c>--allowedTools</c> for
+    /// claude-code). Paired with <see cref="PreApprovedCommandFormat"/>; declaring one without the other
+    /// is refused (<see cref="AdapterManifestError.BadPreApproval"/>).
+    ///
+    /// <para><b>Why this had to exist.</b> A jailed CLI that asks a human before running a command is
+    /// correct behaviour everywhere except a jail with no human in it. The coordinator's ENTIRE surface
+    /// is one command — its role's shim — and a real claude-code coordinator, following its operating
+    /// instructions exactly, ran it as its first action and got "This command requires approval". The
+    /// headline feature stalled on its first action, permanently, with nobody watching.</para>
+    ///
+    /// <para><b>What it may be used for, and nothing else.</b> The daemon renders exactly ONE grant from
+    /// this pair: the absolute in-jail path of the shim THIS agent's role was given
+    /// (<c>AgentIpcPaths.SandboxShimPath</c>), and only for a jail that actually has an IPC dir. It is
+    /// not a hook for adapter-declared allowlists — nothing in a manifest names the granted command, so a
+    /// manifest edit cannot widen the grant, only change how a grant is spelled for that CLI.</para>
+    /// </summary>
+    [property: JsonPropertyName("preApprovedCommandArg")] string? PreApprovedCommandArg = null,
+    /// <summary>
+    /// How THIS CLI spells "this one command needs no approval" — a template containing the literal
+    /// <c>{command}</c>, which the daemon replaces with the shim's absolute in-jail path.
+    /// <c>Bash({command}:*)</c> for claude-code, whose permission rules are
+    /// <c>&lt;Tool&gt;(&lt;pattern&gt;)</c> and whose <c>cmd:*</c> form is a prefix match on that command.
+    ///
+    /// <para>A template rather than a hardcoded string because the tool name and the pattern syntax are
+    /// the vendor's, exactly like <see cref="SystemPromptArg"/>. The placeholder is MANDATORY: a format
+    /// without it would produce a fixed grant that does not name the shim, which is the one way this
+    /// field could widen a jail's capability rather than narrow it.</para>
+    /// </summary>
+    [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
@@ -286,6 +324,29 @@ public sealed record AdapterManifest(
                         $"Adapter '{a.Id}' platformBinary target '{platform.Target}' must be a plain relative path under the adapters prefix.");
             }
 
+            // The pre-approval pair. Both-or-neither, and the format must carry the placeholder —
+            // enforced rather than tolerated because every degraded reading of a half-declared pair is
+            // worse than a refusal. Missing FORMAT would append a flag with no value (or a value the CLI
+            // reads as its next positional); missing ARG would compute a grant and drop it, so the jail's
+            // only tool goes back to stalling on an approval prompt; a placeholder-free FORMAT would emit
+            // a constant grant that does not name this role's shim. This is the one manifest field that
+            // grants execution inside a sandbox, so it fails closed and loudly.
+            var hasPreApprovalArg = !string.IsNullOrWhiteSpace(a.PreApprovedCommandArg);
+            var hasPreApprovalFormat = !string.IsNullOrWhiteSpace(a.PreApprovedCommandFormat);
+            if (hasPreApprovalArg != hasPreApprovalFormat)
+                throw new AdapterManifestException(AdapterManifestError.BadPreApproval,
+                    $"Adapter '{a.Id}' declares only "
+                    + (hasPreApprovalArg ? "'preApprovedCommandArg'" : "'preApprovedCommandFormat'")
+                    + " — the two are a pair: the flag alone has no value to carry, and the format alone "
+                    + "has no flag to travel on. Declare both or neither.");
+            if (hasPreApprovalFormat
+                && !a.PreApprovedCommandFormat!.Contains(PreApprovedCommandPlaceholder, StringComparison.Ordinal))
+                throw new AdapterManifestException(AdapterManifestError.BadPreApproval,
+                    $"Adapter '{a.Id}' preApprovedCommandFormat '{a.PreApprovedCommandFormat}' contains no "
+                    + $"'{PreApprovedCommandPlaceholder}' placeholder. The daemon substitutes the shim's "
+                    + "own in-jail path there; without it the CLI would be handed a fixed grant naming "
+                    + "something other than this agent's shim.");
+
             if (a.Launch is not null && (a.Launch.Count == 0 || a.Launch.Any(string.IsNullOrWhiteSpace)))
                 throw new AdapterManifestException(AdapterManifestError.MissingField,
                     $"Adapter '{a.Id}' has an empty 'launch' command.");
@@ -356,6 +417,28 @@ public sealed record AdapterManifest(
 
         return manifest;
     }
+
+    /// <summary>The literal an adapter's <see cref="AdapterSpec.PreApprovedCommandFormat"/> must contain,
+    /// and which the daemon replaces with the shim's absolute in-jail path. One constant, shared by the
+    /// parser that requires it and the launcher that substitutes it, so the two cannot disagree about
+    /// what a template looks like.</summary>
+    public const string PreApprovedCommandPlaceholder = "{command}";
+
+    /// <summary>
+    /// Renders the ONE pre-approval grant for <paramref name="command"/> in <paramref name="format"/>'s
+    /// spelling — or null when the adapter declares no pre-approval channel, or when the caller has no
+    /// command to grant.
+    ///
+    /// <para>The single substitution point, used by the daemon and asserted by its tests. Null rather
+    /// than a bare format string when anything is missing: "no grant" is a working agent that asks a
+    /// human, while a mis-rendered grant is a permission rule whose contents nobody chose.</para>
+    /// </summary>
+    public static string? RenderPreApproval(string? format, string? command) =>
+        string.IsNullOrWhiteSpace(format)
+        || string.IsNullOrWhiteSpace(command)
+        || !format.Contains(PreApprovedCommandPlaceholder, StringComparison.Ordinal)
+            ? null
+            : format.Replace(PreApprovedCommandPlaceholder, command, StringComparison.Ordinal);
 
     /// <summary>The wire spellings of <see cref="AdapterProvenanceLevel"/>. Ordinal and exact — a
     /// case-insensitive or fuzzy match here would let a typo'd rung become a weaker one.</summary>

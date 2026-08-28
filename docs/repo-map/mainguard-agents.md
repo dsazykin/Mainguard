@@ -152,7 +152,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     which is what a CLI opens unprompted. The `MAINGUARD.md` staged beside the shim is inspectable but
     is NOT a delivery: nothing reads that path on its own, which is why naming the CLI's own convention
     is load-bearing rather than cosmetic. Both fields optional; an adapter declaring neither spawns
-    exactly as before).
+    exactly as before.
+    **Telling a CLI its shim exists is not the same as letting it run one (defect C2).** A real
+    claude-code coordinator followed these instructions exactly, ran `/opt/mainguard/ipc/mainguard-agent`
+    as its first action, and got "This command requires approval" — in a jail with no human to answer,
+    for the one command that IS its whole surface. So the same pattern gained a second pair,
+    `preApprovedCommandArg` + `preApprovedCommandFormat` (claude-code: `--allowedTools` +
+    `Bash({command}:*)`), and `SandboxAgentLauncher.ApplyShimPreApproval` renders exactly ONE grant from
+    it: the absolute in-jail path of the shim THIS agent's role was given, via the same
+    `AgentIpcPaths.SandboxShimPath` that decided which shim the daemon WROTE. A jail with no IPC dir gets
+    nothing. The manifest never names the granted command, so no manifest edit can widen it — only change
+    how a grant is spelled. A launch flag rather than a merge into `.claude/settings.local.json` on
+    purpose: that file is harvested back into the per-repo host store, so a grant written there would be
+    re-injected into every later jail for the repository, workers and untrusted PR heads included).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -1580,7 +1592,17 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`latest`/`@latest`/a range → refused; `@latest` can't even parse). Also validates
       `settingsPaths`: an unknown `root`, an escaping path, a duplicate entry, or a path shared with
       `credentialPaths` are all refused — the last because credentials go to the OS keychain and
-      settings to a plaintext per-repo file, so one path in both lists would divert a credential).
+      settings to a plaintext per-repo file, so one path in both lists would divert a credential.
+      **`BadPreApproval`** guards the one field pair that grants EXECUTION inside a sandbox
+      (`preApprovedCommandArg` + `preApprovedCommandFormat`, defect C2): half-declaring the pair is
+      refused, and so is a format missing the `{command}` placeholder — a flag with no value would be
+      read by the CLI as its next positional, a format with no flag would compute a grant and drop it
+      (back to the stall), and a placeholder-free format would emit a constant grant naming something
+      other than this agent's shim. `PreApprovedCommandPlaceholder` + `RenderPreApproval` are the single
+      substitution point, shared by the parser that requires the placeholder and the launcher that fills
+      it in, and `RenderPreApproval` answers null rather than something half-formed for every missing
+      input — "no grant" is a working agent that asks a human; a mis-rendered grant is a permission rule
+      nobody chose).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
@@ -1642,7 +1664,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       runs; caching would make a new CLI unlaunchable until restart) to answer `TryGetLaunch(agentKind)` →
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
-      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail).
+      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
+      `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`. All are null on markers written before their field existed, so an
+      un-reinstalled CLI degrades to its old behaviour rather than crashing; the daemon reads the MARKER,
+      not the manifest, so a field that stops at the manifest reaches no jail at all).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI
