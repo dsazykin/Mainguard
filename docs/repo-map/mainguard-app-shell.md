@@ -873,7 +873,12 @@
   is a rejection).
 - **`ViewModels/Agents/`** — the P2-13 activity-bar/docking primitives (App-only): `AgentStatus.cs`
   (the nine-value UI badge status + pure total `AgentStatusMap` from
-  `AgentLifecycleState`/`WorkerMergeState`), `AttentionPolicy.cs` (pure attention derivation —
+  `AgentLifecycleState`/`WorkerMergeState` — "total" is a claim its `_ =>` fallback cannot falsify, so
+  `WorkerMergeState.VerificationFailed` maps to `Conflict` EXPLICITLY (the badge this enum reserves for
+  "needs human intervention"; not `Dead` — the branch is still the agent's to fix) rather than sliding
+  into the `Working` default and badging a failed branch as ordinary live work, and
+  `EveryMergeState_HasADeliberateBadge_NotTheWorkingFallback` pins that exactly one state badges
+  `Working`), `AttentionPolicy.cs` (pure attention derivation —
   AwaitingReview/Conflict/plan-pending, + the waiting/blocked transition test the notifier uses),
   `AgentListProjection.cs` (pure LIFO ordering the rail and its test share),
   `AgentWorkspaceViewModel.cs` (per-agent **Dock.Avalonia** workspace: Terminal + agent-diff + staging

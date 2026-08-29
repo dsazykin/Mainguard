@@ -1,0 +1,259 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Mainguard.Agents.Agents;
+
+namespace Mainguard.Server.Tests;
+
+/// <summary>
+/// A stand-in for a real coding CLI attached to a PTY — one that models the <b>CLI's side</b> of the
+/// boundary rather than the PTY's, which is the whole reason it exists.
+///
+/// <para><b>Why a byte-recording stub was not enough.</b> The previous double was a
+/// <see cref="MemoryStream"/> and the assertion was <c>Assert.Equal("prefer the stdlib\n", written)</c>.
+/// That proves bytes reached the PTY — the one thing that was never in doubt. It cannot see the defect
+/// it was written to catch, because the defect lives one layer further on: the CLI submits on <b>CR</b>,
+/// so <c>"\n"</c> put the text in its input box and pressed nothing. Three live prompts accumulated
+/// there unsubmitted while that assertion stayed green.</para>
+///
+/// <para><b>The behaviour modelled here was measured, not assumed</b> — claude-code v2.1.251 driven
+/// under a real <c>forkpty</c>, transcripts in
+/// <c>docs/design/coordinator-phase-3-decisions.md</c> §17.1:</para>
+/// <list type="bullet">
+/// <item>the CLI puts the tty in <b>raw mode</b> (ICANON off, and with it ICRNL), so it sees the bytes
+/// written to the master verbatim — no line discipline translates anything;</item>
+/// <item><b>CR (0x0D) submits</b> the input buffer as one line and clears it;</item>
+/// <item><b>LF (0x0A) inserts a newline into the buffer</b> and submits nothing — two prompts sent that
+/// way become one two-line buffer, which is exactly what the live run produced;</item>
+/// <item>a submit makes the CLI <b>redraw</b>, i.e. produce output. That redraw is the only evidence
+/// the daemon can observe, so the double emits it.</item>
+/// </list>
+///
+/// <para>Assertions are therefore about <see cref="SubmittedLines"/> — what the CLI <i>received as a
+/// submitted line</i> — and <see cref="PendingInput"/>, the text left sitting in its box. Those two
+/// tell delivery and submission apart; a byte log cannot.</para>
+/// </summary>
+internal sealed class RawModeCliDouble : ITerminalSession
+{
+    private readonly object _gate = new();
+    private readonly List<string> _submitted = new();
+    private readonly StringBuilder _pending = new();
+    private readonly CliStream _stream;
+    private readonly bool _redraws;
+
+    /// <param name="redraws">
+    /// Whether the CLI repaints when it accepts a line. False models the case the daemon cannot tell
+    /// apart from a swallowed keystroke by watching the PTY alone — a CLI that is silent after Enter.
+    /// </param>
+    public RawModeCliDouble(bool redraws = true)
+    {
+        _redraws = redraws;
+        _stream = new CliStream(this);
+    }
+
+    public Stream IO => _stream;
+
+    public Task<int> ExitCode { get; } = new TaskCompletionSource<int>().Task;
+
+    /// <summary>Every line the CLI has been made to submit, oldest first.</summary>
+    public IReadOnlyList<string> SubmittedLines
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _submitted.ToArray();
+            }
+        }
+    }
+
+    /// <summary>The text sitting unsubmitted in the CLI's input box.</summary>
+    public string PendingInput
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _pending.ToString();
+            }
+        }
+    }
+
+    public void Resize(int cols, int rows)
+    {
+    }
+
+    public void Kill() => _stream.CompleteOutput();
+
+    public void Dispose() => _stream.Dispose();
+
+    /// <summary>Waits for the CLI to have submitted at least <paramref name="count"/> lines.</summary>
+    public async Task<IReadOnlyList<string>> WaitForSubmittedAsync(int count, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var lines = SubmittedLines;
+            if (lines.Count >= count)
+            {
+                return lines;
+            }
+
+            await Task.Delay(10).ConfigureAwait(false);
+        }
+
+        return SubmittedLines;
+    }
+
+    /// <summary>The raw-mode key handling: CR submits, LF is a newline in the buffer, the rest types.</summary>
+    private void Feed(ReadOnlySpan<byte> data)
+    {
+        var text = Encoding.UTF8.GetString(data);
+        var redraw = false;
+        lock (_gate)
+        {
+            foreach (var ch in text)
+            {
+                if (ch == '\r')
+                {
+                    _submitted.Add(_pending.ToString());
+                    _pending.Clear();
+                    redraw = true;
+                }
+                else
+                {
+                    // '\n' included: a TUI inserts it, it does not act on it.
+                    _pending.Append(ch);
+                }
+            }
+        }
+
+        if (redraw && _redraws)
+        {
+            // What a CLI does when it accepts a line: repaint. The daemon's reaction window watches for
+            // exactly this, so the double has to produce it or the observation would be untestable.
+            _stream.Emit(Encoding.UTF8.GetBytes("\u001b[2K\rworking\r\n"));
+        }
+    }
+
+    /// <summary>
+    /// The PTY as the daemon sees it: writes go to the CLI's key handler, reads deliver whatever the
+    /// CLI has painted (and block until there is some, like a real PTY, rather than reporting EOF).
+    /// </summary>
+    private sealed class CliStream : Stream
+    {
+        private readonly RawModeCliDouble _cli;
+        private readonly SemaphoreSlim _readable = new(0);
+        private readonly Queue<byte[]> _out = new();
+        private readonly object _outGate = new();
+        private readonly CancellationTokenSource _closed = new();
+        private byte[]? _current;
+        private int _offset;
+        private int _disposed;
+
+        public CliStream(RawModeCliDouble cli) => _cli = cli;
+
+        public override bool CanRead => true;
+
+        public override bool CanSeek => false;
+
+        public override bool CanWrite => true;
+
+        public override long Length => throw new NotSupportedException();
+
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public void Emit(byte[] frame)
+        {
+            lock (_outGate)
+            {
+                _out.Enqueue(frame);
+            }
+
+            _readable.Release();
+        }
+
+        public void CompleteOutput()
+        {
+            if (Volatile.Read(ref _disposed) == 0)
+            {
+                _closed.Cancel();
+            }
+        }
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default)
+        {
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _closed.Token);
+            if (_current is null)
+            {
+                try
+                {
+                    await _readable.WaitAsync(linked.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    return 0; // torn down: EOF, as a dead PTY reports it
+                }
+
+                lock (_outGate)
+                {
+                    _current = _out.Dequeue();
+                }
+
+                _offset = 0;
+            }
+
+            var take = Math.Min(buffer.Length, _current.Length - _offset);
+            _current.AsMemory(_offset, take).CopyTo(buffer);
+            _offset += take;
+            if (_offset >= _current.Length)
+            {
+                _current = null;
+            }
+
+            return take;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            ReadAsync(buffer.AsMemory(offset, count)).AsTask().GetAwaiter().GetResult();
+
+        public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
+        {
+            _cli.Feed(buffer.Span);
+            return ValueTask.CompletedTask;
+        }
+
+        public override void Write(byte[] buffer, int offset, int count) => _cli.Feed(buffer.AsSpan(offset, count));
+
+        public override void Flush()
+        {
+        }
+
+        public override Task FlushAsync(CancellationToken ct) => Task.CompletedTask;
+
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+        public override void SetLength(long value) => throw new NotSupportedException();
+
+        protected override void Dispose(bool disposing)
+        {
+            // Idempotent: the bound session disposes the terminal, and the test's own `using` disposes
+            // the double again. A second Cancel() on a disposed CTS would throw out of the test body.
+            if (disposing && Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _closed.Cancel();
+                _closed.Dispose();
+                _readable.Dispose();
+            }
+
+            base.Dispose(disposing);
+        }
+    }
+}

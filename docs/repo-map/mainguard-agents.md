@@ -27,7 +27,7 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     has focused), and terminates with **CR (0x0D), never LF**. Measured against a real CLI under a
     forkpty, not reasoned: a TUI runs the tty in raw mode so ICRNL translates nothing and LF is merely a
     newline typed into its input box. Deliberately NOT a per-adapter manifest field — see
-    `docs/design/coordinator-phase-3-decisions.md` §16.2. Consumed by `AgentCliBinder`).
+    `docs/design/coordinator-phase-3-decisions.md` §17.2. Consumed by `AgentCliBinder`).
 - **`Terminal/Vterm/`** — the **P2-18 server-side terminal engine** (daemon-only at runtime; the
   client never loads native terminal code).
   - `VtermNative.cs` (P/Invoke over the pinned libvterm 0.3.3 — `build/libvterm/`; resolver:

@@ -223,6 +223,31 @@ public class MergeQueueStateMachineTests
         Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("a"));
     }
 
+    /// <summary>
+    /// Every <see cref="WorkerMergeState"/> has a deliberate badge, and adding a member must not let one
+    /// slip into the <c>Working</c> fallback.
+    ///
+    /// <para><c>AgentStatusMap</c>'s own doc claims it is "total by construction (every input has a case)",
+    /// and its <c>_ =></c> arm is what makes that claim unfalsifiable — <c>VerificationFailed</c> landed in
+    /// it and badged a branch whose tests had just failed as ordinary live work, which is the exact
+    /// conflation this state exists to end. This asserts the mapping the fallback would otherwise hide.</para>
+    /// </summary>
+    [Fact]
+    public void EveryMergeState_HasADeliberateBadge_NotTheWorkingFallback()
+    {
+        Assert.Equal(
+            Mainguard.Agents.UI.ViewModels.Agents.AgentStatus.Conflict,
+            Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromMergeState(
+                WorkerMergeState.VerificationFailed));
+
+        // The control: exactly one state is badged Working, and it is Working.
+        var badgedWorking = Enum.GetValues<WorkerMergeState>()
+            .Where(s => Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromMergeState(s)
+                == Mainguard.Agents.UI.ViewModels.Agents.AgentStatus.Working)
+            .ToArray();
+        Assert.Equal(new[] { WorkerMergeState.Working }, badgedWorking);
+    }
+
     /// <summary>The state survives a daemon restart: it is persisted per transition like every other, and
     /// a rehydrated queue answers the verdict rather than "not verified yet".</summary>
     [Fact]

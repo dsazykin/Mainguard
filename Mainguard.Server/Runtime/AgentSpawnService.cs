@@ -983,10 +983,11 @@ public sealed class AgentSpawnService
             return new AgentIpcResponse(Ok: false, Error: planReason);
         }
 
-        var delivered = await _binder.TrySendPromptAsync(owned.Key, request.Prompt, ct).ConfigureAwait(false);
-        if (!delivered)
+        var delivery = await _binder.TrySendPromptAsync(owned.Key, request.Prompt, ct).ConfigureAwait(false);
+        if (!delivery.Submitted)
         {
-            return new AgentIpcResponse(Ok: false, Error: $"{owned.Id} has no live CLI to steer.");
+            return new AgentIpcResponse(
+                Ok: false, Error: delivery.Refusal ?? $"{owned.Id} has no live CLI to steer.");
         }
 
         _audit.Append(new AuditEvent("coordinator_worker_prompt", new Dictionary<string, string>
@@ -994,10 +995,32 @@ public sealed class AgentSpawnService
             ["coordinator_id"] = coordinatorAgentId,
             ["worker_agent_id"] = owned.Id,
             ["repo_hash"] = owned.RepoHash ?? string.Empty,
+            // What was actually pressed, and what the CLI did about it. The record used to say only that
+            // a prompt happened — which is exactly what it said for three prompts that were never
+            // submitted at all.
+            ["terminator"] = "CR",
+            ["cli_reacted"] = delivery.Reacted ? "true" : "false",
         }));
 
-        return new AgentIpcResponse(Ok: true, AgentId: owned.Id, Status: "PromptSent");
+        // No agentId on purpose: the shim prints an id when one is present and the status only when one
+        // is not, so echoing the target back is what kept every observation below invisible to the
+        // caller. A prompt's useful answer is what happened to it, not who it was for.
+        return new AgentIpcResponse(Ok: true, Status: PromptStatus(owned.Id, delivery.Reacted));
     }
+
+    /// <summary>
+    /// What the coordinator is told about its own steer. Both readings are honest: the daemon pressed
+    /// Enter either way, and the difference is whether the worker's CLI was observed reacting to it.
+    /// The unacknowledged sentence deliberately does <b>not</b> say "retry" — a second prompt is a
+    /// second turn, not a redelivery, and a coordinator told to retry would double-steer a worker that
+    /// was simply busy.
+    /// </summary>
+    internal static string PromptStatus(string workerId, bool reacted) => reacted
+        ? $"prompt submitted to {workerId} — Enter was pressed and its CLI redrew in response."
+        : $"prompt submitted to {workerId}, but its CLI produced no output for "
+            + $"{AgentCliBinder.PromptReactionWindow.TotalSeconds:0}s — it may be mid-turn. Check it with "
+            + $"`mainguard-agent status {workerId}` or its terminal before sending another; a second "
+            + "prompt is a second turn, not a retry.";
 
     /// <summary>
     /// <c>request_verification</c> (contract §3) — <b>propose</b> an owned worker's branch. The daemon

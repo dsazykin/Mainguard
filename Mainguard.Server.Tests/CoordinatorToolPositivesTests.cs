@@ -27,10 +27,18 @@ namespace Mainguard.Server.Tests;
 ///
 /// <para><b>What makes a positive possible here.</b> A prompt is delivered by writing to the worker's
 /// bound pty, and the plan-gate rig's substrate has none — so the op could previously only be watched
-/// failing. Binding a real <see cref="BoundTerminalSession"/> over a stub gives the delivery path
-/// somewhere to land, and the assertion is on the BYTES that arrive, not on the response flag: a
-/// handler that returned <c>Ok</c> without writing anything is the exact silent no-op the trailing
-/// newline in <c>TrySendPromptAsync</c> exists to prevent.</para>
+/// failing. Binding a real <see cref="BoundTerminalSession"/> over a double gives the delivery path
+/// somewhere to land.</para>
+///
+/// <para><b>What the assertions are on, after the 2026-08-30 correction.</b> They used to be on the
+/// BYTES that arrived — <c>Assert.Equal("prefer the stdlib\n", written)</c> — written to prove delivery
+/// rather than a return value, which was the right instinct aimed at the wrong side of the boundary. A
+/// PTY-attached CLI submits on <b>CR</b>; <c>"\n"</c> types a newline into its input box and presses
+/// nothing. That assertion was therefore green over a tool that had never once worked: in a live run
+/// three prompts to two workers sat unsubmitted and ACCUMULATED — one worker's box held two
+/// concatenated prompts — while the daemon logged "prompt delivered" for each. The assertions are now
+/// on what <see cref="RawModeCliDouble"/> received as a <i>submitted line</i> and on what was left
+/// sitting in its input box: the two facts a byte log cannot tell apart.</para>
 /// </summary>
 public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassFixture<PlanGateRig>
 {
@@ -39,9 +47,9 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
     }
 
     /// <summary>
-    /// An approved worker with a live CLI receives the prompt, and the CLI receives the BYTES — with the
-    /// trailing newline that submits them. Without the newline the text sits in the agent's input buffer
-    /// and nothing happens, which would look like a delivered prompt to everything upstream.
+    /// An approved worker with a live CLI receives the prompt <b>as a submitted line</b> — the CLI's own
+    /// input box is empty afterwards. That second half is the assertion: bytes reaching the pty is what
+    /// the shipped defect already achieved.
     /// </summary>
     [Fact]
     public async Task SendWorkerPrompt_ReachesAnApprovedWorkersCli_AsASubmittedLine()
@@ -49,18 +57,107 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("tidy the retry helper");
         await ApproveAsync(workerId);
 
-        var stub = new StubSession();
-        using var bound = new BoundTerminalSession(workerId, stub);
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
         Rig.Terminals.Bind(KeyFor(workerId), bound);
 
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
             AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "prefer the stdlib"));
 
         Assert.True(response.Ok, $"an approved worker with a live CLI refused a prompt: {response.Error}");
-        Assert.Equal("PromptSent", response.Status);
 
-        var written = await stub.ReadWrittenAsync();
-        Assert.Equal("prefer the stdlib\n", written);
+        var submitted = await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "prefer the stdlib" }, submitted);
+
+        // The discriminator. Under the shipped `prompt + "\n"` the bytes still ARRIVE — they just stay
+        // here, in the input box, forever.
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// The live failure, as a test: two steers in a row must land as <b>two</b> submitted lines, not as
+    /// one input box holding both. This is what a stress run actually produced — a worker whose input
+    /// line held two concatenated prompts and whose transcript showed no turn for either.
+    /// </summary>
+    [Fact]
+    public async Task SendWorkerPrompt_Twice_LandsAsTwoLines_NotOneAccumulatedInputBox()
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("two steers");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        foreach (var text in new[] { "use the stdlib", "and add a test" })
+        {
+            var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+                AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: text));
+            Assert.True(response.Ok, $"a steer was refused: {response.Error}");
+        }
+
+        var submitted = await cli.WaitForSubmittedAsync(2, TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "use the stdlib", "and add a test" }, submitted);
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// A multi-line steer arrives as ONE submitted line carrying its newlines — and a stray CR inside the
+    /// text does not cut it into two turns. Measured against the real CLI: an embedded CR submits the
+    /// prefix and strands the remainder, so a message authored with CRLF would silently steer a worker
+    /// with half a sentence.
+    /// </summary>
+    [Fact]
+    public async Task SendWorkerPrompt_WithEmbeddedNewlines_SubmitsExactlyOnce()
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("multi-line steer");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "drop the retry loop\r\nkeep the timeout\n"));
+
+        Assert.True(response.Ok, $"a multi-line steer was refused: {response.Error}");
+
+        var submitted = await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { "drop the retry loop\nkeep the timeout" }, submitted);
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// The observation the coordinator is given, in both readings. A CLI that repaints after Enter is
+    /// reported as having reacted; a CLI that stays silent is reported as <b>not</b> having reacted —
+    /// still <c>Ok</c>, because the daemon really did press Enter, but no longer indistinguishable from
+    /// it. The old response said "PromptSent" either way, and the shim printed the worker id instead of
+    /// the status, so nothing about a steer's fate reached the caller at all.
+    /// </summary>
+    [Theory]
+    [InlineData(true, "redrew in response")]
+    [InlineData(false, "produced no output")]
+    public async Task SendWorkerPrompt_ReportsWhetherTheCliWasSeenReacting(bool redraws, string expected)
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync($"reaction {redraws}");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble(redraws);
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "status?"));
+
+        Assert.True(response.Ok, $"a steer was refused: {response.Error}");
+        Assert.Contains(expected, response.Status ?? string.Empty, StringComparison.Ordinal);
+
+        // Either way the line WAS submitted — the reaction is an observation about the CLI, not a
+        // second opinion about whether Enter was pressed.
+        Assert.Equal(new[] { "status?" }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+
+        // And the caller can actually see it: the shim prints `status` only when no agentId is present.
+        Assert.Null(response.AgentId);
     }
 
     /// <summary>
@@ -136,36 +233,4 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
 
     private AgentSessionKey KeyFor(string workerId) =>
         Rig.Sessions.List().Single(s => s.Id == workerId).Key;
-
-    /// <summary>A terminal whose writes can be read back — the only way to assert delivery rather than
-    /// a return value.</summary>
-    private sealed class StubSession : ITerminalSession
-    {
-        private readonly MemoryStream _io = new();
-
-        public Stream IO => _io;
-
-        public Task<int> ExitCode { get; } = new TaskCompletionSource<int>().Task;
-
-        public void Resize(int cols, int rows)
-        {
-        }
-
-        public void Kill()
-        {
-        }
-
-        public void Dispose() => _io.Dispose();
-
-        /// <summary>The bytes written toward the CLI, once the write has actually landed.</summary>
-        public async Task<string> ReadWrittenAsync()
-        {
-            for (var i = 0; i < 200 && _io.Length == 0; i++)
-            {
-                await Task.Delay(10);
-            }
-
-            return Encoding.UTF8.GetString(_io.ToArray());
-        }
-    }
 }

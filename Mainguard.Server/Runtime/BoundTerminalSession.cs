@@ -187,6 +187,51 @@ public sealed class BoundTerminalSession : IDisposable
     }
 
     /// <summary>
+    /// Writes toward the CLI and then waits up to <paramref name="window"/> for the CLI to produce
+    /// output — the only in-band evidence the daemon has that a write was <i>consumed</i> rather than
+    /// merely accepted by the PTY master.
+    ///
+    /// <para><b>What this proves and what it does not.</b> A write to a PTY master succeeds whether or
+    /// not the child ever reads it, so "the write returned" is evidence of nothing. A PTY-attached CLI,
+    /// by contrast, cannot consume a keystroke silently: it re-renders. So output arriving here means
+    /// the child read and reacted. It does <b>not</b> mean the CLI understood the text, and it is
+    /// <b>necessary but not sufficient</b> as a submission signal — a CLI already mid-turn emits output
+    /// continuously, and that output would satisfy this wait on its own. Its evidential weight is in the
+    /// negative direction: an idle CLI that produces nothing at all after a keystroke did not see one.
+    /// Callers must report it as an observation, never assert it as proof.</para>
+    ///
+    /// <para>The subscription is opened <i>before</i> the write, so no reaction can slip through the gap
+    /// between the two; it is dropped again on every path.</para>
+    /// </summary>
+    /// <returns>True when the CLI produced output within the window.</returns>
+    public async Task<bool> WriteInputAndAwaitOutputAsync(
+        ReadOnlyMemory<byte> data, TimeSpan window, CancellationToken ct)
+    {
+        var (_, live) = Subscribe(out var unsubscribe);
+        try
+        {
+            await WriteInputAsync(data, ct).ConfigureAwait(false);
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(window);
+            try
+            {
+                // False here means the stream COMPLETED (the CLI died) — also "no reaction", correctly.
+                return await live.WaitToReadAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ct.ThrowIfCancellationRequested(); // a caller's cancel is not an observation
+                return false;
+            }
+        }
+        finally
+        {
+            unsubscribe();
+        }
+    }
+
+    /// <summary>
     /// Propagates a resize toward the CLI (SIGWINCH) and, on the libvterm engine, reflows the
     /// vterm screen in the same breath — the PTY, the parser grid, and the rendered grid can never
     /// disagree (the P2-18 one-authoritative-size rule). Grid subscribers receive a fresh snapshot

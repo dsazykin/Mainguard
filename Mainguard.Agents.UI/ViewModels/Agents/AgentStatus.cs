@@ -63,6 +63,12 @@ public static class AgentStatusMap
         // Dead, like Rejected: finished, not merged, nothing further will happen to it. Falling through
         // to the Working default would have badged a dropped entry as live work.
         WorkerMergeState.Discarded => AgentStatus.Dead,
+        // H2 — Conflict, the badge this enum already reserves for "stuck/blocked and needs human
+        // intervention". Spelled out rather than left to the default for exactly the reason Discarded is:
+        // falling through to Working would badge a branch whose tests just failed as ordinary live work,
+        // which is the very conflation the VerificationFailed state exists to end. Not Dead — the branch
+        // is still the agent's to fix and the entry keeps its retry.
+        WorkerMergeState.VerificationFailed => AgentStatus.Conflict,
         _ => AgentStatus.Working,
     };
 }

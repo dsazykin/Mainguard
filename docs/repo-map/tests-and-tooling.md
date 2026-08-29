@@ -1028,7 +1028,7 @@
   and strand the remainder — CRLF text arrives that way routinely; trailing whitespace is trimmed; and
   an empty message is REFUSED rather than encoded as a bare CR, which is Enter pressed at whatever the
   CLI has focused (a permission dialog's highlighted option). The rules are measured against claude-code
-  v2.1.251 under a real forkpty — transcripts in `docs/design/coordinator-phase-3-decisions.md` §16.1.
+  v2.1.251 under a real forkpty — transcripts in `docs/design/coordinator-phase-3-decisions.md` §17.1.
 - **`Mainguard.Tests/AdapterInitialPromptTests.cs`** — the manifest half of the first turn:
   `initialPromptStyle`, which only `claude-code` declares (`first-positional`; asserted that no other
   shipped adapter does). Every unreadable spelling is REFUSED at parse with

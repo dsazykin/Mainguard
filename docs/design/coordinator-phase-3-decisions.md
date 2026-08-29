@@ -1804,10 +1804,14 @@ that arm a worker that repaired its own branch would sit red forever. (`Verified
 push — the machine has no `Verified → Verifying` edge, and inventing one here would be the trigger changing
 the merge spine instead of triggering it. That limitation is unchanged.)
 
-**The third surface.** `MergeQueueProvisioner.MarkMergeState` is what a coordinator's `get_worker_status`
-reads (contract §3). It had no arm for the new state and would have fallen to `_ => null` — so the state fix
-would have reached two surfaces and left the coordinator, whose reader is an agent that acts on the answer,
-still hearing "Back at work". It now says the tests failed and what to do about it.
+**The other surfaces the fallback would have hidden.** `MergeQueueProvisioner.MarkMergeState` is what a
+coordinator's `get_worker_status` reads (contract §3). It had no arm for the new state and would have fallen
+to `_ => null` — so the state fix would have reached the rail and left the coordinator, whose reader is an
+agent that acts on the answer, still hearing "Back at work". `AgentStatusMap.FromMergeState` had the same
+shape with a worse default: its `_ => AgentStatus.Working` would have badged a branch whose tests just
+failed as ordinary live work, and the type's own doc claims it is "total by construction", which is a claim
+a `_` arm makes unfalsifiable. Both now have explicit arms, and the badge one is pinned by a test that
+asserts exactly one state maps to `Working`.
 
 **No migration.** `MergeQueueRow.State` is a TEXT column and the member was appended to the enum, so existing
 rows are untouched and rehydrate exactly as before.
@@ -1889,6 +1893,7 @@ by hand rather than trusted — a `--no-build` run over a stale binary reports a
 | M10 | the wire's verdict becomes a plain `bool` | 1 — `AnEntryThatWasNeverVerified_CarriesNoVerdictAtAll` |
 | M11 | a missing artifact renders as an empty log | 1 — `GetVerificationLog_WhenTheArtifactIsGone_KeepsTheVerdict_AndSaysWhy` |
 | M12 | `ReadTail` returns the head instead of the tail | 1 — `ReadTail_KeepsTheEndAndSaysItTruncated` |
+| M13 | the rail badge falls back to `Working` for the new state | 1 — `EveryMergeState_HasADeliberateBadge_NotTheWorkingFallback` |
 
 M7 is the one worth reading twice. It is the *only* mutation whose damage is invisible in the tests about
 the defect being fixed — every G1-positive test still passes with a default-deny gate, because they are all
@@ -1910,3 +1915,198 @@ larger failure than the one being repaired.
 - **The stranded-jail reason does not override the failure reason.** A `VerificationFailed` entry whose jail
   is gone reports the verdict, not `StrandedReason`. The verdict is the more actionable truth about that row,
   and `has_live_sandbox` already reaches the surface separately and withholds Verify on its own.
+
+---
+
+## 17. Defect H5 — `send_worker_prompt` has never once worked, and a test blessed it
+
+`AgentCliBinder.TrySendPromptAsync` wrote `prompt + "\n"` to the worker's PTY. **A PTY-attached CLI
+submits on CR, not LF.** Observed in a live stress run: three prompts to two workers all sat
+UNSUBMITTED in the CLIs' input lines and ACCUMULATED — one worker's input box held two concatenated
+prompts — and the jail transcripts show no new turn at any of the three timestamps.
+
+Every layer above reported success. The daemon logged `coordinator prompt delivered (184 bytes)`, and
+the bytes genuinely did arrive; the CLI simply never saw an Enter. `send_worker_prompt` is one of the
+contract's four tools and the coordinator's **only** steering channel, so for the whole life of the
+phase-3 surface the coordinator could spawn, watch, and verify — but never steer. It also made the
+escalation card's own advice ("steer it or end it") a false choice with one arm.
+
+### 17.1 What was measured, before anything was changed
+
+Not reasoned from first principles. `claude-code v2.1.251` was driven under a real `forkpty` (a Python
+harness: fork a PTY, set a 120×40 winsize, write bytes at the master, replay the output through a small
+VT screen model, and read the rendered input box). The tty modes were sampled at every write.
+
+**Modes at the CLI's prompt** — `ICANON=False, ECHO=False, ISIG=False, ICRNL=False, INLCR=False,
+IGNCR=False`. Raw mode. With `ICRNL` off the line discipline translates nothing, so the CLI receives the
+byte that was written, whichever it is. That is the mechanism behind everything below.
+
+| # | written at the master | rendered result |
+|---|---|---|
+| 1 | `AAA` then `0x0A` then `BBB` then `0x0A` | input box shows `AAA` / `BBB` on two lines. **Nothing submitted, ever** — an exact reproduction of the live failure, accumulation included |
+| 2 | `AAA` then `0x0D` | box clears, `❯ AAA` moves into the transcript, the CLI runs a turn and answers |
+| 3 | `line1\nline2\nline3` then `0x0D` | submitted **once**, intact; the CLI's own reply: "I received your message as three lines … the multiline input came through intact" |
+| 4 | `say A_OK` `0x0D` `say B_OK` then `0x0D` | **two turns.** The embedded CR submitted the prefix; `say B_OK` was left in the box |
+| 5 | `AAA` then `0x0D 0x0A` | submitted; the trailing LF did no visible harm — but only because the CLI was mid-turn, so this is not a property to rely on |
+| 6 | a menu (the folder-trust dialog): `0x0D` | confirms the highlighted option |
+| 7 | `/bin/sh -i`, `echo CR_WORKS` + `0x0D`, then `echo LF_WORKS` + `0x0A` | **both ran** |
+
+Row 1 is the shipped defect, reproduced on demand. Row 2 is the fix. Rows 3–4 are why the encoding is
+more than a one-byte swap. Row 6 is why an empty prompt must not be encoded as a bare CR. Row 7 is the
+whole per-adapter argument, below.
+
+### 17.2 Is the submit sequence per-adapter? No — and the argument matters more than the answer
+
+There is real precedent for putting it on the adapter: `systemPromptArg`, `preApprovedCommandArg` and
+`initialPromptStyle` are all per-adapter, all in `AdapterManifest`, all justified the same way — *only
+the CLI's author knows how their binary spells this*. The question is whether "which byte means Enter"
+is that kind of knowledge.
+
+It is not. It is knowledge about the **terminal**, and both classes of PTY-attached program agree:
+
+- **A TUI runs the tty in raw mode** (row 1's `ICANON=False`, and with it `ICRNL=False`), so it sees the
+  byte the terminal sent. A terminal sends **CR** for Enter. Every such TUI therefore binds CR; LF is at
+  best a literal newline in its input buffer (measured: exactly that).
+- **A line-oriented reader** either leaves the tty canonical — where the line discipline's `ICRNL`, on by
+  default, turns CR into NL and completes the line — or uses a line editor (readline/libedit), which
+  binds CR and LF alike to accept-line. Row 7 measures this on the class the scripted test adapters
+  actually are: `scripted-agent` and friends end in `exec sh -i`, and **both** bytes worked.
+
+So CR is correct for both classes and LF is correct for only one. A manifest field could therefore only
+ever be set to the single value that always works — while inviting an adapter author to write `"\n"` and
+silently reintroduce this exact defect, in a file the daemon trusts. That is a worse property than a
+missing field.
+
+The codebase already agreed and nobody noticed: `TerminalControl.MapKey` maps `Key.Enter` to a bare
+`0x0D` for every adapter, consults no manifest, and works. The human keystroke path and the
+coordinator's steering path were writing **different bytes for the same act**, and only one of them was
+right.
+
+**Decision.** One shared encoder, `Mainguard.Agents/Terminal/TerminalSubmit.cs`, with the rule stated
+once. `TryEncodeLine`:
+
+1. rewrites every embedded CR (and CRLF) to LF — row 4: an embedded CR submits a *prefix* as its own
+   turn and strands the remainder, and CRLF text arrives from a Windows-authored or log-pasted message
+   routinely;
+2. keeps embedded LFs — row 3: a TUI inserts them, so a multi-line steer arrives intact and is submitted
+   once, by the single terminator;
+3. trims trailing whitespace, so a caller that already ended with a newline does not submit a blank line;
+4. **refuses an empty message rather than writing a bare CR** — row 6: a lone CR is Enter, pressed at
+   whatever the CLI currently has focused. A worker sitting on a permission dialog would have its
+   highlighted option confirmed by a steer that said nothing;
+5. terminates with **CR**.
+
+### 17.3 Making it observable — and being honest about the limit
+
+The defect's real damage was not the byte. It was that **every layer reported success for a prompt that
+did nothing**, so the failure survived a live run, a green test, and a log line that said "delivered".
+
+What evidence can the daemon reasonably have? A write to a PTY master succeeds whether or not the child
+ever reads it, so the old signal — the write returned — was evidence of nothing. The one thing available
+in band is that **a PTY-attached CLI cannot consume a keystroke silently: it re-renders.**
+`BoundTerminalSession.WriteInputAndAwaitOutputAsync` subscribes *before* the write and then waits up to
+`AgentCliBinder.PromptReactionWindow` (2s) for output.
+
+**And the honest limit, stated rather than papered over.** That observation is *necessary but not
+sufficient*. A CLI already mid-turn emits output continuously and would satisfy the wait on its own, so
+a positive reading is not proof the line was submitted, and it is certainly not proof the CLI understood
+it. Its evidential weight is in the negative direction: an idle CLI that produces nothing at all after a
+keystroke did not see one. It is therefore **reported, never asserted on** — `TrySendPromptAsync` returns
+`PromptDelivery(Submitted, Reacted, Refusal)`, delivery is never failed on a missing reaction (a busy
+worker would be reported as unreachable, and a coordinator told to retry would double-steer it), and the
+`coordinator_worker_prompt` audit event now carries `terminator=CR` and `cli_reacted`.
+
+The ground truth — that a prompt became a *turn* — exists only in the CLI's own transcript inside the
+jail. The daemon does not read agent home directories, and building a signal on a vendor's private
+transcript format would be exactly the per-adapter coupling §17.2 refused. **So it is not claimed.** The
+daemon reports what it pressed and what it saw; the transcript remains the arbiter, out of band.
+
+**A second observability gap, found on the way.** The response carried `AgentId: owned.Id, Status:
+"PromptSent"` — and the shim prints an id when one is present and the status only when one is not. So
+the coordinator's `mainguard-agent prompt` printed the worker id it had just typed, and nothing about
+the prompt's fate could reach it even in principle. The response now carries no id and a status the
+caller can act on:
+
+```
+prompt submitted to pr-7 — Enter was pressed and its CLI redrew in response.
+prompt submitted to pr-7, but its CLI produced no output for 2s — it may be mid-turn. Check it with
+`mainguard-agent status pr-7` or its terminal before sending another; a second prompt is a second
+turn, not a retry.
+```
+
+The last clause is deliberate: the unacknowledged reading must not read as "retry", because a repeat is
+a second turn and a worker that was merely busy would be steered twice.
+
+### 17.4 The test that blessed the defect, and what it asserts now
+
+`CoordinatorToolPositivesTests` asserted `Assert.Equal("prefer the stdlib\n", written)` against a
+`MemoryStream`. Its own doc comment explains that it asserts the bytes "not on the response flag" —
+the right instinct, aimed at the wrong side of the boundary. It proved delivery **to the PTY**, which
+was never in doubt, and could not see that the CLI on the other side pressed nothing.
+
+The correction is not a different literal. A literal is the same mistake with a better constant. The
+double is now `RawModeCliDouble` — a stand-in for the **CLI's side**: raw mode, CR submits the input
+buffer, LF inserts a newline into it, a submit repaints (the repaint being the daemon's only evidence,
+so the double has to produce it). The rules are the ones measured in §17.1. Assertions are on
+`SubmittedLines` and `PendingInput`, which is what tells "the CLI received a submitted line" from
+"bytes reached the pty" — a byte log cannot.
+
+Four cases were added around it: two steers in a row must land as **two** submitted lines and not one
+accumulated input box (the live failure, as a test); a message carrying CRLF must submit exactly once; and
+both readings of the reaction observation, including that the caller can actually see it
+(`Assert.Null(response.AgentId)`).
+
+### 17.5 The same class of bug, checked elsewhere
+
+Every place the daemon writes to an agent PTY expecting the CLI to act:
+
+| site | verdict |
+|---|---|
+| `AgentCliBinder.TrySendPromptAsync` | **the defect.** Fixed |
+| `TerminalGrpcService` (two attach-input paths) | **clean** — forwards bytes the UI already encoded |
+| `TerminalControl.MapKey` (`Key.Enter`) | **clean** — `0x0D` already, and shift+Enter is CSI-u `13;2u`, alt+Enter `ESC CR` |
+| `TerminalControl.BuildPasteBytes` | **clean** — normalises `\r\n`→`\r` and `\n`→`\r`, which is what a real terminal sends for a paste |
+| the worker's first turn | **not a PTY write at all** — `initialPromptStyle: first-positional` puts it in the launch argv (`SandboxAgentLauncher`), which is why the first turn worked while every steer after it did not |
+| `mainguard-plan` / `mainguard-agent` shims | **not a PTY write** — newline-delimited JSON over a socket/outbox, where LF is the framing and correct |
+
+That last row is the reason this survived so long: the one prompt that visibly worked never went
+through a PTY.
+
+### 17.6 The mutation log
+
+Every guard watched failing. `TerminalSubmitTests` is 15 tests in `Mainguard.Tests`;
+`CoordinatorToolPositivesTests` + `PromptDeliveryBinderTests` are 10 in `Mainguard.Server.Tests`.
+Restores used `touch`, because `mv`ing a file back preserves its mtime and MSBuild then skips the
+rebuild — you test the mutated binary and every mutation looks survivable.
+
+| # | mutation | went red |
+|---|---|---|
+| M1 | terminator back to `\n` — **the shipped defect** | **9 of 15** encoder, **6 of 10** server |
+| M2 | embedded CR left alone (no CR→LF normalisation) | 5 of 15, 1 of 10 |
+| M3 | an empty message encoded as a bare CR instead of refused | 5 of 15, 1 of 10 |
+| M4 | trailing whitespace not trimmed | 8 of 15, 2 of 10 |
+| M5 | the reaction observation faked (always "the CLI reacted") | 1 of 10 |
+| M6 | the response echoes the worker id again, hiding the status from the shim | 2 of 10 |
+| M7 | the binder's empty-prompt guard removed | 1 of 10 |
+
+M7 is the one worth reading. It went red **only** because `PromptDeliveryBinderTests` exists: that guard
+is unreachable through the IPC surface, since `AgentSpawnService.PromptAsync` rejects a blank prompt with
+a usage sentence first. A guard no test can turn red is indistinguishable from a guard that was deleted,
+so the delivery layer is now reached directly rather than left as decoration.
+
+### 17.7 What this does not close
+
+- **The live four-tool run of contract §8 still has not been performed** (§4 remains open). What is new
+  is that the tool it would have exercised is no longer inert, and that the live failure mode has a test.
+- **A steer sent while the worker's CLI is showing a modal** (a permission dialog, an autocomplete
+  popup) types into that modal rather than into the message box. The empty-prompt refusal removes the
+  worst case — pressing Enter at a dialog with nothing to say — but a real prompt sent at that moment is
+  still delivered into whatever has focus. Detecting a modal from PTY output is per-CLI screen-scraping,
+  which §17.2 refused for the same reason; recorded, not fixed.
+- **No proof of comprehension.** §17.3 is explicit that the daemon reports what it pressed and what it
+  saw, and that the CLI's own transcript is the arbiter. Any stronger claim would be an invented signal.
+- **Adjacent, not fixed here: `mainguard-agent prompt <agent-id> <text ...>` is taught unquoted**, which
+  is defect G3 (§15.2) in the other shim — a coordinator reaching this through its CLI's Bash tool with
+  text containing `()`, `&&`, `|`, `$` or a quote never gets past the shell. `spawn` was hardened by
+  teaching a quoted `--task`; `prompt` was not. Recorded so the next change to the shim's usage text
+  does both.

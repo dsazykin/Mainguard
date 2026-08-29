@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Agents.Sandbox;
+using Mainguard.Agents.Terminal;
 using Mainguard.Git.Audit;
 using Mainguard.Server.Logging;
 using Microsoft.Extensions.Logging;
@@ -28,6 +29,31 @@ public sealed record CliPtyLaunch(
     IReadOnlyDictionary<string, string> Environment,
     int Cols,
     int Rows);
+
+/// <summary>
+/// The outcome of one <c>send_worker_prompt</c> delivery, split into the two facts the daemon can
+/// actually distinguish — because the defect this type replaces was a <c>bool</c> that conflated them.
+/// </summary>
+/// <param name="Submitted">
+/// The line — text plus the CR that submits it — was written to the worker's PTY without error.
+/// </param>
+/// <param name="Reacted">
+/// The CLI produced output within <see cref="AgentCliBinder.PromptReactionWindow"/> of that write. This
+/// is an <b>observation, not a proof</b>: it says the child read its PTY and re-rendered, which a CLI
+/// that never saw the keystroke cannot do, but a CLI that was already mid-turn would have satisfied it
+/// anyway. Report it; never assert on it. The ground truth that a prompt became a TURN lives in the
+/// CLI's own transcript inside the jail, which the daemon deliberately does not read.
+/// </param>
+/// <param name="Refusal">Set only when <paramref name="Submitted"/> is false and the reason is known
+/// more precisely than "no live CLI" — the sentence the coordinator is shown.</param>
+internal readonly record struct PromptDelivery(bool Submitted, bool Reacted, string? Refusal)
+{
+    /// <summary>Nothing was written: no bound CLI, or the PTY refused the write.</summary>
+    public static PromptDelivery NotDelivered => new(false, false, null);
+
+    /// <summary>Nothing was written, and the daemon can say exactly why.</summary>
+    public static PromptDelivery Refused(string reason) => new(false, false, reason);
+}
 
 /// <summary>
 /// Binds a freshly launched jail's CLI to a real terminal: spawns the CLI inside the container
@@ -201,9 +227,22 @@ public sealed class AgentCliBinder
     public void ClearBindPending(AgentSessionKey key) => _terminals.ClearBindPending(key);
 
     /// <summary>
+    /// How long the daemon waits, after pressing Enter for the coordinator, for the worker's CLI to
+    /// produce output. Long enough that an idle CLI's redraw always lands inside it; short enough that a
+    /// coordinator's tool call does not stall on a worker that is wedged.
+    /// </summary>
+    internal static readonly TimeSpan PromptReactionWindow = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// Delivers a coordinator's steering prompt to a managed worker's live CLI (coordinator contract §3,
-    /// <c>send_worker_prompt</c>). Returns false when no CLI is bound for that session — the caller reports
-    /// that rather than pretending the prompt landed.
+    /// <c>send_worker_prompt</c>). Reports <see cref="PromptDelivery.NotDelivered"/> when no CLI is bound
+    /// for that session — the caller reports that rather than pretending the prompt landed.
+    ///
+    /// <para><b>The line is terminated with CR, not LF, and that is the whole defect this once had.</b>
+    /// It wrote <c>prompt + "\n"</c>, which a PTY-attached TUI reads as "insert a newline in my input
+    /// box" — never as Enter. Three prompts to two workers in a live run therefore ACCUMULATED unsubmitted
+    /// in their input lines while every layer above logged success. See <see cref="TerminalSubmit"/> for
+    /// the measured rule and why it is one shared fact rather than per-adapter vendor knowledge.</para>
     ///
     /// <para><b>Why this deliberately does not consult <see cref="Mainguard.Server.Auth.TerminalLockRegistry"/>.</b>
     /// That lock exists to sever <i>human</i> keyboard input to a managed worker (P2-14): a worker's terminal
@@ -217,36 +256,48 @@ public sealed class AgentCliBinder
     /// the same repo, and must already hold an approved plan. This method is the delivery mechanism, not the
     /// gate — it is <c>internal</c> so no other transport can reach it without going through those checks.</para>
     /// </summary>
-    internal async Task<bool> TrySendPromptAsync(AgentSessionKey key, string prompt, CancellationToken ct)
+    internal async Task<PromptDelivery> TrySendPromptAsync(
+        AgentSessionKey key, string prompt, CancellationToken ct)
     {
         var bound = _terminals.TryGetBound(key);
         if (bound is null)
         {
-            return false;
+            return PromptDelivery.NotDelivered;
         }
 
-        // A CLI reads a prompt as a line: the trailing newline is what submits it. Without it the text
-        // sits in the agent's input buffer and nothing happens — a silent no-op that would look like a
-        // delivered prompt to everything upstream.
-        var line = prompt.EndsWith('\n') ? prompt : prompt + "\n";
+        if (!TerminalSubmit.TryEncodeLine(prompt, out var line))
+        {
+            // A bare terminator is Enter, which would confirm whatever the CLI has focused (a permission
+            // dialog's highlighted option, an autocomplete row). Refuse rather than press it blindly.
+            return PromptDelivery.Refused("there is nothing to submit — the prompt is empty.");
+        }
+
+        bool reacted;
         try
         {
-            await bound.WriteInputAsync(System.Text.Encoding.UTF8.GetBytes(line), ct).ConfigureAwait(false);
+            reacted = await bound
+                .WriteInputAndAwaitOutputAsync(line, PromptReactionWindow, ct)
+                .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
         {
             // `TryGetBound` succeeding only means a session EXISTS, not that its pty is still writable —
             // a jail can die between the lookup and the write, and the write then throws EIO. Letting
-            // that escape made a bool-returning Try method throw, and the coordinator saw the raw errno
-            // ("Input/output error") instead of the actionable refusal its caller already had ready
-            // ("<id> has no live CLI to steer."). Undelivered is exactly what `false` means.
+            // that escape made a Try method throw, and the coordinator saw the raw errno ("Input/output
+            // error") instead of the actionable refusal its caller already had ready ("<id> has no live
+            // CLI to steer."). Undelivered is exactly what NotDelivered means.
             _log.LogWarning(
                 ex, "coordinator prompt to worker={Agent} could not be written to its pty", key.AgentId);
-            return false;
+            return PromptDelivery.NotDelivered;
         }
 
-        _log.LogInformation("coordinator prompt delivered to worker={Agent} ({Bytes} bytes)", key.AgentId, line.Length);
-        return true;
+        // The old line here said "delivered", off nothing but a write that returned. It now says what was
+        // actually written (terminator included, so a regression to LF is visible in the log itself) and
+        // what the CLI did about it.
+        _log.LogInformation(
+            "coordinator prompt submitted to worker={Agent} ({Bytes} bytes, terminator=CR) reacted={Reacted}",
+            key.AgentId, line.Length, reacted);
+        return new PromptDelivery(true, reacted, null);
     }
 
     /// <summary>Cap on the last-output tail carried into the death reason/audit — enough to name
