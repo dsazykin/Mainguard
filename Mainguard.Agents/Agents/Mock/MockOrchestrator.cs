@@ -957,7 +957,12 @@ public sealed class MockOrchestrator :
                 .Select(a => new AgentResourceUsage(
                     a.Id, a.Name, a.Life.ToString(), a.Life == AgentLifecycleState.Paused,
                     Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail,
-                    IsMetered: true))
+                    IsMetered: true,
+                    // The scripted fleet is a coordinator's fan-out, so its rows carry the same role +
+                    // brief a live one does — otherwise the design captures would show an identity the
+                    // shipped surface never renders.
+                    Role: AgentRoles.Managed,
+                    Title: _workerPlans.FirstOrDefault(p => p.WorkerAgentId == a.Id)?.Title ?? ""))
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToList();
     }

@@ -2223,6 +2223,15 @@ public sealed class DaemonBackedOrchestrator :
     {
         lock (_gate)
         {
+            // The worker briefs, taken from the plan stream the surface is already receiving rather than
+            // from a new wire field: the plan's Title IS the brief a worker was spawned against, and it is
+            // the only human-legible name any of these sessions has. Without it the resource monitor can
+            // only print the CLI kind, which is identical for every agent of that kind.
+            var titles = _workerPlans
+                .Where(p => p.WorkerAgentId.Length > 0 && p.Title.Length > 0)
+                .GroupBy(p => p.WorkerAgentId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Last().Title, StringComparer.Ordinal);
+
             return _agents.Values
                 .Select(a =>
                 {
@@ -2239,7 +2248,9 @@ public sealed class DaemonBackedOrchestrator :
                         RamGb: haveReading && res.RamBytes is { } bytes ? bytes / (1024.0 * 1024.0 * 1024.0) : null,
                         SpendUsd: spendUsd,
                         Task: a.Detail,
-                        IsMetered: haveReading && res.Metered);
+                        IsMetered: haveReading && res.Metered,
+                        Role: a.Role,
+                        Title: titles.TryGetValue(a.AgentId, out var title) ? title : string.Empty);
                 })
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToArray();

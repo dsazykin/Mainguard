@@ -55,8 +55,9 @@
         </StackPanel>
       </Border>
 
-      <!-- column headers -->
-      <Grid Grid.Row="1" ColumnDefinitions="90,110,60,70,70,*" Margin="12,0,12,4">
+      <!-- column headers. The Agent column is wide enough for a real identity (role + short id over the
+           CLI kind and the brief) rather than the 90px that could only ever fit "claude-code". -->
+      <Grid Grid.Row="1" ColumnDefinitions="200,110,60,70,70,*" Margin="12,0,12,4">
         <TextBlock Grid.Column="0" Text="Agent" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}"/>
         <TextBlock Grid.Column="1" Text="State" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}"/>
         <TextBlock Grid.Column="2" Text="CPU" FontSize="10" FontWeight="Bold" Foreground="{DynamicResource TextMuted}" HorizontalAlignment="Right"/>
@@ -93,8 +94,20 @@
                       <MenuItem Header="End task" Command="{Binding EndTaskCommand}" Foreground="{DynamicResource DangerBrush}"/>
                     </ContextMenu>
                   </Border.ContextMenu>
-                  <Grid ColumnDefinitions="90,110,60,70,70,*">
-                    <TextBlock Grid.Column="0" Classes="Mono" Text="{Binding Name}" FontSize="12" Foreground="{DynamicResource TextPrimary}" VerticalAlignment="Center"/>
+                  <Grid ColumnDefinitions="200,110,60,70,70,*">
+                    <!-- WHICH agent this is. The old row printed only Name — the CLI kind — so four
+                         sessions of the same CLI rendered as four identical lines reading "claude-code",
+                         and the right-click End task on any of them looked the same as on the coordinator.
+                         Role and short id lead because they are what a human recognises and what every
+                         other surface (agent rail, merge queue, "Written by …" on a plan card) uses for
+                         the same agent; the CLI kind and the worker's brief follow underneath. -->
+                    <StackPanel Grid.Column="0" VerticalAlignment="Center" Spacing="1" Margin="0,0,10,0">
+                      <TextBlock Text="{Binding IdentityLine}" Classes="Mono" FontSize="12" FontWeight="SemiBold"
+                                 Foreground="{DynamicResource TextPrimary}" TextTrimming="CharacterEllipsis"/>
+                      <TextBlock Text="{Binding KindLine}" FontSize="10" Foreground="{DynamicResource TextMuted}"
+                                 TextTrimming="CharacterEllipsis"
+                                 ToolTip.Tip="{Binding AgentId}"/>
+                    </StackPanel>
                     <TextBlock Grid.Column="1" Text="{Binding StateWord}" FontSize="11" Foreground="{DynamicResource TextMuted}" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="2" Classes="Mono" Text="{Binding CpuText}" FontSize="12" Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="3" Classes="Mono" Text="{Binding RamText}" FontSize="12" Foreground="{DynamicResource TextPrimary}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
@@ -118,10 +131,13 @@
       </Border>
     </Grid>
 
-    <!-- End-task confirmation (C-pattern: the object, what changes, what's kept) -->
+    <!-- End-task confirmation (C-pattern: the object, what changes, what's kept). The title names the
+         ROW — "End Coordinator 066626ed?" — not the CLI kind it happens to run, and the message is the
+         row's own consequence sentence, which differs for the coordinator because ending it ends the
+         session. Wider than the other confirms because that sentence has two halves and both matter. -->
     <Border Background="#C0000000" IsVisible="{Binding IsEndConfirmVisible}">
       <Border Background="{DynamicResource SurfacePanel}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1"
-              CornerRadius="12" MaxWidth="380" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="20">
+              CornerRadius="12" MaxWidth="460" VerticalAlignment="Center" HorizontalAlignment="Center" Padding="20">
         <Border.BoxShadow>
           <BoxShadows>0 10 30 0 #40000000</BoxShadows>
         </Border.BoxShadow>

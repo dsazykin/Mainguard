@@ -167,6 +167,63 @@ public class ResourceMonitorHonestyTests
         Assert.Single(vm.CpuPoints);
     }
 
+    /// <summary>
+    /// <b>3. A row says WHICH agent it is, and the confirm says what ending THAT one costs.</b>
+    ///
+    /// <para>Reported from a live run: four rows all reading <c>claude-code</c> with no id, and a confirm
+    /// dialog reading "End claude-code?". The name column was the CLI kind, which is identical for every
+    /// session of that CLI — so the coordinator, whose death ends the whole session, was visually
+    /// indistinguishable from the three workers next to it. An irreversible action confirmed against a
+    /// label four rows share is not a confirmation.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void EveryRow_NamesTheAgentItWouldEnd()
+    {
+        var telemetry = new FakeTelemetry();
+        telemetry.Seed(
+            current: new ResourceSample(DateTimeOffset.UtcNow, 40, 3.0, null),
+            usage: new[]
+            {
+                new AgentResourceUsage(
+                    "066626ed198c4a46bfdc9b50a9b7ca44", "claude-code", "Working", false, 10, 1.0, null,
+                    "planning", IsMetered: false, Role: AgentRoles.Coordinator),
+                new AgentResourceUsage(
+                    "b3d2e7a48d09462fb9b6421bcd6da68b", "claude-code", "Working", false, 20, 1.5, null,
+                    "editing calc.js", IsMetered: false, Role: AgentRoles.Managed, Title: "multiply helper"),
+                new AgentResourceUsage(
+                    "fad68b04fa5a429fab790d64fb807a9f", "claude-code", "Working", false, 5, 1.1, null,
+                    "waiting", IsMetered: false, Role: AgentRoles.Managed, Title: "divide helper"),
+            });
+
+        using var vm = new ResourceMonitorViewModel(new FakeAgents(), telemetry);
+
+        // No two rows read the same. That is the whole defect: they did.
+        var identities = vm.Rows.Select(r => r.IdentityLine).ToList();
+        Assert.Equal(identities.Count, identities.Distinct(StringComparer.Ordinal).Count());
+
+        var coordinator = vm.Rows.Single(r => r.AgentId.StartsWith("066626ed", StringComparison.Ordinal));
+        Assert.True(coordinator.IsCoordinator);
+        Assert.Equal("Coordinator 066626ed", coordinator.IdentityLine);
+
+        var worker = vm.Rows.Single(r => r.AgentId.StartsWith("b3d2e7a4", StringComparison.Ordinal));
+        Assert.False(worker.IsCoordinator);
+        Assert.Equal("Worker b3d2e7a4", worker.IdentityLine);
+        // …and the brief, which is the line that actually says which worker this is.
+        Assert.Contains("multiply helper", worker.KindLine, StringComparison.Ordinal);
+        Assert.Contains("claude-code", worker.KindLine, StringComparison.Ordinal);
+
+        // The confirm names the row and, for the coordinator, states the blast radius the others lack.
+        vm.RequestEnd(coordinator);
+        Assert.Equal("End Coordinator 066626ed?", vm.EndConfirmTitle);
+        Assert.Contains("stops the whole session", vm.EndConfirmMessage, StringComparison.Ordinal);
+        vm.CancelEndCommand.Execute(null);
+
+        vm.RequestEnd(worker);
+        Assert.Equal("End Worker b3d2e7a4?", vm.EndConfirmTitle);
+        Assert.DoesNotContain("whole session", vm.EndConfirmMessage, StringComparison.Ordinal);
+        Assert.Contains("worker cap", vm.EndConfirmMessage, StringComparison.Ordinal);
+    }
+
     private sealed class FakeTelemetry : ITelemetryService
     {
         private readonly List<ResourceSample> _history = new();
