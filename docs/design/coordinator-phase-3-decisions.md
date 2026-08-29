@@ -1469,3 +1469,83 @@ effect — a test that cannot tell which guard fired cannot show that this one e
   nothing crosses a trust boundary.
 - **`ex.Message` from a throwing handler still reaches the jail** on both framings (§14.1). Pre-existing,
   daemon-authored text, and a different change.
+
+---
+
+## 15. The concurrent stress run's three defects (G2, G3, G4)
+
+A stress run of three concurrent coordinators, on the daemon built from `92083bd7`, produced three
+regressions in commits landed the same night. Each was reproduced on this machine before anything was
+changed.
+
+### 15.1 Defect G2 — one jail, two briefings, and they disagreed about the machine
+
+`2414130c` made the coordinator's instructions render the installed agent kinds per spawn, and said why
+in `SpellKinds`' own doc-comment: the text and the enforcement are *"the same claim about the same set,
+made to the same reader seconds apart, and two renderings of one set is how they come to disagree."*
+
+There were two renderings.
+
+```
+SandboxAgentLauncher.InstructionsFor(role, _adapters)      -> Coordinator(shim, adapters.InstalledKinds())
+AgentIpcServer.Endpoint.Start (~line 415)                  -> For(role, SandboxShimPath(role))
+                                                              …installedKinds defaulted to null
+```
+
+So in one and the same jail the `--append-system-prompt` copy named every installed CLI and the
+`MAINGUARD.md` copy — the one a CLI opens unprompted — said `(none installed on this machine)`. A
+coordinator that read the file and believed it has no correct move: every kind it can name is refused,
+and the refusal it would get names a list its own briefing said was empty.
+
+**Reproduced before changing anything**, daemon-side, in a spawn through the real service against a temp
+adapter registry (`CoordinatorSpawnKindTests.TheTwoDeliveriesOfOneJailsInstructions_AreTheSameText`):
+
+```
+Expected: ···"ed on this machine\n\n`probe-cli`, `second-"···   (the launch-line copy)
+Actual:   ···"ed on this machine\n\n(none installed on th"···   (the file beside the shim)
+```
+
+**The fix is not the missing argument.** Passing `adapters.InstalledKinds()` at the second call site
+would have restored agreement and left the defect's actual shape untouched: a rendering that can be
+reached without the thing it describes. Two changes remove that shape.
+
+- **You cannot render without the catalog.** `Coordinator` and `For` take an
+  `InstalledAdapterCatalog` — required, no default — instead of an optional
+  `IReadOnlyCollection<string>?`. The list is no longer a value a caller carries; it is read from the
+  same object the `spawn` refusal reads, at the moment of rendering. A third call site therefore gets the
+  machine's real state whatever it forgets, because there is nothing left to forget. The shim path went
+  the same way: it was a second caller-supplied string that both sites happened to spell identically, and
+  it is now derived from the role.
+- **A delivery site does not render.** `AgentIpcServer.CreateEndpoint` takes the *rendered* text as a
+  required argument and writes it. The daemon's one production rendering is
+  `SandboxAgentLauncher.InstructionsFor(role)`, an instance method bound to that launcher's own catalog;
+  `AgentSpawnService` asks it for the string before creating the endpoint (the endpoint is a mount source,
+  so it must exist first) and the launcher puts the same string on the launch line moments later.
+
+**Why an instance method and not a static over a catalog argument.** The interesting failure is not "the
+text can name kinds" — it is "the text names the kinds *this daemon* has". A static invites a caller to
+supply some other catalog, and G2 was that shape with the argument omitted altogether.
+
+`NoWayToRenderTheCoordinatorText_WithoutTheInstalledCatalog` asserts the structural half by reflection,
+because "nobody will add an overload" is the kind of promise this file exists to stop making.
+
+**What this deliberately does not change.** `SpellKinds` keeps its list parameter: the refusal path
+(`CoordinatorSpawnGate.RefuseUnknownKind`, `AgentSpawnService.SpawnWorkerAsync`) already holds
+`_launcher.InstalledAgentKinds` and is the *enforcement*, not a description that can go stale.
+
+#### The mutation log
+
+Each guard was broken, the named tests run, the failure observed, then `git checkout --` **followed by
+`touch`** — a restore that preserves mtime lets MSBuild skip the rebuild and re-run the suite against the
+mutated binary (§12.4). All numbers are `CoordinatorSpawnKindTests`, 10 tests.
+
+| # | mutation | result |
+|---|---|---|
+| M1 | the endpoint renders its own copy again, from a catalog that resolves to nothing — **the shipped defect** | **2 failed** / 8 passed (`TheTwoDeliveries…`, `TheInstructionsFileAJailOpens…`) |
+| M2 | the catalog becomes an optional argument again | **1 failed** / 9 passed (`NoWayToRenderTheCoordinatorText…` — and *only* that one, which is the point: agreement between two copies is restorable by accident, the ability to render from nothing is not) |
+| M3 | the launcher renders from a fresh empty catalog instead of its own | **2 failed** / 8 passed |
+| M4 | the endpoint is handed the other role's instructions | **2 failed** / 8 passed |
+
+M2 is the one worth reading. It leaves both deliveries agreeing — they still come from one string — so
+every equality assertion stays green, and only the reflection test notices. That is exactly the state the
+codebase was in before `AgentIpcServer` was written: a latent defect with a green suite.

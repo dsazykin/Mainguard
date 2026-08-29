@@ -255,7 +255,7 @@ public sealed class SandboxAgentLauncher
         var instructionsRole = string.Equals(agentRole, AgentRoles.Coordinator, StringComparison.Ordinal)
             ? AgentIpcEndpointRole.Coordinator
             : AgentIpcEndpointRole.Worker;
-        var instructions = InstructionsFor(instructionsRole, _adapters);
+        var instructions = InstructionsFor(instructionsRole);
 
         // The launch line the jail's CLI is actually started with: the first turn, the instructions, and
         // the one pre-approved command, assembled in ONE place because their ORDER is load-bearing (see
@@ -977,16 +977,19 @@ public sealed class SandboxAgentLauncher
     }
 
     /// <summary>
-    /// The operating instructions a jail of this role is handed, <b>bound to this daemon's catalog</b>.
+    /// The operating instructions a jail of this role is handed, <b>bound to this daemon's catalog</b> —
+    /// and the one place the daemon renders them. Everything that DELIVERS the text asks for it here: the
+    /// launch flag below, the file <c>AgentIpcServer</c> writes beside the shim (via
+    /// <c>AgentSpawnService</c>, which creates the endpoint before the jail exists), and the copy staged
+    /// into a worker's worktree.
     ///
-    /// <para>Named and internal so the binding is testable as a fact about the launcher rather than as a
-    /// fact about the string function. The interesting failure is not "the text can name kinds" — it is
-    /// "the text names the kinds this box actually has", and passing an empty list from the one call site
-    /// would leave every prose assertion about the instructions perfectly green.</para>
+    /// <para>An instance method rather than a static over a caller-supplied catalog, because the
+    /// interesting failure is not "the text can name kinds" — it is "the text names the kinds THIS daemon
+    /// has". Defect G2 was that shape with the argument omitted altogether: the launcher bound its catalog
+    /// and the IPC server bound nothing, so one jail got two different texts.</para>
     /// </summary>
-    internal static string InstructionsFor(AgentIpcEndpointRole role, InstalledAdapterCatalog adapters) =>
-        AgentOperatingInstructions.For(
-            role, AgentIpcPaths.SandboxShimPath(role), adapters.InstalledKinds());
+    internal string InstructionsFor(AgentIpcEndpointRole role) =>
+        AgentOperatingInstructions.For(role, _adapters);
 
     /// <summary>
     /// Assembles the complete launch line a jailed CLI is started with — the first user turn, the role's

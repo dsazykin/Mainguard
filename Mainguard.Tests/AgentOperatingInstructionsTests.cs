@@ -1,5 +1,7 @@
 using System;
+using System.IO;
 using System.Linq;
+using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.Agents.Ipc;
 using Xunit;
 
@@ -15,22 +17,35 @@ namespace Mainguard.Tests;
 /// turns discovering that. So the coordinator text is pinned against
 /// <see cref="AgentIpcRequest.CoordinatorOps"/> in both directions.</para>
 /// </summary>
-public class AgentOperatingInstructionsTests
+public class AgentOperatingInstructionsTests : IDisposable
 {
     /// <summary>Stand-ins for "what this daemon has installed" — deliberately not the shipped ids, so a
     /// test that passes only because it recognised a real adapter name cannot exist.</summary>
     private static readonly string[] Kinds = { "alpha-cli", "beta-cli" };
 
-    private static string Coordinator() =>
-        AgentOperatingInstructions.For(
-            AgentIpcEndpointRole.Coordinator,
-            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator),
-            Kinds);
+    /// <summary>
+    /// The installed set reaches the text as a <see cref="InstalledAdapterCatalog"/> and never as a bare
+    /// list, which is what defect G2 turned into a structural fix: an optional list argument is one a
+    /// caller can omit, and one caller did — so the file copy of these instructions told a coordinator
+    /// nothing was installed while the launch-flag copy named everything. A catalog over a registry this
+    /// test owns keeps the assertions independent of what the developer happens to have installed.
+    /// </summary>
+    private readonly TempRegistry _registry = new(Kinds);
 
-    private static string Worker() =>
-        AgentOperatingInstructions.For(
-            AgentIpcEndpointRole.Worker,
-            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker));
+    private readonly TempRegistry _emptyRegistry = new(Array.Empty<string>());
+
+    public void Dispose()
+    {
+        _registry.Dispose();
+        _emptyRegistry.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    private string Coordinator() =>
+        AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, _registry.Catalog);
+
+    private string Worker() =>
+        AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, _registry.Catalog);
 
     /// <summary>
     /// Every op the daemon serves a coordinator is named in what the coordinator is told. A tool the
@@ -231,28 +246,53 @@ public class AgentOperatingInstructionsTests
     public void ACoordinatorOnABoxWithNothingInstalled_IsToldThat_NotAnEmptyList()
     {
         var text = AgentOperatingInstructions.For(
-            AgentIpcEndpointRole.Coordinator,
-            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator),
-            Array.Empty<string>());
+            AgentIpcEndpointRole.Coordinator, _emptyRegistry.Catalog);
 
         Assert.Contains("none installed", text, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>A worker has no <c>spawn</c>, so nothing about what is installed belongs in its text —
-    /// and the kinds argument must not leak into it by being threaded through one shared renderer.</summary>
+    /// and the catalog must not leak into it by being threaded through one shared renderer.</summary>
     [Fact]
     public void TheWorkerTextDoesNotDependOnWhatIsInstalled()
     {
         Assert.Equal(
             Worker(),
-            AgentOperatingInstructions.For(
-                AgentIpcEndpointRole.Worker,
-                AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker),
-                Kinds));
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, _emptyRegistry.Catalog));
     }
 
     /// <summary>An unknown role gets the text that cannot start work without a human.</summary>
     [Fact]
     public void AnUnknownRoleFallsBackToTheWorkerText()
-        => Assert.Equal(Worker(), AgentOperatingInstructions.For((AgentIpcEndpointRole)999, AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker)));
+        => Assert.Equal(
+            Worker(), AgentOperatingInstructions.For((AgentIpcEndpointRole)999, _registry.Catalog));
+
+    /// <summary>A registry directory holding exactly the adapter markers a test names.</summary>
+    private sealed class TempRegistry : IDisposable
+    {
+        private readonly string _path;
+
+        public TempRegistry(params string[] ids)
+        {
+            _path = Path.Combine(
+                Path.GetTempPath(), "mg-instr-registry-" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(_path);
+            foreach (var id in ids)
+            {
+                File.WriteAllText(
+                    Path.Combine(_path, id + ".json"),
+                    InstalledAdapterMarker.Serialize(
+                        new InstalledAdapterMarker(id, "1.0.0", new[] { "/bin/" + id })));
+            }
+
+            Catalog = new InstalledAdapterCatalog(_path);
+        }
+
+        public InstalledAdapterCatalog Catalog { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(_path, recursive: true); } catch { /* best effort */ }
+        }
+    }
 }

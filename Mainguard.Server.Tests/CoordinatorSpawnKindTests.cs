@@ -165,7 +165,7 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
     {
         using var registry = new TempRegistry(Installed, AlsoInstalled);
 
-        var instructions = SandboxAgentLauncher.InstructionsFor(
+        var instructions = AgentOperatingInstructions.For(
             AgentIpcEndpointRole.Coordinator, new InstalledAdapterCatalog(registry.Path));
 
         // The rendered list is EXACTLY the two markers in that registry — asserted as the whole line, so a
@@ -185,7 +185,7 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
         using var registry = new TempRegistry(Installed, AlsoInstalled);
         var catalog = new InstalledAdapterCatalog(registry.Path);
 
-        var instructions = SandboxAgentLauncher.InstructionsFor(AgentIpcEndpointRole.Coordinator, catalog);
+        var instructions = AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, catalog);
         var refusal = CoordinatorSpawnGate.RefuseUnknownKind("coder", catalog.InstalledKinds());
 
         Assert.NotNull(refusal);
@@ -195,6 +195,82 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
             Assert.Contains(kind, refusal!, StringComparison.Ordinal);
         }
     }
+
+    // ---- G2: the two copies of one jail's instructions ------------------------------------------
+
+    /// <summary>
+    /// <b>Defect G2 — the same jail was handed two different instruction texts.</b>
+    ///
+    /// <para><c>SandboxAgentLauncher</c> rendered the <c>--append-system-prompt</c> copy from the daemon's
+    /// catalog, while <c>AgentIpcServer</c> rendered the <c>MAINGUARD.md</c> copy from nothing at all — it
+    /// simply omitted the optional argument. So in one and the same jail the flag named all six installed
+    /// kinds and the file the CLI opens unprompted said <c>(none installed on this machine)</c>. Measured
+    /// here on the FILE the daemon actually wrote, in a spawn that went through the real service.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheInstructionsFileAJailOpens_NamesTheKindsThisDaemonHas()
+    {
+        var coordinator = await SpawnCoordinatorAsync();
+
+        var file = InstructionsFileFor(coordinator);
+
+        Assert.Contains("`" + Installed + "`, `" + AlsoInstalled + "`", file, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            AgentOperatingInstructions.SpellKinds(Array.Empty<string>()), file, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The invariant the defect broke, asserted as one equality: the copy written beside the shim and the
+    /// copy the launcher puts on the launch line are <b>the same bytes</b>. Two deliveries of one text can
+    /// only disagree if something renders twice, so this is the assertion that a third delivery would also
+    /// have to satisfy.
+    /// </summary>
+    [Fact]
+    public async Task TheTwoDeliveriesOfOneJailsInstructions_AreTheSameText()
+    {
+        var coordinator = await SpawnCoordinatorAsync();
+
+        var onTheLaunchLine = AgentOperatingInstructions
+            .For(AgentIpcEndpointRole.Coordinator, _rig.Adapters).Replace("\r\n", "\n");
+
+        Assert.Equal(onTheLaunchLine, InstructionsFileFor(coordinator));
+    }
+
+    /// <summary>
+    /// <b>The structural half.</b> The divergence was possible because the installed set was an OPTIONAL
+    /// argument: one call site passed it, the other did not, and both compiled. There is now no rendering
+    /// entry point that can be reached without the catalog the enforcement itself reads — so a third call
+    /// site cannot repeat this, whatever it forgets.
+    ///
+    /// <para>Asserted by reflection rather than by review, because "nobody will add an overload" is exactly
+    /// the kind of promise this file exists to stop making.</para>
+    /// </summary>
+    [Fact]
+    public void NoWayToRenderTheCoordinatorText_WithoutTheInstalledCatalog()
+    {
+        var renderers = typeof(AgentOperatingInstructions)
+            .GetMethods(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static)
+            .Where(m => m.Name is nameof(AgentOperatingInstructions.For)
+                              or nameof(AgentOperatingInstructions.Coordinator))
+            .ToArray();
+
+        Assert.NotEmpty(renderers);
+        foreach (var renderer in renderers)
+        {
+            var catalogArg = renderer.GetParameters()
+                .SingleOrDefault(p => p.ParameterType == typeof(InstalledAdapterCatalog));
+            Assert.True(
+                catalogArg is not null,
+                $"{renderer.Name} can render the coordinator's instructions without a catalog — that is "
+                + "the G2 defect's shape: a caller that omits the installed set still compiles.");
+            Assert.False(
+                catalogArg!.IsOptional,
+                $"{renderer.Name}'s catalog is optional, so it can be omitted at a call site.");
+        }
+    }
+
+    private string InstructionsFileFor(string agentId) =>
+        File.ReadAllText(Path.Combine(_rig.Ipc.DirFor(agentId), AgentIpcPaths.InstructionsFileName));
 
     /// <summary>A registry directory holding exactly the markers a test names, and nothing the developer
     /// happens to have installed.</summary>
@@ -275,6 +351,9 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
         public AgentIpcServer Ipc => Host.Services.GetRequiredService<AgentIpcServer>();
 
         public AgentSessionStore Sessions => Host.Services.GetRequiredService<AgentSessionStore>();
+
+        /// <summary>The daemon's own catalog — the one source both the instructions and the refusal read.</summary>
+        public InstalledAdapterCatalog Adapters => Host.Services.GetRequiredService<InstalledAdapterCatalog>();
 
         public static SpawnKindRig Create(bool withAdapters = true)
         {

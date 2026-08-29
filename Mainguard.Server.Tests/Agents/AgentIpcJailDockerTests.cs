@@ -37,6 +37,12 @@ public class AgentIpcJailDockerTests
 
     /// <summary>Short by necessity: the endpoint binds a Unix socket beneath this root, and
     /// <c>sun_path</c> holds 104 bytes on macOS. See <see cref="TestDataRootIsolation"/>.</summary>
+    /// <summary>Instructions text for an endpoint under test. The daemon renders the real thing from
+    /// its adapter catalog (<c>SandboxAgentLauncher.InstructionsFor</c>); these tests are about the
+    /// channel, not the briefing, so they pass a stand-in — but they must pass ONE, because a caller
+    /// that could omit it is defect G2.</summary>
+    private const string Instructions = "# operating instructions (test)\n";
+
     private static string NewRoot() => Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "ipcd");
 
     /// <summary>
@@ -52,7 +58,7 @@ public class AgentIpcJailDockerTests
         using var ipc = new AgentIpcServer(NewRoot());
         var agentId = "ipcjail1";
         var dir = ipc.CreateEndpoint(agentId, (request, id, _) =>
-            Task.FromResult(new AgentIpcResponse(Ok: true, Status: $"reached:{request.Op}:{id}")));
+            Task.FromResult(new AgentIpcResponse(Ok: true, Status: $"reached:{request.Op}:{id}")), AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
@@ -78,7 +84,7 @@ public class AgentIpcJailDockerTests
         using var ipc = new AgentIpcServer(NewRoot());
         var agentId = "ipcjail2";
         var dir = ipc.CreateEndpoint(agentId, (request, id, _) =>
-            Task.FromResult(new AgentIpcResponse(Ok: true, Status: $"outbox:{request.Op}:{id}")));
+            Task.FromResult(new AgentIpcResponse(Ok: true, Status: $"outbox:{request.Op}:{id}")), AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
@@ -106,7 +112,7 @@ public class AgentIpcJailDockerTests
         await using var fx = new SandboxFixture();
         using var ipc = new AgentIpcServer(NewRoot());
         var agentId = "ipcjail3";
-        var dir = ipc.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)));
+        var dir = ipc.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)), AgentIpcEndpointRole.Coordinator, Instructions);
 
         // The endpoint dir is mounted, the outbox is NOT — which is exactly a jail on a substrate whose
         // socket works, talking to a daemon that has gone away.
@@ -132,7 +138,7 @@ public class AgentIpcJailDockerTests
         await using var fx = new SandboxFixture();
         using var ipc = new AgentIpcServer(NewRoot());
         var agentId = "ipcjail4";
-        var dir = ipc.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)));
+        var dir = ipc.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)), AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
@@ -175,7 +181,7 @@ public class AgentIpcJailDockerTests
         {
             seen = request;
             return Task.FromResult(new AgentIpcResponse(Ok: true, AgentId: "w-1"));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
@@ -218,7 +224,7 @@ public class AgentIpcJailDockerTests
         {
             reached = true;
             return Task.FromResult(new AgentIpcResponse(Ok: true, AgentId: "w-1"));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));

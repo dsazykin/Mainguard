@@ -35,6 +35,12 @@ public sealed class AgentIpcOutboxTests
     /// chatty root here fails the class on path length rather than on anything it means to measure — see
     /// <see cref="TestDataRootIsolation"/>, which budgets the assembly's root for exactly this.
     /// </summary>
+    /// <summary>Instructions text for an endpoint under test. The daemon renders the real thing from
+    /// its adapter catalog (<c>SandboxAgentLauncher.InstructionsFor</c>); these tests are about the
+    /// channel, not the briefing, so they pass a stand-in — but they must pass ONE, because a caller
+    /// that could omit it is defect G2.</summary>
+    private const string Instructions = "# operating instructions (test)\n";
+
     private static string NewRoot() => Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "ob");
 
     private static AgentIpcServer NewServer() => new(NewRoot());
@@ -71,7 +77,7 @@ public sealed class AgentIpcOutboxTests
         {
             seenAgentId = id;
             return Task.FromResult(new AgentIpcResponse(Ok: true, Status: "served:" + request.Op));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
 
         var response = await CallOverOutboxAsync(server, agentId, new AgentIpcRequest(AgentIpcRequest.StatusOp));
 
@@ -93,7 +99,7 @@ public sealed class AgentIpcOutboxTests
     {
         using var server = NewServer();
         var agentId = NewAgentId();
-        var dir = server.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)));
+        var dir = server.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)), AgentIpcEndpointRole.Coordinator, Instructions);
 
         // Created on EVERY platform, not only the one that needs it: a code path that runs in one place
         // is a code path nothing else tests, which is the shape of the bug this file exists for.
@@ -115,7 +121,7 @@ public sealed class AgentIpcOutboxTests
             Interlocked.Increment(ref dispatches);
             await release.Task.ConfigureAwait(false);
             return new AgentIpcResponse(Ok: true, Status: "Approved");
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
         var ticket = Drop(outbox, new AgentIpcRequest(AgentIpcRequest.PresentPlanOp));
 
@@ -147,7 +153,7 @@ public sealed class AgentIpcOutboxTests
         {
             reachedHandler = true;
             return Task.FromResult(new AgentIpcResponse(Ok: true));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
 
         var ticket = DropRaw(outbox, "this is not json\n");
@@ -170,7 +176,7 @@ public sealed class AgentIpcOutboxTests
         {
             reachedHandler = true;
             return Task.FromResult(new AgentIpcResponse(Ok: true));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
 
         // The outbox is the one thing a jail can WRITE into the daemon's data root, so the size of what
@@ -210,7 +216,7 @@ public sealed class AgentIpcOutboxTests
         {
             reachedHandler = true;
             return Task.FromResult(new AgentIpcResponse(Ok: true));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
 
         var target = Path.Combine(outbox, "..", "big.bin");
@@ -267,7 +273,7 @@ public sealed class AgentIpcOutboxTests
         {
             reachedHandler = true;
             return Task.FromResult(new AgentIpcResponse(Ok: true, Status: "alive"));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
 
         var ticket = Guid.NewGuid().ToString("N");
@@ -311,7 +317,7 @@ public sealed class AgentIpcOutboxTests
         {
             Interlocked.Increment(ref served);
             return Task.FromResult(new AgentIpcResponse(Ok: true, Status: "alive"));
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
 
         var flood = (AgentIpcPaths.MaxOutboxFiles * 2) + 1;
@@ -354,7 +360,7 @@ public sealed class AgentIpcOutboxTests
             claimedIn = string.Join(",", Directory.GetFiles(inflight).Select(Path.GetFileName));
             await release.Task.ConfigureAwait(false);
             return new AgentIpcResponse(Ok: true);
-        });
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
         var outbox = AgentIpcPaths.OutboxIn(dir);
         var ticket = Drop(outbox, new AgentIpcRequest(AgentIpcRequest.StatusOp));
 
@@ -389,7 +395,7 @@ public sealed class AgentIpcOutboxTests
         File.WriteAllText(staleClaim, "{}\n");
         File.WriteAllText(staleResponse, "{}\n");
 
-        server.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)));
+        server.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)), AgentIpcEndpointRole.Coordinator, Instructions);
 
         Assert.False(File.Exists(staleClaim), "a claim from a dead daemon outlived the endpoint that made it");
         Assert.False(File.Exists(staleResponse));

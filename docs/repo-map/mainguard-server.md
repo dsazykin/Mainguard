@@ -343,10 +343,14 @@
     have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
     daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un limit) that also carries **the one shim
     that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker —
-    **and beside it the role's `MAINGUARD.md` operating instructions** (`AgentOperatingInstructions`),
-    written in the same call so the shim and the text that makes it discoverable cannot be staged
-    independently: a shim is useless to a CLI that was never told it exists, which is what every jail was
-    until now. **Every endpoint also serves an `outbox/`** — the same JSON, the same handler, the same
+    **and beside it the role's `MAINGUARD.md` operating instructions**, written in the same call so the
+    shim and the text that makes it discoverable cannot be staged independently: a shim is useless to a
+    CLI that was never told it exists, which is what every jail was until now. Since **defect G2**
+    (2026-08-29) `CreateEndpoint` takes that text as a REQUIRED argument and this class renders nothing —
+    it used to call `AgentOperatingInstructions.For(role, shimPath)` and omit the then-optional
+    installed-kind argument, so one jail carried two disagreeing briefings. The string it is handed is the
+    one `SandboxAgentLauncher.InstructionsFor` put on the launch line.
+    **Every endpoint also serves an `outbox/`** — the same JSON, the same handler, the same
     role, framed as request/response FILES the daemon polls every 100 ms — because on macOS the socket
     half is unreachable from a jail (daemon on the host, jail in the engine's Linux VM; virtiofs does not
     proxy AF_UNIX, so `connect()` is ECONNREFUSED against a listening daemon). Requests are claimed by

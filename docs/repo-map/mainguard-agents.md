@@ -153,8 +153,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker
     does not start before approval" a property of the system rather than a request in a prompt).
     `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
-    `Coordinator(shimPath, installedKinds)` / `Worker(shimPath)` / `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
-    `AgentIpcServer`. Phase 3 §1.2 recorded that the coordinator's boundary prompt "is never delivered";
+    `Coordinator(InstalledAdapterCatalog)` / `Worker()` / `For(role, InstalledAdapterCatalog)` /
+    `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
+    `AgentIpcServer`. **Defect G2 (2026-08-29) made the catalog structural**: the installed set used to be
+    an OPTIONAL list and the shim path a caller-supplied string, so the launcher's `--append-system-prompt`
+    copy named every installed kind while `AgentIpcServer`'s file copy — rendered from the same function
+    with the argument omitted — told the same coordinator `(none installed on this machine)`. No entry
+    point can now be reached without the catalog the `spawn` refusal itself reads, and the shim path is
+    derived from the role, so a third call site gets the machine's real state whatever it forgets. Phase 3 §1.2 recorded that the coordinator's boundary prompt "is never delivered";
     it was worse — **nothing ran at spawn for either role**, so neither was told its shim existed, and
     since a worker's approved task arrives as the RETURN VALUE of the blocking `mainguard-plan` call, a
     worker that never runs the shim never presents a plan and correctly receives nothing, forever.

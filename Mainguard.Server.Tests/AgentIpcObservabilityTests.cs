@@ -46,6 +46,12 @@ public sealed class AgentIpcObservabilityTests : IDisposable
     /// </summary>
     private readonly string _root = Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "ipcobs");
 
+    /// <summary>Instructions text for an endpoint under test. The daemon renders the real thing from
+    /// its adapter catalog (<c>SandboxAgentLauncher.InstructionsFor</c>); these tests are about the
+    /// channel, not the briefing, so they pass a stand-in — but they must pass ONE, because a caller
+    /// that could omit it is defect G2.</summary>
+    private const string Instructions = "# operating instructions (test)\n";
+
     private static readonly TimeSpan ShortGrace = TimeSpan.FromMilliseconds(250);
 
     public void Dispose()
@@ -74,7 +80,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            server.CreateEndpoint("sil1", NeverCalled, AgentIpcEndpointRole.Coordinator);
+            server.CreateEndpoint("sil1", NeverCalled, AgentIpcEndpointRole.Coordinator, Instructions);
 
             await WaitForAsync(() => audit.Read().Any(e => e.Type == "ipc_channel_silent"));
 
@@ -100,7 +106,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            var dir = server.CreateEndpoint("bsy1", Ok, AgentIpcEndpointRole.Coordinator);
+            var dir = server.CreateEndpoint("bsy1", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
             Assert.Contains("\"ok\":true", await SocketRoundTripAsync(dir, """{"op":"status"}"""), StringComparison.Ordinal);
 
             // Well past the grace window: the watch has fired by now if it is ever going to.
@@ -123,7 +129,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            server.CreateEndpoint("brf1", NeverCalled, AgentIpcEndpointRole.Coordinator);
+            server.CreateEndpoint("brf1", NeverCalled, AgentIpcEndpointRole.Coordinator, Instructions);
             server.CloseEndpoint("brf1");
 
             await Task.Delay(ShortGrace + ShortGrace);
@@ -144,7 +150,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            var dir = server.CreateEndpoint("bad1", Ok, AgentIpcEndpointRole.Coordinator);
+            var dir = server.CreateEndpoint("bad1", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
 
             var response = await SocketRoundTripAsync(dir, "this is not json");
 
@@ -166,7 +172,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            server.CreateEndpoint("bad2", Ok, AgentIpcEndpointRole.Coordinator);
+            server.CreateEndpoint("bad2", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
             WriteOutboxRequest(server.OutboxFor("bad2"), "ticket-1", "{ not json");
 
             await WaitForAsync(() => audit.Read().Any(e => e.Type == "ipc_request_rejected"));
@@ -192,7 +198,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            var dir = server.CreateEndpoint("fld1", Ok, AgentIpcEndpointRole.Coordinator);
+            var dir = server.CreateEndpoint("fld1", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
             for (var i = 0; i < flood; i++)
             {
                 await SocketRoundTripAsync(dir, "junk " + i);
@@ -221,7 +227,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            var dir = server.CreateEndpoint("ech1", Ok, AgentIpcEndpointRole.Coordinator);
+            var dir = server.CreateEndpoint("ech1", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
             var hostile = new string('A', 400) + "\nFAKE LOG LINE";
 
             await SocketRoundTripAsync(dir, "{\"op\":\"" + hostile.Replace("\n", "\\n") + "\"}");
@@ -248,7 +254,7 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         using (factory)
         using (server)
         {
-            var dir = server.CreateEndpoint("qui1", Ok, AgentIpcEndpointRole.Coordinator);
+            var dir = server.CreateEndpoint("qui1", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
             for (var i = 0; i < 5; i++)
             {
                 await SocketRoundTripAsync(dir, """{"op":"status"}""");

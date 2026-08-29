@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Mainguard.Agents.Agents.Adapters;
 
 namespace Mainguard.Agents.Agents.Ipc;
 
@@ -28,6 +29,17 @@ namespace Mainguard.Agents.Agents.Ipc;
 /// the in-process tool API — <c>spawn_worker(title, task_prompt, budget_usd)</c> — which the shipped
 /// coordinator does not have. It has a CLI. Handing it a prompt describing function calls it cannot make
 /// would be a worse failure than silence, because it would look wired. Same policy, CLI-shaped.</para>
+///
+/// <para><b>Every entry point here takes the daemon's own <see cref="InstalledAdapterCatalog"/>, and none
+/// of them takes a shim path (defect G2).</b> Both used to be caller-supplied, one of them optional, and
+/// two call sites in one spawn chain then disagreed: the launcher passed the catalog into the
+/// <c>--append-system-prompt</c> copy while <c>AgentIpcServer</c> omitted it from the <c>MAINGUARD.md</c>
+/// copy, so a jail with six CLIs installed was handed a file that said "(none installed on this machine)"
+/// and a flag that listed all six. The defect was not the missing argument; it was that a rendering could
+/// be reached without the thing it describes. It cannot now: the set comes from the catalog the refusal
+/// itself reads, and the shim path is derived from the role — so a third call site gets the machine's
+/// real state whatever it forgets, and DELIVERING the text (writing the file, appending the flag) is a
+/// separate job from producing it.</para>
 /// </summary>
 public static class AgentOperatingInstructions
 {
@@ -53,20 +65,26 @@ public static class AgentOperatingInstructions
     /// the boundary, and the two behaviours a coordinator otherwise gets wrong (writing plans itself, and
     /// retrying into a cap that is full because humans have not decided yet).
     /// </summary>
-    /// <param name="installedKinds">
-    /// The agent kinds this daemon can actually launch (<c>InstalledAdapterCatalog.InstalledKinds</c>).
+    /// <param name="adapters">
+    /// The daemon's catalog of installed agent CLIs — the same object the <c>spawn</c> refusal reads.
     ///
-    /// <para><b>Why the list is a parameter and not prose.</b> The first thing a real coordinator did with
+    /// <para><b>Why the catalog, and not prose or a list.</b> The first thing a real coordinator did with
     /// these instructions was run <c>spawn coder</c> — a natural reading of <c>spawn &lt;agent-kind&gt;</c>
     /// when nothing anywhere says what a kind is. <c>coder</c> is not an installed adapter, so its jail
     /// came up with no CLI in it at all and the shim answered <c>Ok</c> anyway. Writing the kinds into this
     /// text as prose would have been the other half of the same defect: a hardcoded list stops describing
-    /// the machine the first time a user installs or removes a CLI (MG-12). It is rendered per spawn from
-    /// the same catalog the daemon's <c>spawn</c> refusal reads, so the text and the enforcement cannot
-    /// say different things.</para>
+    /// the machine the first time a user installs or removes a CLI (MG-12). Taking a caller-supplied LIST
+    /// was that same half one layer down (G2): the argument was optional, one of the two call sites in a
+    /// spawn omitted it, and the file copy of these instructions told a coordinator that nothing was
+    /// installed. A catalog cannot be omitted and cannot be a stale copy — it re-reads the registry.</para>
     /// </param>
-    public static string Coordinator(string shimPath, IReadOnlyCollection<string>? installedKinds = null) =>
-        $"""
+    public static string Coordinator(InstalledAdapterCatalog adapters)
+    {
+        ArgumentNullException.ThrowIfNull(adapters);
+        var shimPath = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator);
+        var installedKinds = adapters.InstalledKinds();
+
+        return $"""
         # You are the Mainguard Coordinator
 
         You plan the shape of the work and delegate it. **You never write code, touch a worktree, or
@@ -135,6 +153,7 @@ public static class AgentOperatingInstructions
 
         Serialize dependent tasks; parallelize independent ones.
         """;
+    }
 
     /// <summary>
     /// A worker's operating instructions. Two sentences are load-bearing, and they are the two ends of the
@@ -151,8 +170,11 @@ public static class AgentOperatingInstructions
     /// quiet, so a worker that never commits is indistinguishable, to every mechanism downstream, from a
     /// worker that did nothing at all.</para>
     /// </summary>
-    public static string Worker(string shimPath) =>
-        $$"""
+    public static string Worker()
+    {
+        var shimPath = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        return $$"""
         # You are a Mainguard worker
 
         You have a repository checked out at `/workspace`. **You do not yet have a task, and you do not
@@ -209,12 +231,13 @@ public static class AgentOperatingInstructions
         own and puts it in front of a human — so the last thing you do is commit, then report what you
         did, then stop.
         """;
+    }
 
     /// <summary>Renders the instructions for a role. Unknown roles get the worker text: the conservative
     /// default is the one that cannot start work without a human.</summary>
-    /// <param name="installedKinds">Only a coordinator has a <c>spawn</c>, so this is only ever read by
-    /// the coordinator text; a worker's instructions do not change with what is installed.</param>
-    public static string For(
-        AgentIpcEndpointRole role, string shimPath, IReadOnlyCollection<string>? installedKinds = null) =>
-        role == AgentIpcEndpointRole.Coordinator ? Coordinator(shimPath, installedKinds) : Worker(shimPath);
+    /// <param name="adapters">The daemon's installed-CLI catalog. Only a coordinator has a <c>spawn</c>,
+    /// so only the coordinator text reads it — but it is required on this entry point too, because an
+    /// optional one is exactly what let a caller render a coordinator's instructions from nothing.</param>
+    public static string For(AgentIpcEndpointRole role, InstalledAdapterCatalog adapters) =>
+        role == AgentIpcEndpointRole.Coordinator ? Coordinator(adapters) : Worker();
 }

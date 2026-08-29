@@ -141,8 +141,20 @@ public sealed class AgentIpcServer : IDisposable
     /// Materializes the agent's IPC dir (role's shim written 0755, socket bound + listening) and returns
     /// the dir path to bind-mount. Idempotent per agent id.
     /// </summary>
+    /// <param name="instructions">
+    /// The role's operating instructions, <b>already rendered</b> — written beside the shim as
+    /// <see cref="AgentIpcPaths.InstructionsFileName"/>.
+    ///
+    /// <para><b>Required, and deliberately NOT rendered here (defect G2).</b> This class used to call
+    /// <c>AgentOperatingInstructions.For(role, shimPath)</c> itself, omitting the installed-CLI argument
+    /// because that argument was optional. The result was one jail carrying two different texts: the
+    /// launcher's <c>--append-system-prompt</c> copy named every installed kind while this file said
+    /// "(none installed on this machine)". Producing the text and delivering it are now separate jobs —
+    /// this is handed the very string <c>SandboxAgentLauncher.InstructionsFor</c> put on the launch line,
+    /// so there is nothing here that could disagree with it.</para>
+    /// </param>
     public string CreateEndpoint(
-        string agentId, AgentIpcHandler handler, AgentIpcEndpointRole role = AgentIpcEndpointRole.Coordinator)
+        string agentId, AgentIpcHandler handler, AgentIpcEndpointRole role, string instructions)
     {
         if (string.IsNullOrWhiteSpace(agentId))
         {
@@ -150,10 +162,12 @@ public sealed class AgentIpcServer : IDisposable
         }
 
         ArgumentNullException.ThrowIfNull(handler);
+        ArgumentException.ThrowIfNullOrWhiteSpace(instructions);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var endpoint = _endpoints.GetOrAdd(agentId, id => Endpoint.Start(
-            DirFor(id), id, handler, role, new ChannelObserver(_log, _audit, id, role), _firstContactGrace));
+            DirFor(id), id, handler, role, new ChannelObserver(_log, _audit, id, role), _firstContactGrace,
+            instructions));
         return endpoint.Dir;
     }
 
@@ -399,7 +413,7 @@ public sealed class AgentIpcServer : IDisposable
 
         public static Endpoint Start(
             string dir, string agentId, AgentIpcHandler handler, AgentIpcEndpointRole role,
-            ChannelObserver observer, TimeSpan firstContactGrace)
+            ChannelObserver observer, TimeSpan firstContactGrace, string instructions)
         {
             Directory.CreateDirectory(dir);
 
@@ -410,9 +424,14 @@ public sealed class AgentIpcServer : IDisposable
             // A shim is useless to a CLI that was never told it exists. Phase 3 §1.2 recorded this as
             // "the prompt was never delivered", which understated it — nothing ran at spawn at all, for
             // either role. Written beside the shim so the two cannot be staged independently.
+            //
+            // G2: the text ARRIVES here, rendered. This used to render its own copy and omit the
+            // installed-kind argument, so the file a coordinator opens said "(none installed on this
+            // machine)" while the launch flag in the very same jail listed every installed CLI. See
+            // CreateEndpoint's remarks for why delivery and authorship are now separate.
             File.WriteAllText(
                 Path.Combine(dir, AgentIpcPaths.InstructionsFileName),
-                AgentOperatingInstructions.For(role, AgentIpcPaths.SandboxShimPath(role)).Replace("\r\n", "\n"));
+                instructions.Replace("\r\n", "\n"));
 
             // The outbox: the file-framed form of this same channel. Created before the listener so
             // the directory exists by the time the container is created (it is a mount source too).

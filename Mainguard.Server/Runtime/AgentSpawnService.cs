@@ -304,12 +304,17 @@ public sealed class AgentSpawnService
                     : Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Worker;
                 try
                 {
+                    // The instructions are RENDERED BY THE LAUNCHER and delivered here — the same string
+                    // that goes on the jail's launch line moments later. This endpoint writes the file
+                    // copy beside the shim; before G2 it rendered its own, from no catalog, and the two
+                    // copies of one jail's briefing disagreed about what was installed.
                     ipcDir = _ipc.CreateEndpoint(
                         session.Id,
                         endpointRole == Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Coordinator
                             ? HandleShimRequestAsync
                             : HandleWorkerPlanRequestAsync,
-                        endpointRole);
+                        endpointRole,
+                        _launcher.InstructionsFor(endpointRole));
                     _coordLog.LogInformation(
                         "{Role} IPC endpoint created: {Dir}", endpointRole, ipcDir);
                 }
