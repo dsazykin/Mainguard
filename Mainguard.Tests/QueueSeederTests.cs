@@ -92,7 +92,7 @@ public sealed class QueueSeederTests : IDisposable
     }
 
     [Fact]
-    public async Task SeedVerifyFail_SettlesToWorking_ThroughTheRealFailurePath()
+    public async Task SeedVerifyFail_SettlesToVerificationFailed_ThroughTheRealFailurePath()
     {
         var (seeder, repoHash, verifications) = Provision();
 
@@ -100,10 +100,14 @@ public sealed class QueueSeederTests : IDisposable
             new[] { new SeedSpec(WorkerMergeState.Working, VerificationFails: true) }, Actor, CancellationToken.None);
 
         var outcome = Assert.Single(report.Results);
-        Assert.Equal("Working", outcome.ReachedState);
+        // H2 — the seeded failure lands where a real one now does. The SPEC still says `Working` (that is
+        // the spelling the seeding RPC and its UI send), but the state it reaches is the honest one; the
+        // failure is no longer indistinguishable from an entry nobody ran.
+        Assert.Equal("VerificationFailed", outcome.ReachedState);
 
         var ctx = _registry.Resolve(repoHash)!;
-        Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out _));
+        Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out var reason));
+        Assert.Contains("FAILED", reason);
         Assert.False(verifications.Latest(repoHash, outcome.AgentId)!.Passed);
     }
 

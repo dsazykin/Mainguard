@@ -741,6 +741,15 @@ public sealed class MergeQueueProvisioner
             WorkerMergeState.StaleVerified =>
                 "Main moved, so this branch's verification no longer counts; it is being re-queued.",
             WorkerMergeState.AwaitingReview => "Waiting for your review.",
+            // H2 — the coordinator's window onto its own fan-out is this word plus this sentence
+            // (get_worker_status, contract §3). A red verification used to report as `Working` / "back at
+            // work", which is what an unverified branch reports: a coordinator was structurally unable to
+            // learn that its worker's tests had failed, and so could neither steer it nor say so. This is
+            // the third surface the missing state was lying to, and it is the one whose reader is an agent
+            // that will act on the answer.
+            WorkerMergeState.VerificationFailed =>
+                "The verification FAILED on this branch — the tests ran and did not pass. Read the run "
+                + "output, then fix the branch and push; it verifies again on the new commit.",
             WorkerMergeState.Merged => "Merged into main.",
             WorkerMergeState.Rejected => "Rejected in review.",
             WorkerMergeState.Discarded => "Dropped from the merge queue.",

@@ -128,6 +128,9 @@ public class WorkerReadinessTriggerTests
         public void ReleaseBlockedRun() => _hold.TrySetResult();
         public void FailRunFor(string id) => _fails.Add(id);
 
+        /// <summary>Undoes <see cref="FailRunFor"/> — the agent pushed a fix and its next run passes.</summary>
+        public void PassRunFor(string id) => _fails.Remove(id);
+
         public void Advance(TimeSpan by) => Now += by;
 
         public IReadOnlyList<ReadinessDecision> Sweep() => Trigger.PollOnce();
@@ -173,10 +176,11 @@ public class WorkerReadinessTriggerTests
         Assert.Equal(1, rig.RunCountFor("w-1"));
     }
 
-    /// <summary>A failing suite still settles through the SAME method: back to <c>Working</c>, surfaced,
-    /// never silently retried. The trigger owns no part of that decision.</summary>
+    /// <summary>A failing suite still settles through the SAME method — as
+    /// <see cref="WorkerMergeState.VerificationFailed"/> since H2, surfaced, never silently retried. The
+    /// trigger owns no part of that decision.</summary>
     [Fact]
-    public async Task AFailingRun_SettlesThroughTheQueue_BackToWorking()
+    public async Task AFailingRun_SettlesThroughTheQueue_AsVerificationFailed()
     {
         using var rig = new Rig();
         rig.ApprovedWorker("w-1");
@@ -187,16 +191,108 @@ public class WorkerReadinessTriggerTests
         Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
         await rig.Trigger.LastRun;
 
-        // The run count is asserted alongside the state, and it is the load-bearing half: Working is the
-        // DEFAULT state, so a trigger that quietly ran nothing at all would leave the entry there too and
-        // this test would pass while measuring nothing.
+        // The run count is asserted alongside the state, and it used to be the load-bearing half precisely
+        // because the destination WAS the default state: a trigger that quietly ran nothing would leave the
+        // entry at Working too, and the assertion measured nothing. VerificationFailed is reachable only by
+        // a run that produced a red record, which is the point of the state.
         Assert.Equal(1, rig.RunCountFor("w-1"));
-        Assert.Equal(WorkerMergeState.Working, rig.Queue.GetState("w-1"));
+        Assert.Equal(WorkerMergeState.VerificationFailed, rig.Queue.GetState("w-1"));
 
         // …and a failing run DID produce a record. This is the control for the refusal test below: the two
         // cases must be distinguishable, or "we could not run your tests" and "your tests failed" collapse.
         Assert.NotNull(rig.VerStore.Latest("repo", "w-1"));
         Assert.False(rig.VerStore.Latest("repo", "w-1")!.Passed);
+    }
+
+    /// <summary>
+    /// H3 — the daemon logs the OUTCOME, not only that it started.
+    ///
+    /// <para>A real run produced exactly this shape live: six <c>auto-verify … verifying</c> lines in the
+    /// daemon log and not one line saying what any of them found. The red verdict existed only as a row in
+    /// SQLite and an artifact file nothing linked to, so the log — the first place anyone looks when a swarm
+    /// has gone quiet — recorded six test suites STARTED and none finished. An automatic actor that spends a
+    /// test run on a human's behalf and never says what it found is indistinguishable from one that hung.</para>
+    ///
+    /// <para>The line has to carry three things a human needs and cannot get elsewhere: the verdict, the
+    /// command that produced it (so the failure is attributable) and the artifact path (so the output is one
+    /// <c>cat</c> away rather than a directory to guess at).</para>
+    /// </summary>
+    [Fact]
+    public async Task AFailedRun_LogsTheOutcome_WithTheVerdictAndTheArtifact()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.FailRunFor("w-1");
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        rig.Sweep();
+        await rig.Trigger.LastRun;
+
+        var outcome = Assert.Single(rig.Log, l => l.Contains("FAILED", StringComparison.Ordinal));
+        Assert.Contains("w-1", outcome);
+        Assert.Contains("npm test", outcome);        // what ran
+        Assert.Contains("log.txt", outcome);         // where the output is
+        Assert.Contains("VerificationFailed", outcome); // where the entry ended up
+        Assert.DoesNotContain("PASSED", outcome);
+    }
+
+    /// <summary>The paired positive: a PASS is logged too. A log that only spoke up on failures would be a
+    /// log a reader could not trust the silence of.</summary>
+    [Fact]
+    public async Task APassingRun_AlsoLogsItsOutcome()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        rig.Sweep();
+        await rig.Trigger.LastRun;
+
+        var outcome = Assert.Single(rig.Log, l => l.Contains("PASSED", StringComparison.Ordinal));
+        Assert.Contains("Verified", outcome);
+        Assert.DoesNotContain("FAILED", outcome);
+    }
+
+    /// <summary>
+    /// H2's other half for the automatic path: an entry left at <c>VerificationFailed</c> is verified again
+    /// when the agent pushes a FIX — and not before.
+    ///
+    /// <para>This has to work, or the new state would be a trap. Nothing in the daemon calls
+    /// <c>MergeQueue.NotifyNewCommits</c> for a locally-spawned agent, so a push does not walk the entry
+    /// back to <c>Working</c> on its own; without <c>VerificationFailed</c> in this trigger's eligible set,
+    /// a worker that repaired its own branch would sit red forever and only a human clicking Verify would
+    /// ever find out. The once-per-tip bound is what keeps it from being a retry loop: the SAME tip is never
+    /// re-attempted, so this fires only for work the agent actually pushed after the failure.</para>
+    /// </summary>
+    [Fact]
+    public async Task AFailedEntry_IsReVerified_WhenTheAgentPushesAFix_ButNotOnTheSameTip()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.FailRunFor("w-1");
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        rig.Sweep();
+        await rig.Trigger.LastRun;
+        Assert.Equal(WorkerMergeState.VerificationFailed, rig.Queue.GetState("w-1"));
+
+        // Re-announcing the SAME tip changes nothing — the failure is not re-run on a loop.
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        Assert.Equal(ReadinessOutcome.AlreadyAttempted, Only(rig.Sweep(), "w-1").Outcome);
+        Assert.Equal(1, rig.RunCountFor("w-1"));
+
+        // The agent pushes a fix. THAT is a new tip, and it is verified. (Past the cooldown, which is the
+        // OTHER bound and is not what this test is about.)
+        rig.PassRunFor("w-1");
+        rig.Advance(TimeSpan.FromHours(1));
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-b");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        await rig.Trigger.LastRun;
+
+        Assert.Equal(WorkerMergeState.Verified, rig.Queue.GetState("w-1"));
+        Assert.Equal(2, rig.RunCountFor("w-1"));
     }
 
     /// <summary>
@@ -232,6 +328,8 @@ public class WorkerReadinessTriggerTests
 
         // The entry is back where it can be acted on, and the refusal did not masquerade as a verdict:
         // CanMerge says "not verified yet", never anything shaped like a test result.
+        // Working — NOT VerificationFailed. A refusal is not a verdict, and H2's new state is reachable
+        // only from the arm that has a red record in hand.
         Assert.Equal(WorkerMergeState.Working, rig.Queue.GetState("w-1"));
         Assert.False(rig.Queue.CanMerge("w-1", out var reason));
         Assert.Equal("not verified yet", reason);
@@ -289,15 +387,16 @@ public class WorkerReadinessTriggerTests
     {
         using var rig = new Rig();
         rig.ApprovedWorker("w-1");
-        // A failing suite settles the entry back to Working, which is what keeps this test about the
+        // A failing suite settles the entry at VerificationFailed, which is what keeps this test about the
         // once-per-tip rule: staling the entry instead would fire the queue's own re-verify cascade and
-        // count a run this trigger never asked for.
+        // count a run this trigger never asked for. Both Working and VerificationFailed are states the
+        // trigger CAN fire from, so the refusal below is the tip rule and nothing else.
         rig.FailRunFor("w-1");
         rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
         rig.Advance(TimeSpan.FromSeconds(120));
         Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
         await rig.Trigger.LastRun;
-        Assert.Equal(WorkerMergeState.Working, rig.Queue.GetState("w-1"));
+        Assert.Equal(WorkerMergeState.VerificationFailed, rig.Queue.GetState("w-1"));
 
         // The cooldown is long past and the very same tip is re-announced — the shape a re-published mirror
         // or a restarted watcher produces.
@@ -319,12 +418,14 @@ public class WorkerReadinessTriggerTests
     {
         using var rig = new Rig();
         rig.ApprovedWorker("w-1");
-        rig.FailRunFor("w-1"); // settles back to Working, so the COOLDOWN is the only thing that can refuse
+        // Settles at VerificationFailed — a state the trigger fires from just as it fires from Working —
+        // so the COOLDOWN is the only thing that can refuse the next tip.
+        rig.FailRunFor("w-1");
         rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
         rig.Advance(TimeSpan.FromSeconds(120));
         Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
         await rig.Trigger.LastRun;
-        Assert.Equal(WorkerMergeState.Working, rig.Queue.GetState("w-1"));
+        Assert.Equal(WorkerMergeState.VerificationFailed, rig.Queue.GetState("w-1"));
 
         rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-b");
         rig.Advance(TimeSpan.FromSeconds(120));

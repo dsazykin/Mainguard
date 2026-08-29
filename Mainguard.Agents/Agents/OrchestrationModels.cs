@@ -19,7 +19,8 @@ public enum AgentLifecycleState
 
 /// <summary>
 /// Branch merge-eligibility lifecycle — the P2-10 enum (OPS §4.2), plus the human's
-/// <see cref="Discarded"/> terminal.
+/// <see cref="Discarded"/> terminal and the red half of a verification
+/// (<see cref="VerificationFailed"/>).
 ///
 /// <para><b><see cref="Discarded"/> is deliberately its own member rather than a reuse of
 /// <see cref="Rejected"/>.</b> <c>Rejected</c> means a human read this branch's diff in review and turned
@@ -29,8 +30,27 @@ public enum AgentLifecycleState
 /// queue's own record say something that did not happen, which is the failure this queue exists to
 /// prevent. Neither is <see cref="Merged"/>, and nothing in this enum lets a discard be mistaken for
 /// one.</para>
+///
+/// <para><b><see cref="VerificationFailed"/> exists because a verification has two outcomes and this enum
+/// only had a word for one of them (H2).</b> A pass settled the entry to <see cref="Verified"/>; a FAIL
+/// settled it back to <see cref="Working"/> — the same state an entry that has never been verified at all
+/// sits in — so the row and the worker pane both told the human "not verified yet" about a branch whose
+/// tests had just gone red, with Verify still offered. RED and NEVER-RUN were literally the same value,
+/// and the only way to see the failure was to pay for a second, redundant run.</para>
+///
+/// <para>It is <b>not terminal</b>, and that is the whole shape of it: the branch is still the agent's to
+/// fix. The legal moves out of it are the three honest ones — verify again (the human's retry, or the
+/// automatic trigger on a NEW tip), back to <see cref="Working"/> when the agent pushes a fix
+/// (<c>NotifyNewCommits</c>), and <see cref="Discarded"/> when the human drops it. It can never reach
+/// <see cref="Merged"/> or <see cref="Rejected"/>: <c>Rejected</c> is a verdict on reviewed work and
+/// there is nothing to review, and merging requires a passing record this entry by definition does not
+/// have.</para>
 /// </summary>
-public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded }
+public enum WorkerMergeState
+{
+    Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded,
+    VerificationFailed,
+}
 
 /// <summary>
 /// Where a merge-queue entry came from (P2-12). <see cref="Local"/> is a locally-spawned agent whose
@@ -224,9 +244,18 @@ public sealed record ResourceSample(DateTimeOffset At, double? CpuPercent, doubl
 /// for BYOK CLIs that declare no base-URL/model-host pair (codex, qwen-code, opencode), and when the
 /// gateway is off. When false the UI must show no spend figure rather than <c>$0.00</c>, which would read
 /// as "you have spent nothing". See <c>docs/design/oauth-budgeting.md</c>.</param>
+/// <param name="Name">The agent's CLI kind — "claude-code", "codex". <b>Not an identity.</b> Four agents
+/// of the same kind produce four identical values, which is exactly the row the resource monitor used to
+/// render: four lines reading <c>claude-code</c>, with no way to tell a worker from the coordinator whose
+/// death ends the session.</param>
+/// <param name="Role">Coordinator / managed worker / manual (<see cref="AgentRoles"/>) — the first thing a
+/// human actually recognises about an agent, and the one that decides how bad ending it is.</param>
+/// <param name="Title">The worker's brief: the headline its plan was written against. Empty for a
+/// coordinator (it has no brief) and for a worker that has not presented a plan yet.</param>
 public sealed record AgentResourceUsage(
     string AgentId, string Name, string StateWord, bool IsPaused,
-    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false);
+    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false,
+    string Role = AgentRoles.Manual, string Title = "");
 
 /// <summary>P2-13/P2-08 spend caps, UI-facing shape (Core DTO — no proto/UI coupling). The per-agent
 /// and per-day caps the gateway <c>BudgetLedger</c> enforces daemon-side, surfaced so the Resource

@@ -271,6 +271,10 @@ public partial class QueueEntryViewModel : ViewModelBase
             WorkerMergeState.Verifying when IsVerificationStalled => "Stalled",
             WorkerMergeState.StaleVerified => "Stale",
             WorkerMergeState.AwaitingReview => "Awaiting review",
+            // H2's red verdict, in words a person reads rather than an enum name. The state itself is what
+            // makes the row honest — before it, a failed verification was persisted as `Working` and this
+            // row said the same thing about it as about a branch nobody had ever tested.
+            WorkerMergeState.VerificationFailed => "Tests failed",
             var s => s.ToString(),
         };
         // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in a
@@ -320,6 +324,10 @@ public partial class QueueEntryViewModel : ViewModelBase
             // arrive (a mock, a future projection) it reads as the muted, finished, not-merged thing it is
             // — never borrowing Merged's success green.
             WorkerMergeState.Discarded => ("DismissIcon", false, true, false, false, false, false),
+            // A failed verification is a DANGER, not the muted fallback: it is the one row on the rail
+            // that is red for a reason the human has to act on. It keeps Verify (retry) and Discard —
+            // RecomputeCanVerify and CanDiscard both exclude only the terminal states, and this is not one.
+            WorkerMergeState.VerificationFailed => ("DismissIcon", false, false, false, false, false, true),
             _ => ("AgentWorkingIcon", false, true, false, false, false, false),
         };
     }

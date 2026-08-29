@@ -239,14 +239,24 @@ public sealed class MergeQueue : IMergeQueue
     // frozen at Verifying (the daemon restarted mid-run before ResumeAfterRestartAsync could re-drive it),
     // and an action that only worked from AwaitingReview — where Rejected already lives — would not reach a
     // single one of them.
+    //
+    // VerificationFailed (H2) is reachable ONLY from Verifying, and only from the arm that has a red
+    // VerificationRecord in hand. It is deliberately NOT reachable from the refusal path: a run that could
+    // not start (no jail, a drifted branch, a malformed verify command) writes no record and settles to
+    // Working, and routing it here would turn "we could not run your tests" into "your tests failed" —
+    // the one distinction the merge decision rests on.
     private static readonly IReadOnlyDictionary<WorkerMergeState, WorkerMergeState[]> Legal =
         new Dictionary<WorkerMergeState, WorkerMergeState[]>
         {
             [WorkerMergeState.Working] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
-            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.Working, WorkerMergeState.Verifying, WorkerMergeState.Discarded },
+            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.VerificationFailed, WorkerMergeState.Working, WorkerMergeState.Verifying, WorkerMergeState.Discarded },
             [WorkerMergeState.Verified] = new[] { WorkerMergeState.StaleVerified, WorkerMergeState.AwaitingReview, WorkerMergeState.Working, WorkerMergeState.Discarded },
             [WorkerMergeState.StaleVerified] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
             [WorkerMergeState.AwaitingReview] = new[] { WorkerMergeState.Merged, WorkerMergeState.Rejected, WorkerMergeState.StaleVerified, WorkerMergeState.Working, WorkerMergeState.Discarded },
+            // The three honest moves out of a red verification: retry it, let the agent's fix reset it, or
+            // let the human drop it. No edge to Merged (there is no passing record) and none to Rejected
+            // (that is a verdict on reviewed work, and nothing here has been reviewed).
+            [WorkerMergeState.VerificationFailed] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.VerificationFailed, WorkerMergeState.Discarded },
             [WorkerMergeState.Merged] = Array.Empty<WorkerMergeState>(),
             [WorkerMergeState.Rejected] = Array.Empty<WorkerMergeState>(),
             [WorkerMergeState.Discarded] = Array.Empty<WorkerMergeState>(),
@@ -566,8 +576,13 @@ public sealed class MergeQueue : IMergeQueue
             }
             else
             {
-                // Failure surfaced, not silently retried (edge row 2).
-                SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
+                // H2 — a FAILED verification is its own outcome and gets its own state. This used to settle
+                // to Working, which is where an entry that has NEVER been verified sits, so a red run was
+                // indistinguishable from no run at all: the rail and the worker pane both said "not
+                // verified yet" about a branch whose tests had just failed, Verify was still offered, and
+                // the only way to see the failure was to pay for a second run. Failure surfaced, not
+                // silently retried (edge row 2) — and now surfaced as itself.
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.VerificationFailed);
             }
         }
 
@@ -1522,6 +1537,13 @@ public sealed class MergeQueue : IMergeQueue
                 WorkerMergeState.Verifying => _verifying.Contains(agentId)
                     ? "verifying"
                     : "verification stalled — no run in progress",
+                // H2 — the red verdict, said out loud and with the command that produced it. The whole
+                // reason this state exists is that this sentence used to be "not verified yet", which is a
+                // statement about a branch nobody has tested. The gate reason is rendered verbatim, so it
+                // is the one place a human reliably sees the outcome without paying for a second run; it
+                // names the command so the failure is attributable, and points at the output the entry's
+                // own verification log now carries (H4).
+                WorkerMergeState.VerificationFailed => VerificationFailedReason(agentId),
                 // Terminal states get their own words. They used to fall into "not verified yet", which is
                 // a statement about a branch that might still get there.
                 WorkerMergeState.Merged => "already merged",
@@ -1556,6 +1578,47 @@ public sealed class MergeQueue : IMergeQueue
 
         reason = "";
         return true;
+    }
+
+    /// <summary>
+    /// The verbatim gate reason for a <see cref="WorkerMergeState.VerificationFailed"/> entry. Caller
+    /// holds <c>_gate</c>.
+    ///
+    /// <para>The command is included when the record has one and omitted when it does not, rather than
+    /// substituted: a reason that names a command the queue cannot actually evidence would be the same
+    /// class of fabrication as the "not verified yet" it replaces. The fallback wording still says the one
+    /// load-bearing thing — the tests FAILED — because that fact comes from the state, which only the
+    /// record-carrying arm of <see cref="RunVerificationAsync"/> can set.</para>
+    /// </summary>
+    private string VerificationFailedReason(string agentId)
+    {
+        var record = _lastVerification.TryGetValue(agentId, out var r) ? r : null;
+        var command = record?.ResolvedCommand;
+        return string.IsNullOrWhiteSpace(command)
+            ? "the verification FAILED — read the run output, then push a fix or discard the entry"
+            : $"the verification FAILED ({command}) — read the run output, then push a fix or discard the entry";
+    }
+
+    /// <summary>
+    /// The most recent verification this queue settled for an entry — <b>pass or fail</b> — or null when
+    /// it has never produced one.
+    ///
+    /// <para>H4: the daemon held this record and nothing carried it out. The wire's <c>QueueEntry</c> had
+    /// no verification field at all and the client's projection hardcoded <c>Verification: null</c>, so a
+    /// human looking at a failed branch was shown a one-line gate reason and had no route of any kind to
+    /// the stdout/stderr the run actually produced — which sat in an artifact file on the daemon's disk
+    /// that nothing linked to. This is the accessor that lets the transport carry it.</para>
+    ///
+    /// <para>Deliberately the queue's own settled record rather than a store lookup: it is the exact
+    /// record the state was decided from, so what a human reads can never disagree with the state word
+    /// they are reading it under.</para>
+    /// </summary>
+    public VerificationRecord? LastVerification(string agentId)
+    {
+        lock (_gate)
+        {
+            return _lastVerification.TryGetValue(agentId, out var r) ? r : null;
+        }
     }
 
     private bool IsVerificationStaleLocked(string agentId)

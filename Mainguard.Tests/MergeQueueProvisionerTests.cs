@@ -126,10 +126,17 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
     /// <summary>
     /// The paired negative, and the one that matters most: a RED run must not tell a coordinator its
-    /// worker is done. The queue returns the entry to <c>Working</c>, and that is what the agent says.
+    /// worker is done — and since H2 it must not tell it the worker is merely still working either.
+    ///
+    /// <para>This assertion used to read <c>Working</c>, which is the word an UNVERIFIED branch reports.
+    /// A coordinator's only window onto its fan-out is this state word plus its sentence
+    /// (<c>get_worker_status</c>, contract §3), so with the two collapsed a coordinator was structurally
+    /// unable to learn that its worker's tests had failed. The sentence is asserted alongside the word for
+    /// the same reason it is asserted for <c>Verified</c> above: the word is a label, and the sentence is
+    /// what makes it actionable.</para>
     /// </summary>
     [Fact]
-    public async Task AFailedVerification_NeverReportsVerified_AndReturnsTheAgentToWorking()
+    public async Task AFailedVerification_NeverReportsVerified_AndTellsTheAgentTheTestsFailed()
     {
         var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
         CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
@@ -140,12 +147,16 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.False(record.Passed);
-        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
+        Assert.Equal(WorkerMergeState.VerificationFailed, ctx.Queue.GetState(AgentId));
 
         Assert.DoesNotContain(supervisor.Marks, m => m.State == nameof(WorkerMergeState.Verified));
         Assert.Equal(
-            new[] { nameof(WorkerMergeState.Verifying), nameof(WorkerMergeState.Working) },
+            new[] { nameof(WorkerMergeState.Verifying), nameof(WorkerMergeState.VerificationFailed) },
             supervisor.Marks.Where(m => m.Agent == AgentId).Select(m => m.State).ToArray());
+
+        var failed = supervisor.Marks.Last(m => m.State == nameof(WorkerMergeState.VerificationFailed));
+        Assert.Contains("FAILED", failed.Reason);
+        Assert.DoesNotContain("Back at work", failed.Reason);
     }
 
     [Fact]
@@ -159,8 +170,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
         Assert.False(record.Passed);
-        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(AgentId));
-        Assert.False(ctx.Queue.CanMerge(AgentId, out _));
+        // H2 — a real container exit of 1 lands the entry on the state that says so, and the gate reason
+        // is the verdict rather than "not verified yet".
+        Assert.Equal(WorkerMergeState.VerificationFailed, ctx.Queue.GetState(AgentId));
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("FAILED", reason);
+        Assert.Contains("npm test", reason);
     }
 
     // ---- P2-11 flagged-change gate, wired into the daemon's merge spine --

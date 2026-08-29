@@ -336,11 +336,25 @@ public sealed class WorkerReadinessTrigger : IDisposable
         //    Verifying state means a row that SAYS verifying with no run behind it — the shape a daemon
         //    restart leaves. That belongs to ResumeAfterRestartAsync and to the human's Clear control, not
         //    to a trigger that would be guessing.
+        //
+        //    VerificationFailed is in the set, and it has to be. Nothing in the daemon calls
+        //    MergeQueue.NotifyNewCommits for a locally-spawned agent, so a push does not walk an entry back
+        //    to Working on its own — which means that without this arm, H2's new state would be a state a
+        //    worker's own fix could never get it out of: the entry would sit red forever while the agent
+        //    committed the repair, and only a human clicking Verify would ever find out. The trigger's
+        //    existing bounds do the containment: once-per-tip means this fires only for a tip that has
+        //    never been attempted, i.e. only for work the agent has actually pushed SINCE the failure, and
+        //    the cooldown bounds a grinder. (A Verified entry is still not re-fired on a push — the state
+        //    machine has no Verified → Verifying edge, and inventing one here would be this trigger
+        //    changing the merge spine rather than triggering it. That limitation is unchanged and is
+        //    recorded in docs/design/verification-trigger.md.)
         var merge = queue.GetState(key.AgentId);
-        if (merge is not (WorkerMergeState.Working or WorkerMergeState.StaleVerified))
+        if (merge is not (WorkerMergeState.Working or WorkerMergeState.StaleVerified
+            or WorkerMergeState.VerificationFailed))
         {
             return Drop(ReadinessOutcome.Ineligible,
-                $"the queue entry is {merge} — automatic verification starts only from Working or StaleVerified");
+                $"the queue entry is {merge} — automatic verification starts only from Working, "
+                + "StaleVerified or VerificationFailed");
         }
 
         lock (_gate)
@@ -371,8 +385,27 @@ public sealed class WorkerReadinessTrigger : IDisposable
         {
             // THE one call. Everything about what a verification is — the Verifying transition, the jail
             // execution, the gates armed from the committed trees, the immutable record, the settle to
-            // Verified or back to Working — belongs to this method and to nothing here.
-            await queue.RunVerificationAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+            // Verified or to VerificationFailed — belongs to this method and to nothing here.
+            var record = await queue.RunVerificationAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+
+            // H3 — the OUTCOME, logged. This method announced "verifying" and then said nothing at all,
+            // whichever way the run went: a red verification existed only as a row in SQLite and an
+            // artifact file nothing linked to, so the daemon log — the first place anyone looks when a
+            // swarm has gone quiet — recorded that six test runs were STARTED and not one of them
+            // finished. An automatic actor that spends a test suite on a human's behalf and does not say
+            // what it found is indistinguishable from one that hung.
+            //
+            // The verdict word comes from record.Passed, which is the daemon-observed container-runtime
+            // exit (OPS SA-1) and the same field the queue decided the state from — never a second
+            // opinion — and the line carries the artifact path so the output is one `cat` away rather
+            // than a directory to guess at. The resulting state is included because "PASSED" and
+            // "Verified" are not the same claim: a pass whose entry was discarded mid-run settles
+            // nowhere, and a log that asserted the transition would be wrong exactly then.
+            _log?.Invoke(
+                $"auto-verify repo={key.RepoHash} agent={key.AgentId} — the verification "
+                + $"{(record.Passed ? "PASSED" : "FAILED")} ({record.ResolvedCommand}) against "
+                + $"main@{Short(record.MainSha)}; the entry is now "
+                + $"{queue.GetState(key.AgentId)} — output: {record.LogArtifactPath}");
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("already in flight", StringComparison.Ordinal))
         {

@@ -54,6 +54,19 @@ service MergeQueueService {
   // has no production caller, so the entry reports "verifying" to a human forever. Refused outright while
   // a run really is executing: the honest answer there is "wait".
   rpc ClearStalledVerification(ClearStalledVerificationRequest) returns (ClearStalledVerificationResponse);
+  // The stdout/stderr the entry's last verification actually produced.
+  //
+  // Until this existed a failed verification was UNREADABLE. The daemon wrote the real output to an
+  // artifact file under its own data directory, recorded the path in SQLite, and carried none of it on any
+  // wire: QueueEntry had no verification field at all, so the most a human could be shown was a one-line
+  // gate reason ("tests failed — node test.js"). A human cannot act on a failure they cannot read, and the
+  // only workaround was to open the daemon's database, read a path out of it, and cat the file.
+  //
+  // It returns CONTENT and never the path. The artifact lives under the daemon's data directory and G-14
+  // keeps daemon filesystem paths off the wire; a path would also be useless to a client that is not on
+  // the same machine as the daemon. Bounded server-side (see GetVerificationLogResponse.truncated) — a
+  // pathological test suite can emit megabytes, and a stream frame is not the place to find that out.
+  rpc GetVerificationLog(GetVerificationLogRequest) returns (GetVerificationLogResponse);
 }
 
 message StreamQueueRequest {
@@ -98,6 +111,27 @@ message QueueEntry {
   // render as stranded. Explicit presence lets "unknown" be a value on the wire, and unknown leaves the
   // surface exactly as it was.
   optional bool has_live_sandbox = 9;
+  // ---- The entry's last verification VERDICT (H2/H4) ------------------------------------------------
+  //
+  // `state` above now distinguishes a red run (`VerificationFailed`) from one that never happened
+  // (`Working`), which is the fix for the row being unable to tell them apart. These three carry the
+  // FACTS behind that word, because a state name is not a result: which command was run, when, and
+  // whether it passed. Without them a client could render "the tests failed" and could not say what was
+  // run or how long ago, and had no way to render a PASSING record's provenance either.
+  //
+  // `optional` on the verdict for the same reason has_live_sandbox is optional: proto3 scalars default to
+  // false, and a false meaning "this entry has never been verified" is indistinguishable from one meaning
+  // "the tests failed" — which is precisely the conflation H2 exists to end, and reintroducing it on the
+  // wire would undo the fix one layer down. Absent means NO RECORD; present means a real verdict.
+  optional bool last_verification_passed = 10;
+  // The RT-D2 resolved command the record was produced by (empty when there is no record). It is the
+  // provenance half of the verdict: a branch that rewrote its own test command produces a green record
+  // that means nothing, and the reviewer has to be able to see WHAT passed.
+  string last_verification_command = 11;
+  // When that record was produced, ISO-8601 round-trip ("O"); empty when there is no record. A verdict
+  // with no timestamp cannot be told from a stale one, and a week-old red is a different fact from one
+  // that landed thirty seconds ago.
+  string last_verification_at = 12;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the
@@ -239,6 +273,32 @@ message ClearStalledVerificationResponse {
   // for this entry right now", which is a refusal and not a failure.
   string reason = 2;
   string state = 3; // the resulting WorkerMergeState name
+}
+
+message GetVerificationLogRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+}
+
+message GetVerificationLogResponse {
+  // False when this entry has no verification record at all — which is a materially different answer from
+  // an empty log, and the one the surface must render as "not verified yet" rather than as "the tests
+  // printed nothing". Everything below is empty when this is false.
+  bool has_record = 1;
+  bool passed = 2;
+  string resolved_command = 3;
+  string main_sha = 4;
+  string when = 5;            // ISO-8601 round-trip ("O")
+  // The artifact's content — the header the runner writes plus the run's stdout and stderr. Empty with
+  // has_record true means the artifact could not be read (deleted, or a daemon whose data directory
+  // moved); `unavailable_reason` says which, rather than letting a missing file render as a test suite
+  // that produced no output.
+  string log = 6;
+  // True when `log` is the TAIL of a longer artifact. Named rather than silently elided: a human reading
+  // a failure needs to know they are looking at the end of something.
+  bool truncated = 7;
+  // Verbatim when the record exists and its artifact could not be read. Empty otherwise.
+  string unavailable_reason = 8;
 }
 
 message GetMergeDiffRequest {

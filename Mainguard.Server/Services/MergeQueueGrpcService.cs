@@ -118,6 +118,18 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
 
+        var state = ctx.Queue.GetState(request.AgentId).ToString();
+
+        // H3, the human-driven half: this handler logged every REFUSAL and never once logged a RESULT, so
+        // the daemon log recorded that verifications had been refused and never that any of them ran. The
+        // verdict is the daemon-observed container exit the queue itself settled the state from — not a
+        // second opinion — and the resulting state is reported separately because a run whose entry was
+        // discarded mid-flight settles nowhere.
+        _log.LogInformation(
+            "RunVerification {Verdict} repo={Repo} agent={Agent} command={Command} main={Main} state={State} output={Artifact}",
+            record.Passed ? "PASSED" : "FAILED", request.RepoHandle, request.AgentId,
+            record.ResolvedCommand, record.MainSha, state, record.LogArtifactPath);
+
         return new RunVerificationResponse
         {
             AgentId = record.AgentId,
@@ -125,8 +137,108 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             Passed = record.Passed,
             ResolvedCommand = record.ResolvedCommand,
             ConfigHash = record.ConfigHash,
-            State = ctx.Queue.GetState(request.AgentId).ToString(),
+            State = state,
         };
+    }
+
+    /// <summary>
+    /// The maximum artifact bytes <see cref="GetVerificationLog"/> will return. A failing test suite is
+    /// read by a human, and the last 256 KiB of one is comfortably more than a person reads; an unbounded
+    /// read would let a runaway suite's output decide the size of a gRPC message.
+    /// </summary>
+    internal const int MaxVerificationLogBytes = 256 * 1024;
+
+    /// <summary>
+    /// H4 — the stdout/stderr of the entry's last verification, which nothing could reach before.
+    ///
+    /// <para>The daemon wrote the real output to <c>VerificationRecord.LogArtifactPath</c>, stored the path
+    /// in SQLite, and put none of it on any wire. So the whole of what a human was told about a red branch
+    /// was a one-line gate reason, and the artifact holding the actual failure — the assertion that broke,
+    /// the stack, the compiler error — was reachable only by opening the daemon's database by hand. A
+    /// human cannot act on a failure they cannot read.</para>
+    ///
+    /// <para><b>Content, never the path.</b> The artifact lives under the daemon's data directory, G-14
+    /// keeps daemon filesystem paths off the wire, and a path is meaningless to a client that is not on
+    /// this machine anyway.</para>
+    ///
+    /// <para><b>Three answers, kept apart.</b> No record at all (<c>has_record=false</c> — the entry has
+    /// never been verified); a record whose artifact reads (the log); and a record whose artifact does NOT
+    /// read, which answers with the verdict and a stated <c>unavailable_reason</c>. Collapsing the third
+    /// into an empty log would render a deleted artifact as a test suite that printed nothing, which is
+    /// the same shape of quiet fabrication as the "not verified yet" this whole change removes.</para>
+    /// </summary>
+    public override Task<GetVerificationLogResponse> GetVerificationLog(
+        GetVerificationLogRequest request, ServerCallContext context)
+    {
+        var ctx = Resolve(request.RepoHandle);
+        var record = ctx.Queue.LastVerification(request.AgentId);
+        if (record is null)
+        {
+            return Task.FromResult(new GetVerificationLogResponse { HasRecord = false });
+        }
+
+        var response = new GetVerificationLogResponse
+        {
+            HasRecord = true,
+            Passed = record.Passed,
+            ResolvedCommand = record.ResolvedCommand ?? string.Empty,
+            MainSha = record.MainSha ?? string.Empty,
+            When = record.When.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        };
+
+        if (string.IsNullOrWhiteSpace(record.LogArtifactPath))
+        {
+            // The runner's artifact write is best-effort by design (losing the artifact must not lose the
+            // record), so a record with no path is a real state and not an impossible one.
+            response.UnavailableReason = "this verification recorded no output artifact";
+            return Task.FromResult(response);
+        }
+
+        try
+        {
+            var info = new System.IO.FileInfo(record.LogArtifactPath);
+            if (!info.Exists)
+            {
+                response.UnavailableReason =
+                    "the run's output artifact is no longer on disk — the verdict above is still the "
+                    + "recorded one, but its output cannot be shown";
+                return Task.FromResult(response);
+            }
+
+            response.Log = ReadTail(record.LogArtifactPath, MaxVerificationLogBytes, out var truncated);
+            response.Truncated = truncated;
+        }
+        catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException
+            or NotSupportedException or ArgumentException)
+        {
+            _log.LogWarning(ex, "GetVerificationLog could not read the artifact repo={Repo} agent={Agent}",
+                request.RepoHandle, request.AgentId);
+            response.UnavailableReason = $"the run's output artifact could not be read: {ex.Message}";
+        }
+
+        return Task.FromResult(response);
+    }
+
+    /// <summary>
+    /// The last <paramref name="maxBytes"/> of a file, decoded as UTF-8.
+    ///
+    /// <para>The TAIL and not the head, deliberately: a test runner prints its failures last, so truncating
+    /// from the front is truncating away the reason the human opened the log. <paramref name="truncated"/>
+    /// is set whenever anything was dropped, so the surface can say so rather than present a fragment as
+    /// the whole run.</para>
+    /// </summary>
+    internal static string ReadTail(string path, int maxBytes, out bool truncated)
+    {
+        using var stream = new System.IO.FileStream(
+            path, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite);
+        truncated = stream.Length > maxBytes;
+        if (truncated)
+        {
+            stream.Seek(-maxBytes, System.IO.SeekOrigin.End);
+        }
+
+        using var reader = new System.IO.StreamReader(stream, System.Text.Encoding.UTF8);
+        return reader.ReadToEnd();
     }
 
     public override Task<CanMergeResponse> CanMerge(CanMergeRequest request, ServerCallContext context)
@@ -559,6 +671,19 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                     ?? (_sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(repoHandle, agentId))
                         ?.ContainerId is { Length: > 0 }),
             };
+
+            // H2/H4 — the verdict behind the state word. The queue has held this record all along and no
+            // wire ever carried it, so a client could see that an entry was blocked and never what the
+            // verification actually found. The record is the queue's OWN settled one, so what is rendered
+            // cannot disagree with the state it is rendered under. Left absent — not false — when there is
+            // no record, because an absent verdict and a failing one must stay distinguishable.
+            if (queue.LastVerification(agentId) is { } verification)
+            {
+                entry.LastVerificationPassed = verification.Passed;
+                entry.LastVerificationCommand = verification.ResolvedCommand ?? string.Empty;
+                entry.LastVerificationAt = verification.When.ToString(
+                    "O", System.Globalization.CultureInfo.InvariantCulture);
+            }
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));
             update.Entries.Add(entry);
