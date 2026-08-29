@@ -1862,6 +1862,12 @@ asks, so an id the gate never held (manual agents, external-PR heads, seeded ent
 exactly as it is permitted to merge. A second opinion about what "approved" means is how one of the copies
 goes decorative (MG-12).
 
+**What is withheld is only the row.** `EnsureEntry` still calls `EnsureQueue` on the deferred path, because
+that call is what BUILDS a coordinator-spawned worker's repo queue — that spawn path creates its worktree
+inside the launcher rather than through the RepoSync RPC, so an early return would also have skipped
+registering the queue, the main-sha reconcile and the restart resume for the whole repository. Gating a row
+is not a reason to stop governing a repo.
+
 **The half that makes it a fix rather than a regression.** Every coordinator-spawned worker is spawned
 *before* it has presented anything, so withholding without a way back would mean no legitimate worker ever
 got a row. `AdmitDeferredEntries` creates the owed rows, subscribed in the composition root to

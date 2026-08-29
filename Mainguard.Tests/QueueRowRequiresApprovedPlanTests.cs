@@ -69,6 +69,11 @@ public sealed class QueueRowRequiresApprovedPlanTests : IDisposable
 
         provisioner.EnsureEntry(repoHash, "probe-1");
 
+        // The ROW is withheld and nothing else is: the repo's queue is still built and registered, because
+        // this call is what builds it for a coordinator-spawned worker (its worktree is created inside the
+        // launcher, not through the RepoSync RPC). Gating a row must not stop the daemon governing a repo.
+        Assert.NotNull(_registry.Resolve(repoHash));
+
         var ctx = provisioner.EnsureQueue(repoHash)!;
         Assert.DoesNotContain("probe-1", ctx.Queue.Agents);
 

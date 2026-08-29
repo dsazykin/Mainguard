@@ -459,6 +459,13 @@ public sealed class MergeQueueProvisioner
                 _deferredEntries[(repoHandle ?? string.Empty, agentId)] = origin;
             }
 
+            // The ROW is withheld and nothing else is. EnsureQueue is called anyway because this method
+            // has always been what BUILDS a coordinator-spawned worker's repo queue — that spawn path
+            // creates its worktree inside the launcher rather than through the RepoSync RPC, so returning
+            // early here would also skip registering the queue, the main-sha reconcile and the restart
+            // resume for the whole repository. Gating a row is not a reason to stop governing a repo.
+            EnsureQueue(repoHandle);
+
             _log?.Invoke(
                 $"merge queue repo={repoHandle} agent={agentId} — no queue row yet: {reason}");
             _audit.Append(new AuditEvent(QueueEntryDeferredEvent, new Dictionary<string, string>

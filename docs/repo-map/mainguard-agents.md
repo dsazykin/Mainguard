@@ -1440,7 +1440,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       stores. **G1: `EnsureEntry` now asks the plan gate before creating a row.** Three `scripted` probes
       that made zero plan calls each got a merge-queue row while `get_worker_status` said "no work is
       authorised"; a row is a claim on human attention that arrives carrying Verify, so it requires an
-      approved plan. A withheld row is REMEMBERED (`DeferredEntries()`) and created by
+      approved plan. Only the ROW is withheld — `EnsureQueue` still runs, because this call is what BUILDS a
+      coordinator-spawned worker's repo queue (its worktree is created inside the launcher, not through the
+      RepoSync RPC). A withheld row is REMEMBERED (`DeferredEntries()`) and created by
       `AdmitDeferredEntries()` — subscribed in the composition root to `PlanApprovalService.PlanApproved`,
       the moment the gate's answer changes — which RE-ASKS the gate per candidate rather than trusting the
       event. Ids the gate never held (manual agents, external-PR heads, seeded entries) are permitted
