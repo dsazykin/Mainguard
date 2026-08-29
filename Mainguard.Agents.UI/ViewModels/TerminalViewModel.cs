@@ -19,6 +19,13 @@ namespace Mainguard.Agents.UI.ViewModels;
 /// Ctrl+C → 0x03) are forwarded to the daemon; daemon output is fed back into the engine; and
 /// layout-driven resizes are debounced (~50 ms) before both resizing the engine and notifying the
 /// daemon (SIGWINCH).</para>
+///
+/// <para><b>A keystroke that does not arrive is reported</b> (<see cref="InputDeliveryError"/>,
+/// rendered as a banner over the pane). The forward is necessarily fire-and-forget — a key event
+/// cannot block the UI thread on a network round-trip — and it used to catch only
+/// <see cref="OperationCanceledException"/>, so a gateway write failure became an unobserved task
+/// and the character was gone with nothing said (stress S1 / G5). Partially delivering an
+/// instruction to a jailed CLI and calling it sent is worse than refusing it.</para>
 /// </summary>
 public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
 {
@@ -45,6 +52,16 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
     /// actually drawing" signal, used to replace a startup loading animation with the live terminal.</summary>
     [ObservableProperty]
     private bool _hasReceivedOutput;
+
+    /// <summary>Why the last keystroke/paste did not reach the agent, or null when input is landing.
+    /// Bound to the pane's banner: the operator typed it, so the operator is who must be told.
+    /// Cleared by the next input that does get through.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasInputDeliveryError))]
+    private string? _inputDeliveryError;
+
+    /// <summary>Binding convenience for the banner's visibility.</summary>
+    public bool HasInputDeliveryError => !string.IsNullOrEmpty(InputDeliveryError);
 
     public TerminalViewModel(ITerminalGateway gateway, TimeSpan? resizeDebounce = null)
     {
@@ -113,9 +130,12 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
         {
             await _gateway.SendResizeAsync(_pendingCols, _pendingRows);
         }
-        catch (OperationCanceledException)
+        catch (Exception)
         {
-            // Stream torn down.
+            // Deliberately NOT surfaced, and deliberately not left unobserved either. A lost SIGWINCH
+            // is self-correcting — the next layout change sends the current size again — and it is
+            // not something the operator typed, so a banner would be noise about a frame they never
+            // authored. A lost keystroke is the opposite on both counts; see ForwardInputAsync.
         }
     }
 
@@ -124,18 +144,58 @@ public sealed partial class TerminalViewModel : ViewModelBase, IDisposable
     /// if the CLI were still there.</summary>
     public void ClearView() => _view?.Clear();
 
-    private void OnInputAvailable(byte[] data) => _ = SendInputAsync(data);
+    private void OnInputAvailable(byte[] data) => _ = ForwardInputAsync(data);
 
-    private async Task SendInputAsync(byte[] data)
+    /// <summary>
+    /// Forwards one engine input frame and OBSERVES the outcome. Not awaited by the caller (a key
+    /// event must not block the UI thread on a round-trip), which is exactly why every failure has
+    /// to be caught here — an escaped exception is a character the operator typed, never delivered,
+    /// and never reported.
+    ///
+    /// <para>No <c>ConfigureAwait(false)</c>, on purpose: raised from the UI thread, so the
+    /// continuation resumes there and <see cref="InputDeliveryError"/> is set on the thread
+    /// Avalonia's bindings require. In tests there is no context and it resumes on the pool, which
+    /// is equally fine because nothing is bound.</para>
+    /// </summary>
+    private async Task ForwardInputAsync(byte[] data)
     {
         try
         {
             await _gateway.SendInputAsync(data);
+            if (InputDeliveryError is not null && !_disposed)
+            {
+                InputDeliveryError = null; // input is landing again — retire the stale banner
+            }
         }
-        catch (OperationCanceledException)
+        catch (Exception ex) when (IsTeardown(ex) || _disposed)
         {
-            // Stream torn down.
+            // The pane is going away (detach/dispose/cancel). Nothing was lost from where the
+            // operator sits, and a banner on a terminal that is closing helps no one.
         }
+        catch (Exception ex)
+        {
+            InputDeliveryError = ex.Message;
+        }
+    }
+
+    /// <summary>True for the exceptions that mean "this stream is being torn down", including the
+    /// transport's own spelling of a cancel and anything the gateway wrapped around one.</summary>
+    private static bool IsTeardown(Exception? ex)
+    {
+        for (var e = ex; e is not null; e = e.InnerException)
+        {
+            if (e is OperationCanceledException or ObjectDisposedException)
+            {
+                return true;
+            }
+
+            if (e is Grpc.Core.RpcException rpc && rpc.StatusCode == Grpc.Core.StatusCode.Cancelled)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private void OnOutputReceived(ReadOnlyMemory<byte> data)

@@ -731,7 +731,19 @@
     hold; the 2 MB cap parses rather than drops; and an `[AvaloniaFact]` drives the whole ordering
     end to end through a real `TerminalControl` + real arrange pass),
     `TerminalViewModelTests` (VM forwarding of Ctrl+C→0x03,
-    output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table), and
+    output→engine, debounced resize, plus the `TerminalControl.MapKey` VT-byte table, **and stress
+    S1 / G5's observability half: input the gateway cannot deliver surfaces on the pane as
+    `InputDeliveryError` instead of vanishing into an unobserved task, clears once input lands again,
+    and a teardown cancel raises no banner**),
+    **`TerminalInputSerializationTests`** (stress S1 / G5 — the silent keystroke loss. A
+    `RacyRequestStream` models the real gRPC writer's contract exactly (one in-flight `WriteAsync`,
+    otherwise `Can't write the message because the previous write is in progress`) and holds each
+    write open, so these fail deterministically on the unfixed gateway: 64 concurrent sends all
+    delivered with no race, 200 sequentially-issued unawaited sends arriving in TYPING order, the
+    attach selector still frame 1 under immediate typing, input vs. the debounced resize not racing
+    each other, a send after dispose failing immediately with the CLOSED reason rather than hanging,
+    a full queue refusing loudly rather than growing unbounded, a transport-refused write faulting
+    the caller, and pre-attach input reporting undelivered instead of silent success), and
     `Headless/TerminalRenderHarness` (a coloured TUI frame through the interim engine captured in
     MidnightLoom + DaylightLoom, `terminal_frame_*.png`), and `Headless/BootstrapProgressRenderHarness`
     (P2-05 staged checklist — a running mix + a failed run — in every theme,
@@ -1787,6 +1799,12 @@
   files are 0600, and a missing credential throws instead of downgrading; plus a pinned-mTLS positive
   control that keeps the refusals honest)**, `TerminalStreamRpcTests` (bidi echo — the no-PTY-bound
   fallback, which now applies only to ids the daemon holds no session for),
+  **`TerminalInputSerializationRpcTests` (stress S1 / G5 on the REAL stack: two concurrent writes to
+  one request stream really do throw the one-in-flight-write constraint — pinned as an assertion, so
+  a change there is a signal — and the gateway over that same stack delivers concurrent input
+  byte-exact and in order. The frames are paste-sized because over the in-proc transport a small
+  write completes before the next call starts and nothing overlaps; the deterministic version lives
+  in `Mainguard.Tests/TerminalInputSerializationTests`)**,
   **`TerminalDetachedAttachTests` (ISSUES-LOG #23 — an attach to a KNOWN agent with no bound CLI
   answers with `TerminalGrpcService.DetachedNotice` unprompted instead of falling silently into the
   echo, and discards input rather than reflecting it; the echo is still what an unknown id gets. The

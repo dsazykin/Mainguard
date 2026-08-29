@@ -696,7 +696,15 @@
   - `TerminalViewModel` (P2-03) wires the engine (`ITerminalView`) to the daemon stream
     (`ITerminalGateway`): forwards engine keystrokes (incl. Ctrl+C→0x03) to the daemon, feeds daemon
     `raw` output into the engine, and debounces (~50 ms) layout resizes before propagating them
-    (SIGWINCH) — it touches only the interface, so P2-18 swaps the engine with no VM change. Derives
+    (SIGWINCH) — it touches only the interface, so P2-18 swaps the engine with no VM change. The
+    keystroke forward (`ForwardInputAsync`) is necessarily fire-and-forget — a key event cannot block
+    the UI thread on a round-trip — so it OBSERVES every outcome: a genuine delivery failure sets
+    `InputDeliveryError`, which `TerminalView` renders as a banner over the pane, and the next input
+    that lands clears it. Teardown exceptions (cancel/dispose, including the transport's
+    `RpcException(Cancelled)` and anything the gateway wrapped one in) are classified out. It used to
+    catch only `OperationCanceledException`, which is how three characters typed at a jailed CLI
+    vanished with nothing said (stress S1 / G5). A dropped SIGWINCH is deliberately NOT surfaced —
+    self-correcting, and not something the operator typed — but it is no longer left unobserved. Derives
     from `ViewModelBase` (not bare `ObservableObject`) so `ViewLocator` resolves it to `TerminalView`
     inside a `ContentControl` — the coordinator surface and the agent dock both rely on that resolution.
   - `BootstrapProgressViewModel` (P2-05: drives the `MainguardOsBootstrapper` off the UI thread,
@@ -919,7 +927,26 @@
     and a `role` parameter on `SpawnAgentAsync`.
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
-    `raw` frame; a fake backs the ViewModel tests.
+    `raw` frame; a fake backs the ViewModel tests. **Every frame it sends — selector, input, resize —
+    goes through the one `TerminalWriteQueue` below** (stress S1 / G5: gRPC permits a single in-flight
+    `WriteAsync` per request stream, and this class has three concurrent writers, so a keystroke
+    landing inside another frame's round-trip threw `Can't write the message because the previous
+    write is in progress` into a fire-and-forget task and the character was silently gone). Two
+    consequences of that: `SendInputAsync`/`SendResizeAsync` return a task that completes only once
+    the frame is actually written and FAULTS when it is not, and input sent before an attach (or
+    after a dispose) now says so instead of returning `Task.CompletedTask` for bytes that went
+    nowhere. `AttachOverride`/`WriteQueueCapacity` are the internal test seams
+    (`TerminalInputSerializationTests`).
+  - `TerminalWriteQueue.cs` — the serializing writer behind `DaemonTerminalGateway`: a bounded
+    (4096-frame) channel plus one pump task, so a concurrent caller QUEUES instead of throwing.
+    Ordering is the order `EnqueueAsync` was called (a synchronous `TryWrite` under the lock — the
+    caller's position is fixed before it ever awaits), because out-of-order keystrokes would turn
+    character loss into character transposition. Backpressure is the bound: a stream slow enough to
+    bank the whole queue is refused loudly rather than growing without limit. Teardown (`Close`)
+    fails everything queued and every later enqueue immediately — a write posted after detach must
+    not hang on a stream nobody will read — and a write that genuinely fails poisons the queue, so
+    every frame after the break reports failure rather than reporting success for bytes that go
+    nowhere.
   - `AutoDetectScan.cs` — the pure directory walk behind the sidebar's "auto-detect repositories"
     folder browse, split out of `MainWindowViewModel.ScanAutoDetectFolderAsync` so the walk is
     unit-pinned (`AutoDetectScanTests`) while the ViewModel keeps only the persistence around it.
