@@ -399,10 +399,51 @@ public sealed class MergeQueueProvisioner
         return context;
     }
 
+    /// <summary>Audit event appended when a queue row is withheld because its worker has no approved
+    /// plan, carrying the gate's own <c>reason</c>. The paired admission is
+    /// <see cref="QueueEntryAdmittedEvent"/>.</summary>
+    public const string QueueEntryDeferredEvent = "queue_entry_deferred_no_plan";
+
+    /// <summary>Audit event appended when a deferred row is created after its plan was approved.</summary>
+    public const string QueueEntryAdmittedEvent = "queue_entry_admitted_on_plan";
+
+    /// <summary>
+    /// Rows withheld by the plan gate, keyed by (repo, agent) — the same composite key the gate itself
+    /// uses, and for the same reason: an agent id is unique only within a repo.
+    ///
+    /// <para>Bounded the way <c>AgentRefMediator</c>'s per-agent publish gates are: one small entry per
+    /// worker spawned but never approved, in one daemon lifetime, cleared on admission and on
+    /// <see cref="Remove"/>. It holds no task, no prompt and no plan — only the fact that a row is owed.</para>
+    /// </summary>
+    private readonly Dictionary<(string RepoHandle, string AgentId), MergeEntryOrigin> _deferredEntries = new();
+
     /// <summary>
     /// Ensures the repo's queue exists AND that <paramref name="agentId"/> has an entry in it (the agent
     /// joined the swarm). Without this an agent's branch is invisible to <c>StreamQueue</c>: the queue only
     /// reports agents it tracks, and nothing else in the daemon ever adds one.
+    ///
+    /// <para><b>G1 — a queue row now requires an approved plan.</b> Three <c>scripted</c> probes that made
+    /// ZERO plan calls and received ZERO approvals each got a merge-queue row, at the same time as
+    /// <c>get_worker_status</c> correctly answered "no work is authorised". The row was created here, and
+    /// this method consulted nothing.</para>
+    ///
+    /// <para><b>Why the ROW and not the publish.</b> A branch existing is not the harm — F1 established
+    /// that an agent's branch must survive its teardown, so refusing to publish would destroy work to fix a
+    /// display problem. A queue row is something else: it is a claim on human attention, an entry in the
+    /// list a person is asked to work through, and it comes with Verify — i.e. with the daemon offering to
+    /// spend a test-suite run on work nobody authorised. That is what should require an approved plan, and
+    /// that is what this gates.</para>
+    ///
+    /// <para><b>The gate is the same object, asked the same question.</b> <see cref="_planGate"/> is the
+    /// <see cref="IMergeGate"/> already ANDed into every queue, so an id it never held (a manual-mode
+    /// agent, an external-PR head, an unseeded id) is permitted here exactly as it is permitted to merge —
+    /// a second opinion about what "approved" means is how one of the two copies goes decorative (MG-12).
+    /// Only a worker this gate is HOLDING, and whose plan is not approved, is withheld.</para>
+    ///
+    /// <para><b>Nothing is lost by waiting.</b> A withheld row is remembered and created by
+    /// <see cref="AdmitDeferredEntries"/> the moment the plan is approved, so the normal path — spawn,
+    /// present, approve, work — puts the row in front of the human at the point it starts meaning
+    /// something, rather than at the point the jail happened to attach.</para>
     /// </summary>
     public void EnsureEntry(string repoHandle, string agentId, MergeEntryOrigin origin = MergeEntryOrigin.Local)
     {
@@ -411,11 +452,114 @@ public sealed class MergeQueueProvisioner
             return;
         }
 
+        if (_planGate is not null && !_planGate.Allows(agentId, out var reason))
+        {
+            lock (_gate)
+            {
+                _deferredEntries[(repoHandle ?? string.Empty, agentId)] = origin;
+            }
+
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} — no queue row yet: {reason}");
+            _audit.Append(new AuditEvent(QueueEntryDeferredEvent, new Dictionary<string, string>
+            {
+                ["repo"] = repoHandle ?? string.Empty,
+                ["agent"] = agentId,
+                ["reason"] = reason ?? string.Empty,
+            }));
+            return;
+        }
+
         EnsureQueue(repoHandle)?.Queue.EnsureEntry(agentId, origin);
     }
 
+    /// <summary>
+    /// Creates the rows that <see cref="EnsureEntry"/> withheld and whose workers the plan gate now
+    /// permits. Returns the agent ids admitted (empty on a pass that moved nothing).
+    ///
+    /// <para>This is the other half of G1, and without it the fix would be a regression: a worker held at
+    /// the gate is the NORMAL case — every coordinator-spawned worker is spawned before it has presented
+    /// anything — so gating the row without a way back would mean a legitimately approved worker never got
+    /// one. The daemon calls this on <c>PlanApprovalService.PlanApproved</c>, which is the exact moment the
+    /// gate's answer changes.</para>
+    ///
+    /// <para><b>It re-asks the gate; it does not trust the caller.</b> The event says "a plan was
+    /// approved", not "this agent may now have a row" — the two differ for an id whose plan was approved
+    /// and then superseded, and for every other id in the deferred set. So each candidate is put back
+    /// through the same predicate <see cref="EnsureEntry"/> used, and one that still fails simply stays
+    /// deferred. Passing the approved worker's id in as a hint would make this a second authority.</para>
+    /// </summary>
+    public IReadOnlyList<string> AdmitDeferredEntries()
+    {
+        List<KeyValuePair<(string RepoHandle, string AgentId), MergeEntryOrigin>> candidates;
+        lock (_gate)
+        {
+            if (_deferredEntries.Count == 0)
+            {
+                return Array.Empty<string>();
+            }
+
+            candidates = _deferredEntries.ToList();
+        }
+
+        var admitted = new List<string>();
+        foreach (var (key, origin) in candidates)
+        {
+            if (_planGate is not null && !_planGate.Allows(key.AgentId, out _))
+            {
+                continue;
+            }
+
+            // Dropped from the deferred set BEFORE the row is created, and unconditionally: EnsureQueue can
+            // still answer null (a repo whose mirror went away), and a candidate that is now AUTHORISED but
+            // unprovisionable must not be retried on every future approval for the rest of the daemon's
+            // life. Its own next EnsureEntry — a resume, a re-provision — creates the row, with the gate
+            // now saying yes.
+            lock (_gate)
+            {
+                _deferredEntries.Remove(key);
+            }
+
+            EnsureQueue(key.RepoHandle)?.Queue.EnsureEntry(key.AgentId, origin);
+            admitted.Add(key.AgentId);
+            _log?.Invoke(
+                $"merge queue repo={key.RepoHandle} agent={key.AgentId} — plan approved; the queue row is now live");
+            _audit.Append(new AuditEvent(QueueEntryAdmittedEvent, new Dictionary<string, string>
+            {
+                ["repo"] = key.RepoHandle,
+                ["agent"] = key.AgentId,
+            }));
+        }
+
+        return admitted;
+    }
+
+    /// <summary>The (repo, agent) pairs currently owed a queue row — exposed so the withholding is
+    /// observable rather than only inferable from a row's absence.</summary>
+    public IReadOnlyList<(string RepoHandle, string AgentId)> DeferredEntries()
+    {
+        lock (_gate)
+        {
+            return _deferredEntries.Keys.ToList();
+        }
+    }
+
     /// <summary>Drops a repo's queue on teardown (the handle resolves to NOT_FOUND again).</summary>
-    public void Remove(string repoHandle) => _registry.Remove(repoHandle);
+    public void Remove(string repoHandle)
+    {
+        lock (_gate)
+        {
+            // The owed rows go with the queue they were owed against — a repo that is no longer governed
+            // has nothing to admit them into.
+            foreach (var key in _deferredEntries.Keys
+                .Where(k => string.Equals(k.RepoHandle, repoHandle, StringComparison.Ordinal)).ToList())
+            {
+                _deferredEntries.Remove(key);
+            }
+        }
+
+        _registry.Remove(repoHandle);
+    }
 
     // ---- Internals -------------------------------------------------------
 

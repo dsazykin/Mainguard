@@ -67,10 +67,32 @@ So the enforceable version is: **the daemon never gives the worker its task.**
 5. `WorkerPlanGate` is an `IMergeGate`, ANDed into every repo's merge queue. A branch whose worker never
    had a plan approved **cannot merge, even if it verified green**. This is the backstop that still holds
    if a worker somehow did work it was not cleared for.
+6. **(added by G1, phase 3)** The same gate decides whether the worker gets a **merge-queue row** at all.
+   `MergeQueueProvisioner.EnsureEntry` asks it, and a worker still at the gate is remembered rather than
+   listed; `AdmitDeferredEntries` creates the row when the plan is approved. A queue row is a claim on a
+   human's attention that arrives carrying Verify, so it is authorisation-shaped and now asks.
 
 Point 5 is why the enforcement is credible without claiming the impossible. Nothing can stop a jailed
 process from editing files in its own worktree; what the daemon controls is whether that work is ever
-*authorised*, *steerable*, *verifiable* or *mergeable*, and all four now answer "no".
+*authorised*, *steerable*, *verifiable*, *listed* or *mergeable*.
+
+### What the gate does NOT govern: **publication**
+
+Stated plainly, because the list above reads like a perimeter and is not one. `AgentRefMediator` — which
+carries `refs/heads/agent/<id>` from the worker's own repository into the daemon's mirror — **contains no
+reference to the plan gate at all**, and that is deliberate rather than an omission:
+
+- A branch existing is not the harm. **F1** (phase 3 §12.1) established the opposite requirement — stopping
+  a worker must NOT destroy the commits it made — so a gate on publication would be a mechanism for
+  throwing work away in order to tidy up a list.
+- The gate's job is to decide what is *authorised*, and nothing downstream of publication can act on an
+  unauthorised branch anyway: it is not listed (point 6), it cannot be verified on the daemon's own
+  initiative (`MayAutoVerify`), and it cannot merge (point 5).
+
+So an unapproved worker's branch **does** exist in the mirror, and always did. What G1 found was that it
+also got a queue row, which is the thing a human is asked to act on; that is what point 6 closes. Anyone
+reading this section for the perimeter should read it as: **task delivery, steering, verification, the
+queue row, and the merge — not publication.**
 
 **Deliberately not done:** the gate does not answer for agents it never held. Manual-mode agents and
 external-PR heads are not coordinator-spawned and are not governed by the plan gate; making the gate

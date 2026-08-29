@@ -115,6 +115,68 @@ public sealed class MergeQueueWiringTests
         Assert.Same(host.Services.GetRequiredService<IMergeLeaseStore>(), resolved.Leases);
     }
 
+    // ---- G1: a queue row is a claim on human attention, and requires an approved plan ----------------
+
+    /// <summary>
+    /// Defect G1, end to end through the REAL composition root: a coordinator-spawned worker that has
+    /// presented no plan gets NO merge-queue row — and gets one the moment a human approves its plan.
+    ///
+    /// <para>Both halves have to be here rather than only in the provisioner's unit tests, because the
+    /// second half depends on a SUBSCRIPTION (<c>PlanApprovalService.PlanApproved</c> →
+    /// <c>MergeQueueProvisioner.AdmitDeferredEntries</c>) that lives in the composition root and nowhere
+    /// else. A unit test would pass with that line deleted, and the result would be strictly worse than the
+    /// defect: every legitimately approved worker silently missing from the queue. This test fails if the
+    /// gate is removed (the row appears too early) AND if the subscription is removed (it never appears).</para>
+    /// </summary>
+    [Fact]
+    public async Task AWorkerWithNoApprovedPlan_GetsNoRow_UntilItsPlanIsApproved()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+
+        // The daemon holds this worker's task exactly as the coordinator's spawn path does: it has a
+        // branch and a brief, and no authorisation to do anything.
+        const string worker = "g1-worker";
+        var gate = host.Services.GetRequiredService<WorkerPlanGate>();
+        var plans = host.Services.GetRequiredService<
+            Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>();
+        gate.Hold(worker, "coord-1", "Fix the clock", "the actual work to do", 1m);
+
+        await sync.CreateWorktreeAsync(new CreateWorktreeRequest
+        {
+            RepoHandle = provisioned.RepoHandle,
+            AgentId = worker,
+        }, headers);
+
+        // No row. This is the assertion the live daemon failed: three scripted probes with zero plan calls
+        // each had one.
+        Assert.Empty(await SnapshotAsync(client, headers, provisioned.RepoHandle));
+
+        // The worker presents, and a human approves. Approval is the moment the gate's answer changes.
+        var planId = plans.Present(
+            worker, "coord-1", "Fix the clock",
+            new TaskPlanFields(new[] { "README.md" }, "how", "tests"), "", 1m).PlanId!;
+        plans.Approve(planId, "tester");
+
+        var entry = Assert.Single(await SnapshotAsync(client, headers, provisioned.RepoHandle));
+        Assert.Equal(worker, entry.AgentId);
+        Assert.Equal(WorkerMergeState.Working.ToString(), entry.State);
+    }
+
+    private static async Task<System.Collections.Generic.IReadOnlyList<Mainguard.Protos.V1.QueueEntry>>
+        SnapshotAsync(MergeQueueService.MergeQueueServiceClient client, Metadata headers, string repoHandle)
+    {
+        using var cts = new CancellationTokenSource(Timeout);
+        using var stream = client.StreamQueue(
+            new StreamQueueRequest { RepoHandle = repoHandle }, headers, cancellationToken: cts.Token);
+        Assert.True(await stream.ResponseStream.MoveNext(cts.Token));
+        return stream.ResponseStream.Current.Entries.ToList();
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     // The real composition root with ONE override: the substrate points at an isolated temp VM root so

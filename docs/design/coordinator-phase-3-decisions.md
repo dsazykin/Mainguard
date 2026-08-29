@@ -1726,3 +1726,187 @@ bounded" assertion green. Only a test that asserts the *refusal* can tell a limi
   cosmetic loss set against losing the diff.
 - **Nothing was done about a shell that will not parse the line** (§15.2). It cannot be observed from
   inside this system, and pretending otherwise would be worse than the honest gap.
+
+---
+
+## 16. The merge queue told the human things that were not true (H2, H3, H4, G1)
+
+Four defects from one live run, with one shape between them: the daemon *knew* something and the human was
+told otherwise. They are recorded together because three of them are the same missing fact seen from three
+surfaces, and the fourth is the same failure of honesty applied to a list rather than a verdict.
+
+### 16.1 What was measured, before anything was changed
+
+Straight from the owner's daemon, not reconstructed:
+
+```
+sqlite> select Id,AgentId,Passed,ResolvedCommand from VerificationRows order by Id desc limit 3;
+49|221760f27c…|1|node test.js
+48|b3d2e7a48d…|0|node test.js      ← the human's redundant second run
+47|b3d2e7a48d…|0|node test.js      ← the daemon's automatic run, 92 seconds earlier
+
+sqlite> select AgentId,State,LastVerificationId from MergeQueueRows where AgentId like 'b3d2e7%';
+b3d2e7a48d…|Working|48
+
+$ cat …/verify-artifacts/verify_b3d2e7a48d…log
+container-runtime-exit: 1
+---- stderr ----
+subtract(5,3) !== 2
+
+$ grep auto-verify ~/.mainguard/logs/*.log | wc -l
+6            # six "…verifying" lines. Zero outcome lines.
+```
+
+So: the branch had failed twice, the row said `Working`, and `Working` is where an entry that has **never
+been verified** sits. And G1, from the same database — three agent ids with a `MergeQueueRows` row and no
+entry of any kind in the plan store: the `scripted` probes that made zero plan calls.
+
+### 16.2 H2 — the state model, and why a new member rather than a flag
+
+**The choice.** `WorkerMergeState` gains `VerificationFailed`, a real, non-terminal member of the existing
+machine. Reachable from `Verifying` and from nowhere else; leaves to `Verifying` (retry), `Working` (the
+agent pushed a fix) and `Discarded` (the human dropped it).
+
+**Why not the alternatives.**
+
+- *Keep `Working` and carry the verdict as a side fact.* This is what the code effectively did — the red
+  record was sitting in `_lastVerification` the whole time — and it is exactly what produced the defect:
+  every consumer switches on the state, so the fact existed and nothing read it. A fact no surface consults
+  is the shape this repository keeps paying for (MG-12, MG-10).
+- *A boolean `LastRunFailed` beside the state.* Two things that must agree, updated in two places, with the
+  state machine unable to refuse an impossible pair (`Verified` + failed). The enum already IS the vocabulary
+  every surface renders; adding a second one is a parallel state machine, which the brief ruled out and which
+  is the right call.
+- *Make it terminal, like `Rejected`.* Tempting and wrong. A failing test is the most ordinary event in the
+  system and the branch is still the agent's to fix; a terminal state would mean every red run needed a
+  human to discard the entry and the agent to be re-spawned.
+
+**What it can and cannot do.** No edge to `Merged` — there is no passing record, and `CanMerge` refuses on
+the state before it ever looks at one. No edge to `Rejected` — that is a verdict on *reviewed* work, and
+`TryReject` already says so verbatim ("only a verified branch can be rejected in review … discard the entry
+instead"). Discard works from it, as it does from every non-terminal state.
+
+**The distinction the fix must not blur, and nearly did.** A verification that is *refused before it runs*
+(no jail, a drifted branch, a malformed verify command) writes no record and still settles to `Working`.
+Both paths call the same `SettleAfterVerificationLocked`, so routing both to the new state is a two-character
+mistake that would turn "we could not run your tests" into "your tests failed" — the one distinction the
+merge decision rests on, and the thing PR #322 exists for. M2 in the log below is that mutation.
+
+**What a failed row offers.** Retry (the human's Verify, which is a legal `VerificationFailed → Verifying`
+edge) and Discard. Not Reject, not Merge.
+
+**What happens when the agent pushes a fix** — and this is the part that would otherwise have made the new
+state a trap. Nothing in the daemon calls `MergeQueue.NotifyNewCommits` for a locally-spawned agent, so a
+push does not walk an entry back to `Working` by itself. `VerificationFailed` therefore joins `Working` and
+`StaleVerified` in `WorkerReadinessTrigger`'s eligible set: the trigger's **once-per-tip** bound means it
+fires only for a tip that has never been attempted, i.e. only for work pushed *since* the failure. Without
+that arm a worker that repaired its own branch would sit red forever. (`Verified` is still not re-fired on a
+push — the machine has no `Verified → Verifying` edge, and inventing one here would be the trigger changing
+the merge spine instead of triggering it. That limitation is unchanged.)
+
+**The third surface.** `MergeQueueProvisioner.MarkMergeState` is what a coordinator's `get_worker_status`
+reads (contract §3). It had no arm for the new state and would have fallen to `_ => null` — so the state fix
+would have reached two surfaces and left the coordinator, whose reader is an agent that acts on the answer,
+still hearing "Back at work". It now says the tests failed and what to do about it.
+
+**No migration.** `MergeQueueRow.State` is a TEXT column and the member was appended to the enum, so existing
+rows are untouched and rehydrate exactly as before.
+
+### 16.3 H3 — the outcome, logged
+
+`WorkerReadinessTrigger.RunAsync` announced `…verifying`, logged both of its *catch* arms, and said nothing
+at all on the path that actually completes. `MergeQueueGrpcService.RunVerification` had the mirror-image
+gap: it logged every refusal and never a result. Both now log the verdict, the resolved command, the
+resulting state and **the artifact path**, so the output is one `cat` away instead of a directory to guess
+at. The verdict word comes from `record.Passed` — the daemon-observed container exit the queue itself
+settled from — and never a second opinion; the resulting state is logged separately because a run whose
+entry was discarded mid-flight settles nowhere, and a line asserting the transition would be wrong exactly
+then.
+
+### 16.4 H4 — the output, made reachable
+
+The artifact was written, its path recorded in SQLite, and **no wire carried any of it**: `QueueEntry` had
+no verification field, and the client projection hardcoded `Verification: null`. Two additions:
+
+- `QueueEntry` gains `last_verification_passed` (**`optional`**), `last_verification_command` and
+  `last_verification_at`. The `optional` is load-bearing for the same reason `has_live_sandbox` is optional:
+  a proto3 `bool` defaults to false, so a plain field would make "never verified" and "failed" the same value
+  again — H2's defect reintroduced one layer down. M10 is that mutation.
+- A new `GetVerificationLog` RPC returning the artifact's **content**, never its path (G-14; a daemon path is
+  also useless to a client that is not on that machine). Bounded to 256 KiB, and it returns the **tail** —
+  a test runner prints its failures last, so truncating from the front truncates away the reason the human
+  opened the log. Three answers are kept apart: *no record*, *a record whose artifact reads*, and *a record
+  whose artifact is gone* (which keeps the verdict and states why the output is missing). Collapsing the
+  third into an empty log would render a deleted artifact as a suite that printed nothing.
+
+**Not added to the coordinator deny-list**, deliberately. `GetMergeDiff` — the entire branch-vs-main diff —
+is already open to the coordinator role on this same service, so denying the test output would be theatre
+next to it; and a coordinator steering a worker has a legitimate need for the failure. Recorded here rather
+than left as an unexplained absence.
+
+### 16.5 G1 — a queue row now requires an approved plan
+
+**What was already true.** `WorkerPlanGate` IS an `IMergeGate` and IS in every queue's `gates`, so
+unapproved work genuinely could not merge. That boundary was real and is untouched.
+
+**The boundary added, and the one deliberately not.** The row is gated; the **publish is not**. A branch
+existing is not the harm — F1 (§12.1) established that branches must survive teardown, so gating publication
+would destroy work to fix a display problem. A queue row is different in kind: it is a claim on human
+attention that arrives carrying Verify, i.e. the daemon offering to spend a test-suite run on work nobody
+authorised. `MergeQueueProvisioner.EnsureEntry` now asks the gate — the *same* `Allows` the merge already
+asks, so an id the gate never held (manual agents, external-PR heads, seeded entries) is permitted here
+exactly as it is permitted to merge. A second opinion about what "approved" means is how one of the copies
+goes decorative (MG-12).
+
+**The half that makes it a fix rather than a regression.** Every coordinator-spawned worker is spawned
+*before* it has presented anything, so withholding without a way back would mean no legitimate worker ever
+got a row. `AdmitDeferredEntries` creates the owed rows, subscribed in the composition root to
+`PlanApprovalService.PlanApproved` — the exact moment the gate's answer changes. It **re-asks the gate** for
+every candidate rather than trusting the event: the event says *a* plan was approved, which is not the same
+claim as "this agent may have a row" (M8). Deferred rows are dropped on admission and on `Remove(repo)`, so
+the set is bounded the way `AgentRefMediator`'s per-agent gates are.
+
+Phase 2's §2.2 has been corrected to say what the gate governs (task delivery, steering, verification, the
+queue row, the merge) and to state out loud that publication is not on that list.
+
+### 16.6 The mutation log
+
+Every guard broken, rebuilt, and watched failing. (`mv` on restore preserves mtime and MSBuild then skips
+the rebuild, so every restore here is followed by `touch`; two mutations that did not compile were redone
+by hand rather than trusted — a `--no-build` run over a stale binary reports a pass that means nothing.)
+
+| # | mutation | tests that caught it |
+|---|---|---|
+| M1 | a failed run settles to `Working` again (H2 undone) | 8 — `RunVerification_Fail_SettlesToVerificationFailed…`, `VerificationFailed_SurvivesARestart`, `…NewCommits_ReturnToWorking…`, `AFailingRun_SettlesThroughTheQueue…`, +4 trigger tests |
+| M2 | the **refusal** path also routed to `VerificationFailed` | 3 — `RunVerification_RefusedBeforeItRan_StaysWorking_AndIsNotAFailure`, `NoTestCommand_Throws_Typed_AndReturnsToWorking`, `ARefusedVerification_RecordsNothing…` |
+| M3 | `VerificationFailed` falls back to the generic gate reason | 4 — incl. `AFailingRealExit_LeavesTheBranchUnmergeable`, `SeedVerifyFail_SettlesToVerificationFailed…` |
+| M4 | the trigger stops logging the outcome (H3 undone) | 2 — `AFailedRun_LogsTheOutcome_WithTheVerdictAndTheArtifact`, `APassingRun_AlsoLogsItsOutcome` |
+| M5 | the trigger stops firing from `VerificationFailed` (the self-healing arm) | 2 — `AFailedEntry_IsReVerified_WhenTheAgentPushesAFix…`, `AGrinderIsHeldOffByTheCooldown…` |
+| M6 | the queue-row plan gate removed (G1 undone) | 5 of `QueueRowRequiresApprovedPlanTests` |
+| M7 | the gate becomes default-**deny** for ids it never held | 2 — `AnAgentTheGateNeverHeld_GetsItsRowUnchanged`, `AnAlreadyApprovedWorker_GetsItsRowImmediately` |
+| M8 | `AdmitDeferredEntries` trusts the caller instead of re-asking the gate | 1 — `AdmitDeferredEntries_ReAsksTheGate_AndLeavesUnapprovedWorkersDeferred` |
+| M9 | the composition root stops subscribing `PlanApproved` | 1 — `AWorkerWithNoApprovedPlan_GetsNoRow_UntilItsPlanIsApproved` |
+| M10 | the wire's verdict becomes a plain `bool` | 1 — `AnEntryThatWasNeverVerified_CarriesNoVerdictAtAll` |
+| M11 | a missing artifact renders as an empty log | 1 — `GetVerificationLog_WhenTheArtifactIsGone_KeepsTheVerdict_AndSaysWhy` |
+| M12 | `ReadTail` returns the head instead of the tail | 1 — `ReadTail_KeepsTheEndAndSaysItTruncated` |
+
+M7 is the one worth reading twice. It is the *only* mutation whose damage is invisible in the tests about
+the defect being fixed — every G1-positive test still passes with a default-deny gate, because they are all
+about workers the gate holds. What fails is the pair of negatives about agents it never held, and without
+those the fix would have silently emptied the merge queue of every manual and external-PR branch: a far
+larger failure than the one being repaired.
+
+### 16.7 Left alone, deliberately
+
+- **The client-side rendering of the verification output.** The daemon now carries the verdict and serves
+  the log; `DaemonBackedOrchestrator` still hardcodes `Verification: null` and there is no
+  `GetVerificationLogAsync` on the client. That is Agents.UI work, concurrent with this change, and taking
+  it here would have meant editing another agent's files mid-flight. Both new wire facts are additive, so
+  the client work is a read, not a migration.
+- **`NotifyNewCommits` still has no production caller for local agents**, so a push does not itself
+  invalidate a `Verified` entry. The automatic trigger covers the case this change created
+  (`VerificationFailed` → re-verify on a new tip) and nothing more; widening it to `Verified` is a change to
+  the merge spine and belongs on its own.
+- **The stranded-jail reason does not override the failure reason.** A `VerificationFailed` entry whose jail
+  is gone reports the verdict, not `StrandedReason`. The verdict is the more actionable truth about that row,
+  and `has_live_sandbox` already reaches the surface separately and withholds Verify on its own.

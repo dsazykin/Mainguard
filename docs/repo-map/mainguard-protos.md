@@ -62,7 +62,13 @@
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
+    unmergeable branch rather than a gate; **H2/H4 add the entry's last VERDICT and a way to read its
+    output** — `QueueEntry.last_verification_passed` (**`optional`** for the same reason
+    `has_live_sandbox` is: a proto3 `bool` defaults to false, so a plain field would make "never verified"
+    and "failed" the same value again, which is the very defect the new `VerificationFailed` state fixes
+    one layer up), `last_verification_command`, `last_verification_at`, and the **`GetVerificationLog`**
+    rpc returning the artifact's CONTENT (never its daemon path — G-14), tail-bounded with an explicit
+    `truncated`, and distinguishing "no record" from "a record whose artifact is gone" from "the log"; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
     entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
     takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
     untouched); `RejectEntry` is the review verdict "no" — terminal `Rejected`, legal only from

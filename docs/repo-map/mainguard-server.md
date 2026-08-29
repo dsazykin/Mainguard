@@ -248,6 +248,10 @@
     `TerminalStreamer` pump drains the PTY into VT-safe frames kept in a bounded 512 KB replay ring and
     fanned out to subscribers (re-attach renders the missed output composed; a stalled attach is
     completed, never unbounded), input/resize forwarding, and `Kill` only on StopAgent/teardown.
+    `WriteInputAndAwaitOutputAsync` writes and then waits a bounded window for the CLI to produce
+    output — the only in-band evidence the daemon has that a write was CONSUMED rather than merely
+    accepted by the PTY master (necessary, not sufficient: a CLI already mid-turn satisfies it anyway;
+    its weight is negative — an idle CLI that emits nothing after a keystroke did not see one).
   - **`Runtime/AgentCliBinder.cs`** (PR3) — binds a launched jail's CLI to a real TTY: the default
     factory spawns `docker exec -i -t` under a daemon-side forkpty PTY from the pure `BuildPtyLaunch`
     plan (`CliPtyLaunch`: `SandboxCliLaunch` argv, interactive tty + attached stdin, explicit `TERM` on
@@ -258,6 +262,11 @@
     and marks the session `Dead` when the CLI exits — auditing `cli_exited` with the exit code + the
     VT-stripped output tail (`BoundTerminalSession.TailText`), the bound session staying registered so
     attaching to the dead agent's terminal still replays its final output (the why).
+    Also owns `TrySendPromptAsync` — the ONLY write path into a worker's CLI (coordinator contract §3
+    `send_worker_prompt`), returning `PromptDelivery(Submitted, Reacted, Refusal)`. It encodes the line
+    through `TerminalSubmit` (**CR, not LF** — the shipped `prompt + "\n"` typed into the input box and
+    pressed nothing, so the tool had never once worked) and reports whether the CLI was observed
+    reacting inside `PromptReactionWindow`.
   - **`Runtime/AgentSpawnService.cs`** (PR3) — the ONE spawn/stop workflow behind BOTH entry points (the
     `SpawnAgent` RPC and the coordinator's in-jail `mainguard-agent` shim): kill-gate → session record
     (with role) → **the phase-2 task withhold** (`WorkerPlanGate.Hold`, armed the instant the id is
@@ -608,7 +617,11 @@
   — P2-13 carried-in from P2-08 maps the proto `Budget`'s per-day caps
   (`usd_micros_cap_per_day`/`token_cap_per_day`) too, so per-day is displayable+editable over gRPC;
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
-  stream) / **`MergeQueueGrpcService.cs`** (P2-10: `StreamQueue` re-pushes on the queue's `Changed`
+  stream) / **`MergeQueueGrpcService.cs`** (P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
+  refusal and never a verdict — and **`GetVerificationLog`** serves the run's artifact CONTENT, bounded to
+  the last 256 KiB via `ReadTail` (the tail, because a runner prints its failures last) and answering "no
+  record" / "artifact gone" / the log as three distinct things; `Snapshot` carries the entry's verdict,
+  command and timestamp so a client can render what the state word stands for: `StreamQueue` re-pushes on the queue's `Changed`
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
   list can badge external-PR entries, plus `verification_in_flight` (via
   `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run

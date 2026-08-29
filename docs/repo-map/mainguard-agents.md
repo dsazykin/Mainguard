@@ -21,6 +21,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation
     counting; returns the largest prefix that never splits a VT sequence or UTF-8 codepoint — the
     correctness heart, split-at-every-offset tested).
+  - `TerminalSubmit.cs` (**how a line is SUBMITTED to a PTY-attached CLI**: `TryEncodeLine` normalises
+    embedded CR→LF — an embedded CR submits a *prefix* as its own turn — trims trailing whitespace,
+    refuses an empty message rather than writing a bare CR (which is Enter, pressed at whatever the CLI
+    has focused), and terminates with **CR (0x0D), never LF**. Measured against a real CLI under a
+    forkpty, not reasoned: a TUI runs the tty in raw mode so ICRNL translates nothing and LF is merely a
+    newline typed into its input box. Deliberately NOT a per-adapter manifest field — see
+    `docs/design/coordinator-phase-3-decisions.md` §16.2. Consumed by `AgentCliBinder`).
 - **`Terminal/Vterm/`** — the **P2-18 server-side terminal engine** (daemon-only at runtime; the
   client never loads native terminal code).
   - `VtermNative.cs` (P/Invoke over the pinned libvterm 0.3.3 — `build/libvterm/`; resolver:
@@ -1312,7 +1319,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Orchestrator/` (P2-10 merge queue + verification runs + stale invalidation — the
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
-      `GetState`/`LastChangedAt`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      `GetState`/`LastChangedAt`/`LastVerification`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      **H2: a FAILED run settles to `WorkerMergeState.VerificationFailed`, not to `Working`** — `Working`
+      is where a NEVER-verified entry sits, so red and never-run used to be the same value and every
+      surface said "not verified yet" about a branch whose tests had just failed; the new state is
+      non-terminal (retry / the agent's fix / discard), is reachable ONLY from the arm holding a red
+      record (a run REFUSED before it produced a verdict still settles to `Working` — "we could not run
+      your tests" is not "your tests failed"), and `CanMerge` renders the verdict plus the resolved
+      command instead of the generic reason. `LastVerification(agentId)` exposes the settled record —
+      pass or fail — so a transport can carry the verdict the state word stands for (H4);
       `LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory (rehydrated on restart, never
       restamped) so the rail can order its permanent history by when a verdict was GIVEN rather than by
       spawn order — ISSUES-LOG #13; every legal transition enumerated,
@@ -1422,7 +1437,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       daemon's whole lifetime and every merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were
       neither enforced nor bypassable, they simply were not running. Builds a repo's queue on the events
       that make a repo active (ProvisionRepo / CreateWorktree / a jailed spawn) over the same persisted
-      stores and, load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
+      stores. **G1: `EnsureEntry` now asks the plan gate before creating a row.** Three `scripted` probes
+      that made zero plan calls each got a merge-queue row while `get_worker_status` said "no work is
+      authorised"; a row is a claim on human attention that arrives carrying Verify, so it requires an
+      approved plan. A withheld row is REMEMBERED (`DeferredEntries()`) and created by
+      `AdmitDeferredEntries()` — subscribed in the composition root to `PlanApprovalService.PlanApproved`,
+      the moment the gate's answer changes — which RE-ASKS the gate per candidate rather than trusting the
+      event. Ids the gate never held (manual agents, external-PR heads, seeded entries) are permitted
+      exactly as before; default-deny there would silently empty the queue. `MarkMergeState` gained a
+      `VerificationFailed` sentence, so a coordinator's `get_worker_status` learns its worker's tests
+      failed instead of hearing "Back at work". Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
@@ -1643,7 +1667,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Allows`'s permissive default exists so manual-mode agents and external-PR heads are not blocked from
       merging, and reading it as consent would start spending test-suite runs on every agent in the daemon;
       and the type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
-      approved cannot merge even if it verified green. Also owns the legible-stall text —
+      approved cannot merge even if it verified green — and, since G1, the same `Allows` decides whether the
+      worker gets a merge-queue ROW at all (`MergeQueueProvisioner.EnsureEntry`). What it does NOT gate is
+      PUBLICATION: `AgentRefMediator` never asks it, deliberately, because F1 requires an agent's branch to
+      survive teardown. Also owns the legible-stall text —
       `BlockedWorkerCount`/`EscalatedWorkerCount`/`BackpressureSignal` render "6 workers are waiting on
       your approval … the coordinator has stopped spawning", which the contract makes a requirement).
     - `WorkerReadinessTrigger.cs` (**phase 2's AUTOMATIC verification trigger**, and nothing more than a
@@ -1662,7 +1689,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       error. **A refusal never becomes a result:** a throw out of the run means the verification was refused
       before it produced a verdict, the queue wrote no record, and this type logs and stops — it holds no
       verification store, so it cannot turn "we could not run your tests" into "your tests failed" (the
-      defect PR #322 fixes). Fires only from `Working` / `StaleVerified`, never creates a queue, and returns
+      defect PR #322 fixes). **H3: it now logs the OUTCOME too** — it announced `…verifying` and logged both
+      of its catch arms while saying nothing at all on the path that completes, so a live run left six
+      "verifying" lines and zero results in the daemon log; the completion line carries the verdict, the
+      resolved command, the resulting state and the ARTIFACT PATH, so the output is one `cat` away.
+      Fires from `Working` / `StaleVerified` / **`VerificationFailed`** — the last one is required, not
+      optional: nothing calls `NotifyNewCommits` for a local agent, so without it a worker that repaired
+      its own red branch would sit failed forever; the once-per-tip bound means it fires only for work
+      pushed SINCE the failure. Never creates a queue, and returns
       a `ReadinessDecision`/`ReadinessOutcome` per examined worker so "why did this NOT fire" is answerable.
       `PollOnce()` + an injected clock + `DriveManually` make every timing rule assertable without sleeping.
       Rationale, the rejected candidates and the stated known limitation live in

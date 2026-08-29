@@ -124,7 +124,9 @@ public static class GatewayServiceRegistration
         // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
         // MergeDispatch contend for, since the one-outstanding-merge-per-repo invariant only spans origins
         // while they share one store (MG-23).
-        services.AddSingleton(sp => new MergeQueueProvisioner(
+        services.AddSingleton(sp =>
+        {
+            var provisioner = new MergeQueueProvisioner(
             registry: sp.GetRequiredService<MergeQueueRegistry>(),
             repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
             leases: sp.GetRequiredService<IMergeLeaseStore>(),
@@ -229,7 +231,39 @@ public static class GatewayServiceRegistration
                 sp.GetRequiredService<PlanApprovalService>().LatestForWorker(agentId) is
                 { Status: PlanStatus.Approved } approved
                     ? approved.Plan
-                    : null));
+                    : null);
+
+            // ---- G1: the other half of "a queue row requires an approved plan" -------------------------
+            //
+            // MergeQueueProvisioner.EnsureEntry now WITHHOLDS the row for a worker still at the plan gate,
+            // which at spawn time is every coordinator-spawned worker there has ever been. Approval is the
+            // moment the gate's answer changes, and therefore the moment those withheld rows are owed — so
+            // this subscription is not a nicety, it is what keeps the normal path working. Without it a
+            // legitimately approved worker would simply never appear in the queue.
+            //
+            // Subscribed HERE because this factory is the one place that holds the provisioner instance; a
+            // wiring step in a hosted service would be a second thing to delete, and "registered but never
+            // running" is the defect class this whole subsystem exists to have repaired once (MG-10).
+            //
+            // The approved plan is deliberately ignored: the event says *a* plan was approved, and
+            // AdmitDeferredEntries re-asks the gate about each deferred candidate itself. Threading the id
+            // through as a hint would put the authorisation rule in two places, and MG-12 is the standing
+            // reason not to. Swallowing is the same posture as MergeQueue's onStateChanged — creating a
+            // queue row may never fail the human's plan approval.
+            sp.GetRequiredService<PlanApprovalService>().PlanApproved += _ =>
+            {
+                try
+                {
+                    provisioner.AdmitDeferredEntries();
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"merge queue — admitting plan-gated queue rows failed: {ex.Message}");
+                }
+            };
+
+            return provisioner;
+        });
 
         services.AddSingleton(sp =>
         {

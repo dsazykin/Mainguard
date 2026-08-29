@@ -1018,6 +1018,17 @@
   onto; no worktree and a substrate-less manager each report as such rather than as success; and the
   message — the one thing a worker supplies — is flattened to a single bounded subject, with an absent
   one defaulting rather than losing the work.
+- **`Mainguard.Tests/TerminalSubmitTests.cs`** — how a line is SUBMITTED to a PTY-attached CLI, at the
+  byte the CLI acts on. The terminator is **CR (0x0D), never LF**, asserted as its own case because it
+  is the entire defect `send_worker_prompt` shipped with: `AgentCliBinder` wrote `prompt + "\n"` for the
+  whole life of the coordinator's only steering channel, and in a live run three prompts to two workers
+  sat unsubmitted and accumulated in their input boxes while every layer above logged success. Also
+  pins the guards around it: embedded newlines survive (a multi-line steer arrives intact, submitted
+  once); an embedded CR is rewritten to LF, since it would otherwise submit a *prefix* as its own turn
+  and strand the remainder — CRLF text arrives that way routinely; trailing whitespace is trimmed; and
+  an empty message is REFUSED rather than encoded as a bare CR, which is Enter pressed at whatever the
+  CLI has focused (a permission dialog's highlighted option). The rules are measured against claude-code
+  v2.1.251 under a real forkpty — transcripts in `docs/design/coordinator-phase-3-decisions.md` §16.1.
 - **`Mainguard.Tests/AdapterInitialPromptTests.cs`** — the manifest half of the first turn:
   `initialPromptStyle`, which only `claude-code` declares (`first-positional`; asserted that no other
   shipped adapter does). Every unreadable spelling is REFUSED at parse with
@@ -1573,7 +1584,19 @@
   — the latter paired with the positive that the *merge* gate still allows that id, which is what makes the
   stricter predicate deliberate; an in-flight run deferred rather than fought over; a `Verified` entry left
   alone because no legal edge to `Verifying` exists; and a repo with no queue skipped rather than
-  provisioned. All sixteen mutations of the fix were watched go red),
+  provisioned. **H2/H3 add**: a failing run settling at `VerificationFailed` rather than at the default
+  `Working`; the outcome being LOGGED with its verdict, command and artifact path (both a failure and the
+  paired pass, so the log's silence is trustworthy); and a failed entry being re-verified when the agent
+  pushes a FIX but never on the same tip — the arm without which the new state would be one a worker's own
+  repair could not get it out of. All sixteen mutations of the fix were watched go red),
+  **`QueueRowRequiresApprovedPlanTests`** (defect G1 — a merge-queue ROW now requires an approved plan,
+  over a real bare mirror. The row is withheld for a worker the plan gate holds with nothing approved (the
+  `scripted` probe, reproduced) and for one whose plan is merely PENDING; it appears when the plan is
+  approved, and `AdmitDeferredEntries` RE-ASKS the gate so a pass triggered by someone else's approval
+  leaves an unapproved worker deferred. The two negatives are the load-bearing half: an agent the gate
+  never held — a manual agent, an external-PR head — and a provisioner given no gate at all must both get
+  their rows exactly as before, because a default-deny here would silently empty the queue of every
+  non-coordinated branch, which is a larger failure than the one being fixed),
   **`CoordinatorPlanDecisionTests`** (phase 2 — the human half of the same gate: Approve/Reject must never
   latch disabled, since the blocked worker on the card holds its jail and its slot against the worker cap
   and the click is the only thing that clears it. Covers the decision throwing, the decision returning
@@ -1873,20 +1896,44 @@
   decide twice, and the revision counter survives — a reset counter would grant unlimited revisions with
   the cap still described everywhere and enforced nowhere. Mutation-checked: a `LoadAll` that returns
   empty fails all three),**
+  **`PlanGateOutlivesItsAgentTests` (a plan-gate card must not survive the agent it is about, and the
+  amber backpressure banner must not be able to disagree with the cards beside it. Field report: a worker
+  escalated, the human ended it, its jail was torn down — and its escalated card stayed on the gate,
+  stacking above the next pending plan, while the banner had already stopped counting it. Two populations:
+  the cards came off the persisted plan store, the counts off the plan gate's held-task table, which the
+  stop path clears. Drives the real in-proc daemon through the shipped `DaemonBackedOrchestrator`: an
+  escalated worker's card and count appear together, the session is stopped WITHOUT touching the plan
+  record, and both go away together; plus the general form over a mixed live/gone pair. Mutation-checked:
+  dropping the liveness filter and reading the counts off the gate again fails both),**
   **`CoordinatorToolPositivesTests` (the half of the four-tool surface nothing proved: that
   `send_worker_prompt` and `request_verification` can SUCCEED. Every assertion about either in the
   29-test `CoordinatorRoleLockTests` is a refusal, so a handler failing both unconditionally passed that
   whole suite — demonstrated, not asserted: stubbing the pty write to a silent no-op that still reports
   success fails this file and leaves all 31 role-lock tests green. A prompt needs a bound pty, which the
-  plan-gate substrate lacks, so a real `BoundTerminalSession` over a readable stub is bound through
-  `PlanGateRig.Terminals` and the assertion is on the BYTES that arrive — `"prefer the stdlib\n"`,
-  trailing newline included, since without it the text sits in the agent's input buffer and looks
-  delivered to everything upstream. The paired negative RELEASES the binding rather than assuming none,
+  plan-gate substrate lacks, so a real `BoundTerminalSession` over `RawModeCliDouble` is bound through
+  `PlanGateRig.Terminals`. **Corrected 2026-08-30:** the assertion used to be on the BYTES that arrive
+  (`"prefer the stdlib\n"`) — which proved delivery to the WRONG SIDE of the boundary and stayed green
+  over a tool that had never worked, since a PTY-attached CLI submits on **CR** and LF merely typed the
+  text into its input box. It is now on what the CLI received as a *submitted line* and on what was left
+  in its input box, plus the two-steers-in-a-row case that reproduces the live accumulation, the
+  embedded-CR case, and both readings of the reaction observation. The paired negative RELEASES the binding rather than assuming none,
   because a spawn binds one. `request_verification` is honest about its limit: it asserts the call gets
   PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
   fake environment goes — a true verification positive needs a real repo and belongs to the Docker
   tier),**
-  **`AgentIpcOutboxTests` (the file-framed half of the agent-IPC channel, at the daemon — the macOS fix.
+  **`RawModeCliDouble` (test support, not a test: a stand-in for a coding CLI attached to a PTY that
+  models the CLI's SIDE of the boundary — raw mode, CR submits the input buffer, LF inserts a newline
+  into it, a submit repaints. The behaviour was measured against claude-code v2.1.251 under a real
+  forkpty, not assumed. Exposes `SubmittedLines` / `PendingInput`, which is what lets a test tell "the
+  CLI received a submitted line" from "bytes reached the pty" — the distinction a `MemoryStream` byte
+  log cannot make),**
+  **`PromptDeliveryBinderTests` (`AgentCliBinder.TrySendPromptAsync` on its own, no IPC in front:
+  a whitespace-only prompt is refused and NO Enter is pressed at the CLI — a bare CR would confirm
+  whatever the CLI has focused — with a real-text control beside it, plus the no-bound-CLI case. It
+  exists separately because that guard is unreachable through `AgentSpawnService.PromptAsync`, which
+  rejects a blank prompt first, and a guard no test can turn red is indistinguishable from a deleted
+  one),**
+    **`AgentIpcOutboxTests` (the file-framed half of the agent-IPC channel, at the daemon — the macOS fix.
   Nothing here dials the socket: it puts bytes in the outbox exactly as an in-jail shim does (stage,
   rename, poll) and reads what comes back, because dialling the socket from the daemon's own process is
   what let a completely unreachable channel keep complete coverage. Pins that the same handler serves it
@@ -2063,7 +2110,22 @@
   `not verified yet` cleared; verifying does NOT merge and an always-refusing `IMergeGate` still
   refuses (the trigger weakens no gate); a `NoVerificationCommandException` surfaces as a quotable
   `Can't verify — …` with the branch back on Working rather than a phantom Verified; and no active
-  repo refuses with a reason instead of throwing into the UI thread); `ReviewCockpitOverlayAckTests` (the **review
+  repo refuses with a reason instead of throwing into the UI thread); **`VerificationOutcomeSurfaceTests`
+  (H2/H4 at the daemon's EDGE — what a client can actually LEARN about a verification.** Two causes met on
+  the wire: the state could not express a failure, and `QueueEntry` carried no verification facts, so even
+  a client that wanted to say something true had nothing to say it from. Through the shipped RPCs: a red
+  run reaching the client as `VerificationFailed` with the verdict in the gate reason rather than "not
+  verified yet"; a never-verified entry carrying NO verdict at all — the `optional` field is what keeps
+  "never run" from collapsing back into "failed", so this is the test that fails if it stops being optional;
+  `GetVerificationLog` returning the artifact's real stdout/stderr with the daemon's own path NOT on the
+  wire; the three answers kept apart (no record / artifact gone, verdict retained and reason stated / the
+  log); and `ReadTail` keeping the END of a long artifact and declaring the truncation, because a runner
+  prints its failures last); `MergeQueueWiringTests` also carries **G1's end-to-end half** — a
+  coordinator-held worker with no approved plan gets no queue row, and gets one the moment a human approves
+  its plan. It lives here and not only in the provisioner's unit tests because the second half depends on a
+  SUBSCRIPTION that exists only in the composition root; a unit test would pass with that line deleted, and
+  the result would be strictly worse than the defect (every approved worker silently missing from the
+  queue); `ReviewCockpitOverlayAckTests` (the **review
   cockpit overlay** against the same real in-proc daemon: an RT-D2-blocked branch surfaces its flagged
   item on the overlay, the overlay's own per-row acknowledge control is pressed, and the **daemon-side
   gate** then permits the merge it was refusing — asserted on `ChangedTestCommandGate` state and
