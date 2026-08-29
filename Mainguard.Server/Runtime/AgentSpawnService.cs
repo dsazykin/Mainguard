@@ -731,6 +731,28 @@ public sealed class AgentSpawnService
         _coordinatorHandlers.Keys.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>
+    /// The one way a refused shim spawn becomes visible: a warning naming the coordinator, and a
+    /// <c>shim_spawn_refused</c> audit entry.
+    ///
+    /// <para><b>Why it is a named method (G3).</b> Two of the three refusal branches in
+    /// <see cref="SpawnWorkerAsync"/> logged and audited; the third — a spawn carrying no agent kind at
+    /// all, which is precisely the shape a shim reports when it could not parse its own arguments —
+    /// answered the jail and told the daemon's operator nothing. Three copies of one report is how one of
+    /// them comes to be missing, and one of them was.</para>
+    /// </summary>
+    private void RefuseShimSpawn(string coordinatorAgentId, string agentKind, string reason)
+    {
+        _coordLog.LogWarning(
+            "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, reason);
+        _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
+        {
+            ["coordinator_id"] = coordinatorAgentId,
+            ["agent_kind"] = agentKind,
+            ["reason"] = reason,
+        }));
+    }
+
+    /// <summary>
     /// <c>spawn_worker</c> (contract §3) — start a Managed worker on the described task, under the caps.
     /// The described task itself goes to the plan gate, not into the jail.
     /// </summary>
@@ -740,10 +762,15 @@ public sealed class AgentSpawnService
         if (string.IsNullOrWhiteSpace(request.AgentKind))
         {
             var installed = _launcher.InstalledAgentKinds;
-            return new AgentIpcResponse(
-                Ok: false,
-                Error: "an agent kind is required (mainguard-agent spawn <agent-kind>): "
-                     + Mainguard.Agents.Agents.Ipc.AgentOperatingInstructions.SpellKinds(installed));
+            var noKind = "an agent kind is required (mainguard-agent spawn <agent-kind>): "
+                       + Mainguard.Agents.Agents.Ipc.AgentOperatingInstructions.SpellKinds(installed);
+
+            // G3: reported like the other two refusals below, and it was not. This is the shape a
+            // shim-side refusal arrives in — the shim reports an attempt it could not build rather
+            // than swallowing it (`report_refused_spawn`) — so a branch that answered silently was the
+            // one place a spawn could still fail with nothing anywhere.
+            RefuseShimSpawn(coordinatorAgentId, request.AgentKind ?? string.Empty, noKind);
+            return new AgentIpcResponse(Ok: false, Error: noKind);
         }
 
         // D1: a kind that maps to no installed CLI is refused HERE, before anything is minted. Left to
@@ -753,14 +780,7 @@ public sealed class AgentSpawnService
         // no session record, no jail and no worker slot.
         if (CoordinatorSpawnGate.RefuseUnknownKind(request.AgentKind, _launcher.InstalledAgentKinds) is { } unknownKind)
         {
-            _coordLog.LogWarning(
-                "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, unknownKind);
-            _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
-            {
-                ["coordinator_id"] = coordinatorAgentId,
-                ["agent_kind"] = request.AgentKind,
-                ["reason"] = unknownKind,
-            }));
+            RefuseShimSpawn(coordinatorAgentId, request.AgentKind, unknownKind);
             return new AgentIpcResponse(Ok: false, Error: unknownKind);
         }
 
@@ -772,14 +792,7 @@ public sealed class AgentSpawnService
         // definition, so the wire must carry both, and it is checked before anything is minted.
         if (WorkerPlanGate.RefuseBrief(request.Title, request.TaskPrompt) is { } briefRefusal)
         {
-            _coordLog.LogWarning(
-                "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, briefRefusal);
-            _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
-            {
-                ["coordinator_id"] = coordinatorAgentId,
-                ["agent_kind"] = request.AgentKind,
-                ["reason"] = briefRefusal,
-            }));
+            RefuseShimSpawn(coordinatorAgentId, request.AgentKind, briefRefusal);
             return new AgentIpcResponse(Ok: false, Error: briefRefusal);
         }
 

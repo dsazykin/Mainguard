@@ -34,15 +34,30 @@ public static class AgentSpawnShim
     /// <item><b>Order cannot be inverted</b>, because each argument says which one it is. A positional
     /// pair can be swapped by a model that read the usage once and remembered the wrong order, and the
     /// result — the task on the approval card and the title withheld — is exactly backwards.</item>
-    /// <item><b>The long argument needs no quotes.</b> <c>--task</c> takes every remaining word, so the
-    /// one that is hard to quote correctly does not have to be quoted at all.</item>
     /// <item><b>The short argument's quoting slip is DETECTABLE.</b> <c>--title</c> takes exactly one
     /// argument, so an unquoted multi-word title leaves stray words where <c>--task</c> must be, and the
     /// shim refuses with that exact diagnosis instead of shipping a one-word title. That detectability is
     /// the property the positional form cannot have.</item>
     /// </list>
+    ///
+    /// <para><b>Defect G3 (2026-08-29): <c>--task</c> is QUOTED, and this used to say the opposite.</b>
+    /// The original spelling ended <c>--task &lt;the task ...&gt;</c> and the instructions told a
+    /// coordinator the long argument "needs no quotes at all", on the reasoning that the parser joins
+    /// every remaining word. The parser does — but a shell parses the line first. The one command a
+    /// coordinator has is reached through its CLI's Bash tool, so <c>--task rewrite add() and
+    /// multiply()</c> never becomes argv at all: <c>bash: syntax error near unexpected token '('</c>,
+    /// exit 2. In a stress run two of three first spawns died exactly there, and task text describing
+    /// code carries <c>()</c>, <c>&amp;&amp;</c>, <c>|</c>, <c>$</c>, <c>*</c> and quotes constantly. The
+    /// taught form is now one the shell survives; the parser still joins a multi-word tail, so a
+    /// coordinator using the old form keeps working whenever its text happens to be shell-safe.</para>
+    ///
+    /// <para><b>What quoting cannot fix, and what was done instead.</b> Nothing in this file executes
+    /// after a shell has refused to parse the line — so no shim change can make that failure visible, and
+    /// none is claimed to. What IS now visible is every spawn that reaches the shim and cannot be built:
+    /// see <c>report_refused_spawn</c> below.</para>
     /// </summary>
-    public const string SpawnUsage = """spawn <agent-kind> --title "<short title>" --task <the task ...>""";
+    public const string SpawnUsage =
+        "spawn <agent-kind> --title \"<short title>\" --task \"<the task ...>\"";
 
     /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon). Composed
     /// from the shared <see cref="AgentIpcShimTransport"/>, which is the ONLY place either shim's
@@ -63,9 +78,20 @@ Usage:
 
   mainguard-agent list                                   alias of `status`
 
---title is the worker's BRIEF: a short, human-readable headline (quote it — it is ONE
-argument), and it is what the human sees on the plan-approval card. --task is the work
-itself and takes every word after it, so it needs no quotes.
+--title is the worker's BRIEF: a short, human-readable headline, and it is what the human
+sees on the plan-approval card. --task is the work itself.
+
+QUOTE BOTH. A shell parses this command line before Mainguard sees any of it, so an
+unquoted task describing code dies before anything runs -- exit 2, no worker, and nothing
+in the daemon's log, because nothing ran:
+
+  right: --title "Validate arithmetic inputs" --task "rewrite add() and multiply()"
+  wrong: --title "Validate arithmetic inputs" --task rewrite add() and multiply()
+         -> bash: syntax error near unexpected token `('   (and no request is sent)
+
+Use single quotes when the text itself contains double quotes. --title is exactly ONE
+argument: an unquoted multi-word title is detected and refused rather than silently eating
+the first words of your task.
 
 A spawned worker does NOT receive its --task until a human approves the plan the worker
 itself authors after inspecting the repository. Until then all it has is the --title, and
@@ -113,10 +139,40 @@ def spawn_request(argv):
     return {"op": "spawn", "agentKind": argv[2], "title": argv[4], "taskPrompt": task}, None
 
 
+def report_refused_spawn(argv):
+    """Tell the daemon a spawn was attempted here and could not be built.
+
+    Defect G3: a spawn that failed before becoming a request left NOTHING anywhere. In a stress
+    run two of three first spawns exited 2 with zero daemon log lines, and the outage read as
+    three coordinators thinking. A refusal only this process can see is a refusal nobody can
+    debug, so the attempt goes over the channel and the daemon refuses it there — which is what
+    produces the warning and the `shim_spawn_refused` audit entry.
+
+    It is sent as the incomplete spawn it is. NOTHING is derived: a field this parse did not
+    establish is sent absent, and a spawn missing either a title or a task is refused at the
+    channel before anything is minted (WorkerPlanGate.RefuseBrief, AgentSpawnService), so this
+    can never become a worker. The diagnosis the coordinator reads is still the local one below,
+    because only this process saw argv and can name the quoting slip.
+
+    Best effort by construction: an unreachable daemon must not turn a usage error into a
+    different error.
+    """
+    attempt = {"op": "spawn"}
+    if len(argv) > 2 and argv[2].strip() and not argv[2].startswith("-"):
+        attempt["agentKind"] = argv[2]
+    if len(argv) > 4 and argv[3] == "--title":
+        attempt["title"] = argv[4]
+    try:
+        call(attempt, 10)
+    except Exception:
+        pass
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "spawn":
         request, refusal = spawn_request(argv)
         if refusal:
+            report_refused_spawn(argv)
             sys.stderr.write("mainguard-agent: %s\n" % refusal)
             return 2
     elif len(argv) >= 2 and argv[1] in ("status", "list"):

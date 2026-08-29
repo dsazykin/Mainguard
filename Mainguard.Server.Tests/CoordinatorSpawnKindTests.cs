@@ -269,6 +269,34 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
         }
     }
 
+    // ---- G3: a spawn that fails leaves a record ---------------------------------------------------
+
+    /// <summary>
+    /// <b>Defect G3's second half.</b> A spawn carrying neither a kind nor a brief is exactly what the
+    /// shim reports when it could not parse its own arguments — and that branch used to answer the jail
+    /// and tell the daemon's operator nothing. Two of the three refusal branches logged and audited; this
+    /// was the third, and it is the one a reported failure lands in.
+    ///
+    /// <para>The count is a delta because the in-proc hosts share one run-scoped daemon DB.</para>
+    /// </summary>
+    [Fact]
+    public async Task ASpawnTheShimCouldNotBuild_IsRecorded_AndNotJustAnswered()
+    {
+        var coordinator = await SpawnCoordinatorAsync();
+        var before = RefusalsRecorded();
+        var sessionsBefore = _rig.Sessions.List().Count;
+
+        // Byte-for-byte what `report_refused_spawn` sends when even the agent kind could not be read.
+        var response = await CallAsync(coordinator, new AgentIpcRequest(AgentIpcRequest.SpawnOp));
+
+        Assert.False(response.Ok);
+        Assert.Equal(before + 1, RefusalsRecorded());
+        Assert.Equal(sessionsBefore, _rig.Sessions.List().Count);   // a report is never a spawn
+    }
+
+    private int RefusalsRecorded() =>
+        _rig.Audit.Read().Count(e => string.Equals(e.Type, "shim_spawn_refused", StringComparison.Ordinal));
+
     private string InstructionsFileFor(string agentId) =>
         File.ReadAllText(Path.Combine(_rig.Ipc.DirFor(agentId), AgentIpcPaths.InstructionsFileName));
 
@@ -354,6 +382,10 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
 
         /// <summary>The daemon's own catalog — the one source both the instructions and the refusal read.</summary>
         public InstalledAdapterCatalog Adapters => Host.Services.GetRequiredService<InstalledAdapterCatalog>();
+
+        /// <summary>The durable record a refused spawn has to leave (G3).</summary>
+        public Mainguard.Git.Audit.IAuditLog Audit =>
+            Host.Services.GetRequiredService<Mainguard.Git.Audit.IAuditLog>();
 
         public static SpawnKindRig Create(bool withAdapters = true)
         {

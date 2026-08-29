@@ -186,12 +186,13 @@ public class AgentIpcJailDockerTests
         var handle = await fx.SpawnAsync(
             agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
 
-        // Spelled exactly as the coordinator's operating instructions teach it — unquoted task tail
-        // included, which is the form a model actually produces.
+        // Spelled exactly as the coordinator's operating instructions teach it — including the QUOTED
+        // task, which is the G3 correction: this line reaches a real shell first, and a task describing
+        // code carries parentheses.
         var result = await fx.ExecAsync(handle.ContainerId, "sh", "-c",
             AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator)
             + " spawn claude-code --title 'Fix the token clock'"
-            + " --task rewrite TokenClock so expiry is computed in UTC and add boundary tests");
+            + " --task 'rewrite TokenClock so expiry is computed in UTC and add boundary tests'");
         _out.WriteLine($"spawn => exit {result.ExitCode} out='{result.Stdout.Trim()}' err='{result.Stderr.Trim()}'");
         _out.WriteLine($"daemon saw: title='{seen?.Title}' taskPrompt='{seen?.TaskPrompt}'");
 
@@ -206,12 +207,19 @@ public class AgentIpcJailDockerTests
     }
 
     /// <summary>
-    /// The pre-fix invocation — a bare positional prompt — is <b>refused by the shim itself</b>, without a
-    /// round trip, and the refusal names the form that works.
+    /// The pre-fix invocation — a bare positional prompt — is <b>refused, and never guessed at</b>, and
+    /// the refusal names the form that works.
     ///
     /// <para>Refusing rather than deriving is the decision: a derived title is how <c>brief == task</c>
     /// came back the first time. A coordinator that gets this message has everything it needs to retry
     /// correctly on its next turn.</para>
+    ///
+    /// <para><b>G3 changed what this asserts, deliberately.</b> It used to require that NOTHING reached
+    /// the daemon, which is a statement about a round trip rather than about the defect. What matters is
+    /// that the shim does not invent a brief. A refusal now DOES reach the daemon — as a report the
+    /// daemon refuses out loud, so a spawn that failed leaves a warning and an audit entry instead of
+    /// living only in this jail's stderr. So the assertion is the stronger one: whatever arrives carries
+    /// no task, therefore cannot be served, and no title was derived from one.</para>
     /// </summary>
     [RequiresDockerFact]
     public async Task TheRealShimsSpawn_RefusesTheOldTitlelessForm_AndSaysWhatToRunInstead()
@@ -219,11 +227,11 @@ public class AgentIpcJailDockerTests
         await using var fx = new SandboxFixture();
         using var ipc = new AgentIpcServer(NewRoot());
         var agentId = "ipcjail6";
-        var reached = false;
-        var dir = ipc.CreateEndpoint(agentId, (_, _, _) =>
+        AgentIpcRequest? reported = null;
+        var dir = ipc.CreateEndpoint(agentId, (request, _, _) =>
         {
-            reached = true;
-            return Task.FromResult(new AgentIpcResponse(Ok: true, AgentId: "w-1"));
+            reported = request;
+            return Task.FromResult(new AgentIpcResponse(Ok: false, Error: "refused by the test handler"));
         }, AgentIpcEndpointRole.Coordinator, Instructions);
 
         var handle = await fx.SpawnAsync(
@@ -233,10 +241,56 @@ public class AgentIpcJailDockerTests
             AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator)
             + " spawn claude-code rewrite TokenClock so expiry is computed in UTC");
         _out.WriteLine($"titleless spawn => exit {result.ExitCode} err='{result.Stderr.Trim()}'");
+        _out.WriteLine($"daemon saw: title='{reported?.Title}' taskPrompt='{reported?.TaskPrompt}'");
 
         Assert.NotEqual(0, result.ExitCode);
-        Assert.False(reached, "a title-less spawn reached the daemon — the shim guessed instead of refusing");
         Assert.Contains("--title", result.Stderr, StringComparison.Ordinal);
         Assert.Contains("--task", result.Stderr, StringComparison.Ordinal);
+
+        // The shim did not guess: no brief, no task. A spawn carrying neither is refused at the channel
+        // before anything is minted, which is what makes reporting it safe.
+        Assert.True(string.IsNullOrEmpty(reported?.Title), $"the shim derived a title: '{reported?.Title}'");
+        Assert.True(string.IsNullOrEmpty(reported?.TaskPrompt), "the shim sent a task it had not parsed");
+    }
+
+    /// <summary>
+    /// <b>Defect G3's second half, in a real jail: a spawn that fails is not invisible.</b> In a stress
+    /// run two of three first spawns exited 2 and produced ZERO daemon log lines, so three coordinators
+    /// stalling read as three coordinators thinking. Every spawn that reaches the shim and cannot be
+    /// built is now reported over the channel the jail already has.
+    ///
+    /// <para>The residual is stated rather than papered over: a line the SHELL refuses to parse never
+    /// starts the shim, so nothing can report it. That is why the other half of G3 is making the taught
+    /// form one a shell survives.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task ASpawnTheShimCannotBuild_StillReachesTheDaemon_SoItIsNotInvisible()
+    {
+        await using var fx = new SandboxFixture();
+        using var ipc = new AgentIpcServer(NewRoot());
+        var agentId = "ipcjail7";
+        var seen = new System.Collections.Concurrent.ConcurrentQueue<AgentIpcRequest>();
+        var dir = ipc.CreateEndpoint(agentId, (request, _, _) =>
+        {
+            seen.Enqueue(request);
+            return Task.FromResult(new AgentIpcResponse(Ok: false, Error: "refused by the test handler"));
+        }, AgentIpcEndpointRole.Coordinator, Instructions);
+
+        var handle = await fx.SpawnAsync(
+            agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
+
+        // An unquoted multi-word title — the one quoting slip the shim can see, and one it must not
+        // silently turn into a one-word title plus a corrupted task.
+        var result = await fx.ExecAsync(handle.ContainerId, "sh", "-c",
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator)
+            + " spawn claude-code --title Fix the token clock --task 'rewrite it'");
+        _out.WriteLine($"mis-split spawn => exit {result.ExitCode} err='{result.Stderr.Trim()}'");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.Contains("ONE quoted argument", result.Stderr, StringComparison.Ordinal);
+
+        var attempt = Assert.Single(seen);
+        Assert.Equal(AgentIpcRequest.SpawnOp, attempt.Op);
+        Assert.True(string.IsNullOrEmpty(attempt.TaskPrompt), "the report carried a task it had not parsed");
     }
 }

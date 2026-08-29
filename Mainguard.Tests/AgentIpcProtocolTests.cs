@@ -175,7 +175,7 @@ public class AgentIpcProtocolTests
             return; // no python3 on this box — nothing measured, nothing claimed
         }
 
-        var (title, task, refusal) = parsed.Value;
+        var (title, task, refusal, reported) = parsed.Value;
         if (expectedRefusal is null)
         {
             Assert.Null(refusal);
@@ -191,38 +191,117 @@ public class AgentIpcProtocolTests
             // Every refusal shows the form that works, with the shim's own path in it — a coordinator
             // reads this and retries; a refusal that only says "no" costs it a turn to rediscover.
             Assert.Contains(AgentSpawnShim.SpawnUsage, refusal!, StringComparison.Ordinal);
+
+            // <b>G3.</b> A refused spawn is REPORTED, so it exists somewhere other than this jail's
+            // stderr — two of three first spawns in a stress run exited 2 with zero daemon log lines.
+            Assert.NotNull(reported);
+
+            // …and reporting is not guessing. The attempt carries no task, so the daemon's channel
+            // check refuses it before anything is minted; a report that could be served would be a
+            // worse defect than the invisibility it fixes.
+            Assert.DoesNotContain("\"taskPrompt\"", reported!, StringComparison.Ordinal);
         }
     }
 
-    /// <summary>Runs the shim's own <c>spawn_request</c> under python3, or null where there is none.</summary>
-    private static (string? Title, string? Task, string? Refusal)? RunSpawnParser(string[] args)
+    /// <summary>
+    /// <b>Defect G3, both halves, measured through a real shell.</b> The taught form is what a
+    /// coordinator types into its CLI's Bash tool, so the claim "this form works" is a claim about what
+    /// <c>bash -c</c> does with it — not about what the parser would do given clean argv.
+    ///
+    /// <para>The instructions used to say <c>--task</c> "needs no quotes at all", reasoning that the
+    /// parser joins every remaining word. It does. But a task describing code contains <c>()</c>, and
+    /// <c>bash -c</c> never reaches the parser: <c>syntax error near unexpected token '('</c>, exit 2,
+    /// and — because nothing ran — nothing in the daemon's log either.</para>
+    /// </summary>
+    [Fact]
+    public void TheTaughtSpawnForm_SurvivesAShell_AndTheOldUnquotedOneDoesNot()
+    {
+        const string Task = "rewrite add() and multiply() so they reject non-numbers";
+
+        var quoted = RunSpawnParserThroughBash($"spawn claude-code --title 'Validate inputs' --task \"{Task}\"");
+        if (quoted is null)
+        {
+            return; // no python3/bash on this box — nothing measured, nothing claimed
+        }
+
+        Assert.Null(quoted.Value.Refusal);
+        Assert.Equal("Validate inputs", quoted.Value.Title);
+        Assert.Equal(Task, quoted.Value.Task);
+
+        // The advice that was there before, run: the shell kills the line and the shim never starts.
+        var unquoted = RunSpawnParserThroughBash($"spawn claude-code --title 'Validate inputs' --task {Task}");
+        Assert.NotNull(unquoted);
+        Assert.Null(unquoted!.Value.Title);
+        Assert.Null(unquoted.Value.Task);
+        Assert.Null(unquoted.Value.Reported);   // nothing ran, so nothing could be reported
+        Assert.Contains("syntax error", unquoted.Value.Refusal ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    /// <summary>What one driven run of the shim's <c>main()</c> produced.</summary>
+    /// <param name="Reported">The JSON of the request that reached the stubbed transport, or null when
+    /// none did. On a refusal this is the G3 report — the attempt the shim could not build, sent so the
+    /// daemon can refuse it out loud rather than the failure existing only inside the jail.</param>
+    private readonly record struct DrivenSpawn(
+        string? Title, string? Task, string? Refusal, string? Reported);
+
+    /// <summary>
+    /// Runs the taught command line through <c>bash -c</c> and then the shim's own <c>main()</c>, so the
+    /// shell is part of what is measured. Null where python3 or bash is unavailable.
+    /// </summary>
+    private static DrivenSpawn? RunSpawnParserThroughBash(string commandLine)
     {
         var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-shim-{Guid.NewGuid():N}");
         System.IO.Directory.CreateDirectory(dir);
-        var shim = System.IO.Path.Combine(dir, "mainguard_agent_shim.py");
-        var driver = System.IO.Path.Combine(dir, "driver.py");
-        System.IO.File.WriteAllText(shim, AgentSpawnShim.Script);
-        // Drives the shim's OWN main() with the transport stubbed, not `spawn_request` in isolation:
-        // the parser being right is worthless if main() does not route through it, and that wiring is
-        // exactly what the pre-2026-08-29 line got wrong. Stubbing `call` also proves a refused spawn
-        // never reaches the daemon at all.
-        System.IO.File.WriteAllText(driver, """
-            import contextlib, importlib.util, io, json, sys
-            spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            seen = {}
-            def fake_call(request, timeout=60):
-                seen["request"] = request
-                return {"ok": True, "agentId": "w-1"}
-            mod.call = fake_call
-            err = io.StringIO()
-            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-                code = mod.main(["/opt/mainguard/ipc/mainguard-agent"] + sys.argv[2:])
-            print(json.dumps({"exit": code, "request": seen.get("request"), "stderr": err.getvalue()}))
-            """);
         try
         {
+            var (shim, driver) = WriteDriver(dir);
+            var start = new System.Diagnostics.ProcessStartInfo("bash")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add("-c");
+            start.ArgumentList.Add($"python3 {Quote(driver)} {Quote(shim)} {commandLine}");
+
+            using var process = System.Diagnostics.Process.Start(start);
+            if (process is null)
+            {
+                return null;
+            }
+
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+
+            // The shell refused to parse the line: the shim never started, so there is no request, no
+            // report, and nothing on stdout. This is the failure the old advice produced.
+            if (process.ExitCode != 0 && stdout.Trim().Length == 0)
+            {
+                return new DrivenSpawn(null, null, stderr, null);
+            }
+
+            return Read(stdout);
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return null; // no bash or no python3 here
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    private static string Quote(string path) => "'" + path.Replace("'", "'\\''") + "'";
+
+    /// <summary>Runs the shim's own <c>main()</c> under python3, or null where there is none.</summary>
+    private static DrivenSpawn? RunSpawnParser(string[] args)
+    {
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-shim-{Guid.NewGuid():N}");
+        System.IO.Directory.CreateDirectory(dir);
+        try
+        {
+            var (shim, driver) = WriteDriver(dir);
             var start = new System.Diagnostics.ProcessStartInfo("python3")
             {
                 RedirectStandardError = true,
@@ -245,21 +324,7 @@ public class AgentIpcProtocolTests
             var stderr = process.StandardError.ReadToEnd();
             process.WaitForExit();
             Assert.True(process.ExitCode == 0, $"the shim's spawn parser threw: {stderr}");
-
-            using var document = System.Text.Json.JsonDocument.Parse(stdout);
-            var root = document.RootElement;
-            if (root.GetProperty("request").ValueKind == System.Text.Json.JsonValueKind.Null)
-            {
-                // Nothing reached the transport: the shim refused, and said so on stderr.
-                Assert.NotEqual(0, root.GetProperty("exit").GetInt32());
-                return (null, null, root.GetProperty("stderr").GetString());
-            }
-
-            var request = root.GetProperty("request");
-            Assert.Equal(0, root.GetProperty("exit").GetInt32());
-            return (request.TryGetProperty("title", out var t) ? t.GetString() : null,
-                    request.GetProperty("taskPrompt").GetString(),
-                    null);
+            return Read(stdout);
         }
         catch (System.ComponentModel.Win32Exception)
         {
@@ -269,6 +334,60 @@ public class AgentIpcProtocolTests
         {
             try { System.IO.Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
         }
+    }
+
+    /// <summary>
+    /// Writes the real shim plus a driver that runs its OWN <c>main()</c> with the transport stubbed —
+    /// not <c>spawn_request</c> in isolation. A correct parser that <c>main()</c> does not route through
+    /// is exactly the shape of the defect the 2026-08-29 change fixed, so the wiring is part of what is
+    /// measured. The stub also captures what — if anything — reached the daemon.
+    /// </summary>
+    private static (string Shim, string Driver) WriteDriver(string dir)
+    {
+        var shim = System.IO.Path.Combine(dir, "mainguard_agent_shim.py");
+        var driver = System.IO.Path.Combine(dir, "driver.py");
+        System.IO.File.WriteAllText(shim, AgentSpawnShim.Script);
+        System.IO.File.WriteAllText(driver, """
+            import contextlib, importlib.util, io, json, sys
+            spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            seen = {}
+            def fake_call(request, timeout=60):
+                seen["request"] = request
+                return {"ok": True, "agentId": "w-1"}
+            mod.call = fake_call
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = mod.main(["/opt/mainguard/ipc/mainguard-agent"] + sys.argv[2:])
+            print(json.dumps({"exit": code, "request": seen.get("request"), "stderr": err.getvalue()}))
+            """);
+        return (shim, driver);
+    }
+
+    /// <summary>Reads the driver's one JSON line into a <see cref="DrivenSpawn"/>.</summary>
+    private static DrivenSpawn Read(string stdout)
+    {
+        using var document = System.Text.Json.JsonDocument.Parse(stdout);
+        var root = document.RootElement;
+        var reached = root.GetProperty("request");
+        var reported = reached.ValueKind == System.Text.Json.JsonValueKind.Null
+            ? null
+            : reached.GetRawText();
+
+        // A refusal is spelled by the exit code, not by "nothing reached the transport" — since G3 a
+        // refused spawn DOES reach it, as a report the daemon then refuses out loud.
+        if (root.GetProperty("exit").GetInt32() != 0)
+        {
+            return new DrivenSpawn(null, null, root.GetProperty("stderr").GetString(), reported);
+        }
+
+        Assert.NotNull(reported);
+        return new DrivenSpawn(
+            reached.TryGetProperty("title", out var t) ? t.GetString() : null,
+            reached.GetProperty("taskPrompt").GetString(),
+            null,
+            reported);
     }
 
     [Fact]

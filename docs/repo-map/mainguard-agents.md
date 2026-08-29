@@ -138,14 +138,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
     <text>` / `verify <id>`, with `list` kept as an alias of `status` — and its docstring says plainly that
     there is no fifth. **Contract §3 change, 2026-08-29:** `spawn` takes `SpawnUsage` —
-    `spawn <agent-kind> --title "<short title>" --task <the task ...>` — a single-sourced constant
+    `spawn <agent-kind> --title "<short title>" --task "<the task ...>"` — a single-sourced constant
     interpolated into the shim's `--help`, its refusals, and `AgentOperatingInstructions.Coordinator`, so
     the three places a model reads this command cannot disagree. It used to send NO title, which is what
     made the daemon's `Title ?? TaskPrompt` fallback hand every worker its task as its "brief". Both flags
     are required and ordered, and `spawn_request` refuses rather than derives: named flags cannot be
-    swapped, `--task` swallows the unquoted tail so the hard-to-quote argument need not be quoted, and an
-    unquoted `--title` leaves stray words where `--task` must be — so the one remaining quoting slip is
-    *detected* rather than silently mis-split) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
+    swapped, and an unquoted `--title` leaves stray words where `--task` must be — so that quoting slip is
+    *detected* rather than silently mis-split. **Defect G3 (2026-08-29) quoted `--task` and made a refused
+    spawn visible.** The usage used to end `--task <the task ...>` and the instructions said the long
+    argument "needs no quotes at all" — true of the parser, false of the world: the coordinator reaches
+    this command through its CLI's Bash tool, so `--task rewrite add() …` dies at `bash: syntax error near
+    unexpected token '('` with nothing in the daemon's log, which is how two of three first spawns
+    vanished in a stress run. The taught form is now shell-safe (the parser still joins a multi-word tail,
+    so the old form keeps working where the text happens to be), and `report_refused_spawn` sends every
+    spawn the shim could NOT build over the channel — nothing derived, so the daemon's channel check
+    refuses it and the failure leaves a warning and a `shim_spawn_refused` audit entry instead of only
+    this jail's stderr) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
     **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
     **`commit <message>`** (the only route a jailed CLI has to a commit — measured against claude-code
     2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`).

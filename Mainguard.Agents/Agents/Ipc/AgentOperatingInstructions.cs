@@ -112,8 +112,13 @@ public static class AgentOperatingInstructions
         against it. **`--task` is withheld until a human approves the plan the worker writes.** The
         title is also the headline on that approval card, so it is what the human decides from.
 
-        - **Quote the title.** It is exactly ONE argument. `--task` takes every word after it, so the
-          long one needs no quotes at all.
+        - **Quote both.** Your command line is read by a shell before Mainguard sees any of it, so an
+          unquoted task describing code — `add()`, `a && b`, `$HOME`, `*.cs` — dies with
+          `syntax error near unexpected token` before anything runs: no worker, and no record. Write
+          `--task "rewrite add() and multiply() so they reject non-numbers"`, and use single quotes
+          when the text itself contains a double quote.
+        - **`--title` is exactly ONE argument.** An unquoted multi-word title is detected and refused,
+          so that slip can never quietly eat the first words of your task.
         - **Write the title like a pull-request title** — short, specific, human-readable:
           `--title "Fix token expiry in the auth clock"`.
         - **The title must not be the task.** A spawn whose title repeats its task is refused: a brief

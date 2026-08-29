@@ -104,6 +104,31 @@ public class AgentOperatingInstructionsTests : IDisposable
     }
 
     /// <summary>
+    /// <b>Defect G3 — the quoting advice has to be TRUE.</b> The text used to say <c>--task</c> "needs no
+    /// quotes at all", which is right about the shim's parser and wrong about the world: the coordinator
+    /// reaches its one command through its CLI's Bash tool, so a task describing code
+    /// (<c>rewrite add() …</c>) dies at <c>syntax error near unexpected token '('</c> before the parser
+    /// exists. Two of three first spawns in a stress run failed exactly there, with exit 2 and no daemon
+    /// log line, because nothing ran.
+    ///
+    /// <para>Pinned both ways: the warning must be present, and the sentence that caused it must be gone.
+    /// A negative assertion is worth having here because the failure mode is a well-meant edit restoring
+    /// the shorter, friendlier, false advice.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldAShellReadsItsCommandLine_AndIsNotToldTheTaskNeedsNoQuotes()
+    {
+        var text = Flatten(Coordinator());
+
+        Assert.Contains("read by a shell", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("syntax error near unexpected token", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs no quotes", text, StringComparison.OrdinalIgnoreCase);
+
+        // …and the form it is taught quotes the task, so the advice and the usage cannot disagree.
+        Assert.Contains("--task \"", AgentSpawnShim.SpawnUsage, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// And nothing else. An instruction naming a command the daemon refuses sends the agent to spend
     /// turns on a wall, then improvise around it — which is exactly the behaviour the role lock exists
     /// to remove.

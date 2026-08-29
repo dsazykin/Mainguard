@@ -1549,3 +1549,93 @@ mutated binary (§12.4). All numbers are `CoordinatorSpawnKindTests`, 10 tests.
 M2 is the one worth reading. It leaves both deliveries agreeing — they still come from one string — so
 every equality assertion stays green, and only the reflection test notices. That is exactly the state the
 codebase was in before `AgentIpcServer` was written: a latent defect with a green suite.
+
+### 15.2 Defect G3 — the quoting advice was false, and the failure it caused was invisible
+
+`2a087c71` §13.2 argued for two named flags partly on this ground:
+
+> the argument that is *hardest* to quote — the long free-form task — is the one that needs no quotes
+> at all.
+
+That is true of `spawn_request`, which joins `argv[6:]`. It is false of the coordinator, because the
+coordinator does not produce argv. It produces a **command line**, which its CLI hands to `bash -c`.
+
+**Reproduced first, at a shell on this machine:**
+
+```
+$ bash -c '... spawn claude-code --title "Fix the clock" --task rewrite add() and multiply() so they ...'
+bash: -c: line 1: syntax error near unexpected token `('
+exit=2
+```
+
+The shim never runs. Task text describing code carries `()`, `&&`, `|`, `$`, `*` and quotes constantly,
+so this is not an edge case — in the stress run two of three first spawns died here, exit 2, **zero
+daemon log lines**, and three coordinators stalling read as three coordinators thinking.
+
+#### Both halves, and why "a more robust invocation" is not one of them
+
+**(a) The advice is made true.** `AgentSpawnShim.SpawnUsage` becomes
+`spawn <agent-kind> --title "<short title>" --task "<the task ...>"`, and because that constant is the
+single source for the shim's `--help`, the shim's refusals and the coordinator's instructions, all three
+move together. The instructions now say *why* — a shell reads the line first — and name the exact error
+a coordinator will see, with a worked example containing parentheses. Naming the symptom matters: a model
+that has seen `syntax error near unexpected token` in its own transcript can connect the two.
+
+**The parser is unchanged and still joins a multi-word tail.** An existing coordinator using the old form
+keeps working whenever its text happens to be shell-safe, so nothing regresses; what changed is which
+form is *taught*. That is the whole of the "more robust invocation" available here — the hazard class
+shrinks from "any shell metacharacter in free-form English" to "a quote character in the text", which is
+the one a model is best trained to handle.
+
+**Why nothing stronger was built.** A `--task-file`, a heredoc form, or a stdin form would each be
+immune, and each adds a second spelling of the one command a coordinator has. §13.2's argument against a
+second positional applies verbatim to a second *form*: the caller is a language model that read the usage
+once, and the failure mode of two forms is that it composes them. The single quoted form is one thing to
+remember and it is shell-complete.
+
+**(b) A spawn that fails leaves a record.** This is the half that survives the advice being ignored.
+`report_refused_spawn` sends, over the channel the jail already has, the spawn the shim could not build —
+so the daemon refuses it, logs a warning naming the coordinator, and appends `shim_spawn_refused`.
+
+- **Nothing is derived.** A field the parse did not establish is sent absent. A spawn missing either a
+  title or a task is refused at the channel before anything is minted (§13.3's `RefuseBrief` call, which
+  exists precisely so a request carrying neither cannot become an ungated worker), so a report can never
+  be served. `AgentIpcJailDockerTests.TheRealShimsSpawn_RefusesTheOldTitlelessForm_…` now asserts that —
+  it used to assert that nothing reached the daemon at all, which is a statement about a round trip
+  rather than about the defect.
+- **This reverses §13.3's "before any round trip".** That sentence defended a local refusal as cheap,
+  and it is; what it did not weigh is that a refusal only the jail can see is a failure nobody can debug.
+  The local diagnosis is still what the coordinator reads — only the shim saw argv, so only the shim can
+  say *"found 'the' where --task was expected"*.
+- **The third refusal branch was silent, and it is the one reports land in.** Two of
+  `SpawnWorkerAsync`'s three refusals logged and audited; the "no agent kind" branch answered the jail
+  and told the operator nothing. Three copies of one report is how one comes to be missing, and one was:
+  it is now `RefuseShimSpawn`, called from all three.
+
+**What is still invisible, stated rather than papered over.** A line the shell refuses to parse never
+starts the shim, so nothing in this repository can report it — the daemon's only shadow of it is the
+existing `ipc_channel_silent` warning, and only for a coordinator that never calls at all. That is the
+reason (a) exists. One diagnostic property does fall out of (b): after this change, `exit 2` from a
+coordinator's spawn **with no daemon-side record** can only be the shell.
+
+#### The mutation log
+
+| # | mutation | went red |
+|---|---|---|
+| M5 | `SpawnUsage` reverts to the unquoted `--task <the task ...>` | `TheCoordinatorIsToldAShellReadsItsCommandLine_AndIsNotToldTheTaskNeedsNoQuotes` — 1 of 35 |
+| M6 | the instructions revert to "the long one needs no quotes at all" | the same test — 1 of 14 |
+| M7 | the shim stops reporting a spawn it could not build | `TheShimsSpawnParser_…` — **5 of 21**, every refusal row |
+| M8 | the report derives the task it could not parse | `TheShimsSpawnParser_…` — 5 of 21 |
+| M9 | the kind-less refusal stops being recorded | `ASpawnTheShimCouldNotBuild_IsRecorded_AndNotJustAnswered` — 1 of 11 |
+
+**And the shell test was checked for vacuity**, because it exits early where `bash` or `python3` is
+absent and a silently-skipping test proves nothing. Inverting its assertion produced the real thing:
+
+```
+String:    "bash: -c: line 1: syntax error near unexp"···
+Not found: "NOT-A-REAL-STRING"
+```
+
+`TheTaughtSpawnForm_SurvivesAShell_AndTheOldUnquotedOneDoesNot` runs the taught line through a real
+`bash -c` and then the shim's own `main()`: the quoted form arrives with `add()` intact, the unquoted
+form never reaches the shim, and — the point — reports nothing, because nothing ran.
