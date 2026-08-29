@@ -356,6 +356,24 @@
     on every platform — whether the jail can WRITE it is the container spec's decision — so the code path
     is exercised everywhere rather than only where it is load-bearing.
     The dir is created BEFORE the jail (it is a read-only mount source) and removed on stop. Identity is
+    **The outbox is jail-controlled, and treated that way (phase 3 §14).** The stated 64 KiB cap
+    inspected the wrong object: `FileInfo.Length` on a SYMLINK is the length of the link, so `ln -s
+    /dev/zero x.req` from inside a jail passed the cap, `File.Move` renamed the link, and the read
+    followed it — measured at 4.2 GB resident and still climbing, i.e. one symlink kills the daemon and
+    every running agent's control plane with it. A request is now claimed by renaming it into
+    `inflight/`, a daemon-only SIBLING of the outbox (inside the read-only IPC mount, outside the
+    read-write one), which removes the second writer and is what lets the checks that follow mean
+    anything: a symlink is refused unread, so is anything that is not a plain non-empty regular file (a
+    FIFO — creatable with no capability, indistinguishable from a file through every managed API — used
+    to park the poll loop in `open()` forever), and the byte cap is enforced by the READ rather than by
+    the stat that precedes it, which is what closes the grow-after-stat window. The directory is bounded
+    in aggregate too (`MaxOutboxFiles` / `MaxOutboxBytes`): past either, everything in it is deleted
+    unread and polling CONTINUES — a jail must not be able to fill the host's disk, and equally must not
+    be able to switch off a control plane the human depends on. Leftovers from a daemon that died
+    mid-call are cleared when the endpoint comes UP, never on a timer, because a claim that has sat for
+    hours is the normal shape of the plan gate. Every refusal goes through the existing capped
+    `ChannelObserver`, so there is no second reporting path.
+    Identity is
     positional — only that agent's jail has the mount — and the **role is fixed on the endpoint**, so a
     worker cannot reach a coordinator op by naming it and vice versa. One newline-delimited JSON request
     per connection (`AgentIpcProtocol`); malformed input gets an error response. Each connection is served

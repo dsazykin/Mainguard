@@ -103,7 +103,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
     with `daemon.sock` + **the one shim that agent's role is allowed**, and — **macOS fix** — the nested
-    read-write `outbox/` plus its request/claim/response suffixes and `MaxOutboxRequestBytes` — plus `AgentIpcEndpointRole`
+    read-write `outbox/` plus its request/claim/response suffixes, the daemon-only `inflight/` claim dir
+    that is its sibling rather than its child (renaming a claim ACROSS that line is what takes it out of
+    the jail's reach, so the daemon's checks about it hold until it is read), and the three bounds on a
+    jail-controlled directory — `MaxOutboxRequestBytes` per request, `MaxOutboxFiles` and
+    `MaxOutboxBytes` in aggregate) — plus `AgentIpcEndpointRole`
     (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
     `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`,
     and **`commit_work`** — the rung the loop was missing: a worker records its approved work on its own

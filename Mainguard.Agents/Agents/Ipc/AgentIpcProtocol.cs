@@ -89,8 +89,10 @@ public static class AgentIpcPaths
     /// — the rename is what makes "the daemon never reads half a request" structural rather than lucky.</summary>
     public const string OutboxStagingSuffix = ".tmp";
 
-    /// <summary>Suffix a claimed request carries while its handler runs. Claiming by rename is what stops
-    /// a second poll pass dispatching the same request again while the first is parked on a human.</summary>
+    /// <summary>Suffix a claimed request carries while its handler runs, in <see cref="InflightDirName"/>
+    /// rather than in the outbox. Claiming by rename is what stops a second poll pass dispatching the
+    /// same request again while the first is parked on a human; claiming ACROSS the writable boundary is
+    /// what stops the jail editing a request the daemon has already decided to read.</summary>
     public const string OutboxClaimSuffix = ".busy";
 
     /// <summary>Suffix the daemon stages a response under, distinct from <see cref="OutboxStagingSuffix"/>
@@ -101,11 +103,50 @@ public static class AgentIpcPaths
     public const string OutboxResponseSuffix = ".res";
 
     /// <summary>
+    /// The daemon-side directory a claimed request is renamed INTO. It is a sibling of the outbox inside
+    /// the IPC dir, which means it is inside the READ-ONLY mount and outside the read-write one: the jail
+    /// can see its own claimed request and can touch nothing about it.
+    ///
+    /// <para><b>Why the claim leaves the jail's directory.</b> Claiming used to rename a request within
+    /// the outbox, so the claimed path stayed in a directory the jail can write. Every check the daemon
+    /// then made about that path — is it a link, how big is it — was a separate syscall from the read
+    /// that followed, on a name the jail could still replace in between. Renaming ACROSS the boundary
+    /// makes the claimed entry immutable to the jail, and that is what turns those checks from advice
+    /// into guarantees: after this rename there is no second writer, so what was stat'd is what is
+    /// opened. See <c>AgentIpcServer</c>'s outbox remarks for the defect this closes.</para>
+    /// </summary>
+    public const string InflightDirName = "inflight";
+
+    /// <summary>
     /// The largest request the daemon will read off the outbox. A request line is a few hundred bytes;
     /// this is the bound on the one new thing a writable mount grants a jail — the ability to put bytes
-    /// in the daemon's data root. Anything larger is deleted unread.
+    /// in the daemon's data root.
+    ///
+    /// <para>It is enforced by the READ — the daemon stops after this many bytes and refuses — not by a
+    /// stat that precedes it. A stat is a promise about a path, and the outbox is a path the jail owns;
+    /// the read is a promise about the daemon's own memory, which is the thing actually being
+    /// protected.</para>
     /// </summary>
     public const int MaxOutboxRequestBytes = 64 * 1024;
+
+    /// <summary>
+    /// How many files one agent's outbox may hold before the daemon stops reading it and reclaims it.
+    ///
+    /// <para><see cref="MaxOutboxRequestBytes"/> bounds ONE request and nothing else, which left the
+    /// directory unbounded in count: a jail could fill the host's disk inside the daemon's data root 64
+    /// KiB at a time, and make the 100 ms sweep walk an ever-growing directory while it did. A shim
+    /// writes exactly one request and blocks until its answer appears, so a healthy outbox holds a
+    /// handful of files; sixty-four is roughly twenty concurrent calls, far past any legitimate burst and
+    /// far below anything that costs the daemon.</para>
+    /// </summary>
+    public const int MaxOutboxFiles = 64;
+
+    /// <summary>
+    /// How many bytes one agent's outbox may hold in total before the daemon stops reading it and
+    /// reclaims it. Sixteen full-size requests — the same reasoning as <see cref="MaxOutboxFiles"/>, for
+    /// the axis a file count does not bound.
+    /// </summary>
+    public const long MaxOutboxBytes = 16L * MaxOutboxRequestBytes;
 
     /// <summary>
     /// The daemon-side outbox directory inside an agent's IPC dir. One function, used by the daemon that
@@ -113,6 +154,11 @@ public static class AgentIpcPaths
     /// "the read-write mount is that dir and nothing else" is a single fact rather than three spellings.
     /// </summary>
     public static string OutboxIn(string ipcDir) => System.IO.Path.Combine(ipcDir, OutboxDirName);
+
+    /// <summary>The daemon-only claim directory inside an agent's IPC dir (see
+    /// <see cref="InflightDirName"/>). Never a mount source of its own — it rides the read-only IPC
+    /// mount, which is exactly what makes it daemon-only.</summary>
+    public static string InflightIn(string ipcDir) => System.IO.Path.Combine(ipcDir, InflightDirName);
 
     /// <summary>The in-jail shim path for a role — what the instructions tell that CLI to run.</summary>
     public static string SandboxShimPath(AgentIpcEndpointRole role) =>

@@ -1348,3 +1348,124 @@ reaches the daemon at all. Re-run against M9 it goes red, as it should have the 
 - **The old title-less invocation now fails.** That is intended and is the reason this is recorded as a
   contract change: an existing coordinator transcript that used it was producing a worker whose brief was
   its task, and the refusal names the form that works.
+
+## 14. Defect G1 — one symlink in an agent's outbox kills the daemon
+
+`a71bf2c3` gave every IPC endpoint an `outbox/` directory, bind-mounted **read-write** into the jail on
+substrates whose mount cannot carry an AF_UNIX socket. It stated one bound on the capability that grants:
+
+> anything past the cap is deleted unread rather than read into the daemon's memory
+
+The cap inspected the wrong object, and the directory had no aggregate bound at all.
+
+### 14.1 What was reproduced, before anything was changed
+
+The daemon's exact sequence, run by hand on this machine:
+
+```
+ln -s /dev/zero zero.req
+FileInfo("zero.req").Length   ->  9          # the length of the STRING "/dev/zero"
+                                             # (LinkTarget = "/dev/zero", Attributes = ReparsePoint)
+File.Move(req, claim)         ->  moves the LINK; rename does not follow
+File.ReadAllText(claim)       ->  follows it. RSS passed 4.2 GB and was still climbing
+                                  when the process was killed; it ends in OutOfMemoryException
+```
+
+So a coordinator — or any jail with an outbox — creates one symlink and the daemon dies. That is not one
+agent's channel: the daemon serves **every** running agent's control plane out of that process, and the
+kill needs no capability, no network, and one shell builtin.
+
+Three further measurements from the same session, each of which turned out to matter more than it looked:
+
+- **A FIFO is invisible to managed code.** `mkfifo x.req` needs no capability at all in a directory the
+  jail can write, and `new FileInfo(x)` reports `Attributes = Normal`, `LinkTarget = null`, `Length = 0`
+  — identical to an ordinary empty file. .NET 10 exposes **no** file-type API; there is nothing to ask.
+- **The blocking open is on the poll loop's own thread.** `File.ReadAllTextAsync` opens synchronously
+  before its first await, and `_ = ServeOutboxRequestAsync(...)` runs synchronously up to that point on
+  the caller. Measured: the whole sweep parks, so one FIFO ends that agent's file-framed channel for
+  good — worse than the "parks the handler task" the report expected.
+- **Stat and read are two syscalls on a path the jail owns.** A regular file that passes the cap can be
+  grown through a descriptor the jail kept open across the claim; `rename` does not invalidate it.
+
+**Confidentiality was checked and holds.** A line that does not parse produces the fixed string
+`"malformed request (expected one JSON line)"` toward the jail and a fixed `reason` in the observer; the
+only jail-supplied text that reaches a log line is `op`, control-stripped and truncated to 40 chars by
+`ChannelObserver.Echo`. Nothing that was read is echoed anywhere. The exposure is availability, exactly
+as reported. (One adjacent note, unchanged and pre-existing on both framings: a handler that throws
+returns `ex.Message` to the jail, so a daemon-side exception could name a host path. It is daemon code
+throwing, not attacker-shaped input, and it is not touched here.)
+
+### 14.2 The design, and the one that was measured wrong first
+
+**The rejected design was `O_NOFOLLOW`,** and it is worth recording why, because it is the obvious answer.
+.NET 10 has no no-follow open — `FileStreamOptions` carries no such flag — so it means P/Invoking
+`open(2)` with a hand-written flag table. That table is **architecture-dependent on Linux**: `O_NOFOLLOW`
+is `0o400000` on x86-64 and `0o100000` on arm64. The x86-64 value was probed inside a real Linux/arm64
+container against a real `/dev/zero` symlink and it did **not** refuse — it opened the link and read
+64 KiB of zeros. A guard built on a wrong magic number looks exactly like a guard. That is a bad
+foundation for a security boundary, and it was caught only because it was measured.
+
+**What shipped instead rests on one structural fact and no magic numbers: the claim leaves the jail's
+directory.** `outbox/` is the read-write mount; its *sibling* `inflight/` is inside the read-only IPC
+mount and outside it. Claiming by renaming across that line (same filesystem, so `rename(2)` still gives
+the atomic dispatch-exactly-once property the plan gate depends on) means the claimed entry has **no
+second writer**. Every check after it is therefore about the same inode that is then opened:
+
+| Guard | What it refuses | Why it is sound here |
+|---|---|---|
+| `LinkTarget is not null` | a symlink, unread | lstat semantics, on a frozen entry — no check-then-open race |
+| `Length <= 0` | FIFO, socket, device node, empty file | every non-regular inode stats as zero-length, and a zero-length request is malformed anyway — so one test covers the whole class without asking a managed API a question it cannot answer |
+| read stops at `cap + 1` | anything bigger, however it got that way | the ceiling is on the **read**, so the grow-after-stat window has nothing to run into. The `Length > cap` check above it is a cheap first look, not the bound |
+
+The aggregate bound is `MaxOutboxFiles = 64` and `MaxOutboxBytes = 1 MiB` (16 full-size requests). A shim
+writes one request and blocks for its answer, so a healthy outbox holds a handful of files; 64 is roughly
+twenty concurrent calls. **On breach the directory is reclaimed and polling CONTINUES.** Both
+alternatives are worse in opposite directions: leaving the files is the defect (a jail fills the host's
+disk 64 KiB at a time inside `~/.mainguard`, degrading its own sweep as it goes), and *stopping* the poll
+would let a jail switch off a control plane the human depends on too — a jail does not get that decision.
+Recovery is automatic, so a legitimate burst that overshoots costs a retry, never the channel. The sweep
+also stops enumerating the moment the count passes the limit, so a pass costs the **limit**, never the
+directory.
+
+**Stale `.busy`: swept when the endpoint comes UP, never on a timer.** Age cannot be the signal — a
+worker's plan presentation parks on its claim for as long as the human takes, and a TTL would be a timer
+on the human. At the moment an endpoint is created nothing can be in flight by construction, so anything
+left in either directory belongs to a daemon that died mid-call and goes.
+
+Every refusal goes through the existing `ChannelObserver.Rejected` (capped at five lines and one audit
+event per endpoint, because the directory is jail-writable). No second reporting path was built. The
+over-quota report fires on the **transition** into breach rather than every 100 ms, so a jail that camps
+over the line cannot spend the endpoint's whole rejection budget on one condition.
+
+A refused request is deleted and **not answered**, matching the treatment oversize requests already had:
+a request the daemon will not read is one it has no honest answer for, and writing a response per refusal
+into a jail-writable directory would be a way to make the daemon fill that directory on demand.
+
+### 14.3 The mutation log
+
+Each guard was reverted, rebuilt (`touch`ing the restored file — `mv` preserves mtime and MSBuild will
+happily skip the rebuild and test the mutated binary), and watched.
+
+| # | Mutation | Expected | Result |
+|---|---|---|---|
+| M0 | the whole reader back to `FileInfo.Length` + `ReadAllText` — the shipped code | 2 red | `ASymlinkedRequest…` and `ANonRegularRequest…` red, 8 green |
+| M1 | symlink guard off | red | `ASymlinkedRequest…` red (on the audited REASON, so the ceiling's refusal cannot stand in for it) |
+| M2 | non-regular / zero-length guard off | red | `ANonRegularRequest…` red — 15 s, the poll loop parked |
+| M3 | stat pre-filter removed, read ceiling kept | **green** | `AnOversizeRequest_IsDeletedUnread` green — the cap is the read, which is the TOCTOU fix stated as a test |
+| M4 | stat pre-filter AND read ceiling removed | red | `AnOversizeRequest_IsDeletedUnread` red |
+| M5 | aggregate bound off | red | `AnOutboxPastItsAggregateBound…` red |
+| M6 | claim renamed within the outbox, as before | red | `AClaimedRequest_IsRenamedOutOfTheDirectoryTheJailCanWrite` red |
+| M7 | startup leftover sweep off | red | `AnEndpointComingUp_ClearsWhat…` red |
+
+M1 is the interesting one: with the symlink guard off, the read ceiling still refuses the request. That is
+defence in depth working, and it is exactly why the test asserts the audited reason rather than the
+effect — a test that cannot tell which guard fired cannot show that this one exists.
+
+### 14.4 Left alone, deliberately
+
+- **The response file is still written into the jail-writable outbox.** It has to be: that is how the
+  shim reads it. It is bounded by the dispatch limit and reclaimed with everything else on a breach.
+- **A jail can still forge its own `<ticket>.res`** and read its own forgery. It is talking to itself;
+  nothing crosses a trust boundary.
+- **`ex.Message` from a throwing handler still reaches the jail** on both framings (§14.1). Pre-existing,
+  daemon-authored text, and a different change.

@@ -5,6 +5,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Ipc;
+using Mainguard.Git.Audit;
 using Mainguard.Server.Runtime;
 using Xunit;
 
@@ -37,6 +38,26 @@ public sealed class AgentIpcOutboxTests
     private static string NewRoot() => Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "ob");
 
     private static AgentIpcServer NewServer() => new(NewRoot());
+
+    /// <summary>
+    /// A server whose refusals are readable. Every guard below is a security boundary, and a boundary
+    /// that refuses silently is one nobody can tell from a boundary that is not there — so each of these
+    /// tests asserts the REASON as well as the effect, through the same capped
+    /// <c>ipc_request_rejected</c> path <c>ChannelObserver</c> already owns (one event per endpoint; the
+    /// cap is what stops a jail-writable directory being an audit-flood primitive).
+    /// </summary>
+    private static AgentIpcServer NewAuditedServer(out InMemoryAuditLog audit)
+    {
+        audit = new InMemoryAuditLog();
+        return new AgentIpcServer(NewRoot(), log: null, audit: audit);
+    }
+
+    private static async Task<string> RefusalReasonAsync(InMemoryAuditLog audit)
+    {
+        await WaitUntilAsync(
+            () => audit.Read().Any(e => e.Type == "ipc_request_rejected"), "no rejection was ever audited");
+        return audit.Read().First(e => e.Type == "ipc_request_rejected").Fields["reason"];
+    }
 
     // ---- the channel ---------------------------------------------------------------------------
 
@@ -161,6 +182,217 @@ public sealed class AgentIpcOutboxTests
         await WaitUntilAsync(() => !File.Exists(request), "the oversize request was never removed");
         Assert.False(File.Exists(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix)));
         Assert.False(reachedHandler);
+    }
+
+    // ---- the directory is jail-controlled, and it is not allowed to hurt the daemon --------------
+
+    /// <summary>
+    /// One <c>ln -s /dev/zero x.req</c> from inside a jail used to kill the daemon.
+    ///
+    /// <para><b>Reproduced before it was fixed</b>, running the daemon's own sequence by hand:
+    /// <c>FileInfo("x.req").Length</c> is <b>9</b> — the length of the string "/dev/zero", not of what it
+    /// points at — so the 64 KiB cap passed it; <c>File.Move</c> renamed the LINK, because rename does
+    /// not follow; and <c>File.ReadAllText</c> on the claim followed it and read until the process died.
+    /// Measured: 4.2 GB resident and still climbing when it was killed. That is not one agent's channel
+    /// — the daemon serves every running agent's control plane out of the same process.</para>
+    ///
+    /// <para>The link here points at an ordinary large file rather than at <c>/dev/zero</c> so that this
+    /// test can be watched failing without costing the machine several gigabytes: 16 MiB is already 256
+    /// times the cap the daemon claims to enforce, which is all the assertion needs.</para>
+    /// </summary>
+    [Fact]
+    public async Task ASymlinkedRequest_IsRefusedUnread_RatherThanFollowed()
+    {
+        using var server = NewAuditedServer(out var audit);
+        var agentId = NewAgentId();
+        var reachedHandler = false;
+        var dir = server.CreateEndpoint(agentId, (_, _, _) =>
+        {
+            reachedHandler = true;
+            return Task.FromResult(new AgentIpcResponse(Ok: true));
+        });
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+
+        var target = Path.Combine(outbox, "..", "big.bin");
+        using (var big = new FileStream(target, FileMode.Create))
+        {
+            big.SetLength(16L * 1024 * 1024); // sparse: costs no disk, stats as 16 MiB
+        }
+
+        var ticket = Guid.NewGuid().ToString("N");
+        var request = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxRequestSuffix);
+        File.CreateSymbolicLink(request, target);
+
+        // The cap the daemon states is a cap on what it READS. A link is refused before that question
+        // is even asked, so the request goes unanswered rather than being followed off the end of it.
+        await WaitUntilAsync(() => !File.Exists(request), "the symlinked request was never removed");
+        await Task.Delay(300);
+        Assert.False(reachedHandler, "the daemon followed a symlink into something that was not a request");
+        Assert.False(File.Exists(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix)));
+        Assert.True(File.Exists(target), "the refusal deleted the link, and must not touch its target");
+
+        // Refused AS A SYMLINK, and audited as one. Without this the ceiling below would also have
+        // stopped it — defence in depth is the point, but a test that cannot tell which guard fired
+        // cannot show that this one exists.
+        Assert.Contains("SYMLINK", await RefusalReasonAsync(audit), StringComparison.Ordinal);
+
+        // And the endpoint is still an endpoint.
+        var response = await CallOverOutboxAsync(server, agentId, new AgentIpcRequest(AgentIpcRequest.StatusOp));
+        Assert.True(response.Ok, response.Error);
+    }
+
+    /// <summary>
+    /// A jail needs no capability at all to <c>mkfifo</c> in a directory it can write, and a FIFO is
+    /// indistinguishable from a regular file through every managed API — measured: <c>Attributes</c> is
+    /// <c>Normal</c>, <c>LinkTarget</c> is null, <c>Length</c> is 0.
+    ///
+    /// <para>Opening one blocks until a writer appears, and the daemon's open happened on the POLL LOOP's
+    /// own thread: <c>File.ReadAllTextAsync</c> opens synchronously before it goes anywhere near the
+    /// await. So a single FIFO parked that agent's whole file-framed channel for good — which is what the
+    /// second half of this test measures, by requiring a perfectly ordinary call to still be served
+    /// afterwards.</para>
+    /// </summary>
+    [Fact]
+    public async Task ANonRegularRequest_IsRefused_AndCannotParkThePollLoop()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return; // no FIFOs in the filesystem namespace, and no jail writes this dir on Windows
+        }
+
+        using var server = NewAuditedServer(out var audit);
+        var agentId = NewAgentId();
+        var reachedHandler = false;
+        var dir = server.CreateEndpoint(agentId, (_, _, _) =>
+        {
+            reachedHandler = true;
+            return Task.FromResult(new AgentIpcResponse(Ok: true, Status: "alive"));
+        });
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+
+        var ticket = Guid.NewGuid().ToString("N");
+        var request = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxRequestSuffix);
+        using (var mkfifo = System.Diagnostics.Process.Start("mkfifo", request))
+        {
+            await mkfifo!.WaitForExitAsync();
+            Assert.Equal(0, mkfifo.ExitCode);
+        }
+
+        Assert.Null(new FileInfo(request).LinkTarget); // nothing managed distinguishes this from a file
+
+        await WaitUntilAsync(() => !File.Exists(request), "the FIFO request was never removed");
+        Assert.False(reachedHandler);
+        Assert.Contains("not a regular file", await RefusalReasonAsync(audit), StringComparison.Ordinal);
+
+        // The assertion that matters: the loop is still sweeping. On the unhardened daemon this call
+        // never returns, because the poll loop is parked in open() on the FIFO above.
+        var response = await CallOverOutboxAsync(server, agentId, new AgentIpcRequest(AgentIpcRequest.StatusOp));
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal("alive", response.Status);
+    }
+
+    /// <summary>
+    /// <c>MaxOutboxRequestBytes</c> bounds ONE request. Nothing bounded the number of them, so a jail
+    /// could fill the host's disk inside <c>~/.mainguard</c> 64 KiB at a time and make its own 100 ms
+    /// sweep walk an ever-growing directory while it did.
+    ///
+    /// <para>The breach is answered by reclaiming the directory and CONTINUING to poll. Stopping the
+    /// endpoint would let a jail switch off a control plane the human depends on too; leaving the files
+    /// is the defect. The recovery half of this test is the half that matters — a burst must cost a
+    /// retry, never the channel.</para>
+    /// </summary>
+    [Fact]
+    public async Task AnOutboxPastItsAggregateBound_IsReclaimed_AndTheChannelRecovers()
+    {
+        using var server = NewAuditedServer(out var audit);
+        var agentId = NewAgentId();
+        var served = 0;
+        var dir = server.CreateEndpoint(agentId, (_, _, _) =>
+        {
+            Interlocked.Increment(ref served);
+            return Task.FromResult(new AgentIpcResponse(Ok: true, Status: "alive"));
+        });
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+
+        var flood = (AgentIpcPaths.MaxOutboxFiles * 2) + 1;
+        for (var i = 0; i < flood; i++)
+        {
+            File.WriteAllText(
+                Path.Combine(outbox, Guid.NewGuid().ToString("N") + AgentIpcPaths.OutboxRequestSuffix),
+                AgentIpcProtocol.SerializeRequest(new AgentIpcRequest(AgentIpcRequest.StatusOp)) + "\n");
+        }
+
+        await WaitUntilAsync(
+            () => Directory.GetFiles(outbox).Length == 0, "the over-quota outbox was never reclaimed");
+
+        // Not served, and not answered: past the bound the daemon stops reading the directory rather than
+        // working through it.
+        Assert.Equal(0, Volatile.Read(ref served));
+        Assert.Contains("the outbox held more than", await RefusalReasonAsync(audit), StringComparison.Ordinal);
+
+        var response = await CallOverOutboxAsync(server, agentId, new AgentIpcRequest(AgentIpcRequest.StatusOp));
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal("alive", response.Status);
+        Assert.Equal(1, Volatile.Read(ref served));
+    }
+
+    /// <summary>
+    /// The claim leaves the jail's directory. That single structural fact is what every other check in
+    /// the reader is allowed to rest on: after this rename the entry is inside the READ-ONLY IPC mount
+    /// and outside the read-write one, so there is no second writer between the stat and the read.
+    /// </summary>
+    [Fact]
+    public async Task AClaimedRequest_IsRenamedOutOfTheDirectoryTheJailCanWrite()
+    {
+        using var server = NewServer();
+        var agentId = NewAgentId();
+        var claimedIn = "";
+        var inflight = AgentIpcPaths.InflightIn(server.DirFor(agentId));
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var dir = server.CreateEndpoint(agentId, async (_, _, _) =>
+        {
+            claimedIn = string.Join(",", Directory.GetFiles(inflight).Select(Path.GetFileName));
+            await release.Task.ConfigureAwait(false);
+            return new AgentIpcResponse(Ok: true);
+        });
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+        var ticket = Drop(outbox, new AgentIpcRequest(AgentIpcRequest.StatusOp));
+
+        await WaitUntilAsync(() => claimedIn.Length > 0, "the request was never dispatched");
+        Assert.Equal(ticket + AgentIpcPaths.OutboxClaimSuffix, claimedIn);
+        Assert.Empty(Directory.GetFiles(outbox)); // nothing of the claim is left where the jail can reach
+
+        release.SetResult(true);
+        var response = await ReadResponseAsync(outbox, ticket);
+        Assert.True(response.Ok, response.Error);
+    }
+
+    /// <summary>
+    /// A claim whose handler never returned is swept when the endpoint comes UP, not on a timer.
+    ///
+    /// <para>Age cannot be the signal: a worker's plan presentation parks on its claim for as long as the
+    /// human takes, and a TTL that swept "stale" claims would be a timer on the human. But at the moment
+    /// an endpoint is created nothing can be in flight by construction, so anything left in either
+    /// directory belongs to a daemon that died mid-call and goes.</para>
+    /// </summary>
+    [Fact]
+    public void AnEndpointComingUp_ClearsWhatADaemonThatDiedMidCallLeftBehind()
+    {
+        using var server = NewServer();
+        var agentId = NewAgentId();
+
+        var dir = server.DirFor(agentId);
+        Directory.CreateDirectory(AgentIpcPaths.OutboxIn(dir));
+        Directory.CreateDirectory(AgentIpcPaths.InflightIn(dir));
+        var staleClaim = Path.Combine(AgentIpcPaths.InflightIn(dir), "old" + AgentIpcPaths.OutboxClaimSuffix);
+        var staleResponse = Path.Combine(AgentIpcPaths.OutboxIn(dir), "old" + AgentIpcPaths.OutboxResponseSuffix);
+        File.WriteAllText(staleClaim, "{}\n");
+        File.WriteAllText(staleResponse, "{}\n");
+
+        server.CreateEndpoint(agentId, (_, _, _) => Task.FromResult(new AgentIpcResponse(Ok: true)));
+
+        Assert.False(File.Exists(staleClaim), "a claim from a dead daemon outlived the endpoint that made it");
+        Assert.False(File.Exists(staleResponse));
     }
 
     // ---- the shim's side of the protocol, exactly ----------------------------------------------

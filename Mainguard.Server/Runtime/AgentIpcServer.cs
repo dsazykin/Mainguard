@@ -71,6 +71,22 @@ public delegate Task<AgentIpcResponse> AgentIpcHandler(
 /// <para>Everything a healthy channel does is <c>Debug</c>. Nothing at or above <c>Information</c> is
 /// emitted per request, and no jail-supplied text is logged unsanitised or unbounded.</para>
 ///
+/// <para><b>The outbox directory is jail-controlled, and is treated that way.</b> It is the one path in
+/// this system where a sandbox hands the daemon a filesystem object of its own making, so nothing about
+/// one is believed until it has been taken out of the jail's reach. A request is claimed by renaming it
+/// into <c>inflight/</c> — a sibling of the outbox, inside the read-only IPC mount and outside the
+/// read-write one — and only then read, with a hard ceiling on the bytes and a refusal for anything that
+/// is not a plain, non-empty, regular file. What that closes, all of it found in one review of the
+/// framing above: a symlink whose <c>FileInfo.Length</c> is the length of the LINK slipped straight past
+/// the 64 KiB cap and took the read to <c>/dev/zero</c> (measured: 4.2 GB resident and climbing — the
+/// daemon dies, and every running agent's control plane dies with it); a FIFO, which needs no capability
+/// to create and which no managed API can distinguish from a file, parked the poll loop in <c>open()</c>
+/// forever; a regular file that passed the cap could still grow between the stat and the read; and
+/// nothing at all bounded the NUMBER of files, so a jail could fill the host's disk 64 KiB at a time and
+/// degrade its own 100 ms sweep while it did. Each refusal goes through the same capped
+/// <see cref="ChannelObserver"/> path as every other one — a boundary that refuses silently cannot be
+/// told from a boundary that is not there.</para>
+///
 /// <para><b>Long-blocking calls are expected here.</b> A worker's plan presentation parks on the socket
 /// until a human decides, which may be hours. Each connection is served on its own task, so a parked
 /// worker never blocks the accept loop or another agent's request — and a claimed outbox request is
@@ -363,6 +379,12 @@ public sealed class AgentIpcServer : IDisposable
         private readonly CancellationTokenSource _cts = new();
         private readonly ChannelObserver _observer;
 
+        /// <summary>Whether the last pass already reported this outbox as over quota. Reported on the
+        /// TRANSITION into breach, not every 100 ms: the observer's own cap would swallow the repeats,
+        /// but a jail that stays over quota would still spend the endpoint's whole rejection budget on
+        /// one condition and leave nothing to say about the next.</summary>
+        private bool _overQuotaReported;
+
         public string Dir { get; }
 
         public AgentIpcEndpointRole Role { get; }
@@ -397,6 +419,22 @@ public sealed class AgentIpcServer : IDisposable
             var outbox = Path.Combine(dir, AgentIpcPaths.OutboxDirName);
             Directory.CreateDirectory(outbox);
 
+            // The claim directory, beside the outbox and NOT inside it. Both live under the read-only
+            // IPC mount; only `outbox/` is also mounted read-write, so renaming a request in here takes
+            // it out of the jail's reach for good. See AgentIpcPaths.InflightDirName.
+            var inflight = AgentIpcPaths.InflightIn(dir);
+            Directory.CreateDirectory(inflight);
+
+            // Leftovers from a daemon that died mid-call. Nothing can be in flight at the moment an
+            // endpoint is created — this is the endpoint coming up — so a `.busy` here is a claim whose
+            // handler died with its process, and a `.req`/`.res` is a call whose shim died with its jail.
+            // Cleared HERE rather than swept on a timer, because on a live endpoint a claim that has sat
+            // for hours is the normal shape of the plan gate (a worker parks until a human decides) and a
+            // timer could not tell that from a leak without timing out the human. Age is not the signal;
+            // "the endpoint is being created" is.
+            SweepLeftovers(outbox);
+            SweepLeftovers(inflight);
+
             var socketPath = Path.Combine(dir, AgentIpcPaths.SocketFileName);
             File.Delete(socketPath); // a stale socket from a crashed daemon blocks bind
 
@@ -429,7 +467,7 @@ public sealed class AgentIpcServer : IDisposable
             var endpoint = new Endpoint(dir, listener, role, observer);
             observer.EndpointReady(dir);
             _ = endpoint.AcceptLoopAsync(agentId, handler);
-            _ = endpoint.OutboxLoopAsync(outbox, agentId, handler);
+            _ = endpoint.OutboxLoopAsync(outbox, inflight, agentId, handler);
             _ = endpoint.FirstContactWatchAsync(firstContactGrace);
             return endpoint;
         }
@@ -481,47 +519,15 @@ public sealed class AgentIpcServer : IDisposable
         /// boundary reliably. A 100 ms sweep of a directory that is empty almost always is not a cost
         /// worth trading correctness for.
         /// </summary>
-        private async Task OutboxLoopAsync(string outbox, string agentId, AgentIpcHandler handler)
+        private async Task OutboxLoopAsync(
+            string outbox, string inflight, string agentId, AgentIpcHandler handler)
         {
             var ct = _cts.Token;
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    foreach (var path in Directory.EnumerateFiles(outbox, "*" + AgentIpcPaths.OutboxRequestSuffix))
-                    {
-                        var ticket = Path.GetFileNameWithoutExtension(path);
-                        if (string.IsNullOrEmpty(ticket))
-                        {
-                            continue;
-                        }
-
-                        // The bound on the one capability a writable mount grants: a jail can put bytes in
-                        // the daemon's data root. A request line is a few hundred of them; anything past
-                        // the cap is deleted unread rather than read into the daemon's memory.
-                        if (new FileInfo(path).Length > AgentIpcPaths.MaxOutboxRequestBytes)
-                        {
-                            TryDelete(path);
-                            _observer.Rejected(
-                                OutboxFraming,
-                                $"outbox request over the {AgentIpcPaths.MaxOutboxRequestBytes}-byte cap, deleted unread");
-                            continue;
-                        }
-
-                        // Claim by rename: the request stops matching the poll's filter the instant it is
-                        // claimed, so a handler parked on a human for hours is never re-dispatched.
-                        var claim = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxClaimSuffix);
-                        try
-                        {
-                            File.Move(path, claim, overwrite: false);
-                        }
-                        catch (IOException)
-                        {
-                            continue; // already claimed, or gone
-                        }
-
-                        _ = ServeOutboxRequestAsync(outbox, ticket, claim, agentId, handler, _observer, ct);
-                    }
+                    SweepOutboxOnce(outbox, inflight, agentId, handler, ct);
                 }
                 catch (Exception)
                 {
@@ -540,6 +546,117 @@ public sealed class AgentIpcServer : IDisposable
             }
         }
 
+        /// <summary>
+        /// One poll pass: account for the whole directory, then claim and dispatch what it holds.
+        ///
+        /// <para>The accounting and the dispatch share ONE enumeration on purpose. The pass used to walk
+        /// the directory and stat every entry in it with no ceiling on either number, so a jail that
+        /// wrote files faster than they were served made its own sweep progressively more expensive —
+        /// while nothing at all bounded how many files, or how many bytes, it could leave in the daemon's
+        /// data root. The walk now stops the moment the count passes
+        /// <see cref="AgentIpcPaths.MaxOutboxFiles"/>, so the cost of a pass is bounded by the LIMIT
+        /// rather than by whatever the jail wrote.</para>
+        /// </summary>
+        private void SweepOutboxOnce(
+            string outbox, string inflight, string agentId, AgentIpcHandler handler, CancellationToken ct)
+        {
+            List<FileInfo>? requests = null;
+            var count = 0;
+            long bytes = 0;
+            var overQuota = false;
+
+            foreach (var entry in new DirectoryInfo(outbox).EnumerateFiles())
+            {
+                if (++count > AgentIpcPaths.MaxOutboxFiles)
+                {
+                    overQuota = true;
+                    break; // the pass costs the limit, never the directory
+                }
+
+                bytes += Math.Max(0, SafeLength(entry));
+                if (bytes > AgentIpcPaths.MaxOutboxBytes)
+                {
+                    overQuota = true;
+                    break;
+                }
+
+                if (entry.Name.EndsWith(AgentIpcPaths.OutboxRequestSuffix, StringComparison.Ordinal))
+                {
+                    (requests ??= new List<FileInfo>()).Add(entry);
+                }
+            }
+
+            if (overQuota)
+            {
+                // Reclaim, and keep polling. The alternatives are worse in both directions: leaving the
+                // files there lets a jail fill the host's disk and permanently degrade its own sweep,
+                // while STOPPING the poll would let a jail switch off a control plane the daemon and the
+                // human also depend on — a jail must not get to decide that. Everything in the directory
+                // goes, including responses: at sixty-four files this is not a shim's directory any more,
+                // and an honest call cannot be among them. Recovery is automatic — the next pass sees an
+                // empty directory and serves normally — so a legitimate burst that briefly overshoots
+                // costs a retry, not the channel.
+                ReclaimOutbox(outbox);
+                if (!_overQuotaReported)
+                {
+                    _overQuotaReported = true;
+                    _observer.Rejected(
+                        OutboxFraming,
+                        $"the outbox held more than {AgentIpcPaths.MaxOutboxFiles} files or "
+                        + $"{AgentIpcPaths.MaxOutboxBytes} bytes — every file in it was deleted unread and "
+                        + "the endpoint keeps polling");
+                }
+
+                return;
+            }
+
+            _overQuotaReported = false;
+            if (requests is null)
+            {
+                return;
+            }
+
+            foreach (var entry in requests)
+            {
+                var ticket = Path.GetFileNameWithoutExtension(entry.Name);
+                if (string.IsNullOrEmpty(ticket))
+                {
+                    continue;
+                }
+
+                // Claim by rename, OUT of the jail's directory and into the daemon-only one. Two things
+                // at once: the request stops matching the poll's filter the instant it is claimed (so a
+                // handler parked on a human for hours is never re-dispatched), and the claimed entry
+                // stops being writable — or replaceable — by the jail, which is what lets everything
+                // ServeOutboxRequestAsync then decides about it be decided about the same inode it reads.
+                var claim = Path.Combine(inflight, ticket + AgentIpcPaths.OutboxClaimSuffix);
+                try
+                {
+                    File.Move(entry.FullName, claim, overwrite: false);
+                }
+                catch (Exception)
+                {
+                    continue; // already claimed, gone, or something the daemon may not move
+                }
+
+                _ = ServeOutboxRequestAsync(outbox, ticket, claim, agentId, handler, _observer, ct);
+            }
+        }
+
+        /// <summary>A length that cannot throw for an entry that vanished, or that was never the kind of
+        /// thing a length means anything for.</summary>
+        private static long SafeLength(FileInfo entry)
+        {
+            try
+            {
+                return entry.Length;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
         /// <summary>Serves one claimed outbox request — the exact <see cref="ServeConnectionAsync"/>
         /// contract, with files where that one has a stream.</summary>
         private static async Task ServeOutboxRequestAsync(
@@ -549,7 +666,22 @@ public sealed class AgentIpcServer : IDisposable
             AgentIpcResponse response;
             try
             {
-                var line = (await File.ReadAllTextAsync(claim, ct).ConfigureAwait(false)).Trim();
+                // The claim is now a daemon-only path, so this is the whole of the decision about what
+                // the daemon is willing to read — no second writer can invalidate it between here and
+                // the read below.
+                if (!TryReadClaimedRequest(claim, out var line, out var refusal))
+                {
+                    // Refused UNREAD: deleted, not answered. Same treatment the oversize case has always
+                    // had, and for the same reason — a request the daemon would not read is one it has no
+                    // honest answer for, and writing a response per refusal into a jail-writable
+                    // directory would be a way to make the daemon fill that directory on demand. The
+                    // shim's own deadline is what reports it on the other side; the observer is what
+                    // reports it here.
+                    observer.Rejected(OutboxFraming, refusal);
+                    TryDelete(claim);
+                    return;
+                }
+
                 var request = AgentIpcProtocol.TryParseRequest(line);
                 if (request is null)
                 {
@@ -597,6 +729,156 @@ public sealed class AgentIpcServer : IDisposable
             finally
             {
                 TryDelete(claim);
+            }
+        }
+
+        /// <summary>
+        /// Reads one claimed request, or says why it will not be read. The three refusals below are the
+        /// three ways the outbox's one stated bound — <see cref="AgentIpcPaths.MaxOutboxRequestBytes"/> —
+        /// was not a bound at all.
+        ///
+        /// <para><b>A symlink.</b> <c>FileInfo.Length</c> on a symlink is the length of the LINK (nine
+        /// bytes for <c>/dev/zero</c>), <c>File.Move</c> renames the link rather than following it, and
+        /// the read that followed then followed it: one <c>ln -s /dev/zero x.req</c> from inside a jail
+        /// took the daemon — and with it every running agent's control plane — to an
+        /// <c>OutOfMemoryException</c>. Measured on this machine: the read passed 4.2 GB of resident
+        /// memory and was still climbing.</para>
+        ///
+        /// <para><b>Not a regular file.</b> A jail needs no capability at all to <c>mkfifo x.req</c> in a
+        /// directory it can write, and a FIFO is invisible to every managed file API — it reports
+        /// <c>Attributes = Normal</c>, a null <c>LinkTarget</c> and a zero length, exactly like an
+        /// ordinary file. Opening one blocks until a writer appears, and the open happens on the POLL
+        /// LOOP's own thread, so that jail's channel stops serving anything, forever. Every non-regular
+        /// inode — FIFO, socket, device node — stats as zero-length, and a request that is genuinely
+        /// zero-length is refused anyway, so one test covers the whole class without asking a managed API
+        /// a question it cannot answer.</para>
+        ///
+        /// <para><b>Bigger than the cap.</b> Enforced by the read, which stops at
+        /// <c>cap + 1</c> bytes and refuses. The stat below is a cheap first look, NOT the bound: a
+        /// stat and a read are two syscalls, and a jail that keeps its own descriptor open across the
+        /// claim can grow a file that passed the first one. What the daemon is protecting is its own
+        /// memory, so the ceiling belongs on the thing that fills it.</para>
+        ///
+        /// <para><b>Why this and not an <c>O_NOFOLLOW</c> open.</b> That was the first design, and it was
+        /// measured wrong before it shipped. .NET 10 exposes no no-follow open — <c>FileStreamOptions</c>
+        /// has no such flag — so it means P/Invoking <c>open(2)</c> with a hand-written flag table, and
+        /// the flag is architecture-dependent on Linux: <c>O_NOFOLLOW</c> is <c>0o400000</c> on x86-64
+        /// but <c>0o100000</c> on arm64. The x86-64 value was probed inside a real Linux/arm64 container
+        /// and it did not refuse the symlink — it silently opened <c>/dev/zero</c> and read 64 KiB of it,
+        /// which is the original defect wearing a guard. A wrong magic number is invisible; the design
+        /// here has none, and every step of it rests on one testable structural fact: after the claim
+        /// rename the entry is outside the jail's writable mount, so what is stat'd is what is
+        /// opened.</para>
+        /// </summary>
+        private static bool TryReadClaimedRequest(string claim, out string line, out string refusal)
+        {
+            line = "";
+            var info = new FileInfo(claim);
+
+            if (info.LinkTarget is not null)
+            {
+                refusal = "the request was a SYMLINK, refused unread (following it is how a jail makes "
+                    + "the daemon read something that is not its request)";
+                return false;
+            }
+
+            long stated;
+            try
+            {
+                stated = info.Length;
+            }
+            catch (Exception)
+            {
+                refusal = "the request could not be stat'd, refused unread";
+                return false;
+            }
+
+            if (stated <= 0)
+            {
+                refusal = "the request was empty, or was not a regular file — a FIFO, socket or device "
+                    + "node stats as zero-length and blocks the reader that opens it; refused unread";
+                return false;
+            }
+
+            if (stated > AgentIpcPaths.MaxOutboxRequestBytes)
+            {
+                refusal =
+                    $"outbox request over the {AgentIpcPaths.MaxOutboxRequestBytes}-byte cap, deleted unread";
+                return false;
+            }
+
+            var buffer = new byte[AgentIpcPaths.MaxOutboxRequestBytes + 1];
+            var read = 0;
+            try
+            {
+                using var stream = new FileStream(
+                    claim, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                while (read < buffer.Length)
+                {
+                    var n = stream.Read(buffer, read, buffer.Length - read);
+                    if (n == 0)
+                    {
+                        break;
+                    }
+
+                    read += n;
+                }
+            }
+            catch (Exception)
+            {
+                refusal = "the request could not be read, refused";
+                return false;
+            }
+
+            if (read > AgentIpcPaths.MaxOutboxRequestBytes)
+            {
+                refusal =
+                    $"outbox request over the {AgentIpcPaths.MaxOutboxRequestBytes}-byte cap, deleted unread";
+                return false;
+            }
+
+            line = Encoding.UTF8.GetString(buffer, 0, read).Trim();
+            refusal = "";
+            return true;
+        }
+
+        /// <summary>Deletes everything in one of the endpoint's own directories. Used at start (leftovers
+        /// from a daemon that died mid-call) and on an over-quota outbox (reclaiming the disk a jail
+        /// filled).</summary>
+        private static void SweepLeftovers(string dir)
+        {
+            try
+            {
+                foreach (var path in Directory.EnumerateFileSystemEntries(dir))
+                {
+                    TryDelete(path);
+                }
+            }
+            catch (Exception)
+            {
+                // Nothing to sweep, or the dir is already gone.
+            }
+        }
+
+        /// <summary>The over-quota reclaim, bounded so that reclaiming a directory a jail is still
+        /// filling cannot itself become the expensive thing.</summary>
+        private static void ReclaimOutbox(string outbox)
+        {
+            var deleted = 0;
+            try
+            {
+                foreach (var path in Directory.EnumerateFileSystemEntries(outbox))
+                {
+                    TryDelete(path);
+                    if (++deleted >= AgentIpcPaths.MaxOutboxFiles * 16)
+                    {
+                        return; // the rest goes on the next pass; a pass stays bounded
+                    }
+                }
+            }
+            catch (Exception)
+            {
+                // Gone (teardown), or momentarily unreadable — the next pass tries again.
             }
         }
 

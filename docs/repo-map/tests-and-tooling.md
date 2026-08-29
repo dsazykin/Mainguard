@@ -1877,7 +1877,20 @@
   block); that a malformed line gets an honest error rather than silence; that an oversize request is
   deleted unread; and that nothing half-finished is left in a directory the jail can also write. Seven
   mutations watched red — loop removed, claim by copy instead of rename, claim never deleted, size cap
-  dropped, handler not awaited, malformed branch removed, outbox dir not created),**
+  dropped, handler not awaited, malformed branch removed, outbox dir not created.
+  **Phase 3 §14 adds the half that treats the directory as jail-controlled**, each case reproduced before
+  it was written: a SYMLINKED request is refused unread and its target untouched (the link's own length
+  is what the old cap measured, so the read followed it to `/dev/zero` and killed the process); a real
+  FIFO — `mkfifo` needs no capability, and `Attributes`/`LinkTarget`/`Length` cannot tell one from a file
+  — is refused AND the endpoint is required to serve an ordinary call afterwards, which is the assertion
+  that catches a parked poll loop; an outbox flooded past its aggregate bound is reclaimed and the
+  channel RECOVERS; a claim is renamed out of the directory the jail can write; and leftovers from a
+  daemon that died mid-call are cleared when the endpoint comes up. Each asserts the audited REASON, not
+  only the effect, so a guard cannot be shown by a different guard's refusal. Eight further mutations
+  watched red or deliberately green — the whole reader reverted to `ReadAllText`+stat (2 red: symlink and
+  FIFO), symlink guard off, non-regular guard off, aggregate bound off, claim left in the outbox, startup
+  sweep off; and the stat pre-filter removed alone, which must stay GREEN because the read ceiling is the
+  cap and the stat is only a cheap first look),**
   **`AgentIpcObservabilityTests` (defect C3 — a jail that cannot reach the daemon left NO daemon-side
   evidence. `AgentIpcServer` had no logger at all, so three refused connections from a live jail produced
   zero entries and the outage read as a model sitting idle. Shaped by the fact that a refused `connect()`
