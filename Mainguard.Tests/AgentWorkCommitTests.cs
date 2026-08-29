@@ -214,37 +214,167 @@ public sealed class AgentWorkCommitTests : IDisposable
 
     // ---- the message, which is the one thing a worker supplies ------------------------------------
 
-    /// <summary>The subject is one argv element that lands in the user's history. A newline would turn
-    /// everything after it into a commit body nobody chose, and an unbounded one is a log line an
-    /// operator cannot read.</summary>
+    /// <summary>
+    /// Normalisation is the ONLY thing done to a message that is going to be recorded: line endings
+    /// folded, trailing whitespace removed, leading and trailing blank lines dropped. Nothing reflows,
+    /// nothing is collapsed, nothing is cut — every row here is a change the worker cannot notice, and
+    /// the rows that would matter are refusals instead.
+    /// </summary>
     [Theory]
     [InlineData("feat: one line", "feat: one line")]
-    [InlineData("feat: one\nStill me", "feat: one Still me")]
     [InlineData("  padded  ", "padded")]
-    public void TheWorkersMessage_BecomesASingleBoundedSubject(string given, string expected)
+    // …but a BODY keeps its indentation: that is the worker's code block, not a slip.
+    [InlineData("feat: x\n\n    indented", "feat: x\n\n    indented")]
+    [InlineData("feat: x\r\n\r\nbody", "feat: x\n\nbody")]
+    [InlineData("\n\nfeat: x\n\nbody\n\n\n", "feat: x\n\nbody")]
+    // Blank lines INSIDE the body are the worker's paragraphs and survive untouched — this is what
+    // `--cleanup=verbatim` is for, since git's default for `-m` would collapse them.
+    [InlineData("feat: x\n\none\n\n\ntwo", "feat: x\n\none\n\n\ntwo")]
+    public void AMessageIsNormalised_AndNothingElse(string given, string expected)
     {
-        Assert.Equal(expected, WorktreeManager.CommitSubject(given, AgentId));
+        Assert.Equal(expected, AgentCommitMessage.Normalize(given));
     }
 
-    [Fact]
-    public void AVeryLongMessage_IsBounded()
+    /// <summary>
+    /// <b>The G4 rule: a message that cannot be honoured fails loudly.</b> Each of these used to be
+    /// silently repaired into something the worker did not write — the over-long one by truncation at
+    /// 200 characters mid-word, the missing blank line by git folding the whole body into <c>%s</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("subject too long", 0)]
+    [InlineData("missing blank line", 1)]
+    [InlineData("far too big", 2)]
+    [InlineData("control character", 3)]
+    public void AMessageThatCannotBeRecorded_IsRefused_WithTheReason(string _, int which)
     {
-        var subject = WorktreeManager.CommitSubject(new string('x', 5000), AgentId);
+        var message = which switch
+        {
+            0 => new string('x', AgentCommitMessage.MaxSubjectLength + 1),
+            1 => "feat: a subject\nstraight into the body",
+            2 => "feat: a subject\n\n" + new string('x', AgentCommitMessage.MaxLength),
+            _ => "feat: a subject\n\nbody with a \u0007 bell",
+        };
 
-        Assert.True(subject.Length <= 200, $"subject was {subject.Length} characters");
+        var refusal = AgentCommitMessage.Refuse(AgentCommitMessage.Normalize(message));
+
+        Assert.NotNull(refusal);
+        Assert.Contains("Nothing was committed", refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>The boundary itself is accepted — a limit that refuses its own permitted value is a
+    /// different limit, and this one is git's documented convention rather than a number picked here.</summary>
+    [Fact]
+    public void TheSubjectBoundaryItself_IsNotRefused()
+    {
+        Assert.Null(AgentCommitMessage.Refuse(new string('x', AgentCommitMessage.MaxSubjectLength)));
+        Assert.NotNull(AgentCommitMessage.Refuse(new string('x', AgentCommitMessage.MaxSubjectLength + 1)));
+    }
+
+    /// <summary>
+    /// A refused message refuses the COMMIT, and the worktree is left exactly as the worker left it: the
+    /// branch does not move, nothing is staged behind its back, and a corrected message is a retry.
+    /// </summary>
+    [Fact]
+    public void ARefusedMessage_CommitsNothing_AndLeavesTheWorkToRetryWith()
+    {
+        var (manager, repoHash, worktree) = NewAgent();
+        var before = AgentBranchTip(repoHash);
+        File.WriteAllText(Path.Combine(worktree, "feature.cs"), "public class Feature { }\n");
+
+        var result = manager.CommitAgentWork(repoHash, AgentId, new string('x', 400));
+
+        Assert.Equal(AgentWorkCommitOutcome.RefusedMessage, result.Outcome);
+        Assert.False(result.Committed);
+        Assert.Null(result.Sha);
+        Assert.Equal(before, AgentBranchTip(repoHash));
+        Assert.Contains("72", result.Detail ?? string.Empty, StringComparison.Ordinal);
+
+        // …and the same work commits the moment the message is one git can record.
+        var retry = manager.CommitAgentWork(
+            repoHash, AgentId, "feat: the approved work\n\nWith the detail in the body, where it goes.");
+        Assert.Equal(AgentWorkCommitOutcome.Committed, retry.Outcome);
     }
 
     /// <summary>An empty message is a default that names the agent, not a refusal: refusing the commit
-    /// over a missing subject would lose the work, which is the defect this whole change is about.</summary>
+    /// over a missing subject would lose the work, which is the defect this whole change is about. That
+    /// is not the G4 case — nothing structured is being discarded — so it is deliberately unchanged.</summary>
     [Theory]
     [InlineData(null)]
     [InlineData("")]
     [InlineData("   ")]
     public void AnAbsentMessage_StillCommits_UnderADefaultThatNamesTheAgent(string? given)
     {
-        var subject = WorktreeManager.CommitSubject(given, AgentId);
+        var (manager, repoHash, worktree) = NewAgent();
+        File.WriteAllText(Path.Combine(worktree, "feature.cs"), "x\n");
 
-        Assert.Contains(AgentId, subject, StringComparison.Ordinal);
+        var result = manager.CommitAgentWork(repoHash, AgentId, given);
+
+        Assert.Equal(AgentWorkCommitOutcome.Committed, result.Outcome);
+        using var repo = new Repository(AgentRepoPath(repoHash));
+        Assert.Contains(
+            AgentId, repo.Branches["agent/" + AgentId].Tip.MessageShort, StringComparison.Ordinal);
+    }
+
+    // ---- G4: the message is the durable record, and it was being destroyed ------------------------
+
+    /// <summary>
+    /// <b>Defect G4.</b> A worker passed a proper git message — subject, blank line, two body paragraphs
+    /// — and the commit that resulted had every newline replaced by a space, was cut at 200 characters
+    /// mid-word, and had an empty <c>%b</c>. The op reported success. Two of three commits in a stress
+    /// run were mangled this way.
+    ///
+    /// <para>Asserted with git's own <c>%s</c>/<c>%b</c>, because those are what a human reads at review
+    /// and what every tool downstream splits on — a test that only compared the whole message would pass
+    /// on a body that git considers part of the subject.</para>
+    /// </summary>
+    [Fact]
+    public void AProperMessage_IsRecordedVerbatim_SubjectBlankLineAndBody()
+    {
+        var (manager, repoHash, worktree) = NewAgent();
+        File.WriteAllText(Path.Combine(worktree, "feature.cs"), "x\n");
+        const string Message =
+            "feat(auth): recompute token expiry in UTC\n"
+            + "\n"
+            + "The clock read the host's local zone, so a token minted at 23:30 CET expired\n"
+            + "an hour before the server thought it would.\n"
+            + "\n"
+            + "Boundary tests cover the DST transition in both directions.";
+
+        var result = manager.CommitAgentWork(repoHash, AgentId, Message);
+
+        Assert.Equal(AgentWorkCommitOutcome.Committed, result.Outcome);
+        using var repo = new Repository(AgentRepoPath(repoHash));
+        var tip = repo.Branches["agent/" + AgentId].Tip;
+
+        Assert.Equal("feat(auth): recompute token expiry in UTC", tip.MessageShort);
+        Assert.Contains("an hour before the server thought it would.", tip.Message, StringComparison.Ordinal);
+        Assert.Contains("Boundary tests cover the DST transition", tip.Message, StringComparison.Ordinal);
+
+        // The paragraph break survives — it is the difference between a body and one long line.
+        Assert.Contains("would.\n\nBoundary tests", tip.Message.Replace("\r\n", "\n"), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <b>Git is asked to record the message, not to tidy it.</b> The default cleanup for <c>-m</c> is
+    /// <c>whitespace</c>, which COLLAPSES consecutive blank lines — and it is configurable through
+    /// <c>commit.cleanup</c>, so leaving it implicit makes the shape of an agent's commit depend on a
+    /// config key nobody set on purpose. A body whose spacing is quietly altered is a smaller version of
+    /// exactly the defect this change removes, so <c>--cleanup=verbatim</c> is passed explicitly.
+    /// </summary>
+    [Fact]
+    public void TheCommitDoesNotLetGitReflowTheBody()
+    {
+        var (manager, repoHash, worktree) = NewAgent();
+        File.WriteAllText(Path.Combine(worktree, "feature.cs"), "x\n");
+        const string Message = "feat: spacing the worker chose\n\nfirst\n\n\nsecond";
+
+        var result = manager.CommitAgentWork(repoHash, AgentId, Message);
+
+        Assert.Equal(AgentWorkCommitOutcome.Committed, result.Outcome);
+        using var repo = new Repository(AgentRepoPath(repoHash));
+        var recorded = repo.Branches["agent/" + AgentId].Tip.Message.Replace("\r\n", "\n");
+
+        Assert.Contains("first\n\n\nsecond", recorded, StringComparison.Ordinal);
     }
 
     // ---- helpers ----------------------------------------------------------------------------------

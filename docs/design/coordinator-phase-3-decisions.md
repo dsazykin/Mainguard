@@ -1639,3 +1639,90 @@ Not found: "NOT-A-REAL-STRING"
 `TheTaughtSpawnForm_SurvivesAShell_AndTheOldUnquotedOneDoesNot` runs the taught line through a real
 `bash -c` and then the shim's own `main()`: the quoted form arrives with `add()` intact, the unquoted
 form never reaches the shim, and — the point — reports nothing, because nothing ran.
+
+### 15.3 Defect G4 — `mainguard-plan commit` destroyed the record it exists to create
+
+A worker sent a subject, a blank line and two body paragraphs. What landed on `agent/<id>` had every
+newline replaced by a space, was cut at **200 characters mid-word**, and had an empty `%b`. The op
+answered `COMMITTED: <sha>`. Two of three commits in the stress run were mangled this way.
+
+**Reproduced before changing anything**, through the real `WorktreeManager` against real git:
+
+```
+Expected: "feat(auth): recompute token expiry in UTC"
+Actual:   ···" token expiry in UTC  The clock read the "···
+```
+
+The whole of it was `WorktreeManager.CommitSubject`, and so was the reasoning:
+
+> Trimmed to one line and bounded, because a subject is one argv element that ends up in the user's
+> history — a newline **would turn the rest into a body nobody chose**.
+
+That is exactly backwards. A commit message *is* a subject and a body separated by a blank line. The
+body is not an accident of a newline; it is the structure git defines, every tool downstream splits on,
+and the thing a human reads at review. §11.2 called the commit "the durable record of what an agent
+did" and then shipped the one function that destroyed it.
+
+#### What the constraint should be, and why not simply a bigger number
+
+Raising 200 moves where a message is destroyed; it does not stop a message being destroyed. The real
+constraint is git's own, so it is git's own that is enforced — in one pure class,
+`AgentCommitMessage`:
+
+| rule | why |
+|---|---|
+| line 1 is the subject, **≤ 72 characters** | git's documented convention and the width `git log` shows without wrapping. It is deliberately **smaller** than the 200 it replaces: 200 was never a limit anyone chose, it was the offset at which the string was cut |
+| if there is a body, **line 2 is blank** | without it `%s` swallows the body and `%b` is empty — silently the same outcome as the flattening being removed, produced by git instead of by us |
+| the whole message ≤ 8 KiB, no control characters but `\n`/`\t` | it arrives from inside a sandbox over a channel whose own ceiling is 64 KiB; bounded, named in the refusal, never shortened |
+
+**Everything else is left alone.** `Normalize` folds CRLF, trims trailing whitespace per line, and drops
+leading/trailing blank lines. It does not reflow, does not collapse blank lines inside the body, and does
+not truncate — a body's indentation is the worker's code block and its paragraph spacing is the worker's
+paragraphs. `git commit` is then given `--cleanup=verbatim` **explicitly**, because the default for `-m`
+is `whitespace`, which collapses consecutive blank lines, and because that default is
+`commit.cleanup`-configurable — leaving it implicit makes the shape of an agent's commit depend on a
+config key nobody set on purpose.
+
+**A message that cannot be honoured fails loudly.** `AgentWorkCommitOutcome.RefusedMessage`, with the
+reason, and the check runs **first — before `git add -A`**, so the worktree is exactly as the worker left
+it and a corrected message is a retry rather than a recovery. The reader is an agent that can read a
+sentence and try again: a refusal costs it a turn, a mangle costs the record and nobody finds out until a
+human is reading the log.
+
+**What is deliberately NOT refused: an absent message.** It still commits under `wip: work by agent <id>`.
+No structure is being discarded there, and §11.2's reasoning stands — refusing would lose the work, which
+is the defect `commit_work` exists to fix.
+
+**The shim's half.** `commit` took `' '.join(argv[2:])`, which rejoins with single spaces whatever the
+shell already split — so an unquoted message arrived flat and the join hid that anything had been lost.
+It now takes **ONE quoted argument** and refuses a second positional, naming the cause. That is G3's
+lesson applied to the other shim: the slip that can be seen is refused, and the one that cannot be seen
+is designed out of the taught form. The worker's operating instructions carry the shape (subject, blank
+line, body), the cap, the quoting, and the fact that a bad message is refused — a rule an agent is not
+told about is a rule it discovers by having a commit refused.
+
+#### The mutation log
+
+| # | mutation | went red |
+|---|---|---|
+| M10 | `Normalize` back to flatten-to-spaces + cut at 200 — **the shipped defect** | **7 of 50**: the verbatim commit, the reflow guard, 4 normalisation rows, and the missing-blank-line refusal |
+| M11 | the subject cap truncates instead of refusing | 3 of 50 (`…IsRefused_WithTheReason(subject too long)`, the boundary test, `ARefusedMessage_CommitsNothing…`) |
+| M12 | the blank-line rule dropped | 1 of 50 |
+| M13 | `--cleanup=verbatim` removed, so git's default tidies the body | 1 of 50 (`TheCommitDoesNotLetGitReflowTheBody`) |
+| M14 | the plan shim rejoins a shell-split message | 1 of 50 (`TheShimsCommit_TakesOneQuotedMessage…`) |
+| M15 | the message is not judged before the commit runs | 1 of 50 (`ARefusedMessage_CommitsNothing_AndLeavesTheWorkToRetryWith` — it commits the bad message, which is what the assertion catches) |
+
+M11 is the one that shows the choice: keeping a cap and truncating at it keeps every "the message is
+bounded" assertion green. Only a test that asserts the *refusal* can tell a limit from a shredder.
+
+### 15.4 Left alone, deliberately
+
+- **The `commit_work` channel handler is unchanged.** `RefusedMessage` falls into its existing
+  `_ => Ok: false` arm carrying `Detail`, which is the sentence the worker reads. Adding a case would be
+  a second opinion about an outcome the manager already decided.
+- **An absent commit message still defaults** (§15.3), and a title-less spawn still refuses (§13.3). The
+  two look inconsistent and are not: a spawn with no brief produces an ungated worker, which is a
+  capability; a commit with no subject produces a commit with a truthful generic subject, which is a
+  cosmetic loss set against losing the diff.
+- **Nothing was done about a shell that will not parse the line** (§15.2). It cannot be observed from
+  inside this system, and pretending otherwise would be worse than the honest gap.

@@ -194,6 +194,29 @@ public class AgentOperatingInstructionsTests : IDisposable
     }
 
     /// <summary>
+    /// <b>Defect G4.</b> The daemon now records a worker's commit message verbatim and REFUSES one it
+    /// cannot record, instead of flattening the newlines out of it and cutting it at 200 characters. A
+    /// rule the worker is not told about is a rule it discovers by having a commit refused, so the shape
+    /// — subject, blank line, body — and the cap are in the text, and so is the quoting.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldTheShapeOfACommitMessage_AndThatABadOneIsRefused()
+    {
+        var text = Flatten(Worker());
+
+        Assert.Contains("blank line", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            Mainguard.Agents.Agents.AgentCommitMessage.MaxSubjectLength.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            text, StringComparison.Ordinal);
+        Assert.Contains("refused", text, StringComparison.OrdinalIgnoreCase);
+
+        // The shell lesson, which is the same one G3 taught the coordinator: an unquoted message has
+        // already lost its blank lines by the time the shim runs.
+        Assert.Contains("ONE argument", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// A worker's plan file must not land in the tree its own commit records. That commit is
     /// <c>git add -A</c> over <c>/workspace</c>, and the shim takes a path — so an unqualified "write the
     /// plan to a JSON file" puts it in the working directory, which IS the repository.

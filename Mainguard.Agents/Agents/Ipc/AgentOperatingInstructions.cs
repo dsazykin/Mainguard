@@ -218,7 +218,7 @@ public static class AgentOperatingInstructions
         ## When the work is done, commit it — nothing else will
 
         ```
-        {{shimPath}} commit <message>            record your work on your own branch
+        {{shimPath}} commit "<message>"          record your work on your own branch
         ```
 
         **This is the only way your work leaves this jail.** Your worktree is deleted when the agent is
@@ -230,6 +230,26 @@ public static class AgentOperatingInstructions
         `/workspace`** onto **your own branch** — the one already checked out, and the only one you have.
         You supply the message and nothing else. It never pushes, never merges, and never touches the
         user's main branch; a human decides all of that later, after reading your diff.
+
+        ### The message is a real git message, and it is recorded verbatim
+
+        A subject line of **at most 72 characters**, then a **blank line**, then as much body as the
+        change deserves. That is the shape git means and the shape a human reads at review, and the
+        daemon writes exactly what you send — it will not shorten your subject or flatten your
+        paragraphs. **A message it cannot record is refused, with the reason, and nothing is committed;**
+        fix the message and run the command again.
+
+        **Quote the whole message as ONE argument.** A shell reads your command line first, so an
+        unquoted message loses its blank lines before this program ever starts — and a second argument
+        is refused rather than joined, because a message that arrived flattened cannot be un-flattened.
+
+        ```
+        {{shimPath}} commit "fix(auth): recompute token expiry in UTC
+
+        The clock read the host's local zone, so a token minted at 23:30 expired an hour early.
+
+        Boundary tests cover the DST transition in both directions."
+        ```
 
         Commit at meaningful points as you go, not only at the end, and commit again after any further
         change. Once your branch stops moving the daemon runs the repository's tests against it on its

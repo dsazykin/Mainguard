@@ -155,8 +155,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     refuses it and the failure leaves a warning and a `shim_spawn_refused` audit entry instead of only
     this jail's stderr) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
     **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
-    **`commit <message>`** (the only route a jailed CLI has to a commit — measured against claude-code
-    2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`).
+    **`commit "<message>"`** (the only route a jailed CLI has to a commit — measured against claude-code
+    2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`.
+    **G4:** ONE quoted argument, and a second positional is REFUSED rather than joined — `' '.join(argv[2:])`
+    rejoined with single spaces whatever a shell had already split, so a subject/blank-line/body arrived
+    flat and nothing could tell a structure had been lost).
     `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
     the response carries the task prompt the daemon had been withholding, which is what makes "the worker
     does not start before approval" a property of the system rather than a request in a prompt).
@@ -338,6 +341,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `CountLooseObjects`/`MeasureObjectStoreBytes` + the `SizeWarningBytes` guard, and
       `AfterAgentDetached` (the teardown hook: a fast path below the loose-object threshold so a stop
       never scales with repository size)).
+    - `AgentCommitMessage.cs` (**defect G4, 2026-08-29** — the one place a worker-supplied commit message
+      is normalised and judged. `Normalize` folds CRLF, trims trailing whitespace per line and strips
+      leading/trailing blank lines, and does **nothing else**: no reflowing, no collapsing of blank lines,
+      no truncation. `Refuse` applies git's own convention — subject ≤ `MaxSubjectLength` (72), a BLANK
+      second line when there is a body, no control characters, `MaxLength` 8 KiB — and returns the reason,
+      which becomes `AgentWorkCommitOutcome.RefusedMessage`. It replaces a `CommitSubject` that replaced
+      every newline with a space and cut the result at 200 characters mid-word while reporting success:
+      two of three commits in a stress run were destroyed that way, `%b` empty. An ABSENT message is still
+      a default naming the agent (`DefaultFor`) rather than a refusal — nothing structured is being
+      discarded there, and §11.2's "refusing would lose the work" still holds)
     - `WorktreeManager.cs` (`IAgentWorktreeManager`: `CreateAgentWorktree` creates the agent's OWN
       repository (**MG-3**) then `git worktree add -b agent/<id> <path> <defaultBranch>` **off that**,
       then the **quarantine remote** — remove any inherited `origin`,
@@ -348,10 +361,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       runner delegate + warning sink); `AgentRepoPathFor` (the read-write mount the jail gets) and
       `PublishAgentBranch` (the daemon-side carry of `refs/heads/agent/<id>` from the agent's repo into
       the mirror — the daemon names BOTH refs, so the agent never proposes a ref update at all);
-      **`CommitAgentWork(repoHash, agentId, message)`** → `AgentWorkCommitResult` /
-      `AgentWorkCommitOutcome` (`git add -A` + commit onto `agent/<id>`, refused unless
-      `CheckAgentBranch` says HEAD really is that branch, `NothingToCommit` kept distinct from
-      `Committed` so a clean tree is never reported as recorded work, and pointedly NOT publishing —
+      **`CommitAgentWork(repoHash, agentId, rawMessage)`** → `AgentWorkCommitResult` /
+      `AgentWorkCommitOutcome` (`git add -A` + `commit --cleanup=verbatim` onto `agent/<id>`, refused
+      unless `CheckAgentBranch` says HEAD really is that branch, refused with `RefusedMessage` when
+      `AgentCommitMessage` cannot record what the worker sent (**G4** — checked FIRST, before any git
+      runs, so the worktree is untouched and a corrected message is a retry), `NothingToCommit` kept
+      distinct from `Committed` so a clean tree is never reported as recorded work, and pointedly NOT
+      publishing —
       `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
       `WorkerReadinessTrigger` for the very commit it exists to react to);
       `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then

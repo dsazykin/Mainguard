@@ -390,6 +390,111 @@ public class AgentIpcProtocolTests
             reported);
     }
 
+    /// <summary>
+    /// <b>Defect G4, the shim's half.</b> <c>commit</c> takes ONE quoted argument. It used to be
+    /// <c>' '.join(argv[2:])</c>, which rejoins with single spaces whatever the shell handed it — so a
+    /// worker's subject / blank line / body arrived as one flat line and nothing anywhere could tell
+    /// that a structure had been lost. A second positional is now refused, with the reason.
+    ///
+    /// <para>Run through the real <c>main()</c> under python3, because the property being asserted is
+    /// that the DISPATCH refuses, not that some helper would have.</para>
+    /// </summary>
+    [Theory]
+    // The taught form: one argument, newlines and all, passed through untouched.
+    [InlineData(new[] { "commit", "feat: a subject\n\nA body paragraph." }, "feat: a subject\n\nA body paragraph.", null)]
+    // An empty message is still allowed — the daemon defaults it, and refusing would lose the work.
+    [InlineData(new[] { "commit" }, "", null)]
+    // The slip: a shell-split message. Refused rather than rejoined into a single line.
+    [InlineData(new[] { "commit", "feat:", "a", "subject" }, null, "ONE quoted argument")]
+    public void TheShimsCommit_TakesOneQuotedMessage_AndRefusesAShellSplitOne(
+        string[] args, string? expectedMessage, string? expectedRefusal)
+    {
+        var run = RunPlanShim(args);
+        if (run is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        var (message, refusal) = run.Value;
+        if (expectedRefusal is null)
+        {
+            Assert.Null(refusal);
+            Assert.Equal(expectedMessage, message);
+        }
+        else
+        {
+            Assert.Null(message);
+            Assert.Contains(expectedRefusal, refusal!, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>Runs <c>mainguard-plan</c>'s own <c>main()</c> with the transport stubbed.</summary>
+    private static (string? Message, string? Refusal)? RunPlanShim(string[] args)
+    {
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-plan-{Guid.NewGuid():N}");
+        System.IO.Directory.CreateDirectory(dir);
+        try
+        {
+            var shim = System.IO.Path.Combine(dir, "mainguard_plan_shim.py");
+            var driver = System.IO.Path.Combine(dir, "driver.py");
+            System.IO.File.WriteAllText(shim, WorkerPlanShim.Script);
+            System.IO.File.WriteAllText(driver, PlanDriverSource);
+
+            var start = new System.Diagnostics.ProcessStartInfo("python3")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add(driver);
+            start.ArgumentList.Add(shim);
+            foreach (var arg in args)
+            {
+                start.ArgumentList.Add(arg);
+            }
+
+            using var process = System.Diagnostics.Process.Start(start);
+            if (process is null)
+            {
+                return null;
+            }
+
+            var stdout = process.StandardOutput.ReadToEnd();
+            process.WaitForExit();
+
+            using var document = System.Text.Json.JsonDocument.Parse(stdout);
+            var root = document.RootElement;
+            if (root.GetProperty("exit").GetInt32() != 0)
+            {
+                return (null, root.GetProperty("stderr").GetString());
+            }
+
+            return (root.GetProperty("request").GetProperty("message").GetString(), null);
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return null; // python3 is not installed here
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    private const string PlanDriverSource =
+        "import contextlib, importlib.util, io, json, sys\n"
+        + "spec = importlib.util.spec_from_file_location(\"shim\", sys.argv[1])\n"
+        + "mod = importlib.util.module_from_spec(spec)\n"
+        + "spec.loader.exec_module(mod)\n"
+        + "seen = {}\n"
+        + "def fake_call(request, timeout=None):\n"
+        + "    seen[\"request\"] = request\n"
+        + "    return {\"ok\": True, \"committed\": True, \"commitSha\": \"abc\", \"status\": \"agent/x\"}\n"
+        + "mod.call = fake_call\n"
+        + "err = io.StringIO()\n"
+        + "with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):\n"
+        + "    code = mod.main([\"/opt/mainguard/ipc/mainguard-plan\"] + sys.argv[2:])\n"
+        + "print(json.dumps({\"exit\": code, \"request\": seen.get(\"request\"), \"stderr\": err.getvalue()}))\n";
+
     [Fact]
     public void IpcPaths_AreTheFixedInJailLayout()
     {

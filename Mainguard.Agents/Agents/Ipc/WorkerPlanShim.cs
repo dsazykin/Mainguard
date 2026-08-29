@@ -36,7 +36,7 @@ Usage:
   mainguard-plan present <plan.json>    present the plan you authored, then wait
   mainguard-plan revise <id> <plan.json>  re-present after a rejection, then wait
   mainguard-plan await <id>             block until the human decides
-  mainguard-plan commit <message ...>   record the approved work on your own branch
+  mainguard-plan commit "<message>"     record the approved work on your own branch
 
 plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}. Write it
 OUTSIDE the repository (/tmp/plan.json) — /workspace is the tree your commit records.
@@ -48,6 +48,17 @@ it until then, so there is nothing to start on before approval.
 `commit` is how finished work leaves this jail. The daemon commits everything in
 /workspace onto your own branch; you supply only the message. Work you have not
 committed does not survive the agent being stopped.
+
+The message is ONE quoted argument, and it is a real git message: a subject line of at
+most 72 characters, then a BLANK line, then as much body as you want. The daemon records
+it verbatim and REFUSES anything it cannot record -- it will not shorten your subject or
+flatten your paragraphs. Quote the whole thing: a shell splits an unquoted message on
+whitespace, and your blank lines are gone before this program starts.
+
+  mainguard-plan commit "fix(auth): recompute token expiry in UTC
+
+  The clock read the host's local zone, so a token minted at 23:30 expired an hour
+  early. Boundary tests cover the DST transition in both directions."
 """
 """"
         + "\n" + AgentIpcShimTransport.PythonSource + "\n" + """"
@@ -65,7 +76,7 @@ def report(response):
         # Said HERE, at the one moment the worker is cleared to start, because this is the only
         # output it is guaranteed to read after the gate opens. A finished worker that never
         # commits leaves nothing behind: the worktree goes with the jail.
-        print("WHEN DONE: mainguard-plan commit <message>  (uncommitted work is lost)")
+        print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
         return 0
     if status == "Rejected":
         remaining = response.get("revisionsRemaining")
@@ -99,7 +110,20 @@ def main(argv):
     elif len(argv) >= 2 and argv[1] == "commit":
         # The message is ALL the worker contributes. The repo, the worktree and the branch are the
         # daemon's to compute from this endpoint's identity, so there is nothing else to send.
-        request = {"op": "commit_work", "message": " ".join(argv[2:])}
+        #
+        # ONE argument, and a second one is REFUSED rather than joined (G4). ' '.join(argv[2:]) was
+        # the other half of the message-destroying path: by the time a shell has split an unquoted
+        # message on whitespace, the subject/blank-line/body the worker wrote is already gone, and
+        # rejoining it with single spaces hides that a structure was lost. A commit message is the
+        # durable record of what this agent did; a slip in it is worth a turn to correct.
+        if len(argv) > 3:
+            sys.stderr.write(
+                "mainguard-plan: commit takes ONE quoted argument and %d were given. A shell splits an\n"
+                "unquoted message on whitespace, so the subject, blank line and body you wrote are\n"
+                "already one flat line by the time this runs. Quote the whole message -- newlines\n"
+                "inside the quotes are kept.\n" % (len(argv) - 2))
+            return 2
+        request = {"op": "commit_work", "message": argv[2] if len(argv) > 2 else ""}
         timeout = 300
     else:
         sys.stderr.write(__doc__ or "usage: mainguard-plan present <plan.json>\n")

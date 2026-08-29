@@ -169,8 +169,10 @@ public interface IAgentWorktreeManager
     /// answering "committed" for a commit that did not happen is the failure this codebase keeps paying
     /// for — the caller would report success to the worker while the branch stayed empty.</para>
     /// </summary>
-    /// <param name="message">The commit subject. It travels as one argv element through the audited
-    /// arg-list git primitive, never through a shell.</param>
+    /// <param name="message">The commit message — subject, blank line, body, exactly as git means it.
+    /// It travels as one argv element through the audited arg-list git primitive, never through a shell,
+    /// so newlines in it are ordinary characters. Judged by <see cref="AgentCommitMessage"/>: a message
+    /// that cannot be recorded is REFUSED, never repaired into something the worker did not write.</param>
     AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
         => new(AgentWorkCommitOutcome.Unsupported, AgentRepoLayout.BranchPrefix + agentId,
             Detail: "this worktree manager has no worktree to commit");
@@ -194,6 +196,12 @@ public enum AgentWorkCommitOutcome
 
     /// <summary>There is no worktree for this agent (never created, or already torn down).</summary>
     NoWorktree,
+
+    /// <summary>The message cannot be recorded as a commit message (G4). Refused rather than repaired:
+    /// the alternative shipped for weeks and it flattened newlines to spaces, cut the result at 200
+    /// characters mid-word, left <c>%b</c> empty, and reported success. See
+    /// <see cref="AgentCommitMessage"/>.</summary>
+    RefusedMessage,
 
     /// <summary>Git itself failed. Nothing is claimed about what did or did not land.</summary>
     Failed,
@@ -595,9 +603,25 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     };
 
     /// <inheritdoc />
-    public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+    public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? rawMessage)
     {
         var branch = BranchFor(agentId);
+
+        // The message is judged FIRST, before any git runs. It is the one pure check here, it costs
+        // nothing, and a refusal that arrives before `add -A` leaves the worktree exactly as the worker
+        // left it — so a rewritten message is a retry rather than a recovery.
+        var message = AgentCommitMessage.Normalize(rawMessage);
+        if (AgentCommitMessage.Refuse(message) is { } messageRefusal)
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.RefusedMessage, branch, Detail: messageRefusal);
+        }
+
+        if (message.Length == 0)
+        {
+            message = AgentCommitMessage.DefaultFor(agentId);
+        }
+
         var worktreePath = WorktreePathFor(repoHash, agentId);
         if (!Directory.Exists(worktreePath))
         {
@@ -640,7 +664,14 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             }
 
             var args = new List<string>(IdentityFor(agentId));
-            args.AddRange(new[] { "commit", "-m", CommitSubject(message, agentId) });
+
+            // `--cleanup=verbatim` is explicit for two reasons. The default for `-m` is `whitespace`,
+            // which COLLAPSES consecutive blank lines — so a two-paragraph body would come back with its
+            // spacing quietly altered, which is a smaller version of the defect this change removes. And
+            // the default is `commit.cleanup`-configurable, so leaving it implicit means the shape of an
+            // agent's commit depends on a config key nobody set deliberately. The text was normalised
+            // and judged before this point; git is asked to record it and nothing else.
+            args.AddRange(new[] { "commit", "--cleanup=verbatim", "-m", message });
             AgentGitCommand.Run(worktreePath, args.ToArray());
 
             var sha = HeadShaOrNull(worktreePath);
@@ -658,21 +689,6 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         {
             return new AgentWorkCommitResult(AgentWorkCommitOutcome.Failed, branch, Detail: ex.Message);
         }
-    }
-
-    /// <summary>The commit subject: what the worker said, or a truthful default when it said nothing
-    /// usable. Trimmed to one line and bounded, because a subject is one argv element that ends up in the
-    /// user's history — a newline would turn the rest into a body nobody chose, and an unbounded one is a
-    /// log line an operator cannot read.</summary>
-    internal static string CommitSubject(string? message, string agentId)
-    {
-        var single = (message ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ').Trim();
-        if (single.Length == 0)
-        {
-            return $"wip: work by agent {agentId}";
-        }
-
-        return single.Length <= 200 ? single : single[..200].TrimEnd();
     }
 
     private static string? HeadShaOrNull(string worktreePath) =>
