@@ -1816,6 +1816,14 @@ asserts exactly one state maps to `Working`.
 **No migration.** `MergeQueueRow.State` is a TEXT column and the member was appended to the enum, so existing
 rows are untouched and rehydrate exactly as before.
 
+**The name was already in the codebase, which is the strongest argument for the model.** Phase 3's own role
+lock (95ef2c95) answers a coordinator's `request_verification` with
+`Status: record.Passed ? "Verified" : "VerificationFailed"` — a literal string, because there was no state
+to name. So the daemon has been telling coordinators about a `VerificationFailed` outcome all along while
+the queue had no such state to put the branch in, and the queue put it in `Working` instead. The two now
+agree, and the agreement is not a coincidence: the vocabulary was right and the state machine was missing a
+word for it.
+
 ### 16.3 H3 — the outcome, logged
 
 `WorkerReadinessTrigger.RunAsync` announced `…verifying`, logged both of its *catch* arms, and said nothing
