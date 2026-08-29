@@ -31,6 +31,82 @@ public class WorkerPlanGateTests
         return (plans, new WorkerPlanGate(plans, audit));
     }
 
+    // ---- The brief is a brief, not the task (contract §3 change, 2026-08-29) ----------------
+
+    /// <summary>
+    /// <b>The defect, at the object that produced it.</b> Until 2026-08-29 the coordinator's shim sent no
+    /// title and the daemon filled the hole with <c>Title ?? TaskPrompt</c>, so
+    /// <see cref="WorkerPlanGate.PlanningBriefFor"/> returned the task verbatim to every worker —
+    /// MAINGUARD.md's "what you are here to plan (never the task itself)" made false by a fallback, with
+    /// nothing red anywhere. There is no fallback left: a hold without a real brief is refused, and each
+    /// refusal names its own cause so a coordinator can retry correctly rather than guess.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "rewrite TokenClock", "a title is required")]
+    [InlineData("", "rewrite TokenClock", "a title is required")]
+    [InlineData("   ", "rewrite TokenClock", "a title is required")]
+    [InlineData("Fix the clock", null, "a task is required")]
+    [InlineData("Fix the clock", "   ", "a task is required")]
+    [InlineData("rewrite TokenClock", "rewrite TokenClock", "must not be the task")]
+    [InlineData("  rewrite TokenClock  ", "rewrite TokenClock", "must not be the task")]
+    [InlineData("Fix\nthe clock", "rewrite TokenClock", "single line")]
+    public void ABriefThatIsMissingOrIsTheTask_IsRefused(string? title, string? task, string expected)
+    {
+        var refusal = WorkerPlanGate.RefuseBrief(title, task);
+        Assert.NotNull(refusal);
+        Assert.Contains(expected, refusal!, StringComparison.Ordinal);
+
+        // Every refusal carries the form to use — this text is read by a model that has to fix it.
+        Assert.Contains(
+            Mainguard.Agents.Agents.Ipc.AgentSpawnShim.SpawnUsage, refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>The title is a card headline, so a pasted task is refused by length even when it differs
+    /// from the task string — with the boundary pinned on both sides, so the cap is the cap.</summary>
+    [Fact]
+    public void AnOverLongTitle_IsRefused_AndTheBoundaryItselfIsNot()
+    {
+        Assert.Null(WorkerPlanGate.RefuseBrief(new string('x', WorkerPlanGate.MaxBriefLength), "the work"));
+
+        var over = WorkerPlanGate.RefuseBrief(new string('x', WorkerPlanGate.MaxBriefLength + 1), "the work");
+        Assert.NotNull(over);
+        Assert.Contains("headline", over!, StringComparison.Ordinal);
+    }
+
+    /// <summary>The paired positive: a real brief and a real task are accepted, and the brief that comes
+    /// back is the title — never the task. Without this every assertion above would hold on a validator
+    /// that refused everything.</summary>
+    [Fact]
+    public void ARealBrief_IsHeld_AndIsWhatTheWorkerIsGiven()
+    {
+        var (_, gate) = Rig();
+        Assert.Null(WorkerPlanGate.RefuseBrief("Fix the clock", "rewrite TokenClock and add boundary tests"));
+
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock and add boundary tests", 2m);
+
+        Assert.Equal("Fix the clock", gate.PlanningBriefFor("w-1"));
+        Assert.False(gate.TryReleaseTask("w-1", out _)); // …and the task is still not on offer
+    }
+
+    /// <summary>
+    /// The gate itself refuses, not only its callers. <c>Hold</c> is the one place both strings are
+    /// stored and the sole source of <see cref="WorkerPlanGate.PlanningBriefFor"/>, so it is where the
+    /// rule lives; a check that existed only at the spawn service would be the second copy that goes
+    /// decorative (MG-12) the first time another caller appears.
+    /// </summary>
+    [Fact]
+    public void HoldRefusesABriefThatIsTheTask_AndHoldsNothing()
+    {
+        var (_, gate) = Rig();
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => gate.Hold("w-1", "coord-1", "rewrite TokenClock", "rewrite TokenClock", 1m));
+        Assert.Contains("must not be the task", ex.Message, StringComparison.Ordinal);
+
+        Assert.Equal(0, gate.HeldTaskCount);
+        Assert.Null(gate.PlanningBriefFor("w-1"));
+    }
+
     // ---- The daemon holds the task ---------------------------------------
 
     [Fact]

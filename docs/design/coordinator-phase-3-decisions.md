@@ -1174,3 +1174,177 @@ Re-spelled as an unconditional early return, it went red.
   likely again by having each test stop the jail it leaves running — the class's own cleanup runs only
   after every test in it, so a jail left standing competes with the next spawn for admission headroom and
   the bridge pool. Reported as still-open rather than as fixed.
+
+---
+
+## 13. A contract §3 change — `spawn_worker` takes a title, and the brief stops being the task
+
+**Decided by the owner, 2026-08-29.** This section is longer than the diff because §3 says a change to
+the coordinator's surface is "a deliberate contract change, reviewed as such — not an implementation
+detail", and this is one. [`coordinator-contract.md`](coordinator-contract.md) §3 was amended in the
+same change.
+
+### 13.1 What was found
+
+Phase 2 §2.2/§2.3 and the worker's `MAINGUARD.md` both say a worker is given a **brief** — *"what you
+are here to plan (never the task itself)"* — and that the task is withheld until a human approves the
+plan. In the shipped daemon, `mainguard-plan brief` returned the **task, verbatim**. Three lines, in
+three files, made that true:
+
+```python
+# AgentSpawnShim — the coordinator's CLI sent no title at all
+request = {"op": "spawn", "agentKind": argv[2], "taskPrompt": " ".join(argv[3:])}
+```
+```csharp
+// AgentSpawnService.SpawnWorkerAsync — so the daemon derived one
+heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task",
+```
+```csharp
+// WorkerPlanGate.PlanningBriefFor — which is what `brief` returns
+return FindLocked(workerAgentId)?.Title;
+```
+
+`brief == task`, by fallback rather than by intent. The documented separation collapsed, and **nothing
+was red**: every daemon-side test constructed its own `AgentIpcRequest` and supplied a `Title` no real
+coordinator could send, so the one component that never appeared in a test — the shim — was the one
+component that was wrong. `WorkerPlanChannelIpcTests.ACoordinatorSpawnedWorker_GetsAPlanShimAndABrief_
+ButNotItsTask` asserted the brief equalled the string it had spawned with, and passed on the defect it
+was named for.
+
+**Verified before anything was changed**, in a real jail (`SandboxFixture` + the real shim, no paid
+CLI): running `mainguard-agent spawn claude-code --title 'Fix the token clock' --task rewrite …` from
+inside a container, the daemon received
+
+```
+title='' taskPrompt='--title Fix the token clock --task rewrite TokenClock so expiry is …'
+```
+
+— no title, and the flags swallowed into the prompt. A title-less spawn was also accepted, exit 0.
+
+### 13.2 The decision, and the spelling
+
+The coordinator supplies a title separately from the task. The CLI form is a **single-sourced
+constant**, `AgentSpawnShim.SpawnUsage`, interpolated into the shim's `--help`, the shim's refusals, and
+`AgentOperatingInstructions.Coordinator` — three renderings of one command is how they come to disagree:
+
+```
+mainguard-agent spawn <agent-kind> --title "<short title>" --task <the task ...>
+```
+
+**Why not a second positional** (`spawn <kind> <title> <task ...>`), which is the obvious repair. The
+caller is a language model that has read the usage once, and a positional pair fails it three ways: the
+order can be remembered backwards (and the failure — the task on the approval card, the title withheld —
+is exactly inverted, not merely wrong); an unquoted title silently eats the first word of the task; an
+unquoted task silently extends the title. All three are *silent*.
+
+Two named flags fix each of those:
+
+| slip | positional form | this form |
+|---|---|---|
+| arguments swapped | silent, and inverted | impossible — each argument says which it is |
+| task not quoted | silently absorbed into the title | fine: `--task` takes every remaining word |
+| title not quoted | silently truncates the title, corrupts the task | **detected** — the stray words land where `--task` must be, and the shim says so |
+
+The last row is the load-bearing one. `--title` takes exactly ONE argument, so a quoting slip cannot
+produce a plausible-looking parse; it produces a shape the parser can see. The refusal names the cause
+(*"--title must be ONE quoted argument (found 'the' where --task was expected — quote the title)"*) and
+prints the working form. And the argument that is *hardest* to quote — the long free-form task — is the
+one that needs no quotes at all.
+
+### 13.3 What happens when the coordinator omits the title: **refuse**
+
+Not derive, not truncate, not fall back. A derived brief is precisely the defect; a truncated task would
+be worse, because it would *look* like a title while still leaking the work.
+
+- **The shim refuses locally**, before any round trip, and prints the form. That is an affordance, not
+  the enforcement — the shim is a file in the jail's mount and a jailed process can speak the socket
+  itself.
+- **The daemon refuses**, and that is the enforcement. `WorkerPlanGate.RefuseBrief(title, taskPrompt)`
+  is the single authority; it lives on the gate because the gate is the one object that holds both
+  strings and the sole source of `PlanningBriefFor`. It is called from `WorkerPlanGate.Hold` (which
+  throws, so no caller can store a brief that is not one), from `AgentSpawnService.SpawnAsync` before
+  `_store.Spawn` mints anything, and from `SpawnWorkerAsync` at the channel.
+
+**Why the channel call is required and not merely defensive.** `SpawnAsync` reads *"neither a title nor
+a task"* as *"this spawn is not plan-gated"* — that is how an operator's own spawn is spelled. So a shim
+request carrying neither would not have been refused downstream: it would have produced a Managed worker
+with **no plan gate at all**, which is strictly worse than the defect being fixed. The check at the
+channel is what closes that, and `ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing`
+asserts the session count, not just the refusal.
+
+The rules, each with its own refusal text and its own row in the theory: a title is required; a task is
+required; the title is one line; the title is at most `MaxBriefLength` (120) characters; and **the title
+must not equal the task**. That last one is a tripwire for exactly this defect returning through the
+front door, and the code says so — it is not claimed to catch a title that merely paraphrases its task.
+
+### 13.4 The UI consequence, which is why "short" is in the rules
+
+The title is what a human reads on the plan-approval card (`PlanGateView`, `{Binding Title}`). So the
+constraints are not stylistic:
+
+- the 120-character cap and the single-line rule are there because a card headline that is a paragraph
+  is a card nobody reads — and "paste the task in as the title" is the shape the old fallback produced
+  automatically, every time;
+- the coordinator's operating instructions **say** the title is the headline the human decides from, and
+  tell it to write one like a pull-request title, with a worked example. A model that is not told this
+  optimises the title for itself;
+- `AgentOperatingInstructionsTests.TheCoordinatorIsToldThatTheTitleIsTheBrief_AndTheTaskIsWithheld`
+  pins that the text says all of it, so the guidance cannot be edited away silently.
+
+The card's own title still prefers the worker's `present` title and falls back to the brief, which is
+now a real headline either way — so the card improved without a UI change.
+
+### 13.5 Keeping the instructions honest
+
+`AgentOperatingInstructionsTests` already pinned the coordinator text against
+`AgentIpcRequest.CoordinatorOps` in both directions. That check is about *which* ops exist and could not
+have caught this: the op is still `spawn`. So it gained two:
+`TheCoordinatorIsTaughtTheSpawnFormTheShimActuallyParses` (the instructions carry
+`AgentSpawnShim.SpawnUsage` verbatim, and so does the script), and the meaning test above. The shim's own
+end is covered by `AgentIpcProtocolTests.TheShimsSpawnParser_…`, which runs the real `main()` under
+python3 with the transport stubbed — see §13.6 for why it does not call the parser directly.
+
+The op set itself is unchanged — `CoordinatorOps` still has exactly its five members and
+`CoordinatorRoleLockTests` still set-equals it against the served surface. This change alters the shape
+of one op, not the surface.
+
+### 13.6 The mutation log — every guard watched failing
+
+Each guard was broken, the named test run, and the failure observed; the guard was then restored with
+`git checkout --` **followed by `touch`**, because a restore that preserves mtime lets MSBuild skip the
+rebuild and re-run the tests against the *mutated* binary.
+
+| # | mutation | went red |
+|---|---|---|
+| M1 | `RefuseBrief` returns `null` unconditionally | `WorkerPlanGateTests` — 10 failures across the theory, the boundary test and `HoldRefuses…` |
+| M2 | drop the title-equals-task check | `ABriefThatIsMissingOrIsTheTask_IsRefused` (both equality rows) + `HoldRefusesABriefThatIsTheTask_AndHoldsNothing` |
+| M3 | drop the length cap | `AnOverLongTitle_IsRefused_AndTheBoundaryItselfIsNot` |
+| M4 | drop the single-line check | `ABriefThatIsMissingOrIsTheTask_IsRefused(title: "Fix\nthe clock")` |
+| M5 | `Hold` no longer calls `RefuseBrief` | `HoldRefusesABriefThatIsTheTask_AndHoldsNothing` |
+| M6 | `SpawnWorkerAsync` drops the channel check | `ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing(null, null)` — and **only** that row, which is the point: the other rows are still caught downstream, and the one the channel check exists for is the request that would otherwise mint an ungated worker |
+| M7 | `SpawnAsync` drops the pre-`_store.Spawn` check | `SpawnAsync_WithAPlanGatedTaskAndNoBrief_ThrowsBeforeMintingASession` — it still throws (from `Hold`), but a session record is left behind, which is what the assertion catches |
+| M8 | `PlanningBriefFor` returns `TaskPrompt` — **the defect itself** | `ACoordinatorSpawnedWorker_GetsAPlanShimAndABrief_ButNotItsTask`, `BackendWorkflowSimulation.Phase2_…`, and 3 in `WorkerPlanGateTests` |
+| M9 | the shim's `main` restores the old `taskPrompt: " ".join(argv[3:])` | `AgentIpcJailDockerTests.TheRealShimsSpawn_SendsTheTitleAndTheTaskAsSeparateFields` + `…RefusesTheOldTitlelessForm_…` — and, after the fix below, 6 rows of the host-side theory |
+| M10 | the shim derives a title from the task instead of refusing | host-side theory + `…RefusesTheOldTitlelessForm_AndSaysWhatToRunInstead` |
+| M11 | the shim stops detecting a mis-split (unquoted) title | host-side theory, the `ONE quoted argument` row |
+| M12 | the instructions revert to the old positional spawn line | `TheCoordinatorIsTaughtTheSpawnFormTheShimActuallyParses` |
+| M13 | the instructions drop the `--title`/`--task` section | `TheCoordinatorIsToldThatTheTitleIsTheBrief_AndTheTaskIsWithheld` |
+
+**One mutation exposed a weak test, and the test was fixed rather than the mutation excused.** M9 changed
+only the shim's `main`, not its `spawn_request`, and the host-side test called `spawn_request` directly —
+so it stayed **green** while the shim on disk sent no title. A correct parser that `main` does not route
+through is exactly the shape of the original defect. The test now loads the shim, **stubs `call`, and
+runs the real `main()`**, so it covers the parser, the dispatch, and the fact that a refused spawn never
+reaches the daemon at all. Re-run against M9 it goes red, as it should have the first time.
+
+### 13.7 What this does not do
+
+- **The worker's `present`/`revise` title is still worker-supplied and still falls back to the brief.**
+  That is a different string (the plan's own headline) and the fallback there is to a real title now, so
+  it was left alone.
+- **`CoordinatorAgent.SystemPrompt` / `CoordinatorTools.spawn_worker` already took a title** and are
+  unchanged. They are the un-wired in-process tool API; the defect was that the *shipped* CLI had no
+  equivalent. This change gives the CLI parity with the API rather than the reverse.
+- **The old title-less invocation now fails.** That is intended and is the reason this is recorded as a
+  contract change: an existing coordinator transcript that used it was producing a worker whose brief was
+  its task, and the refusal names the form that works.

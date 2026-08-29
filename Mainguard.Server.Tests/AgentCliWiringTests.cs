@@ -337,7 +337,7 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         // The shim's wire protocol: one JSON line in, one out — a managed worker spawns through the
         // SAME chain (session store → jail → bound CLI) and streams to the UI as a subagent.
         var response = await ShimRoundTripAsync(dir,
-            """{"op":"spawn","agentKind":"claude-code","taskPrompt":"split the work"}""");
+            """{"op":"spawn","agentKind":"claude-code","title":"Plan the split","taskPrompt":"split the work"}""");
         Assert.Contains("\"ok\":true", response, StringComparison.Ordinal);
 
         var list = await agents.ListAgentsAsync(new ListAgentsRequest(), rig.Auth);
@@ -422,7 +422,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         try
         {
             var refused = await spawns.HandleShimRequestAsync(
-                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "more work"),
+                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                    "spawn", "claude-code", "more work", Title: "Plan the extra work"),
                 coordinatorId, default);
             Assert.False(refused.Ok);
             Assert.Contains("frozen", refused.Error, StringComparison.OrdinalIgnoreCase);
@@ -445,9 +446,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var coordB = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
 
         var a = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordA, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coordA, default);
         var b = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordB, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coordB, default);
         Assert.True(a.Ok, a.Error);
         Assert.True(b.Ok, b.Error);
 
@@ -512,7 +515,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var coord = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
 
         var refused = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coord, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coord, default);
         Assert.False(refused.Ok);
         Assert.Contains("memory", refused.Error!, StringComparison.OrdinalIgnoreCase);
 
@@ -531,7 +535,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         // Another coordinator with a worker exists on this daemon...
         var other = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
         await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), other, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), other, default);
 
         // ...but a coordinator that has spawned nothing must see nothing (previously it saw everything).
         var idle = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
@@ -559,7 +564,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         for (var i = 0; i < 2; i++)
         {
             var ok = await spawns.HandleShimRequestAsync(
-                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"),
+                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                    "spawn", "claude-code", "work", Title: "Plan the work"),
                 coordinatorId, default);
             Assert.True(ok.Ok, ok.Error);
         }
@@ -568,7 +574,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // The third is refused by the server-side cap — and no worker record leaks.
         var refused = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "too much"),
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "too much", Title: "Plan too much"),
             coordinatorId, default);
         Assert.False(refused.Ok);
         Assert.Contains("cap", refused.Error, StringComparison.OrdinalIgnoreCase);

@@ -52,6 +52,43 @@ public class AgentOperatingInstructionsTests
     }
 
     /// <summary>
+    /// <b>The contract §3 change of 2026-08-29.</b> The coordinator is taught the spawn form the shim
+    /// actually parses — the same string, not a second spelling of it.
+    ///
+    /// <para>Single-sourcing is the whole mechanism: <c>AgentSpawnShim.SpawnUsage</c> is interpolated
+    /// into the shim's <c>--help</c>, into the shim's refusals, and into this text, so the three places a
+    /// model reads this command cannot disagree. What that leaves for a test is to prove the instructions
+    /// really use it rather than restating it — a copy-pasted line would satisfy a reader and drift on the
+    /// next edit.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsTaughtTheSpawnFormTheShimActuallyParses()
+    {
+        Assert.Contains(AgentSpawnShim.SpawnUsage, Coordinator(), StringComparison.Ordinal);
+        Assert.Contains(AgentSpawnShim.SpawnUsage, AgentSpawnShim.Script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// …and is told what the two arguments MEAN, which is the half that changes behaviour. A coordinator
+    /// that knows the flag but not that `--title` is all the worker gets writes the task into both — the
+    /// defect this change removed, re-created by hand.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldThatTheTitleIsTheBrief_AndTheTaskIsWithheld()
+    {
+        var text = Flatten(Coordinator());
+
+        Assert.Contains("--title", text, StringComparison.Ordinal);
+        Assert.Contains("--task", text, StringComparison.Ordinal);
+        Assert.Contains("withheld", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("must not be the task", text, StringComparison.OrdinalIgnoreCase);
+
+        // The UI consequence: the title is the headline a human decides from, so the text must say so —
+        // otherwise a model optimises the title for itself and the approval card becomes unreadable.
+        Assert.Contains("headline", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// And nothing else. An instruction naming a command the daemon refuses sends the agent to spend
     /// turns on a wall, then improvise around it — which is exactly the behaviour the role lock exists
     /// to remove.

@@ -105,7 +105,8 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
         var coordinator = await SpawnCoordinatorAsync();
 
         var response = await CallAsync(coordinator, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: Installed, TaskPrompt: "do the thing"));
+            AgentIpcRequest.SpawnOp, AgentKind: Installed, TaskPrompt: "do the thing",
+            Title: "Plan the thing"));
 
         Assert.True(response.Ok, response.Error);
         _spawned.Add(response.AgentId!);
@@ -146,7 +147,8 @@ public sealed class CoordinatorSpawnKindTests : IDisposable
             Repo, Installed, null, AgentRoles.Coordinator, CancellationToken.None);
 
         var response = await CallAsync(rig, coordinator, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "coder", TaskPrompt: "do the thing"));
+            AgentIpcRequest.SpawnOp, AgentKind: "coder", TaskPrompt: "do the thing",
+            Title: "Plan the thing"));
 
         Assert.True(response.Ok, response.Error);
         try { await rig.Spawns.StopAsync(response.AgentId!, CancellationToken.None); } catch { }

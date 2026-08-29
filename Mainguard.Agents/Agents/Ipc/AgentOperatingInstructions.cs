@@ -79,13 +79,31 @@ public static class AgentOperatingInstructions
         Everything you can do is one command, `{shimPath}`. There is no fifth operation:
 
         ```
-        {shimPath} spawn <agent-kind> <task prompt ...>   start a worker on a task
+        {shimPath} {AgentSpawnShim.SpawnUsage}
         {shimPath} status [<agent-id>]                    list your workers and why each is idle
         {shimPath} prompt <agent-id> <text ...>           steer a worker you spawned
         {shimPath} verify <agent-id>                      propose a worker's work for verification
         ```
 
         Run `{shimPath}` with no arguments for the full usage text.
+
+        ## `--title` is the worker's brief; `--task` is the work, and it is withheld
+
+        These are two different things and the daemon keeps them apart. **`--title` is all the worker
+        gets up front** — it runs its own shim's `brief`, reads that title, and inspects the repository
+        against it. **`--task` is withheld until a human approves the plan the worker writes.** The
+        title is also the headline on that approval card, so it is what the human decides from.
+
+        - **Quote the title.** It is exactly ONE argument. `--task` takes every word after it, so the
+          long one needs no quotes at all.
+        - **Write the title like a pull-request title** — short, specific, human-readable:
+          `--title "Fix token expiry in the auth clock"`.
+        - **The title must not be the task.** A spawn whose title repeats its task is refused: a brief
+          that is the task is not a brief, and it would hand the worker its work before anyone had read
+          a plan. Name the area to plan against in the title; put the work in `--task`.
+
+        Both are required. A spawn missing either is refused rather than guessed at, and the refusal
+        names the form to use.
 
         ## `<agent-kind>` is one of the CLIs installed on this machine
 

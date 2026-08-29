@@ -94,10 +94,19 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
 
     // ---- the daemon withholds the task -----------------------------------
 
+    /// <summary>
+    /// <b>The separation, at the worker's own channel.</b> The brief is the coordinator's <c>--title</c>
+    /// and it is NOT the task — the assertion this test could not previously make, because until
+    /// 2026-08-29 the daemon derived the brief from the task (<c>Title ?? TaskPrompt</c>) and this test's
+    /// own expectation was the task prompt it had just spawned with. It passed, and the thing it was
+    /// named for was false.
+    /// </summary>
     [Fact]
     public async Task ACoordinatorSpawnedWorker_GetsAPlanShimAndABrief_ButNotItsTask()
     {
-        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("fix the token clock");
+        const string title = "Fix the token clock";
+        const string task = "rewrite TokenClock so expiry is computed in UTC and add boundary tests";
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync(task, title);
 
         // The worker's jail carries mainguard-plan and NOT the coordinator's spawn shim.
         var dir = Rig.Ipc.DirFor(workerId);
@@ -108,9 +117,91 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         // `brief` tells it what to plan about — and carries no task prompt.
         var brief = await CallAsync(workerId, new AgentIpcRequest(AgentIpcRequest.BriefOp));
         Assert.True(brief.Ok);
-        Assert.Equal("fix the token clock", brief.Brief);
+        Assert.Equal(title, brief.Brief);
         Assert.True(string.IsNullOrEmpty(brief.TaskPrompt));
         Assert.Equal(Rig.Limits.MaxPlanRevisions, brief.MaxRevisions);
+
+        // The point: the brief is not the task, and does not contain it. Asserted both ways so a
+        // reinstated `Title ?? TaskPrompt` fallback fails here rather than passing quietly.
+        Assert.NotEqual(task, brief.Brief);
+        Assert.DoesNotContain(task, brief.Brief!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A coordinator that sends no title is <b>refused</b>, and no worker is minted for it.
+    ///
+    /// <para>This is the daemon half of the contract §3 change, and it is asserted through the socket
+    /// rather than against the shim, because the shim is a file in a read-only mount and the wire is what
+    /// a jail can actually speak. A shim-only check would be the convention MG-12 warns about.</para>
+    ///
+    /// <para><b>The refusal must also not fall through to an ungated spawn.</b> <c>SpawnAsync</c> reads
+    /// "neither title nor task" as "this spawn is not plan-gated" — the operator's own spelling — so the
+    /// dangerous failure mode is not a bad brief but a Managed worker with no gate at all. Hence the
+    /// worker-count assertion.</para>
+    /// </summary>
+    [Theory]
+    // The dangerous row, and the reason this check lives at the CHANNEL: with neither field,
+    // SpawnAsync would read the request as "not plan-gated" and mint an UNGATED managed worker.
+    [InlineData(null, null, "a task is required")]
+    [InlineData(null, "rewrite TokenClock", "a title is required")]
+    [InlineData("   ", "rewrite TokenClock", "a title is required")]
+    [InlineData("Fix the clock", null, "a task is required")]
+    [InlineData("Fix the clock", "   ", "a task is required")]
+    [InlineData("rewrite TokenClock", "rewrite TokenClock", "must not be the task")]
+    public async Task ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing(
+        string? title, string? task, string expected)
+    {
+        var coordinatorId = await SpawnCoordinatorAsync();
+        var before = Rig.Sessions.List().Count;
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: task, Title: title));
+
+        Assert.False(response.Ok);
+        Assert.Contains(expected, response.Error!, StringComparison.Ordinal);
+        Assert.Null(response.AgentId);
+        Assert.Equal(before, Rig.Sessions.List().Count);
+    }
+
+    /// <summary>
+    /// The same rule one layer down, at <c>SpawnAsync</c> itself — the entry point every future
+    /// plan-gated caller reaches, not just the shim channel. It refuses BEFORE <c>_store.Spawn</c>, so a
+    /// bad brief costs no session record; letting it reach <c>Hold</c>'s throw instead would leave an
+    /// orphan session behind. Asserting the session count is what makes the placement testable rather
+    /// than a comment.
+    /// </summary>
+    [Fact]
+    public async Task SpawnAsync_WithAPlanGatedTaskAndNoBrief_ThrowsBeforeMintingASession()
+    {
+        var before = Rig.Sessions.List().Count;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => Rig.Spawns.SpawnAsync(
+            PlanGateRig.RepoHandle, "claude-code", null, AgentRoles.Managed, CancellationToken.None,
+            heldTaskTitle: null, heldTaskPrompt: "rewrite TokenClock"));
+
+        Assert.Equal(before, Rig.Sessions.List().Count);
+    }
+
+    /// <summary>
+    /// An over-long or multi-line title is refused too: it is the headline on a human's approval card,
+    /// and "paste the task in as the title" is the shape the fallback used to produce automatically.
+    /// </summary>
+    [Fact]
+    public async Task ATitleThatIsNotAHeadline_IsRefused()
+    {
+        var coordinatorId = await SpawnCoordinatorAsync();
+
+        var tooLong = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "do the work",
+            Title: new string('x', WorkerPlanGate.MaxBriefLength + 1)));
+        Assert.False(tooLong.Ok);
+        Assert.Contains("headline", tooLong.Error!, StringComparison.Ordinal);
+
+        var multiLine = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "do the work",
+            Title: "Fix the clock\nand everything else"));
+        Assert.False(multiLine.Ok);
+        Assert.Contains("single line", multiLine.Error!, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -463,7 +554,7 @@ public sealed class WorkerCapDaemonEnforcementTests : PlanGateIpcTestBase, IClas
         await WaitForAsync(() => Rig.Gate.BlockedWorkerCount == max ? "ok" : null);
 
         var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more"));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more", Title: DefaultBrief));
 
         Assert.False(refused.Ok);
         Assert.Contains($"{max} workers are waiting on human plan approval", refused.Error!, StringComparison.Ordinal);
@@ -524,17 +615,27 @@ public abstract class PlanGateIpcTestBase : IAsyncLifetime
         return id;
     }
 
-    protected async Task<(string CoordinatorId, string WorkerId)> SpawnCoordinatorAndWorkerAsync(string taskPrompt)
+    /// <summary>
+    /// A stand-in brief for the tests that are not about the brief. Deliberately a DIFFERENT string from
+    /// every task prompt these tests spawn with, so no test here can pass on the two being equal — which
+    /// is how the pre-2026-08-29 defect survived a green suite: the daemon derived the brief from the
+    /// task, and every test that built its own request agreed with the derivation by construction.
+    /// </summary>
+    protected const string DefaultBrief = "Plan the auth-module work";
+
+    protected async Task<(string CoordinatorId, string WorkerId)> SpawnCoordinatorAndWorkerAsync(
+        string taskPrompt, string title = DefaultBrief)
     {
         var coordinatorId = await SpawnCoordinatorAsync();
-        return (coordinatorId, await ShimSpawnAsync(coordinatorId, taskPrompt));
+        return (coordinatorId, await ShimSpawnAsync(coordinatorId, taskPrompt, title));
     }
 
     /// <summary>Spawns a worker exactly as a coordinator CLI does — one JSON line on its own socket.</summary>
-    protected async Task<string> ShimSpawnAsync(string coordinatorId, string taskPrompt)
+    protected async Task<string> ShimSpawnAsync(
+        string coordinatorId, string taskPrompt, string title = DefaultBrief)
     {
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt, Title: title));
         Assert.True(response.Ok, response.Error);
         Assert.Equal("AwaitingPlan", response.Status);
         _spawned.Add(response.AgentId!);

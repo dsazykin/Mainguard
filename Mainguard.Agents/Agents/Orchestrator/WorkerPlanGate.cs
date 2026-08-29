@@ -116,9 +116,76 @@ public sealed class WorkerPlanGate : IMergeGate
     public event Action<string, string>? TaskReleased;
 
     /// <summary>
+    /// The longest a brief may be. It is a headline on a human's plan-approval card, and a card whose
+    /// headline is a paragraph is a card nobody reads — which is the decision the gate exists to make
+    /// possible. Deliberately generous (a long pull-request title fits) so this refuses the class of
+    /// caller that pasted the task in, not the one that wrote a wordy title.
+    /// </summary>
+    public const int MaxBriefLength = 120;
+
+    /// <summary>
+    /// Why this (title, task) pair may not be held — or <c>null</c> when it may. The reasons are written
+    /// for the <b>coordinator</b> to read verbatim and retry correctly on its next turn, because that is
+    /// who receives them: <c>AgentSpawnService</c> returns this text as the <c>spawn</c> refusal.
+    ///
+    /// <para><b>Why refuse rather than derive (contract §3 change, 2026-08-29).</b> The defect this
+    /// closes was a derivation: the shim sent no title, the daemon filled the hole with
+    /// <c>Title ?? TaskPrompt</c>, and <see cref="PlanningBriefFor"/> therefore handed every worker its
+    /// task verbatim — the documented "never the task itself" made false by a fallback, with nothing
+    /// failing anywhere. Any replacement fallback recreates that. Truncating the task would be worse
+    /// still: it would look like a title while still leaking the work. So a spawn without a real brief
+    /// does not happen, and the coordinator is told exactly what to send instead.</para>
+    ///
+    /// <para><b>What the equality check is and is not.</b> It is a tripwire for exactly the defect above
+    /// — a caller passing one string as both — not a semantic guarantee that a title paraphrasing its
+    /// task is caught. Stated plainly, because a check described as more than it is becomes the reason
+    /// nobody looks again.</para>
+    /// </summary>
+    public static string? RefuseBrief(string? title, string? taskPrompt)
+    {
+        var usage = "Spawn again as: " + Mainguard.Agents.Agents.Ipc.AgentSpawnShim.SpawnUsage;
+
+        if (string.IsNullOrWhiteSpace(taskPrompt))
+        {
+            return "a task is required — that is the work the worker is spawned to do. " + usage;
+        }
+
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            return "a title is required: it is the BRIEF the worker plans against before its task is "
+                 + "released, and the headline you put in front of the human. " + usage;
+        }
+
+        if (title.Length > MaxBriefLength)
+        {
+            return "the title is a one-line headline on a human's approval card, not the task — keep it "
+                 + $"under {MaxBriefLength} characters ({title.Length} given). " + usage;
+        }
+
+        if (title.AsSpan().IndexOfAny('\n', '\r') >= 0)
+        {
+            return "the title is a single line. " + usage;
+        }
+
+        if (string.Equals(title.Trim(), taskPrompt.Trim(), StringComparison.Ordinal))
+        {
+            return "the title must not be the task: the worker is given the title up front and the task "
+                 + "only after a human approves its plan, so a title that repeats the task hands over the "
+                 + "work the gate is there to withhold. Write a short headline instead. " + usage;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Records the work a worker was spawned for <b>without giving it to the worker</b>. Called on the
     /// spawn path; idempotent per worker id.
     /// </summary>
+    /// <exception cref="ArgumentException">
+    /// The brief is missing, over-long, multi-line, or is the task itself (<see cref="RefuseBrief"/>) —
+    /// or the worker id is blank. Thrown rather than stored, because a held task with no real brief is
+    /// the defect, not a degraded case of it.
+    /// </exception>
     public void Hold(
         string workerAgentId, string coordinatorId, string title, string taskPrompt, decimal budgetUsd,
         string repoHash = "")
@@ -126,6 +193,14 @@ public sealed class WorkerPlanGate : IMergeGate
         if (string.IsNullOrWhiteSpace(workerAgentId))
         {
             throw new ArgumentException("workerAgentId is required.", nameof(workerAgentId));
+        }
+
+        // The brief/task separation is checked HERE, at the one object that stores both strings and is
+        // the sole source of PlanningBriefFor. A caller-side check alone would be the second copy of a
+        // policy that this codebase's standing lesson (MG-12) says goes decorative.
+        if (RefuseBrief(title, taskPrompt) is { } refusal)
+        {
+            throw new ArgumentException(refusal, nameof(title));
         }
 
         var key = (repoHash ?? string.Empty, workerAgentId);

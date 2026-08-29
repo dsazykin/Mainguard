@@ -136,7 +136,22 @@ These four already exist as `CoordinatorTools`. The contract is that this list i
 | `request_verification` | propose a worker's branch for daemon verification | ownership scope |
 
 Anything not on this list is denied. Adding to this list is a deliberate contract change, reviewed as
-such — not an implementation detail.
+such — not an implementation detail. So is changing the shape of one of them: `spawn_worker`'s arguments
+were changed on **2026-08-29** and that change is recorded as a contract change, in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §13.
+
+**`spawn_worker` takes a title AND a task, and they are different things.** The CLI form is
+
+```
+mainguard-agent spawn <agent-kind> --title "<short title>" --task <the task ...>
+```
+
+The **title is the brief** — the only thing the worker is given before its plan is approved (§3.1
+`brief`), and the headline the human reads on the approval card. The **task is withheld** until that
+approval. Both are required: a spawn missing either, or whose title *is* its task, is refused
+daemon-side rather than defaulted. This is stated in the contract because the alternative was tried and
+failed silently — the shim sent no title, the daemon derived one from the task, and "the brief is never
+the task" was false everywhere while every test was green.
 
 **`get_worker_status` must be able to say "done".** It is the coordinator's only window onto its own
 fan-out, so a status that can only ever describe the jail's liveness makes a coordinator structurally

@@ -133,7 +133,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
     G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
     <text>` / `verify <id>`, with `list` kept as an alias of `status` — and its docstring says plainly that
-    there is no fifth) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
+    there is no fifth. **Contract §3 change, 2026-08-29:** `spawn` takes `SpawnUsage` —
+    `spawn <agent-kind> --title "<short title>" --task <the task ...>` — a single-sourced constant
+    interpolated into the shim's `--help`, its refusals, and `AgentOperatingInstructions.Coordinator`, so
+    the three places a model reads this command cannot disagree. It used to send NO title, which is what
+    made the daemon's `Title ?? TaskPrompt` fallback hand every worker its task as its "brief". Both flags
+    are required and ordered, and `spawn_request` refuses rather than derives: named flags cannot be
+    swapped, `--task` swallows the unquoted tail so the hard-to-quote argument need not be quoted, and an
+    unquoted `--title` leaves stray words where `--task` must be — so the one remaining quoting slip is
+    *detected* rather than silently mis-split) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
     **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
     **`commit <message>`** (the only route a jailed CLI has to a commit — measured against claude-code
     2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`).
@@ -150,7 +158,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     NOT that string, which is written for the in-process `spawn_worker(...)` API the shipped coordinator
     does not have. `AgentOperatingInstructionsTests` pins the coordinator text against
     `AgentIpcRequest.CoordinatorOps` in both directions, so a tool the contract grants but the text omits
-    — a capability the agent would then never use — fails a test. **Delivered two ways, neither
+    — a capability the agent would then never use — fails a test, and (2026-08-29) pins that the
+    coordinator text carries `AgentSpawnShim.SpawnUsage` verbatim plus what `--title`/`--task` MEAN: the
+    title is the whole brief, the task is withheld until approval, and the title is the headline on the
+    human's approval card. **Delivered two ways, neither
     redundant**, via `AdapterSpec`/`InstalledAdapterMarker` `instructionsFile` + `systemPromptArg`
     (claude-code: `CLAUDE.md` + `--append-system-prompt`): the launcher appends the FLAG to the launch
     argv, which is the ONLY channel that reaches a coordinator — the role lock leaves it an empty tmpfs
@@ -1580,7 +1591,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
-      a spawned worker's task **without giving it to the worker**; `TryReleaseTask` yields it only against
+      a spawned worker's task **without giving it to the worker** — and, since 2026-08-29, refuses to
+      record one at all unless the brief is a brief (`RefuseBrief`/`MaxBriefLength`: a title is required,
+      is one line, is at most 120 characters, and **must not equal the task**). That check lives here
+      because this is the one object holding both strings and the sole source of `PlanningBriefFor`; the
+      fallback it replaces (`Title ?? TaskPrompt`, plus `?? "Untitled task"`) is what made
+      `mainguard-plan brief` return the task verbatim; `TryReleaseTask` yields it only against
       an approved plan (no override parameter — an override is how a gate becomes decorative) and is
       **idempotent in both directions**: it keeps answering with the task on a repeat call, because
       `mainguard-plan await <id>` is the documented re-attach after a worker crash or daemon restart and an

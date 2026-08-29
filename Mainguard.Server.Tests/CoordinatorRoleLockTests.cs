@@ -314,6 +314,7 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
                 AgentIpcRequest.SpawnOp,
                 AgentKind: "claude-code",
                 TaskPrompt: "spawn under a name I chose",
+                Title: DefaultBrief,
                 AgentId: hostile));
 
             Assert.True(response.Ok, response.Error);
@@ -556,10 +557,15 @@ public sealed class CoordinatorRoleLockTests : IClassFixture<RoleLockRig>, IAsyn
         _spawned.Add(id);
     }
 
-    private async Task<string> ShimSpawnAsync(string coordinatorId, string taskPrompt)
+    /// <summary>A brief that is deliberately not any of this file's task prompts, so no assertion here
+    /// can pass on the two being the same string (the shape of the pre-2026-08-29 defect).</summary>
+    private const string DefaultBrief = "Plan the auth-module work";
+
+    private async Task<string> ShimSpawnAsync(
+        string coordinatorId, string taskPrompt, string title = DefaultBrief)
     {
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt, Title: title));
         Assert.True(response.Ok, response.Error);
         _spawned.Add(response.AgentId!);
         return response.AgentId!;

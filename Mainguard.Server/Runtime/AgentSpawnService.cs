@@ -220,6 +220,19 @@ public sealed class AgentSpawnService
             throw new ArgumentException("agent_kind is required.");
         }
 
+        // A plan-gated spawn is refused UP FRONT when its brief is not a brief — before _store.Spawn
+        // mints a session, so a refusal leaves nothing behind. WorkerPlanGate.Hold enforces the same
+        // rule (it is the authority; this is the same function, called early enough to fail cleanly),
+        // but reaching it after the session record exists would leak that record and, worse, would put
+        // the throw inside a path whose rollback is written for jail teardown rather than for a request
+        // that never should have been admitted.
+        if ((heldTaskTitle is not null || heldTaskPrompt is not null)
+            && WorkerPlanGate.RefuseBrief(heldTaskTitle, heldTaskPrompt) is { } briefRefusal)
+        {
+            _spawnLog.LogWarning("spawn refused: {Reason}", briefRefusal);
+            throw new ArgumentException(briefRefusal);
+        }
+
         // Memory-only, per (repo, kind): lets a coordinator-initiated worker of the same kind IN THE
         // SAME REPO reuse the key the client last supplied (the daemon has no keystore of its own —
         // P2-01 is host-side). MG-6: scoping by repo keeps one repo's credentials out of another's
@@ -252,8 +265,11 @@ public sealed class AgentSpawnService
         {
             // The repo is half the key (see WorkerPlanGate._held): a held task belongs to (repo, agent id),
             // never to the bare id.
+            // No `?? "Untitled task"` here any more. That fallback is what made the brief the task: with
+            // the shim sending no title, `Title ?? TaskPrompt` upstream never reached the default, and
+            // every worker's brief WAS its task. Both values are now required and validated above.
             _planGate.Hold(
-                session.Id, parentAgentId ?? "", heldTaskTitle ?? "Untitled task", heldTaskPrompt ?? "",
+                session.Id, parentAgentId ?? "", heldTaskTitle!, heldTaskPrompt!,
                 heldBudgetUsd, session.RepoHash ?? string.Empty);
         }
 
@@ -743,6 +759,25 @@ public sealed class AgentSpawnService
             return new AgentIpcResponse(Ok: false, Error: unknownKind);
         }
 
+        // The brief/task separation, refused at the channel — and this check is REQUIRED here rather
+        // than only inside the gate. `SpawnAsync` treats "neither a title nor a task" as "this spawn is
+        // not plan-gated" (that is how an operator's own spawn is spelled), so a shim request carrying
+        // neither would not be refused downstream — it would silently produce an UNGATED managed worker,
+        // which is strictly worse than the defect being fixed. A coordinator spawn is plan-gated by
+        // definition, so the wire must carry both, and it is checked before anything is minted.
+        if (WorkerPlanGate.RefuseBrief(request.Title, request.TaskPrompt) is { } briefRefusal)
+        {
+            _coordLog.LogWarning(
+                "shim spawn refused (coordinator={Coordinator}): {Reason}", coordinatorAgentId, briefRefusal);
+            _audit.Append(new AuditEvent("shim_spawn_refused", new Dictionary<string, string>
+            {
+                ["coordinator_id"] = coordinatorAgentId,
+                ["agent_kind"] = request.AgentKind,
+                ["reason"] = briefRefusal,
+            }));
+            return new AgentIpcResponse(Ok: false, Error: briefRefusal);
+        }
+
         // Id-only by necessity: the shim's identity is positional (only that coordinator's jail
         // has the socket) and the socket carries no repo. Safe — a coordinator id is always a
         // minted GUID; the only ids that repeat across repos are the intake's `pr-<n>`, and an
@@ -801,8 +836,8 @@ public sealed class AgentSpawnService
                 repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
                 AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
                 parentAgentId: coordinatorAgentId,
-                heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task",
-                heldTaskPrompt: request.TaskPrompt ?? "").ConfigureAwait(false);
+                heldTaskTitle: request.Title,
+                heldTaskPrompt: request.TaskPrompt).ConfigureAwait(false);
 
             return new AgentIpcResponse(
                 Ok: true,

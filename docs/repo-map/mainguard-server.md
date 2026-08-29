@@ -446,6 +446,15 @@
   catalog stays permissive — the documented meaning of `InstalledAdapterCatalog.HasAny`, and the only
   honest behaviour when there is no list of alternatives to offer. Covered by
   `Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`.
+  **Contract §3 change, 2026-08-29 — the brief is refused, never derived.** `SpawnWorkerAsync` calls
+  `WorkerPlanGate.RefuseBrief(request.Title, request.TaskPrompt)` before anything is minted, and
+  `SpawnAsync` re-checks it before `_store.Spawn` so a refusal leaves no session record. The old
+  `heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task"` was the defect: the shim sent no
+  title, so every worker's `mainguard-plan brief` returned its TASK. The channel check is required rather
+  than merely defensive — `SpawnAsync` reads "neither title nor task" as *not plan-gated* (the operator's
+  own spelling), so a title-less shim request would otherwise have produced an **ungated** Managed worker.
+  Covered by `WorkerPlanChannelIpcTests.ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing`
+  and `Agents/AgentIpcJailDockerTests.TheRealShimsSpawn_*` (the real shim, in a real jail).
 - **`Runtime/ExternalPrWorkerHost.cs`** — the daemon's `IPrWorkerHost`: gives an intake'd upstream
   pull request a REAL jail by running the ONE spawn chain (`AgentSpawnService.SpawnAsync`) under the
   id `pr-<n>`, kind `external-pr` (no installed adapter answers to it ⇒ no CLI, no launch command),

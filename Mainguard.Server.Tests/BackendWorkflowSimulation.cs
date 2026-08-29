@@ -50,13 +50,16 @@ public sealed class BackendWorkflowSimulation : PlanGateIpcTestBase, IClassFixtu
     public async Task Phase2_TheWorkerAuthorsItsPlan_AndTheDaemonWithholdsTheTaskUntilApproval()
     {
         Stage("coordinator spawns, then spawns a worker over its own socket");
-        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("fix the token expiry off-by-one");
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync(
+            "rewrite TokenExpiry so the boundary second is inclusive", "Fix the token expiry off-by-one");
         Fact_($"coordinator={coordinatorId[..8]} worker={workerId[..8]}");
 
         Stage("the worker asks what it is meant to plan about");
         var brief = await CallAsync(workerId, new AgentIpcRequest(AgentIpcRequest.BriefOp));
         Assert.True(brief.Ok, brief.Error);
-        Assert.Equal("fix the token expiry off-by-one", brief.Brief);
+        // The brief is the coordinator's --title, and is NOT the task it spawned with.
+        Assert.Equal("Fix the token expiry off-by-one", brief.Brief);
+        Assert.NotEqual("rewrite TokenExpiry so the boundary second is inclusive", brief.Brief);
         Assert.True(
             string.IsNullOrEmpty(brief.TaskPrompt),
             "the brief carried the task prompt — the gate is decorative if the work is already in hand");
@@ -108,7 +111,10 @@ public sealed class BackendWorkflowSimulation : PlanGateIpcTestBase, IClassFixtu
         Assert.False(
             string.IsNullOrEmpty(approved.TaskPrompt),
             "approved, but the task never arrived — the worker has nothing to do");
-        Assert.Contains("token expiry", approved.TaskPrompt!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(
+            "rewrite TokenExpiry so the boundary second is inclusive", approved.TaskPrompt);
+        // …and the task is the thing the brief was NOT: what arrives here never arrived earlier.
+        Assert.NotEqual(brief.Brief, approved.TaskPrompt);
         Assert.True(Rig.Gate.MayWork(workerId, out _), "approval did not clear the worker to work");
         Fact_($"task delivered after approval, not before: \"{approved.TaskPrompt}\"");
     }
@@ -208,7 +214,8 @@ public sealed class BackendWorkflowSimulation : PlanGateIpcTestBase, IClassFixtu
 
         Stage("a hostile AgentId on spawn is ignored, not honoured");
         var hostile = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "adopt", AgentId: workerId));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "adopt",
+            Title: DefaultBrief, AgentId: workerId));
         Assert.True(hostile.Ok, hostile.Error);
         Assert.NotEqual(workerId, hostile.AgentId);
         Fact_($"minted {hostile.AgentId![..8]} instead of adopting {workerId[..8]}");
@@ -257,7 +264,7 @@ public sealed class BackendWorkflowSimulation : PlanGateIpcTestBase, IClassFixtu
 
         Stage("the next spawn is refused, and says why");
         var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more"));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more", Title: DefaultBrief));
         Assert.False(refused.Ok, "the cap did not hold at the daemon");
         Assert.False(string.IsNullOrWhiteSpace(refused.Error), "refused with no reason a human could read");
         Fact_($"refused: {refused.Error}");

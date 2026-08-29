@@ -148,4 +148,89 @@ public class AgentIpcJailDockerTests
         Assert.DoesNotContain("IPC-WRITABLE", probe.Stdout, StringComparison.Ordinal);
         Assert.DoesNotContain("SHIM-WRITABLE", probe.Stdout, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// <b>The brief/task separation, measured at the only place it is decided: the bytes the real shim
+    /// puts on the wire.</b>
+    ///
+    /// <para><b>The defect this pins.</b> The shim used to send
+    /// <c>{"op":"spawn","agentKind":argv[2],"taskPrompt":" ".join(argv[3:])}</c> — no title at all — and
+    /// the daemon filled the hole with <c>request.Title ?? request.TaskPrompt</c>. So the "brief" a worker
+    /// was handed by <c>mainguard-plan brief</c> was the task, verbatim, and MAINGUARD.md's "what you are
+    /// here to plan (never the task itself)" was false by fallback. Every daemon-side test could hold
+    /// <i>because it constructed the request itself</i> and supplied a Title no real coordinator ever
+    /// sent; the gap lived entirely in the one component no such test runs — the shim.</para>
+    ///
+    /// <para>So this asserts on the parsed request as the daemon received it, from a real jail, through
+    /// the real shim: the title and the task must arrive as two different strings.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task TheRealShimsSpawn_SendsTheTitleAndTheTaskAsSeparateFields()
+    {
+        await using var fx = new SandboxFixture();
+        using var ipc = new AgentIpcServer(NewRoot());
+        var agentId = "ipcjail5";
+        AgentIpcRequest? seen = null;
+        var dir = ipc.CreateEndpoint(agentId, (request, _, _) =>
+        {
+            seen = request;
+            return Task.FromResult(new AgentIpcResponse(Ok: true, AgentId: "w-1"));
+        });
+
+        var handle = await fx.SpawnAsync(
+            agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
+
+        // Spelled exactly as the coordinator's operating instructions teach it — unquoted task tail
+        // included, which is the form a model actually produces.
+        var result = await fx.ExecAsync(handle.ContainerId, "sh", "-c",
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator)
+            + " spawn claude-code --title 'Fix the token clock'"
+            + " --task rewrite TokenClock so expiry is computed in UTC and add boundary tests");
+        _out.WriteLine($"spawn => exit {result.ExitCode} out='{result.Stdout.Trim()}' err='{result.Stderr.Trim()}'");
+        _out.WriteLine($"daemon saw: title='{seen?.Title}' taskPrompt='{seen?.TaskPrompt}'");
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.NotNull(seen);
+        Assert.Equal("Fix the token clock", seen!.Title);
+        Assert.Equal(
+            "rewrite TokenClock so expiry is computed in UTC and add boundary tests", seen.TaskPrompt);
+
+        // The point of the whole change: what the worker is handed up front is NOT the work.
+        Assert.NotEqual(seen.Title, seen.TaskPrompt);
+    }
+
+    /// <summary>
+    /// The pre-fix invocation — a bare positional prompt — is <b>refused by the shim itself</b>, without a
+    /// round trip, and the refusal names the form that works.
+    ///
+    /// <para>Refusing rather than deriving is the decision: a derived title is how <c>brief == task</c>
+    /// came back the first time. A coordinator that gets this message has everything it needs to retry
+    /// correctly on its next turn.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task TheRealShimsSpawn_RefusesTheOldTitlelessForm_AndSaysWhatToRunInstead()
+    {
+        await using var fx = new SandboxFixture();
+        using var ipc = new AgentIpcServer(NewRoot());
+        var agentId = "ipcjail6";
+        var reached = false;
+        var dir = ipc.CreateEndpoint(agentId, (_, _, _) =>
+        {
+            reached = true;
+            return Task.FromResult(new AgentIpcResponse(Ok: true, AgentId: "w-1"));
+        });
+
+        var handle = await fx.SpawnAsync(
+            agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
+
+        var result = await fx.ExecAsync(handle.ContainerId, "sh", "-c",
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator)
+            + " spawn claude-code rewrite TokenClock so expiry is computed in UTC");
+        _out.WriteLine($"titleless spawn => exit {result.ExitCode} err='{result.Stderr.Trim()}'");
+
+        Assert.NotEqual(0, result.ExitCode);
+        Assert.False(reached, "a title-less spawn reached the daemon — the shim guessed instead of refusing");
+        Assert.Contains("--title", result.Stderr, StringComparison.Ordinal);
+        Assert.Contains("--task", result.Stderr, StringComparison.Ordinal);
+    }
 }

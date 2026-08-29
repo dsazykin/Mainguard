@@ -1808,7 +1808,11 @@
   leg),** **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
   Unix-socket channel a jail uses, through the production `AgentSpawnService` handlers. This is the file
   that answers "is the gate enforced, or merely described?", so nothing in it asserts a prompt: a
-  coordinator-spawned worker gets `mainguard-plan` and a brief but **not its task**; `present_plan`
+  coordinator-spawned worker gets `mainguard-plan` and a brief but **not its task** — and the brief is
+  the coordinator's `--title`, asserted to be neither equal to nor containing the task, which is the
+  assertion this test could not make before 2026-08-29 because the daemon derived one from the other; a
+  spawn with no title, no task, or a title that IS the task is refused and mints no session (the session
+  count is checked, because the dangerous failure was not a bad brief but an UNGATED worker); `present_plan`
   genuinely parks on the socket and only an approval yields the withheld prompt; a rejection comes back
   as feedback and the revision blocks again; the rejection that spends the budget answers `Escalated` and
   a defiant revision after it is refused; a worker cannot reach a coordinator op (nor a coordinator a

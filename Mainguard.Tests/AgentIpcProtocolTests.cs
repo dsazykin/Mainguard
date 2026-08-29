@@ -138,6 +138,139 @@ public class AgentIpcProtocolTests
         }
     }
 
+    /// <summary>
+    /// <b>The spawn parser, run.</b> The contract §3 change of 2026-08-29 put a required
+    /// <c>--title</c> / <c>--task</c> pair on <c>mainguard-agent spawn</c>, and the whole reason for that
+    /// spelling is that a quoting slip must be <i>detected</i> rather than silently mis-split. That is a
+    /// property of Python living inside a C# string literal, which no assertion about the script's TEXT
+    /// can check — so this runs the shim's own <c>main()</c> under the real interpreter with the
+    /// transport stubbed, which also proves a refused spawn never reaches the daemon.
+    ///
+    /// <para>The real-jail leg of the same claim is <c>AgentIpcJailDockerTests.TheRealShimsSpawn_*</c>;
+    /// this one is in the everyday tier so a regression is caught on a box with no Docker.</para>
+    /// </summary>
+    [Theory]
+    // The taught form: an unquoted, multi-word task tail is fine — it is the argument that is hard to
+    // quote, so it is the one that does not have to be.
+    [InlineData(
+        new[] { "spawn", "claude-code", "--title", "Fix the token clock", "--task", "rewrite", "TokenClock", "in", "UTC" },
+        "Fix the token clock", "rewrite TokenClock in UTC", null)]
+    // The pre-change invocation. Refused — not turned into a title by deriving one from the task, which
+    // is the fallback this change exists to remove.
+    [InlineData(new[] { "spawn", "claude-code", "rewrite", "TokenClock" }, null, null, "--title")]
+    // An UNQUOTED title. The stray words land where --task must be, so the slip is diagnosed instead of
+    // producing a one-word title and a truncated task. This case is the reason for two named flags.
+    [InlineData(
+        new[] { "spawn", "claude-code", "--title", "Fix", "the", "clock", "--task", "rewrite" },
+        null, null, "ONE quoted argument")]
+    [InlineData(new[] { "spawn", "claude-code", "--title", "Fix the clock" }, null, null, "--task")]
+    [InlineData(new[] { "spawn", "claude-code", "--title", "Fix the clock", "--task" }, null, null, "the task text")]
+    [InlineData(new[] { "spawn", "--title", "Fix the clock", "--task", "work" }, null, null, "agent kind")]
+    public void TheShimsSpawnParser_AcceptsTheTaughtForm_AndDiagnosesEverySlip(
+        string[] args, string? expectedTitle, string? expectedTask, string? expectedRefusal)
+    {
+        var parsed = RunSpawnParser(args);
+        if (parsed is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        var (title, task, refusal) = parsed.Value;
+        if (expectedRefusal is null)
+        {
+            Assert.Null(refusal);
+            Assert.Equal(expectedTitle, title);
+            Assert.Equal(expectedTask, task);
+            Assert.NotEqual(title, task);
+        }
+        else
+        {
+            Assert.Null(title);
+            Assert.Contains(expectedRefusal, refusal!, StringComparison.Ordinal);
+
+            // Every refusal shows the form that works, with the shim's own path in it — a coordinator
+            // reads this and retries; a refusal that only says "no" costs it a turn to rediscover.
+            Assert.Contains(AgentSpawnShim.SpawnUsage, refusal!, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>Runs the shim's own <c>spawn_request</c> under python3, or null where there is none.</summary>
+    private static (string? Title, string? Task, string? Refusal)? RunSpawnParser(string[] args)
+    {
+        var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-shim-{Guid.NewGuid():N}");
+        System.IO.Directory.CreateDirectory(dir);
+        var shim = System.IO.Path.Combine(dir, "mainguard_agent_shim.py");
+        var driver = System.IO.Path.Combine(dir, "driver.py");
+        System.IO.File.WriteAllText(shim, AgentSpawnShim.Script);
+        // Drives the shim's OWN main() with the transport stubbed, not `spawn_request` in isolation:
+        // the parser being right is worthless if main() does not route through it, and that wiring is
+        // exactly what the pre-2026-08-29 line got wrong. Stubbing `call` also proves a refused spawn
+        // never reaches the daemon at all.
+        System.IO.File.WriteAllText(driver, """
+            import contextlib, importlib.util, io, json, sys
+            spec = importlib.util.spec_from_file_location("shim", sys.argv[1])
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            seen = {}
+            def fake_call(request, timeout=60):
+                seen["request"] = request
+                return {"ok": True, "agentId": "w-1"}
+            mod.call = fake_call
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                code = mod.main(["/opt/mainguard/ipc/mainguard-agent"] + sys.argv[2:])
+            print(json.dumps({"exit": code, "request": seen.get("request"), "stderr": err.getvalue()}))
+            """);
+        try
+        {
+            var start = new System.Diagnostics.ProcessStartInfo("python3")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+            };
+            start.ArgumentList.Add(driver);
+            start.ArgumentList.Add(shim);
+            foreach (var arg in args)
+            {
+                start.ArgumentList.Add(arg);
+            }
+
+            using var process = System.Diagnostics.Process.Start(start);
+            if (process is null)
+            {
+                return null;
+            }
+
+            var stdout = process.StandardOutput.ReadToEnd();
+            var stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            Assert.True(process.ExitCode == 0, $"the shim's spawn parser threw: {stderr}");
+
+            using var document = System.Text.Json.JsonDocument.Parse(stdout);
+            var root = document.RootElement;
+            if (root.GetProperty("request").ValueKind == System.Text.Json.JsonValueKind.Null)
+            {
+                // Nothing reached the transport: the shim refused, and said so on stderr.
+                Assert.NotEqual(0, root.GetProperty("exit").GetInt32());
+                return (null, null, root.GetProperty("stderr").GetString());
+            }
+
+            var request = root.GetProperty("request");
+            Assert.Equal(0, root.GetProperty("exit").GetInt32());
+            return (request.TryGetProperty("title", out var t) ? t.GetString() : null,
+                    request.GetProperty("taskPrompt").GetString(),
+                    null);
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            return null; // python3 is not installed here
+        }
+        finally
+        {
+            try { System.IO.Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     [Fact]
     public void IpcPaths_AreTheFixedInJailLayout()
     {
