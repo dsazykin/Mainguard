@@ -141,9 +141,19 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         Assert.False(verified.Passed, "the jail must report the fixture suite's real non-zero exit");
         Assert.NotEqual(WorkerMergeState.Verified.ToString(), verified.State);
 
+        // H2 — over a REAL jail exit, the entry lands on the state that says the tests failed. This used
+        // to be `Working`, which is where an entry nobody has ever verified sits, so the end-to-end loop
+        // could not distinguish this test's whole subject (a branch that broke its own suite) from a
+        // branch that had never been run.
+        Assert.Equal(WorkerMergeState.VerificationFailed.ToString(), verified.State);
+        Assert.Equal(WorkerMergeState.VerificationFailed, loop.Queue.GetState(agent.Id));
+
         var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
             () => loop.Adapter.ConfirmMergeAsync(agent.Id).WaitAsync(Timeout));
-        Assert.Contains("not verified", refusal.Message, StringComparison.OrdinalIgnoreCase);
+        // The refusal NAMES the failure rather than saying "not verified yet" — which was true of this
+        // branch only in the sense that it is true of every branch that is not Verified, and told the
+        // human nothing about the run that had just gone red in their jail.
+        Assert.Contains("FAILED", refusal.Message, StringComparison.Ordinal);
 
         Assert.Equal(loop.MainSha0, Rev(loop.Checkout, "main"));
         Assert.NotEqual(WorkerMergeState.Merged, loop.Queue.GetState(agent.Id));
