@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Mainguard.Agents.Agents;
@@ -57,6 +58,35 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         using var signal = new SemaphoreSlim(0);
         void OnChanged() => signal.Release();
         _plans.Changed += OnChanged;
+
+        // …and on session deltas, because a plan's card can now stop being a card without the plan store
+        // moving at all. Ending an escalated worker changes no plan record — it removes a session — and a
+        // stream woken only by _plans.Changed would keep serving that worker's card until something else
+        // happened to touch a plan. The snapshot is what decides; this is only what makes it re-run.
+        var sessions = _sessions.Subscribe(out var unsubscribeSessions);
+        var pump = Task.Run(async () =>
+        {
+            try
+            {
+                while (await sessions.WaitToReadAsync(context.CancellationToken).ConfigureAwait(false))
+                {
+                    while (sessions.TryRead(out _))
+                    {
+                    }
+
+                    signal.Release();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Client detached — normal teardown.
+            }
+            catch (ChannelClosedException)
+            {
+                // The store completed this subscription (slow-consumer guard); plan changes still wake us.
+            }
+        });
+
         try
         {
             await responseStream.WriteAsync(Snapshot(coordinatorId)).ConfigureAwait(false);
@@ -73,6 +103,8 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         finally
         {
             _plans.Changed -= OnChanged;
+            unsubscribeSessions();
+            await Task.WhenAny(pump, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
         }
     }
 
@@ -133,11 +165,50 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         }
     }
 
+    /// <summary>
+    /// The one projection the plan surface is built from — <b>cards and counts together</b>.
+    ///
+    /// <para><b>Why they are built together.</b> They used to be two independent reads of two different
+    /// populations: the entries came straight off the persisted plan store, while
+    /// <c>BlockedWorkerCount</c>/<c>EscalatedWorkerCount</c> counted only workers the plan gate was still
+    /// holding a task for. The gate forgets a held task the instant a session is torn down, so ending an
+    /// escalated worker dropped it from the counts — the amber banner lost it — while its plan record, and
+    /// therefore its card, stayed exactly where it was. One update, sent in one message, asserting two
+    /// different things about the same worker.</para>
+    ///
+    /// <para><b>What a plan whose agent is gone should be.</b> Not a gate item. Every move either kind of
+    /// card offers needs a live agent behind it: approving a pending plan releases the withheld task to a
+    /// session, and an escalated card's copy offers to steer or end a worker. With the session gone there
+    /// is nothing to release, steer or end — the plan is history, and it stays in the daemon's store as
+    /// history (it is not deleted, and the decided statuses still travel). It simply stops being streamed
+    /// as something the human is being asked about.</para>
+    ///
+    /// <para>So liveness is applied ONCE, to the gate-relevant statuses, and the counts and the sentence
+    /// are then derived from the entries this method actually emitted. The banner cannot mention a worker
+    /// with no card, and no card can appear that the banner does not count.</para>
+    /// </summary>
     private PlanUpdate Snapshot(string? coordinatorId)
     {
         var update = new PlanUpdate();
+
+        // Read the session table ONCE: `live` decides which plans are gate items and `activeWorkers` is the
+        // population the spawn cap counts, and the two must not be read a moment apart.
+        var sessions = _sessions.List();
+        var live = sessions.Select(s => s.Id).ToHashSet(StringComparer.Ordinal);
+        var activeWorkers = sessions.Count(s => s.Role == AgentRoles.Managed);
+
         foreach (var plan in _plans.All().Where(p => coordinatorId is null || p.CoordinatorId == coordinatorId))
         {
+            // Pending and Escalated are the two the client renders as cards, and they are the two that
+            // claim a human owes an answer. Filtered by liveness so that claim can only be made about a
+            // worker that exists. Decided plans are unfiltered history and travel as they always did.
+            var isGateItem = plan.Status is Mainguard.Agents.Agents.Orchestrator.PlanStatus.Pending
+                or Mainguard.Agents.Agents.Orchestrator.PlanStatus.Escalated;
+            if (isGateItem && !live.Contains(plan.WorkerAgentId))
+            {
+                continue;
+            }
+
             update.Plans.Add(new PlanEntry
             {
                 PlanId = plan.PlanId,
@@ -158,16 +229,28 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
 
         update.PressureSignal = coordinatorId is not null ? _plans.PressureSignal(coordinatorId) ?? "" : "";
 
-        // Backpressure (contract §2). The counted population is every live Managed session — the same
+        // Backpressure (contract §2). ActiveWorkerCount is every live Managed session — the same
         // population the wired spawn gate counts — so what the UI reports and what refuses the coordinator
         // are the same number. Reporting a different one would be a surface that disagrees with its gate.
-        var activeWorkers = _sessions.List().Count(s => s.Role == AgentRoles.Managed);
+        //
+        // Blocked/escalated are counted off the entries JUST EMITTED, by distinct worker, so the banner is
+        // arithmetic over the card list rather than a second opinion about it. Distinct because these are
+        // worker counts, not plan counts, and that is what the cap is measured in.
         update.ActiveWorkerCount = activeWorkers;
         update.MaxActiveWorkers = _limits.MaxActiveWorkers;
         update.MaxPlanRevisions = _limits.MaxPlanRevisions;
-        update.BlockedWorkerCount = _planGate.BlockedWorkerCount;
-        update.EscalatedWorkerCount = _planGate.EscalatedWorkerCount;
-        update.BackpressureSignal = _planGate.BackpressureSignal(activeWorkers, _limits.MaxActiveWorkers) ?? "";
+        update.BlockedWorkerCount = CountWorkers(update, "Pending");
+        update.EscalatedWorkerCount = CountWorkers(update, "Escalated");
+        update.BackpressureSignal = _planGate.BackpressureSignal(
+            update.BlockedWorkerCount, update.EscalatedWorkerCount,
+            activeWorkers, _limits.MaxActiveWorkers) ?? "";
         return update;
     }
+
+    /// <summary>Distinct workers among the emitted entries in one status — the banner's arithmetic.</summary>
+    private static int CountWorkers(PlanUpdate update, string status) => update.Plans
+        .Where(p => string.Equals(p.Status, status, StringComparison.OrdinalIgnoreCase))
+        .Select(p => p.WorkerAgentId)
+        .Distinct(StringComparer.Ordinal)
+        .Count();
 }

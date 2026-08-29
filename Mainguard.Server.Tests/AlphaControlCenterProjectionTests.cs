@@ -59,6 +59,15 @@ public sealed class AlphaControlCenterProjectionTests
         // store. A literal id shared with another test therefore trips the daemon's one-live-plan-per-
         // worker invariant — which is the invariant doing its job, in the wrong place.
         var workerId = "worker-" + Guid.NewGuid().ToString("N")[..8];
+
+        // …and it needs a live SESSION, because a plan is only a gate item while the worker it is about
+        // exists. StreamPlans filters on that (see PlanGateOutlivesItsAgentTests): a card whose agent is
+        // gone has nothing left to approve, steer or end, and used to sit on the surface anyway while the
+        // backpressure banner beside it had already dropped the same worker. In production the plan
+        // arrives over the worker's own IPC socket, so the session is always there; here it is stated.
+        daemon.Services.GetRequiredService<Mainguard.Server.Runtime.AgentSessionStore>()
+            .Spawn("claude-code", role: AgentRoles.Managed, agentId: workerId);
+
         var plans = daemon.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>();
         var presented = plans.Present(
             workerAgentId: workerId, coordinatorId: "coordinator-1", title: "Fix the flaky test",

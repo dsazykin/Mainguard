@@ -479,10 +479,24 @@ public sealed class WorkerPlanGate : IMergeGate
     /// </summary>
     /// <param name="activeWorkers">The live worker population counted against the cap.</param>
     /// <param name="maxActiveWorkers">The cap itself (<see cref="CoordinatorLimits.MaxActiveWorkers"/>).</param>
-    public string? BackpressureSignal(int activeWorkers, int maxActiveWorkers)
+    public string? BackpressureSignal(int activeWorkers, int maxActiveWorkers) =>
+        BackpressureSignal(BlockedWorkerCount, EscalatedWorkerCount, activeWorkers, maxActiveWorkers);
+
+    /// <summary>
+    /// The same sentence, written over counts the CALLER already established.
+    ///
+    /// <para>It exists so a surface that renders a list of blocked/escalated workers can state the numbers
+    /// it actually rendered, in this type's wording, instead of re-asking for a second set that was
+    /// computed from a different population. That divergence is not hypothetical: the gate forgets a
+    /// worker's held task the moment its session is torn down, so the counts above drop to zero while the
+    /// worker's plan record — and therefore its card — is still there. The banner then said one thing and
+    /// the cards said another, at the same instant, about the same worker.</para>
+    ///
+    /// <para>The wording stays here rather than being duplicated at the call site for the standing reason
+    /// (MG-12): a second copy of a sentence is a copy that goes stale.</para>
+    /// </summary>
+    public string? BackpressureSignal(int blocked, int escalated, int activeWorkers, int maxActiveWorkers)
     {
-        var blocked = BlockedWorkerCount;
-        var escalated = EscalatedWorkerCount;
         if (blocked == 0 && escalated == 0)
         {
             return null;
