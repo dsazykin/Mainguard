@@ -64,8 +64,14 @@
            CoordinatorPanelView / ICoordinatorService plumbing is kept for a possible future surface but
            is no longer rendered here. Column 0 stays in the grid for the layout but hosts nothing. -->
 
-      <!-- center content: what the section rail focused -->
-      <Border Grid.Column="1" Background="{DynamicResource SurfacePanel}" CornerRadius="12"
+      <!-- center content: what the section rail focused.
+
+           Named because the plan gate's MAXIMUM height is now a share of THIS border rather than a
+           constant (see the gate row below). This border's height is decided by the window and the grid
+           around it — never by the gate inside it — so capping a child against it cannot feed back into
+           its own measure. -->
+      <Border Grid.Column="1" x:Name="CoordinatorPane"
+              Background="{DynamicResource SurfacePanel}" CornerRadius="12"
               BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
         <Panel>
           <Panel IsVisible="{Binding IsCoordinatorFocus}">
@@ -73,7 +79,21 @@
                  a Start / Stop / Restart toolbar. Start spawns a REAL CLI in its own hardened jail and its
                  interactive terminal appears below; that terminal is how you talk to it (and where CLI login
                  happens when no key is stored). -->
-            <Grid RowDefinitions="Auto,Auto,*" Margin="10">
+            <Grid Margin="10">
+              <Grid.RowDefinitions>
+                <!-- header -->
+                <RowDefinition Height="Auto"/>
+                <!-- THE PLAN GATE. Auto so an idle gate costs nothing, capped at a SHARE of the pane so
+                     the cap grows when the window does. See the block comment on the gate itself. -->
+                <RowDefinition Height="Auto"
+                               MaxHeight="{Binding #CoordinatorPane.Bounds.Height,
+                                                   Converter={x:Static FractionConverter.Instance},
+                                                   ConverterParameter=0.7}"/>
+                <!-- the draggable seam between the decision and the terminal -->
+                <RowDefinition Height="Auto"/>
+                <!-- the terminal, which keeps a floor so the gate can never take the whole pane -->
+                <RowDefinition Height="*" MinHeight="120"/>
+              </Grid.RowDefinitions>
 
               <!-- header + lifecycle controls -->
               <Grid Grid.Row="0" ColumnDefinitions="*,Auto" Margin="0,0,0,8">
@@ -130,16 +150,44 @@
                    work already done, and approval is the gate BEFORE work starts.
 
                    The region costs nothing when idle: HasGateContent collapses it entirely unless a plan,
-                   an escalation or a backpressure sentence is waiting, and the ScrollViewer bounds it so a
-                   saturated cap's six cards scroll rather than squeezing the terminal off the surface. -->
-              <ScrollViewer Grid.Row="1" MaxHeight="360" Margin="0,0,0,8"
+                   an escalation or a backpressure sentence is waiting, and it scrolls so a saturated cap's
+                   six cards scroll rather than squeezing the terminal off the surface.
+
+                   HOW BIG IT IS ALLOWED TO GET — the fix for the defect that made Approve/Reject a
+                   four-point target. This region used to be capped by a literal `MaxHeight="360"`. A
+                   constant cap does not move when the window does, so enlarging the window bought the gate
+                   nothing and the overflow was cut at the same pixel either way; and because the decision
+                   buttons are the LAST row of every card, what a bottom-clip removes is always the
+                   decision. Measured on the headless harness: with an escalated card above a blocked one,
+                   the second card's Approve had exactly zero visible pixels at 1296x759 AND at 1700x1050.
+
+                   Three things changed, and each of them is load-bearing:
+                     · the cap is now a SHARE of the pane (the row's MaxHeight above), so it grows with the
+                       window instead of staying at 360 forever;
+                     · the seam below is a real GridSplitter, so the split is the human's to move — the
+                       previous surface offered no way at all to give the gate more room;
+                     · AllowAutoHide is off, so an overflowing gate SAYS it has more below rather than
+                       ending in a silent cut with a scrollbar that only appears once you already guessed
+                       to point at it.
+                   PlanGateView additionally orders decidable cards ABOVE non-actionable escalated ones,
+                   so what a clip can reach first is the card with no button on it. -->
+              <ScrollViewer Grid.Row="1" Margin="0,0,0,8"
                             IsVisible="{Binding Coordinator.HasGateContent}"
-                            HorizontalScrollBarVisibility="Disabled">
+                            HorizontalScrollBarVisibility="Disabled"
+                            VerticalScrollBarVisibility="Auto"
+                            AllowAutoHide="False">
                 <views:PlanGateView DataContext="{Binding Coordinator}"/>
               </ScrollViewer>
 
+              <!-- The seam. Present only while the gate is, so an idle coordinator surface is unchanged;
+                   it uses the same PanelSeam styling as the shell's other splitters, so it announces on
+                   hover/focus that the boundary is draggable. -->
+              <GridSplitter Grid.Row="2" x:Name="GateSeam" Classes="PanelSeam" Height="5" Margin="0,0,0,6"
+                            ResizeDirection="Rows" HorizontalAlignment="Stretch"
+                            IsVisible="{Binding Coordinator.HasGateContent}"/>
+
               <!-- body: the built-in terminal once a coordinator exists; otherwise the start explainer -->
-              <Border Grid.Row="2" Background="{DynamicResource SurfaceCard}" CornerRadius="8" ClipToBounds="True"
+              <Border Grid.Row="3" Background="{DynamicResource SurfaceCard}" CornerRadius="8" ClipToBounds="True"
                       BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
                 <Panel>
                   <!-- coordinator exists (live or dead) → its interactive terminal, or a placeholder
@@ -293,7 +341,7 @@
              the splitter then takes over. NOTE the row only STAYS Auto until the first drag — after that
              the splitter has rewritten it to pixels, and the collapse-on-hide is maintained by
              ControlCenterView.axaml.cs, not by this markup. -->
-        <GridSplitter Grid.Row="1" Classes="PanelSeam" Height="6" Margin="0,4"
+        <GridSplitter Grid.Row="1" x:Name="TelemetrySeam" Classes="PanelSeam" Height="6" Margin="0,4"
                       ResizeDirection="Rows" Cursor="SizeNorthSouth"
                       IsVisible="{Binding IsFlightDeck}"
                       HorizontalAlignment="Stretch" VerticalAlignment="Center"/>

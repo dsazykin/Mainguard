@@ -53,7 +53,9 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [ObservableProperty] private string _pressureText = "";
 
     /// <summary>The daemon's legible-stall line, e.g. "6 workers are waiting on your approval…".</summary>
-    [ObservableProperty] private string _backpressureText = "";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasGateContent))]
+    private string _backpressureText = "";
 
     /// <summary>True when blocked plans are the reason the coordinator has stopped spawning.</summary>
     [ObservableProperty] private bool _isCapSaturatedByBlockedWorkers;
@@ -65,14 +67,35 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     /// or the daemon's backpressure sentence. Hosts bind their whole region to this, so an idle
     /// orchestration costs no vertical space at all — the gate appears because something is waiting, which
     /// is the only reason it should ever be on screen.
+    ///
+    /// <para><b>Computed, not assigned.</b> It used to be a settable flag written at the end of
+    /// <see cref="Refresh"/>, which made "is the gate showing?" and "what is in the gate?" two facts that
+    /// could disagree whenever one of them was updated and the other was not — the same species of drift
+    /// as the banner/card disagreement this surface was reported for. Derived from the collections and the
+    /// sentence themselves, the region cannot be visible while empty, or collapsed while something waits.</para>
     /// </summary>
-    [ObservableProperty] private bool _hasGateContent;
+    public bool HasGateContent =>
+        PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0;
 
-    public CoordinatorPanelViewModel(ICoordinatorService coordinator)
+    /// <param name="endWorker">
+    /// Ends an agent by id — the release an escalated card offers. Optional because the design harness and
+    /// the unit fakes have no agent to end; when it is null the card simply does not offer the action,
+    /// rather than offering a button that does nothing.
+    /// </param>
+    public CoordinatorPanelViewModel(ICoordinatorService coordinator, Func<string, Task>? endWorker = null)
     {
         _coordinator = coordinator;
+        _endWorker = endWorker;
+
+        // The one flag both halves of the gate are read through is derived, so it has to be re-raised
+        // whenever either collection moves — including the in-place reconciliation Refresh does.
+        PendingPlans.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasGateContent));
+        EscalatedPlans.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasGateContent));
+
         Refresh();
     }
+
+    private readonly Func<string, Task>? _endWorker;
 
     public void Refresh()
     {
@@ -110,9 +133,11 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
 
         PendingPlan = PendingPlans.FirstOrDefault();
 
+        // Escalated cards are rebuilt each pass. They carry no half-typed human input to preserve (unlike
+        // a pending card's feedback box), and an in-flight "End" is guarded by the card's own latch.
         EscalatedPlans.Clear();
         foreach (var escalated in cards.Where(c => c.IsEscalated))
-            EscalatedPlans.Add(new EscalatedPlanViewModel(escalated));
+            EscalatedPlans.Add(new EscalatedPlanViewModel(escalated, _endWorker));
 
         PressureText = pending.Count > 2
             ? $"{pending.Count} plans pending — the oldest has waited {(int)(DateTimeOffset.Now - pending.Min(p => p.PresentedAt)).TotalMinutes} min."
@@ -122,7 +147,6 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         BackpressureText = backpressure.Signal;
         IsCapSaturatedByBlockedWorkers = backpressure.CapSaturatedByBlockedWorkers;
 
-        HasGateContent = PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0;
     }
 
     private async Task DecideAsync(string planId, bool approve, string? feedback)
@@ -282,11 +306,25 @@ public partial class PlanCardViewModel : ViewModelBase
 }
 
 /// <summary>
-/// A worker that spent its revision budget and stopped. Rendered as a distinct, non-actionable card: there
-/// is no button here on purpose — the loop is over and the next move is the human's.
+/// A worker that spent its revision budget and stopped. There is no plan decision on this card — the loop
+/// is over and there is nothing left to approve.
+///
+/// <para><b>There IS a release, and there has to be.</b> An escalated worker is still a live agent: it
+/// keeps its jail and it keeps counting against <c>MaxActiveWorkers</c>, so until someone ends it the
+/// coordinator has one fewer slot to spawn into. The card's own sentence has always said "steer it or end
+/// it" while offering neither, and the only route that existed — Resources → right-click → End task — is
+/// a context menu on a row that names no agent. A promise of an action, with the action reachable only by
+/// guessing, is how a user ends up with a cap they cannot get back.</para>
+///
+/// <para>It is deliberately the <b>same</b> act as the Resources one (<c>EndAgentAsync</c>), stated with
+/// the same consequences, rather than a gentler-sounding neighbour of it. Ending and discarding a queue
+/// entry are different things and this card must not blur them: discard drops a merge-queue row, ending
+/// stops the agent.</para>
 /// </summary>
-public sealed class EscalatedPlanViewModel : ViewModelBase
+public sealed partial class EscalatedPlanViewModel : ViewModelBase
 {
+    private readonly Func<string, Task>? _endWorker;
+
     public string PlanId { get; }
     public string WorkerAgentId { get; }
     public string Title { get; }
@@ -294,8 +332,29 @@ public sealed class EscalatedPlanViewModel : ViewModelBase
     public string LastFeedbackText { get; }
     public bool HasLastFeedback { get; }
 
-    public EscalatedPlanViewModel(WorkerPlanCard plan)
+    /// <summary>Whether this card can actually end its worker. False when no ending seam was supplied
+    /// (harness/fakes) or the plan named no worker — an action that cannot run is not offered.</summary>
+    public bool ShowEndAction { get; }
+
+    /// <summary>What ending this worker does, in the C-pattern the other confirms use: the object, what
+    /// changes, what is kept.</summary>
+    public string EndConfirmText { get; }
+
+    /// <summary>The two-step guard. Nothing has been asked of the daemon while this is true.</summary>
+    [ObservableProperty] private bool _isConfirmingEnd;
+
+    /// <summary>True only while this card's own end request is in flight.</summary>
+    [ObservableProperty] private bool _isEnding;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasEndError))]
+    private string _endErrorText = "";
+
+    public bool HasEndError => EndErrorText.Length > 0;
+
+    public EscalatedPlanViewModel(WorkerPlanCard plan, Func<string, Task>? endWorker = null)
     {
+        _endWorker = endWorker;
         PlanId = plan.PlanId;
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
@@ -305,5 +364,39 @@ public sealed class EscalatedPlanViewModel : ViewModelBase
             "It will not try again — steer it or end it.";
         LastFeedbackText = plan.RejectionFeedback.Length > 0 ? $"your last feedback: {plan.RejectionFeedback}" : "";
         HasLastFeedback = LastFeedbackText.Length > 0;
+
+        ShowEndAction = endWorker is not null && plan.WorkerAgentId.Length > 0;
+        var named = plan.Title.Length > 0 ? plan.Title : worker;
+        EndConfirmText =
+            $"End {named}? Its work is rejected and its sandbox is torn down, which frees the slot it is "
+            + "holding against the worker cap. Its branch is kept until teardown, so nothing is silently lost.";
+    }
+
+    [RelayCommand] private void BeginEnd() => IsConfirmingEnd = true;
+
+    [RelayCommand] private void CancelEnd() => IsConfirmingEnd = false;
+
+    [RelayCommand]
+    private async Task ConfirmEndAsync()
+    {
+        if (IsEnding || _endWorker is null) return;
+
+        IsEnding = true;
+        EndErrorText = "";
+        try
+        {
+            await _endWorker(WorkerAgentId);
+            IsConfirmingEnd = false;
+        }
+        catch (Exception ex)
+        {
+            // Said, never swallowed: the card looks identical whether the agent went away or the RPC
+            // failed, and the operator's next move depends entirely on which happened.
+            EndErrorText = $"Could not end this worker — {ex.Message}. It is still holding its slot; try again.";
+        }
+        finally
+        {
+            IsEnding = false;
+        }
     }
 }

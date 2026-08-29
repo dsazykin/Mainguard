@@ -107,7 +107,7 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   traffic-light cluster (`TitleBarPadding`). Consumed by `ChromedWindow`, `CustomTitleBar`, and
   MainWindow's code-behind.
 - **`Controls/CustomTitleBar.axaml`(+`.cs`)** — the reusable hand-drawn title bar (drag/minimize/maximize/close) placed in row 0 of every `ChromedWindow`, reading `Title`/state off its ancestor window; on macOS its buttons hide and its padding insets per `WindowChromePolicy`.
-- **`Converters/`** — the two git-free `IValueConverter`s: `BoolToOpacityConverter` and `ResourceKeyToGeometryConverter` (icon-key → `Icons.axaml`/theme `StreamGeometry`, the control-center badge lookup). Git-model converters (`AgentStatusBrushConverter`, `DiffLineKindToClassConverter`, `FileExtensionToIconConverter`) stayed in `Mainguard.App.Shell/Converters/`.
+- **`Converters/`** — the three git-free `IValueConverter`s: `BoolToOpacityConverter`, `ResourceKeyToGeometryConverter` (icon-key → `Icons.axaml`/theme `StreamGeometry`, the control-center badge lookup) and **`FractionConverter`** (a measured length × a `ConverterParameter` fraction, so a bounded region can be capped at a SHARE of its host instead of a constant — the coordinator plan gate's `MaxHeight` is bound through it; bind it only to a length that does not depend on the capped child, or the cap and the measure chase each other). Git-model converters (`AgentStatusBrushConverter`, `DiffLineKindToClassConverter`, `FileExtensionToIconConverter`) stayed in `Mainguard.App.Shell/Converters/`.
 - **`Properties/XmlnsDefinitions.cs`** — assembly `XmlnsDefinition`s mapping `Mainguard.UI.Controls`/`.Views`/`.Converters` (+ the `Mainguard.UI` root) onto the standard Avalonia XML namespace, so the moved chrome/converters resolve prefix-free under the default `xmlns` in the shell/Pro-UI XAML (Avalonia's compiled `using:`/`clr-namespace:` otherwise searches only the compiling assembly).
 
 ## Role in the solution
@@ -119,7 +119,7 @@ Startup/Shutdown/OOBE windows reference it by root-relative `/Assets/…`).
   `App.axaml` `ResourceInclude`s/`StyleInclude`s via `avares://Mainguard.UI/…`, `Theming/ThemeManager`
   (runtime theme swap; persistence via a `PersistKey` seam the shell wires), `Charts/ChartTheme`,
   generic chrome (`Views/ChromedWindow`, `Controls/CustomTitleBar`) and the git-free converters
-  (`BoolToOpacityConverter`, `ResourceKeyToGeometryConverter`). **Avalonia-only (+ LiveChartsCore for
+  (`BoolToOpacityConverter`, `ResourceKeyToGeometryConverter`, `FractionConverter`). **Avalonia-only (+ LiveChartsCore for
   ChartTheme); NO reference to Mainguard.Git / Mainguard.Agents / Mainguard.App.Shell / Docker / Grpc
   / Protos** (a clean base leaf — pinned by the reference-graph gate). Moved types were normalized to
   `Mainguard.UI.*` CLR namespaces in 2g (the assembly + `avares://` URIs changed in 2c); an assembly

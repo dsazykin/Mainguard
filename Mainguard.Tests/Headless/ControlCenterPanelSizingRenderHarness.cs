@@ -342,9 +342,11 @@ public class ControlCenterPanelSizingRenderHarness
         root.GetVisualDescendants().OfType<GridSplitter>()
             .Single(s => s.ResizeDirection == GridResizeDirection.Columns && s.Classes.Contains("PanelSeam"));
 
+    /// <summary>The right rail's queue/telemetry seam. Named rather than "the only row seam": the
+    /// coordinator pane grew one of its own between the plan gate and the terminal, and an unnamed
+    /// "Single row splitter" lookup would silently start matching whichever came first.</summary>
     private static GridSplitter RowSeam(Visual root) =>
-        root.GetVisualDescendants().OfType<GridSplitter>()
-            .Single(s => s.ResizeDirection == GridResizeDirection.Rows && s.Classes.Contains("PanelSeam"));
+        root.GetVisualDescendants().OfType<GridSplitter>().Single(s => s.Name == "TelemetrySeam");
 
     private static QueueRailView QueueRail(Visual root) =>
         root.GetVisualDescendants().OfType<QueueRailView>().Single();

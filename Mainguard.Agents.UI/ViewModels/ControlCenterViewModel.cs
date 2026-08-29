@@ -292,7 +292,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // press time — a value captured here would be whatever was selected when the repo was opened, and
         // an empty one (no CLI installed yet) is answered by the daemon rather than guessed at.
         Queue = new QueueRailViewModel(_queue, OpenReview, resumeAgentKind: () => SelectedCli?.Id);
-        Coordinator = new CoordinatorPanelViewModel(_coordinator);
+        // The escalated card's "End this worker" is the SAME act as Resources -> End task, handed over as a
+        // seam rather than reimplemented: an escalated worker still holds a jail and a slot against the
+        // worker cap, and until now the only route to releasing it was a context menu on an unlabelled row.
+        Coordinator = new CoordinatorPanelViewModel(_coordinator, endWorker: id => _agents.EndAgentAsync(id));
         Telemetry = new TelemetryPanelViewModel(_telemetry);
         // Vibe is headed for its own app (decision 2026-07-11); the VM stays alive here so
         // the render harness and the future shell keep a working surface, but nothing in
