@@ -162,7 +162,7 @@ public class PlanModeToggleTests
         Assert.Equal("coordinator-1", gate.CoordinatorFor("w-1"));
         Assert.Equal(5m, gate.BudgetFor("w-1"));
 
-        var withheld = Assert.Single(audit.Read().Where(e => e.Type == "worker_task_withheld"));
+        var withheld = Assert.Single(audit.Read(), e => e.Type == "worker_task_withheld");
         Assert.Equal("off", withheld.Fields["plan_mode"]);
     }
 
@@ -172,7 +172,9 @@ public class PlanModeToggleTests
     {
         var (_, gate, audit) = Rig();
         Hold(gate, "w-1", WorkerPlanMode.Gated);
-        Assert.Equal("on", Assert.Single(audit.Read().Where(e => e.Type == "worker_task_withheld")).Fields["plan_mode"]);
+        Assert.Equal(
+            "on",
+            Assert.Single(audit.Read(), e => e.Type == "worker_task_withheld").Fields["plan_mode"]);
     }
 
     /// <summary>
@@ -320,7 +322,7 @@ public class PlanModeToggleTests
         Assert.True(gate.TryReleaseTask("w-1", out var second));
         Assert.Equal(first, second);          // a re-attach must keep getting its task
         Assert.Equal(1, announced);
-        Assert.Single(audit.Read().Where(e => e.Type == "worker_task_released"));
+        Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
         Assert.True(gate.TaskWasReleased("w-1"));
     }
 
@@ -336,7 +338,7 @@ public class PlanModeToggleTests
         Assert.False(gate.TryReleaseTask("w-1", out _));
         Assert.Equal(
             "no-approved-plan",
-            Assert.Single(audit.Read().Where(e => e.Type == "worker_task_release_denied")).Fields["cause"]);
+            Assert.Single(audit.Read(), e => e.Type == "worker_task_release_denied").Fields["cause"]);
     }
 
     // ---- Backpressure: an ungated worker never blocks anyone --------------------------------

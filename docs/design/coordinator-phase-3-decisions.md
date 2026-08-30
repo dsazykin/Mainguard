@@ -3327,8 +3327,7 @@ While wiring it, `TryReleaseTask` stopped reading `HasApprovedPlan` directly and
 two were independent spellings of one policy, and this change is precisely the one that would have split
 them.
 
-### 23.5 The jail text is mode-dependent, because instructions that assert a gate the daemon is not
-applying are worse than none
+### 23.5 The jail text is mode-dependent, because instructions that assert a gate the daemon is not applying are worse than none
 
 A worker told "present your plan, then wait for the human" with approvals off would block forever on a
 card nobody is reviewing, having already been handed its task. `AgentOperatingInstructions.Worker`,
@@ -3419,9 +3418,114 @@ run that reports 0 red against a stale assembly is worse than no run. It also ho
 concurrent runs restore each other's originals over each other's mutations, which was observed once and
 left the tree carrying a mutation nobody was testing.
 
-MUTATION_TABLE_PLACEHOLDER
+`PlanModeToggleTests` is 26 tests in `Mainguard.Tests`; `PlanModeToggleDaemonTests` is 10 in
+`Mainguard.Server.Tests`. The counts below are over the filtered plan-gate slice of each tier (82 and 92
+tests), so a mutation that breaks a neighbouring guarantee shows up as more than one.
 
-### 23.10 Left alone, deliberately
+| # | mutation | went red |
+|---|---|---|
+| M1 | plan-mode default flips to OFF (fail-open) | **5** unit · **17** daemon |
+| M2 | `MayWork` loses its ungated arm | 4 · 3 |
+| M3 | `TryReleaseTask` reads `HasApprovedPlan` again instead of the one authority | 3 · 1 |
+| M4 | `MergeEvidence` collapses OFF into "plan approved" | 1 · 1 |
+| M5 | `RefusePlanPresentation` never refuses | 1 · 1 |
+| M6 | `Hold` ignores the mode it was given | 7 · 5 |
+| M7 | `Hold`'s `mode` parameter defaults to `Ungated` (fail-open default) | **14** · 0 |
+| M8 | the kickoff turn ignores the mode | 1 · 0 |
+| M9 | the operating instructions ignore the mode (dropped inside `For`) | 1 · 0 |
+| M10 | the worker text's mode switch always renders the gated half | 2 · 0 |
+| M11 | the spawn path always holds the worker as gated | — · 5 |
+| M12 | the spawn path never reads the switch | — · 5 |
+| M13 | the shim spawn reports the literal `AwaitingPlan` again | — · 1 |
+| M14 | the `task` op skips the gate and hands the task over unconditionally | — · 1 |
+| M15 | `present_plan` drops the ungated refusal | — · 1 |
+| M16 | `SetPlanMode` is not denied to a coordinator | — · 1 |
+| M17 | the plan stream stops carrying the plan-mode state | — · 1 |
+| M18 | `SetPlanMode` echoes the request instead of the daemon's state | — · 2 |
+
+**Three of these are worth reading rather than counting.**
+
+**M9 survived the first full run — 0 red in both tiers — and that is the one this pass actually bought.**
+`AgentOperatingInstructions.For(role, adapters, mode)` is the entry point the launcher calls, and dropping
+the argument inside it gives every jail the gated text whatever the operator set. Nothing went red:
+`EveryModeDefaultIsTheGatedOne` compares the no-argument overload against `Gated`, which a `For` that
+always renders gated satisfies perfectly, and every other text assertion called `Worker`/`Coordinator`
+directly, so none of them crossed the one forwarding step that can drop the argument.
+`ForRoutesTheModeToBothRolesTexts` was written for it and asserts both halves — that `For` forwards, and
+that the argument changes what comes back — because equality alone would still hold if the methods it
+forwards to ignored the mode too.
+
+**M7's asymmetry (14 unit, 0 daemon) is honest and expected**, not a hole: the daemon always passes the
+mode explicitly, so a fail-open *default* is unreachable from it. The default's whole risk is a future
+caller that forgets the argument, and that is exactly what the unit tier measures.
+
+**M5 first showed up as a HANG, not a failure**, and that is a defect in the test that has been fixed.
+With the ungated refusal removed, `present_plan` is accepted, and an accepted presentation **parks on the
+socket until a human decides** — which is the gate working, so the shim gives it no timeout. The test
+therefore sat for fifteen minutes until the run was killed, and the mutation scored nothing. It now goes
+through `CallWithinAsync`, which fails the assertion on a missed deadline. A guard whose failure mode is a
+hang is indistinguishable from a guard nobody tested.
+
+**Two process-level notes on the harness itself**, because both cost a run:
+
+- A harness that survived a session interruption **raced the replacement run**, mutated a file behind its
+  back, and made two mutations report "pattern not found" while polluting every result in between. A lock
+  *file* does not catch that (a killed run leaves a stale one; an older copy of the script never took
+  one), so the runner now asks the **process table** — `pgrep -f mutate.py` — before it starts.
+- One mutation was committed and pushed as if it were the implementation, because a `git add -A` ran
+  while the harness had a file mutated. Backed out in `d3ec9612`. The runner now verifies
+  `git diff --quiet` on each restored file and refuses to continue if a restore did not take, and prints
+  the tracked-file dirt at the end (`none (clean)` for the run above) — but the real lesson is not to
+  stage anything while a mutation run is in flight.
+
+### 23.10 Tier results — and the one tier that was deliberately NOT run
+
+- `dotnet build Mainguard.slnx -c Release` — **succeeded**. The four warnings it prints
+  (`MergeQueue.cs`, `MergeQueueProvisioner.cs`, `BranchHandoffService.cs`, and four `CS0067` in test
+  harnesses) are pre-existing and in files this change does not touch.
+- `dotnet test Mainguard.Tests -c Release` — **3816 passed, 0 failed**, 25 skipped.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **783 passed,
+  0 failed**, 22 skipped.
+- `dotnet format Mainguard.slnx --verify-no-changes` — **exit 0**. It first reported four `xUnit2031`
+  analyzer warnings against the new test file (`Assert.Single` over a `Where` clause); those are fixed,
+  not suppressed.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category=RequiresDocker"` — **NOT RUN, on
+  purpose.** The reasoning is below, because "it was not run" is only useful with the evidence attached.
+
+**Why the Docker tier was not run here.** CONTRIBUTING's rule is that a machine with a live agent jail
+uses `Category!=RequiresDocker`, because `DockerSuiteIsolation` sweeps on **both** construction and
+dispose. Measured on this machine at the time of the run:
+
+- **There is exactly one usable Docker engine.** `docker context ls` shows OrbStack as current;
+  `/var/run/docker.sock` is a symlink to OrbStack's socket, and Docker Desktop's socket
+  (`~/.docker/run/docker.sock`) **does not exist**. So the two-daemon separation CONTRIBUTING relies on
+  ("tests run against Docker Desktop, real jails live in MainguardEnv's own engine") is simply not
+  present under the macos-host substrate (ADR-008): the daemon under test and the owner's jails share one
+  engine.
+- **Two live `mainguard-*` jails were running on it** — one since 07:24 (the operator's Pro app, itself
+  up since 07:12) and one started 14:38, i.e. during this session.
+- **`DockerSuiteSweepGuard.RefusalFor` would not have stopped it.** Its evidence test is
+  `MainguardOsHost.IsInside()` — whether the *test process* is running inside Mainguard OS. On
+  macos-host the daemon runs natively on the Mac against the host's engine, so the process is outside,
+  the guard returns `null`, and the sweep proceeds. **The guard's own refusal text describes exactly this
+  machine's situation** ("the sweep would leave live jails running with no networks … with nothing in the
+  symptom pointing back at a test run") while its predicate cannot detect it. Recorded here, not fixed:
+  it belongs to whoever owns that fixture, and widening the predicate is a change to a destructive
+  safety check that deserves its own review.
+- The blast radius today happens to be narrow — at the moment of checking, no `mainguard-agents` /
+  `mainguard-egress` / `mainguard-agent-*` networks existed, no egress proxy container existed, and both
+  jails were attached to no network — but that is a property of one instant, and the Pro app is live and
+  can attach a jail to those literal names at any point during a seven-minute suite.
+
+**What this change would have been asking that tier to prove, and why little is at stake.** Nothing here
+adds a sandbox, network, or jail surface. The plan-mode toggle touches the plan gate, the worker/coordinator
+IPC surface, one gRPC service, the role interceptor and one view. The one place it reaches the real spawn
+chain is `AgentSpawnService.SpawnAsync`, and for every caller that is not a coordinator-delegated spawn —
+which is every `RequiresDocker` test — `delegated` is false, the mode resolves to `Gated`, and the launch
+line is byte-identical to before. **It should still be run**, on Linux CI or on this machine with the Pro
+app stopped, before the PR merges.
+
+### 23.11 Left alone, deliberately
 
 - **`CoordinatorTools` is not mode-aware.** Its `SpawnWorkerAsync` success string still says the worker
   "will inspect the repo, author its plan, and block for approval", which is false with the toggle off.
