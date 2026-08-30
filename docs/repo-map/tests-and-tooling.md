@@ -1995,7 +1995,9 @@
   switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
   coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
   through the same single exit; an ungated worker's `present`/`revise`/`await` are refused and queue
-  nothing; steering, verification and committing are all permitted off and all refused BY THE GATE on; the
+  nothing, and so is `rescope` — for the REAL reason, paired with a gated worker naming a plan that does
+  not exist, which must keep getting `no plan '<id>'` and must not be told the mode is off;
+  steering, verification and committing are all permitted off and all refused BY THE GATE on; the
   G1 merge-queue row is created at spawn off and deferred on; the merge record names which authorisation
   the worker actually had; `Get`/`SetPlanMode` over gRPC read back the DAEMON's state; the plan stream
   carries the state on an EMPTY update — the case that needs it most; and `RoleInterceptor` denies

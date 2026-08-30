@@ -1475,10 +1475,26 @@ public sealed class AgentSpawnService
     /// <para>Ownership is checked the same way <c>revise</c> checks it, and answers a stranger's plan id
     /// exactly as it answers one that does not exist — this channel is not an existence oracle for other
     /// workers' plans.</para>
+    ///
+    /// <para><b>Plan mode off is answered first</b>, in the gate's own words — see the comment on that
+    /// check for why the truth about it cannot live in <c>PlanApprovalService.Rescope</c>.</para>
     /// </summary>
     private async Task<AgentIpcResponse> RescopePlanAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
     {
+        // Asked FIRST, exactly as `present` / `revise` / `await` ask it, and for the same reason: a worker
+        // spawned with plan mode OFF has no plans at all, so every check below answers with the wrong
+        // reason. `OwnsPlan` says "no plan '<id>'" and `PlanApprovalService.Rescope` says "No plan
+        // '<id>'." — both true of the lookup, and both implying the id was wrong when the truth is that
+        // there is nothing to widen because no plan was ever required. Only the gate can say that, because
+        // only the gate holds this worker's recorded mode: `Rescope` is handed a plan id, and an id that
+        // resolves to nothing cannot tell it which worker asked. So the true reason is said here, and
+        // `Rescope` keeps "No plan '<id>'." for what it actually means — no such plan.
+        if (_planGate.RefusePlanPresentation(workerAgentId) is { } noPlanWanted)
+        {
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: noPlanWanted);
+        }
+
         if (string.IsNullOrWhiteSpace(request.PlanId))
         {
             return new AgentIpcResponse(

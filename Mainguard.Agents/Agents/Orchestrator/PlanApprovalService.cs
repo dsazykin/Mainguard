@@ -658,6 +658,13 @@ public sealed class PlanApprovalService
         {
             if (!_plans.TryGetValue(planId, out var approved))
             {
+                // Exactly what it says: this service has no such plan. It is deliberately NOT the answer a
+                // worker spawned with plan mode OFF gets — that worker has no plans at all, so this
+                // sentence would be true of the lookup and wrong about the world, implying a bad id when
+                // the truth is that no plan was ever required of it. This service cannot tell the two
+                // apart (an unresolvable plan id names no worker, and the mode lives on the worker), so
+                // `AgentSpawnService.RescopePlanAsync` answers the ungated case up front with
+                // `WorkerPlanGate.RefusePlanPresentation` and only a genuine miss reaches here.
                 return new PlanRescopeResult(PlanRescopeOutcome.Refused, $"No plan '{planId}'.", null);
             }
 

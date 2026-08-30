@@ -328,7 +328,12 @@
     does**. What it deliberately does NOT touch is `MayWork`: a worker with a re-scope pending still holds
     the approval it is asking to widen, so steering, verification and `commit_work` keep answering off the
     old scope. Suspending it would make asking more expensive than widening quietly, and would refuse a
-    running worker the one call that lets its work outlive its jail (F1). `DecisionResponse` carries
+    running worker the one call that lets its work outlive its jail (F1). It DOES ask
+    `WorkerPlanGate.RefusePlanPresentation` first, as `present`/`revise`/`await` do: without it an ungated
+    worker fell through to the plan lookup and was told `no plan '<id>'` — true of the lookup and a lie
+    about the world, since it reads as "you named the wrong id" and argues against the one correct
+    response. `PlanApprovalService.Rescope` cannot say it (a plan id that resolves to nothing names no
+    worker, and the mode lives on the worker), so it keeps `No plan` for a genuine miss. `DecisionResponse` carries
     `RescopeOf` on every decision about a re-scope, not only the approval — a declined one has taken
     nothing away, and the generic wording would send a still-authorised worker away from its work.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`

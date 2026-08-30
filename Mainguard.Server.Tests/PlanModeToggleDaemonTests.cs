@@ -134,6 +134,43 @@ public sealed class PlanModeToggleDaemonTests : PlanGateIpcTestBase, IClassFixtu
     }
 
     /// <summary>
+    /// <b><c>rescope</c> was the one plan op that answered with the wrong reason.</b> It never consulted
+    /// the gate, so an ungated worker fell through to the plan lookup and was told <c>no plan '&lt;id&gt;'</c>
+    /// — true of the lookup, and a lie about the world: it reads as "you named the wrong id", so the one
+    /// correct response (stop asking, plan mode is off for you) is the one it argues against. A worker
+    /// acting on it would go hunting for the right plan id, find none, and have nowhere left to go.
+    ///
+    /// <para>Both halves are asserted, because "say something else" is not the fix — the genuine miss has
+    /// to keep its own answer. A GATED worker naming a plan that does not exist still gets
+    /// <c>no plan</c>, and must not be told plan mode is off when it is on.</para>
+    /// </summary>
+    [Fact]
+    public async Task WithPlanModeOff_RescopeIsRefusedForTheRealReason_NotAsAMissingPlan()
+    {
+        var (_, ungated, _) = await SpawnWithPlanModeAsync(planModeEnabled: false, "widen without a gate");
+
+        var refused = await CallWithinAsync(ungated, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: "p1", PlanJson: PlanJson("src/a.cs")));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("plan mode is off", refused.Error!, StringComparison.Ordinal);
+        // The wrong answer, named: it must not send this worker looking for a plan id.
+        Assert.DoesNotContain("no plan 'p1'", refused.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.Null(Rig.Plans.LatestForWorker(ungated));
+
+        // The control: with the gate ON, an unknown plan id is still exactly that, and the refusal must
+        // not have been widened into "plan mode is off" for a worker whose plan mode is on.
+        var (_, gated, _) = await SpawnWithPlanModeAsync(planModeEnabled: true, "widen with a gate");
+
+        var missing = await CallWithinAsync(gated, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: "p1", PlanJson: PlanJson("src/a.cs")));
+
+        Assert.False(missing.Ok);
+        Assert.Contains("no plan 'p1'", missing.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("plan mode is off", missing.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// <b>Not a half-enforced gate.</b> Every path the plan gate governs answers YES for an ungated
     /// worker: steering, verification, and committing. One of them still refusing would leave a worker
     /// that has been handed its task and cannot be steered, verified or have its work recorded — which is
