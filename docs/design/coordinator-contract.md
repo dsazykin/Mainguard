@@ -174,9 +174,41 @@ object the daemon builds its handler table against.
 |---|---|---|
 | `brief` | what am I here to plan? | never yields the task prompt |
 | `present_plan` | present the plan I authored, then block | one live plan per worker |
-| `revise_plan` | re-present after a rejection, then block | plan ownership · revision budget |
+| `revise_plan` | re-present after a **rejection**, then block | plan ownership · revision budget |
+| `rescope_plan` | widen an **approved** plan, then block | plan ownership · approved plan · one live re-scope · escalation is terminal |
 | `await_decision` | re-attach and block on my own plan | plan ownership |
 | `commit_work` | record my approved work on my own branch | **approved plan** (`MayWork`) |
+
+`rescope_plan` was added on **2026-08-30** and, like `spawn_worker`'s argument change, it is recorded as
+a contract change rather than an implementation detail — in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.
+
+**An approved scope can be changed, and only by asking.** Live testing found a worker that discovered
+mid-task it had to touch a neighbouring file and was refused by both existing ops — `present_plan`
+because one live plan per worker means an approved plan blocks a second, `revise_plan` because it acts
+only on a rejected one. Each refusal is correct about its own op; together they left a worker trying to
+stay legal with two moves, both bad: exceed its approved scope silently, or stop. `rescope_plan` is the
+third move. It presents a revised plan against the approval the worker already holds, and a human
+decides it exactly as they decided the first.
+
+Four properties of it are contract-level, because each of them is a thing the daemon must keep true
+rather than a way the code happens to be arranged:
+
+- **It is not a revision.** `revise_plan` answers a rejection and spends the revision budget;
+  `rescope_plan` follows an approval and spends none. A worker whose plan was rejected the maximum number
+  of times and *then* approved must still be able to widen it — charging the same budget would leave the
+  workers that had the hardest time agreeing a plan with no legal way to change it.
+- **The approved plan keeps authorising the worker until the human decides**, and is retired only when
+  the wider one is approved. A worker is never suspended for asking: steering, verification and
+  `commit_work` keep answering off the scope that was already approved. Blocking it would make the legal
+  move more expensive than the silent one.
+- **A worker has exactly one approved plan, or none.** `resolveApprovedPlan` hands that plan's scope to
+  the flagged-change gate, so this is what makes F6 measure against the *current* authorisation instead
+  of a stale or an absent one.
+- **Work already done outside the scope is not re-policed here.** The flagged-change gate already puts
+  every out-of-scope file in front of a human at verification and blocks the merge until it is
+  acknowledged; a re-scope asked late is accepted so that the human hears the reason before they see the
+  diff. There is one mechanism, not two.
 
 `commit_work` is the step that makes a worker's work outlive its jail, and it is where the loop used to
 end one rung short: a worker finished, stopped on an uncommitted diff, and the worktree was deleted with

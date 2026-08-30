@@ -125,7 +125,13 @@
     (`blocked_worker_count`, `escalated_worker_count`, `active_worker_count`, `max_active_workers`,
     `max_plan_revisions`, `backpressure_signal`) — a blocked worker counts against the worker cap, so a
     saturated cap means the coordinator has stopped spawning, and the contract makes saying so a
-    requirement rather than a nicety).
+    requirement rather than a nicety. **Phase 3 (2026-08-30) adds the re-scope's three fields** —
+    `supersedes_plan_id`, `previous_scope` and `rescope_count` — because that card is a different decision
+    from a first presentation: the human is approving a WIDENING of something they already approved, and
+    cannot judge it against a scope they are expected to remember. `previous_scope` is the scope COPIED
+    when the re-scope was presented, not a lookup, so the card diffs against what was actually consented
+    to rather than against whatever that plan says by the time a second re-scope exists; `rescope_count`
+    is visibility, not a budget — nothing refuses on it).
   - `Mainguard.Protos.csproj` runs `Grpc.Tools` with `GrpcServices="Both"`.
 
 ## Role in the solution

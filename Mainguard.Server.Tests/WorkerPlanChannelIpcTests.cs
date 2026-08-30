@@ -621,9 +621,13 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         await ApproveAsync(mine);
         var theirPlan = await ApproveAsync(theirs);
 
+        // BOUNDED, and the bound is part of the assertion. If the ownership check were removed this
+        // re-scope would be ACCEPTED — and then park on a human who is never coming, so the test would
+        // hang rather than fail. A guard whose absence produces a hang is a guard nothing reports on:
+        // mutation m13 was watched doing exactly that before this timeout was added.
         var refused = await CallAsync(mine, new AgentIpcRequest(
             AgentIpcRequest.RescopePlanOp, PlanId: theirPlan,
-            PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+            PlanJson: PlanJson("src/calc.js"), Title: "Wider")).WaitAsync(TimeSpan.FromSeconds(15));
 
         Assert.False(refused.Ok);
         Assert.Equal($"no plan '{theirPlan}'", refused.Error); // the same answer as a plan that is not there
@@ -642,8 +646,11 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
         var approvedId = await ApproveAsync(workerId);
 
+        // Bounded for the same reason as the ownership test above: a handler that INFERRED the plan id
+        // instead of refusing would accept this and then block on a decision nobody is going to make.
         var refused = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.RescopePlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+            AgentIpcRequest.RescopePlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"))
+            .WaitAsync(TimeSpan.FromSeconds(15));
 
         Assert.False(refused.Ok);
         Assert.Contains(WorkerPlanShim.RescopeUsage, refused.Error!, StringComparison.Ordinal);

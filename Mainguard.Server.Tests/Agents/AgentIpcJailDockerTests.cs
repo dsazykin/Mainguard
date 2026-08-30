@@ -293,4 +293,60 @@ public class AgentIpcJailDockerTests
         Assert.Equal(AgentIpcRequest.SpawnOp, attempt.Op);
         Assert.True(string.IsNullOrEmpty(attempt.TaskPrompt), "the report carried a task it had not parsed");
     }
+
+    /// <summary>
+    /// <b>The re-scope verb, from inside a real jail.</b> The op exists so a worker that discovers it
+    /// needs a file outside its approved scope has somewhere legal to go; a verb that only works in a
+    /// host-side parser test is exactly the arrangement this file was created to stop believing in — the
+    /// whole worker plan gate was once fully covered and completely unreachable on macOS.
+    ///
+    /// <para>Both halves in one jail: the form the instructions teach reaches the daemon carrying the plan
+    /// id and the plan document, and the id-less form is refused locally, printing the working form and
+    /// sending nothing.</para>
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task TheRealShimsRescope_SendsThePlanItWidens_AndRefusesTheIdLessForm()
+    {
+        await using var fx = new SandboxFixture();
+        using var ipc = new AgentIpcServer(NewRoot());
+        var agentId = "ipcjail8";
+        var seen = new System.Collections.Concurrent.ConcurrentQueue<AgentIpcRequest>();
+        var dir = ipc.CreateEndpoint(agentId, (request, _, _) =>
+        {
+            seen.Enqueue(request);
+            return Task.FromResult(new AgentIpcResponse(
+                Ok: true, Status: "Approved", PlanId: "new-plan", RescopeOf: "plan-7"));
+        }, AgentIpcEndpointRole.Worker, Instructions);
+
+        var handle = await fx.SpawnAsync(
+            agentId: agentId, ipcDirPath: dir, ipcOutboxPath: AgentIpcPaths.OutboxIn(dir));
+        var shim = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        // The plan is written OUTSIDE the repository, exactly as the worker's instructions say — the tree
+        // at /workspace is what its commit records.
+        var write = await fx.ExecAsync(handle.ContainerId, "sh", "-c",
+            "printf '%s' '{\"scope\":[\"test.js\",\"src/calc.js\"],\"approach\":\"a\",\"testStrategy\":\"t\"}'"
+            + " > /tmp/plan.json");
+        Assert.Equal(0, write.ExitCode);
+
+        var ok = await fx.ExecAsync(handle.ContainerId, "sh", "-c", shim + " rescope plan-7 /tmp/plan.json");
+        _out.WriteLine($"rescope => exit {ok.ExitCode} out='{ok.Stdout.Trim()}' err='{ok.Stderr.Trim()}'");
+
+        Assert.Equal(0, ok.ExitCode);
+        var sent = Assert.Single(seen);
+        Assert.Equal(AgentIpcRequest.RescopePlanOp, sent.Op);
+        Assert.Equal("plan-7", sent.PlanId);
+        Assert.Contains("src/calc.js", sent.PlanJson!, StringComparison.Ordinal);
+
+        // ...and the worker is told this was a WIDENING rather than a first approval, which is the one
+        // difference that stops it reporting a re-scope as a fresh start.
+        Assert.Contains("wider scope", ok.Stdout, StringComparison.OrdinalIgnoreCase);
+
+        var refused = await fx.ExecAsync(handle.ContainerId, "sh", "-c", shim + " rescope");
+        _out.WriteLine($"id-less rescope => exit {refused.ExitCode} err='{refused.Stderr.Trim()}'");
+
+        Assert.NotEqual(0, refused.ExitCode);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, refused.Stderr, StringComparison.Ordinal);
+        Assert.Single(seen); // nothing more reached the daemon
+    }
 }
