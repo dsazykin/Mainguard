@@ -141,6 +141,12 @@
     backpressure banner names the count and the stopped coordinator — so a render that silently loses one
     fails here rather than in a screenshot nobody opened. Paired with a negative
     (`NoBlockedWorkers_ShowsNoBackpressureLine`): an always-on warning is the same as no warning.
+    **(2026-08-30) A sixth state, the RE-SCOPE card** (`plan_gate_rescope`, phase 3 §23.7) — a worker
+    asking to widen an approval it already holds. Its fake both ADDS and DROPS a path, because a fixture
+    that only ever widened would never exercise the Drops row, which is the one direction this op can take
+    something away in; and it pins the three strings that differ by card kind, each of which is FALSE on
+    the other kind — most importantly the Reject button, which must not claim declining stops a worker
+    that declining does not stop.
     **`TheShippedControlCenterSurface_MountsThePlanGate`** is the one that matters most, and it is here
     because its absence let phase 2 ship undriveable: the five state renders above build
     `CoordinatorPanelView`, a control **the application never constructs**, so the entire gate could be

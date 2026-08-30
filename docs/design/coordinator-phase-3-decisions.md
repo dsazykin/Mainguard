@@ -3447,7 +3447,27 @@ absence produces a hang is a guard nothing is watching. Both assertions are now 
 (`WaitAsync(15s)`), the bound is part of what they assert, and re-run against M13/M14 they go red in 15
 seconds as they should have the first time.
 
-### 23.10 Left alone, deliberately
+### 23.10 Tier results
+
+All four tiers on the shipped tree, run serially on one machine:
+
+| tier | result |
+|---|---|
+| `dotnet build Mainguard.slnx -c Release` | 0 errors |
+| `dotnet format --verify-no-changes` | exit 0 |
+| `dotnet test Mainguard.Tests -c Release` | **3815 passed**, 0 failed, 25 skipped |
+| `Mainguard.Server.Tests` · `Category!=RequiresDocker` | **778 passed**, 0 failed, 22 skipped |
+| `Mainguard.Server.Tests` · `Category=RequiresDocker` | **131 passed**, 0 failed, 2 skipped |
+
+The Docker tier was **clean**, which is worth stating because it usually is not: neither §12.5's
+`QueueEntryResumeDockerTests` ordering flake nor
+`SandboxNetworkIsolationDockerTests.ReachabilityProbe_…` fired. An earlier run of the same tier on this
+branch did hit the first one — `ACleanStopAfterACommit_KeepsTheBranch_AndTheEntryIsStillResumable`, with
+`OCI runtime exec failed: chdir to cwd ("/workspace") … no such file or directory`, i.e. the jail was gone
+by the time the exec landed. Recorded, not chased: it is the documented flake, its failure is about
+container lifecycle rather than anything this change touches, and it did not reproduce.
+
+### 23.11 Left alone, deliberately
 
 - **Half (a) is not turned into a commit-time scope check.** The owner's brief says not to build a
   second mechanism that contradicts the flagged-change gate, and it would be one: the gate already
