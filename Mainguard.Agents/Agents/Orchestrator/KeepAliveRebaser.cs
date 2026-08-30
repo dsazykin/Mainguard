@@ -73,6 +73,11 @@ public interface IKeepAliveRebaser
 ///   <item><see cref="GitMutationGuard.CanMutate"/> — skip the cycle if the agent is mid its own rebase / detached / mid-merge.</item>
 ///   <item>If the worktree is dirty: <c>git add -A</c> + <c>git commit -m "wip: sync"</c> (guarded against a transient lock).</item>
 ///   <item><c>git rebase &lt;main&gt;</c> onto the already-fetched mirror main.</item>
+///   <item><b>K6/§23.6</b> — both mutations hand <see cref="GitMutationGuard.RunGuarded{T}"/> a re-read of
+///     step 2's verdict, evaluated once the <c>index.lock</c> backoff clears and immediately before the
+///     mutation. Step 2 is a snapshot, the backoff is up to ~1.5 s, and the three states it checks are
+///     exactly the ones an agent enters while a lock is held; a refusal there ends the cycle as
+///     <see cref="RebaseCycleKind.Skipped"/>, the same terminus step 2's own refusal has.</item>
 ///   <item>Conflict → status <see cref="AgentRunState.Conflict"/>, hand the worktree to the T-04 resolver, keep the PTY paused
 ///     (resume-after-resolve is a later hook). <b>No automatic <c>rebase --abort</c></b> (rejection trigger).</item>
 ///   <item>Success → resume the agent.</item>

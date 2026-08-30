@@ -94,6 +94,17 @@ public interface IExternalPrMergeExecutor
 /// refuses with 409 if the PR gained a commit in the window), and main (pre-checked against the lease's
 /// expected sha, then enforced by the <c>--ff-only</c> reconcile).</para>
 ///
+/// <para><b>K4/§23.5 — the head CAS could not fail, and that is why it is READ and not derived.</b> The
+/// "verified <c>agent/pr-&lt;n&gt;</c> tip" above used to be computed here, at merge time, from whatever
+/// this checkout held under that name. <c>PrHeadFetcher</c> hard-resets that ref to the pull request's
+/// newest head BEFORE the intake re-queues the entry, so between a force-push and the next intake poll
+/// both sides of the compare were the new head: it passed, and unverified third-party code merged. The
+/// verified head now comes from <c>ForegroundMergeRequest.ExpectedBranchSha</c> — the sha the daemon put
+/// on the lease from its OWN verification record — and this checkout is only asked whether that commit is
+/// present. An entry with no recorded verified head refuses rather than falling back, the one place in
+/// this lane where an unknown is a "no": here declining to answer means merging code from outside this
+/// installation on the strength of a compare that cannot fail.</para>
+///
 /// <para><b>Double-merge.</b> A confirmed entry is terminal <c>Merged</c>, so <c>CanMerge</c> is false and
 /// the daemon's <c>BeginMerge</c> never grants a second lease for it. Independently, a second attempt
 /// reads the PR as <c>Merged</c> upstream and refuses before touching anything, and the host's head CAS
@@ -587,8 +598,6 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
         return many ? null : sole;
     }
 
-    /// <summary>The verified PR head as this checkout can see it: the local mirror branch, else the sync
-    /// remote's tracking form of the same ref. Null when neither exists.</summary>
     /// <summary>
     /// Whether the recorded verified head is actually in this checkout, under either spelling of
     /// <c>agent/pr-&lt;n&gt;</c>. This asks "is the commit the queue verified HERE" — it deliberately does

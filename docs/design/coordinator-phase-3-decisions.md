@@ -3523,10 +3523,17 @@ manufacturing a test that reached it would have meant weakening one of them to e
 
 ### 23.9 Tier results
 
-- `dotnet build Mainguard.slnx -c Release` — clean, no new warnings (12 pre-existing).
-- `dotnet test Mainguard.Tests -c Release` — **3810 passed, 25 skipped, 0 failed**.
-- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **786 passed,
+- `dotnet build Mainguard.slnx -c Release` — clean, 0 errors, no new warnings (12 pre-existing).
+- `dotnet test Mainguard.Tests -c Release` — **3811 passed, 25 skipped, 0 failed**.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **789 passed,
   22 skipped, 0 failed**.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category=RequiresDocker"` — **129 passed /
+  1 failed / 2 skipped of 132**, the one red being §22.6's known network-probe flake
+  (`SandboxNetworkIsolationDockerTests.ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply`,
+  red in the tier and green on a repeat in isolation). §12.5's `QueueEntryResumeDockerTests` ordering
+  flake did not fire. That is one better than the 128/2 the same machine measures on the base, and every
+  `MergeQueueEndToEndDockerTests` case — the merge spine's own E2E, including §22's cascade test — is
+  green.
 - `dotnet format --verify-no-changes` — exit 0.
 
 Two test fixtures were changed rather than the product, and both are the fix landing correctly rather

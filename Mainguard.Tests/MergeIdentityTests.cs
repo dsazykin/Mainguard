@@ -353,6 +353,55 @@ public class MergeIdentityTests : IDisposable
     }
 
     /// <summary>
+    /// Two remotes holding <c>agent/x</c> at DIFFERENT shas: the reconcile has no substrate facade and so
+    /// cannot know which one is the SC-2 sync remote, and answering the containment question about the
+    /// wrong copy of a branch is exactly the class of mistake this lane exists to remove. Unique-or-nothing
+    /// (the <c>WorkerPlanGate.ResolveKeyLocked</c> precedent): the ambiguous case falls through to the
+    /// journal, which is identity-bound, and here the journal names the wrong branch — so nothing is
+    /// recorded.
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_RefusesToGuess_WhenTwoRemotesHoldTheBranchAtDifferentShas()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+        var lease = leases.TryBegin("repohash", "lease-x", "x", seed, "main")!;
+
+        // agent/x at two different commits, published to two different remotes; the older one is already
+        // contained in main, the newer one is not.
+        var olderTip = Rev(repo, "agent/x");
+        Git(repo, "checkout", "agent/x");
+        Commit(repo, "x2.txt", "more x work\n", "x commit 2");
+        var newerTip = Rev(repo, "agent/x");
+        Git(repo, "checkout", "main");
+
+        var remoteA = NewDir("mainguard-mergeid-remA-");
+        var remoteB = NewDir("mainguard-mergeid-remB-");
+        Git(remoteA, "init", "--bare");
+        Git(remoteB, "init", "--bare");
+        Git(repo, "remote", "add", "a", remoteA);
+        Git(repo, "remote", "add", "b", remoteB);
+        Git(repo, "push", "a", $"{olderTip}:refs/heads/agent/x");
+        Git(repo, "push", "b", $"{newerTip}:refs/heads/agent/x");
+        Git(repo, "fetch", "a");
+        Git(repo, "fetch", "b");
+        Git(repo, "branch", "-D", "agent/x"); // only the two tracking forms remain
+        Assert.NotEqual(
+            Rev(repo, "refs/remotes/a/agent/x"), Rev(repo, "refs/remotes/b/agent/x"));
+
+        // Main is advanced onto the OLDER tip, and the journal's Merge entry names agent/y — so neither
+        // witness can honestly identify this lease's merge.
+        JournaledFfMerge(journal, repo, olderTip);
+        Assert.Equal(olderTip, Rev(repo, "main"));
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        Assert.Empty(outcome.Merged);
+        Assert.Single(outcome.Interrupted);
+    }
+
+    /// <summary>
     /// An unreadable main is not an unchanged main. The reconcile used to read "no sha" as "main did not
     /// move" and report an interrupted attempt as fact; it now says it could not tell.
     /// </summary>

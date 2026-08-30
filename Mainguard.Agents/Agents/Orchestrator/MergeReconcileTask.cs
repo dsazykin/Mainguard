@@ -269,7 +269,18 @@ public sealed class MergeReconcileTask : IBootTask
             && description.Contains($"pull request #{number}", StringComparison.Ordinal);
     }
 
-    /// <summary>The ref this lease's <c>agent/&lt;id&gt;</c> is reachable as here, or null when it is gone.</summary>
+    /// <summary>
+    /// The ref this lease's <c>agent/&lt;id&gt;</c> is reachable as here — <b>unique-or-nothing</b>, or null
+    /// when it is gone or ambiguous.
+    ///
+    /// <para>The local <c>refs/heads/</c> form wins when it exists: that is the ref the foreground merge
+    /// consumed. Otherwise the branch is looked up by shape across every remote-tracking namespace, because
+    /// the reconcile has no substrate facade and so does not know the SC-2 sync remote's name. If two
+    /// remotes hold that branch at DIFFERENT shas, this returns nothing rather than whichever git listed
+    /// first — following the <c>WorkerPlanGate.ResolveKeyLocked</c> precedent, since the caller reads "no
+    /// ref" as "ask the journal instead" and an arbitrary pick could answer the containment question about
+    /// a copy of the branch that is not the one that merged.</para>
+    /// </summary>
     private static string? ResolveAgentRef(string repoPath, string agentId)
     {
         var branch = $"agent/{agentId}";
@@ -278,18 +289,27 @@ public sealed class MergeReconcileTask : IBootTask
             return $"refs/heads/{branch}";
         }
 
-        // Any remote-tracking form of the same branch. The sync remote's name is not known here (the
-        // reconcile has no substrate facade), so the ref is looked up by shape rather than by remote.
         var (code, output, _) = GitService.RunGit(
-            repoPath, "for-each-ref", "--format=%(refname)", $"refs/remotes/*/{branch}");
+            repoPath, "for-each-ref", "--format=%(objectname) %(refname)", $"refs/remotes/*/{branch}");
         if (code != 0)
         {
             return null;
         }
 
-        var first = output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .FirstOrDefault();
-        return string.IsNullOrEmpty(first) ? null : first;
+        var rows = output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(line => line.Split(' ', 2))
+            .Where(parts => parts.Length == 2)
+            .ToList();
+
+        if (rows.Count == 0)
+        {
+            return null;
+        }
+
+        return rows.Select(parts => parts[0]).Distinct(StringComparer.Ordinal).Count() == 1
+            ? rows[0][1]
+            : null; // two remotes, two different shas — refuse to guess which one merged.
     }
 
     /// <summary>True only when git ANSWERS that <paramref name="ancestor"/> is contained in <paramref name="descendant"/>.</summary>
