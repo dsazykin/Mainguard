@@ -3468,6 +3468,7 @@ mechanized here: the runner **refuses to report** unless a built assembly's mtim
 | K1-M5 | the journal fallback drops the post-state main compare | 1 red — see below |
 | K1-M6 | the containment is asked the wrong way round | 1 red — see below |
 | K1-M7 | `Undecidable` synthesizes the confirm anyway | 4 red |
+| K1-M8 | the multi-remote branch lookup takes git's first listing instead of refusing | 1 red |
 | K2-M1 | the stale local ref is preferred again (the original defect) | 1 red |
 | K2-M2 | the identity compare is dropped, falling back to freshness | 1 red |
 | K2-M3 | a source matching neither ref is merged anyway | 1 red |
@@ -3524,16 +3525,17 @@ manufacturing a test that reached it would have meant weakening one of them to e
 ### 23.9 Tier results
 
 - `dotnet build Mainguard.slnx -c Release` — clean, 0 errors, no new warnings (12 pre-existing).
-- `dotnet test Mainguard.Tests -c Release` — **3811 passed, 25 skipped, 0 failed**.
-- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **789 passed,
+- `dotnet test Mainguard.Tests -c Release` — **3807 passed, 25 skipped, 0 failed**.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **780 passed,
   22 skipped, 0 failed**.
-- `dotnet test Mainguard.Server.Tests -c Release --filter "Category=RequiresDocker"` — **129 passed /
-  1 failed / 2 skipped of 132**, the one red being §22.6's known network-probe flake
-  (`SandboxNetworkIsolationDockerTests.ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply`,
-  red in the tier and green on a repeat in isolation). §12.5's `QueueEntryResumeDockerTests` ordering
-  flake did not fire. That is one better than the 128/2 the same machine measures on the base, and every
-  `MergeQueueEndToEndDockerTests` case — the merge spine's own E2E, including §22's cascade test — is
-  green.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category=RequiresDocker"` — the FULL tier,
+  **130 passed / 0 failed / 2 skipped of 132**. A clean run: both §12.5/§22.6 intermittents
+  (`SandboxNetworkIsolationDockerTests.ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply`
+  and `QueueEntryResumeDockerTests`) stayed green. An earlier run in this lane measured 129/1 with the
+  network probe red, which is its documented behaviour; against the **128 / 2** the same machine measures
+  on the unmodified base, nothing here regressed and the two flakes remain the only thing between this
+  tier and a clean run. Every `MergeQueueEndToEndDockerTests` case — the merge spine's own E2E, §22's
+  cascade test included — is green.
 - `dotnet format --verify-no-changes` — exit 0.
 
 Two test fixtures were changed rather than the product, and both are the fix landing correctly rather
