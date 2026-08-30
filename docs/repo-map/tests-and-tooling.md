@@ -1197,8 +1197,10 @@
   `MergeQueueProvisioner` was false); `BranchSha` round-tripping through SQLite, with the empty
   pre-migration case asserted alongside, because a gate that works until you restart is not a gate; the
   Verify button offered on exactly the states the daemon can start a run from and no others; and a
-  `Verified → Verifying` refusal still writing nothing and leaving no in-flight latch. Fourteen mutations
-  of the fix were watched go red; the log is in `docs/design/coordinator-phase-3-decisions.md` §19.
+  `Verified → Verifying` refusal still writing nothing and leaving no in-flight latch; and — the negative
+  the belt could otherwise get wrong — a branch the cascade REBASED with no announcement staying mergeable
+  after it re-verifies. Fifteen mutations were checked, fourteen red; the log, including the one kept
+  deliberately uncovered and why, is in `docs/design/coordinator-phase-3-decisions.md` §19.
 - **`Mainguard.Server.Tests/Agents/SubstrateConformanceTests.cs`** — the ESC §4 rows run against
   THIS host's substrate composition: `SubstrateConformanceTests` (#1 git-objects round-trip through
   the opaque `ResolveSyncRemote` handle, byte-identical; git-only, macOS leg — the WSL2 handle needs

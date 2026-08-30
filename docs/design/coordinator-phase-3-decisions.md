@@ -2384,7 +2384,53 @@ the record's own `MainSha`.
 Every guard removed in turn, the tier rebuilt (`touch` on restore — an `mv` preserves mtime and MSBuild
 then skips the rebuild, so the mutated binary is what gets tested), and the failure recorded.
 
-MUTATION_TABLE_PLACEHOLDER
+| mutation | result |
+|---|---|
+| M1 `NotifyBranchAdvanced` records the tip but never moves state | 4 red |
+| M2 the invalidator never subscribes to the sweep | 2 red |
+| M3 the invalidation moves state but leaves the record standing | 1 red |
+| M4 a run overtaken mid-flight still settles `Verified` | 1 red |
+| M5 `CanMerge` drops the branch-side compare | **0 red — see below** |
+| M6 the runner drops `BranchSha` from the record | 1 red |
+| M7 the provisioner never resolves the branch tip | 1 red |
+| M8 the mid-run window compared against the last known tip instead | 2 red |
+| M9 the settle stops advancing the queue's known tip | 1 red |
+| M10 the Verify button is offered on `Verified` again | 3 red |
+| M11 the store stops persisting `BranchSha` | 1 red |
+| M12 `verified_main_sha` reverts to today's main | 1 red |
+| M13 the daemon registers the invalidator but nothing resolves it | 1 red |
+| M14 the composition root stops building the invalidator | 2 red |
+| M15 the readiness trigger stops being constructed at boot | 1 red |
+
+Four of these are worth reading.
+
+**M8 is the one that found a real bug in the fix.** The first implementation asked "did the branch move
+mid-run?" by comparing the record's tip against the last tip the queue knew. That is a different question:
+a rebase, or a commit made while nothing was watching, moves the branch with no announcement, so a
+re-verification legitimately measures a tip the queue has never heard of. Reading that as a mid-run move
+demoted every re-verified entry straight back to `Working` — a cascade that can never finish.
+`MergeQueueProvisionerTests` caught it, and the guard is now an explicit window opened when the run starts.
+
+**M9 is its mirror**, and it guards a *false refusal* rather than a false pass: without the settle
+advancing the queue's known tip, a branch the cascade rebased would re-verify green and then be refused by
+the branch-side compare forever, with nothing anywhere saying why.
+
+**M2, M13, M14 and M15 were all 0 red at first**, and that was the most useful result of the pass. The
+wiring tests asserted `GetService<T>()` is non-null — but a DI singleton is built on first resolve, so the
+*test itself* was the only thing that had ever constructed either subscriber, and "registered, never
+running" passed. `BothSubscribersAreConstructedAtBoot_NotMerelyRegistered` reads the watcher's subscriber
+list before asking the container for anything, and `Watcher_AdvancedInvalidatesAVerifiedEntry…` drives a
+real commit through a real sweep. The gap existed for the readiness trigger too (M15), and is now closed
+for both.
+
+**M5 is deliberately uncovered.** With the invalidation wired, `CanMerge`'s branch-side compare is
+unreachable: every path that could put a newer tip in `_branchTip` under a `Verified` entry either
+invalidates it (`NotifyBranchAdvanced`) or is caught by the settle (`Verifying`). It is kept because it
+does not depend on an *observation* — the thing that can be missed, delayed, or absent on a substrate with
+no watcher — and its premise, that `CanMerge`'s admit set and the invalidator's demote set are the same
+set, is itself asserted by `EveryStateThatCanMerge_IsAStateAnAdvancedBranchInvalidates` over all nine
+states. Manufacturing a test that reached it would have meant weakening the mechanism to exercise the
+belt.
 
 ### 19.7 Left alone, deliberately
 
