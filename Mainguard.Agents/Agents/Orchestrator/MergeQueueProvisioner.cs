@@ -1056,8 +1056,8 @@ public sealed class MergeQueueProvisioner
         // pinned to? That is the single predicate `BranchIsOnTopOfMain` stands for, and every way the
         // cascade has ever got it wrong — a stale rebase target, a rebase that exited 0 having moved
         // nothing, a publish that reported success — ends with this answer being no. It costs one
-        // `merge-base` and it does not depend on any event having fired, which is why it stays even though
-        // the alignment above makes it unreachable on a wired daemon.
+        // `merge-base`, it depends on no event having fired, and it is the only one of the three checks
+        // above it that cannot be fooled by a component reporting its own success.
         //
         // It refuses only on a POSITIVE mismatch: both shas must be readable. A substrate with no mirror
         // (the pure-unit doubles) answers nothing, and inventing a refusal from ignorance would strand

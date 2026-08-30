@@ -3002,3 +3002,195 @@ stays armed — the provisioner's own cadence — and the test now walks it.
   acknowledgment standing — unlike `AcknowledgmentStore`, whose acks bind to a content hash. That is a
   pre-existing gap in the RT-D2 gate and is out of scope here; what this change guarantees is that the
   waiver *record* describes the latest drift rather than the first (M12).
+
+---
+
+## 22. The cascade test that "never returned B to Verified" — two defects stacked, and only one of them was in the test
+
+`MergeQueueEndToEndDockerTests.WhenOneBranchMerges_TheCoTenantIsInvalidated_BlockedFromMerging_AndReVerifiedAgainstTheNewMain`
+was the one red left on the merged phase-3 branch, reporting *"the cascade's auto re-verification never
+returned B to Verified"*. Three agents had looked at it and reached three different conclusions, and a
+live stress run had watched the same cascade work. All of that turns out to be consistent.
+
+### 22.1 The evidence, reconciled
+
+| who | what they saw | why |
+|---|---|---|
+| J1 (`be817cbe`) | `RequiresDocker` **130/0** | the coin came up heads |
+| L1/L3 (`f7c90466`) | **130 passed, no flakes** | likewise |
+| L2/L4 (`a651126c`) | red on its branch AND on base `e6327fe3` → "pre-existing" | **correct**, and the only one who checked |
+| a live stress run | a real co-tenant reparented and re-verified green in seconds | live, nothing races the cascade |
+
+Measured here rather than argued. One test, run alone, at four points:
+
+| commit | result |
+|---|---|
+| `9ed5e767` — the commit BEFORE the J1 lane | **1 red, 1 green** in two runs |
+| `be817cbe` — J1 | 1 green, **2 red** in three runs |
+| `e6327fe3` — the J1 merge | **3 red** in three runs |
+| `4de197f8` — the tip | **3 red** in three runs |
+
+It fails before J1 exists. Nothing regressed. The failure is a **coin flip with a bias that varies with
+machine speed**, which is exactly what four agents disagreeing about one test looks like. The passing
+count never changed either: the tier is 132 with 2 skips, and the base branch measured **today** gives
+`128 passed / 2 failed` with the cascade test GREEN and a different second red — see §22.5.
+
+### 22.2 The outer defect: the fixture's dwell knob was untracked, and that was not enough
+
+`FixtureRepo.DelayFile` (`.verify-delay-ms`) is a worktree-only knob the fixture's `verify.js` reads to
+make B's re-verification dwell, so the invalidated window is a fact rather than a race. Its own doc
+said why it must never be in a tree: *"anything in the tree would differ between a branch and main and
+arm the RT-D2 gate."*
+
+`KeepAliveRebaser` preserves an agent's uncommitted work across the reparent by committing
+`git add -A` as `wip: sync` **before** it rebases — and `add -A` stages untracked files. So the cascade
+swept the knob into B's tree, and the test's next line — `DeleteUntracked`, there to shorten the
+re-verify — turned it into an **unstaged deletion**, which `git rebase` refuses outright. Measured, with
+the cycle instrumented:
+
+```
+t0=07:42:33.879 dirty=[?? .verify-delay-ms]        → wip: sync commits the knob
+        34.007  the test deletes the knob
+t1=07:42:34.082 dirty=[ D .verify-delay-ms]        → error: cannot rebase: You have unstaged changes
+```
+
+A ~200 ms window, and the test walked straight into it because the cascade's yield and the test's own
+two refused-merge RPCs take about the same time. The cascade then blocked with the honest reason —
+*"this branch is not on top of the new main yet — Rebase returned 1 …"* — which nobody ever saw, because
+the assertion said only "never returned B to Verified" after waiting out a three-minute timeout.
+
+**The fix is the missing half of "untracked": the seed writes a `.gitignore` naming the knob.** `add -A`
+then does not stage it, the knob is in no tree (which is what its doc always claimed), and the rebase is
+clean. The test also stops deleting the knob — the delete existed only to shorten the re-verify, it cost
+one dwell, and removing it means the test no longer interleaves with the cascade it is measuring at all.
+That is what turns the `.gitignore` from a mitigation into a checkable guard: with the delete gone, an
+un-ignored knob is swept into the tree on **every** run.
+
+### 22.3 The inner defect, which the outer one had been hiding: the cascade could rebase onto a main the mirror had never seen
+
+With the fixture fixed, the test failed differently — and this one is a product bug:
+
+```
+aTip = mirrorMain = checkoutMain = queueMain = e8802a18
+mirrorB = c4eab929   log: c4eab92 docs: notes | 168a0d6 seed: node fixture project
+```
+
+B is `Verified`, `CanMerge` says yes, and **B's branch does not contain main at all**. It was never
+reparented; it was re-verified where it stood.
+
+`ConfirmMerge` does two things in this order:
+
+1. `TryConfirmHumanMerge` — which, under the queue lock, marks `Merged` and fires `NotifyMainMoved`, i.e.
+   **starts the cascade**;
+2. `TryRefreshMirrorMainAfterMerge` — which pulls the mirror's `refs/heads/main` forward from origin.
+
+So a cascade that reaches its rebase before step 2 lands carries the **pre-merge** main into the agent's
+repository. `git rebase main` finds the branch already on top of *that* main, exits 0 having moved
+nothing, and the cycle reports `CleanNoop` — which `RebaseCycleResult.BranchIsOnTopOfMain` reads as *"safe
+to re-verify."* The re-verification is pinned to the **new** main (the queue's), passes, and settles
+`Verified`. Green rail, enabled Merge button, and a `--ff-only` that refuses forever: the precise
+loop-forever state `TryReturnToWorking` exists to prevent, reached by the one route that skips it.
+
+This is the half of the defect `KeepAliveRebaser.TryRefreshMainFromMirror` did not close.
+`42b6a9a1` made that method read the fetch's exit code, with the right argument — *"a cycle that cannot
+establish what main IS must not claim the branch is on top of it."* A fetch that **succeeds** against a
+mirror which is merely behind establishes a main just as confidently, and the wrong one.
+
+Also pre-existing: `TryRefreshMirrorMainAfterMerge` has been at the end of `ConfirmMerge` since
+`04e8b2d8` (2026-08-18), twelve days before the J1 lane. Its own doc even names the reason nobody caught
+it — *"the window between a merge and the next repo-open is a trap the E2E suite never walks (it verifies
+every agent before merging)."* The cascade test is the one test that walks it, and the fixture bug meant
+it never got far enough to.
+
+### 22.4 What changed, and why not somewhere else
+
+Two guards in `MergeQueueProvisioner.RequeueStaleAsync`, both refusing only on a **positive** mismatch —
+an unreadable mirror or an empty sha answers nothing, and refusing from ignorance would strand every
+substrate-less caller.
+
+- **`TryAlignMirrorMain`, before the rebase.** If the mirror's main is not the queue's `main@sha`, catch
+  it up with the same one-refspec pull the merge-confirm makes, then require equality; a mirror that still
+  disagrees blocks with a measured reason instead of minting a green. Making the cascade idempotent about
+  the catch-up is what stops it having to *win* a race with `ConfirmMerge` — the ordering inside that RPC
+  is left alone, because reordering it would advance the mirror for a merge the gate may still refuse, and
+  the fix has to hold for the cascade's other origins (`MergeDispatch`, the RT-D1 boot reconcile, the
+  seeder) too.
+- **`BranchDescendsFromMain`, before the re-verify.** Ask git whether the published `agent/<id>` really
+  contains the queue's main. That is the single predicate the whole re-entry exists to establish, and
+  every way the cascade has ever got it wrong — a stale rebase target, a rebase that exited 0 having moved
+  nothing, a publish that reported success — ends with this answer being no. It costs one `merge-base`, it
+  depends on no event having fired, and it is kept for the same reason §19.6's M5 keeps `CanMerge`'s
+  branch-side compare.
+
+The catch-up introduces its own hazard and the code says so: `TryRefreshMirrorMainAfterMerge` is a
+**forced** single-refspec fetch, so firing it at a mirror that is *ahead* of the queue would drag main
+backwards and reparent every co-tenant onto a commit the human has already moved past. So a mirror that
+already CONTAINS the queue's main is left alone — being ahead is not this cascade's business.
+
+The test grew two assertions to match: the cascade must have really **reparented** B (`aTip` is an
+ancestor of the mirror's `agent/<id>`, not merely "B reached Verified"), and the dwell knob must be in no
+tree. Its failure message now carries the queue's own gate reason, because "still Working" is the symptom
+of every terminus the re-entry has and a bare timeout is what sent three agents hunting a regression that
+was never in the product.
+
+### 22.5 The mutation log
+
+Every guard removed in turn, the tier rebuilt and re-run. (`touch` on restore — an `mv`/`cp` preserves
+mtime, MSBuild skips the rebuild, and the next run tests the *mutated* binary. This bit once here: a
+first M1 pass reported 0 red against a stale assembly, and the mutation runner now refuses to report
+unless the built `Mainguard.Agents.dll` mtime actually moved.)
+
+| # | mutation | result |
+|---|---|---|
+| M1 | the mirror catch-up never runs | 1 red — `WhenTheMirrorHasNotSeenTheMergeYet…` |
+| M2 | it compares but never catches up (blocks instead) | 1 red — same test; pins *catch up*, not merely *refuse* |
+| M3 | the ahead carve-out is dropped, so the forced fetch can drag main backwards | 1 red — `AMirrorAlreadyAheadOfTheQueue…` |
+| M4 | the descent belt is dropped | 1 red — `ARebasedBranchThatNeverReachedTheMirror…` |
+| M5 | the belt asks the ancestry the wrong way round | **3 red** |
+| M6 | the fixture's `.gitignore` is dropped | 1 red (2 of 2 runs) — the knob is swept into the tree |
+
+**M3 was 0 red on the first pass**, and that is why it has a test now. The carve-out is a hazard *this
+change introduced*, so leaving it uncovered on the §19.6-M5 precedent would have been the wrong reading:
+M5 is a belt on a defect, this is a new forced-write path. `AMirrorAlreadyAheadOfTheQueue…` puts the
+mirror two commits ahead of the sha the queue is told about and asserts the cascade left it there.
+
+**M6 was also 0 red at first**, and the reason is worth keeping. Once the catch-up existed, its `git
+fetch` shifted the cascade's own timing enough that the test's delete reliably landed *before* the wip
+commit — the coin was still being flipped, it had simply started landing the other way. Deleting the
+knob at all was the last interleaving between the test and the cascade; removing that line is what makes
+the guard bite on every run rather than on a lucky one.
+
+M1's effect on the E2E tier was measured directly rather than inferred: the pre-fix product failed the
+new reparent assertion in 4 of 6 runs, with B `Verified` on a branch that did not contain main.
+
+### 22.6 Tier results, and the two flakes that remain
+
+`Category=RequiresDocker`, three runs after the fix: **128/2**, **128/2**, then **129 passed / 1 failed /
+2 skipped of 132** — against **128 / 2** on the unmodified base `4de197f8`, measured on the same machine
+within the hour and with the cascade test GREEN in that base run. That last fact is the one that matters:
+the headline number did not move because the tier has *two* intermittent tests, and different agents have
+been reading different pairs of them as "the failure".
+
+- The cascade test itself: **8 green in a row** (5 single runs + 3 after the fixture change) plus green
+  in all three post-fix tier runs, down from ~3 minutes to ~15 seconds.
+- `SandboxNetworkIsolationDockerTests.ReachabilityProbe_ClassifiesOnTheHandshake_NotOnGettingAPrettyReply`
+  — the known flake. Confirmed: red in the tier, red once and then green on a repeat in isolation.
+- `QueueEntryResumeDockerTests.AStrandedEntry_IsResumed_VerifiesInItsNewJail_AndBecomesMergeable`
+  — **§12.5's documented docker-suite ordering flake**, verbatim: red in the full run, green every time
+  the class is run on its own (3/3 here), and red on the unmodified base too. Its failure is
+  `verified.Passed == false` in the resumed jail. It did not fire in the third run at all. Still
+  undiagnosed, still recorded rather than fixed — and, with the network probe, now the only thing between
+  this tier and a clean run.
+
+### 22.7 Left alone, deliberately
+
+- **`ConfirmMerge`'s internal ordering is unchanged.** Refreshing the mirror before
+  `TryConfirmHumanMerge` would advance it for a merge the gate can still refuse, and would fix only one
+  of the four paths that fire the cascade.
+- **`RebaseCycleKind.CleanNoop` still implies `BranchIsOnTopOfMain`.** Given a correct rebase target it
+  is a true statement, and the cycle is not the right place to learn what the queue's main is; the caller
+  that knows both is the one that now checks.
+- **`git add -A` in the wip commit is not narrowed.** Sweeping untracked files is what preserves an
+  agent's in-flight work across a reparent, and `.gitignore` is the answer a repository already has for
+  files that must not be swept — which is exactly what the fixture was missing.
+- **The two tier flakes are not chased.** §12.5 owns the resume one and says why it is still open.

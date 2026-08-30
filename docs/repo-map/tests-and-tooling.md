@@ -1257,7 +1257,10 @@
   `Agents/FixtureRepo.cs` — the tiny **Node** project both Docker merge-queue suites verify (shared
   rather than copied: the verify command and marker are what the assertions compare against, so two
   copies would drift and the stale one would assert provenance against a command the repo no longer
-  declares).
+  declares). Seeds a **`.gitignore` naming the `.verify-delay-ms` dwell knob** (§22): the knob is
+  worktree-only by design, and merely leaving it unadded did not keep it out of a tree — the keep-alive
+  rebase commits `git add -A` as `wip: sync` before reparenting, which staged it, after which the test's
+  own removal became an unstaged deletion `git rebase` refuses over.
 - **`Mainguard.Server.Tests/AgentSessionReconcileTests.cs`** — the unit tier of the live session store's
   reconcile against Docker (ISSUES-LOG #18/#20): adoption with the jail's kind/role, the pause-axis-only
   correction (a `RateLimited` agent stays `RateLimited`), `Unresponsive` when the container is gone, the
@@ -1327,8 +1330,11 @@
   verify command verifies GREEN and is still unmergeable until the item is acknowledged **per item** —
   acknowledging a different id does not clear it); the stale cascade (a co-tenant is BLOCKED —
   `CanMerge` false, `BeginMerge` refused, the Merge button refused, `main` unmoved — through a window
-  made deterministic by an *untracked* dwell file, so the verify command stays byte-identical to
-  main's and the RT-D2 gate stays silent); an `External` entry merging on its host with the checkout
+  made deterministic by an *untracked, git-ignored* dwell file, so the verify command stays
+  byte-identical to main's and the RT-D2 gate stays silent — and the cascade's re-entry is then asserted
+  to have really REPARENTED the co-tenant (`aTip` is an ancestor of the mirror's `agent/<id>`) and to
+  have left the knob in no tree, not merely to have reached `Verified`); an `External` entry merging on
+  its host with the checkout
   reconciled onto that commit; and the daemon-restart resume. **The external legs are now driven by
   the REAL `ExternalPrIntake` over the daemon's own `IPrWorkerHost`** (one `PollOnceAsync`; only the
   PR *list* and the fetch *URL* are fixture-local, and the source→repo resolution has its own tier —
@@ -1775,6 +1781,18 @@
   (not the generic `StrandedReason`) and that the PASSING record is still readable, which is what the
   verification panel renders. `AStrandedEntryWhoseReasonAssumedALiveJail_StillGetsTheStrandedSentence`
   is its paired negative: a reason measured with a live jail must not outlive the jail it assumed.
+  **§22, the cascade's main-side guards:**
+  `WhenTheMirrorHasNotSeenTheMergeYet_TheCascadeCatchesItUp_RatherThanMintingAFalseGreen` lands the merge
+  on ORIGIN only and tells the queue the new sha while the mirror still holds the old one — the exact
+  `ConfirmMerge` interleaving, reproduced deterministically instead of raced for. Every cascade test
+  written before it moved the MIRROR's main and then told the queue, which is the one ordering in which
+  the window cannot open. It asserts both answers that used to disagree: the queue believes the co-tenant
+  can merge, and git agrees the `--ff-only` would land.
+  `AMirrorAlreadyAheadOfTheQueue_IsLeftAlone_NotDraggedBackToOrigin` is the hazard the catch-up
+  introduces, pinned: the catch-up is a FORCED refspec fetch, so firing it at an ahead mirror would move
+  main backwards. `ARebasedBranchThatNeverReachedTheMirror_IsNotReVerified_EvenThoughThePublishSaidYes`
+  drives the belt through the one path that still reaches it — a publisher that answers TRUE and writes
+  no ref — so "the branch descends from main" is asked of git rather than inferred from a cycle kind.
   **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
   holder — distro-scoped argv with no lifecycle verbs (G-12), restart-on-exit with capped backoff,
   start failures swallowed and retried, Dispose cancels a live holder session promptly). **Daemon

@@ -1512,7 +1512,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       equal to `CanMerge`'s admit set over the whole enum
       (`EveryStateThatCanMerge_IsAStateTheRestartRearmCovers`). `NoLiveSandboxReason` is the cascade's
       no-jail sentence, passed to `Block(..., sandboxIsGone: true)` so `CanMerge` renders it verbatim
-      instead of the generic `StrandedReason` (L3). `ArmFlaggedChangeReview` runs the
+      instead of the generic `StrandedReason` (L3). **The cascade's two main-side guards (§22):**
+      `RequeueStaleAsync` calls **`TryAlignMirrorMain`** BEFORE the rebase and
+      **`BranchDescendsFromMain`** before the re-verify. `ConfirmMerge` fires the cascade from inside
+      `TryConfirmHumanMerge` and pulls the mirror's main forward AFTERWARDS, so a cascade that got there
+      first carried the PRE-merge main into the agent's repo, `git rebase main` exited 0 having moved
+      nothing, `CleanNoop` reported `BranchIsOnTopOfMain`, and the entry went `Verified` against a main
+      its branch does not descend from — green rail, enabled Merge, and a `--ff-only` that refuses
+      forever. The first catches the mirror up (the same one-refspec `TryRefreshMirrorMainAfterMerge`,
+      idempotent here so the cascade never has to win the race) and blocks if it still disagrees; it
+      deliberately leaves a mirror that already CONTAINS the queue's main alone, because that fetch is
+      FORCED and would drag an ahead mirror backwards. The second is the belt: it asks git whether the
+      published `agent/<id>` really contains the queue's main — the one predicate the whole re-entry
+      exists to establish, and the answer no cycle-kind can fake. Both refuse only on a POSITIVE
+      mismatch; an unreadable mirror or an empty sha answers nothing, and refusing from ignorance would
+      strand every substrate-less caller. `ArmFlaggedChangeReview` runs the
       required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
       same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
       that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
