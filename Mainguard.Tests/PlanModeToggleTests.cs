@@ -475,6 +475,42 @@ public class PlanModeToggleTests
     }
 
     /// <summary>
+    /// <b>The mode must reach the text through <c>For</c>, which is the entry point the launcher calls</b>
+    /// — not merely through the two methods it delegates to.
+    ///
+    /// <para>Written because mutation M9 (dropping the mode inside <c>For</c>, so every jail gets the
+    /// gated text whatever the operator set) scored <b>zero red across both tiers</b> until this existed.
+    /// <see cref="EveryModeDefaultIsTheGatedOne"/> compares the no-argument overload against
+    /// <c>Gated</c>, which a <c>For</c> that always renders gated satisfies perfectly, and every other
+    /// text assertion calls <c>Worker</c>/<c>Coordinator</c> directly and so never crosses the one
+    /// forwarding step that can drop the argument. A guard no test can turn red is indistinguishable
+    /// from a guard that was deleted.</para>
+    /// </summary>
+    [Fact]
+    public void ForRoutesTheModeToBothRolesTexts()
+    {
+        var catalog = new InstalledAdapterCatalog(
+            Path.Combine(Path.GetTempPath(), $"mg-registry-{Guid.NewGuid():N}"));
+
+        // It forwards, rather than rendering something of its own…
+        Assert.Equal(
+            AgentOperatingInstructions.Worker(WorkerPlanMode.Ungated),
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, catalog, WorkerPlanMode.Ungated));
+        Assert.Equal(
+            AgentOperatingInstructions.Coordinator(catalog, WorkerPlanMode.Ungated),
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, catalog, WorkerPlanMode.Ungated));
+
+        // …and the argument actually changes what comes back, for BOTH roles. Equality alone would hold
+        // for a `For` that ignored the mode if `Worker()`/`Coordinator()` ignored it too.
+        Assert.NotEqual(
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, catalog, WorkerPlanMode.Gated),
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, catalog, WorkerPlanMode.Ungated));
+        Assert.NotEqual(
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, catalog, WorkerPlanMode.Gated),
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, catalog, WorkerPlanMode.Ungated));
+    }
+
+    /// <summary>
     /// The worker's shim teaches <c>task</c>, and it is on the exhaustive worker op list — the object the
     /// daemon builds its handler table against, so an op missing from it is unreachable.
     /// </summary>
