@@ -201,7 +201,12 @@ public sealed class ExternalPrMergePathTests : IClassFixture<DaemonFixture>, IDi
     /// <summary>Registers a live queue whose authoritative main is <paramref name="mainSha"/>, with the
     /// external entry verified against it (so <c>CanMerge</c> is genuinely true — a gate that blocks the
     /// honest path proves nothing).</summary>
-    private async Task<MergeQueue> RegisterQueueAsync(string mainSha, bool verifyEntry = true)
+    /// <param name="branchSha">K4/§23.5 — the <c>agent/pr-&lt;n&gt;</c> tip the verification was measured
+    /// ON, which the live provisioner resolves from the mirror after the pre-verification publish. The
+    /// external merge now READS its verified head from this record rather than re-deriving it from a ref
+    /// <c>PrHeadFetcher</c> has already reset forward, so the fixture has to record it too.</param>
+    private async Task<MergeQueue> RegisterQueueAsync(
+        string mainSha, bool verifyEntry = true, string branchSha = "")
     {
         var registry = (MergeQueueRegistry)_daemon.Services.GetRequiredService<IMergeQueueRegistry>();
         var queue = new MergeQueue(
@@ -211,7 +216,7 @@ public sealed class ExternalPrMergePathTests : IClassFixture<DaemonFixture>, IDi
             verifications: new InMemoryVerificationStore(),
             runVerification: (agentId, ct) => Task.FromResult(new Mainguard.Agents.Agents.Orchestrator.VerificationRecord(
                 agentId, mainSha, Passed: true, LogArtifactPath: "", ResolvedCommand: "dotnet test",
-                ConfigHash: "cfg", When: DateTimeOffset.UtcNow)));
+                ConfigHash: "cfg", When: DateTimeOffset.UtcNow, BranchSha: branchSha)));
 
         queue.EnsureEntry(AgentId, MergeEntryOrigin.External);
         if (verifyEntry)
@@ -236,7 +241,7 @@ public sealed class ExternalPrMergePathTests : IClassFixture<DaemonFixture>, IDi
         ArrangeAsync(World world, bool verifyEntry = true)
     {
         var client = NewClient();
-        var queue = await RegisterQueueAsync(world.MainSha, verifyEntry);
+        var queue = await RegisterQueueAsync(world.MainSha, verifyEntry, branchSha: world.PrHead);
         var host = new FakeHost(world);
         var adapter = NewAdapter(client, host);
         adapter.SetActiveRepo(_repoHandle, world.Path, SyncRemote);
@@ -395,6 +400,99 @@ public sealed class ExternalPrMergePathTests : IClassFixture<DaemonFixture>, IDi
         await AssertUpstreamRefusalAsync(
             host => host.Detail = WithHeadSha(host.Detail, new string('a', 40)),
             expectedFragment: "new commits since it was verified");
+    }
+
+    /// <summary>
+    /// <b>K4/§23.5 — the head compare could not fail.</b> The verified head used to be re-derived at merge
+    /// time from whatever <c>refs/heads/agent/pr-&lt;n&gt;</c> this checkout held. But
+    /// <c>PrHeadFetcher</c> hard-RESETS that ref to the pull request's newest head <i>before</i> the
+    /// intake calls <c>NotifyNewCommits</c>, so between a force-push and the next intake poll BOTH sides
+    /// of the compare were the new head: the CAS passed, and unverified third-party code merged.
+    ///
+    /// <para>This walks exactly that window. The queue verified the PR at its old head; the ref in the
+    /// checkout is then reset forward to the new one, and upstream reports the new one. Nothing here is
+    /// stale from git's point of view — which is the whole problem, and why the verified head has to be
+    /// READ from the record rather than computed from the repository.</para>
+    /// </summary>
+    [Fact]
+    public async Task AForcePushedPrHead_CannotPassTheHeadCompareByMovingBothSidesOfIt()
+    {
+        var world = BuildWorld();
+        var (client, adapter, queue, host) = await ArrangeAsync(world);
+        using var _c = client;
+        using var _a = adapter;
+
+        // The bot force-pushes. The intake's fetcher resets the materialized ref to the new head, and the
+        // user's checkout picks it up — both spellings now name the NEW head, not the verified one.
+        var newHead = ForcePushPrHead(world);
+        Assert.NotEqual(world.PrHead, newHead);
+        Assert.Equal(newHead, Rev(world.Path, $"refs/remotes/{SyncRemote}/agent/{AgentId}"));
+        host.Detail = WithHeadSha(host.Detail, newHead);
+
+        var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => adapter.ConfirmMergeAsync(AgentId).WaitAsync(Timeout));
+
+        Assert.Contains("not the pull request head the queue verified", refusal.Message,
+            StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, host.MergeCalls);
+        Assert.Equal(world.MainSha, Rev(world.UpstreamWork, "main"));
+        Assert.Equal(world.MainSha, Rev(world.Path, "main"));
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Null(Leases.GetOutstanding(_repoHandle)); // the lease did not strand the repo
+    }
+
+    /// <summary>
+    /// The one place in the merge-identity lane that refuses on an UNKNOWN rather than declining to
+    /// answer. Everywhere else an unmeasured sha means "do not manufacture a refusal"; here declining to
+    /// answer means merging code from outside this installation on the strength of a compare that cannot
+    /// fail. An unanswerable question in front of an irreversible act on third-party code is a "no".
+    /// </summary>
+    [Fact]
+    public async Task AnExternalEntryWithNoRecordedVerifiedHead_RefusesRatherThanComparingAgainstItself()
+    {
+        var world = BuildWorld();
+        var client = NewClient();
+        using var _c = client;
+        // A queue that verified the entry WITHOUT recording which head it measured — the pre-K3 record
+        // shape, and the shape a seeded row has.
+        var queue = await RegisterQueueAsync(world.MainSha, verifyEntry: true, branchSha: "");
+        var host = new FakeHost(world);
+        using var adapter = NewAdapter(client, host);
+        adapter.SetActiveRepo(_repoHandle, world.Path, SyncRemote);
+        // The origin travels on the queue stream and the merge routes on it — without this wait the
+        // adapter would take the LOCAL path and this test would measure the wrong leg entirely.
+        Assert.True(
+            await WaitUntilAsync(() => adapter.GetQueue().Count > 0),
+            "the queue projection never arrived — the origin could not have been read");
+
+        var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => adapter.ConfirmMergeAsync(AgentId).WaitAsync(Timeout));
+
+        Assert.Contains("no recorded verified head", refusal.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("re-verify", refusal.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(0, host.MergeCalls);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Null(Leases.GetOutstanding(_repoHandle));
+    }
+
+    /// <summary>
+    /// A force-push of the pull request head, propagated the way the intake propagates one: the mirror's
+    /// <c>agent/pr-&lt;n&gt;</c> is hard-reset forward (<c>PrHeadFetcher</c>'s own behaviour) and the
+    /// user's checkout fetches it. Returns the new head.
+    /// </summary>
+    private string ForcePushPrHead(World world)
+    {
+        File.WriteAllText(Path.Combine(world.UpstreamWork, "more.txt"), "force-pushed work\n");
+        Git(world.UpstreamWork, "checkout", "pr-head");
+        Git(world.UpstreamWork, "add", "-A");
+        Git(world.UpstreamWork, "commit", "-m", "bot commit 2");
+        var newHead = Rev(world.UpstreamWork, "pr-head");
+        Git(world.UpstreamWork, "push", "--force", "origin", "pr-head");
+        Git(world.UpstreamWork, "push", "--force", world.Mirror, $"pr-head:refs/heads/agent/{AgentId}");
+        Git(world.UpstreamWork, "checkout", "main");
+        Git(world.Path, "fetch", "--force", SyncRemote);
+        Git(world.Path, "fetch", "--force", "origin");
+        return newHead;
     }
 
     /// <summary>Every "the pull request upstream is not in a state we may merge" refusal has the same

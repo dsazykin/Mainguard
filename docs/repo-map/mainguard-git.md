@@ -435,7 +435,10 @@ The all-editions base. Git logic goes here.
   or non-allowlisted prefix); `DeclaredDependencyDeniedException` — P2-07 F5 out-of-scope module
   fetch; `GitMutationLockException` — P2-09 keep-alive worktree `index.lock` stayed held across the
   bounded backoff cap (the agent is yielded/paused, so a persistent lock is a typed failure, not
-  retried forever); `SandboxImageMissingException` — v1 spawn-preflight refusal: a required jail image
+  retried forever); `GitMutationStateChangedException` — K6/§23.6, the sibling of the above: the lock DID
+  clear and the worktree underneath had moved on (the agent started its own rebase, detached, or opened a
+  merge during the backoff), so the guard's snapshot verdict no longer describes it and the action never
+  runs; `SandboxImageMissingException` — v1 spawn-preflight refusal: a required jail image
   (`mainguard-agent-base`/`mainguard-egress-proxy`) is absent from the VM's docker store (fresh import
   / post-tier-2-upgrade), thrown before any worktree/jail work, names exactly the missing image(s) +
   the repair; mapped to `FailedPrecondition` in `AgentGrpcService.SpawnAgent`;

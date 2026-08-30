@@ -34,7 +34,10 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class MergeAuditRpcTests : IDisposable
 {
-    private const string MainSha = "main-sha-0000";
+    // K3/§23.4 — real object ids: ConfirmMerge screens the sha the caller reports for shape before it
+    // records anything, so a readable placeholder is no longer an acceptable claim about a ref.
+    private const string MainSha = "0000000000000000000000000000000000000aa0";
+    private const string PostMergeSha = "0000000000000000000000000000000000000bb1";
 
     // Both unique per test instance. The in-proc daemon hosts share ONE run-scoped chained audit log (the
     // trap AuditRpcTests documents), so an assertion keyed on a constant agent id would match records this
@@ -77,7 +80,7 @@ public sealed class MergeAuditRpcTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = _agentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers);
 
         Assert.True(confirmed.Confirmed);
@@ -91,7 +94,7 @@ public sealed class MergeAuditRpcTests : IDisposable
         Assert.Equal(MergeAuthorization.ConfirmRpcSource, merged.Fields["source"]);
         Assert.Equal(begun.LeaseId, merged.Fields["lease"]);
         Assert.Equal(MainSha, merged.Fields["pre_main_sha"]);
-        Assert.Equal("main-sha-0001", merged.Fields["post_main_sha"]);
+        Assert.Equal(PostMergeSha, merged.Fields["post_main_sha"]);
         Assert.Equal("npm test", merged.Fields["verification_command"]);
         Assert.Equal("true", merged.Fields["verification_passed"]);
 
@@ -120,7 +123,7 @@ public sealed class MergeAuditRpcTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = _agentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers);
 
         var audit = new AuditService.AuditServiceClient(host.CreateChannel());
@@ -141,7 +144,7 @@ public sealed class MergeAuditRpcTests : IDisposable
             r => r.Type == MergeQueue.MergedEvent && r.PayloadJson.Contains(_repoHandle, StringComparison.Ordinal));
         Assert.Equal(64, record.Hash.Length);
         Assert.Equal(64, record.PrevHash.Length);
-        Assert.Contains("main-sha-0001", record.PayloadJson, StringComparison.Ordinal);
+        Assert.Contains(PostMergeSha, record.PayloadJson, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -162,7 +165,7 @@ public sealed class MergeAuditRpcTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = _agentId,
             LeaseId = "fabricated-lease",
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers).ResponseAsync);
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
 
@@ -176,7 +179,7 @@ public sealed class MergeAuditRpcTests : IDisposable
         Assert.Equal("fabricated-lease", refused.Fields["lease"]);
         // "reported", never "post_main_sha": nothing verified this sha, and the record's whole point is
         // that the daemon declined to accept the claim.
-        Assert.Equal("main-sha-0001", refused.Fields["reported_main_sha"]);
+        Assert.Equal(PostMergeSha, refused.Fields["reported_main_sha"]);
 
         // And no merge was recorded — a refusal that also wrote a merge record would be worse than the
         // silence it replaces, because a false record is believed.
@@ -251,7 +254,7 @@ public sealed class MergeAuditRpcTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = _agentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers);
 
         var merged = Assert.Single(

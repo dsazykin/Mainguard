@@ -27,7 +27,13 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class MergeConfirmGateTests : IDisposable
 {
-    private const string MainSha = "main-sha-0000";
+    // K3/§23.4 — real object ids, because ConfirmMerge now screens the sha the CALLER reports for shape
+    // before it records anything. These used to be "main-sha-0000"-style placeholders: readable, and
+    // exactly the kind of value the daemon must not accept as a claim about what a ref now holds.
+    private const string MainSha = "0000000000000000000000000000000000000aa0";
+    private const string PostMergeSha = "0000000000000000000000000000000000000bb1";
+    private const string CoTenantMergedSha = "0000000000000000000000000000000000000cc9";
+    private const string VerifiedBranchSha = "0000000000000000000000000000000000000dd2";
     private const string AgentId = "loom-11";
 
     // A fresh handle per test. The daemon's merge-lease store is DB-backed and — see the note on
@@ -61,7 +67,7 @@ public sealed class MergeConfirmGateTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = "fabricated-lease",
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers).ResponseAsync);
 
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
@@ -74,7 +80,7 @@ public sealed class MergeConfirmGateTests : IDisposable
     {
         using var host = new DaemonFixture();
         var (client, headers) = Client(host);
-        var queue = await SeedVerifiedQueueAsync(host, "other-agent");
+        var queue = await SeedVerifiedQueueAsync(host, extraAgents: "other-agent");
 
         // The lease belongs to "other-agent"; confirming AgentId under it would let one branch ride
         // another's authorization — the per-repo lease is not a per-repo free pass.
@@ -87,7 +93,7 @@ public sealed class MergeConfirmGateTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers).ResponseAsync);
 
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
@@ -108,14 +114,14 @@ public sealed class MergeConfirmGateTests : IDisposable
 
         // A co-tenant's merge lands between BeginMerge and ConfirmMerge: the branch is now Verified@old.
         // The old code confirmed it anyway — the exact "confirmed while still Verified@old" window.
-        queue.NotifyMainMoved("main-sha-9999");
+        queue.NotifyMainMoved(CoTenantMergedSha);
 
         var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
         {
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers).ResponseAsync);
 
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
@@ -144,7 +150,7 @@ public sealed class MergeConfirmGateTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers).ResponseAsync);
 
         Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
@@ -198,14 +204,140 @@ public sealed class MergeConfirmGateTests : IDisposable
             RepoHandle = _repoHandle,
             AgentId = AgentId,
             LeaseId = begun.LeaseId,
-            NewMainSha = "main-sha-0001",
+            NewMainSha = PostMergeSha,
         }, headers);
 
         Assert.True(confirmed.Confirmed);
         Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
-        Assert.Equal("main-sha-0001", queue.CurrentMainSha);
+        Assert.Equal(PostMergeSha, queue.CurrentMainSha);
         // The idempotency record is written only on a merge that was actually authorized.
         Assert.Null(host.Services.GetRequiredService<IMergeLeaseStore>().GetOutstanding(_repoHandle));
+    }
+
+    // ---- K3/§23.4: the post-merge sha is a CLAIM, and it is now screened -------------------------
+
+    /// <summary>
+    /// The sha main allegedly moved to is a claim, made by the caller, about a ref on the caller's own
+    /// machine. Nothing here used to look at it: the daemon wrote it into the idempotency record, set the
+    /// queue's authoritative main to it, and fired the cascade at every co-tenant on that basis. A wrong
+    /// value reparents and re-verifies every co-tenant against a main that may not exist, and
+    /// <c>CanMerge</c> then compares its evidence against a phantom forever.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_WithAPostMergeShaThatIsNotACommitId_IsRefused_AndRecordsNothing()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = "whatever-the-client-says",
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("not a commit id", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(MainSha, queue.CurrentMainSha); // the queue's main was NOT walked to the claim
+        // The lease is handed back rather than stranding the repo behind a refused confirm.
+        Assert.Null(host.Services.GetRequiredService<IMergeLeaseStore>().GetOutstanding(_repoHandle));
+    }
+
+    /// <summary>A confirm reporting the main it was authorized against is a merge that moved nothing.</summary>
+    [Fact]
+    public async Task ConfirmMerge_ReportingTheMainItWasAuthorizedAgainst_IsRefused()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+        Assert.Equal(MainSha, begun.ExpectedMainSha);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = MainSha,
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("nothing moved", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+    }
+
+    /// <summary>
+    /// The exact one. A LOCAL entry merges by <c>git merge --ff-only agent/&lt;id&gt;</c>, and a
+    /// fast-forward leaves main AT the source's tip — so the sha main moved to must BE the
+    /// <c>agent/&lt;id&gt;</c> tip the queue verified. The daemon put that sha on the lease itself at
+    /// <c>BeginMerge</c>, so the caller's claim is checkable against the daemon's own record without
+    /// reading the caller's repository at all.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_ReportingAMainThatIsNotTheVerifiedBranchTip_IsRefused()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host, branchSha: VerifiedBranchSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+        // The grant carries BOTH halves of the identity, so the client merges the branch the daemon
+        // authorized rather than whatever its own projection last saw.
+        Assert.Equal(VerifiedBranchSha, begun.ExpectedBranchSha);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = PostMergeSha, // well-formed, moved, and not the branch that was authorized
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("not the branch this merge was authorized for", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(MainSha, queue.CurrentMainSha);
+    }
+
+    /// <summary>
+    /// The control, and the one that makes the test above measure the identity rather than a confirm that
+    /// refuses everything: reporting the verified branch tip — what a real fast-forward leaves behind —
+    /// confirms.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_ReportingTheVerifiedBranchTip_Confirms()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host, branchSha: VerifiedBranchSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+
+        var confirmed = await client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = VerifiedBranchSha,
+        }, headers);
+
+        Assert.True(confirmed.Confirmed);
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(VerifiedBranchSha, queue.CurrentMainSha);
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -221,7 +353,8 @@ public sealed class MergeConfirmGateTests : IDisposable
     /// <see cref="MainSha"/> — the state a branch is in the instant before a human merges it. Built with the
     /// daemon's own lease-store singleton so the lease checks under test are the real ones.
     /// </summary>
-    private async Task<MergeQueue> SeedVerifiedQueueAsync(DaemonFixture host, params string[] extraAgents)
+    private async Task<MergeQueue> SeedVerifiedQueueAsync(
+        DaemonFixture host, string branchSha = "", params string[] extraAgents)
     {
         var registry = host.Services.GetRequiredService<MergeQueueRegistry>();
         var leases = host.Services.GetRequiredService<IMergeLeaseStore>();
@@ -234,9 +367,11 @@ public sealed class MergeConfirmGateTests : IDisposable
             currentMainSha: MainSha,
             store: new InMemoryMergeQueueStore(),
             verifications: new InMemoryVerificationStore(),
+            // BranchSha defaults to "" — the pre-K3 shape, which every identity compare reads as "not
+            // measured" and declines to answer on. The tests that are ABOUT the identity pass one.
             runVerification: (id, _) => Task.FromResult(new VerificationRecord(
                 id, queue.CurrentMainSha, Passed: true, LogArtifactPath: "", ResolvedCommand: "npm test",
-                ConfigHash: "cfg", When: DateTimeOffset.UtcNow)),
+                ConfigHash: "cfg", When: DateTimeOffset.UtcNow, BranchSha: branchSha)),
             // No re-verify on the cascade: the tests want the intermediate stale window to stay observable.
             requeue: (_, _) => Task.CompletedTask,
             gates: new IMergeGate[] { changed });

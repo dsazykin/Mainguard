@@ -1462,10 +1462,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `VerificationStore.cs` (`IVerificationStore` — **insert-only, no update** (invariant 2);
       `InMemoryVerificationStore`/`DbVerificationStore`). `MergeQueuePersistence.cs` (`DbMergeQueueStore`
       + the RT-D1 `IMergeLeaseStore`/`InMemoryMergeLeaseStore`/`DbMergeLeaseStore` — one outstanding lease
-      per repo). `MergeReconcileTask.cs` (the RT-D1 `IBootTask` in the boot merge-reconcile slot: replays
-      the T-19 journal for an outstanding lease → synthesizes a missing `ConfirmMerge` + fires
-      `NotifyMainMoved` for a committed-but-unrecorded merge, else releases the lease + surfaces the
-      interrupted attempt — exactly once or none). `MergeQueueRegistry.cs`
+      per repo; K3/§23.4 `TryBegin` also records `ExpectedBranchSha`, the `agent/<id>` tip the queue's
+      verification was measured on, so the lease states the IDENTITY it authorizes and not merely that a
+      merge is in flight). `MergeReconcileTask.cs` (the RT-D1 `IBootTask` in the boot merge-reconcile slot:
+      **K1/§23.2** — synthesizes a missing `ConfirmMerge` + fires `NotifyMainMoved` only when the merge is
+      proved to be THIS lease's, asked of git (main moved forward from the lease's expected sha AND now
+      contains `agent/<id>`); falls back to the T-19 journal only when the branch ref is gone, and then
+      only to an identity-bound entry (this lease's window, naming this branch, its own snapshots recording
+      main moving from the expected sha to now). Three verdicts — `Merged`, `NeverCommitted`, and
+      `Undecidable`, which releases the lease and records NOTHING. It used to fire on "main moved at all"
+      AND "any `Merge` entry anywhere in the repo", which a `git pull` plus a month-old merge satisfied). `MergeQueueRegistry.cs`
       (`IMergeQueueRegistry`/`MergeQueueRegistry` + `MergeQueueContext` — the per-repo queue+leases the
       gRPC service resolves through; `Handles()` snapshots the active handles on the READ interface, so
       the ISSUES-LOG #24 jail sweep can enumerate every live queue without being handed the concrete
