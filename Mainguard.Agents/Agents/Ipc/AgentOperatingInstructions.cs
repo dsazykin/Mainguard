@@ -326,11 +326,66 @@ public static class AgentOperatingInstructions
           or report to the human and wait.
         """;
 
+        // The declaration is asked of a worker that has an approved `approach` to depart from, and of no
+        // one else. Both halves are written here, next to each other, so a change to one is made while
+        // looking at the other — the same discipline the coordinator's mode-dependent paragraphs use.
+        var gatedWorker = mode != WorkerPlanMode.Ungated;
+
+        // The commit line an UNGATED worker is shown carries no declaration flags: it has no approved
+        // approach, so the daemon neither requires nor records one, and teaching a flag whose answer would
+        // be "not recorded — there is no approved approach" is how instructions start describing a
+        // mechanism that is not applied here (MG-12, one layer up).
+        var commitLine = gatedWorker
+            ? $"{shimPath} {WorkerPlanShim.CommitUsage}"
+            : $"{shimPath} commit \"<message>\"          record your work on your own branch";
+
+        var commitExample = $$"""
+        {{shimPath}} commit "fix(auth): recompute token expiry in UTC
+
+        The clock read the host's local zone, so a token minted at 23:30 expired an hour early.
+
+        Boundary tests cover the DST transition in both directions."{{(gatedWorker ? " --no-deviations" : "")}}
+        """;
+
+        var deviationSection = !gatedWorker
+            ? ""
+            : """
+        ### Say whether you departed from your approved approach
+
+        Exactly one of these is REQUIRED on every commit, after the message:
+
+        ```
+        --no-deviations                          this work follows the approved approach
+        --deviated "<what you did differently, and why>"     it does not, in this way
+        ```
+
+        `--deviated` may be repeated, once per departure. A commit that carries neither is refused —
+        nothing is committed, nothing is lost, and you run it again with an answer.
+
+        **Why you are being asked, since nothing can check it.** The human approved a `scope` and an
+        `approach`. The scope is a file list and the daemon compares your diff against it. The approach is
+        prose, and nothing compares anything against it: your branch's tests are tests **you wrote**, so a
+        change that does the opposite of what you proposed passes them exactly as well as one that does
+        not. This declaration is the only place that difference can surface before a human merges it.
+
+        So the bar is not "did I stay inside the file list" — that is a different question, already
+        answered elsewhere. The bar is: **would the person who read my plan be surprised by my diff?** If
+        the plan said you would leave existing behaviour alone and you changed it; if it said you would
+        not add validation and you added it; if you replaced the technique you described with a different
+        one — that is a deviation, and it is a normal thing to have done. Declare it and say why. A
+        departure you declare is a line the reviewer reads next to your approach; one you do not is
+        something they find in the diff, or do not find at all.
+
+        `--no-deviations` is an assertion, not a default. Make it when you have re-read your approved
+        approach against what you actually wrote — not because it is the shorter flag.
+
+        """;
+
         return opening + "\n\n" + $$"""
         ## When the work is done, commit it — nothing else will
 
         ```
-        {{shimPath}} commit "<message>"          record your work on your own branch
+        {{commitLine}}
         ```
 
         **This is the only way your work leaves this jail.** Your worktree is deleted when the agent is
@@ -356,13 +411,10 @@ public static class AgentOperatingInstructions
         is refused rather than joined, because a message that arrived flattened cannot be un-flattened.
 
         ```
-        {{shimPath}} commit "fix(auth): recompute token expiry in UTC
-
-        The clock read the host's local zone, so a token minted at 23:30 expired an hour early.
-
-        Boundary tests cover the DST transition in both directions."
+        {{commitExample}}
         ```
 
+        {{deviationSection}}
         Commit at meaningful points as you go, not only at the end, and commit again after any further
         change. Once your branch stops moving the daemon runs the repository's tests against it on its
         own and puts it in front of a human — so the last thing you do is commit, then report what you

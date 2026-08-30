@@ -189,6 +189,20 @@ public enum AgentIpcEndpointRole
 /// <param name="Message">The commit subject of a <c>commit_work</c> op. The ONLY thing a worker
 /// contributes to that commit: what is committed, where, and onto which branch are all computed
 /// daemon-side from the endpoint's identity.</param>
+/// <param name="Deviations">
+/// A <c>commit_work</c> op's declared departures from the approved plan's <c>approach</c> — the
+/// <c>--deviated "…"</c> arguments, verbatim and in order.
+///
+/// <para>Carried <b>alongside</b> <paramref name="NoDeviations"/> rather than encoded as its emptiness,
+/// which is the whole design. "I departed from the approach in these ways", "I checked and I did not",
+/// and "nobody asked me" are three different facts; an absent-or-empty list can express two of them, and
+/// the one it loses is the one the review surface has to show. The daemon requires exactly one of the two
+/// to be present and refuses a commit carrying neither or both.</para>
+/// </param>
+/// <param name="NoDeviations">
+/// A <c>commit_work</c> op's explicit <c>--no-deviations</c> assertion: this work follows the approved
+/// approach. It is a claim the worker makes, attributable and audited — not the absence of a claim.
+/// </param>
 public sealed record AgentIpcRequest(
     [property: JsonPropertyName("op")] string Op,
     [property: JsonPropertyName("agentKind")] string? AgentKind = null,
@@ -198,7 +212,9 @@ public sealed record AgentIpcRequest(
     [property: JsonPropertyName("planJson")] string? PlanJson = null,
     [property: JsonPropertyName("agentId")] string? AgentId = null,
     [property: JsonPropertyName("prompt")] string? Prompt = null,
-    [property: JsonPropertyName("message")] string? Message = null)
+    [property: JsonPropertyName("message")] string? Message = null,
+    [property: JsonPropertyName("deviations")] string[]? Deviations = null,
+    [property: JsonPropertyName("noDeviations")] bool? NoDeviations = null)
 {
     // ---- Coordinator ops — coordinator contract §3, and the list is EXHAUSTIVE -----------------
     //
@@ -305,6 +321,17 @@ public sealed record AgentIpcRequest(
     /// the shape that makes <c>AgentRefMediator</c> safe (the agent cannot name a ref at all). It grants
     /// no capability the worker lacked: <c>WorktreeManager</c> gives every agent its own repository
     /// precisely so that committing is available to it.</para>
+    ///
+    /// <para><b>It also carries the worker's deviation declaration</b> (2026-08-31). A plan-gated worker
+    /// must say, as part of committing, whether the work departs from the <c>approach</c> a human
+    /// approved — <c>--no-deviations</c> or one or more <c>--deviated "…"</c>. A commit carrying neither
+    /// is refused. The defect: an approved approach said the module had no validation idiom and the plan
+    /// would keep plain <c>a / b</c>; the worker shipped a throwing validation layer that changed three
+    /// pre-existing functions. The file scope was honoured, so the out-of-scope gate saw nothing, and the
+    /// branch verified green because the worker had written the tests asserting its own new behaviour.
+    /// Nothing in the system held the approach against the diff, and nothing does now either — a worker
+    /// that must ANSWER is not a worker that must be honest. What changed is that the answer exists, is
+    /// attributable, becomes a must-acknowledge row, and cannot be given by saying nothing.</para>
     /// </summary>
     public const string CommitWorkOp = "commit_work";
 

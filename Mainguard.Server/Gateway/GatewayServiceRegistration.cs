@@ -234,8 +234,12 @@ public static class GatewayServiceRegistration
             // — and null means "unmanaged", so a worker would have lost its F6 out-of-scope coverage by
             // the act of asking to widen legally, silently, for as long as the human took to decide. The
             // policy lives in PlanApprovalService now rather than here, so there is one copy of it.
-            resolveApprovedPlan: agentId =>
-                sp.GetRequiredService<PlanApprovalService>().ApprovedPlanFor(agentId));
+            // ApprovedWorkFor, not ApprovedPlanFor: the same lookup answers both halves of an approval —
+            // the SCOPE the diff is compared against, and the APPROACH the human is shown at review
+            // together with whatever the worker declared about departing from it. One call so the two can
+            // never name two different plans after a re-scope.
+            resolveApprovedWork: agentId =>
+                sp.GetRequiredService<PlanApprovalService>().ApprovedWorkFor(agentId));
 
             // ---- G1: the other half of "a queue row requires an approved plan" -------------------------
             //

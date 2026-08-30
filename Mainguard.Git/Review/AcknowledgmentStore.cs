@@ -36,6 +36,28 @@ public enum FlaggedKind
     /// distinction decides a merge.</para>
     /// </summary>
     LockfileAdvisoryUnknown,
+
+    /// <summary>
+    /// A departure from the approved plan's <c>Approach</c> that the WORKER declared at commit time.
+    ///
+    /// <para>The sibling of <see cref="OutOfApprovedScope"/>, for the half of an approval that is not a
+    /// file list. A plan's scope is machine-comparable and is compared; its approach is prose and is not —
+    /// so a worker whose approved approach said "no error handling, keep plain <c>a / b</c>" could ship a
+    /// validation layer that changed three pre-existing functions with the scope honoured, the tests it
+    /// wrote itself green, and nothing flagged. This row is the worker's own statement of what it did
+    /// differently, put in front of the human beside the approach it departed from.</para>
+    /// </summary>
+    DeclaredDeviation,
+
+    /// <summary>
+    /// This branch's approved work carries <b>no deviation declaration at all</b> — the worker was never
+    /// asked, or answered through a path that predates the question.
+    ///
+    /// <para>Its own kind rather than an absent item, for exactly the reason
+    /// <see cref="LockfileAdvisoryUnknown"/> is: an omitted item is an acknowledged item, so silence here
+    /// would report "nobody established whether this follows the approved approach" as "it does".</para>
+    /// </summary>
+    DeviationDeclarationMissing,
 }
 
 /// <summary>

@@ -54,6 +54,68 @@ public enum PlanStatus
     Superseded,
 }
 
+/// <summary>
+/// What a worker has said, at commit time, about whether the work it recorded followed the
+/// <see cref="TaskPlan.Approach"/> a human approved.
+///
+/// <para><b>Three outcomes, not two</b> — the same call <see cref="WorkerPlanGate.MergeEvidence"/> makes,
+/// for the same reason. "I checked and there were none" and "nobody ever asked me" are different facts,
+/// and collapsing them puts a reassurance on the review surface that no worker ever gave. The defect this
+/// exists for is a worker whose approved approach said it would keep plain <c>a / b</c> and which shipped
+/// a validation layer that changed three pre-existing functions: the scope was honoured, verification was
+/// green because the worker wrote the tests, and nothing anywhere compared the approved approach against
+/// the diff. This does not compare them either — it makes the worker state the answer, and puts an
+/// unanswered question in front of the human rather than letting silence read as "nothing to see".</para>
+/// </summary>
+public enum DeviationDeclaration
+{
+    /// <summary>
+    /// Nothing on record. <b>Not</b> "no deviations": the question was never answered for this branch, so
+    /// the review surface flags it exactly as <c>FlaggedKind.LockfileAdvisoryUnknown</c> flags an
+    /// advisory check that could not run. An omitted item is an acknowledged item.
+    /// </summary>
+    NotDeclared,
+
+    /// <summary>The worker explicitly asserted that the work follows the approved approach.</summary>
+    None,
+
+    /// <summary>The worker declared one or more departures from the approved approach.</summary>
+    Declared,
+}
+
+/// <summary>
+/// What a human approved for one worker, and what that worker has since said about following it. One
+/// object because it is one lookup: the F6 scope comparison and the approach shown at review must be
+/// resolved from the <b>same</b> approved plan, and two seams into the same service is how they come to
+/// name two different plans after a re-scope.
+/// </summary>
+/// <param name="Plan">The approved plan itself — <c>Scope</c> is F6-load-bearing, <c>Approach</c> is what
+/// the reviewer compares the diff against.</param>
+/// <param name="Declaration">The worker's commit-time answer about deviating from <c>Approach</c>.</param>
+/// <param name="Deviations">The declared departures, verbatim; empty unless
+/// <paramref name="Declaration"/> is <see cref="DeviationDeclaration.Declared"/>.</param>
+public sealed record ApprovedWork(
+    TaskPlan Plan,
+    DeviationDeclaration Declaration,
+    IReadOnlyList<string> Deviations);
+
+/// <summary>The outcome of a worker's commit-time deviation declaration.</summary>
+public enum DeviationDeclarationOutcome
+{
+    /// <summary>Recorded on the worker's approved plan.</summary>
+    Recorded,
+
+    /// <summary>Refused: this worker holds no approved plan, so there is no approach to deviate from.</summary>
+    NoApprovedPlan,
+}
+
+/// <summary>The result of a <see cref="PlanApprovalService.DeclareDeviations"/> call.</summary>
+public sealed record DeviationDeclarationResult(
+    DeviationDeclarationOutcome Outcome, string Message, PendingPlan? Plan)
+{
+    public bool IsRecorded => Outcome == DeviationDeclarationOutcome.Recorded;
+}
+
 /// <summary>Whether a worker's plan presentation was accepted onto the queue.</summary>
 public enum PlanPresentationOutcome
 {
@@ -124,6 +186,17 @@ public enum PlanRevisionOutcome
 /// re-scope). It is <b>not a budget</b> — nothing refuses on this number; see
 /// <see cref="PlanApprovalService.Rescope"/> for why the count is shown rather than capped.
 /// </param>
+/// <param name="Deviation">
+/// The worker's commit-time answer about departing from <see cref="TaskPlan.Approach"/> — see
+/// <see cref="DeviationDeclaration"/>. It lives on the plan record and not in a register of its own
+/// because a deviation is a deviation <i>from this plan</i>: the record it belongs to is the one that
+/// authorised the work, it is resolved by the same <see cref="PlanApprovalService.ApprovedForWorker"/>
+/// the F6 scope comparison uses, and it persists through a daemon restart for free.
+/// </param>
+/// <param name="DeclaredDeviations">
+/// The departures the worker declared, verbatim and in declaration order. Empty unless
+/// <see cref="Deviation"/> is <see cref="DeviationDeclaration.Declared"/>.
+/// </param>
 public sealed record PendingPlan(
     TaskPlan Plan,
     string CoordinatorId,
@@ -136,7 +209,9 @@ public sealed record PendingPlan(
     string? RejectionFeedback = null,
     string? SupersedesPlanId = null,
     IReadOnlyList<string>? PreviousScope = null,
-    int RescopeCount = 0)
+    int RescopeCount = 0,
+    DeviationDeclaration Deviation = DeviationDeclaration.NotDeclared,
+    IReadOnlyList<string>? DeclaredDeviations = null)
 {
     public string PlanId => Plan.PlanId;
     public string Title => Plan.Title;
@@ -145,6 +220,9 @@ public sealed record PendingPlan(
 
     /// <summary>True when this plan asks to widen an approval the worker already holds.</summary>
     public bool IsRescope => !string.IsNullOrEmpty(SupersedesPlanId);
+
+    /// <summary>The declared departures, never null.</summary>
+    public IReadOnlyList<string> Deviations => DeclaredDeviations ?? Array.Empty<string>();
 
     /// <summary>
     /// True while the worker is held at the gate — presented and undecided, or owing a revision.
@@ -304,6 +382,13 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         SupersedesPlanId = p.SupersedesPlanId,
         PreviousScope = p.PreviousScope?.ToList(),
         RescopeCount = p.RescopeCount,
+        // Persisted for the same reason SupersedesPlanId is: a daemon restart between the worker's commit
+        // and its branch's verification must not turn "the worker asserted it followed the approach" back
+        // into "nobody ever asked" — which is a must-acknowledge flag the human would have to clear for a
+        // question that WAS answered. The three states are written by name, never as an int, so a
+        // hand-read store file says what it means.
+        Deviation = p.Deviation.ToString(),
+        DeclaredDeviations = p.DeclaredDeviations?.ToList(),
     };
 
     private static PendingPlan FromDto(PlanDto d) => new(
@@ -321,7 +406,12 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         // rehydrated plan that had forgotten what it supersedes would leave two.
         d.SupersedesPlanId,
         d.PreviousScope,
-        d.RescopeCount);
+        d.RescopeCount,
+        // An unparseable or absent value rehydrates as NotDeclared — the fail-closed direction. A store
+        // file written before this field existed genuinely holds no answer, and reading one as "None"
+        // would manufacture the assertion this whole mechanism exists to stop being assumed.
+        Enum.TryParse<DeviationDeclaration>(d.Deviation, out var dev) ? dev : DeviationDeclaration.NotDeclared,
+        d.DeclaredDeviations);
 
     private sealed class PlanDto
     {
@@ -343,6 +433,8 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         public string? SupersedesPlanId { get; set; }
         public List<string>? PreviousScope { get; set; }
         public int RescopeCount { get; set; }
+        public string? Deviation { get; set; }
+        public List<string>? DeclaredDeviations { get; set; }
     }
 }
 
@@ -771,6 +863,89 @@ public sealed class PlanApprovalService
     }
 
     /// <summary>
+    /// The worker's commit-time answer about departing from the <see cref="TaskPlan.Approach"/> a human
+    /// approved. Recorded on the approving plan itself, audited, and read back at review.
+    ///
+    /// <para><b>Why the answer is required rather than offered.</b> The failure this closes is a worker
+    /// that shipped the opposite of what its approved approach said it would do, with the file scope
+    /// honoured, verification green (it wrote the tests), and nothing in the system holding the approach
+    /// against the diff. A declaration nobody has to make is a field that is empty on exactly the runs
+    /// that needed it, so the daemon refuses the commit without one — and refuses it in a way that costs
+    /// the worker one re-run and nothing else, because the worktree is untouched by a refusal.</para>
+    ///
+    /// <para><b>A declaration cannot be walked back.</b> A worker commits several times; if any of those
+    /// commits declared a departure, the branch has departed. So <see cref="DeviationDeclaration.Declared"/>
+    /// is sticky and later texts accumulate (ordinal-distinct, order preserved), and a subsequent "none"
+    /// records nothing new rather than clearing what was already said. The opposite rule would let the
+    /// last commit erase the disclosure of the first, which is the rubber stamp this mechanism must not
+    /// become.</para>
+    ///
+    /// <para>It is deliberately <b>not</b> a check of anything: nothing here reads the diff, and nothing
+    /// compares the declaration to it. This records what the worker claims so a human can hold it against
+    /// the approach, which is on their screen for the first time as of this change.</para>
+    /// </summary>
+    /// <param name="workerAgentId">The committing worker.</param>
+    /// <param name="deviations">The declared departures; empty/null means the worker asserted there are none.</param>
+    public DeviationDeclarationResult DeclareDeviations(
+        string workerAgentId, IReadOnlyList<string>? deviations)
+    {
+        var declared = (deviations ?? Array.Empty<string>())
+            .Where(d => !string.IsNullOrWhiteSpace(d))
+            .Select(d => d.Trim())
+            .ToList();
+
+        PendingPlan updated;
+        lock (_gate)
+        {
+            if (ApprovedForWorkerLocked(workerAgentId) is not { } approved)
+            {
+                return new DeviationDeclarationResult(
+                    DeviationDeclarationOutcome.NoApprovedPlan,
+                    "this worker holds no approved plan, so there is no approved approach to deviate from.",
+                    null);
+            }
+
+            var merged = approved.Deviations.ToList();
+            foreach (var d in declared)
+            {
+                if (!merged.Contains(d, StringComparer.Ordinal))
+                {
+                    merged.Add(d);
+                }
+            }
+
+            // Sticky: once a departure is on record the branch has departed, whatever a later commit says.
+            var declaration = merged.Count > 0
+                ? DeviationDeclaration.Declared
+                : DeviationDeclaration.None;
+
+            updated = approved with { Deviation = declaration, DeclaredDeviations = merged };
+            _plans[updated.PlanId] = updated;
+            _store.Save(updated);
+
+            AuditLocked("worker_deviation_declared", new Dictionary<string, string>
+            {
+                ["plan_id"] = updated.PlanId,
+                ["worker_agent_id"] = workerAgentId,
+                ["declaration"] = declaration.ToString(),
+                ["declared_now"] = declared.Count.ToString(),
+                ["declared_total"] = merged.Count.ToString(),
+                // The texts themselves, joined, because the audit chain is where "what did the worker say
+                // it had done differently" has to be answerable after the jail is gone.
+                ["deviations"] = string.Join(" ⏎ ", declared),
+            });
+        }
+
+        Changed?.Invoke();
+        return new DeviationDeclarationResult(
+            DeviationDeclarationOutcome.Recorded,
+            updated.Deviation == DeviationDeclaration.Declared
+                ? $"{updated.Deviations.Count} declared deviation(s) recorded — the human sees them beside your approved approach."
+                : "recorded: no deviation from the approved approach.",
+            updated);
+    }
+
+    /// <summary>
     /// Blocks until the human decides <paramref name="planId"/>, then returns that decision. An
     /// already-decided plan returns immediately (so a worker that reconnects after a daemon restart is not
     /// stranded waiting for an event that already fired).
@@ -1071,6 +1246,26 @@ public sealed class PlanApprovalService
     /// <see cref="TaskPlan"/> itself, or null. Exists so the composition root holds no policy of its own.
     /// </summary>
     public TaskPlan? ApprovedPlanFor(string workerAgentId) => ApprovedForWorker(workerAgentId)?.Plan;
+
+    /// <summary>
+    /// <see cref="ApprovedForWorker"/> as everything downstream of a merge wants it: the approved plan
+    /// <b>and</b> the worker's declaration about following its approach, resolved in one lookup. Null when
+    /// the worker holds no approval (a manual agent, an external-PR head, a worker spawned with plan mode
+    /// off) — which reads as "unmanaged" and means neither the scope comparison nor the deviation rows
+    /// apply.
+    ///
+    /// <para>One method rather than two seams on purpose. The F6 scope comparison and the approach the
+    /// reviewer is shown must describe the SAME approved plan; two independent resolvers would be free to
+    /// name two different ones the instant a re-scope lands, and the surface would then present an
+    /// approach the diff was never measured against.</para>
+    /// </summary>
+    public ApprovedWork? ApprovedWorkFor(string workerAgentId)
+    {
+        var approved = ApprovedForWorker(workerAgentId);
+        return approved is null
+            ? null
+            : new ApprovedWork(approved.Plan, approved.Deviation, approved.Deviations);
+    }
 
     /// <summary>The workers currently held at the plan gate (presented-undecided, or owing a revision).</summary>
     public IReadOnlyList<string> BlockedWorkerIds()

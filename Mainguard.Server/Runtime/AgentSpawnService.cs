@@ -1238,6 +1238,21 @@ public sealed class AgentSpawnService
                 Ok: false, AgentId: workerAgentId, Error: "this worker session is no longer live");
         }
 
+        // The deviation declaration is settled BEFORE anything is committed, so a refusal costs the worker
+        // one re-run and nothing else — the worktree is untouched by it, which is the only reason this is
+        // safe to make mandatory at all. Refusing after the commit would be a failed call over work that
+        // had already landed.
+        if (DeviationRefusal(request, workerAgentId) is { } declarationRefusal)
+        {
+            _audit.Append(new AuditEvent("worker_commit_denied", new Dictionary<string, string>
+            {
+                ["agent_id"] = workerAgentId,
+                ["reason"] = declarationRefusal,
+                ["cause"] = "deviation-declaration",
+            }));
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: declarationRefusal);
+        }
+
         var result = _launcher.Worktrees.CommitAgentWork(repoHash, workerAgentId, request.Message);
         _audit.Append(new AuditEvent("worker_commit", new Dictionary<string, string>
         {
@@ -1248,11 +1263,16 @@ public sealed class AgentSpawnService
             ["sha"] = result.Sha ?? string.Empty,
         }));
 
+        var declarationNote = result.Outcome is AgentWorkCommitOutcome.Committed
+            or AgentWorkCommitOutcome.NothingToCommit
+            ? RecordDeviations(request, workerAgentId)
+            : null;
+
         return result.Outcome switch
         {
             AgentWorkCommitOutcome.Committed => new AgentIpcResponse(
                 Ok: true, AgentId: workerAgentId, Status: result.Branch,
-                CommitSha: result.Sha, Committed: true),
+                CommitSha: result.Sha, Committed: true, Feedback: declarationNote),
 
             // Not an error — the worker asked correctly and there was nothing to record. Answered
             // truthfully rather than as a commit, because "committed" would tell a worker its work is
@@ -1266,6 +1286,72 @@ public sealed class AgentSpawnService
                 Error: result.Detail ?? $"could not commit on {result.Branch} ({result.Outcome})"),
         };
     }
+
+    /// <summary>
+    /// Why this <c>commit_work</c> may not proceed on its deviation declaration, or null when it may.
+    ///
+    /// <para><b>Required only where there is something to deviate FROM.</b> The question is asked of a
+    /// worker that holds an approved plan, because the thing being departed from is that plan's
+    /// <c>approach</c>. A worker spawned with plan mode off has no approved approach, so demanding a
+    /// declaration from it would be a ritual — and it is <c>ApprovedForWorker</c> that answers this, the
+    /// same single authority the F6 scope comparison and the flagged rows resolve through, rather than a
+    /// second reading of the mode switch.</para>
+    ///
+    /// <para><b>Silence is refused, and that is the whole point.</b> The defect this closes had a worker
+    /// ship the opposite of its approved approach with the file scope honoured and a green verification it
+    /// had written the tests for. An optional declaration would be empty on precisely those runs. So a
+    /// gated commit must carry exactly one of the two answers, and "no deviations" is a claim the worker
+    /// makes rather than the absence of one.</para>
+    /// </summary>
+    private string? DeviationRefusal(AgentIpcRequest request, string workerAgentId)
+    {
+        var declared = DeclaredDeviations(request);
+        var assertsNone = request.NoDeviations == true;
+
+        if (assertsNone && declared.Count > 0)
+        {
+            return "--no-deviations and --deviated say opposite things about the same work. Send one: "
+                   + "mainguard-plan " + WorkerPlanShim.CommitUsage;
+        }
+
+        if (_plans.ApprovedForWorker(workerAgentId) is null || assertsNone || declared.Count > 0)
+        {
+            return null;
+        }
+
+        return "this commit needs your deviation declaration. Your plan's approved `approach` is what the "
+               + "human agreed you would do; say whether this work follows it. Nothing checks that for "
+               + "you — your own tests pass either way — so the declaration is the only thing that tells "
+               + "them otherwise. Run: mainguard-plan " + WorkerPlanShim.CommitUsage;
+    }
+
+    /// <summary>
+    /// Records the worker's declaration on its approved plan and returns the sentence the shim prints
+    /// back. Null when there was nothing to say either way.
+    ///
+    /// <para>An ungated worker that volunteered a declaration is <b>told</b> it was not recorded rather
+    /// than having it silently dropped or its commit refused: the commit is the thing that must not be
+    /// lost, and "we ignored what you said" is exactly the kind of quiet that this subsystem keeps
+    /// finding at the bottom of its defects.</para>
+    /// </summary>
+    private string? RecordDeviations(AgentIpcRequest request, string workerAgentId)
+    {
+        var declared = DeclaredDeviations(request);
+        if (!(request.NoDeviations == true) && declared.Count == 0)
+        {
+            return null;
+        }
+
+        var recorded = _plans.DeclareDeviations(workerAgentId, declared);
+        return recorded.IsRecorded
+            ? recorded.Message
+            : "not recorded — " + recorded.Message;
+    }
+
+    private static IReadOnlyList<string> DeclaredDeviations(AgentIpcRequest request) =>
+        (request.Deviations ?? Array.Empty<string>())
+            .Where(d => !string.IsNullOrWhiteSpace(d))
+            .ToList();
 
     /// <summary>What am I here to plan? The brief and the live plan's state — never the task prompt.</summary>
     private AgentIpcResponse Brief(string workerAgentId)

@@ -88,7 +88,7 @@ public sealed class MergeQueueProvisioner
     private readonly Func<string, string, bool>? _publishAgentRef;
     private readonly Func<string, string, AgentBranchAlignment>? _checkAgentBranch;
     private readonly IMergeBranchDiffService _mergeDiff;
-    private readonly Func<string, TaskPlan?>? _resolveApprovedPlan;
+    private readonly Func<string, ApprovedWork?>? _resolveApprovedWork;
     private readonly Func<string, IYieldProtocol>? _yieldFor;
     private readonly Func<string, string, string?>? _locateAgentWorktree;
     private readonly IAgentSupervisor _agentStates;
@@ -126,10 +126,22 @@ public sealed class MergeQueueProvisioner
     /// </param>
     /// <param name="audit">Audit sink threaded into every queue (the loud <c>stale_override_used</c> path).</param>
     /// <param name="log">Optional milestone sink (daemon Merge log category).</param>
-    /// <param name="resolveApprovedPlan">
-    /// SA-1/F6 — agentId → the managed worker's human-approved <see cref="TaskPlan"/>, or null when the
-    /// agent has none. Supplying it turns on the <c>out-of-approved-scope</c> arm of the detector: every
-    /// file the branch touches outside <c>TaskPlan.Scope</c> becomes its own must-acknowledge item.
+    /// <param name="resolveApprovedWork">
+    /// SA-1/F6 — agentId → what a human approved for this worker and what the worker has since said about
+    /// following it (<see cref="ApprovedWork"/>), or null when the agent has none. Supplying it turns on
+    /// two arms of the review, one per half of an approval:
+    /// <list type="bullet">
+    /// <item><b>The scope half.</b> Every file the branch touches outside <c>TaskPlan.Scope</c> becomes its
+    /// own must-acknowledge item (the detector's out-of-approved-scope arm).</item>
+    /// <item><b>The approach half</b> (<see cref="DeviationReview"/>). A scope is machine-comparable and is
+    /// compared; an <c>Approach</c> is prose and is not — which is how a worker shipped the opposite of its
+    /// approved approach with the scope honoured and every gate green. The worker's own commit-time
+    /// declaration becomes a must-ack row, and so does the ABSENCE of one.</item>
+    /// </list>
+    ///
+    /// <para><b>One callback for both, deliberately.</b> They have to describe the SAME approved plan: two
+    /// resolvers would be free to name two different ones the instant a re-scope lands, and the reviewer
+    /// would then be shown an approach the diff was never measured against.</para>
     ///
     /// <para><b>Wired by the daemon since phase 2, and the history is the point.</b> It used to be null for
     /// a stated reason: there was no agent→approved-plan binding anywhere in the running daemon, so any
@@ -199,7 +211,7 @@ public sealed class MergeQueueProvisioner
     /// The offline advisory snapshot the P2-11 §3.6 lockfile review consults. Defaults to the shipped
     /// <see cref="OsvSnapshot.Default"/>.
     ///
-    /// <para><b>Absent at the composition root on purpose</b>, like <paramref name="resolveApprovedPlan"/>,
+    /// <para><b>Absent at the composition root on purpose</b>, unlike <paramref name="resolveApprovedWork"/>,
     /// and for a stated reason rather than by oversight. The snapshot is <b>bundled</b>: a review-time
     /// network call is a P2-11 rejection trigger, so there is no fetch-and-cache the daemon could pass a
     /// handle to, and the embedded copy IS the production answer. Refresh happens by shipping a build —
@@ -233,7 +245,7 @@ public sealed class MergeQueueProvisioner
         IAuditLog? audit = null,
         Action<string>? log = null,
         Func<string, string, bool>? publishAgentRef = null,
-        Func<string, TaskPlan?>? resolveApprovedPlan = null,
+        Func<string, ApprovedWork?>? resolveApprovedWork = null,
         IMergeGate? planGate = null,
         Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
         Func<string, IYieldProtocol>? yieldProtocolFor = null,
@@ -257,7 +269,7 @@ public sealed class MergeQueueProvisioner
         _audit = audit ?? new InMemoryAuditLog();
         _log = log;
         _publishAgentRef = publishAgentRef;
-        _resolveApprovedPlan = resolveApprovedPlan;
+        _resolveApprovedWork = resolveApprovedWork;
         _planGate = planGate;
         _checkAgentBranch = checkAgentBranch;
         _yieldFor = yieldProtocolFor;
@@ -274,7 +286,7 @@ public sealed class MergeQueueProvisioner
         if (audit is not null) { wired.Add(nameof(audit)); }
         if (log is not null) { wired.Add(nameof(log)); }
         if (publishAgentRef is not null) { wired.Add(nameof(publishAgentRef)); }
-        if (resolveApprovedPlan is not null) { wired.Add(nameof(resolveApprovedPlan)); }
+        if (resolveApprovedWork is not null) { wired.Add(nameof(resolveApprovedWork)); }
         if (checkAgentBranch is not null) { wired.Add(nameof(checkAgentBranch)); }
         if (yieldProtocolFor is not null) { wired.Add(nameof(yieldProtocolFor)); }
         if (locateAgentWorktree is not null) { wired.Add(nameof(locateAgentWorktree)); }
@@ -314,12 +326,13 @@ public sealed class MergeQueueProvisioner
     /// exact expected set. Adding a new optional argument, or dropping an existing one, both fail that
     /// assertion until the daemon's intent is restated.</para>
     ///
-    /// <para>The set is deliberately EXACT rather than a minimum. Two names are absent on purpose:
-    /// <c>resolveApprovedPlan</c> (there is no agent→approved-plan binding in the daemon to give it — see
-    /// the NOTE in <c>GatewayServiceRegistration</c>) and <c>osvSnapshot</c> (the advisory snapshot is
-    /// bundled, so the embedded default IS the production answer and a passed one could only be a test
-    /// double). An absence that is a decision has to be as pinned as a presence, or the decision quietly
-    /// becomes an oversight the first time someone passes a guess.</para>
+    /// <para>The set is deliberately EXACT rather than a minimum. <c>osvSnapshot</c> is absent on purpose:
+    /// the advisory snapshot is bundled, so the embedded default IS the production answer and a passed one
+    /// could only be a test double. An absence that is a decision has to be as pinned as a presence, or the
+    /// decision quietly becomes an oversight the first time someone passes a guess.
+    /// (<c>resolveApprovedWork</c> was pinned absent for a similar stated reason until phase 2 gave the
+    /// daemon a real agent→approved-plan binding; it is in the set now, and the note is kept because the
+    /// shape of that argument — a real binding or none, never a guess — is the standing rule.)</para>
     /// </summary>
     public IReadOnlySet<string> WiredOptionalControls { get; }
 
@@ -863,6 +876,10 @@ public sealed class MergeQueueProvisioner
         {
             ChangedTestCommand = changedTestCommand,
             FlaggedChanges = flaggedChanges,
+            // The SAME callback ArmFlaggedChangeReview measures the diff against, handed to the projection
+            // that renders the approval to the human. Resolving it twice from two seams is how the
+            // reviewer ends up reading one plan's approach beside another plan's verdict.
+            ResolveApprovedWork = _resolveApprovedWork,
         };
     }
 
@@ -1583,9 +1600,21 @@ public sealed class MergeQueueProvisioner
         // scope comparison is meaningful exactly when there is an approved scope to compare against, and a
         // "managed but plan-less" combination could only ever mean "compare against nothing", which is the
         // state this change exists to end.
-        var approvedPlan = _resolveApprovedPlan?.Invoke(agentId);
+        var approved = _resolveApprovedWork?.Invoke(agentId);
         var items = new List<FlaggedChange>(
-            FlaggedChangeDetector.DetectFlagged(files, approvedPlan, managed: approvedPlan is not null));
+            FlaggedChangeDetector.DetectFlagged(files, approved?.Plan, managed: approved is not null));
+
+        // The APPROACH half of the same approval. The scope comparison above answers "did it touch files
+        // nobody agreed to"; nothing answered "did it do what it said it would do", and a worker that owns
+        // its own tests can turn any divergence green. These rows are the worker's own commit-time
+        // declaration — and, when there is none, the fact that nobody answered. Only for a worker that
+        // HOLDS an approval: with no approved approach there is nothing to deviate from, and a row saying
+        // otherwise would be a ritual rather than a control.
+        if (approved is not null)
+        {
+            items.AddRange(DeviationReview.ItemsFor(
+                approved.Declaration, approved.Deviations, FlaggedChangeDetector.HashDiff(files)));
+        }
 
         // P2-11 §3.6, and the second half of this method's job. The detector above classifies by PATH, so a
         // lockfile change reaches the human as "package-lock.json changed" and nothing more — which cannot

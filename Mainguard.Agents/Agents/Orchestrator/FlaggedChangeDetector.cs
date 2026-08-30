@@ -117,6 +117,27 @@ public static class FlaggedChangeDetector
         string lockfilePath, IReadOnlyList<DependencyDelta> deltas, string snapshotReason = "")
         => LockfileReview.ItemsFor(lockfilePath, deltas, snapshotReason);
 
+    /// <summary>
+    /// A content hash over the WHOLE merge diff — the seed a flagged item uses when it is about the branch
+    /// rather than about one file (see <see cref="DeviationReview"/>).
+    ///
+    /// <para>Invariant 2 is that a new push invalidates every acknowledgment, and it holds for per-file
+    /// items because their hashes are per-file. A branch-level item hashed only on its own text would
+    /// survive a push that rewrote every line of the diff it was acknowledged against — so it is hashed on
+    /// the diff too, and the same rule then produces the same behaviour for both shapes of item.</para>
+    /// </summary>
+    public static string HashDiff(IReadOnlyList<FilePatch>? mergeDiff)
+    {
+        var sb = new StringBuilder();
+        foreach (var patch in (mergeDiff ?? Array.Empty<FilePatch>())
+                     .OrderBy(FilePatchPath.NewPath, StringComparer.Ordinal))
+        {
+            sb.Append(HashPatch(patch)).Append('\n');
+        }
+
+        return AcknowledgmentStore.HashContent(sb.ToString());
+    }
+
     // The highest-risk (lowest-rank) category among the file's hunks, and whether it is flag-worthy.
     private static RiskCategory TopCategory(string path, FilePatch patch, out bool isFlagWorthy)
     {
