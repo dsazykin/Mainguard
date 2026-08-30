@@ -29,7 +29,6 @@ public class MergeQueueStateMachineTests
         private long _tick;
         private readonly HashSet<string> _fails = new(StringComparer.Ordinal);
         private readonly HashSet<string> _refusals = new(StringComparer.Ordinal);
-        private readonly Dictionary<string, Action> _beforeRefusal = new(StringComparer.Ordinal);
 
         public void FailFor(string agentId) => _fails.Add(agentId);
 
@@ -43,17 +42,6 @@ public class MergeQueueStateMachineTests
         /// queue keeps them apart too: only one of them is a test failure.
         /// </summary>
         public void RefuseFor(string agentId) => _refusals.Add(agentId);
-
-        /// <summary>
-        /// The same refusal, with <paramref name="before"/> run INSIDE the run window — the only way to
-        /// exercise "a human decided while the run was in flight", which is the boundary the settle and
-        /// the reason-restore both have to respect.
-        /// </summary>
-        public void RefuseWith(string agentId, Action before)
-        {
-            _refusals.Add(agentId);
-            _beforeRefusal[agentId] = before;
-        }
 
         /// <summary>Every transition reported through the queue's <c>onStateChanged</c> seam, in order.</summary>
         public List<(string Agent, WorkerMergeState State)> Notices = new();
@@ -69,11 +57,6 @@ public class MergeQueueStateMachineTests
             {
                 if (_refusals.Contains(id))
                 {
-                    if (_beforeRefusal.TryGetValue(id, out var before))
-                    {
-                        before();
-                    }
-
                     throw new NoVerificationCommandException("this repo configures no verification command");
                 }
 
@@ -211,6 +194,7 @@ public class MergeQueueStateMachineTests
     {
         var h = new Harness();
         h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
 
         // The cascade's conflict terminus, exactly as MergeQueueProvisioner writes it.
         Assert.True(h.Queue.TryReturnToWorking("a", MergeQueueProvisioner.RebaseConflictReason, "conflict"));
@@ -226,27 +210,6 @@ public class MergeQueueStateMachineTests
         Assert.Equal(MergeQueueProvisioner.RebaseConflictReason, afterVerify);
     }
 
-    /// <summary>
-    /// The boundary of the rule above: a refused run must not write a <c>Working</c> reason onto an entry
-    /// a human discarded while the run was in flight. That decision is made, and a "this branch needs…"
-    /// sentence under a <c>Discarded</c> row would describe work nobody is going to do.
-    /// </summary>
-    [Fact]
-    public async Task RunVerification_Refused_AfterADiscard_LeavesTheTerminalReasonAlone()
-    {
-        var h = new Harness();
-        h.Build(withRequeue: false);
-        Assert.True(h.Queue.TryReturnToWorking("a", MergeQueueProvisioner.RebaseConflictReason, "conflict"));
-
-        h.RefuseWith("a", () => Assert.True(h.Queue.TryDiscard("a", "uid:1000", "dropped", out var refusal), refusal));
-
-        await Assert.ThrowsAsync<NoVerificationCommandException>(
-            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
-
-        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("a"));
-        Assert.False(h.Queue.CanMerge("a", out var reason));
-        Assert.Equal("discarded — this entry was dropped from the queue", reason);
-    }
 
     /// <summary>
     /// The three ways out of a red verification, and the two that are refused. This is the shape of the

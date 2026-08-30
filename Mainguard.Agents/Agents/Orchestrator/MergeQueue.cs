@@ -2178,9 +2178,15 @@ public sealed class MergeQueue : IMergeQueue
     private void RestoreWorkingReasonAfterRefusedRunLocked(
         string agentId, WorkingReason? reasonBeforeRun, Exception failure)
     {
-        // The settle above is a no-op for an entry that went terminal mid-run (a human discard). Writing a
-        // Working reason onto a Discarded row would put a "this branch needs…" sentence under a decision
-        // that is already made.
+        // The settle above is a no-op for an entry that went terminal mid-run (a human discard), so this
+        // is the case where the state is NOT Working and a Working reason would be a "this branch
+        // needs…" sentence recorded under a decision already made.
+        //
+        // Stated plainly: this branch is not separately observable today. `CanMergeLocked` reads
+        // `_workingReasons` only on its Working arm, so a stray entry for a Discarded row changes no
+        // rendered sentence and no test can watch this line fail — it is an invariant kept for the next
+        // reader of the map, not a live behaviour. It is one comparison, and the alternative is a
+        // dictionary that accumulates reasons for entries whose decision is final.
         if (GetStateLocked(agentId) != WorkerMergeState.Working)
         {
             return;

@@ -1052,6 +1052,244 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.True(Directory.Exists(Path.Combine(ResolveGitDir(worktree), "rebase-merge")));
     }
 
+    // ---- S5: the conflict card's two real controls -------------------------------------------------
+    //
+    // The parking above is deliberate and stays deliberate. What was missing is that the entry's own
+    // sentence ("…needs a human to resolve it") named an action the product could not perform: the jail is
+    // PAUSED, so `docker exec` answers "Container … is paused, unpause the container before exec"; Verify
+    // cannot run in a paused jail; Review is absent because the entry is not Verified — which is exactly
+    // what a conflict makes it — and the one remaining control threw the work away.
+    //
+    // Neither of these is T-04. T-04 is the staging/diff surface where a HUMAN resolves hunks. These are
+    // the two operations composable from machinery that already ships.
+
+    /// <summary>
+    /// The fourth place the conflict now exists: as MEASURED FACTS, not only as a sentence. A human told to
+    /// resolve a conflict and told neither where it is parked nor which files conflict has been given a
+    /// notification, not a task.
+    /// </summary>
+    [Fact]
+    public async Task AConflictingRebase_RecordsTheParkedWorktreeAndTheFilesThatConflict()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "shared.cs", "public class Shared { int First; }\n");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
+
+        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        var parked = provisioner.ParkedConflicts.Find(repoHash, SecondAgent);
+        Assert.NotNull(parked);
+        Assert.Equal(new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent), parked!.WorktreePath);
+        // The file both agents edited — measured from git while the rebase is in progress, which is the
+        // only window in which `--diff-filter=U` answers at all.
+        Assert.Equal(new[] { "shared.cs" }, parked.ConflictedPaths);
+        // ...and it is not measured for an agent whose rebase went through: a parking record for a healthy
+        // branch would light the conflict controls on a row with no conflict.
+        Assert.Null(provisioner.ParkedConflicts.Find(repoHash, FirstAgent));
+    }
+
+    /// <summary>
+    /// <b>"Let the agent resolve."</b> The worker wrote half of the conflict and is the only party with
+    /// context on that half; what it could not do is notice, because the daemon froze it mid-rebase with
+    /// no message. So the unpause and the instruction are ONE operation — and the instruction has to name
+    /// the branch and the conflicting files, since an agent inside a jail cannot see why it was stopped.
+    /// </summary>
+    [Fact]
+    public async Task LettingTheAgentResolve_UnpausesTheJail_AndTellsItExactlyWhatIsWrong()
+    {
+        var prompts = new RecordingPrompts();
+        var (provisioner, ctx, engine, repoHash) = await ParkedConflictAsync(prompts);
+        engine.FreezeLog.Clear();
+
+        var result = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+
+        Assert.True(result.Done, result.Reason);
+        // (1) The jail is awake. Without this the instruction below lands in a frozen pty and is read by
+        // nobody — the "prompt accumulated unsubmitted in its input box" shape, one layer lower.
+        Assert.Contains("unpause:" + ContainerId, engine.FreezeLog);
+
+        // (2) The worker is told what happened, in terms it can act on from inside the jail.
+        var sent = Assert.Single(prompts.Sent);
+        Assert.Equal(SecondAgent, sent.Agent);
+        Assert.Contains("shared.cs", sent.Prompt);
+        Assert.Contains("git rebase --continue", sent.Prompt);
+        Assert.Contains("paused", sent.Prompt);
+
+        // (3) The branch is untouched: this decides nothing about the conflict, it hands it back.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        Assert.True(Directory.Exists(Path.Combine(ResolveGitDir(worktree), "rebase-merge")));
+
+        // (4) The entry stops claiming the agent is paused, because it no longer is. A card left saying
+        // "the agent is paused with the rebase in progress" after this would send the next reader looking
+        // for a frozen jail that is running.
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Equal(MergeQueueProvisioner.ConflictHandedBackReason, reason);
+        Assert.Null(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+        Assert.Contains(_audit.Read(), e =>
+            e.Type == MergeQueueProvisioner.ConflictHandedBackEvent && e.Fields["agent"] == SecondAgent);
+    }
+
+    /// <summary>
+    /// The hand-back's honest partial: the jail woke and the instruction did not land. The entry must say
+    /// SO, rather than keep wearing "the agent is paused with the rebase in progress" — which is now false
+    /// in the one direction that matters, since the next reader would go looking for a frozen jail.
+    /// </summary>
+    [Fact]
+    public async Task LettingTheAgentResolve_WhenTheInstructionIsNotSubmitted_SaysTheJailIsAwakeAnyway()
+    {
+        var prompts = new RecordingPrompts { Submitted = false };
+        var (provisioner, ctx, _, repoHash) = await ParkedConflictAsync(prompts);
+
+        var result = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+
+        Assert.False(result.Done);
+        Assert.Contains("unpaused", result.Reason);
+        Assert.Contains("could not be delivered", result.Reason);
+
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Equal(result.Reason, reason);
+        // The conflict is still parked — nothing about it was resolved, so the controls stay on the row.
+        Assert.NotNull(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+    }
+
+    /// <summary>
+    /// A daemon with no prompt path REFUSES rather than doing half of the operation. Unpausing an agent
+    /// without telling it why is how an agent resumes whatever it was doing on top of a half-finished
+    /// rebase — strictly worse than the paused state it started in, and invisible.
+    /// </summary>
+    [Fact]
+    public async Task LettingTheAgentResolve_WithNoPromptPathWired_RefusesWithoutWakingTheAgent()
+    {
+        var (provisioner, _, engine, repoHash) = await ParkedConflictAsync(prompts: null);
+        engine.FreezeLog.Clear();
+
+        var result = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+
+        Assert.False(result.Done);
+        Assert.Contains("no way to send the agent an instruction", result.Reason);
+        Assert.DoesNotContain("unpause:" + ContainerId, engine.FreezeLog);
+        Assert.NotNull(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+    }
+
+    /// <summary>
+    /// <b>"Abort rebase."</b> The deterministic option: the branch goes back exactly where it was, no
+    /// committed work is lost, and the entry returns to the queue needing verification against the new
+    /// main. It is the answer for a conflict nobody wants to spend an agent's context on.
+    ///
+    /// <para>The mutation goes through the P2-09 yield rather than around it — the pause/unpause pair in
+    /// the freeze log is that invariant, asserted rather than described.</para>
+    /// </summary>
+    [Fact]
+    public async Task AbortingTheParkedRebase_RestoresTheBranch_ResumesTheJail_AndRequeuesTheEntry()
+    {
+        var (provisioner, ctx, engine, repoHash, preRebaseTip) = await ParkedConflictWithTipAsync();
+        engine.FreezeLog.Clear();
+
+        var result = await provisioner.AbortParkedRebaseAsync(repoHash, SecondAgent);
+
+        Assert.True(result.Done, result.Reason);
+
+        // (1) git agrees the rebase is over and the branch is back — HEAD is the agent branch again, at
+        // the commit it stood on before the cascade touched it. No commits were lost.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        Assert.False(Directory.Exists(Path.Combine(ResolveGitDir(worktree), "rebase-merge")));
+        using (var repo = new Repository(worktree))
+        {
+            Assert.False(repo.Info.IsHeadDetached);
+            Assert.Equal("agent/" + SecondAgent, repo.Head.FriendlyName);
+            Assert.Equal(preRebaseTip, repo.Head.Tip.Sha);
+        }
+
+        // (2) The whole freeze sequence, in order, because the ORDER is the invariant. The jail is handed
+        // back to normal first (a yield over an already-paused container would `docker pause` a paused
+        // jail and be refused by the engine); a REAL P2-09 yield then takes it, which is what gates the
+        // mutation (invariant 2 — the token is the only API that may); and the token's own resume leaves
+        // the jail RUNNING, because the reason to keep it frozen went with the rebase. Asserting only that
+        // the two words appear would pass with the resume deleted — the first unpause alone satisfies it.
+        Assert.Equal(
+            new[] { "unpause:" + ContainerId, "pause:" + ContainerId, "unpause:" + ContainerId },
+            engine.FreezeLog);
+
+        // (3) The entry says what is now true: back in the queue, still behind main, needs verifying.
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Equal(MergeQueueProvisioner.ConflictAbortedReason, reason);
+        Assert.Null(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+        Assert.Contains(_audit.Read(), e =>
+            e.Type == MergeQueueProvisioner.ConflictRebaseAbortedEvent && e.Fields["agent"] == SecondAgent);
+    }
+
+    /// <summary>
+    /// The parking is a MEASUREMENT in memory and the worktree is on disk with an agent that has a shell
+    /// in it. If the rebase ends by some other hand, both controls must refuse and forget the record —
+    /// acting on a stale parking would run <c>rebase --abort</c> over whatever the worktree has become.
+    /// </summary>
+    [Fact]
+    public async Task BothConflictActions_RefuseAndForgetTheParking_OnceTheRebaseIsNoLongerInProgress()
+    {
+        var prompts = new RecordingPrompts();
+        var (provisioner, _, _, repoHash) = await ParkedConflictAsync(prompts);
+
+        // Somebody else ended it — the worker itself, a human in the terminal, anything.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        Directory.Delete(Path.Combine(ResolveGitDir(worktree), "rebase-merge"), recursive: true);
+
+        var handBack = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+        Assert.False(handBack.Done);
+        Assert.Contains("no longer in progress", handBack.Reason);
+        Assert.Empty(prompts.Sent);
+        Assert.Null(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+
+        // ...and with the record forgotten, the second control refuses on the honest first reason rather
+        // than acting on a parking that no longer describes anything.
+        var abort = await provisioner.AbortParkedRebaseAsync(repoHash, SecondAgent);
+        Assert.False(abort.Done);
+        Assert.Contains("no rebase parked", abort.Reason);
+    }
+
+    /// <summary>Drives two co-tenants into the real parked-conflict state and hands back the pieces.</summary>
+    private async Task<(MergeQueueProvisioner Provisioner, MergeQueueContext Ctx, FakeSandboxEngine Engine, string RepoHash)>
+        ParkedConflictAsync(RecordingPrompts? prompts)
+    {
+        var (provisioner, ctx, engine, repoHash, _) = await ParkedConflictWithTipAsync(prompts);
+        return (provisioner, ctx, engine, repoHash);
+    }
+
+    /// <summary>The same, plus the agent branch's tip BEFORE the cascade touched it — what an abort has to
+    /// restore.</summary>
+    private async Task<(MergeQueueProvisioner Provisioner, MergeQueueContext Ctx, FakeSandboxEngine Engine, string RepoHash, string PreRebaseTip)>
+        ParkedConflictWithTipAsync(RecordingPrompts? prompts = null)
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "shared.cs", "public class Shared { int First; }\n");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
+
+        var provisioner = NewRebasingProvisioner(
+            out var engine, jailFor: _ => ContainerId, prompts: prompts);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, SecondAgent);
+        string preRebaseTip;
+        using (var repo = new Repository(worktree))
+        {
+            preRebaseTip = repo.Head.Tip.Sha;
+        }
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        // The precondition every test below stands on: this really is the parked state.
+        Assert.NotNull(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+        return (provisioner, ctx, engine, repoHash, preRebaseTip);
+    }
+
     /// <summary>A linked worktree's <c>.git</c> is a file pointing at the real gitdir.</summary>
     private static string ResolveGitDir(string worktreePath)
     {
@@ -1365,10 +1603,16 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// <param name="jailFor">agentId → its live jail, or null when the agent has been stopped.</param>
     /// <param name="publishRebased">Overrides the daemon's rebased-branch publish. Only the belt test
     /// passes one — a publisher that answers TRUE and writes no ref.</param>
+    /// <param name="prompts">
+    /// Records every instruction the "let the agent resolve" path delivers, and decides whether it was
+    /// SUBMITTED. Null wires no prompt path at all, which is the shape that must make the hand-back refuse
+    /// rather than wake an agent with no idea why.
+    /// </param>
     private MergeQueueProvisioner NewRebasingProvisioner(
         out FakeSandboxEngine engine, Func<string, string?> jailFor,
         RecordingSupervisor? supervisor = null, int exitCode = 0,
-        Func<string, string, bool>? publishRebased = null)
+        Func<string, string, bool>? publishRebased = null,
+        RecordingPrompts? prompts = null)
     {
         var sandbox = new FakeSandboxEngine(exitCode);
         engine = sandbox;
@@ -1398,7 +1642,29 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             locateAgentWorktree: (repoHash, agentId) => new WorktreeManager(vmRoot).WorktreePathFor(repoHash, agentId),
             publishRebasedAgentRef: publishRebased ?? ((repoHash, agentId) =>
                 new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId)),
-            agentStates: supervisor);
+            agentStates: supervisor,
+            promptAgent: prompts is null
+                ? null
+                : (repoHash, agentId, prompt, _) => Task.FromResult(prompts.Deliver(repoHash, agentId, prompt)));
+    }
+
+    /// <summary>
+    /// The daemon's prompt-delivery seam, recorded. <see cref="Submitted"/> is settable because "the write
+    /// happened" and "the CLI accepted it" are different facts and the hand-back has to behave differently
+    /// on each — an undelivered instruction leaves a jail awake with nothing told to it, which is a
+    /// materially worse state than a refusal.
+    /// </summary>
+    private sealed class RecordingPrompts
+    {
+        public List<(string Repo, string Agent, string Prompt)> Sent { get; } = new();
+
+        public bool Submitted { get; set; } = true;
+
+        public bool Deliver(string repoHash, string agentId, string prompt)
+        {
+            Sent.Add((repoHash, agentId, prompt));
+            return Submitted;
+        }
     }
 
     /// <summary>Lands the agent's work on the agent branch, exactly as <see cref="CommitOnAgentBranch"/>
