@@ -7,6 +7,7 @@ using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Services;
 using Mainguard.Git;
 using Mainguard.Git.Models;
+using Mainguard.Git.Exceptions;
 using Mainguard.Git.Services;
 using Xunit;
 
@@ -311,6 +312,190 @@ public class MergeIdentityTests : IDisposable
         Assert.Empty(outcome.Merged);
         var reason = Assert.Single(outcome.Interrupted).Reason;
         Assert.DoesNotContain("no ref moved", reason, StringComparison.Ordinal);
+    }
+
+    // ---- K2: the merge consumes the ref it fetched, not a namesake ------------------------------
+
+    /// <summary>
+    /// A repo whose sync remote holds the branch the queue verified, and whose LOCAL <c>agent/x</c> is a
+    /// stale copy from an old checkout. The fetch at step (2) is fatal-if-failed for the stated reason
+    /// that a local copy is "an unknown-age copy, and merging it would land work the queue never
+    /// verified" — and the preference order then merged exactly that copy.
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_PrefersTheRefItJustFetched_OverAStaleLocalAgentBranch()
+    {
+        var world = BuildDivergedWorld();
+
+        var result = world.Service.MergeAgentBranch(new ForegroundMergeRequest(
+            world.RepoPath, "repohash", "x", world.MainSha, "main"));
+
+        Assert.True(result.Merged);
+        // Main is at the MIRROR's tip — the commit the queue verified — not the stale local one.
+        Assert.Equal(world.MirrorTip, Rev(world.RepoPath, "main"));
+        Assert.NotEqual(world.StaleLocalTip, Rev(world.RepoPath, "main"));
+    }
+
+    /// <summary>
+    /// With the verified sha recorded on the lease, the source is that sha or nothing. Here the mirror has
+    /// moved on since the verification and the stale local copy is not it either: neither ref is the
+    /// commit a human was shown a green rail about, so no ref moves.
+    /// </summary>
+    [Fact]
+    public void ForegroundMerge_RefusesWhenNeitherRefIsTheCommitTheQueueVerified()
+    {
+        var world = BuildDivergedWorld();
+
+        var result = world.Service.MergeAgentBranch(new ForegroundMergeRequest(
+            world.RepoPath, "repohash", "x", world.MainSha, "main",
+            ExpectedBranchSha: "0123456789012345678901234567890123456789"));
+
+        Assert.False(result.Merged);
+        Assert.True(result.CasLost); // the branch moved out from under the evidence → re-verify
+        Assert.Contains("not the commit the queue verified", result.Reason ?? "", StringComparison.Ordinal);
+        Assert.Equal(world.MainSha, Rev(world.RepoPath, "main")); // nothing landed
+    }
+
+    /// <summary>The control: naming the verified sha merges exactly that commit.</summary>
+    [Fact]
+    public void ForegroundMerge_WithTheVerifiedSha_MergesExactlyThatCommit()
+    {
+        var world = BuildDivergedWorld();
+
+        var result = world.Service.MergeAgentBranch(new ForegroundMergeRequest(
+            world.RepoPath, "repohash", "x", world.MainSha, "main",
+            ExpectedBranchSha: world.MirrorTip));
+
+        Assert.True(result.Merged);
+        Assert.Equal(world.MirrorTip, Rev(world.RepoPath, "main"));
+    }
+
+    private sealed record DivergedWorld(
+        string RepoPath, string MainSha, string MirrorTip, string StaleLocalTip,
+        ForegroundMergeService Service);
+
+    /// <summary>
+    /// The shape the K2 defect needs and nothing else: the user's checkout holds a LOCAL
+    /// <c>agent/x</c> at an old commit, and the sync remote's mirror holds <c>agent/x</c> one commit
+    /// further on. Both fast-forward main, so <c>--ff-only</c> is happy with either — which is exactly why
+    /// it cannot be the thing that decides.
+    /// </summary>
+    private DivergedWorld BuildDivergedWorld()
+    {
+        var repo = NewDir("mainguard-mergeid-fg-");
+        Git(repo, "-c", "init.defaultBranch=main", "init");
+        Git(repo, "config", "user.name", "T");
+        Git(repo, "config", "user.email", "t@mainguard.local");
+        Git(repo, "config", "commit.gpgsign", "false");
+        Commit(repo, "README.md", "seed\n", "seed");
+        var mainSha = Rev(repo, "main");
+
+        Git(repo, "checkout", "-b", "agent/x");
+        Commit(repo, "a.txt", "first\n", "agent commit 1");
+        var staleLocalTip = Rev(repo, "agent/x");
+        Commit(repo, "b.txt", "second\n", "agent commit 2");
+        var mirrorTip = Rev(repo, "agent/x");
+
+        // The mirror gets the NEWER tip; the checkout's local branch is rewound to the older one.
+        var bare = NewDir("mainguard-mergeid-bare-");
+        Git(bare, "init", "--bare");
+        Git(repo, "remote", "add", "mainguard-vm", bare);
+        Git(repo, "push", "mainguard-vm", "agent/x");
+        Git(repo, "checkout", "main");
+        Git(repo, "branch", "-f", "agent/x", staleLocalTip);
+        Assert.Equal(staleLocalTip, Rev(repo, "refs/heads/agent/x"));
+
+        var dbPath = Path.Combine(NewDir("mainguard-mergeid-fgdb-"), "journal.db");
+        Func<AppDbContext> factory = () => new AppDbContext(dbPath);
+        using (var db = factory()) { db.Database.EnsureCreated(); }
+        var service = new ForegroundMergeService(
+            resolveSyncRemote: _ => new Mainguard.Agents.Agents.SyncRemote("mainguard-vm", bare),
+            journal: new OperationJournal(factory),
+            leases: new InMemoryMergeLeaseStore());
+
+        return new DivergedWorld(repo, mainSha, mirrorTip, staleLocalTip, service);
+    }
+
+    // ---- K6: the guard re-reads the state it decided from ---------------------------------------
+
+    private sealed class ActiveToken : IYieldToken
+    {
+        public string AgentId => "a1";
+        public bool IsActive => true;
+        public YieldOutcome Outcome => YieldOutcome.ByReady;
+        public void Resume() { }
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// The guard's verdict is a SNAPSHOT, and <c>RunGuarded</c> then waits out an <c>index.lock</c>
+    /// backoff before acting. The three preconditions the verdict was made of — mid-rebase, detached HEAD,
+    /// an in-progress merge — are exactly the states a worktree enters while a lock is held, and they were
+    /// never looked at again. The action must not run against a worktree the guard no longer allows.
+    /// </summary>
+    [Fact]
+    public void RunGuarded_RefusesWhenTheStateItDecidedFrom_ChangedDuringTheLockBackoff()
+    {
+        var probes = 0;
+        var actionRuns = 0;
+
+        // Held for two probes, then clear — the ordinary transient-lock shape.
+        bool IsLockHeld() => ++probes <= 2;
+
+        var ex = Assert.Throws<GitMutationStateChangedException>(() => GitMutationGuard.RunGuarded(
+            new ActiveToken(),
+            IsLockHeld,
+            action: () => { actionRuns++; return 0; },
+            sleep: _ => { },
+            // The agent started its own rebase while we backed off.
+            recheck: () => GitMutationGuard.CanMutate(
+                new GitDirState(RebaseInProgress: true, DetachedHead: false, MergeInProgress: false))));
+
+        Assert.Equal(0, actionRuns);
+        Assert.Contains("no longer the worktree the guard allowed", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("mid-rebase", ex.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The control, and the thing that makes the test above measure the re-check rather than a guard that
+    /// refuses everything: an unchanged worktree still runs the action, once.
+    /// </summary>
+    [Fact]
+    public void RunGuarded_StillRunsTheAction_WhenTheStateIsUnchanged()
+    {
+        var actionRuns = 0;
+        var rechecks = 0;
+
+        var result = GitMutationGuard.RunGuarded(
+            new ActiveToken(),
+            isLockHeld: () => false,
+            action: () => { actionRuns++; return 7; },
+            sleep: _ => { },
+            recheck: () => { rechecks++; return MutationVerdict.Allowed; });
+
+        Assert.Equal(7, result);
+        Assert.Equal(1, actionRuns);
+        Assert.Equal(1, rechecks); // read once, at the moment of action
+    }
+
+    /// <summary>
+    /// A lock that never clears must not reach the re-check at all: nothing was attempted, so there is no
+    /// "state it decided from" question to answer, and the failure must stay the lock failure a caller
+    /// already knows how to read.
+    /// </summary>
+    [Fact]
+    public void RunGuarded_APersistentLock_StillThrowsTheLockException_NotTheStateOne()
+    {
+        var rechecks = 0;
+
+        Assert.Throws<GitMutationLockException>(() => GitMutationGuard.RunGuarded(
+            new ActiveToken(),
+            isLockHeld: () => true,
+            action: () => 0,
+            sleep: _ => { },
+            recheck: () => { rechecks++; return MutationVerdict.Allowed; }));
+
+        Assert.Equal(0, rechecks);
     }
 
     public void Dispose()

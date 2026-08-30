@@ -182,6 +182,13 @@ message BeginMergeResponse {
   // sha, so it comes from the daemon that granted the lease — never from the client's own cached
   // projection of the queue, which may already be a revision behind.
   string expected_main_sha = 4;
+  // K3 — the BRANCH-side half of the identity this lease authorizes: the agent/<id> tip the queue's
+  // verification was measured ON (VerificationRecord.BranchSha). expected_main_sha alone says which main
+  // may be fast-forwarded and nothing about which commits get fast-forwarded onto it, so the merge could
+  // consume a ref the queue never verified and still satisfy the lease. Empty means the daemon has no
+  // measured branch sha for this entry (a seeded row, or a record from before the field existed); it is
+  // read as "not measured" and never as a mismatch.
+  string expected_branch_sha = 5;
 }
 
 message AbandonMergeRequest {

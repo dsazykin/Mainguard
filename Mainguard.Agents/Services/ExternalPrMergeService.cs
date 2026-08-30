@@ -273,9 +273,18 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
                 Refuse("verification is stale — main moved; re-verifying", CasLost: true), null, null);
         }
 
-        // The verified PR head. The intake materializes pull/<n>/head into the mirror as agent/pr-<n> and
-        // re-queues the entry whenever that moves, so the mirror's tip IS the commit the queue verified —
-        // which makes it the honest thing to compare the upstream head against.
+        // The verified PR head — K4, and the whole reason this method exists in this shape.
+        //
+        // It used to be RE-DERIVED here, at merge time, by reading whatever refs/heads/agent/pr-<n> this
+        // checkout currently held. PrHeadFetcher hard-RESETS that ref to the PR's newest head BEFORE the
+        // intake calls NotifyNewCommits, so between a force-push and the next intake poll the ref names the
+        // NEW head — and the head compare below then compared the new head against the new head and passed.
+        // "The verified head" was, by construction, whatever was current: the external-origin twin of H6,
+        // and the fix for H6 does not reach it precisely because the reset happens first.
+        //
+        // So it is now READ, from the identity the daemon recorded when it granted the lease — the
+        // agent/pr-<n> tip the queue's verification was measured ON. That is the one sha that cannot be
+        // re-derived into agreement with itself.
         var (fetchCode, _, fetchErr) = UncRemoteTrust.RunGitTrustingRemote(
             request.RepoPath, syncRemote.Name, "fetch", syncRemote.Name);
         if (fetchCode != 0)
@@ -288,15 +297,32 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
         }
 
         var branch = $"agent/{request.AgentId}";
-        var verifiedHead = ResolveVerifiedHead(request.RepoPath, branch, syncRemote.Name);
-        if (verifiedHead is null)
+
+        // The one place in this file that REFUSES on an unknown rather than falling back. Everywhere else a
+        // missing measurement means "decline to answer"; here declining to answer means merging code from
+        // outside this installation on the strength of a compare that cannot fail. An unanswerable question
+        // gating an irreversible act on third-party code is a "no".
+        if (string.IsNullOrEmpty(request.ExpectedBranchSha))
         {
             return new Preflight(
-                Refuse($"'{branch}' isn't in this repository yet — the pull request head hasn't synced down"),
+                Refuse(
+                    "the queue has no recorded verified head for this pull request, so there is nothing "
+                    + "to compare its current head against — re-verify the entry, then merge"),
                 null, null);
         }
 
-        return new Preflight(null, hostRemote, verifiedHead);
+        // The verified head still has to BE here, or there is nothing for the reconcile to land. Which
+        // spelling holds it does not matter; that it is the recorded sha does.
+        if (!IsPresent(request.RepoPath, branch, syncRemote.Name, request.ExpectedBranchSha))
+        {
+            return new Preflight(
+                Refuse(
+                    $"'{branch}' in this repository is not the pull request head the queue verified "
+                    + $"({Short(request.ExpectedBranchSha)}) — re-verifying", CasLost: true),
+                null, null);
+        }
+
+        return new Preflight(null, hostRemote, request.ExpectedBranchSha);
     }
 
     // ---- (2) upstream state classification ---------------------------------------------------------
@@ -563,17 +589,24 @@ public sealed class ExternalPrMergeService : IExternalPrMergeExecutor
 
     /// <summary>The verified PR head as this checkout can see it: the local mirror branch, else the sync
     /// remote's tracking form of the same ref. Null when neither exists.</summary>
-    private static string? ResolveVerifiedHead(string repoPath, string branch, string syncRemoteName)
+    /// <summary>
+    /// Whether the recorded verified head is actually in this checkout, under either spelling of
+    /// <c>agent/pr-&lt;n&gt;</c>. This asks "is the commit the queue verified HERE" — it deliberately does
+    /// not compute a verified head, which is the K4 defect.
+    /// </summary>
+    private static bool IsPresent(string repoPath, string branch, string syncRemoteName, string expectedHead)
     {
         var local = RevParse(repoPath, "--verify", "--quiet", $"refs/heads/{branch}");
-        if (local.Length > 0)
+        if (string.Equals(local, expectedHead, StringComparison.OrdinalIgnoreCase))
         {
-            return local;
+            return true;
         }
 
         var tracking = RevParse(repoPath, "--verify", "--quiet", $"refs/remotes/{syncRemoteName}/{branch}");
-        return tracking.Length > 0 ? tracking : null;
+        return string.Equals(tracking, expectedHead, StringComparison.OrdinalIgnoreCase);
     }
+
+    private static string Short(string sha) => sha.Length > 8 ? sha[..8] : sha;
 
     private static ForegroundMergeResult Refuse(string reason, bool CasLost = false) =>
         new(false, null, CasLost, reason);

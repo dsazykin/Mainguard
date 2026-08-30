@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -186,26 +187,50 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
 
             _setState(agentId, AgentRunState.Rebasing);
 
+            // K6 — the verdict above is a SNAPSHOT, and both mutations below wait out an index.lock
+            // backoff before they run. Handing the guard a re-read of the same three preconditions is what
+            // makes the decision hold at the moment of action rather than at the moment of decision; the
+            // refusal comes back typed and this cycle skips, exactly as the start-of-cycle refusal does.
+            Func<MutationVerdict> recheck =
+                () => GitMutationGuard.CanMutate(GitMutationGuard.Inspect(loc.WorktreePath));
+
             var wip = false;
-            if (IsDirty(loc.WorktreePath))
+            int rebaseExit;
+            string headBefore;
+            try
             {
-                GitMutationGuard.RunGuarded(
+                if (IsDirty(loc.WorktreePath))
+                {
+                    GitMutationGuard.RunGuarded(
+                        token,
+                        () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
+                        () =>
+                        {
+                            AgentGitCommand.Run(loc.WorktreePath, "add", "-A");
+                            AgentGitCommand.Run(loc.WorktreePath, Args("commit", "-m", "wip: sync"));
+                            return 0;
+                        },
+                        recheck: recheck);
+                    wip = true;
+                }
+
+                headBefore = HeadSha(loc.WorktreePath);
+                rebaseExit = GitMutationGuard.RunGuarded(
                     token,
                     () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
-                    () =>
-                    {
-                        AgentGitCommand.Run(loc.WorktreePath, "add", "-A");
-                        AgentGitCommand.Run(loc.WorktreePath, Args("commit", "-m", "wip: sync"));
-                        return 0;
-                    });
-                wip = true;
+                    () => AgentGitCommand.TryRun(loc.WorktreePath, out _, Args("rebase", loc.MainBranch)),
+                    recheck: recheck);
             }
-
-            var headBefore = HeadSha(loc.WorktreePath);
-            var rebaseExit = GitMutationGuard.RunGuarded(
-                token,
-                () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
-                () => AgentGitCommand.TryRun(loc.WorktreePath, out _, Args("rebase", loc.MainBranch)));
+            catch (GitMutationStateChangedException ex)
+            {
+                // The agent started its own rebase (or detached, or opened a merge) while we waited for
+                // its index.lock. Nothing was mutated. Same terminus as the start-of-cycle guard skip:
+                // resume the agent and let the next cycle retry, with the measured reason rather than a
+                // restatement of it. WipCommitCreated is reported honestly — the wip commit may already
+                // have landed before the rebase leg refused.
+                _setState(agentId, AgentRunState.Working);
+                return new RebaseCycleResult(RebaseCycleKind.Skipped, ex.Message, wip);
+            }
 
             if (rebaseExit != 0)
             {

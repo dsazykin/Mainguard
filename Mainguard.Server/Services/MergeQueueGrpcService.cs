@@ -261,7 +261,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         var ctx = Resolve(request.RepoHandle);
         var leaseId = Guid.NewGuid().ToString("N");
         var verified = ctx.Queue.CurrentMainSha;
-        var lease = ctx.Leases.TryBegin(request.RepoHandle, leaseId, request.AgentId, verified, "main");
+        // K3 — the identity this lease authorizes, both halves of it. The branch sha is the daemon's OWN
+        // record of the tip the verification ran on, read here rather than anywhere downstream: every
+        // component that could re-derive it is a component that could re-derive it into agreement with
+        // whatever the branch happens to be now (K4).
+        var verifiedBranch = ctx.Queue.LastVerification(request.AgentId)?.BranchSha ?? string.Empty;
+        var lease = ctx.Leases.TryBegin(
+            request.RepoHandle, leaseId, request.AgentId, verified, "main", verifiedBranch);
         if (lease is null)
         {
             _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=False (lease held)",
@@ -297,6 +303,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             Granted = true,
             LeaseId = lease.LeaseId,
             ExpectedMainSha = lease.ExpectedMainSha,
+            ExpectedBranchSha = lease.ExpectedBranchSha,
         });
     }
 
@@ -373,6 +380,64 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 "No outstanding merge lease for this repository and agent — call BeginMerge first."));
         }
 
+        // (1.5) K3 — the reported post-merge sha, which nothing here used to look at.
+        //
+        // `NewMainSha` is a CLAIM, made by the caller, about a ref on the caller's own machine. The daemon
+        // wrote it into the idempotency record, set the queue's authoritative main to it, and fired the
+        // cascade at every co-tenant in the repo on the strength of that claim. A wrong value is not a
+        // cosmetic error: every co-tenant is then rebased onto, and re-verified against, a main that may
+        // not exist, and `CanMerge` compares its evidence against a phantom forever.
+        //
+        // What can honestly be checked here is checked here; what cannot, is not invented.
+        if (!IsWellFormedSha(request.NewMainSha))
+        {
+            const string malformed =
+                "The post-merge sha this confirm reports is not a commit id; nothing was recorded.";
+            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: malformed post-merge sha",
+                request.RepoHandle, request.AgentId);
+            ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
+            AuditConfirmRefused(request, actor, "identity", lease.ExpectedMainSha, malformed);
+            throw new RpcException(new Status(StatusCode.InvalidArgument, malformed));
+        }
+
+        if (string.Equals(request.NewMainSha, lease.ExpectedMainSha, StringComparison.Ordinal))
+        {
+            const string didNotMove =
+                "This confirm reports the same main the merge was authorized against — nothing moved, so "
+                + "nothing was recorded as merged.";
+            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: post-merge sha == expected main",
+                request.RepoHandle, request.AgentId);
+            ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
+            AuditConfirmRefused(request, actor, "identity", lease.ExpectedMainSha, didNotMove);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, didNotMove));
+        }
+
+        // The strong one, and it is exact rather than probabilistic: a LOCAL entry merges by
+        // `git merge --ff-only agent/<id>`, and a fast-forward sets main TO the source's tip. So the sha
+        // main moved to must BE the agent/<id> tip the queue verified. The daemon knows that sha — it put
+        // it on the lease at grant time — so the client's claim is checkable against the daemon's own
+        // record without reading the client's repository at all.
+        //
+        // Only for Local, and stated as a limit rather than stretched: the P2-12 external leg lands the
+        // HOST's merge commit, which is not the PR head and could not be, so the same equality would be
+        // false for every honest external merge. That path has its own head compare-and-swap (K4) and the
+        // host's own `sha` merge parameter. An empty ExpectedBranchSha is an unknown, not a mismatch.
+        if (ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
+            && !string.IsNullOrEmpty(lease.ExpectedBranchSha)
+            && !string.Equals(request.NewMainSha, lease.ExpectedBranchSha, StringComparison.OrdinalIgnoreCase))
+        {
+            var mismatch =
+                "This confirm reports a post-merge main that is not the branch this merge was authorized "
+                + "for. A fast-forward merge leaves main AT the merged branch's tip, and the queue verified "
+                + $"agent/{request.AgentId} at {Short(lease.ExpectedBranchSha)}. Nothing was recorded.";
+            _log.LogWarning(
+                "ConfirmMerge refused repo={Repo} agent={Agent}: reported main={Reported} != verified branch={Branch}",
+                request.RepoHandle, request.AgentId, request.NewMainSha, lease.ExpectedBranchSha);
+            ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
+            AuditConfirmRefused(request, actor, "identity", lease.ExpectedMainSha, mismatch);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, mismatch));
+        }
+
         // (2)+(3) Gate and freshness, atomically with the Merged transition.
         if (!ctx.Queue.TryConfirmHumanMerge(
                 request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason,
@@ -427,6 +492,32 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// rather than replacing a precise refusal reason with an audit-store error.</para>
     /// </summary>
     internal const string ConfirmRefusedEvent = "merge_confirm_refused";
+
+    /// <summary>
+    /// Whether a string is shaped like a git object id at all: 7–64 lowercase-or-uppercase hex characters.
+    /// Deliberately a SHAPE check and nothing more — the daemon cannot resolve a sha in a repository it does
+    /// not hold, and a shape check that pretended to be an existence check would be the same fabrication as
+    /// the claim it is screening.
+    /// </summary>
+    private static bool IsWellFormedSha(string? sha)
+    {
+        if (string.IsNullOrEmpty(sha) || sha!.Length is < 7 or > 64)
+        {
+            return false;
+        }
+
+        foreach (var c in sha)
+        {
+            if (!Uri.IsHexDigit(c))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static string Short(string sha) => sha.Length > 8 ? sha[..8] : sha;
 
     private void AuditConfirmRefused(
         ConfirmMergeRequest request, string actor, string stage, string expectedMainSha, string reason)

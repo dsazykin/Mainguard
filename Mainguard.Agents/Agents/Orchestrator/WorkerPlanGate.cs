@@ -447,6 +447,18 @@ public sealed class WorkerPlanGate : IMergeGate
     /// <see cref="IMergeGate.MergeEvidence"/>). It says whether the merged work was governed by an
     /// approved plan at all: a manual-mode agent and a coordinator worker whose plan a human approved are
     /// the same <c>Allows == true</c>, and only one of them has a plan behind it.
+    ///
+    /// <para><b>K5, the half of it that is about merge identity.</b> "plan approved" named no plan, so the
+    /// merge record said a decision had been made and gave no way to find WHICH decision — and a worker
+    /// can present, revise and re-present plans, so "some plan was approved for this worker" is not a
+    /// reference to anything. The plan id is now carried, which is the only thing that makes the line
+    /// answerable later; the plan's own title comes with it because an id is not readable and the
+    /// investigating human is reading, not querying.</para>
+    ///
+    /// <para>What this deliberately does NOT do is tie the plan to the code: an approved <c>TaskPlan</c>
+    /// still carries no repo sha, no branch sha and no diff hash, so this line still cannot say the merged
+    /// bytes are inside the approved scope. That is real and it is left alone here on purpose — a
+    /// concurrent change owns re-scoping — and it is recorded in §23 with the design it needs.</para>
     /// </summary>
     public string? MergeEvidence(string agentId)
     {
@@ -458,9 +470,18 @@ public sealed class WorkerPlanGate : IMergeGate
             }
         }
 
-        return MayWork(agentId, out var reason)
-            ? "plan gate: plan approved"
-            : $"plan gate: NOT satisfied — {reason}";
+        if (!MayWork(agentId, out var reason))
+        {
+            return $"plan gate: NOT satisfied — {reason}";
+        }
+
+        var plan = _plans.LatestForWorker(agentId);
+        return plan is null
+            // MayWork said yes and the plan cannot be named. Said as its own sentence rather than
+            // collapsed into the ordinary one: an audit line that claims an approval it cannot identify is
+            // the fabrication this whole lane exists to remove.
+            ? "plan gate: plan approved (the approved plan could not be identified)"
+            : $"plan gate: plan approved — {plan.PlanId} '{plan.Plan.Title}'";
     }
 
     // ---- backpressure -----------------------------------------------------

@@ -1691,14 +1691,18 @@ public sealed class DaemonBackedOrchestrator :
             throw new InvalidOperationException($"Can't merge — {begun.Reason}.");
         }
 
-        // The CAS old-OID comes from the grant, not from our own queue projection: the projection is a
-        // stream snapshot and may be a revision behind the main the daemon just authorized against.
+        // BOTH halves of the identity come from the grant, not from our own queue projection: the
+        // projection is a stream snapshot and may be a revision behind the main — and the branch tip — the
+        // daemon just authorized against. K3: the branch sha is what makes `agent/<id>` in this checkout an
+        // identity rather than a name, and it is what ConfirmMerge compares the reported post-merge main
+        // against.
         var lease = new Mainguard.Git.Models.MergeLeaseRow
         {
             RepoHash = repoHandle!,
             LeaseId = begun.LeaseId,
             AgentId = agentId,
             ExpectedMainSha = begun.ExpectedMainSha ?? string.Empty,
+            ExpectedBranchSha = begun.ExpectedBranchSha ?? string.Empty,
             MainBranch = MainBranchName,
         };
 
@@ -1707,7 +1711,8 @@ public sealed class DaemonBackedOrchestrator :
             RepoHash: repoHandle!,
             AgentId: agentId,
             ExpectedMainSha: lease.ExpectedMainSha,
-            MainBranch: MainBranchName);
+            MainBranch: MainBranchName,
+            ExpectedBranchSha: lease.ExpectedBranchSha);
 
         Mainguard.Agents.Services.ForegroundMergeResult result;
         try

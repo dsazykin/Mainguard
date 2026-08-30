@@ -3194,3 +3194,268 @@ been reading different pairs of them as "the failure".
   agent's in-flight work across a reparent, and `.gitignore` is the answer a repository already has for
   files that must not be swept — which is exactly what the fixture was missing.
 - **The two tier flakes are not chased.** §12.5 owns the resume one and says why it is still open.
+
+---
+
+## 23. Merge identity — the six stale-evidence defects §19.5 catalogued, taken as one problem
+
+§19.5 listed six. They are not six bugs; they are one, six times. Every one of them is a **decision
+recorded against a sha, acted on after that sha moved** — J1's own sentence, and the reason that fix
+(`BranchTipInvalidator` + `VerificationRecord.BranchSha`) closed exactly one instance of it and could not
+reach the rest. §22 then found a seventh independently, which is what a class of defect looks like when
+you keep patching instances of it.
+
+### 23.1 What merge identity is
+
+The merge is the one irreversible act in the product: it moves the user's `main`. Everything upstream of
+it — verification, the flagged-change gates, the review cockpit, the plan gate — exists to produce **one
+decision**: *this branch may land on that main*. So the decision is not a boolean. It is a claim about a
+**triple**:
+
+| | what it is | where it is recorded today |
+|---|---|---|
+| **branch** | the `agent/<id>` tip the evidence was measured ON | `VerificationRecord.BranchSha` (J1), and now `MergeLeaseRow.ExpectedBranchSha` |
+| **main** | the `main@sha` the evidence was measured AGAINST, and which the merge may fast-forward | `VerificationRecord.MainSha`, `MergeLeaseRow.ExpectedMainSha` |
+| **result** | the sha main becomes | `MergeLeaseRow.PostMergeSha`, `queue_entry_merged`'s `post_main_sha` |
+
+Three rules follow, and every change in this section is one of them applied somewhere:
+
+1. **Evidence must record what it is evidence FOR.** A record that pins one leg of the triple can only
+   ever ask about that leg. §19's H6 is the general form: a `VerificationRecord` that pinned `main@sha`
+   and nothing else was *structurally unable* to notice the branch had moved. K3 and K4 are the same
+   sentence about the lease.
+2. **The check happens at the moment of ACTION, not the moment of decision.** A verdict computed from a
+   snapshot and acted on later is a verdict about a world that may no longer exist. K6 is the purest
+   instance — the guard re-checked the lock, which was never part of its verdict, and not the three
+   things that were.
+3. **Where a check can ask git instead of trusting a component's self-report, ask git.** §22's
+   `BranchDescendsFromMain` is the precedent, and K1 is where it mattered most.
+
+And the disposition when the triple cannot be established: **refuse.** `AgentBranchReapVerdict.Undecidable`
+(J1) is the precedent — an unanswerable question gating a destructive act is a "no". That is deliberately
+NOT the same rule as "an unknown never manufactures a refusal", which this codebase also follows and which
+§19.6's `CanMerge` compare states: **an unknown declines to answer; an unknown does not license an act.**
+The two look contradictory and are not. `CanMerge` refusing on ignorance would strand every pre-existing
+row forever and merges nothing; `MergeReconcileTask` proceeding on ignorance walks a row to a terminal
+state and moves a ref. The asymmetry is whether the ignorance sits in front of an action or in front of a
+refusal.
+
+### 23.2 K1 — `MergeReconcileTask` could mark an unrelated entry Merged on a coincidence
+
+The worst of the set, and it is worth stating exactly how little it required. The old predicate:
+
+```csharp
+var advanced   = currentMain != lease.ExpectedMainSha;
+var hasMergeEntry = _journal.GetHistory(repoPath)
+    .Any(e => e.Kind == JournalKinds.Merge);   // ANY entry. Any age. Any branch. Any repo state.
+if (advanced && hasMergeEntry) { Confirm(...); onMerged(...); }
+```
+
+Two facts about a **repository**, neither of them about **this lease**. `advanced` is satisfied by a
+`git pull`, a co-tenant's merge, a hotfix commit, a rebase — anything that moves main. `hasMergeEntry` is
+satisfied by a merge somebody performed last month. Together they synthesized a `ConfirmMerge`: the lease
+went `Confirmed` (so nothing could ever revisit it), the queue row went terminal `Merged`, and
+`NotifyMainMoved` fired the whole stale cascade at every co-tenant — for a merge of that agent that never
+happened. This is the only defect in the set that can **fabricate a terminal state**, which is why it was
+done first.
+
+**Verified before changing anything.** `ART_D1_Reconcile_DoesNotMarkALeaseMerged_WhenItWasADifferentBranchThatMerged`
+builds the shape and asserts on the old predicate's own inputs: two branches `agent/x` and `agent/y`, both
+one commit ahead of the same seed, a lease taken for `x`, and then `y` merged. Both conditions hold. The
+old code confirms `x`.
+
+**The fix is the identity, asked of git.** `Classify` returns one of three verdicts:
+
+| verdict | when |
+|---|---|
+| `NeverCommitted` | main is still the sha the lease was authorized against. Unambiguous, and the one arm that was always right. |
+| `Merged` | main moved **forward from** `ExpectedMainSha` **and** now **contains** `agent/<id>` — `merge-base --is-ancestor`, twice. That pair is what `merge --ff-only agent/<id>` *means*, and it is false for every unrelated reason main might have moved. |
+| `Undecidable` | anything else — main unreadable, main not a descendant of the authorized sha, or the branch gone and the journal unable to identify the merge. |
+
+Three smaller decisions inside that are load-bearing:
+
+- **An unreadable main is not an unchanged main.** The old code read "no sha" as `advanced == false` and
+  told the human "no ref moved" as a fact. It now says it could not tell.
+- **The forward-descent check is separate from the containment check**, and it comes first. A rewound or
+  sideways main cannot be a fast-forward's effect whatever else is true, and saying so as its own arm is
+  what makes the failure legible rather than lumped in with "the branch isn't in main".
+- **The journal is corroboration, never an independent sufficient condition.** It is consulted only when
+  the branch ref is *gone* (deleted after the merge, or never local in this checkout) and git therefore has
+  nothing left to be asked. Even then it is used in identity-bound form only: kind `Merge`, at or after
+  `lease.BeginUtc`, a description naming this branch, and — read through the new
+  `OperationJournal.TryReadRef` — the entry's own pre/post snapshots showing `refs/heads/<main>` moving
+  **from** the lease's expected sha **to** the sha main holds now. Both snapshot reads must SUCCEED; a
+  snapshot that does not name main is an entry that cannot say what the merge did, and treating a missing
+  answer as a match is how "any `Merge` entry anywhere" got written in the first place. The description
+  match is a **self-report**, which is exactly the kind of evidence §22 says to prefer git over — so it is
+  the fallback, under three independent constraints, and never the check.
+
+**`Undecidable` still hands the lease back.** Holding it would strand every future merge on the repo until
+the next restart, which is the RT-D1 strand this task exists to sweep. What is withheld is the only
+irreversible half: nothing is marked `Merged`, no cascade fires, and the human is told the ambiguity
+("main has since moved for some other reason — nothing shows this merge landed, so it was NOT recorded")
+rather than one horn of it restated as fact.
+
+### 23.3 K2 — the merge consumed a stale local ref over the one it had just fetched
+
+`PerformJournaledMerge` step (2) fetches the sync remote and treats a failure as fatal, in its own words:
+*"whatever `agent/<id>` happens to be in this repo is then an unknown-age copy, and merging it would land
+work the queue never verified."* Step (4) then called `ResolveMergeSource`, which **preferred the local
+`refs/heads/agent/<id>`** and fell back to the tracking ref only when there was no local branch at all. So
+on any checkout that had ever brought the branch local, the fetch's result was discarded and the merge
+consumed precisely the unknown-age copy step (2) exists to prevent. `--ff-only` does not help: it
+guarantees main-ancestry and guarantees nothing about the source being the verified ref.
+
+Now two rules, in order:
+
+1. **Identity, when it is known.** The lease carries the verified `agent/<id>` tip (§23.4). Whichever
+   spelling resolves to exactly that sha is the source. If **neither** does, the merge refuses — reported
+   with `CasLost: true`, because the branch really has moved out from under the evidence and re-verifying
+   is the right answer. A namesake is not the branch.
+2. **Freshness, when identity is unknown.** With no measured sha the honest tiebreak is recency, and the
+   just-fetched remote-tracking ref is the only one whose age this method can vouch for. Local is used
+   only when there is no tracking ref at all — the exact inversion of the old preference.
+
+### 23.4 K3 — the lease was a mutex over a repository, and `ConfirmMerge` believed the client
+
+Two halves, and the second is the one that could move a ref.
+
+**The lease.** `MergeLeaseRow` carried `ExpectedMainSha` and no branch sha, so it recorded *which main a
+merge was authorized against* and could not record *which commits were authorized to land on it*. The
+branch could move between the grant and the merge; the merge could consume a different ref of the same
+name (K2); the merge could be of a completely different tip; and every one of those still satisfied the
+lease. `MergeLeaseRow.ExpectedBranchSha` (migration `AddMergeLeaseExpectedBranchSha`, default `""`) is the
+missing half, populated at `BeginMerge` from the daemon's **own** record —
+`Queue.LastVerification(agentId)?.BranchSha` — and returned to the client on `BeginMergeResponse` beside
+`expected_main_sha`, for exactly the reason that field is already returned there: a client's own
+projection is a stream snapshot and is allowed to be a revision behind.
+
+**Is it a CAS now? — the argument, because "make the lease a CAS" is the wrong shape.**
+`DbMergeLeaseStore.TryBegin` is a uniqueness check: one unconfirmed lease per repo, first caller wins,
+losers are told "another merge is already in progress for this repository". That is **mutual exclusion**,
+and it is correct — it is what freezes conflicting queue actions for the duration, and the merge is
+human-driven and irreversible, so the one thing a losing caller must never get is a silent retry that
+merges later against a world nobody looked at. Turning `TryBegin` into a compare-and-swap **loop** would
+convert an honest refusal into exactly that.
+
+What a CAS actually gives you is narrower and is the part that was missing: *the write happens only if the
+world is still the one you decided from*. That is now true, and it is enforced at three points rather than
+inside the take:
+
+| where | compare | on failure |
+|---|---|---|
+| `PerformJournaledMerge` (4) | the merge source must BE `ExpectedBranchSha` | refuses, `CasLost: true`, no ref touched |
+| `ConfirmMerge` RPC | the reported `NewMainSha` must be the identity's result (below) | `FailedPrecondition`, lease released, `merge_confirm_refused` audited |
+| `TryConfirmHumanMerge` under the queue lock | `ExpectedMainSha == _currentMainSha`, plus `CanMergeLocked`'s record-vs-main and record-vs-branch compares | refuses, nothing transitions |
+
+**What a losing caller now sees.** Unchanged for the contended case: a second `BeginMerge` while a lease is
+outstanding is still refused with the same sentence, and nothing spins or blocks. What is new is that a
+caller whose *identity* moved under it gets a specific refusal instead of a successful merge of the wrong
+thing — at the merge leg, "`agent/<id>` in this repository is not the commit the queue verified (`<sha>`);
+re-verifying", and at the confirm, a `FailedPrecondition` naming the mismatch. Both are `CasLost`-shaped:
+the queue re-verifies and the entry becomes mergeable again on its own. **No call that used to succeed on a
+matching identity now fails** — the compares are all equalities against a sha the daemon itself recorded,
+and an empty `ExpectedBranchSha` (a seeded row, a lease from before the column existed) is read everywhere
+as "not measured" and never as a mismatch.
+
+**`ConfirmMerge`'s `NewMainSha`.** It was client-supplied and validated against nothing. The daemon wrote it
+into the idempotency record, set the queue's authoritative main to it, and fired the cascade at every
+co-tenant on the strength of a claim about a ref on the caller's machine. A wrong value is not cosmetic:
+every co-tenant is then reparented onto, and re-verified against, a main that may not exist, and `CanMerge`
+compares its evidence against a phantom forever. Three checks, before anything transitions:
+
+- **Shape.** 7–64 hex characters, or refuse. Deliberately a shape check and nothing more — the daemon
+  cannot resolve a sha in a repository it does not hold, and a shape check pretending to be an existence
+  check would be the same fabrication as the claim it screens.
+- **Non-triviality.** `NewMainSha != lease.ExpectedMainSha`. A confirm reporting the main it was authorized
+  against is a merge that moved nothing.
+- **Identity, and it is exact.** A **local** entry merges by `git merge --ff-only agent/<id>`, and a
+  fast-forward sets main **to the source's tip**. So the sha main moved to must BE the `agent/<id>` tip the
+  queue verified — a sha the daemon put on the lease itself, so the client's claim is checkable against the
+  daemon's own record without reading the client's repository at all.
+
+That last one is stated as a limit rather than stretched: it applies to `MergeEntryOrigin.Local` only. The
+P2-12 external leg lands the **host's merge commit**, which is not the PR head and could not be, so the
+same equality would be false for every honest external merge. That path has its own head CAS (K4) and the
+host's own `sha` merge parameter. A refusal at any of the three releases the lease and writes
+`merge_confirm_refused` with `stage = "identity"` — §21.2's asymmetry applies unchanged: by the time this
+RPC is reached the git operation has already run, so a refusal means the daemon and the user's repository
+may now disagree about what main is, and that divergence is what someone investigates later.
+
+### 23.5 K4 — the external merge re-derived the head it was supposed to be checking
+
+`ExternalPrMergeService.PrepareCheckout` computed its "verified head" by reading whatever
+`refs/heads/agent/pr-<n>` this checkout currently held, and `ClassifyUpstreamState` then compared the PR's
+upstream head against it. But `PrHeadFetcher` **hard-resets** `agent/pr-<n>` to the PR's newest head
+*before* the intake calls `NotifyNewCommits`. So between a force-push and the next intake poll, both sides
+of the compare are the new head, the CAS passes, and unverified third-party code merges. The comment
+above it asserted the opposite — *"the mirror's tip IS the commit the queue verified"* — which stopped
+being true the moment the reset was ordered that way. This is the external-origin twin of H6, and §19's
+fix cannot reach it precisely because the reset happens first.
+
+The verified head is now **read**, not derived: `request.ExpectedBranchSha`, from the lease. The local ref
+is used only to establish that the recorded head is *present* in this checkout under either spelling —
+"is the commit the queue verified here", never "what shall we call the verified commit".
+
+**This is the one place in the lane that refuses on an unknown.** Everywhere else an unmeasured sha means
+"decline to answer"; here declining to answer means merging code from outside this installation on the
+strength of a compare that cannot fail. So an empty `ExpectedBranchSha` refuses: *"the queue has no
+recorded verified head for this pull request… re-verify the entry, then merge."* The live path populates
+it — external entries are ordinary queue entries verified by the provisioner, which resolves `agent/<id>`
+from the mirror after the pre-verification publish — so the refusal is reachable only by a genuinely
+unverified entry, which is the one it is for.
+
+### 23.6 K6 — the guard re-checked the one precondition that was never part of its verdict
+
+`GitMutationGuard.CanMutate` decides from a `GitDirState` snapshot: mid-rebase, detached HEAD,
+`MERGE_HEAD`. `RunGuarded` then waits out up to five `index.lock` backoff attempts — ~1.5 s by default —
+and re-checked **only the lock**, which was never one of the three. The three that *were* went unlooked-at,
+and they are exactly the states a worktree enters while a lock is held: the usual reason the backoff is
+running at all is that git is busy establishing one of them. So the keep-alive cycle could run
+`git add -A; git commit` and `git rebase main` against a worktree whose agent had started its own rebase
+during the wait.
+
+`RunGuarded` gains `recheck`, evaluated once the lock is clear and immediately before the action, and
+`KeepAliveRebaser` hands it a re-read of the same `Inspect`+`CanMutate` pair the cycle opened with — the
+same predicate, not a second opinion about it. A refusing verdict raises
+`GitMutationStateChangedException` (distinct from `GitMutationLockException`: that one means the lock never
+cleared and nothing was attempted; this one means the lock cleared and the worktree had moved on), the
+cycle returns `Skipped` with the measured reason, and the next tick retries — the "skip and retry" arm the
+cooperative-yield contract has always had. `WipCommitCreated` is reported honestly, because the wip commit
+may already have landed before the rebase leg refused.
+
+The parameter is nullable only so a caller with no worktree to inspect (the pure-backoff tests) can still
+exercise the lock loop; a re-check that cannot be performed must not fabricate a refusal.
+
+### 23.7 K5 — deliberately NOT fixed here, and why, with the design it needs
+
+**The defect is real.** `WorkerPlanGate.Allows` answers "was some plan approved for this worker", never
+"does the current tip still match its scope". An approved `TaskPlan` is keyed to a plan id with **no tie to
+code**: no repo sha, no branch sha, no diff hash. The scope is only ever re-evaluated when
+`ArmFlaggedChangeReview` runs, so it inherits §19's cadence exactly — which is what makes it *correct
+today* and structurally unable to stay correct.
+
+**What was changed here is only the identity half**, because a re-scope operation is being added
+concurrently on another branch and the scope machinery is its subject. `MergeEvidence` said `plan gate:
+plan approved` — naming no plan. A worker can present, revise and re-present, so "some plan was approved"
+is not a reference to anything, and §21's whole argument for `gates` is that a record has to say what was
+*established*. It now names the plan id and title, with a separate sentence for the case where `MayWork`
+says yes and no plan can be identified — an audit line that claims an approval it cannot identify is the
+fabrication this lane exists to remove. **No scope evaluation, no `IMergeGate.Allows` behaviour, and no
+plan-approval state was touched.**
+
+**The recommended design for the rest**, for whoever lands it: an approved plan should record the
+`(branchSha, mainSha)` it was approved against, exactly as `VerificationRecord` now does — the approval is
+evidence and must record what it is evidence FOR (§23.1 rule 1). `Allows` then has a question it can
+actually ask: *is the current tip's diff-against-main still within the scope this plan was approved for?*
+With `BranchTipInvalidator` already walking a moved branch out of `Verified`, the re-scope trigger is
+free: the same sweep that voids a verification is the sweep that should void a scope verdict. Until then
+the honest statement is that the plan gate is a gate on **provenance** (was this worker cleared to work)
+and not on **content**, and §23's merge record now says which clearance.
+
+### 23.8 The mutation log
+
+Every guard removed in turn, the tier rebuilt, the failure recorded. `touch` on restore — an `mv`/`cp`
+preserves mtime, MSBuild skips the rebuild, and the next run tests the *mutated* binary. §22.5's lesson is
+mechanized here: the runner **refuses to report** unless a built assembly's mtime actually moved.
+

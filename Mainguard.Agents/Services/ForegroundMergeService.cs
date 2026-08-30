@@ -185,7 +185,9 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
     public MergeLeaseRow? BeginMerge(ForegroundMergeRequest request)
     {
         var leaseId = Guid.NewGuid().ToString("N");
-        return Leases.TryBegin(request.RepoHash, leaseId, request.AgentId, request.ExpectedMainSha, request.MainBranch);
+        return Leases.TryBegin(
+            request.RepoHash, leaseId, request.AgentId, request.ExpectedMainSha, request.MainBranch,
+            request.ExpectedBranchSha);
     }
 
     /// <summary>
@@ -255,14 +257,16 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         // in THIS repo that commit is reachable either as a local branch or — with the sync remote's default
         // refspec — only as refs/remotes/<sync>/agent/<id>. `git merge agent/<id>` does NOT fall back to the
         // remote-tracking form, so naming it unconditionally fails with "not something we can merge" on a
-        // repo that has never checked the branch out. Same commit either way; only the spelling differs.
+        // repo that has never checked the branch out.
         var branch = $"agent/{request.AgentId}";
-        var mergeSource = ResolveMergeSource(request.RepoPath, branch, syncRemote.Name);
-        if (mergeSource is null)
+        var source = ResolveMergeSource(
+            request.RepoPath, branch, syncRemote.Name, request.ExpectedBranchSha);
+        if (source.Refusal is { } sourceRefusal)
         {
-            return new ForegroundMergeResult(false, null, CasLost: false,
-                $"'{branch}' isn't in this repository yet — the agent hasn't pushed it to '{syncRemote.Name}'");
+            return new ForegroundMergeResult(false, null, CasLost: source.CasLost, sourceRefusal);
         }
+
+        var mergeSource = source.Ref!;
 
         // (5) Freshness pre-check (fast path). The ff-only merge below is the atomic CAS regardless.
         var mainSha = RevParse(request.RepoPath, "--verify", request.MainBranch);
@@ -376,20 +380,74 @@ public sealed class ForegroundMergeService : IForegroundMergeService, IJournaled
         };
     }
 
+    /// <summary>Which ref the merge will consume, or why it refuses to pick one.</summary>
+    private readonly record struct MergeSource(string? Ref, string? Refusal, bool CasLost);
+
     /// <summary>
-    /// The ref this merge consumes: the local <c>refs/heads/agent/&lt;id&gt;</c> when the user's repo has
-    /// one, else the sync remote's tracking form of the same mirror branch. Null when neither exists.
+    /// The ref this merge consumes — <b>K2</b>.
+    ///
+    /// <para><b>What was wrong.</b> This preferred the local <c>refs/heads/agent/&lt;id&gt;</c> whenever the
+    /// user's checkout had one, over the remote-tracking ref the fetch at step (2) had <i>just</i> updated.
+    /// Step (2)'s own comment says why that fetch is fatal-if-failed — "whatever <c>agent/&lt;id&gt;</c>
+    /// happens to be in this repo is then an unknown-age copy, and merging it would land work the queue
+    /// never verified" — and then the preference order threw the fetched ref away and merged exactly that
+    /// unknown-age copy, on any checkout that had ever brought the branch local. <c>--ff-only</c> does not
+    /// save it: it guarantees main-ancestry and says nothing about the source being the verified ref.</para>
+    ///
+    /// <para><b>Two rules, in order.</b></para>
+    /// <list type="number">
+    ///   <item><b>Identity, when it is known.</b> The lease carries the <c>agent/&lt;id&gt;</c> tip the
+    ///   queue's verification was measured on. If either spelling resolves to exactly that sha, that is the
+    ///   ref, whatever else this repository holds under the same name. If NEITHER does, the merge refuses:
+    ///   the commit a human was shown a green rail about is not present here, and merging a namesake is the
+    ///   defect. Reported with <c>CasLost</c> so the queue re-verifies rather than despairing — the branch
+    ///   really has moved out from under the evidence.</item>
+    ///   <item><b>Freshness, when identity is unknown.</b> With no measured sha (a seeded row, a record
+    ///   from before the field existed) the honest tiebreak is recency, and the freshly fetched
+    ///   remote-tracking ref is the only one whose age this method can vouch for. Local is used only when
+    ///   there is no tracking ref at all.</item>
+    /// </list>
     /// </summary>
-    private static string? ResolveMergeSource(string repoPath, string branch, string syncRemoteName)
+    private static MergeSource ResolveMergeSource(
+        string repoPath, string branch, string syncRemoteName, string expectedBranchSha)
     {
-        if (RevParse(repoPath, "--verify", "--quiet", $"refs/heads/{branch}").Length > 0)
+        var localSha = RevParse(repoPath, "--verify", "--quiet", $"refs/heads/{branch}");
+        var tracking = $"{syncRemoteName}/{branch}";
+        var trackingSha = RevParse(repoPath, "--verify", "--quiet", $"refs/remotes/{tracking}");
+
+        if (localSha.Length == 0 && trackingSha.Length == 0)
         {
-            return branch;
+            return new MergeSource(null,
+                $"'{branch}' isn't in this repository yet — the agent hasn't pushed it to '{syncRemoteName}'",
+                CasLost: false);
         }
 
-        var tracking = $"{syncRemoteName}/{branch}";
-        return RevParse(repoPath, "--verify", "--quiet", $"refs/remotes/{tracking}").Length > 0 ? tracking : null;
+        if (!string.IsNullOrEmpty(expectedBranchSha))
+        {
+            // The just-fetched ref is asked first, so the ordinary case costs nothing extra and the answer
+            // is the same ref the queue read in the mirror.
+            if (string.Equals(trackingSha, expectedBranchSha, StringComparison.Ordinal))
+            {
+                return new MergeSource(tracking, null, CasLost: false);
+            }
+
+            if (string.Equals(localSha, expectedBranchSha, StringComparison.Ordinal))
+            {
+                return new MergeSource(branch, null, CasLost: false);
+            }
+
+            return new MergeSource(null,
+                $"verification is stale — '{branch}' in this repository is not the commit the queue "
+                + $"verified ({Short(expectedBranchSha)}); re-verifying",
+                CasLost: true);
+        }
+
+        return trackingSha.Length > 0
+            ? new MergeSource(tracking, null, CasLost: false)
+            : new MergeSource(branch, null, CasLost: false);
     }
+
+    private static string Short(string sha) => sha.Length > 8 ? sha[..8] : sha;
 
     private static string FirstLine(string? text)
     {
