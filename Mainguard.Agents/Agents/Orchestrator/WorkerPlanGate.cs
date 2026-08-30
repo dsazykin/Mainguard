@@ -6,6 +6,36 @@ using Mainguard.Git.Audit;
 namespace Mainguard.Agents.Agents.Orchestrator;
 
 /// <summary>
+/// Whether the worker this gate is holding must have a human-approved plan before it may work.
+///
+/// <para>Set once, at <see cref="WorkerPlanGate.Hold"/>, from the operator's
+/// <see cref="PlanModeSwitch"/>. It is a property of the WORKER, not of the daemon's current setting, so
+/// flipping the switch never retroactively authorises a worker already blocked at the gate nor strands a
+/// worker that was already told to start.</para>
+/// </summary>
+public enum WorkerPlanMode
+{
+    /// <summary>
+    /// The phase-2 model (contract §2): the task is withheld, the worker authors a plan against its
+    /// brief, presents it and blocks, and a human decides. The default, and what every caller that does
+    /// not say otherwise gets.
+    /// </summary>
+    Gated,
+
+    /// <summary>
+    /// Plan mode was OFF when this worker was spawned. It is a coordinator-delegated worker in every
+    /// other respect — it is held, it counts against the cap, it is steerable, it auto-verifies, it gets
+    /// a queue row — but it receives its task at spawn and no plan is required or accepted.
+    ///
+    /// <para><b>This is not "the gate is skipped".</b> It is a different, recorded authorisation: the
+    /// operator authorised this class of work once, in advance, instead of per worker. The distinction is
+    /// carried all the way to the merge record (<see cref="WorkerPlanGate.MergeEvidence"/>), because a
+    /// merge whose authorisation was a standing preference must not read like one a human signed.</para>
+    /// </summary>
+    Ungated,
+}
+
+/// <summary>
 /// The <b>daemon-side</b> enforcement of the phase-2 plan gate (coordinator contract §2 + §5).
 ///
 /// <para><b>Why this exists separately from <see cref="PlanApprovalService"/>.</b> That service owns the
@@ -27,6 +57,17 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// worker never had a plan approved cannot merge, no matter what it verified. That is the backstop — even
 /// if a worker did work it was not cleared for, that work cannot reach <c>main</c>.</item>
 /// </list>
+///
+/// <para><b>The plan-mode toggle (2026-08-30).</b> Whether a delegated worker is actually withheld from
+/// is now the operator's <see cref="PlanModeSwitch"/>, read ONCE per spawn into the worker's own
+/// <see cref="WorkerPlanMode"/>. Off does not remove this gate from any path: the worker is still held
+/// here, still counted, still asked about by the merge queue and the readiness trigger, and its mode is
+/// still on its merge record. What changes is the one thing the switch names — the task is not withheld,
+/// so <see cref="MayWork"/> answers yes from the start and every predicate that delegates to it follows.
+/// Implementing "off" as "don't call <see cref="Hold"/>" was the tempting alternative and is the one the
+/// codebase already calls out as strictly worse (<c>AgentSpawnService.SpawnWorkerAsync</c>): an unheld
+/// worker is invisible to <see cref="MayAutoVerify"/>, gets the manual-agent wording on its merge record,
+/// and has no recorded authorisation at all.</para>
 ///
 /// <para><b>Backpressure legibility.</b> A blocked worker counts against
 /// <see cref="CoordinatorLimits.MaxActiveWorkers"/> (it still holds a jail, tmpfs, network segment and
@@ -65,8 +106,14 @@ public sealed class WorkerPlanGate : IMergeGate
     }
 
     /// <summary>A task prompt withheld from a worker until its plan is approved.</summary>
+    /// <param name="Mode">
+    /// Whether this worker's task is actually withheld. <see cref="WorkerPlanMode.Ungated"/> means plan
+    /// mode was off when it was spawned, so the same record is kept — the worker is still delegated,
+    /// still counted, still merge-gate-visible — and only the withholding is not applied.
+    /// </param>
     private sealed record HeldTask(
-        string RepoHash, string CoordinatorId, string Title, string TaskPrompt, decimal BudgetUsd, bool Released);
+        string RepoHash, string CoordinatorId, string Title, string TaskPrompt, decimal BudgetUsd, bool Released,
+        WorkerPlanMode Mode);
 
     /// <summary>
     /// Resolves a bare agent id to its held-task key, <b>unique-or-nothing</b>.
@@ -186,9 +233,15 @@ public sealed class WorkerPlanGate : IMergeGate
     /// or the worker id is blank. Thrown rather than stored, because a held task with no real brief is
     /// the defect, not a degraded case of it.
     /// </exception>
+    /// <param name="mode">
+    /// Whether this worker's task is actually withheld — the operator's <see cref="PlanModeSwitch"/>,
+    /// read ONCE here and then owned by this worker. It defaults to <see cref="WorkerPlanMode.Gated"/>
+    /// so that a caller which has not been taught about the switch keeps the gate, rather than a caller
+    /// which forgot to pass it silently producing an unauthorised worker.
+    /// </param>
     public void Hold(
         string workerAgentId, string coordinatorId, string title, string taskPrompt, decimal budgetUsd,
-        string repoHash = "")
+        string repoHash = "", WorkerPlanMode mode = WorkerPlanMode.Gated)
     {
         if (string.IsNullOrWhiteSpace(workerAgentId))
         {
@@ -212,16 +265,42 @@ public sealed class WorkerPlanGate : IMergeGate
             }
 
             _held[key] = new HeldTask(
-                repoHash ?? string.Empty, coordinatorId ?? "", title ?? "", taskPrompt ?? "", budgetUsd, Released: false);
+                repoHash ?? string.Empty, coordinatorId ?? "", title ?? "", taskPrompt ?? "", budgetUsd,
+                Released: false, Mode: mode);
         }
 
+        // One event, with the mode ON it, rather than two event names. A reader counting "how many
+        // workers were spawned under a plan requirement" must not have to know that a second name exists
+        // — the shape that hides a mode is how a missing case becomes an unnoticed one.
         _audit.Append(new AuditEvent("worker_task_withheld", new Dictionary<string, string>
         {
             ["worker_agent_id"] = workerAgentId,
             ["coordinator_id"] = coordinatorId ?? "",
             ["repo_hash"] = repoHash ?? string.Empty,
+            ["plan_mode"] = mode == WorkerPlanMode.Gated ? "on" : "off",
         }));
     }
+
+    /// <summary>
+    /// The mode this worker was held under, or <c>null</c> when this gate does not hold it (a manual-mode
+    /// agent, an external-PR head, or an id it has already forgotten).
+    /// </summary>
+    public WorkerPlanMode? ModeFor(string workerAgentId)
+    {
+        lock (_gate)
+        {
+            return FindLocked(workerAgentId)?.Mode;
+        }
+    }
+
+    /// <summary>
+    /// True when this gate holds the worker AND it was spawned with plan mode off.
+    ///
+    /// <para>Deliberately false for a worker this gate never held: "we are not withholding anything from
+    /// it" and "plan mode was off for it" are different facts, and only the second one authorises the
+    /// daemon to hand over a task it is holding.</para>
+    /// </summary>
+    public bool IsUngated(string workerAgentId) => ModeFor(workerAgentId) == WorkerPlanMode.Ungated;
 
     /// <summary>The brief a worker IS given up front: what to plan about, never what to do.</summary>
     /// <remarks>
@@ -277,7 +356,13 @@ public sealed class WorkerPlanGate : IMergeGate
     public bool TryReleaseTask(string workerAgentId, out string taskPrompt)
     {
         taskPrompt = string.Empty;
-        if (!_plans.HasApprovedPlan(workerAgentId))
+
+        // MayWork, not a second reading of HasApprovedPlan. The two used to be independent spellings of
+        // the same policy, which is how one of them goes decorative (MG-12) — and the plan-mode switch is
+        // exactly the change that would have split them: an ungated worker has no approved plan and must
+        // still be given its task. There is one authority now, and it is the one every other entry point
+        // here already delegates to.
+        if (!MayWork(workerAgentId, out _))
         {
             _audit.Append(new AuditEvent("worker_task_release_denied", new Dictionary<string, string>
             {
@@ -358,6 +443,16 @@ public sealed class WorkerPlanGate : IMergeGate
     /// </summary>
     public bool MayWork(string workerAgentId, out string reason)
     {
+        // Plan mode was off when this worker was spawned, so there is no plan to wait for and never was.
+        // Placed FIRST and answered from the worker's own recorded mode rather than from the current
+        // setting: this must stay true for the whole life of a worker that was told to start, even if the
+        // operator turns plan mode back on a second later.
+        if (IsUngated(workerAgentId))
+        {
+            reason = string.Empty;
+            return true;
+        }
+
         if (_plans.HasApprovedPlan(workerAgentId))
         {
             reason = string.Empty;
@@ -378,6 +473,24 @@ public sealed class WorkerPlanGate : IMergeGate
         };
         return false;
     }
+
+    /// <summary>
+    /// Why this worker may not present a plan — or <c>null</c> when it may. Non-null only for a worker
+    /// spawned while plan mode was off.
+    ///
+    /// <para><b>Refused rather than accepted-and-ignored.</b> An ungated worker that presents a plan is a
+    /// worker following stale instructions, and the two silent alternatives are both worse than a
+    /// refusal: accepting it queues a card in front of a human who has switched approvals off and is not
+    /// watching for one, and the worker then <c>await</c>s a decision that will never come — it would
+    /// block forever holding a jail, having already been given its task. The text is written for the
+    /// worker to read and act on in one turn.</para>
+    /// </summary>
+    public string? RefusePlanPresentation(string workerAgentId) =>
+        IsUngated(workerAgentId)
+            ? "plan mode is off for this worker, so no plan is required and none will be reviewed — "
+              + "nobody is waiting to approve one. You already have your task: ask for it again if you "
+              + "need it, then do the work and commit it."
+            : null;
 
     /// <summary>Whether the coordinator may steer this worker (denied while it is held at the gate).</summary>
     public bool MayReceivePrompt(string workerAgentId, out string reason) => MayWork(workerAgentId, out reason);
@@ -400,7 +513,9 @@ public sealed class WorkerPlanGate : IMergeGate
     /// <para>In the other direction it is exactly <see cref="MayWork"/>, and it must stay exactly that: a
     /// second opinion about what "approved" means is how one of the two copies becomes decorative (MG-12).
     /// A worker whose plan was never approved never auto-verifies, for the same reason it never received
-    /// its task.</para>
+    /// its task — and a worker spawned with plan mode OFF auto-verifies from the start, for the same
+    /// reason it did receive it. The heldness check above is what keeps that from leaking to manual-mode
+    /// agents: they are not held at all, so "plan mode is off" never becomes "everything auto-verifies".</para>
     /// </summary>
     /// <param name="reason">Render/log-verbatim explanation when this returns false.</param>
     public bool MayAutoVerify(string workerAgentId, out string reason)
@@ -450,12 +565,26 @@ public sealed class WorkerPlanGate : IMergeGate
     /// </summary>
     public string? MergeEvidence(string agentId)
     {
+        WorkerPlanMode mode;
         lock (_gate)
         {
-            if (ResolveKeyLocked(agentId) is null)
+            if (FindLocked(agentId) is not { } held)
             {
                 return "plan gate: not a plan-gated worker";
             }
+
+            mode = held.Mode;
+        }
+
+        // THREE outcomes, not two. A worker spawned while plan mode was off satisfies every predicate
+        // here and has no plan behind it, so collapsing it into "plan approved" would put a sentence on
+        // the merge record asserting a human decision that never happened — the single worst thing this
+        // record could say, and the reason the mode is carried this far at all. Nor is it "not a
+        // plan-gated worker": that is the manual-agent/external-PR wording, and a coordinator-delegated
+        // worker is neither of those.
+        if (mode == WorkerPlanMode.Ungated)
+        {
+            return "plan gate: OFF at spawn — delegated worker, no plan was authored or approved";
         }
 
         return MayWork(agentId, out var reason)

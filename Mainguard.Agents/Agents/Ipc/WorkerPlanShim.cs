@@ -29,10 +29,11 @@ public static class WorkerPlanShim
 #!/usr/bin/env python3
 """mainguard-plan: present the plan YOU authored, and wait for the human.
 
-You are a Mainguard worker. You do not start work until a human approves your plan.
+You are a Mainguard worker. Your operating instructions say whether this run needs a plan.
 
 Usage:
   mainguard-plan brief                  what you are here to plan (never the task itself)
+  mainguard-plan task                   the work you are cleared to do
   mainguard-plan present <plan.json>    present the plan you authored, then wait
   mainguard-plan revise <id> <plan.json>  re-present after a rejection, then wait
   mainguard-plan await <id>             block until the human decides
@@ -44,6 +45,11 @@ OUTSIDE the repository (/tmp/plan.json) — /workspace is the tree your commit r
 `present` and `revise` block until the decision arrives and print it. On approval the
 output includes TASK: followed by the work you are cleared to do — the daemon withholds
 it until then, so there is nothing to start on before approval.
+
+`task` prints that same work whenever the daemon is willing to give it to you: after your
+plan is approved, or immediately when the operator has plan mode off. If it refuses, the
+refusal says what you are waiting for. It is the same withheld text either way — there is
+no second copy of it and no second decision about it.
 
 `commit` is how finished work leaves this jail. The daemon commits everything in
 /workspace onto your own branch; you supply only the message. Work you have not
@@ -99,6 +105,12 @@ def main(argv):
     if len(argv) >= 2 and argv[1] == "brief":
         request = {"op": "brief"}
         timeout = 60
+    elif len(argv) >= 2 and argv[1] == "task":
+        # Bounded like `brief`, NOT like `await`: this asks a question the daemon can answer at once
+        # (it either may hand the task over or it may not). It is the block that is unbounded, and
+        # this is not the block.
+        request = {"op": "task"}
+        timeout = 60
     elif len(argv) >= 3 and argv[1] == "present":
         request = {"op": "present_plan", "planJson": read_plan(argv[2]),
                    "title": " ".join(argv[3:]) or None}
@@ -138,6 +150,13 @@ def main(argv):
     if response.get("ok"):
         if response.get("brief") is not None:
             print(response["brief"])
+            return 0
+        if response.get("status") == "Task":
+            # Same two lines `present` prints on approval, for the same reason: this is the moment the
+            # worker learns what to do, and it is the only output it is guaranteed to read before it
+            # starts. A worker that finishes and never commits leaves nothing behind.
+            print("TASK: %s" % (response.get("taskPrompt") or ""))
+            print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
             return 0
         if response.get("committed") is not None:
             # Distinguished, not collapsed: "nothing to commit" is an ok answer, and reporting it as a
