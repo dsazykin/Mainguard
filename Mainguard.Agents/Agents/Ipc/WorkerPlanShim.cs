@@ -228,6 +228,12 @@ def main(argv):
     if response.get("ok"):
         if response.get("brief") is not None:
             print(response["brief"])
+            # The live plan's id and state, printed HERE because this is the only place a worker can
+            # learn them without having kept the output of a call it may have made hours ago -- and
+            # `rescope` REQUIRES that id. The id-less rescope refusal points at this command, so if this
+            # line is missing that refusal is advice that does not work (the exact shape of defect G3).
+            if response.get("planId"):
+                print("PLAN: %s (%s)" % (response["planId"], response.get("status") or "unknown"))
             return 0
         if response.get("committed") is not None:
             # Distinguished, not collapsed: "nothing to commit" is an ok answer, and reporting it as a
