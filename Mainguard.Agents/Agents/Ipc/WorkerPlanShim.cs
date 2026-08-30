@@ -34,6 +34,15 @@ public static class WorkerPlanShim
     /// instructions against <see cref="AgentIpcRequest.WorkerOps"/> the way the coordinator's have been
     /// pinned since phase 3 §13.5: an op added without a verb, or a verb the instructions never teach, is
     /// a test failure rather than a capability the worker never learns it has.</para>
+    ///
+    /// <para><b>The generated <see cref="Script"/> dispatches from HERE, for every verb.</b> Four of them
+    /// (<c>brief</c>, <c>present</c>, <c>await</c>, <c>commit</c>) used to be hardcoded literals in both
+    /// the <c>argv[1] ==</c> comparison and the request payload's op — equal to this map by coincidence,
+    /// which is the state a drift starts from: re-spell one entry here and such a shim keeps sending the
+    /// old word to a daemon that no longer serves it, silently. No runtime assertion can catch that (the
+    /// script is composed FROM this map, so any comparison against it passes either way), so
+    /// <c>AgentIpcProtocolTests.TheWorkerShimsDispatch_IsGeneratedFromTheVerbMap_NeverWrittenOutAsALiteral</c>
+    /// reads this file's source and fails on a bare literal.</para>
     /// </summary>
     public static readonly IReadOnlyDictionary<string, string> Verbs =
         new Dictionary<string, string>(System.StringComparer.Ordinal)
@@ -178,8 +187,8 @@ def report(response):
 def main(argv):
     # `await` has no deadline by design: this is the gate, and a human may take hours.
     timeout = None
-    if len(argv) >= 2 and argv[1] == "brief":
-        request = {"op": "brief"}
+    if len(argv) >= 2 and argv[1] == "{{Verbs[AgentIpcRequest.BriefOp]}}":
+        request = {"op": "{{AgentIpcRequest.BriefOp}}"}
         timeout = 60
     elif len(argv) >= 2 and argv[1] == "{{Verbs[AgentIpcRequest.TaskOp]}}":
         # Bounded like `brief`, NOT like `await`: this asks a question the daemon can answer at once
@@ -187,8 +196,8 @@ def main(argv):
         # this is not the block.
         request = {"op": "{{AgentIpcRequest.TaskOp}}"}
         timeout = 60
-    elif len(argv) >= 3 and argv[1] == "present":
-        request = {"op": "present_plan", "planJson": read_plan(argv[2]),
+    elif len(argv) >= 3 and argv[1] == "{{Verbs[AgentIpcRequest.PresentPlanOp]}}":
+        request = {"op": "{{AgentIpcRequest.PresentPlanOp}}", "planJson": read_plan(argv[2]),
                    "title": " ".join(argv[3:]) or None}
     elif len(argv) >= 4 and argv[1] == "{{Verbs[AgentIpcRequest.RevisePlanOp]}}":
         request = {"op": "{{AgentIpcRequest.RevisePlanOp}}", "planId": argv[2],
@@ -207,9 +216,9 @@ def main(argv):
             return 2
         request = {"op": "{{AgentIpcRequest.RescopePlanOp}}", "planId": argv[2],
                    "planJson": read_plan(argv[3]), "title": " ".join(argv[4:]) or None}
-    elif len(argv) >= 3 and argv[1] == "await":
-        request = {"op": "await_decision", "planId": argv[2]}
-    elif len(argv) >= 2 and argv[1] == "commit":
+    elif len(argv) >= 3 and argv[1] == "{{Verbs[AgentIpcRequest.AwaitDecisionOp]}}":
+        request = {"op": "{{AgentIpcRequest.AwaitDecisionOp}}", "planId": argv[2]}
+    elif len(argv) >= 2 and argv[1] == "{{Verbs[AgentIpcRequest.CommitWorkOp]}}":
         # The message is ALL the worker contributes. The repo, the worktree and the branch are the
         # daemon's to compute from this endpoint's identity, so there is nothing else to send.
         #
@@ -225,7 +234,7 @@ def main(argv):
                 "already one flat line by the time this runs. Quote the whole message -- newlines\n"
                 "inside the quotes are kept.\n" % (len(argv) - 2))
             return 2
-        request = {"op": "commit_work", "message": argv[2] if len(argv) > 2 else ""}
+        request = {"op": "{{AgentIpcRequest.CommitWorkOp}}", "message": argv[2] if len(argv) > 2 else ""}
         timeout = 300
     else:
         sys.stderr.write(__doc__ or "usage: mainguard-plan present <plan.json>\n")
