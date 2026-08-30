@@ -838,6 +838,37 @@ public sealed class MockOrchestrator :
         }
     }
 
+    private bool _planModeEnabled = true;
+
+    /// <summary>
+    /// The prototype's plan-mode toggle. On by default, exactly like the daemon's: the mock is what the
+    /// design surfaces are demoed against, and demoing a gate that is off by default would teach the
+    /// wrong default.
+    /// </summary>
+    public PlanModeView GetPlanMode()
+    {
+        lock (_gate)
+        {
+            return new PlanModeView(
+                _planModeEnabled,
+                _planModeEnabled
+                    ? "Plan mode is ON — every worker authors a plan and blocks until you approve it."
+                    : "Plan mode is OFF — workers receive their task at spawn and start implementing "
+                      + "immediately. No plan is authored and nothing waits for your approval.");
+        }
+    }
+
+    public Task SetPlanModeAsync(bool enabled)
+    {
+        lock (_gate)
+        {
+            _planModeEnabled = enabled;
+        }
+
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
     private static string BuildMockSignal(int blocked, int escalated, int active)
     {
         var parts = new List<string>();

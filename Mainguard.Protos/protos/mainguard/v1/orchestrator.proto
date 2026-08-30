@@ -25,6 +25,28 @@ service PlanApprovalService {
   rpc ApprovePlan(ApprovePlanRequest) returns (ApprovePlanResponse);
   // Send a plan back to its worker with feedback. The worker revises and re-presents.
   rpc RejectPlan(RejectPlanRequest) returns (RejectPlanResponse);
+
+  // The operator's PLAN-MODE TOGGLE. On (the default) is the model above. Off means a delegated worker
+  // is given its task at spawn and no plan is authored, presented or reviewed.
+  //
+  // SetPlanMode is denied to the coordinator role by the RoleInterceptor, on exactly the boundary that
+  // denies it ApprovePlan: an agent that could turn the gate off would hold the gate it is denied at,
+  // and would hold it for every future worker rather than for one plan.
+  rpc GetPlanMode(GetPlanModeRequest) returns (PlanModeState);
+  rpc SetPlanMode(SetPlanModeRequest) returns (PlanModeState);
+}
+
+message GetPlanModeRequest {}
+
+message SetPlanModeRequest {
+  bool enabled = 1;
+}
+
+message PlanModeState {
+  bool enabled = 1;
+  // The daemon's own sentence for this state, rendered daemon-side so the surface a human reads and the
+  // gate that refuses the coordinator cannot disagree about what is on.
+  string summary = 2;
 }
 
 message StreamPlansRequest {
@@ -45,6 +67,14 @@ message PlanUpdate {
   int32 max_active_workers = 6;      // CoordinatorLimits.MaxActiveWorkers
   int32 max_plan_revisions = 7;      // CoordinatorLimits.MaxPlanRevisions
   string backpressure_signal = 8;    // the rendered fact line, or empty when there is nothing to say
+
+  // The plan-mode toggle, carried on the same stream the approval cards arrive on. A human looking at an
+  // EMPTY plan gate has two possible explanations — nothing is running, or approvals are off — and only
+  // the daemon can tell them apart. Carried rather than re-derived client-side for the §2.6 reason: a
+  // surface that disagrees with its gate is how somebody comes to believe they still have an approval
+  // step they switched off.
+  bool plan_mode_enabled = 9;
+  string plan_mode_summary = 10;
 }
 
 message PlanEntry {

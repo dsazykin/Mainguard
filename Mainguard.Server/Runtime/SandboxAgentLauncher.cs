@@ -125,7 +125,9 @@ public sealed class SandboxAgentLauncher
         IProgress<string>? progress = null,
         bool adoptExistingBranch = false,
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
-        string agentRole = "")
+        string agentRole = "",
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated)
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -255,12 +257,13 @@ public sealed class SandboxAgentLauncher
         var instructionsRole = string.Equals(agentRole, AgentRoles.Coordinator, StringComparison.Ordinal)
             ? AgentIpcEndpointRole.Coordinator
             : AgentIpcEndpointRole.Worker;
-        var instructions = InstructionsFor(instructionsRole);
+        var instructions = InstructionsFor(instructionsRole, planMode);
 
         // The launch line the jail's CLI is actually started with: the first turn, the instructions, and
         // the one pre-approved command, assembled in ONE place because their ORDER is load-bearing (see
         // BuildLaunchArgv).
-        launchCommand = BuildLaunchArgv(launchCommand, adapter, ipcDirPath, instructionsRole, instructions);
+        launchCommand = BuildLaunchArgv(
+            launchCommand, adapter, ipcDirPath, instructionsRole, instructions, planMode);
 
         // THREE cases, and the order is the point — phase 3's role lock is asked FIRST.
         //
@@ -988,8 +991,11 @@ public sealed class SandboxAgentLauncher
     /// has". Defect G2 was that shape with the argument omitted altogether: the launcher bound its catalog
     /// and the IPC server bound nothing, so one jail got two different texts.</para>
     /// </summary>
-    internal string InstructionsFor(AgentIpcEndpointRole role) =>
-        AgentOperatingInstructions.For(role, _adapters);
+    internal string InstructionsFor(
+        AgentIpcEndpointRole role,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated) =>
+        AgentOperatingInstructions.For(role, _adapters, planMode);
 
     /// <summary>
     /// Assembles the complete launch line a jailed CLI is started with — the first user turn, the role's
@@ -1014,9 +1020,11 @@ public sealed class SandboxAgentLauncher
         InstalledAdapterMarker? adapter,
         string? ipcDirPath,
         AgentIpcEndpointRole role,
-        string instructions)
+        string instructions,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated)
     {
-        launchCommand = ApplyInitialPrompt(launchCommand, adapter, ipcDirPath, role);
+        launchCommand = ApplyInitialPrompt(launchCommand, adapter, ipcDirPath, role, planMode);
 
         if (launchCommand is { Count: > 0 } && adapter?.SystemPromptArg is { Length: > 0 } promptArg)
         {
@@ -1061,7 +1069,9 @@ public sealed class SandboxAgentLauncher
         IReadOnlyList<string>? launchCommand,
         InstalledAdapterMarker? adapter,
         string? ipcDirPath,
-        AgentIpcEndpointRole role)
+        AgentIpcEndpointRole role,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated)
     {
         if (launchCommand is not { Count: > 0 }
             || string.IsNullOrEmpty(ipcDirPath)
@@ -1070,7 +1080,7 @@ public sealed class SandboxAgentLauncher
             return launchCommand;
         }
 
-        var turn = AgentKickoffPrompt.For(role, AgentIpcPaths.SandboxShimPath(role));
+        var turn = AgentKickoffPrompt.For(role, AgentIpcPaths.SandboxShimPath(role), planMode);
         return turn is null ? launchCommand : launchCommand.Append(turn).ToList();
     }
 

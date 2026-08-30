@@ -373,6 +373,15 @@
       the generic sentence ends a worker that is doing approved work. No new tokens (phase 2 §2.9).
       **Mounted by `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
       that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
+      the coordinator is saying, so it has to be hostable without the chat. **Mounted by
+      `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
+      that pane — collapsed entirely by `HasGateContent` when nothing is waiting. **The plan-mode toggle
+      (2026-08-30) lives at the top of this view**: a checkbox bound `OneWay` plus a `Command` (a two-way
+      binding would render a setting the daemon rejected or never received) over the daemon's own summary
+      sentence, in `WarningBrush` when approvals are OFF. `HasGateContent` now also includes
+      `!PlanModeEnabled`, because with approvals off nothing is ever pending and a gate that only appeared
+      for pending cards would go permanently dark — which is exactly what an IDLE orchestration looks
+      like), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47

@@ -151,6 +151,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly List<TaskPlan> _plans = new();
     private readonly List<WorkerPlanCard> _workerPlans = new();
     private OrchestrationBackpressure _backpressure = OrchestrationBackpressure.None;
+    private PlanModeView _planMode = PlanModeView.Unknown;
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly Dictionary<string, (long Tokens, long UsdMicros)> _agentSpend = new(StringComparer.Ordinal);
@@ -947,6 +948,11 @@ public sealed class DaemonBackedOrchestrator :
             _backpressure = new OrchestrationBackpressure(
                 update.BlockedWorkerCount, update.EscalatedWorkerCount, update.ActiveWorkerCount,
                 update.MaxActiveWorkers, update.MaxPlanRevisions, update.BackpressureSignal);
+
+            // Carried on the plan stream, so the state and the cards it explains arrive together. A
+            // separate poll would let the screen say "no plans waiting" and "plan mode is on" out of step
+            // with each other, which is the pair of facts a human reads as "nothing is running".
+            _planMode = new PlanModeView(update.PlanModeEnabled, update.PlanModeSummary);
         }
 
         Changed?.Invoke();
@@ -2193,6 +2199,32 @@ public sealed class DaemonBackedOrchestrator :
                 : feedback!;
             await _client.RejectPlanAsync(planId, reason, cts.Token).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>The plan-mode toggle as the last plan update reported it.</summary>
+    public PlanModeView GetPlanMode()
+    {
+        lock (_gate) return _planMode;
+    }
+
+    /// <summary>
+    /// Turns the plan gate on or off, and adopts the DAEMON's answer rather than the requested value.
+    ///
+    /// <para>Not swallowed, for the same reason <see cref="SubmitPlanDecisionAsync"/> is not: a toggle
+    /// that failed to reach the daemon would otherwise render as the state the operator asked for while
+    /// the gate kept doing the opposite — and this particular disagreement is the one where the human
+    /// believes there is an approval step and there is not.</para>
+    /// </summary>
+    public async Task SetPlanModeAsync(bool enabled)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var state = await _client.SetPlanModeAsync(enabled, cts.Token).ConfigureAwait(false);
+        lock (_gate)
+        {
+            _planMode = new PlanModeView(state.Enabled, state.Summary);
+        }
+
+        Changed?.Invoke();
     }
 
     // ---- ICliAgentHost (PR3: coordinator-as-CLI) --------------------------

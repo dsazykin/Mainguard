@@ -103,6 +103,14 @@ public static class DaemonHost
             store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanApprovalStore(ResolvePlanStorePath(tokenPath)),
             audit: sp.GetRequiredService<IAuditLog>(),
             limits: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>()));
+        // The operator's plan-mode toggle. Registered BEFORE the gate that reads it, and persisted beside
+        // the plan store for the same reason that one is a file: the daemon must be able to answer "is
+        // the gate on?" before anything that needs a database is up. It fails CLOSED — an unreadable
+        // file, or none at all, is plan mode ON, because the default of a human-approval gate is that it
+        // is there.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch(
+            store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanModeStore(ResolvePlanModePath(tokenPath)),
+            audit: sp.GetRequiredService<IAuditLog>()));
         // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
         // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
         // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
@@ -465,6 +473,24 @@ public static class DaemonHost
         }
 
         return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "agent-ipc");
+    }
+
+    /// <summary>
+    /// Where the operator's plan-mode setting lands — beside the (test-isolated) session token, exactly
+    /// like the plan store, so an in-proc test host never turns the real daemon's gate off.
+    /// </summary>
+    private static string ResolvePlanModePath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-plan-mode.json");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-plan-mode.json");
     }
 
     /// <summary>

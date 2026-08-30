@@ -309,6 +309,35 @@ public sealed record AgentIpcRequest(
     public const string CommitWorkOp = "commit_work";
 
     /// <summary>
+    /// <c>task</c> — what am I here to DO? Returns the task prompt the daemon has been holding, and only
+    /// to a worker <c>WorkerPlanGate.MayWork</c> already authorises.
+    ///
+    /// <para><b>A contract §3.1 addition, made deliberately for the plan-mode toggle (2026-08-30).</b>
+    /// With plan mode off there is no plan, so <c>present</c> — until now the only path that ever
+    /// returned a task — is neither run nor accepted, and the worker would have no way to learn its task
+    /// at all. The two alternatives were both worse:</para>
+    ///
+    /// <list type="bullet">
+    /// <item><b>Redefine <see cref="BriefOp"/> to yield the task when the gate is off.</b> The brief's one
+    /// documented property is "never the task itself", asserted in the contract, in this file, in the
+    /// worker's instructions and in the shim's own help. Making it conditionally false is how a
+    /// documented invariant becomes a sentence nobody can trust — and that exact defect (a fallback that
+    /// made "the brief is never the task" false everywhere while every test stayed green) is §13.</item>
+    /// <item><b>Put the task in the launch argv.</b> <c>AgentKickoffPrompt</c> is a pure function of
+    /// (role, shim path) precisely so that it <i>cannot</i> carry the work even by mistake; adding the
+    /// task as a parameter would trade a structural guarantee for a conditional one, in the one place
+    /// where the task would then sit in a process argument list.</item>
+    /// </list>
+    ///
+    /// <para>So the task keeps exactly one exit from the daemon — the gate's <c>TryReleaseTask</c>, with
+    /// its release-once audit record — and this op is a second <i>door</i> onto that same exit rather
+    /// than a second copy of the decision. It is authorised by the same predicate as
+    /// <see cref="CommitWorkOp"/>, so with plan mode ON it is refused before approval exactly like
+    /// everything else, and afterwards answers with the task the worker already holds.</para>
+    /// </summary>
+    public const string TaskOp = "task";
+
+    /// <summary>
     /// The complete set of ops a worker endpoint will serve. Disjoint from <see cref="CoordinatorOps"/>
     /// by construction — the two sets share no member, and a test pins that, because the whole point of
     /// fixing the role on the endpoint is that neither role can reach the other's operations.
@@ -316,7 +345,7 @@ public sealed record AgentIpcRequest(
     public static readonly System.Collections.Generic.IReadOnlySet<string> WorkerOps =
         new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
         {
-            BriefOp, PresentPlanOp, RevisePlanOp, RescopePlanOp, AwaitDecisionOp, CommitWorkOp,
+            BriefOp, TaskOp, PresentPlanOp, RevisePlanOp, RescopePlanOp, AwaitDecisionOp, CommitWorkOp,
         };
 }
 

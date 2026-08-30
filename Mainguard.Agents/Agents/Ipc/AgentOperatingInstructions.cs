@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Orchestrator;
 
 namespace Mainguard.Agents.Agents.Ipc;
 
@@ -78,11 +79,71 @@ public static class AgentOperatingInstructions
     /// spawn omitted it, and the file copy of these instructions told a coordinator that nothing was
     /// installed. A catalog cannot be omitted and cannot be a stale copy — it re-reads the registry.</para>
     /// </param>
-    public static string Coordinator(InstalledAdapterCatalog adapters)
+    /// <param name="workerMode">
+    /// The mode the workers this coordinator spawns will be held under. With plan mode off, four
+    /// paragraphs of this text — the withheld task, "you do not write task plans", the refusal of
+    /// <c>prompt</c>/<c>verify</c> at the gate, and the cap-refusal advice — describe a gate the daemon
+    /// is not applying. A coordinator that believed them would report a stall that is not happening and
+    /// would treat a working <c>prompt</c> as a bug.
+    /// </param>
+    public static string Coordinator(
+        InstalledAdapterCatalog adapters, WorkerPlanMode workerMode = WorkerPlanMode.Gated)
     {
         ArgumentNullException.ThrowIfNull(adapters);
         var shimPath = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Coordinator);
         var installedKinds = adapters.InstalledKinds();
+        var gated = workerMode == WorkerPlanMode.Gated;
+
+        // The two halves of every mode-dependent paragraph, kept next to each other so a change to one
+        // is a change made while looking at the other. Interpolated below at the point each replaces.
+        var briefSection = gated
+            ? """
+        ## `--title` is the worker's brief; `--task` is the work, and it is withheld
+
+        These are two different things and the daemon keeps them apart. **`--title` is all the worker
+        gets up front** — it runs its own shim's `brief`, reads that title, and inspects the repository
+        against it. **`--task` is withheld until a human approves the plan the worker writes.** The
+        title is also the headline on that approval card, so it is what the human decides from.
+        """
+            : """
+        ## `--title` is the worker's headline; `--task` is the work
+
+        These are two different things and the daemon keeps them apart. **`--title` is a short headline**
+        — it names the worker on the merge queue and in `status`, and it is what a human reads first.
+        **`--task` is the work**, and with plan mode off the worker is given it at once.
+        """;
+
+        var planAuthorshipSection = gated
+            ? """
+        **You do not write task plans.** Each worker inspects the repository, authors its own plan,
+        presents it to the human, and blocks until it is approved. Do not describe scope, approach or
+        test strategy yourself: you cannot see the code, so anything you wrote would be a guess the
+        worker would have to undo. Give the worker a clear brief and let it plan.
+
+        Until a worker's plan is approved, `prompt` and `verify` are refused for it. **That is the gate
+        working, not an error to route around.**
+
+        ## When spawning is refused
+
+        A worker waiting on plan approval still occupies a worker slot. If `spawn` is refused for the
+        worker cap, the honest report to the operator is that plans are waiting on them to decide — do
+        not retry in a loop, and do not describe the stall as a failure. `status` tells you, per worker,
+        exactly which ones are blocked and why; say that.
+        """
+            : """
+        **Plan mode is off.** The operator turned plan approvals off, so a worker receives its task at
+        spawn and starts implementing immediately. There is no plan, no approval card, and no worker
+        waiting on a human — `prompt` and `verify` work from the moment a worker exists.
+
+        **You still do not write task plans.** You cannot see the code, so anything you wrote would be a
+        guess the worker would have to undo. Write a clear `--task` and let the worker decide how.
+
+        ## When spawning is refused
+
+        If `spawn` is refused for the worker cap, the workers holding those slots are genuinely working.
+        Do not retry in a loop: report that the cap is full and wait for one to finish. `status` tells
+        you what each of them is doing; say that.
+        """;
 
         return $"""
         # You are the Mainguard Coordinator
@@ -105,12 +166,7 @@ public static class AgentOperatingInstructions
 
         Run `{shimPath}` with no arguments for the full usage text.
 
-        ## `--title` is the worker's brief; `--task` is the work, and it is withheld
-
-        These are two different things and the daemon keeps them apart. **`--title` is all the worker
-        gets up front** — it runs its own shim's `brief`, reads that title, and inspects the repository
-        against it. **`--task` is withheld until a human approves the plan the worker writes.** The
-        title is also the headline on that approval card, so it is what the human decides from.
+        {briefSection}
 
         - **Quote both.** Your command line is read by a shell before Mainguard sees any of it, so an
           unquoted task describing code — `add()`, `a && b`, `$HOME`, `*.cs` — dies with
@@ -141,20 +197,7 @@ public static class AgentOperatingInstructions
         Decompose the operator's request into independent tasks and spawn one worker per task. Spawning
         needs no human approval — only the caps.
 
-        **You do not write task plans.** Each worker inspects the repository, authors its own plan,
-        presents it to the human, and blocks until it is approved. Do not describe scope, approach or
-        test strategy yourself: you cannot see the code, so anything you wrote would be a guess the
-        worker would have to undo. Give the worker a clear brief and let it plan.
-
-        Until a worker's plan is approved, `prompt` and `verify` are refused for it. **That is the gate
-        working, not an error to route around.**
-
-        ## When spawning is refused
-
-        A worker waiting on plan approval still occupies a worker slot. If `spawn` is refused for the
-        worker cap, the honest report to the operator is that plans are waiting on them to decide — do
-        not retry in a loop, and do not describe the stall as a failure. `status` tells you, per worker,
-        exactly which ones are blocked and why; say that.
+        {planAuthorshipSection}
 
         Serialize dependent tasks; parallelize independent ones.
         """;
@@ -174,12 +217,43 @@ public static class AgentOperatingInstructions
     /// work still in it. The daemon's readiness signal is the agent's branch advancing and then going
     /// quiet, so a worker that never commits is indistinguishable, to every mechanism downstream, from a
     /// worker that did nothing at all.</para>
+    ///
+    /// <para><b>The opening half is mode-dependent (2026-08-30).</b> With the operator's plan-mode toggle
+    /// off, every sentence about withholding, presenting and blocking is <i>false</i> for this worker —
+    /// and instructions that assert a gate the daemon is not applying are worse than none: a worker that
+    /// followed them would present a plan nobody is reviewing and then block on <c>await</c> forever,
+    /// holding a jail, having already been handed its task. The closing half (commit, or the work is
+    /// lost) is unconditional and is shared verbatim between the two, because it is the half that has
+    /// nothing to do with plans and everything to do with the worktree dying with the jail.</para>
     /// </summary>
-    public static string Worker()
+    public static string Worker(WorkerPlanMode mode = WorkerPlanMode.Gated)
     {
         var shimPath = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
 
-        return $$"""
+        var opening = mode == WorkerPlanMode.Ungated
+            ? $$"""
+        # You are a Mainguard worker
+
+        You have a repository checked out at `/workspace`, and a task waiting for you.
+
+        ## What to do first
+
+        ```
+        {{shimPath}} task                        the work you are here to do
+        ```
+
+        Then read the code it points at — actually read it — and do the work.
+
+        ## Plan mode is off for this run
+
+        There is no plan to write and no approval to wait for: the operator turned plan approvals off, so
+        the task above is yours the moment you ask for it. `present` is refused, and refusing it is the
+        point — **nobody is reviewing plans, so a plan you presented would wait forever.** Do the work.
+
+        A human still reviews the finished change: your branch is verified and put in front of them
+        before anything merges. The step that moved is the one before you started, not the one after.
+        """
+            : $$"""
         # You are a Mainguard worker
 
         You have a repository checked out at `/workspace`. **You do not yet have a task, and you do not
@@ -207,14 +281,23 @@ public static class AgentOperatingInstructions
 
         ## The part that matters
 
-        `present`, `revise` and `rescope` **block** until the human decides, and print the decision. On
-        approval the output includes `TASK:` followed by the work you are cleared to do. **The daemon
-        withholds that text until then**, so there is genuinely nothing to start on before approval — not
-        because you are being polite, but because the work has not been given to you.
+        `present`, `revise` and `rescope` **block** until the human decides, and print the decision. On approval the
+        output includes `TASK:` followed by the work you are cleared to do. **The daemon withholds that
+        text until then**, so there is genuinely nothing to start on before approval — not because you
+        are being polite, but because the work has not been given to you.
 
         A rejection is feedback, not death: it comes back with the reason, and you revise and re-present.
         Your revision budget is finite and the daemon reports what is left; when it is spent the task
         escalates to the human rather than looping.
+
+        Once you are approved the task is yours to re-read at any time, and asking again costs nothing:
+
+        ```
+        {{shimPath}} task                        the work you were cleared to do
+        ```
+
+        Asked BEFORE approval, that same command tells you what you are still waiting on rather than a
+        task you have not been given — the honest answer, and never a head start.
 
         ## If the work needs a file your approved scope does not cover, ASK
 
@@ -241,7 +324,9 @@ public static class AgentOperatingInstructions
           revised and re-presented like any other plan, on its own budget, and the daemon reports what is
           left; once that is spent you may not ask to widen again. Finish what your approved plan covers,
           or report to the human and wait.
+        """;
 
+        return opening + "\n\n" + $$"""
         ## When the work is done, commit it — nothing else will
 
         ```
@@ -290,6 +375,14 @@ public static class AgentOperatingInstructions
     /// <param name="adapters">The daemon's installed-CLI catalog. Only a coordinator has a <c>spawn</c>,
     /// so only the coordinator text reads it — but it is required on this entry point too, because an
     /// optional one is exactly what let a caller render a coordinator's instructions from nothing.</param>
-    public static string For(AgentIpcEndpointRole role, InstalledAdapterCatalog adapters) =>
-        role == AgentIpcEndpointRole.Coordinator ? Coordinator(adapters) : Worker();
+    /// <param name="mode">
+    /// The operator's plan-mode setting as it applies to THIS jail — the worker's own mode, or (for a
+    /// coordinator) the mode the workers it is about to spawn will get. Defaults to
+    /// <see cref="WorkerPlanMode.Gated"/> so a caller that has not been taught about the toggle renders
+    /// the text that describes a gate, never the text that promises there is none.
+    /// </param>
+    public static string For(
+        AgentIpcEndpointRole role, InstalledAdapterCatalog adapters,
+        WorkerPlanMode mode = WorkerPlanMode.Gated) =>
+        role == AgentIpcEndpointRole.Coordinator ? Coordinator(adapters, mode) : Worker(mode);
 }

@@ -146,6 +146,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     names the other. `AgentIpcResponse.RescopeOf` carries the widened plan's id back, which is what lets
     the shim report a DECLINED re-scope truthfully: nothing was taken away, and the generic "stop" would
     send a still-authorised worker away from its work.
+    that died with its worktree, and — **the plan-mode toggle, 2026-08-30** — **`task`**, a second DOOR
+    onto the gate's one exit for the withheld task (it calls the same `TryReleaseTask`, with the same
+    release-once audit record, and is authorised by the same `MayWork` predicate as `commit_work`). It
+    exists because with plan mode off there is no `present`, until then the only path that ever returned a
+    task; redefining `brief` instead would have made "never yields the task prompt" conditionally false,
+    which is §13's defect exactly.
     **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
     object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
     two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
@@ -188,6 +194,7 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     this jail's stderr) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
     **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` /
     `rescope <approved-plan-id> <plan.json>` / `await <id>` /
+    **worker's** IPC dir: `brief` / **`task`** / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
     **`commit "<message>"`** (the only route a jailed CLI has to a commit — measured against claude-code
     2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`.
     **G4:** ONE quoted argument, and a second positional is REFUSED rather than joined — `' '.join(argv[2:])`
@@ -202,7 +209,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     the op→verb map, which is the object `AgentOperatingInstructionsTests` set-equals against
     `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test).
     `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
-    `Coordinator(InstalledAdapterCatalog)` / `Worker()` / `For(role, InstalledAdapterCatalog)` /
+    `Coordinator(InstalledAdapterCatalog, WorkerPlanMode)` / `Worker(WorkerPlanMode)` /
+    `For(role, InstalledAdapterCatalog, WorkerPlanMode)` /
     `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
     `AgentIpcServer`. **Defect G2 (2026-08-29) made the catalog structural**: the installed set used to be
     an OPTIONAL list and the shim path a caller-supplied string, so the launcher's `--append-system-prompt`
@@ -263,14 +271,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `CoordinatorSpawnGate.RefuseUnknownKind` enumerates — the text and the enforcement cannot say
     different things, and no list is hardcoded anywhere to rot (MG-12)).
     `AgentKickoffPrompt.cs` (**the FIRST USER TURN — the defect that stopped the loop starting at all**.
-    `Worker(shimPath)` / `For(role, shimPath)`, and a coordinator gets NULL. A vendor CLI does not act on
+    `Worker(shimPath)` / `WorkerUngated(shimPath)` / `For(role, shimPath, WorkerPlanMode)`, and a
+    coordinator gets NULL. A vendor CLI does not act on
     a system prompt: a live worker jail launched `claude --append-system-prompt <instructions>` and sat
     at an empty input box — six minutes, empty outbox, no transcript, `mainguard-plan` never run — and
     nothing could start it, because the only writer to a worker's CLI is the coordinator's
     `send_worker_prompt`, which `WorkerPlanGate` refuses until a plan is approved. No first turn without
     a plan; no plan without a first turn. The turn is a compile-time constant of `(role, shimPath)`:
     there is no task/title/agent-id parameter, so it CANNOT carry the work, and what it says is "run
-    `mainguard-plan brief`" — the one thing phase 2 §2.2 gives a worker up front. Every gate is untouched
+    `mainguard-plan brief`" — the one thing phase 2 §2.2 gives a worker up front. **The plan-mode toggle
+    adds a second constant**, `WorkerUngated`, selected by an ENUM: it says "run `mainguard-plan task`"
+    instead, and keeps the property intact — passing the task in as a parameter was the obvious
+    implementation and would have traded a structural guarantee for a conditional one, in the one place
+    the task would then sit in a process argument list. Every gate is untouched
     and still answers no. A coordinator gets none deliberately: its terminal is not input-locked, so a
     human can type into it, and its real first turn is the operator's request, which the daemon does not
     have and must not invent. Delivered by the third per-adapter field, `initialPromptStyle`
@@ -1780,6 +1793,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       budget bounds bad plans, not a growing job); its own reject→revise loop is bounded by a fresh
       budget, and the loop AROUND that is closed by one live re-scope at a time plus escalation being
       terminal for the path).
+      Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+    - `PlanModeSwitch.cs` (**the operator's plan-mode toggle**, 2026-08-30 — whether a coordinator-delegated
+      worker must have a human-approved plan before it is given its task. `Enabled` /
+      `ModeForNewWorker` / `Set(enabled, actor)` / `Summary` (the one sentence a human reads, rendered
+      daemon-side so the screen and the gate cannot disagree), plus the `IPlanModeStore` seam with
+      `JsonPlanModeStore` (a one-boolean file beside the plan store — a daemon must answer "is the gate
+      on?" before anything needing a database is up) and `InMemoryPlanModeStore`. **Fail-closed**: a
+      missing or unreadable store is plan mode ON, because the default of a human-approval gate is that it
+      is there. Read ONCE per spawn into the worker's own `WorkerPlanMode`, never re-read, so a toggle
+      never retroactively authorises a worker blocked at the gate nor strands one already working. Set
+      over `PlanApprovalService.SetPlanMode`, which `RoleInterceptor` denies to a coordinator on the same
+      boundary as `ApprovePlan`. Design: `docs/design/coordinator-phase-3-decisions.md` §23).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
       a spawned worker's task **without giving it to the worker** — and, since 2026-08-29, refuses to
@@ -1805,7 +1830,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       PUBLICATION: `AgentRefMediator` never asks it, deliberately, because F1 requires an agent's branch to
       survive teardown. Also owns the legible-stall text —
       `BlockedWorkerCount`/`EscalatedWorkerCount`/`BackpressureSignal` render "6 workers are waiting on
-      your approval … the coordinator has stopped spawning", which the contract makes a requirement).
+      your approval … the coordinator has stopped spawning", which the contract makes a requirement.
+      **The plan-mode toggle (2026-08-30)** adds `WorkerPlanMode{Gated,Ungated}` (declared in this file),
+      a `mode` argument on `Hold` defaulting to `Gated`, and `ModeFor`/`IsUngated`/`RefusePlanPresentation`.
+      OFF does not remove this gate from any path: the worker is still held, still counted, still asked
+      about by the queue and the readiness trigger — `MayWork` simply answers yes from the start and every
+      predicate that delegates to it follows, `TryReleaseTask` now asks `MayWork` rather than reading
+      `HasApprovedPlan` a second time (one authority), and `MergeEvidence` gains a THIRD outcome
+      ("plan gate: OFF at spawn …") so a merge record never claims a human approval that never
+      happened).
     - `WorkerReadinessTrigger.cs` (**phase 2's AUTOMATIC verification trigger**, and nothing more than a
       trigger: it calls `MergeQueue.RunVerificationAsync` and owns no gate, no jail execution and no
       transition, because two paths that can disagree about what "verified" means is the defect this area

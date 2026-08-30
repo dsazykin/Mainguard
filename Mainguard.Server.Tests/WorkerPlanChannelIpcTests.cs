@@ -49,6 +49,9 @@ public sealed class PlanGateRig : IDisposable
     /// to do (which worktree it committed on, and on whose behalf).</summary>
     internal AgentSessionRepoScopingTests.FakeAgentEnvironment Environment { get; }
 
+    /// <summary>The host's container, for the services a single typed accessor would not justify.</summary>
+    public IServiceProvider Services => _host.Services;
+
     public AgentSpawnService Spawns => _host.Services.GetRequiredService<AgentSpawnService>();
 
     public AgentIpcServer Ipc => _host.Services.GetRequiredService<AgentIpcServer>();

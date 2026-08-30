@@ -741,6 +741,26 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.Rejected;
     }
 
+    /// <summary>
+    /// Sets the operator's plan-mode toggle and returns the state the DAEMON now holds.
+    ///
+    /// <para>The response is read back rather than assumed: it is the daemon's own answer, so a client
+    /// that renders it cannot show a gate the daemon is not applying.</para>
+    /// </summary>
+    public async Task<PlanModeState> SetPlanModeAsync(bool enabled, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        return await client.SetPlanModeAsync(
+            new SetPlanModeRequest { Enabled = enabled }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Reads the operator's plan-mode toggle.</summary>
+    public async Task<PlanModeState> GetPlanModeAsync(CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        return await client.GetPlanModeAsync(new GetPlanModeRequest(), CallOptions(ct, deadline));
+    }
+
     // ---- P2-14 kill switch (P2-47 #3) ----
 
     /// <summary>Engages the kill switch: freeze-queue-first, then yield fan-out (SA-1/F4 + RT-D4).</summary>

@@ -106,7 +106,9 @@
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
   writable jail to another agent's branch and have the daemon verify what it put there — and because
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
-  `SpawnAgentRequest`), the human-only plan-approval RPCs (`ApprovePlan`/`RejectPlan`), the scrollback
+  `SpawnAgentRequest`), the human-only plan-approval RPCs (`ApprovePlan`/`RejectPlan`/**`SetPlanMode`** — the last added
+  2026-08-30 with the plan-mode toggle: a coordinator that could turn the gate off would hold it
+  wholesale, for every worker it spawns from then on, with no card ever reaching a human), the scrollback
   read (`GetScrollback` — MG-30: serves any agent's daemon-side scrollback ring, up to 1000 rows per
   attach, which a coordinator could otherwise use to read another agent's terminal history it was never
   attached to), the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` — the chain carries other
@@ -734,7 +736,10 @@
     which could not distinguish "the worker will revise" from "the worker has stopped"; and `PlanUpdate`
     carries the **backpressure** counts + the daemon's rendered stall line, taken from the same
     `WorkerPlanGate` and Managed-session population that refuses the coordinator a spawn — a surface that
-    re-derived its own number could disagree with the gate it is rendering) and
+    re-derived its own number could disagree with the gate it is rendering. **The plan-mode toggle**
+    adds `GetPlanMode`/`SetPlanMode` — the actor on the audit event is the same daemon-derived peer
+    credential that records an approver, the response is read BACK from the switch rather than echoing the
+    request, and `PlanUpdate` carries the state on every update including the empty one) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
   - **`Services/AuditGrpcService.cs`** (P2-15) — transport for `AuditService` (`VerifyAudit`/
     `ReadAudit`): the audit store's first production readers. Verification/decryption live in

@@ -67,6 +67,39 @@ public static class AgentKickoffPrompt
         """;
 
     /// <summary>
+    /// The first turn for a worker spawned while <b>plan mode was off</b>: ask for your task, do it,
+    /// commit it.
+    ///
+    /// <para><b>Still a pure function of (role, shim path) — the task is NOT a parameter.</b> That is the
+    /// property this class's remarks rest on, and it survives the toggle intact: the text names a command
+    /// to run, and the daemon answers that command only for a worker <c>WorkerPlanGate.MayWork</c>
+    /// authorises. Passing the task in here was the obvious implementation and would have put the work in
+    /// a process argument list for every ungated worker, trading a structural guarantee ("this text
+    /// cannot carry the task") for a conditional one ("it carries the task only when the caller meant
+    /// it to").</para>
+    ///
+    /// <para>The closing steps are deliberately the same words as the gated turn: the half of a worker's
+    /// job that happens after it knows its task did not change, and a second wording of it would
+    /// drift.</para>
+    /// </summary>
+    public static string WorkerUngated(string shimPath) =>
+        $$"""
+        Begin now — this is your first turn as a Mainguard worker, and nothing else will prompt you.
+
+        1. Run `{{shimPath}} task` to learn what you are here to do.
+        2. Read the code in /workspace that the task points at. Actually read it before you change it.
+        3. Do the work.
+        4. Run `{{shimPath}} commit <message>` when it is done, and again after any further change. That
+           is the only way your work leaves this jail: the worktree is deleted when the agent stops, so
+           anything you have not committed is lost.
+
+        Plan mode is off for this run, so there is no plan to write and nothing to wait for — `present`
+        is refused and nobody is reviewing plans. A human still reviews your finished change before it
+        merges. Nobody is watching this terminal, so do not stop to ask for input: everything you need
+        comes from that one command.
+        """;
+
+    /// <summary>
     /// Renders the first turn for a role, or <c>null</c> when the role gets none.
     ///
     /// <para><b>A coordinator deliberately gets none, and the asymmetry is not an oversight.</b> A
@@ -77,8 +110,15 @@ public static class AgentKickoffPrompt
     /// and must not invent: a synthetic one would make a coordinator start fanning out workers for work
     /// nobody asked for. So the coordinator's first turn comes from the human, as it must.</para>
     /// </summary>
-    public static string? For(AgentIpcEndpointRole role, string shimPath) =>
+    /// <param name="mode">
+    /// The worker's own plan mode. Defaults to <see cref="Orchestrator.WorkerPlanMode.Gated"/>, so a
+    /// caller that has not been taught about the toggle sends the turn that stops at the gate rather than
+    /// the one that says there is none.
+    /// </param>
+    public static string? For(
+        AgentIpcEndpointRole role, string shimPath,
+        Orchestrator.WorkerPlanMode mode = Orchestrator.WorkerPlanMode.Gated) =>
         role == AgentIpcEndpointRole.Worker && !string.IsNullOrWhiteSpace(shimPath)
-            ? Worker(shimPath)
+            ? mode == Orchestrator.WorkerPlanMode.Ungated ? WorkerUngated(shimPath) : Worker(shimPath)
             : null;
 }

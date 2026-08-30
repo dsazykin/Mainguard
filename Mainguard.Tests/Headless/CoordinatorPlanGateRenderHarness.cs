@@ -767,6 +767,16 @@ public class CoordinatorPlanGateRenderHarness
 
         public OrchestrationBackpressure GetBackpressure() => _backpressure;
 
+        public PlanModeView PlanMode { get; set; } = new(true, "");
+
+        public PlanModeView GetPlanMode() => PlanMode;
+
+        public Task SetPlanModeAsync(bool enabled)
+        {
+            PlanMode = new PlanModeView(enabled, "");
+            return Task.CompletedTask;
+        }
+
         public event Action? Changed { add { } remove { } }
 
         public Task SendAsync(string text) => Task.CompletedTask;

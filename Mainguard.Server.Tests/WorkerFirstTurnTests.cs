@@ -178,7 +178,14 @@ public sealed class WorkerFirstTurnTests
         {
             typeof(IReadOnlyList<string>), typeof(InstalledAdapterMarker), typeof(string),
             typeof(AgentIpcEndpointRole),
+
+            // The plan-mode toggle (2026-08-30). Admitted to this list because it is an ENUM of two
+            // values: it selects which of two compile-time constant turns is sent and is structurally
+            // incapable of carrying a task, which is exactly the property this test exists to enforce.
+            // A `string planMode` would have been refused here, correctly.
+            typeof(Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode),
         };
+        Assert.Equal(2, Enum.GetValues<Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode>().Length);
 
         var methods = new[]
         {
@@ -205,6 +212,22 @@ public sealed class WorkerFirstTurnTests
             "--allowedTools", "Bash(" + WorkerShim + ":*)",
         };
         Assert.All(argv, a => Assert.Contains(a, permitted));
+
+        // The same claim for the OTHER mode: an ungated worker's line carries its own first turn and
+        // still nothing else. The turn tells it to ASK for the task; it does not contain one.
+        var ungated = SandboxAgentLauncher.BuildLaunchArgv(
+            Launch, ClaudeCode(), IpcDir, AgentIpcEndpointRole.Worker, Instructions,
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Ungated)!;
+        var permittedUngated = new HashSet<string>(StringComparer.Ordinal)
+        {
+            Launch[0],
+            AgentKickoffPrompt.For(
+                AgentIpcEndpointRole.Worker, WorkerShim,
+                Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Ungated)!,
+            "--append-system-prompt", Instructions,
+            "--allowedTools", "Bash(" + WorkerShim + ":*)",
+        };
+        Assert.All(ungated, a => Assert.Contains(a, permittedUngated));
     }
 
     private static IReadOnlyList<string>? Build(

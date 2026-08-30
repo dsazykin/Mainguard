@@ -3849,3 +3849,346 @@ container lifecycle rather than anything this change touches, and it did not rep
 - **A superseded plan keeps its own card history.** It stops being a gate item (it is not `Pending` or
   `Escalated`) and stays in the store as the record of what was authorised and by whom, which is what
   the audit chain's `plan_superseded` event points at.
+## 25. The plan-mode toggle — planning becomes the operator's choice, and OFF is a mode
+
+**Owner decision, 2026-08-30:** *"the worker should be required to create a plan, this is something that
+should be changed. just like in a normal cli users can choose to use plan mode, same thing should apply
+here. if the plan mode toggle in mainguard is on, then by default all worker agents spawn in plan mode
+and then the presented plan is the one they create. otherwise they can just go straight for
+implementing."*
+
+Phase 2 made the plan gate **mandatory**. This makes it the operator's choice, with ON as the default and
+as the shipped behaviour.
+
+### 25.1 What prompted it, and the trap in the obvious fix
+
+Live testing found the resulting plan can be hollow. The brief carries only `--title` (the §13 fix,
+deliberately, so the task stays withheld), so a worker can invent a scope from the title alone without
+reading the repository — one did, producing a 5-file scope derived purely from its title. A human then
+approves *that* scope, and F6 later measures the real diff against it.
+
+The reading of the owner's decision that was investigated first was: with the toggle ON, spawn each worker
+in **the vendor CLI's own native plan mode**, so the presented plan is grounded in the repository by
+construction. That reading was **measured and rejected for this change**; §25.6 is the measurement and
+§25.7 is the recommended design for landing it separately. The change recorded here is the toggle itself
+and — the part that is genuinely new — what OFF means.
+
+### 25.2 Where the toggle lives: daemon-side, because the gate is
+
+`PlanModeSwitch` (`Mainguard.Agents/Agents/Orchestrator/PlanModeSwitch.cs`), registered in
+`DaemonHost` and persisted by `JsonPlanModeStore` beside the plan store.
+
+**Not `App.Settings`/`UserPreferences`.** That store is a client-side `config.json`
+(`Mainguard.Git/Services/SettingsService.cs`) and **the daemon never reads it**. A gate enforced where the
+daemon serves the call, switched by a value the enforcement point cannot see, is the exact shape of
+control this codebase keeps finding to be decorative (MG-12). The setting lives where the actor is — the
+established pattern, and the one PR intake was built on after a settings screen that looked saved and
+changed nothing.
+
+The wire is `PlanApprovalService.GetPlanMode`/`SetPlanMode`, plus `plan_mode_enabled`/`plan_mode_summary`
+on the existing `PlanUpdate` stream so the state arrives **with the cards it explains** rather than on a
+second poll that can disagree with them.
+
+- **`SetPlanMode` is denied to the coordinator role** (`RoleInterceptor`), on contract §4's plan-approval
+  boundary and for a strictly stronger reason: a coordinator that could approve one plan holds the gate
+  for one worker; a coordinator that could turn plan mode off removes it for every worker it spawns from
+  then on, with no card ever reaching a human.
+- **Fail-closed.** A missing or unparseable settings file is plan mode **ON**. The default of a
+  human-approval gate is that it is there, and an unreadable file must not be a way to remove one.
+- **No EF migration.** The plan subsystem's own record is already a JSON file in the same directory, for
+  the same reason: the daemon must be able to answer "is the gate on?" before anything needing a database
+  is up.
+
+**The UI affordance is on `PlanGateView`** — the surface the decisions arrive on, and therefore where a
+*missing* decision is noticed. It is a checkbox bound `OneWay` plus a `Command`, deliberately: a two-way
+binding would render a setting the daemon rejected or never received, and this is the one disagreement
+where a human believes they still have an approval step and do not. The click moves the box, the command
+tells the daemon, and the refresh puts the daemon's answer back.
+
+The gate region's visibility flag (`HasGateContent`) now includes `|| !PlanModeEnabled`. With approvals
+off nothing is ever pending, so a gate that only appeared for pending cards would go dark permanently —
+and a dark gate is exactly what an *idle* orchestration looks like. **An off gate stays on screen saying
+so**, in `WarningBrush`.
+
+### 25.3 What OFF means — a recorded mode, not a set of disabled checks
+
+This is the part that needed the most care, and the tempting implementation is the wrong one.
+
+**Rejected: "with the toggle off, don't call `Hold`."** The daemon already has an ungated-managed-worker
+path (an operator's own spawn, spelled as "neither title nor task"), and `AgentSpawnService` already calls
+producing one *"strictly worse than the defect being fixed"* — correctly. An unheld worker:
+
+- is **ineligible** for automatic verification (`MayAutoVerify` treats an id the gate never held as not a
+  plan-gated worker at all, deliberately, so the daemon does not start test runs on manual agents);
+- carries the **manual-agent wording** on its merge record, so a later reader cannot tell a delegated
+  worker the operator authorised in advance from a human driving a jail by hand;
+- has **no recorded authorisation** anywhere.
+
+**Taken: the gate still holds every delegated worker; the toggle decides whether the task is withheld.**
+`WorkerPlanMode{Gated,Ungated}` is read once from the switch at `Hold` and then owned by that worker. So
+the *population* every predicate reasons over is identical in both modes, and exactly one answer changes:
+
+| | plan mode ON | plan mode OFF |
+|---|---|---|
+| `Hold` | held, task withheld | **held**, task not withheld (`Mode = Ungated`, on the `worker_task_withheld` audit event as `plan_mode=off`) |
+| `MayWork` (and `MayReceivePrompt` / `MayRequestVerification`, which delegate to it) | no until approved | **yes from the start** |
+| `TryReleaseTask` | only against an approved plan | yields the task |
+| `MayAutoVerify` | no until approved | **yes** — it is still a delegated worker, and an unheld agent is still ineligible |
+| `Allows` (`IMergeGate`) | no until approved | yes |
+| G1 merge-queue row | deferred until approval | **created at spawn** |
+| `MergeEvidence` | `plan gate: plan approved` | **`plan gate: OFF at spawn — delegated worker, no plan was authored or approved`** |
+| `BlockedWorkerCount` / backpressure | counts | silent — nothing is waiting on a human |
+| `spawn` response status | `AwaitingPlan` | `Working` |
+| `present_plan` / `revise_plan` / `await_decision` | the gate | **refused**, with the reason |
+
+Three of those rows are the design, not bookkeeping:
+
+**`MergeEvidence` gained a third outcome.** Collapsing OFF into "plan approved" would put a sentence on a
+merge record asserting a human decision that never happened — the single worst thing that record could
+say. Collapsing it into "not a plan-gated worker" would borrow the manual-agent wording. Off is a
+different authorisation (the operator authorised this *class* of work once, in advance, and it is on the
+audit chain as `plan_mode_changed` with the actor), so it says so.
+
+**`present_plan` is refused rather than humoured.** A worker following stale instructions would otherwise
+queue a card in front of an operator who switched approvals off and is not watching for one, then block on
+`await` forever — holding a jail and a cap slot, having already been given its task.
+
+**The toggle is not retroactive, in either direction.** A worker already blocked at the gate must not be
+authorised by a switch nobody pointed at it (an approval nobody gave); a worker already told to start must
+not be stranded mid-task by a preference change. Hence the mode is a property of the worker.
+
+### 25.4 The task needs a door when there is no `present` — contract §3.1 gains `task`
+
+`present` was the only path that ever returned the withheld task. With plan mode off it is neither run nor
+accepted, so a worker would have no way to learn its task at all. The two alternatives were worse:
+
+- **Redefine `brief` to yield the task when the gate is off.** The brief's one documented property is
+  "never the task itself" — asserted in the contract, in `AgentIpcProtocol`, in the worker's instructions
+  and in the shim's own help. Making it conditionally false is how a documented invariant becomes a
+  sentence nobody can trust, and §13 is that exact defect.
+- **Put the task in the launch argv.** `AgentKickoffPrompt` is a pure function of `(role, shimPath)`
+  *precisely so that it cannot carry the work even by mistake*. Adding the task as a parameter trades a
+  structural guarantee for a conditional one, in the one place the task would then sit in a process
+  argument list.
+
+So `task` is a **second door onto the gate's one exit**, not a second copy of the decision: it calls
+`TryReleaseTask`, with its release-once audit record, and is authorised by the same `MayWork` predicate as
+`commit_work`. With plan mode ON it is refused before approval exactly like everything else.
+
+While wiring it, `TryReleaseTask` stopped reading `HasApprovedPlan` directly and now asks `MayWork`. The
+two were independent spellings of one policy, and this change is precisely the one that would have split
+them.
+
+### 25.5 The jail text is mode-dependent, because instructions that assert a gate the daemon is not applying are worse than none
+
+A worker told "present your plan, then wait for the human" with approvals off would block forever on a
+card nobody is reviewing, having already been handed its task. `AgentOperatingInstructions.Worker`,
+`.Coordinator` and `AgentKickoffPrompt.For` all take the mode; **every default is `Gated`**, so a caller
+that has not been taught about the toggle renders the text that describes a gate, never the text that
+promises there is none. The commit half — "this is the only way your work leaves this jail" — is shared
+verbatim between the two worker texts, because it has nothing to do with plans and a second wording of it
+would drift.
+
+The coordinator's text loses four paragraphs it would otherwise state falsely: the withheld task, the
+`prompt`/`verify` refusal at the gate, the cap-refusal advice about plans waiting on a human, and the
+brief/task framing. It keeps *"you do not write task plans"* in both modes — that one is true for a
+different reason (the coordinator cannot see the code).
+
+### 25.6 The vendor CLI's native plan mode — what was measured, and why it is not in this change
+
+Measured against **claude-code 2.1.251** on this machine (and cross-checked against the strings of the
+installed adapter binary, 2.1.234 linux-arm64, which the managed updater had moved past the bundled
+2.1.218 pin). One real session, `--permission-mode plan -p --output-format stream-json`, $0.17.
+
+| # | finding |
+|---|---|
+| 1 | **`--permission-mode plan` is real.** Choices: `acceptEdits, auto, bypassPermissions, manual, dontAsk, plan`. Session init reports `"permissionMode":"plan"`. Present in the installed adapter binary too. |
+| 2 | **Plan mode is read-only, and it enforces that against exactly the call the shim path needs.** Asked to run a trivial mutating Bash command as part of exploring, the CLI refused: *"plan mode restricts me to read-only actions (plus editing the plan file itself), and creating a file isn't read-only."* Nothing was created. Its system prompt says so in stronger terms — *"you MUST NOT … run any non-readonly tools … This supercedes any other instructions you have received."* |
+| 3 | **So the shim path and native plan mode are structurally incompatible.** `mainguard-plan present /tmp/plan.json` requires writing a file outside the plan file and running a non-read-only command — both of which plan mode's own instructions forbid, and the refusal is the model's, so an `--allowedTools` grant does not reliably override it. |
+| 4 | **The plan is delivered as free-text markdown, via `ExitPlanMode({"plan": "<markdown>"})`.** It is not structured and does not map to `TaskPlanFields{scope[], approach, testStrategy}`. Inventing that structure from it is the §18 fabricated-counts failure class, so it must not be done. |
+| 5 | **The plan is also written incrementally to a plan file at `$HOME/.claude/plans/plan-<slug>-<random>.md`** — a non-deterministic name, in the jail's tmpfs home, with no completion signal in the file. The daemon cannot know the path in advance, and building on a vendor's private plan-file layout is the per-CLI coupling §17.2 refused. |
+| 6 | **`ExitPlanMode` requires user approval** — an interactive dialog. In a jail whose terminal is input-locked and which nobody is watching, nothing answers it. |
+
+**Conclusion.** Adding `--permission-mode plan` to the launch line *on its own would deadlock every
+worker*: it cannot run the shim, and its `ExitPlanMode` dialog has no one to answer it. Capturing a
+CLI-authored plan needs a **`PreToolUse` hook on `ExitPlanMode`** — a new capture channel (hook config
+injected into the jail's `.claude/settings.json`, a hook subcommand on the shim, a decision returned as
+`permissionDecision`) plus an honest free-text plan representation carried through
+`PlanApprovalService`, the proto, and the approval card. That is a change to the plan's data model, which
+F6/`FlaggedChangeGate` compares diffs against — a merge-spine gate. Landing it inside a PR named for a
+toggle would be the same misjudgement phase 2 §3a declined to make. §25.7 is the design; it is not built.
+
+### 25.7 Recommended follow-up: capture the CLI's plan at `ExitPlanMode`, additively
+
+The shape that avoids changing the plan's data model, and therefore avoids touching F6:
+
+1. Launch a gated worker with `--permission-mode plan` **and** a `PreToolUse` hook matching
+   `ExitPlanMode`, both declared **per adapter** (this is genuine vendor knowledge, like `systemPromptArg`
+   — an adapter that declares neither keeps today's shim-authored path, which is the answer to "what does
+   an adapter with no plan mode do when the toggle is ON": it behaves exactly as it does now, and nothing
+   is refused).
+2. The hook posts the markdown `tool_input.plan` to the daemon over the existing IPC transport and
+   returns `permissionDecision: "allow"`, so plan mode ends and the CLI is free to run the shim.
+3. The daemon stores that markdown against the worker as **narrative evidence** — a new free-text field on
+   the plan record and the card, never parsed into `scope[]`.
+4. The worker then presents the structured plan through the existing shim path, now authored by a model
+   that has just read the repository, and the human sees both.
+
+`TaskPlanFields` is unchanged, F6 keeps comparing against a `scope[]` a model wrote, and the CLI's own
+plan is shown verbatim beside it rather than being fabricated into fields.
+
+A smaller, independent guard worth landing either way: **refuse a presented plan whose scope names no path
+that exists in the worker's worktree.** A plan invented from a title alone names paths that are not there,
+and that is a daemon-side, non-fabricated check on exactly the defect §25.1 opens with.
+
+### 25.8 Per-adapter — argued, and deliberately empty for now
+
+Plan mode *is* vendor knowledge, and §17.2's rule is the test: a manifest field is right when only the
+CLI's author knows how their binary spells the thing, and wrong when it invites an adapter author to write
+a value that silently reintroduces a defect. Both halves apply here, so the answer depends on which
+mechanism ships:
+
+- **In this change there is no manifest field, because there is nothing that would read it.** The gate is
+  vendor-neutral — the shim path works identically on `claude-code`, `codex`, `gemini-cli`, `qwen-code`,
+  `opencode` and the scripted test adapters — so every adapter behaves the same under both toggle
+  positions. Adding `planModeArg` now would be a declaration nothing consults, which is the species of
+  thing this repo keeps finding to be decorative.
+- **When §25.7 lands it needs two fields** (`planModeArg`, and the hook declaration), and the answer to
+  "what should an adapter with no plan mode do when the toggle is ON?" is: **fall back to the
+  shim-authored plan, and do not refuse the spawn.** Refusing would make an operator preference into a
+  per-CLI capability gate — a worker that cannot be spawned at all because its vendor lacks a feature is a
+  much larger behaviour change than the toggle, and the shim path is a working, tested plan gate for
+  exactly those adapters. Half-declaring the pair must be refused at parse time, like
+  `preApprovedCommandArg`/`preApprovedCommandFormat`: a CLI put into plan mode with no capture hook is the
+  deadlock measured in §25.6 row 6.
+
+### 25.9 The mutation log
+
+Every guard watched failing. Restores use `touch`, and the runner **refuses to report a result unless the
+witness dll inside the test project's own output directory has a newer mtime than before the build** — a
+run that reports 0 red against a stale assembly is worse than no run. It also holds a lock file: two
+concurrent runs restore each other's originals over each other's mutations, which was observed once and
+left the tree carrying a mutation nobody was testing.
+
+`PlanModeToggleTests` is 26 tests in `Mainguard.Tests`; `PlanModeToggleDaemonTests` is 10 in
+`Mainguard.Server.Tests`. The counts below are over the filtered plan-gate slice of each tier (82 and 92
+tests), so a mutation that breaks a neighbouring guarantee shows up as more than one.
+
+| # | mutation | went red |
+|---|---|---|
+| M1 | plan-mode default flips to OFF (fail-open) | **5** unit · **17** daemon |
+| M2 | `MayWork` loses its ungated arm | 4 · 3 |
+| M3 | `TryReleaseTask` reads `HasApprovedPlan` again instead of the one authority | 3 · 1 |
+| M4 | `MergeEvidence` collapses OFF into "plan approved" | 1 · 1 |
+| M5 | `RefusePlanPresentation` never refuses | 1 · 1 |
+| M6 | `Hold` ignores the mode it was given | 7 · 5 |
+| M7 | `Hold`'s `mode` parameter defaults to `Ungated` (fail-open default) | **14** · 0 |
+| M8 | the kickoff turn ignores the mode | 1 · 0 |
+| M9 | the operating instructions ignore the mode (dropped inside `For`) | 1 · 0 |
+| M10 | the worker text's mode switch always renders the gated half | 2 · 0 |
+| M11 | the spawn path always holds the worker as gated | — · 5 |
+| M12 | the spawn path never reads the switch | — · 5 |
+| M13 | the shim spawn reports the literal `AwaitingPlan` again | — · 1 |
+| M14 | the `task` op skips the gate and hands the task over unconditionally | — · 1 |
+| M15 | `present_plan` drops the ungated refusal | — · 1 |
+| M16 | `SetPlanMode` is not denied to a coordinator | — · 1 |
+| M17 | the plan stream stops carrying the plan-mode state | — · 1 |
+| M18 | `SetPlanMode` echoes the request instead of the daemon's state | — · 2 |
+
+**Three of these are worth reading rather than counting.**
+
+**M9 survived the first full run — 0 red in both tiers — and that is the one this pass actually bought.**
+`AgentOperatingInstructions.For(role, adapters, mode)` is the entry point the launcher calls, and dropping
+the argument inside it gives every jail the gated text whatever the operator set. Nothing went red:
+`EveryModeDefaultIsTheGatedOne` compares the no-argument overload against `Gated`, which a `For` that
+always renders gated satisfies perfectly, and every other text assertion called `Worker`/`Coordinator`
+directly, so none of them crossed the one forwarding step that can drop the argument.
+`ForRoutesTheModeToBothRolesTexts` was written for it and asserts both halves — that `For` forwards, and
+that the argument changes what comes back — because equality alone would still hold if the methods it
+forwards to ignored the mode too.
+
+**M7's asymmetry (14 unit, 0 daemon) is honest and expected**, not a hole: the daemon always passes the
+mode explicitly, so a fail-open *default* is unreachable from it. The default's whole risk is a future
+caller that forgets the argument, and that is exactly what the unit tier measures.
+
+**M5 first showed up as a HANG, not a failure**, and that is a defect in the test that has been fixed.
+With the ungated refusal removed, `present_plan` is accepted, and an accepted presentation **parks on the
+socket until a human decides** — which is the gate working, so the shim gives it no timeout. The test
+therefore sat for fifteen minutes until the run was killed, and the mutation scored nothing. It now goes
+through `CallWithinAsync`, which fails the assertion on a missed deadline. A guard whose failure mode is a
+hang is indistinguishable from a guard nobody tested.
+
+**Two process-level notes on the harness itself**, because both cost a run:
+
+- A harness that survived a session interruption **raced the replacement run**, mutated a file behind its
+  back, and made two mutations report "pattern not found" while polluting every result in between. A lock
+  *file* does not catch that (a killed run leaves a stale one; an older copy of the script never took
+  one), so the runner now asks the **process table** — `pgrep -f mutate.py` — before it starts.
+- One mutation was committed and pushed as if it were the implementation, because a `git add -A` ran
+  while the harness had a file mutated. Backed out in `d3ec9612`. The runner now verifies
+  `git diff --quiet` on each restored file and refuses to continue if a restore did not take, and prints
+  the tracked-file dirt at the end (`none (clean)` for the run above) — but the real lesson is not to
+  stage anything while a mutation run is in flight.
+
+### 25.10 Tier results — and the one tier that was deliberately NOT run
+
+- `dotnet build Mainguard.slnx -c Release` — **succeeded**. The four warnings it prints
+  (`MergeQueue.cs`, `MergeQueueProvisioner.cs`, `BranchHandoffService.cs`, and four `CS0067` in test
+  harnesses) are pre-existing and in files this change does not touch.
+- `dotnet test Mainguard.Tests -c Release` — **3816 passed, 0 failed**, 25 skipped.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **783 passed,
+  0 failed**, 22 skipped.
+- `dotnet format Mainguard.slnx --verify-no-changes` — **exit 0**. It first reported four `xUnit2031`
+  analyzer warnings against the new test file (`Assert.Single` over a `Where` clause); those are fixed,
+  not suppressed.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category=RequiresDocker"` — **NOT RUN, on
+  purpose.** The reasoning is below, because "it was not run" is only useful with the evidence attached.
+
+**Why the Docker tier was not run here.** CONTRIBUTING's rule is that a machine with a live agent jail
+uses `Category!=RequiresDocker`, because `DockerSuiteIsolation` sweeps on **both** construction and
+dispose. Measured on this machine at the time of the run:
+
+- **There is exactly one usable Docker engine.** `docker context ls` shows OrbStack as current;
+  `/var/run/docker.sock` is a symlink to OrbStack's socket, and Docker Desktop's socket
+  (`~/.docker/run/docker.sock`) **does not exist**. So the two-daemon separation CONTRIBUTING relies on
+  ("tests run against Docker Desktop, real jails live in MainguardEnv's own engine") is simply not
+  present under the macos-host substrate (ADR-008): the daemon under test and the owner's jails share one
+  engine.
+- **Two live `mainguard-*` jails were running on it** — one since 07:24 (the operator's Pro app, itself
+  up since 07:12) and one started 14:38, i.e. during this session.
+- **`DockerSuiteSweepGuard.RefusalFor` would not have stopped it.** Its evidence test is
+  `MainguardOsHost.IsInside()` — whether the *test process* is running inside Mainguard OS. On
+  macos-host the daemon runs natively on the Mac against the host's engine, so the process is outside,
+  the guard returns `null`, and the sweep proceeds. **The guard's own refusal text describes exactly this
+  machine's situation** ("the sweep would leave live jails running with no networks … with nothing in the
+  symptom pointing back at a test run") while its predicate cannot detect it. Recorded here, not fixed:
+  it belongs to whoever owns that fixture, and widening the predicate is a change to a destructive
+  safety check that deserves its own review.
+- The blast radius today happens to be narrow — at the moment of checking, no `mainguard-agents` /
+  `mainguard-egress` / `mainguard-agent-*` networks existed, no egress proxy container existed, and both
+  jails were attached to no network — but that is a property of one instant, and the Pro app is live and
+  can attach a jail to those literal names at any point during a seven-minute suite.
+
+**What this change would have been asking that tier to prove, and why little is at stake.** Nothing here
+adds a sandbox, network, or jail surface. The plan-mode toggle touches the plan gate, the worker/coordinator
+IPC surface, one gRPC service, the role interceptor and one view. The one place it reaches the real spawn
+chain is `AgentSpawnService.SpawnAsync`, and for every caller that is not a coordinator-delegated spawn —
+which is every `RequiresDocker` test — `delegated` is false, the mode resolves to `Gated`, and the launch
+line is byte-identical to before. **It should still be run**, on Linux CI or on this machine with the Pro
+app stopped, before the PR merges.
+
+### 25.11 Left alone, deliberately
+
+- **`CoordinatorTools` is not mode-aware.** Its `SpawnWorkerAsync` success string still says the worker
+  "will inspect the repo, author its plan, and block for approval", which is false with the toggle off.
+  It has **no production construction site** (all 14 are in `Mainguard.Tests`) — the wired equivalent is
+  `AgentSpawnService`'s IPC handlers, which are mode-aware. Threading the mode through a surface nothing
+  reaches would add a second copy of the policy for no behaviour.
+- **`RefuseBrief` still requires a title in both modes.** With approvals off the title is no longer a
+  brief, but it is still the headline on the merge-queue row and in `status`, and the "title must not be
+  the task" tripwire costs nothing to keep. One code path, and the spawn form does not change under the
+  operator.
+- **The switch is not exposed in Settings → General.** It belongs beside the decisions it governs; a
+  second entry point would be a second place for the state to be read from and disagree.
+- **Nothing retroactively re-gates or un-gates a live worker**, by design (§25.3), so there is no
+  migration and no reconciliation pass.

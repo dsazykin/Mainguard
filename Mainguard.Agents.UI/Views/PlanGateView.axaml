@@ -29,6 +29,33 @@
 
   <StackPanel Spacing="8">
 
+    <!-- THE TOGGLE, and the one state it must never let a human guess at.
+
+         The checkbox is the operator's plan-mode switch; the line under it is the DAEMON's own sentence
+         for the state, not a second wording of it. It is rendered at the top of the gate because this is
+         the surface the decisions arrive on, so it is where a missing decision is noticed.
+
+         Read-only binding plus a Command, deliberately: a two-way binding would let the screen show a
+         setting the daemon rejected or never received. The click moves the box, the command tells the
+         daemon, and the refresh puts the daemon's answer back — so what is ticked is what is enforced. -->
+    <Border Classes="Card" Padding="10,8" CornerRadius="8" BorderThickness="1"
+            BorderBrush="{DynamicResource BorderHairline}">
+      <StackPanel Spacing="3">
+        <CheckBox Content="Require plan approval before a worker starts"
+                  IsChecked="{Binding PlanModeEnabled, Mode=OneWay}"
+                  Command="{Binding TogglePlanModeCommand}"
+                  ToolTip.Tip="On: every worker inspects the repository, writes a plan, and blocks here until you approve it. Off: workers are given their task at spawn and start implementing straight away."/>
+        <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextMuted}"
+                   IsVisible="{Binding PlanModeEnabled}"/>
+        <!-- Off is the state that costs something, so it is the state that gets the warning hue: an
+             approval step the human may still believe they have is not there. -->
+        <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource WarningBrush}"
+                   IsVisible="{Binding !PlanModeEnabled}"/>
+      </StackPanel>
+    </Border>
+
     <!-- The legible stall. Bordered and named when the cap is saturated by blocked plans, because at that
          point it is not a status line — it is the explanation for why nothing is happening. -->
     <Border Classes="Card" Padding="10,8" CornerRadius="8" BorderThickness="1"

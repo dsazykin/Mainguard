@@ -330,6 +330,20 @@ public class CoordinatorPlanDecisionTests
 
         public OrchestrationBackpressure GetBackpressure() => OrchestrationBackpressure.None;
 
+        /// <summary>The plan-mode toggle this fake reports, and every value it was asked to set.</summary>
+        public PlanModeView PlanMode { get; set; } = new(true, "Plan mode is ON — every worker authors a plan.");
+
+        public List<bool> PlanModeSets { get; } = new();
+
+        public PlanModeView GetPlanMode() => PlanMode;
+
+        public Task SetPlanModeAsync(bool enabled)
+        {
+            PlanModeSets.Add(enabled);
+            PlanMode = new PlanModeView(enabled, enabled ? "ON" : "OFF");
+            return Task.CompletedTask;
+        }
+
         public event Action? Changed { add { } remove { } }
 
         public Task SendAsync(string text) => Task.CompletedTask;

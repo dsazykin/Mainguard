@@ -120,6 +120,14 @@
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`
     `StreamConversation`/`SendMessage`** — the coordinator chat bridge, snapshot-then-deltas
     conversation turns + a send-message RPC, carrying no merge/git/worktree capability.
+    **The plan-mode toggle (2026-08-30):** `GetPlanMode`/`SetPlanMode` + `PlanModeState{enabled,summary}`
+    — the operator's switch for whether a delegated worker must have an approved plan before it gets its
+    task. **`SetPlanMode` is denied to the coordinator role** at the `RoleInterceptor`, on the same
+    boundary as `ApprovePlan` and for a stronger reason (approving one plan holds the gate for one worker;
+    turning the mode off removes it for every future worker). The summary sentence is rendered
+    daemon-side, and `PlanUpdate` also carries `plan_mode_enabled`/`plan_mode_summary`, so the state
+    arrives with the cards it explains — an EMPTY plan gate has two explanations and only the daemon can
+    tell them apart. Design: `docs/design/coordinator-phase-3-decisions.md` §23.
     **Phase 2** (worker-authored plans): `PlanEntry` gains `worker_agent_id` (the plan is the
     *worker's* now — it wrote it after inspecting the repo), `revision`, `revisions_remaining` and
     `rejection_feedback`; `RejectPlanRequest.reason` becomes load-bearing — it is **delivered to the

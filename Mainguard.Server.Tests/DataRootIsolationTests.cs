@@ -131,6 +131,12 @@ public class DataRootIsolationTests
     /// step 3's "snapshot written BEFORE returning" wrote into an object that died with the process —
     /// which is the one process an emergency stop is followed by restarting. Giving it a file made it a
     /// store, and every daemon store belongs under this test.</para>
+    ///
+    /// <para><b>Why it grew again (2026-08-30):</b> <c>ResolvePlanModePath</c>, for the operator's
+    /// plan-mode toggle. It is a one-boolean file and it is still a daemon store — and this one has a
+    /// sharper failure than most if it escapes isolation: an in-proc test host that turned plan mode off
+    /// in the developer's real data root would leave the human approval gate off on the next real
+    /// daemon start, silently.</para>
     /// </summary>
     [Fact]
     public void Every_daemon_store_path_resolver_is_covered_by_the_fallback_test()
@@ -142,6 +148,7 @@ public class DataRootIsolationTests
             "ResolveKillJournalPath",
             "ResolveLeaderRegistryPath",
             "ResolveLogsDirectory",
+            "ResolvePlanModePath",
             "ResolvePlanStorePath",
         };
 
