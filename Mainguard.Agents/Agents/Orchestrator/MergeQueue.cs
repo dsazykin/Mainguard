@@ -699,12 +699,23 @@ public sealed class MergeQueue : IMergeQueue
             throw new ArgumentException("agentId is required.", nameof(agentId));
         }
 
+        // The measured reason this entry was resting at Working BEFORE anyone asked for a run — captured
+        // here because the transition below is about to delete it (SetStateLocked retires the cascade's
+        // refusal on any move OFF Working, correctly, for a run that actually happens). A run that is
+        // REFUSED never happens, and it must not be able to erase the only sentence naming why the branch
+        // needs a person. See the catch below for the defect this closes.
+        WorkingReason? reasonBeforeRun;
+
         lock (_gate)
         {
             if (!_verifying.Add(agentId))
             {
                 throw new InvalidOperationException($"A verification for '{agentId}' is already in flight.");
             }
+
+            reasonBeforeRun = _workingReasons.TryGetValue(agentId, out var measuredBefore)
+                ? measuredBefore
+                : null;
 
             try
             {
@@ -736,13 +747,14 @@ public sealed class MergeQueue : IMergeQueue
             record = await _runVerification(agentId, ct).ConfigureAwait(false);
             _verifications.Insert(_repoHash, record);
         }
-        catch
+        catch (Exception ex)
         {
             lock (_gate)
             {
                 _verifying.Remove(agentId);
                 // A failed run surfaces the branch back to Working (not silently retried — edge row 2).
                 SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
+                RestoreWorkingReasonAfterRefusedRunLocked(agentId, reasonBeforeRun, ex);
             }
             Changed?.Invoke();
             throw;
@@ -2135,6 +2147,61 @@ public sealed class MergeQueue : IMergeQueue
         }
 
         SetStateLocked(agentId, target, verifiedAt);
+    }
+
+    /// <summary>
+    /// Puts a <c>Working</c> entry's render-verbatim reason back after a verification that was
+    /// <b>refused</b> — and, when there was none to put back, records the refusal's own words instead.
+    ///
+    /// <para><b>The defect.</b> Pressing Verify on an entry the stale cascade had blocked used to make
+    /// the surface say LESS than it did before the press. <see cref="RunVerificationAsync"/> transitions
+    /// to <c>Verifying</c> first, <see cref="SetStateLocked"/> drops the measured reason on any move off
+    /// <c>Working</c>, and then the run refuses (no jail, no verification command, a worktree parked on a
+    /// detached HEAD mid-rebase) and settles the entry straight back to <c>Working</c> — now with nothing
+    /// to say. The accurate refusal went to the daemon log and to gRPC's <c>FailedPrecondition</c>, and
+    /// the entry's own gate line fell back to the generic "not verified yet": the human's one available
+    /// action deleted the actionable sentence it was offered next to. Observed live on a rebase-conflict
+    /// entry, whose card went from "the agent is paused with the rebase in progress and needs a human to
+    /// resolve it" to "not verified yet".</para>
+    ///
+    /// <para><b>Why the prior reason wins over the refusal's.</b> Nothing ran, so nothing about the world
+    /// changed: the cascade's measurement is still the most specific true statement about this entry, and
+    /// it is the one written for a human to act on. The refusal is the second-best answer and is used only
+    /// when there was no measurement to keep — which is the ordinary case for an entry that had simply
+    /// never been verified.</para>
+    ///
+    /// <para><b>And only for a TYPED refusal.</b> The set mirrors <c>MergeQueueGrpcService.RunVerification</c>'s
+    /// own catch filter exactly: those are the messages the daemon already puts on the wire verbatim, so
+    /// recording one here exposes nothing new. Anything else — an IO fault, a cancellation — keeps its
+    /// message off a render-verbatim surface rather than leaking whatever a stack happened to contain.</para>
+    /// </summary>
+    private void RestoreWorkingReasonAfterRefusedRunLocked(
+        string agentId, WorkingReason? reasonBeforeRun, Exception failure)
+    {
+        // The settle above is a no-op for an entry that went terminal mid-run (a human discard). Writing a
+        // Working reason onto a Discarded row would put a "this branch needs…" sentence under a decision
+        // that is already made.
+        if (GetStateLocked(agentId) != WorkerMergeState.Working)
+        {
+            return;
+        }
+
+        if (reasonBeforeRun is { } measured)
+        {
+            _workingReasons[agentId] = measured;
+            return;
+        }
+
+        var quotable = failure is NoVerificationCommandException
+            or MalformedVerificationCommandException
+            or Mainguard.Git.Exceptions.ToolchainProvisioningException
+            or InvalidOperationException;
+        if (quotable && !string.IsNullOrWhiteSpace(failure.Message))
+        {
+            // Not sandbox-aware: this reason was not derived from probing the jail, so a stranded entry
+            // still gets StrandedReason — see WorkingReason.
+            _workingReasons[agentId] = new WorkingReason(failure.Message, AccountsForMissingSandbox: false);
+        }
     }
 
     private void SetStateLocked(string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null)

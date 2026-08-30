@@ -96,6 +96,18 @@ public sealed class MergeQueueProvisioner
     private readonly OsvSnapshot _osv;
     private readonly string _artifactDir;
     private readonly SyntheticVerificationRegistry? _synthetic;
+    private readonly Func<string, string, string, CancellationToken, Task<bool>>? _promptAgent;
+
+    /// <summary>
+    /// The worktrees this provisioner's cascade has parked mid-rebase, and what it measured about each.
+    ///
+    /// <para>Owned here rather than injected because the parking and the un-parking are this type's own
+    /// acts: <see cref="OnRebaseConflict"/> writes it, <see cref="LetAgentResolveConflictAsync"/> and
+    /// <see cref="AbortParkedRebaseAsync"/> clear it, and no fourth writer exists. Exposed so the gRPC
+    /// projection can put the facts on the card — a provisioner is already what that layer resolves for
+    /// the post-merge mirror refresh.</para>
+    /// </summary>
+    public RebaseConflictParkingStore ParkedConflicts { get; } = new();
 
     /// <summary>
     /// The phase-2 plan gate, ANDed into every repo's queue: a worker whose own plan was never approved
@@ -220,6 +232,17 @@ public sealed class MergeQueueProvisioner
     /// produces is REQUIRED to be visibly synthetic
     /// (<see cref="SyntheticVerificationPlan.SeededProvenanceMarker"/>).
     /// </param>
+    /// <param name="promptAgent">
+    /// (repoHash, agentId, prompt) → whether the text was actually submitted to that agent's live CLI.
+    /// The daemon passes its existing prompt-delivery path — the SAME
+    /// <c>AgentCliBinder.TrySendPromptAsync</c> a coordinator's <c>send_worker_prompt</c> uses, with its
+    /// measured CR-as-a-separate-frame submission — because a second way to type at a worker is a second
+    /// place for the "the prompt accumulated unsubmitted in its input box" defect to live.
+    /// <para>Only <see cref="LetAgentResolveConflictAsync"/> uses it, and null makes exactly that one
+    /// action refuse with a reason rather than silently doing half of itself: unpausing a jail and NOT
+    /// telling the agent why it woke up is how an agent goes back to whatever it was doing on top of a
+    /// half-finished rebase.</para>
+    /// </param>
     public MergeQueueProvisioner(
         MergeQueueRegistry registry,
         IRepoProvisioner repos,
@@ -241,7 +264,8 @@ public sealed class MergeQueueProvisioner
         IAgentSupervisor? agentStates = null,
         Func<string, string, bool>? publishRebasedAgentRef = null,
         OsvSnapshot? osvSnapshot = null,
-        SyntheticVerificationRegistry? syntheticVerifications = null)
+        SyntheticVerificationRegistry? syntheticVerifications = null,
+        Func<string, string, string, CancellationToken, Task<bool>>? promptAgent = null)
     {
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _repos = repos ?? throw new ArgumentNullException(nameof(repos));
@@ -267,6 +291,7 @@ public sealed class MergeQueueProvisioner
         _osv = osvSnapshot ?? OsvSnapshot.Default;
         _artifactDir = artifactDirectory;
         _synthetic = syntheticVerifications;
+        _promptAgent = promptAgent;
 
         // The whole optional tail, recorded as data. See WiredOptionalControls for why every one of these
         // is here rather than only the one that happened to get a test.
@@ -282,6 +307,7 @@ public sealed class MergeQueueProvisioner
         if (publishRebasedAgentRef is not null) { wired.Add(nameof(publishRebasedAgentRef)); }
         if (osvSnapshot is not null) { wired.Add(nameof(osvSnapshot)); }
         if (syntheticVerifications is not null) { wired.Add(nameof(syntheticVerifications)); }
+        if (promptAgent is not null) { wired.Add(nameof(promptAgent)); }
         WiredOptionalControls = wired;
     }
 
@@ -1022,10 +1048,7 @@ public sealed class MergeQueueProvisioner
 
         if (cycle.Kind == RebaseCycleKind.Conflict)
         {
-            Block(repoHandle, agentId, queue,
-                "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
-                + "rebase in progress and needs a human to resolve it",
-                "conflict");
+            Block(repoHandle, agentId, queue, RebaseConflictReason, "conflict");
             return;
         }
 
@@ -1181,6 +1204,20 @@ public sealed class MergeQueueProvisioner
     public const string NoLiveSandboxReason =
         "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent";
 
+    /// <summary>
+    /// The cascade's terminus for a branch whose keep-alive rebase hit the human's changes: the worktree
+    /// is parked mid-rebase, the jail is paused, and neither is undone automatically (no
+    /// <c>rebase --abort</c> — a rejection trigger).
+    ///
+    /// <para>A constant for the same two reasons <see cref="NoLiveSandboxReason"/> is, plus a third: it
+    /// is the sentence the card renders verbatim, it names a required human action, and the two controls
+    /// that make that action possible — <see cref="LetAgentResolveConflictAsync"/> and
+    /// <see cref="AbortParkedRebaseAsync"/> — have to be offered for exactly the entries wearing it.</para>
+    /// </summary>
+    public const string RebaseConflictReason =
+        "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
+        + "rebase in progress and needs a human to resolve it";
+
     // The one terminus for every way a re-entry can fail to reparent: Working, with the reason a human
     // reads on the queue rail (MergeQueue renders it verbatim as the CanMerge reason) and an audit event.
     //
@@ -1294,10 +1331,19 @@ public sealed class MergeQueueProvisioner
     /// </summary>
     private void OnRebaseConflict(string repoHandle, ConflictHandoff handoff)
     {
+        // Measured HERE and nowhere later. `git diff --diff-filter=U` only answers while the rebase is in
+        // progress, and the whole point of the parking is that it stays that way until a human acts — but
+        // an agent with a shell in that worktree can `git add` a path out of the unmerged set at any time,
+        // so an answer taken at render time would drift from the answer the daemon blocked the entry on.
+        var conflicted = MeasureConflictedPaths(handoff.WorktreePath);
+        var parked = new ParkedRebaseConflict(
+            handoff.AgentId, handoff.WorktreePath, handoff.MainBranch, conflicted, DateTimeOffset.UtcNow);
+        ParkedConflicts.Park(repoHandle, parked);
+
         _log?.Invoke(
             $"merge queue repo={repoHandle} agent={handoff.AgentId} keep-alive rebase CONFLICTED against "
             + $"'{handoff.MainBranch}' — worktree {handoff.WorktreePath} is parked mid-rebase and the jail "
-            + "stays paused until it is resolved");
+            + $"stays paused until it is resolved (conflicting: {DescribePaths(conflicted)})");
 
         _audit.Append(new AuditEvent(KeepAliveConflictEvent, new Dictionary<string, string>
         {
@@ -1305,8 +1351,385 @@ public sealed class MergeQueueProvisioner
             ["agent"] = handoff.AgentId,
             ["worktree"] = handoff.WorktreePath,
             ["main_branch"] = handoff.MainBranch,
+            // The half of the handoff the event never carried. A resolver — human or T-04 — that is told
+            // WHERE without being told WHAT has to re-derive it from a worktree that may since have moved.
+            ["conflicted_paths"] = string.Join(" ", conflicted),
             ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
         }));
+    }
+
+    /// <summary>
+    /// The unmerged paths in a worktree, repo-relative, or an empty list when git could not be asked.
+    ///
+    /// <para>Empty means <b>not measured</b>, never "nothing conflicts": the caller is on the path where
+    /// git has just refused a rebase, so a rendered "no files conflict" would be a fabricated reassurance
+    /// over a real conflict. Every surface treats the empty list as unknown.</para>
+    /// </summary>
+    private static IReadOnlyList<string> MeasureConflictedPaths(string worktreePath)
+    {
+        if (string.IsNullOrEmpty(worktreePath) || !System.IO.Directory.Exists(worktreePath))
+        {
+            return Array.Empty<string>();
+        }
+
+        if (AgentGitCommand.TryRun(
+                worktreePath, out var output, "diff", "--name-only", "--diff-filter=U") != 0)
+        {
+            return Array.Empty<string>();
+        }
+
+        return output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+    }
+
+    private static string DescribePaths(IReadOnlyList<string> paths) =>
+        paths.Count == 0 ? "not measured" : string.Join(", ", paths);
+
+    // ---- The two things a human can do about a parked conflict ---------------------------------------
+    //
+    // The cascade's conflict arm blocks the entry with a sentence naming a required human action
+    // (RebaseConflictReason) and, until these existed, the surface offered no operation that could perform
+    // it: the jail was paused, so `docker exec` answered "Container … is paused, unpause the container
+    // before exec", and the card's only controls were Verify (which cannot run in a paused jail), Discard
+    // (which throws the work away) and the verification log. A card that names an action the product does
+    // not have is worse than one that names none — it reads as the recovery the human is looking for.
+    //
+    // Neither of these is the T-04 resolver, and neither pretends to be: T-04 is the staging/diff surface
+    // where a HUMAN resolves hunks. These are the two operations that can be built from machinery that
+    // already exists — hand it back to the agent that made it, or undo it — and they are deliberately the
+    // only two.
+
+    /// <summary>The audit event a hand-back appends: the jail was unpaused and the worker was told to
+    /// finish its own rebase.</summary>
+    public const string ConflictHandedBackEvent = "keepalive_conflict_handed_back";
+
+    /// <summary>The audit event an abort appends: the parked rebase was undone and the branch restored.</summary>
+    public const string ConflictRebaseAbortedEvent = "keepalive_conflict_rebase_aborted";
+
+    /// <summary>What the entry says after its conflict has been handed back to the worker.</summary>
+    public const string ConflictHandedBackReason =
+        "the agent has been unpaused and asked to finish resolving this rebase itself — it verifies again "
+        + "once the rebase completes";
+
+    /// <summary>What the entry says after its parked rebase was aborted.</summary>
+    public const string ConflictAbortedReason =
+        "the conflicted rebase was aborted — this branch is back where it was, still behind the new main, "
+        + "and needs verifying again";
+
+    /// <summary>
+    /// <b>"Let the agent resolve"</b> — unpause the parked jail and tell the worker to finish its own
+    /// rebase.
+    ///
+    /// <para><b>Why this is a real answer and not a shrug.</b> The worker is a coding agent and the
+    /// conflict is between its own commits and the human's; resolving it is inside its competence and
+    /// nobody else has more context on the half it wrote. What it could not do is notice: it was frozen
+    /// mid-rebase by the daemon, with no message explaining why, and unfreezing it without saying anything
+    /// would have it carry on with whatever it was doing on top of a half-finished rebase. So the unpause
+    /// and the instruction are one operation, and the instruction goes through the SAME prompt-delivery
+    /// path a coordinator's steer uses rather than a second way to type at a worker.</para>
+    ///
+    /// <para><b>Order matters.</b> The jail is unpaused FIRST: a paused container's pty is frozen, so a
+    /// prompt written to it would sit unread in a buffer — the exact "the prompt accumulated unsubmitted"
+    /// shape this codebase has already paid for once.</para>
+    ///
+    /// <para>Nothing here decides the conflict, and nothing here touches the index: the branch is exactly
+    /// as it was, mid-rebase, and the queue entry stays at <c>Working</c> with a reason that says what is
+    /// now true instead of what was true a moment ago.</para>
+    /// </summary>
+    public async Task<ConflictActionResult> LetAgentResolveConflictAsync(
+        string repoHandle, string agentId, CancellationToken ct = default)
+    {
+        if (!TryOpenParkedConflict(repoHandle, agentId, out var parked, out var queue, out var refusal))
+        {
+            return ConflictActionResult.Refused(refusal);
+        }
+
+        var containerId = _resolveContainerId(repoHandle, agentId);
+        if (string.IsNullOrEmpty(containerId))
+        {
+            return ConflictActionResult.Refused(
+                "this entry's sandbox is gone, so there is no agent to hand the conflict back to — resume "
+                + "the entry to give it one, or abort the rebase");
+        }
+
+        if (_promptAgent is null)
+        {
+            // Deliberately refused rather than half-performed. Unpausing without telling the agent why it
+            // woke up is how an agent resumes whatever it was doing on top of a half-finished rebase.
+            return ConflictActionResult.Refused(
+                "this daemon has no way to send the agent an instruction, so handing the conflict back "
+                + "would wake it with no idea why — abort the rebase instead");
+        }
+
+        try
+        {
+            await _sandboxes.UnpauseAsync(containerId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Classified BY STATE, never by error-message substring (ISandboxEngine.IsPausedAsync' own
+            // note): an engine that refuses because the jail is already running has given us the state we
+            // wanted, and only an engine that still reports it paused has actually failed.
+            if (await StillPausedAsync(containerId, ct).ConfigureAwait(false))
+            {
+                return ConflictActionResult.Refused($"the agent's jail could not be unpaused ({ex.Message})");
+            }
+        }
+
+        MarkRunState(repoHandle, agentId, AgentRunState.Rebasing);
+        try
+        {
+            _agentStates.ResumeInput(agentId);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} resume-input FAILED ({ex.Message})");
+        }
+
+        var prompt = ResolveConflictPrompt(parked!);
+        bool delivered;
+        try
+        {
+            delivered = await _promptAgent(repoHandle, agentId, prompt, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            delivered = false;
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} conflict hand-back prompt THREW ({ex.Message})");
+        }
+
+        if (!delivered)
+        {
+            // Half of the operation happened and the entry must say so: the sentence it is wearing — "the
+            // agent is paused with the rebase in progress" — is no longer true, and leaving it would send
+            // the next reader looking for a paused jail that is running.
+            const string partial =
+                "the agent's jail was unpaused but the instruction could not be delivered to its CLI — it "
+                + "is awake with the rebase still in progress, so tell it yourself in its terminal or "
+                + "abort the rebase";
+            queue!.TryReturnToWorking(agentId, partial, "conflict-handback-no-prompt");
+            return ConflictActionResult.Refused(partial);
+        }
+
+        ParkedConflicts.Clear(repoHandle, agentId);
+        queue!.TryReturnToWorking(agentId, ConflictHandedBackReason, "conflict-handed-back");
+
+        _log?.Invoke(
+            $"merge queue repo={repoHandle} agent={agentId} conflict HANDED BACK — jail unpaused and the "
+            + $"worker told to finish its rebase onto '{parked!.MainBranch}'");
+        _audit.Append(new AuditEvent(ConflictHandedBackEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHandle,
+            ["agent"] = agentId,
+            ["worktree"] = parked.WorktreePath,
+            ["main_branch"] = parked.MainBranch,
+            ["conflicted_paths"] = string.Join(" ", parked.ConflictedPaths),
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        return ConflictActionResult.Ok();
+    }
+
+    /// <summary>
+    /// <b>"Abort rebase"</b> — <c>git rebase --abort</c> in the parked worktree, then let the jail run
+    /// again. The branch returns to exactly where it was before the cascade touched it, and the entry
+    /// returns to the queue needing verification against the new main.
+    ///
+    /// <para><b>Deterministic, and it never makes things worse.</b> An abort loses no committed work — the
+    /// branch tip is restored to its pre-rebase value, including any <c>wip: sync</c> snapshot the cycle
+    /// made — and it costs only the replay progress, which is why it is behind the same confirmation the
+    /// queue's other irreversible action is. It is the honest answer for a conflict nobody wants to spend
+    /// an agent's context on: the branch is unmergeable either way until it is rebased, and an aborted
+    /// rebase is a state a person can reason about.</para>
+    ///
+    /// <para><b>The mutation goes through the P2-09 yield, not around it.</b> The jail is currently frozen
+    /// by the parking, which is the state a yield token exists to produce — but a token is the only API
+    /// that may gate a worktree mutation (invariant 2), and re-requesting a yield over an already-paused
+    /// container would <c>docker pause</c> a paused jail and be refused by the engine. So the jail is
+    /// unpaused first, an ordinary yield is taken over it, and the token's own resume is what leaves the
+    /// jail running at the end. The extra round trip buys the invariant instead of an exception to it.</para>
+    /// </summary>
+    public async Task<ConflictActionResult> AbortParkedRebaseAsync(
+        string repoHandle, string agentId, CancellationToken ct = default)
+    {
+        if (!TryOpenParkedConflict(repoHandle, agentId, out var parked, out var queue, out var refusal))
+        {
+            return ConflictActionResult.Refused(refusal);
+        }
+
+        if (_yieldFor is null)
+        {
+            return ConflictActionResult.Refused(
+                "this daemon has no cooperative-yield gateway wired, and a worktree may not be mutated "
+                + "without one");
+        }
+
+        var containerId = _resolveContainerId(repoHandle, agentId);
+        if (string.IsNullOrEmpty(containerId))
+        {
+            return ConflictActionResult.Refused(
+                "this entry's sandbox is gone, so the yield that gates every worktree mutation cannot be "
+                + "taken — resume the entry first");
+        }
+
+        try
+        {
+            await _sandboxes.UnpauseAsync(containerId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            if (await StillPausedAsync(containerId, ct).ConfigureAwait(false))
+            {
+                return ConflictActionResult.Refused($"the agent's jail could not be unpaused ({ex.Message})");
+            }
+        }
+
+        IYieldToken token;
+        try
+        {
+            token = await _yieldFor(repoHandle).RequestYieldAsync(agentId, null, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return ConflictActionResult.Refused(
+                $"the agent could not be quiesced for the abort ({ex.Message}) — nothing was changed");
+        }
+
+        try
+        {
+            // No `recheck` here, and that is not an oversight: GitMutationGuard's verdict refuses a
+            // worktree that is mid-rebase, which is the precondition of this operation rather than a
+            // hazard to it. What still applies is the index.lock backoff, which is the half that matters —
+            // the jail was running for the few milliseconds above and its CLI may hold the lock.
+            var exit = GitMutationGuard.RunGuarded(
+                token,
+                () => GitMutationGuard.IsIndexLockHeld(parked!.WorktreePath),
+                () => AgentGitCommand.TryRun(parked!.WorktreePath, out _, "rebase", "--abort"));
+
+            if (exit != 0)
+            {
+                return ConflictActionResult.Refused(
+                    $"`git rebase --abort` failed in the parked worktree (exit {exit}) — the rebase is "
+                    + "still in progress and nothing was changed");
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return ConflictActionResult.Refused(
+                $"the parked rebase could not be aborted ({ex.Message}) — nothing was changed");
+        }
+        finally
+        {
+            // Leaves the jail RUNNING, which is the point: the branch is no longer mid-anything, so the
+            // reason to keep the agent frozen is gone with it.
+            token.Resume();
+        }
+
+        ParkedConflicts.Clear(repoHandle, agentId);
+        MarkRunState(repoHandle, agentId, AgentRunState.Working);
+        queue!.TryReturnToWorking(agentId, ConflictAbortedReason, "conflict-aborted");
+
+        _log?.Invoke(
+            $"merge queue repo={repoHandle} agent={agentId} parked rebase ABORTED — worktree "
+            + $"{parked!.WorktreePath} restored and the jail resumed");
+        _audit.Append(new AuditEvent(ConflictRebaseAbortedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHandle,
+            ["agent"] = agentId,
+            ["worktree"] = parked.WorktreePath,
+            ["main_branch"] = parked.MainBranch,
+            ["conflicted_paths"] = string.Join(" ", parked.ConflictedPaths),
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        return ConflictActionResult.Ok();
+    }
+
+    /// <summary>
+    /// The preconditions both conflict actions share: this repo has a live queue, this entry is parked,
+    /// and the rebase the parking is about is still in progress.
+    ///
+    /// <para>The last check is the one that keeps the parking honest. The record is memory and the
+    /// worktree is on disk with an agent that has a shell in it: a worker (or a human, or a later cycle)
+    /// can finish or abort the rebase without telling anyone, and acting on a stale record would run
+    /// <c>rebase --abort</c> over whatever the worktree became. A parking whose rebase is gone is forgotten
+    /// here rather than acted on.</para>
+    /// </summary>
+    private bool TryOpenParkedConflict(
+        string repoHandle, string agentId,
+        out ParkedRebaseConflict? parked, out MergeQueue? queue, out string refusal)
+    {
+        queue = null;
+        parked = ParkedConflicts.Find(repoHandle, agentId);
+        if (parked is null)
+        {
+            refusal = "this entry has no rebase parked for a human — there is no conflict to act on";
+            return false;
+        }
+
+        var ctx = _registry.Resolve(repoHandle);
+        if (ctx is null)
+        {
+            refusal = $"no active merge queue for repo handle '{repoHandle}'";
+            return false;
+        }
+
+        queue = ctx.Queue;
+
+        if (!System.IO.Directory.Exists(parked.WorktreePath)
+            || !GitMutationGuard.Inspect(parked.WorktreePath).RebaseInProgress)
+        {
+            ParkedConflicts.Clear(repoHandle, agentId);
+            refusal =
+                "the rebase this entry was parked on is no longer in progress — the worktree has already "
+                + "moved on, so there is nothing here to resolve or abort";
+            return false;
+        }
+
+        refusal = string.Empty;
+        return true;
+    }
+
+    /// <summary>Whether the engine still reports the jail frozen. An engine that cannot answer says false,
+    /// which reads as "not paused" — the direction that lets the operation proceed rather than refusing on
+    /// ignorance.</summary>
+    private async Task<bool> StillPausedAsync(string containerId, CancellationToken ct)
+    {
+        try
+        {
+            return await _sandboxes.IsPausedAsync(containerId, ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// What the worker is told when its conflict is handed back. It states the four things it cannot see
+    /// from inside a jail that was frozen without explanation: that it was paused and why, that it is
+    /// awake now, which files git could not replay, and the two commands that end the rebase.
+    ///
+    /// <para>It asks the worker NOT to abort. An abort is the human's other button and it is recorded as
+    /// such; a worker that quietly aborted would leave the queue's reason describing a hand-back that no
+    /// longer describes anything.</para>
+    /// </summary>
+    internal static string ResolveConflictPrompt(ParkedRebaseConflict parked)
+    {
+        var files = parked.ConflictedPaths.Count == 0
+            ? "Run `git status` to see which files are unmerged."
+            : "The unmerged files are: " + string.Join(", ", parked.ConflictedPaths) + ".";
+
+        return
+            $"Mainguard paused you because rebasing your branch onto '{parked.MainBranch}' hit a conflict, "
+            + "and a human has now asked you to resolve it yourself. You are unpaused. Your worktree is "
+            + $"still mid-rebase. {files} Resolve each conflict, `git add` the files you fixed, then run "
+            + "`git rebase --continue` until the rebase finishes. Do NOT run `git rebase --abort` — say so "
+            + "instead if you cannot resolve it. Your branch is verified again automatically once the "
+            + "rebase completes.";
     }
 
     /// <summary>
