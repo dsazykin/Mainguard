@@ -402,6 +402,25 @@ public static class GatewayServiceRegistration
                     log: log)
                 : null!);
 
+        // ...and the OTHER subscriber on that same sweep. The trigger above answers "when should this
+        // branch be verified"; this one answers "is the verification this branch already has still ABOUT
+        // this branch". Nothing answered the second question, so a locally-spawned agent's entry that
+        // reached Verified stayed Verified through every commit it pushed afterwards — Merge enabled,
+        // footer "ready to merge", for a tree that had never been tested. See BranchTipInvalidator for the
+        // live observation and for why it is not a branch of the trigger (the trigger debounces; a merge
+        // gate must not).
+        //
+        // Same substrate condition and the same degraded answer: no WorktreeManager means no watcher means
+        // no observation to make. The daemon still starts, and MergeQueue.CanMerge still compares the
+        // record's branch sha against the tip it knows, so the gate does not depend on this being present.
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager worktrees
+                ? new BranchTipInvalidator(
+                    source: worktrees.RefWatcher,
+                    queues: sp.GetRequiredService<IMergeQueueRegistry>(),
+                    log: log)
+                : null!);
+
         services.AddHostedService<GatewayHostedService>();
         // ...and the slot that RESOLVES the trigger at boot. Without it the singleton above would be
         // registered and never constructed — registered-but-never-running is the exact defect this

@@ -34,7 +34,8 @@ The all-editions base. Git logic goes here.
   columns `UsdMicrosCapPerDay`/`TokenCapPerDay` alongside the per-agent caps), and the P2-10
   merge-queue tables (`MergeQueueRows` — one persisted state row per (repo, agent), written in the
   same transaction as every state-machine transition so a restart resumes; `VerificationRows` —
-  immutable verification records keyed to `main@sha`, insert-only; `MergeLeaseRows` — the RT-D1
+  immutable verification records keyed to **both** shas a verdict is only true between, `MainSha` and
+  (since `AddVerificationBranchSha`) `BranchSha`, insert-only; `MergeLeaseRows` — the RT-D1
   per-repo merge lease + idempotency record), and the P2-12 external-PR-intake tables
   (`PrIntakeSubscriptions` — one row per `(host, owner, repo, filter)` subscription, unique so a
   duplicate subscribe is idempotent; `PrIntakeHeads` — the last-seen head SHA per
@@ -60,7 +61,12 @@ The all-editions base. Git logic goes here.
   `AddAuditAnchors` adds `AuditAnchors` (`Models/AuditAnchorRow.cs` — one row per RFC 3161-anchored
   chain head: head seq/hash, request/anchor times, the DER token or null while pending; NOT
   append-only — a forged anchor only invalidates itself, the TSA signature cannot be re-made to
-  match a rewritten chain)).
+  match a rewritten chain); `AddVerificationBranchSha` adds `VerificationRows.BranchSha` — the
+  `refs/heads/agent/<id>` tip a run was measured ON. A record pinned `main@sha` and nothing else, so
+  the queue could ask whether main had moved under its evidence and structurally could not ask whether
+  the BRANCH had; a green row survived three further commits and went on offering Merge. Existing rows
+  take `""`, which is the correct value rather than a backfill — nothing knows what tip they ran on —
+  and every freshness comparison reads empty as "not measured" and declines to answer).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +

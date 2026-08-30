@@ -1718,8 +1718,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       pushed SINCE the failure. Never creates a queue, and returns
       a `ReadinessDecision`/`ReadinessOutcome` per examined worker so "why did this NOT fire" is answerable.
       `PollOnce()` + an injected clock + `DriveManually` make every timing rule assertable without sleeping.
-      Rationale, the rejected candidates and the stated known limitation live in
-      `docs/design/verification-trigger.md`).
+      Rationale and the rejected candidates live in `docs/design/verification-trigger.md`; the "known
+      limitation" that file used to record — a `Verified` entry is never re-fired on a push — is closed by
+      `BranchTipInvalidator` below, not by anything here).
+    - `BranchTipInvalidator.cs` (**the second subscriber on the same `AgentRefWatcher.Advanced` sweep, and
+      the missing caller for `MergeQueue.NotifyBranchAdvanced`.** `MergeQueue.NotifyNewCommits` had exactly
+      two callers — `ExternalPrIntake` and the dev queue seeder — and neither fires for a worker in a jail,
+      so a locally-spawned agent's entry that reached `Verified` **froze there**: nothing re-verified (the
+      trigger starts only from `Working`/`StaleVerified`/`VerificationFailed`), the Verify button was still
+      offered and threw `Verified → Verifying` on every press, and `ArmFlaggedChangeReview` — which runs
+      only inside a verification — kept the F6 out-of-scope classification and every acknowledgment pinned
+      to the diff of two commits ago. Observed 2026-08-30: agent `4c43d17a` verified at 01:35, committed at
+      01:41/01:59/02:13, and the cockpit still read "verified", "ready to merge", **Merge enabled**. This
+      type is deliberately NOT a branch of `WorkerReadinessTrigger`: the trigger DEBOUNCES, and the
+      debounce window is exactly the window in which a human can merge a verdict that has already gone
+      void. It decides nothing — it forwards the observation and the queue turns it into a transition;
+      resolves queues and never creates one; swallows and LOGS a throw rather than dropping it silently.
+      Wired in `GatewayServiceRegistration` and resolved at boot by `WorkerReadinessHostedService`, both
+      asserted by `WorkerReadinessTriggerWiringTests`).
     - `WorkerPlanAuthor.cs` (**phase 2 — the worker side.** `IWorkerPlanDrafter` (author a plan from the
       repo, and from the human's feedback on a revision), `IWorkerPlanChannel` (present/revise/await —
       `LocalWorkerPlanChannel` in-process, the `mainguard-plan` shim in a jail), and `WorkerPlanAuthor`,

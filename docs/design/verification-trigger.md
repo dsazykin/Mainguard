@@ -183,26 +183,54 @@ fix for it (a commit) is what re-arms the branch.
   state — a live run means the entry is already `Verifying`, so the other order made the in-flight branch
   unreachable dead code. It also treats the guard's throw as a deferral, because the check is across a lock
   it does not hold.
-- **Only fires from `Working` or `StaleVerified`**, the states with a legal edge to `Verifying`.
+- **Only fires from `Working`, `StaleVerified` or `VerificationFailed`**, the states with a legal edge to
+  `Verifying`.
 - **Never creates a queue.** An agent pushing must not provision a repo as a side effect.
 
-### Known limitation, not worked around
+### The known limitation, and how it was closed
 
-**A worker that pushes while its entry sits at `Verified` is not auto-verified**, because the state machine
-has no `Verified → Verifying` edge. The human Verify button has exactly the same limitation today. Closing
-it means giving `NotifyNewCommits` a production caller so new commits invalidate a verification — a change
-to the merge spine's behaviour, which is not a trigger's business and should land on its own with its own
-tests. Until it does, a branch can carry a `Verified` state whose tip has moved past the verified bytes.
+This section used to read:
+
+> **A worker that pushes while its entry sits at `Verified` is not auto-verified**, because the state
+> machine has no `Verified → Verifying` edge. […] Closing it means giving `NotifyNewCommits` a production
+> caller so new commits invalidate a verification — a change to the merge spine's behaviour, which is not a
+> trigger's business and should land on its own with its own tests. Until it does, a branch can carry a
+> `Verified` state whose tip has moved past the verified bytes.
+
+It was not a limitation. It was the most dangerous defect in the product, written down as an acceptable
+one, and the last sentence is a precise description of what it cost: on 2026-08-30 agent `4c43d17a`
+verified green at 01:35 and then committed at 01:41, 01:59 and 02:13. Nothing re-verified. The Verify
+button was still offered and refused every press with `Illegal merge-state transition Verified →
+Verifying`. `ArmFlaggedChangeReview` runs only inside a verification, so the F6 out-of-scope gate stayed
+armed against the diff of two commits earlier. The review cockpit listed the old files, stamped the header
+"verified", footed "ready to merge", and left **Merge enabled** — for a tip carrying an out-of-scope change
+and arithmetic that fails the repo's own tests.
+
+It is closed, on the terms this section set out: `NotifyNewCommits` now has the production caller it lacked,
+as a separate type with its own tests, and no new state or edge was invented for it. See
+`docs/design/coordinator-phase-3-decisions.md` §19 for the state-model argument — in short, the agent's own
+commits do not make evidence *stale* (`StaleVerified`, which keeps the record because the tree is unchanged
+and only main moved); they make it *void*, because the tree it describes no longer exists. `Working` already
+means exactly that, and `Verified → Working` was already a legal edge.
 
 ### Wiring
 
 ```
 AgentRefWatcher sweep (1 Hz, already running)
-  → AgentRefWatcher.Advanced                      [NEW event — the sweep result was discarded before]
-  → WorkerReadinessTrigger.NotifyAdvanced          arm/re-arm, restarting the quiet window
-  → WorkerReadinessTrigger.PollOnce                debounce · once-per-tip · cooldown · plan gate · state
-  → MergeQueue.RunVerificationAsync                ← unchanged; ALL the behaviour still lives here
+  → AgentRefWatcher.Advanced                      [the sweep result, which was discarded before]
+  │
+  ├→ WorkerReadinessTrigger.NotifyAdvanced         arm/re-arm, restarting the quiet window
+  │  → WorkerReadinessTrigger.PollOnce             debounce · once-per-tip · cooldown · plan gate · state
+  │  → MergeQueue.RunVerificationAsync             ← unchanged; ALL the behaviour still lives here
+  │
+  └→ BranchTipInvalidator.NotifyAdvanced           NO debounce — a void verdict must not outlive one
+     → MergeQueue.NotifyBranchAdvanced             Verified/AwaitingReview → Working, record cleared
 ```
+
+The two subscribers are deliberately not one. The trigger answers *when to verify* and debounces so five
+commits cost one test run; the invalidator answers *is the evidence still about this branch* and must not
+wait, because the debounce window is exactly the window in which a human can merge a verdict that has
+already gone void.
 
 `GatewayServiceRegistration` builds it over the daemon's own `WorktreeManager.RefWatcher`, and
 `WorkerReadinessHostedService` exists solely to *resolve* it at boot — a DI singleton nobody asks for is

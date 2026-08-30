@@ -100,12 +100,17 @@ public sealed record ReadinessDecision(
 ///   refused before it produced a verdict; the queue writes no record and settles the entry back to
 ///   <c>Working</c>, and this type logs and stops. See <see cref="RunAsync"/>.</item>
 ///   <item><b>It only fires from a state where <c>Verifying</c> is a legal transition</b> —
-///   <c>Working</c> or <c>StaleVerified</c>. In particular a worker that pushes while its entry sits at
-///   <c>Verified</c> is NOT auto-verified: the state machine has no <c>Verified → Verifying</c> edge, and
-///   inventing one (or calling <c>NotifyNewCommits</c> from here to walk it back to <c>Working</c>) would be
-///   this trigger changing the merge spine's behaviour instead of triggering it. The human button has the
-///   same limitation today; it is recorded in <c>docs/design/verification-trigger.md</c> rather than
-///   quietly worked around.</item>
+///   <c>Working</c>, <c>StaleVerified</c> or <c>VerificationFailed</c>. A worker that pushes while its
+///   entry sits at <c>Verified</c> is still not auto-verified FROM HERE, and that is deliberate: the state
+///   machine has no <c>Verified → Verifying</c> edge, and inventing one would be this trigger changing the
+///   merge spine's behaviour instead of triggering it.
+///
+///   <para>It is no longer a hole, which it was for the life of this type. <see cref="BranchTipInvalidator"/>
+///   — the other subscriber on the same sweep — walks such an entry to <c>Working</c> the moment the tip
+///   moves, and this trigger then fires from <c>Working</c> like any other. The split is the point: the
+///   queue decides what a state means, this type decides only when to ask. Before it existed, a green
+///   entry that received new commits was verified by nothing, re-classified by nothing, and still offered
+///   Merge (2026-08-30, agent <c>4c43d17a</c>).</para></item>
 /// </list>
 ///
 /// <para><see cref="PollOnce"/> is public and does one complete sweep against an injectable clock, so every
@@ -344,10 +349,11 @@ public sealed class WorkerReadinessTrigger : IDisposable
         //    committed the repair, and only a human clicking Verify would ever find out. The trigger's
         //    existing bounds do the containment: once-per-tip means this fires only for a tip that has
         //    never been attempted, i.e. only for work the agent has actually pushed SINCE the failure, and
-        //    the cooldown bounds a grinder. (A Verified entry is still not re-fired on a push — the state
-        //    machine has no Verified → Verifying edge, and inventing one here would be this trigger
-        //    changing the merge spine rather than triggering it. That limitation is unchanged and is
-        //    recorded in docs/design/verification-trigger.md.)
+        //    the cooldown bounds a grinder. (A Verified entry is still not re-fired on a push FROM HERE —
+        //    the state machine has no Verified → Verifying edge, and inventing one here would be this
+        //    trigger changing the merge spine rather than triggering it. It no longer needs to:
+        //    BranchTipInvalidator walks that entry to Working off the same sweep, and this arm then fires
+        //    for it on the next pass.)
         var merge = queue.GetState(key.AgentId);
         if (merge is not (WorkerMergeState.Working or WorkerMergeState.StaleVerified
             or WorkerMergeState.VerificationFailed))

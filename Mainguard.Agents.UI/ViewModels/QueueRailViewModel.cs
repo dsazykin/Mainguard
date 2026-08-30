@@ -389,10 +389,27 @@ public partial class QueueEntryViewModel : ViewModelBase
     /// <summary>The single place the Verify affordance is decided, so the command and the stream
     /// refresh can never disagree about it.</summary>
     private void RecomputeCanVerify() =>
-        // Offered on every state a run can legally start from — including Verified, because
-        // RE-verifying against a moved main is the normal way a stale entry gets fresh again. Withheld
-        // while a run is in flight (the daemon refuses a concurrent one) and on the terminal states,
-        // where there is nothing left to verify.
+        // Offered on exactly the states the daemon's transition table can start a run FROM — Working,
+        // StaleVerified and VerificationFailed — and on nothing else.
+        //
+        // It used to be offered on Verified and AwaitingReview too, on the belief that "re-verifying
+        // against a moved main is the normal way a stale entry gets fresh again". That belief was about a
+        // state this button was not being offered for: a moved main puts the entry at StaleVerified, which
+        // IS a legal source. Verified and AwaitingReview are not, and never were — MergeQueue's Legal
+        // table has no Verified → Verifying edge — so pressing Verify there did the same thing every time
+        // for the life of the feature: `RunVerification refused … Illegal merge-state transition
+        // Verified → Verifying`, straight into the row's message slot (observed live 2026-08-30 02:18 on
+        // agent 4c43d17a, whose branch had by then moved three commits past its green). An action that is
+        // offered and always fails is worse than an absent one: it reads as the recovery the human is
+        // looking for, and it teaches them the product is broken rather than that the entry is fine.
+        //
+        // A Verified entry needs no Verify: it is green against its current tip. When that stops being
+        // true — the worker pushes again — the daemon walks the entry to Working
+        // (MergeQueue.NotifyBranchAdvanced) and this button comes back on its own, which is the recovery
+        // the old comment was reaching for.
+        //
+        // Withheld while a run is in flight (the daemon refuses a concurrent one) and on the terminal
+        // states, where there is nothing left to verify.
         //
         // …and withheld when the daemon says this entry has NO JAIL. Verification runs in the worker's own
         // sandbox and never on the host, so pressing Verify there can only ever produce "Agent 'x' has no
@@ -401,9 +418,8 @@ public partial class QueueEntryViewModel : ViewModelBase
         // strength of a fact the projection never supplied would be the worse mistake.
         CanVerify = !IsVerifyRequestInFlight
             && _hasLiveSandbox != false
-            && _lastState is not (
-                WorkerMergeState.Verifying or WorkerMergeState.Merged or WorkerMergeState.Rejected
-                or WorkerMergeState.Discarded);
+            && _lastState is WorkerMergeState.Working or WorkerMergeState.StaleVerified
+                or WorkerMergeState.VerificationFailed;
 
     /// <summary>Arms the destructive action. Nothing has been asked of the daemon yet.</summary>
     [RelayCommand]
