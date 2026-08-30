@@ -802,6 +802,154 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// <b>The cascade must not rebase onto a main the mirror has not caught up to yet.</b> Same "looks
+    /// mergeable and is not" shape as the test above, reached through a window rather than through a
+    /// missing component — and every cascade test written before it moved the MIRROR's main and then told
+    /// the queue about it, which is the one ordering in which the window cannot open.
+    ///
+    /// <para>What the daemon really does: <c>ConfirmMerge</c> fires the cascade from inside
+    /// <c>TryConfirmHumanMerge</c> and pulls the mirror's main forward AFTERWARDS. A cascade that got
+    /// there first carried the PRE-merge main into the agent's repository, <c>git rebase main</c> found
+    /// the branch already on top of it and exited 0 having moved nothing, and the cycle reported
+    /// <c>CleanNoop</c> — which <c>BranchIsOnTopOfMain</c> reads as "safe to re-verify". The entry then
+    /// went <c>Verified</c> against the new main with a branch that does not descend from it: green rail,
+    /// enabled Merge button, and a <c>--ff-only</c> that refuses forever.</para>
+    ///
+    /// <para>So the merge lands on ORIGIN only here, and the queue is told the new sha while the mirror
+    /// still holds the old one — the exact interleaving, reproduced deterministically instead of raced
+    /// for.</para>
+    /// </summary>
+    [Fact]
+    public async Task WhenTheMirrorHasNotSeenTheMergeYet_TheCascadeCatchesItUp_RatherThanMintingAFalseGreen()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        var provisioner = NewRebasingProvisioner(out _, jailFor: _ => ContainerId);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        // The human's merge lands on ORIGIN's main. The mirror knows nothing about it yet — which is the
+        // state ConfirmMerge is in at the instant it fires the cascade.
+        var mainBefore = ctx.Queue.CurrentMainSha;
+        WriteAndCommit(_source, "merged.cs", "public class Merged { }\n", "the human merge landing on origin main");
+        string newMain;
+        using (var origin = new Repository(_source))
+        {
+            newMain = origin.Head.Tip.Sha;
+        }
+
+        Assert.NotEqual(mainBefore, newMain);
+        Assert.Equal(mainBefore, MirrorMainSha(repoHash));   // precondition: the mirror IS behind
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, newMain);
+        await ctx.Queue.LastCascade;
+
+        // (1) The mirror was caught up, so the branch was reparented onto the main the queue pins
+        // verifications against — not onto the one the mirror happened to still be holding.
+        Assert.Equal(newMain, MirrorMainSha(repoHash));
+
+        // (2) The two answers that used to disagree, and the reason this window was worth closing: the
+        // queue believes the co-tenant can merge, and git agrees the merge would land.
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(SecondAgent));
+        Assert.True(ctx.Queue.CanMerge(SecondAgent, out var reason), reason);
+        Assert.True(FastForwardsOntoMain(repoHash, SecondAgent),
+            "the co-tenant re-verified against the new main without ever being reparented onto it — "
+            + "its --ff-only merge would still refuse");
+    }
+
+    /// <summary>
+    /// The belt, on the one path that can still reach it: a publish that <b>reports success and did not
+    /// publish</b>. The keep-alive cycle really did reparent the worktree, the cycle really does say
+    /// <c>Rebased</c>, and the mirror — the ref the queue verifies and the human merges — still holds a
+    /// branch that does not descend from main.
+    ///
+    /// <para>Re-verifying on the strength of the cycle's own report is what produced the permanently
+    /// unmergeable <c>Verified</c> entry; asking git directly is what cannot be fooled by it. The entry
+    /// lands on <c>Working</c> carrying the measurement, which is the cascade's one honest terminus.</para>
+    /// </summary>
+    [Fact]
+    public async Task ARebasedBranchThatNeverReachedTheMirror_IsNotReVerified_EvenThoughThePublishSaidYes()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        // The lying publisher: the daemon's own signature, an answer of true, and no ref written.
+        var provisioner = NewRebasingProvisioner(
+            out _, jailFor: _ => ContainerId, publishRebased: (_, _) => true);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Contains("does not descend from main", reason);
+        Assert.Contains(_audit.Read(), e =>
+            e.Type == MergeQueue.RequeueBlockedEvent
+            && e.Fields["agent"] == SecondAgent
+            && e.Fields["detail"].StartsWith("not-descended", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// The other side of catching the mirror up, and the hazard it introduces: the catch-up is a
+    /// <b>forced</b> single-refspec fetch from origin, so firing it at a mirror that is AHEAD of the
+    /// queue's <c>main@sha</c> would drag the mirror's main <i>backwards</i> to whatever origin holds —
+    /// and the cascade would then reparent every co-tenant onto a main the human has already moved past.
+    ///
+    /// <para>Ahead is a state the daemon really passes through (the mirror is advanced at merge-confirm,
+    /// the queue's own main by the confirm and by <c>EnsureQueue</c>'s reconcile, and they are not one
+    /// write), and it is not this cascade's business: a mirror that already CONTAINS the queue's main
+    /// needs no catching up. So the catch-up is asked only of a mirror that is genuinely behind.</para>
+    /// </summary>
+    [Fact]
+    public async Task AMirrorAlreadyAheadOfTheQueue_IsLeftAlone_NotDraggedBackToOrigin()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        var ctx = NewRebasingProvisioner(out _, jailFor: _ => ContainerId).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+
+        // The first agent lands a SECOND commit, so its branch carries two the mirror's main can walk to.
+        WriteAndCommit(
+            new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, FirstAgent),
+            "first-again.cs", "public class FirstAgain { }\n", "the first agent's second commit");
+        new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, FirstAgent);
+
+        // The mirror's main goes to the newer of the two; origin knows about neither.
+        var ahead = FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent);
+        string behind;
+        using (var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash)))
+        {
+            behind = mirror.Lookup<Commit>(ahead).Parents.First().Sha;
+        }
+
+        // ...and the QUEUE is told about the older one — an ancestor of what the mirror holds.
+        ctx.Queue.NotifyMainMoved(behind);
+        await ctx.Queue.LastCascade;
+
+        // The mirror was not touched, and the co-tenant was reparented rather than blocked.
+        Assert.Equal(ahead, MirrorMainSha(repoHash));
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(SecondAgent));
+        Assert.True(FastForwardsOntoMain(repoHash, SecondAgent));
+    }
+
+    /// <summary>The mirror's own <c>main</c> — the ref the keep-alive rebase resolves its target from.</summary>
+    private string MirrorMainSha(string repoHash)
+    {
+        using var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash));
+        return mirror.Head.Tip.Sha;
+    }
+
+    /// <summary>
     /// Decision: a staled entry whose agent has been STOPPED must not become a second permanent-stuck
     /// state.
     ///
@@ -1215,9 +1363,12 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// locator, so its queues REPARENT a staled branch instead of only re-running its tests.
     /// </summary>
     /// <param name="jailFor">agentId → its live jail, or null when the agent has been stopped.</param>
+    /// <param name="publishRebased">Overrides the daemon's rebased-branch publish. Only the belt test
+    /// passes one — a publisher that answers TRUE and writes no ref.</param>
     private MergeQueueProvisioner NewRebasingProvisioner(
         out FakeSandboxEngine engine, Func<string, string?> jailFor,
-        RecordingSupervisor? supervisor = null, int exitCode = 0)
+        RecordingSupervisor? supervisor = null, int exitCode = 0,
+        Func<string, string, bool>? publishRebased = null)
     {
         var sandbox = new FakeSandboxEngine(exitCode);
         engine = sandbox;
@@ -1245,8 +1396,8 @@ public sealed class MergeQueueProvisionerTests : IDisposable
                 sandbox: sandbox,
                 containerIdFor: jailFor),
             locateAgentWorktree: (repoHash, agentId) => new WorktreeManager(vmRoot).WorktreePathFor(repoHash, agentId),
-            publishRebasedAgentRef: (repoHash, agentId) =>
-                new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId),
+            publishRebasedAgentRef: publishRebased ?? ((repoHash, agentId) =>
+                new WorktreeManager(vmRoot).PublishRebasedAgentBranch(repoHash, agentId)),
             agentStates: supervisor);
     }
 

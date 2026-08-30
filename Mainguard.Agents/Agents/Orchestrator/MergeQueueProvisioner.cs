@@ -978,6 +978,32 @@ public sealed class MergeQueueProvisioner
             return;
         }
 
+        // The main this branch is reparented ONTO must be the main its re-verification will be pinned
+        // AGAINST. LocateAgentWorktree resolves both from the same mirror so the two cannot be different
+        // REFS — and for a window they were the same ref at two different SHAS, which is the same defect
+        // wearing a clock. `ConfirmMerge` fires this cascade from inside `TryConfirmHumanMerge` and pulls
+        // the mirror's main forward AFTERWARDS, so a cascade that got here first carried the PRE-merge
+        // main into the agent's repository; `git rebase main` then found the branch already on top of it,
+        // exited 0 without moving anything, and the cycle reported `CleanNoop` — which
+        // `BranchIsOnTopOfMain` reads as "this may be re-verified". The entry went green against the new
+        // main while its branch did not descend from it, and the human's `--ff-only` merge refused it
+        // forever, with the rail reading "ready to merge".
+        //
+        // This is the half of the defect `KeepAliveRebaser.TryRefreshMainFromMirror` did not close.
+        // Reading the fetch's exit code closed the case where the fetch FAILS; a fetch that succeeds
+        // against a mirror which is merely BEHIND establishes a main just as confidently, and the wrong
+        // one. So the mirror is caught up here — the same one-refspec pull the merge-confirm makes, made
+        // idempotent so the cascade never has to win a race with it — and a mirror that still disagrees
+        // blocks rather than mints a green.
+        if (!TryAlignMirrorMain(repoHandle, queue.CurrentMainSha, out var mirrorMain))
+        {
+            Block(repoHandle, agentId, queue,
+                "this branch is not on top of the new main yet — the daemon's mirror is still on an older "
+                + "main and could not be caught up, so a rebase now would reparent it onto the wrong commit",
+                $"mirror-main-behind:{mirrorMain}");
+            return;
+        }
+
         RebaseCycleResult cycle;
         try
         {
@@ -1025,11 +1051,91 @@ public sealed class MergeQueueProvisioner
             return;
         }
 
+        // The belt on the whole re-entry, asked of git rather than inferred from a cycle kind: does the
+        // branch the queue is about to verify actually DESCEND from the main that verification will be
+        // pinned to? That is the single predicate `BranchIsOnTopOfMain` stands for, and every way the
+        // cascade has ever got it wrong — a stale rebase target, a rebase that exited 0 having moved
+        // nothing, a publish that reported success — ends with this answer being no. It costs one
+        // `merge-base` and it does not depend on any event having fired, which is why it stays even though
+        // the alignment above makes it unreachable on a wired daemon.
+        //
+        // It refuses only on a POSITIVE mismatch: both shas must be readable. A substrate with no mirror
+        // (the pure-unit doubles) answers nothing, and inventing a refusal from ignorance would strand
+        // every entry on it.
+        if (!BranchDescendsFromMain(repoHandle, agentId, queue.CurrentMainSha, out var branchTip))
+        {
+            Block(repoHandle, agentId, queue,
+                "this branch is not on top of the new main yet — the keep-alive cycle reported success but "
+                + "the published branch still does not descend from main, so the merge would be refused",
+                $"not-descended:{branchTip}");
+            return;
+        }
+
         _log?.Invoke(
             $"merge queue repo={repoHandle} agent={agentId} reparented onto main "
             + $"(wip={cycle.WipCommitCreated}) — re-verifying");
 
         await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Establishes that the mirror's main is the main the QUEUE moved to, catching the mirror up if it is
+    /// not. See the call site for the defect this closes.
+    /// </summary>
+    /// <param name="expectedMainSha">The queue's own <c>main@sha</c>. Empty means the queue has never been
+    /// told one (the substrate-less doubles), and there is nothing to establish — aligned by definition.</param>
+    /// <param name="mirrorMain">The mirror's main after the attempt, for the audit detail.</param>
+    private bool TryAlignMirrorMain(string repoHandle, string expectedMainSha, out string mirrorMain)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        var mainBranch = ResolveDefaultBranch(barePath);
+        mirrorMain = RevParse(barePath, mainBranch);
+
+        if (string.IsNullOrEmpty(expectedMainSha)
+            || string.Equals(mirrorMain, expectedMainSha, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        // Only a mirror we can READ can be known to be behind. An unreadable one is the substrate-less
+        // shape, and refusing from ignorance would block every cascade on it.
+        if (string.IsNullOrEmpty(mirrorMain))
+        {
+            return true;
+        }
+
+        // A mirror that already CONTAINS the queue's main is ahead of it, not behind it, and the refresh
+        // below is a FORCED single-refspec fetch — running it here would drag the mirror's main backwards
+        // to whatever origin happens to hold. Being ahead is not this method's business (it is the
+        // pre-existing shape, and the reconcile owns it); being behind is.
+        if (TryGit(barePath, out _, "merge-base", "--is-ancestor", expectedMainSha, mainBranch))
+        {
+            return true;
+        }
+
+        TryRefreshMirrorMainAfterMerge(repoHandle, out _);
+        mirrorMain = RevParse(barePath, mainBranch);
+        return string.Equals(mirrorMain, expectedMainSha, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Whether the mirror's <c>agent/&lt;id&gt;</c> really contains the queue's main — the predicate the
+    /// whole re-entry exists to establish, asked of git. False only when BOTH shas are known and the
+    /// answer is no.
+    /// </summary>
+    private bool BranchDescendsFromMain(
+        string repoHandle, string agentId, string expectedMainSha, out string branchTip)
+    {
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        var branchRef = $"refs/heads/agent/{agentId}";
+        branchTip = RevParse(barePath, branchRef);
+
+        if (string.IsNullOrEmpty(expectedMainSha) || string.IsNullOrEmpty(branchTip))
+        {
+            return true;
+        }
+
+        return TryGit(barePath, out _, "merge-base", "--is-ancestor", expectedMainSha, branchRef);
     }
 
     /// <summary>
