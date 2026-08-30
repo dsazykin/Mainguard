@@ -973,6 +973,52 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// The record the provisioner writes is pinned to the mirror's <b>real</b> <c>agent/&lt;id&gt;</c> tip,
+    /// and to the tip AFTER the pre-verification publish — not to whatever the mirror held before.
+    ///
+    /// <para>This is the fact the whole freeze fix rests on, and it is the one part of it that cannot be
+    /// asserted anywhere but here, against real git: everything downstream — the invalidation, the
+    /// mid-run demotion, the merge gate's branch-side compare — reads
+    /// <c>VerificationRecord.BranchSha</c>, and all of it is inert if this method hands back an empty
+    /// string or a stale sha. The record already pinned <c>main@sha</c> this way; the branch side was
+    /// simply never recorded, which is why the queue could not ask whether the tree it verified still
+    /// existed.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheVerificationRecord_IsPinnedToTheMirrorsRealAgentBranchTip()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var ctx = NewProvisioner(exitCode: 0, out _).EnsureQueue(repoHash)!;
+        var first = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.Equal(MirrorTip(repoHash, AgentId), first.BranchSha);
+        Assert.NotEqual(first.MainSha, first.BranchSha);
+
+        // …and a SECOND run after the agent commits again is pinned to the new tip. The publish that
+        // carries that commit into the mirror happens inside this same call, so a record built before it
+        // would silently name the previous tree — the freeze, one layer down.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, AgentId);
+        WriteAndCommit(worktree, "second.cs", "public class Second { }\n", "more work");
+
+        ctx.Queue.NotifyNewCommits(AgentId);
+        var second = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.NotEqual(first.BranchSha, second.BranchSha);
+        Assert.Equal(MirrorTip(repoHash, AgentId), second.BranchSha);
+    }
+
+    /// <summary>The mirror's current <c>refs/heads/agent/&lt;id&gt;</c> — the ref the merge consumes.</summary>
+    private string MirrorTip(string repoHash, string agentId)
+    {
+        using var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash));
+        var branch = mirror.Refs["refs/heads/agent/" + agentId]
+            ?? throw new InvalidOperationException("the mirror has no branch for " + agentId);
+        return branch.ResolveToDirectReference().TargetIdentifier;
+    }
+
+    /// <summary>
     /// Advances the mirror's main to <paramref name="reference"/> and returns the new sha — the mirror-side
     /// result of a human <c>git merge --ff-only agent/&lt;id&gt;</c> on their own checkout.
     ///

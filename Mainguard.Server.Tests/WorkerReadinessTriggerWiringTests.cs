@@ -13,7 +13,8 @@ using Xunit;
 namespace Mainguard.Server.Tests;
 
 /// <summary>
-/// The automatic verification trigger is actually RUNNING in the daemon, over the daemon's own ref watcher.
+/// The two ref-watcher subscribers — the automatic verification trigger and the branch-tip invalidator —
+/// are actually RUNNING in the daemon, over the daemon's own ref watcher.
 ///
 /// <para>The trigger has no RPC, no client and no other consumer: a DI singleton nobody resolves is never
 /// constructed, so it would never subscribe and never sweep, and every unit test of its rules would still
@@ -56,6 +57,36 @@ public sealed class WorkerReadinessTriggerWiringTests
         Assert.Contains(
             host.Services.GetServices<IHostedService>(),
             s => s is Mainguard.Server.Runtime.WorkerReadinessHostedService);
+    }
+
+    /// <summary>
+    /// The OTHER subscriber on that same watcher, asserted for the same reason and against the same
+    /// instance: <see cref="BranchTipInvalidator"/> is what walks a <c>Verified</c> entry back to
+    /// <c>Working</c> when its branch moves past the tip it was verified on.
+    ///
+    /// <para>It is a stricter requirement than the trigger's, not a parallel one. A trigger that is
+    /// registered and never resolved costs automation — a human can still press Verify. An invalidator
+    /// that is registered and never resolved costs correctness: the entry stays green, the cockpit says
+    /// "ready to merge", and Merge stays enabled for a tip nothing ever ran against. That is the defect
+    /// this type exists to end, and the way it comes back is silently, in this file's absence.</para>
+    /// </summary>
+    [Fact]
+    public void TheDaemonBuildsTheBranchTipInvalidator_OverThatSameRefWatcher()
+    {
+        using var vmRoot = new TempVmRoot();
+        using var host = NewHost(vmRoot.Path);
+
+        var invalidator = host.Services.GetService<BranchTipInvalidator>();
+        Assert.NotNull(invalidator);
+
+        var worktrees = Assert.IsType<WorktreeManager>(
+            host.Services.GetRequiredService<IAgentEnvironment>().Worktrees);
+        Assert.Same(worktrees.RefWatcher, invalidator!.Source);
+
+        // …and the same watcher the trigger rides, which is what makes "one observation, two listeners"
+        // a fact rather than a diagram.
+        Assert.Same(
+            host.Services.GetRequiredService<WorkerReadinessTrigger>().Source, invalidator.Source);
     }
 
     private static Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program> NewHost(string vmRoot)

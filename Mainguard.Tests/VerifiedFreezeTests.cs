@@ -7,6 +7,7 @@ using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Git.Audit;
 using Mainguard.Agents.UI.ViewModels;
+using Microsoft.EntityFrameworkCore;
 using Mainguard.Git.Review;
 using Xunit;
 using VerificationRecord = Mainguard.Agents.Agents.Orchestrator.VerificationRecord;
@@ -526,6 +527,42 @@ public class VerifiedFreezeTests
             new StubQueue());
 
         Assert.Equal(expected, row.CanVerify);
+    }
+
+    // ---- …and it has to survive a restart ---------------------------------
+
+    /// <summary>
+    /// The branch sha round-trips through the daemon's SQLite store.
+    ///
+    /// <para>Without this column every check that reads it silently disables itself at the next daemon
+    /// bounce: <c>MergeQueue.Hydrate</c> rebuilds <c>_lastVerification</c> from the store, so a record
+    /// that came back with an empty <c>BranchSha</c> is a record the freshness compare declines to answer
+    /// about — a gate that works until you restart is not a gate, and it fails in the direction of
+    /// allowing the merge.</para>
+    ///
+    /// <para>The empty case is asserted alongside, because it is the shape of every row written before
+    /// this column existed and it must remain readable rather than becoming a null-reference at boot.</para>
+    /// </summary>
+    [Fact]
+    public void TheBranchSha_RoundTripsThroughTheDaemonStore()
+    {
+        using var connection = new Microsoft.Data.Sqlite.SqliteConnection("DataSource=:memory:");
+        connection.Open();
+        var options = new Microsoft.EntityFrameworkCore.DbContextOptionsBuilder<Mainguard.Git.AppDbContext>()
+            .UseSqlite(connection).Options;
+        using (var db = new Mainguard.Git.AppDbContext(options))
+        {
+            db.Database.EnsureCreated();
+        }
+
+        var store = new DbVerificationStore(() => new Mainguard.Git.AppDbContext(options));
+        store.Insert("repo", new VerificationRecord(
+            "w-1", "main-sha", true, "log.txt", "npm test", "cfg", T0, "branch-tip-sha"));
+        store.Insert("repo", new VerificationRecord(
+            "w-2", "main-sha", true, "log.txt", "npm test", "cfg", T0));
+
+        Assert.Equal("branch-tip-sha", store.Latest("repo", "w-1")!.BranchSha);
+        Assert.Equal(string.Empty, store.Latest("repo", "w-2")!.BranchSha);
     }
 
     /// <summary>A rail row needs a queue seam; nothing here presses anything, so every call throws.</summary>

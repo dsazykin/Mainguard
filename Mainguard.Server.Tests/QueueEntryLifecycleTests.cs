@@ -538,6 +538,38 @@ public sealed class QueueEntryLifecycleTests
     /// the checks under test are the real ones. "merging" is always tracked (the lease cases verify it);
     /// callers add whatever else they need.
     /// </summary>
+    /// <summary>
+    /// The <c>verified_main_sha</c> the daemon projects is the main the RECORD ran against, not the main
+    /// of this instant.
+    ///
+    /// <para>The wire has always documented the field as "the main@sha this branch's verification ran
+    /// against" and the daemon has always filled it with <c>queue.CurrentMainSha</c>, so the review
+    /// cockpit's "verified @ &lt;sha&gt;" stamp named today's main whatever the evidence was measured on.
+    /// A <c>StaleVerified</c> entry is where the two are guaranteed to differ, and it is exactly where the
+    /// stamp asserted the freshness the state exists to deny — the header a human read as "verified @
+    /// ffbc3bc" while the verdict behind it belonged to a different moment.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheProjectedVerifiedSha_IsTheMainTheRecordRanAgainst_NotTodays()
+    {
+        using var host = new DaemonFixture();
+        var queue = SeedQueue(host, host.Services.GetRequiredService<IAuditLog>());
+        queue.EnsureEntry("verified-once", MergeEntryOrigin.Local);
+        await queue.RunVerificationAsync("verified-once", CancellationToken.None);
+
+        // A co-tenant merges: main moves, and this entry's evidence stays pinned to the old one.
+        queue.NotifyMainMoved("main-sha-moved");
+        await queue.LastCascade;
+
+        var client = new MergeQueueService.MergeQueueServiceClient(host.CreateChannel());
+        var headers = new Metadata { { "authorization", "Bearer " + host.Token } };
+        var entry = Assert.Single(
+            (await SnapshotAsync(client, headers)).Entries, e => e.AgentId == "verified-once");
+
+        Assert.Equal(MainSha, entry.VerifiedMainSha);
+        Assert.NotEqual("main-sha-moved", entry.VerifiedMainSha);
+    }
+
     private MergeQueue SeedQueue(DaemonFixture host, IAuditLog audit, IMergeQueueStore? store = null)
     {
         var registry = host.Services.GetRequiredService<MergeQueueRegistry>();
