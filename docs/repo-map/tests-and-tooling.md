@@ -2876,6 +2876,15 @@
   idempotent, nothing at all for an unflagged agent, the latest drift rather than the first when an armed
   item changes, `(not recorded)` vs `(absent)` vs the content kept apart, the excerpt cap with the full
   content still hashed, and `unknown` when nobody is named.
+- **`Mainguard.Tests/MergeIdentityTests.cs`** (K1–K6 — §23 of the phase-3 decisions doc) — merge
+  identity: that what is recorded, merged or reconciled is the thing the decision was made about, and
+  that an unanswerable question refuses. The RT-D1 boot reconcile refusing to synthesize `Merged` from a
+  DIFFERENT branch's merge (which satisfies every non-identity filter — kind, window, and the exact
+  pre/post main shas), from a hand commit on main, and from a main that did not move forward; the
+  journal fallback used only for an entry that names this branch; an unreadable main read as undecidable
+  rather than as "never committed"; the foreground merge consuming the ref it just fetched rather than a
+  stale local `agent/<id>`, and refusing outright when neither is the sha the queue verified; and the
+  keep-alive guard re-reading the `GitDirState` it decided from after the `index.lock` backoff.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---
