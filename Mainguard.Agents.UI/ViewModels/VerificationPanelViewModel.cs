@@ -251,9 +251,12 @@ public partial class VerificationPanelViewModel : ViewModelBase
     /// they are the permanent record of what was true when the entry left the queue.</para>
     /// </summary>
     private static bool VerdictStillStands(WorkerMergeState state) =>
-        state is not (WorkerMergeState.Working
-                   or WorkerMergeState.Verifying
-                   or WorkerMergeState.StaleVerified);
+        state is WorkerMergeState.Verified
+              or WorkerMergeState.AwaitingReview
+              or WorkerMergeState.VerificationFailed
+              or WorkerMergeState.Merged
+              or WorkerMergeState.Rejected
+              or WorkerMergeState.Discarded;
 
     private static string Capitalize(string value) =>
         value.Length == 0 ? value : char.ToUpperInvariant(value[0]) + value[1..];
