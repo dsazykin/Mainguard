@@ -292,7 +292,16 @@
   expanded log is genuinely on screen in `FontMono` and not merely bound, that an entry with no record is
   offered no reader at all, that truncation / a missing artifact / a silent run are three distinct
   sentences rather than one empty box, that a new verdict drops the log the old one was read for, and that
-  the worker pane reads the identical verdict (it composes the same panel). PNGs:
+  the worker pane reads the identical verdict (it composes the same panel). **Extended (the stale pass):**
+  the live defect was a card reading `Tests passed · node test.js · <timestamp>` directly above "rebasing
+  this branch onto the new main hit a conflict…", so the stub can put the GREEN entry exactly there —
+  `Working`, the daemon's own conflict sentence as its detail, its passing verdict untouched. Asserted:
+  the row still reports a PASS (the record is qualified, not rewritten into a failure), says "stale" and
+  "not for the branch as it now stands" inside the verdict clause, keeps its command/timestamp provenance,
+  and is still un-mergeable — presentation, not authorisation. Paired with the same verdict on a
+  `Verified` entry, which must stay unqualified, since marking everything stale is the same defect
+  mirrored. Its colour reading is asserted per theme too: `WarningBrush` for the stale row while the
+  failed row stays `DangerBrush` and the never-run row stays `TextMuted`. PNGs:
   `verification_outcomes_<Theme>.png`, `verification_log_open_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix

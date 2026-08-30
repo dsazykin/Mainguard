@@ -65,6 +65,25 @@ public partial class VerificationPanelViewModel : ViewModelBase
     [ObservableProperty] private bool _isPassed;
 
     /// <summary>
+    /// The record is real, and the branch has moved out from under it — so it is no longer a result ABOUT
+    /// this branch.
+    ///
+    /// <para>The observed defect: a queue entry whose keep-alive rebase had conflicted rendered
+    /// <c>Tests passed · node test.js · &lt;timestamp&gt;</c> immediately above "rebasing this branch onto
+    /// the new main hit a conflict…". Both lines were true of different moments and the pass was the one
+    /// that read as the answer. The merge was correctly blocked (<c>CanMerge</c> is unaffected by any of
+    /// this), so what was wrong was the sentence — which is the worse half: a human deciding what to do
+    /// with a conflicted branch was being shown a green they could not act on.</para>
+    ///
+    /// <para>The house idiom is <c>WorkerMergeState.StaleVerified</c> and
+    /// <c>WorkerPlanGate.MergeEvidence</c>: a record never asserts something that is no longer true, and
+    /// "was true then" gets its own wording rather than being collapsed into "is true". Same rule here,
+    /// and it applies to a red record too — a failure the agent has already pushed a fix for describes
+    /// code that no longer exists.</para>
+    /// </summary>
+    [ObservableProperty] private bool _isStale;
+
+    /// <summary>
     /// The verdict as a sentence: what happened, what command decided it, and when. The command is
     /// provenance and not decoration — a branch that rewrote its own test command produces a green that
     /// means nothing, and a reviewer has to see WHAT ran.
@@ -111,6 +130,8 @@ public partial class VerificationPanelViewModel : ViewModelBase
         HasRecord = verdict is not null;
         IsFailed = verdict is { Passed: false };
         IsPassed = verdict is { Passed: true };
+        // Only a record can be stale. "No run, and it's out of date" is not a fact about anything.
+        IsStale = verdict is not null && entry is not null && !VerdictStillStands(entry.State);
 
         if (verdict is null)
         {
@@ -122,6 +143,15 @@ public partial class VerificationPanelViewModel : ViewModelBase
         }
 
         var parts = verdict.Passed ? "Tests passed" : "Tests failed";
+        if (IsStale)
+        {
+            // The qualifier is part of the verdict clause, not a footnote after it. A reader who stops at
+            // the first three words has to have been told already — that is the whole failure being fixed,
+            // and it is why this is not a separate line under the facts.
+            parts += " — but not for the branch as it now stands: this ran before the branch or the main "
+                   + "it was measured against moved, so the result is stale";
+        }
+
         if (!string.IsNullOrWhiteSpace(verdict.ResolvedCommand))
         {
             parts += " · " + verdict.ResolvedCommand;
@@ -205,6 +235,25 @@ public partial class VerificationPanelViewModel : ViewModelBase
                 ? "Showing the end of a longer log — the run printed more than is kept."
                 : "";
     }
+
+    /// <summary>
+    /// Whether the entry's recorded verdict still describes the branch as it now stands.
+    ///
+    /// <para>Written as the positive list, so a state added later is stale until somebody decides it is
+    /// not — the safe direction, since the failure this closes is a record over-claiming. The three that
+    /// are excluded each moved the branch or its main out from under the run:
+    /// <c>StaleVerified</c> is that fact by name; <c>Working</c> is where the queue puts an entry whose
+    /// agent pushed new commits AND where the stale cascade parks one whose keep-alive rebase could not
+    /// reparent it (the conflict case that produced this defect); <c>Verifying</c> means a newer run is
+    /// under way and the verdict on screen belongs to the previous one.</para>
+    ///
+    /// <para><c>Merged</c>/<c>Rejected</c>/<c>Discarded</c> are NOT stale: nothing moved under them, and
+    /// they are the permanent record of what was true when the entry left the queue.</para>
+    /// </summary>
+    private static bool VerdictStillStands(WorkerMergeState state) =>
+        state is not (WorkerMergeState.Working
+                   or WorkerMergeState.Verifying
+                   or WorkerMergeState.StaleVerified);
 
     private static string Capitalize(string value) =>
         value.Length == 0 ? value : char.ToUpperInvariant(value[0]) + value[1..];

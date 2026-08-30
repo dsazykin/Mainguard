@@ -349,8 +349,11 @@
       cannot push the row's actions off the surface, and horizontal scrolling is ON here (unlike the rail's
       wrapping identifiers) for the reason `ReviewCockpitView` scrolls its diff sideways — wrapping a stack
       trace destroys the alignment that makes it readable. `SelectableTextBlock` in `FontMono`, because the
-      reason a person opens a failing log is usually to copy the assertion out of it. The same control is
-      hosted by `AgentDocumentView`'s review section),
+      reason a person opens a failing log is usually to copy the assertion out of it. The verdict line has
+      three readings by token: `TextMuted` for a current pass or a never-run, `WarningBrush` for a STALE
+      record (a pass the branch has moved out from under must not read like a current one), `DangerBrush`
+      for a failure — `.stale` is declared BEFORE `.failed` so a stale red still reads as a failure. The
+      same control is hosted by `AgentDocumentView`'s review section),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line; **harness-only** — constructed solely by
       `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (the coordinator
@@ -710,7 +713,16 @@
     calls `RunVerificationAsync`, because charging a human a minutes-long jail run to find out why a run
     failed is the problem, not the fix. `LogNotice` keeps the daemon's distinct answers distinct —
     truncated tail / artifact gone / run printed nothing / daemon unreachable — so none of them renders as
-    an empty box), `AgentDocumentViewModel` +
+    an empty box. `IsStale` is the fourth distinction and the one a live run found missing: a conflicted
+    keep-alive rebase parks an entry back at `Working` WITHOUT clearing its verdict, so a card read
+    `Tests passed · node test.js · <timestamp>` directly above "rebasing this branch onto the new main
+    hit a conflict…". The record is qualified, never rewritten — `IsPassed` stays true and `CanMerge` is
+    untouched, since the authorisation was right and only the sentence was wrong — and the qualifier goes
+    INSIDE the verdict clause so a reader who stops at the first three words has already been told.
+    `VerdictStillStands` is the positive list (`Working`/`Verifying`/`StaleVerified` are the states that
+    moved the branch or its main out from under a run; `Merged`/`Rejected`/`Discarded` did not), written
+    that way so a state added later is stale until someone decides it is not),
+    `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
     Merge button, plus the shared `Verification` panel and a `VerifiedAgainstText` main@sha stamp — these
