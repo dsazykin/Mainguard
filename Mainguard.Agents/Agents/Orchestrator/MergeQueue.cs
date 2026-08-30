@@ -309,7 +309,34 @@ public sealed class MergeQueue : IMergeQueue
     /// verification (<see cref="NotifyBranchAdvanced"/> and the settle in
     /// <see cref="RunVerificationAsync"/>). Cleared by any move OFF <c>Working</c>.
     /// </summary>
-    private readonly Dictionary<string, string> _workingReasons = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, WorkingReason> _workingReasons = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// A measured refusal for a <c>Working</c> entry, and whether it already accounts for that entry's
+    /// sandbox being gone.
+    ///
+    /// <para><b>Why the flag exists.</b> <see cref="CanMergeLocked"/> has two candidate sentences for a
+    /// stranded <c>Working</c> entry — this measured one and the generic <see cref="StrandedReason"/> —
+    /// and neither is right in both directions. The cascade's no-jail terminus ("this branch needs
+    /// rebasing onto the new main and its agent has no live sandbox — resume the agent") says everything
+    /// <see cref="StrandedReason"/> says <i>and</i> why the branch is back at <c>Working</c>, so letting
+    /// the generic line win discards the only sentence naming both facts — which is exactly what happened
+    /// live on 2026-08-30 to the three co-tenants of the merge that moved main. But the cascade's OTHER
+    /// termini ("the agent is paused with the rebase in progress", "the keep-alive rebase was skipped")
+    /// were every one of them measured with a live jail in hand; if the sandbox has since gone, they
+    /// instruct a human to act inside a container that no longer exists. So the measured reason outranks
+    /// the generic one exactly when it was itself derived from the missing sandbox, and never otherwise.</para>
+    ///
+    /// <para>Not persisted, deliberately, for the reason <see cref="_branchTip"/> is not: it is a
+    /// MEASUREMENT of one cascade attempt at one instant, and a measurement written to SQLite outlives its
+    /// own truth. After a restart the reason is gone and <see cref="_stranded"/> — which
+    /// <see cref="ReconcileJails"/> re-measures against the live container runtime — is what answers, which
+    /// is the correct ordering of a remembered claim and a fresh one.</para>
+    /// </summary>
+    /// <param name="Reason">The sentence <see cref="CanMerge"/> renders verbatim.</param>
+    /// <param name="AccountsForMissingSandbox">True when the reason was produced BY observing that this
+    /// entry has no live sandbox, so <see cref="StrandedReason"/> would only restate it less precisely.</param>
+    private readonly record struct WorkingReason(string Reason, bool AccountsForMissingSandbox);
 
     /// <summary>
     /// The newest <c>refs/heads/agent/&lt;id&gt;</c> tip this queue has been told about, per entry — the
@@ -669,7 +696,9 @@ public sealed class MergeQueue : IMergeQueue
                 // caller asked for it. What is refused is promoting it to this entry's standing evidence.
                 _lastVerification[agentId] = null;
                 _verifiedAt[agentId] = null;
-                _workingReasons[agentId] = BranchMovedReason;
+                // Not sandbox-aware: nothing here probed the jail. A stranded entry carrying this reason
+                // gets StrandedReason instead — see WorkingReason.
+                _workingReasons[agentId] = new WorkingReason(BranchMovedReason, AccountsForMissingSandbox: false);
                 SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
             }
             else if (record.Passed)
@@ -968,7 +997,9 @@ public sealed class MergeQueue : IMergeQueue
             // Said out loud rather than left to fall into "not verified yet": the human was one click from
             // merging this entry a moment ago, and the reason it is no longer offered is a fact about
             // THEIR branch, not a generic absence.
-            _workingReasons[agentId] = BranchMovedReason;
+            // Not sandbox-aware: this was decided from a ref moving in the mirror, with no question asked
+            // about the agent's jail. A stranded entry carrying this reason gets StrandedReason instead.
+            _workingReasons[agentId] = new WorkingReason(BranchMovedReason, AccountsForMissingSandbox: false);
             SetStateLocked(agentId, WorkerMergeState.Working);
         }
 
@@ -1006,16 +1037,34 @@ public sealed class MergeQueue : IMergeQueue
     /// the measured reason is the difference between an entry a human can act on and one that lies to
     /// them on every refresh.</para>
     ///
-    /// <para>The verification record is cleared with the state, exactly as <see cref="NotifyNewCommits"/>
-    /// does: whatever evidence existed was against a main this branch is no longer parented on.</para>
+    /// <para><b>The verification RECORD is kept</b> — and this is the half that was wrong. The
+    /// <c>VerifiedAtUtc</c> stamp goes, because the entry is no longer verified against anything it could
+    /// merge into; the record itself stays, because it is still evidence about THIS tree. That is exactly
+    /// the distinction <c>StaleVerified</c> is built on (§19.3: "the evidence is still ABOUT this tree,
+    /// measured against an old main"), and this method is reached only from entries the cascade just moved
+    /// through <c>StaleVerified</c> — the branch's bytes did not change, only its parentage. Clearing it
+    /// erased the one thing the row could still honestly say. Observed live on 2026-08-30: three
+    /// co-tenants of a merge, each holding a PASSING <c>VerificationRow</c> (ids 49, 50, 52), rendered
+    /// "Not verified yet — no test run has been recorded for this branch."</para>
+    ///
+    /// <para><b>And it cannot leak into a merge.</b> <see cref="CanMergeLocked"/> reads the record only for
+    /// <c>Verified</c>/<c>AwaitingReview</c>; the only edge out of <c>Working</c> that is not terminal is
+    /// <c>Verifying</c>, whose settle overwrites the record before it can reach either. A retained record
+    /// is readable history and never standing evidence.</para>
     /// </summary>
     /// <param name="agentId">The entry the cascade could not reparent.</param>
     /// <param name="reason">Render-verbatim explanation (§3.4 vocabulary), e.g. the missing jail or the
     /// rebase conflict. Empty falls back to the generic wording.</param>
     /// <param name="detail">Optional extra field for the audit event (never shown as the gate reason).</param>
+    /// <param name="sandboxIsGone">True when <paramref name="reason"/> was produced BY establishing that
+    /// this entry has no live sandbox. It makes the reason outrank <see cref="StrandedReason"/>, which
+    /// would otherwise replace the cascade's own measurement with a strictly less informative restatement
+    /// of half of it. Leave false for every reason measured with a live jail in hand — see
+    /// <see cref="WorkingReason"/>.</param>
     /// <returns>False when the entry is unknown or already terminal — a human discard that landed while
     /// the cascade was running has decided, and this must not walk it back.</returns>
-    public bool TryReturnToWorking(string agentId, string reason, string? detail = null)
+    public bool TryReturnToWorking(
+        string agentId, string reason, string? detail = null, bool sandboxIsGone = false)
     {
         lock (_gate)
         {
@@ -1024,11 +1073,10 @@ public sealed class MergeQueue : IMergeQueue
                 return false;
             }
 
-            _lastVerification[agentId] = null;
             _verifiedAt[agentId] = null;
             if (!string.IsNullOrWhiteSpace(reason))
             {
-                _workingReasons[agentId] = reason;
+                _workingReasons[agentId] = new WorkingReason(reason, sandboxIsGone);
             }
 
             SetStateLocked(agentId, WorkerMergeState.Working);
@@ -1753,6 +1801,21 @@ public sealed class MergeQueue : IMergeQueue
         {
             reason = state switch
             {
+                // FIRST, and ahead of the jail-liveness arm below: a measured reason that was itself
+                // derived from the missing sandbox. It says everything StrandedReason says and also why
+                // the branch is at Working — "this branch needs rebasing onto the new main AND its agent
+                // has no live sandbox — resume the agent". Ordering StrandedReason above it replaced the
+                // cascade's own measurement with a less informative restatement of half of it, which is
+                // what the three co-tenants of the 2026-08-30 merge were shown while the daemon log
+                // carried the honest sentence, and which contradicted MergeQueueProvisioner.Block's own
+                // comment ("rendered verbatim as the CanMerge reason"). See WorkingReason for why this is
+                // a flag on the reason and not a blanket reorder: a reason measured with a LIVE jail in
+                // hand ("the agent is paused with the rebase in progress") would, on an entry whose
+                // sandbox has since gone, send a human into a container that no longer exists.
+                WorkerMergeState.Working
+                    when _workingReasons.TryGetValue(agentId, out var measured)
+                        && (measured.AccountsForMissingSandbox || !_stranded.Contains(agentId))
+                    => measured.Reason,
                 // ISSUES-LOG #24 — the jail-liveness axis outranks both of these, because both of them
                 // promise something that cannot happen without a sandbox. "Re-verifying" is the cascade's
                 // promise and the cascade needs a jail to keep it; "not verified yet" is a sentence about a
@@ -1782,11 +1845,6 @@ public sealed class MergeQueue : IMergeQueue
                 WorkerMergeState.Merged => "already merged",
                 WorkerMergeState.Rejected => "rejected in review",
                 WorkerMergeState.Discarded => "discarded — this entry was dropped from the queue",
-                // A branch the stale cascade could not reparent is at Working like any other unverified
-                // branch, and "not verified yet" would be the second time that fact was reported as
-                // something milder than it is. The measured reason replaces it until the entry moves.
-                WorkerMergeState.Working when _workingReasons.TryGetValue(agentId, out var blocked)
-                    => blocked,
                 _ => "not verified yet",
             };
             return false;

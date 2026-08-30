@@ -388,15 +388,247 @@ public sealed class MergeQueueProvisioner
         {
             _log?.Invoke($"merge queue registered repo={repoHandle} main={mainSha} branch={mainBranch}");
 
+            // The freshness half of the restart repair, and it runs INLINE and FIRST — before the resume,
+            // before the caller gets the context, before anything can touch this queue. It is the only
+            // part of the boot repair that must not race: it decides which rehydrated rows are still
+            // evidence about the tree in the mirror, and every later step (the resume's cascade, the
+            // re-arm below, a human's merge) reads that decision. Backgrounding it announced tips into
+            // live verifications as mid-run moves. Cheap by construction — one rev-parse per non-terminal
+            // entry, no diff, no container.
+            PrimeBranchTipsAfterRestart(repoHandle, context.Queue);
+
             // ...and THIS is the restart resume's production trigger. See the class remarks for why it is
             // here and not in DaemonBootSequence. Started only on the created branch: a repeat EnsureQueue
             // is the same live queue, whose Verifying rows are real runs this process started.
             context.Queue.BeginResumeAfterRestart(
                 hasLiveJail: agentId => !string.IsNullOrEmpty(_resolveContainerId(repoHandle, agentId)),
                 log: _log);
+
+            // ...and the OTHER thing a restart destroys (L1). Background, because unlike the prime it
+            // costs a merge diff per entry, and unlike the prime it cannot race: every step re-reads the
+            // state and refuses to manufacture a store.
+            BeginRearmAfterRestart(repoHandle, context);
         }
 
         return context;
+    }
+
+    // ---- Restart re-arm (L1) ---------------------------------------------
+
+    /// <summary>
+    /// The most recent <see cref="RearmAfterRestart"/> pass. Same posture as
+    /// <c>MergeQueue.LastCascade</c> and <c>MergeQueue.LastResume</c>: tests await it, production fires
+    /// and forgets, and it is a completed no-op until something starts one.
+    /// </summary>
+    public Task LastRearm { get; private set; } = Task.CompletedTask;
+
+    /// <summary>
+    /// The states <see cref="RearmAfterRestart"/> re-arms the flagged-change review for: exactly the two
+    /// <c>MergeQueue.CanMerge</c> admits.
+    ///
+    /// <para>Public, and asserted against the whole enum by
+    /// <c>EveryStateThatCanMerge_IsAStateTheRestartRearmCovers</c>, because the two sets must not be
+    /// allowed to drift: a state that can merge and is missing here is the L1 dead end reopened, and a
+    /// state here that cannot merge is a git diff per entry per boot for nothing. Every other non-terminal
+    /// state is already in the readiness trigger's eligible set (or is a run in flight), so its next
+    /// verification arms the gate exactly as it always did.</para>
+    /// </summary>
+    public static readonly IReadOnlySet<WorkerMergeState> RearmableStates =
+        new HashSet<WorkerMergeState> { WorkerMergeState.Verified, WorkerMergeState.AwaitingReview };
+
+    /// <summary>Starts a <see cref="RearmAfterRestart"/> pass in the background and publishes it on
+    /// <see cref="LastRearm"/>. Background for the reason <c>BeginResumeAfterRestart</c> is: the caller is
+    /// inside a gRPC handler and this pass runs a git diff per entry.</summary>
+    private Task BeginRearmAfterRestart(string repoHandle, MergeQueueContext context) =>
+        LastRearm = Task.Run(() => RearmAfterRestart(repoHandle, context));
+
+    /// <summary>
+    /// Tells the freshly-rehydrated queue what the mirror says each entry's branch tip is <b>now</b>, and
+    /// lets <see cref="MergeQueue.NotifyBranchAdvanced"/> decide what that means.
+    ///
+    /// <para><b>This is the durable half of the branch-side freshness compare.</b> The observed half —
+    /// <c>BranchTipInvalidator</c> riding <c>AgentRefWatcher.Advanced</c> — cannot answer here, twice
+    /// over: <c>_branchTip</c> is deliberately not persisted (§19.7), and the watcher only ever sweeps
+    /// agents something called <c>Watch</c> for, i.e. agents with a live sandbox. So a branch that moved
+    /// while the daemon was down, whose agent has since been stopped, is announced by nothing at all. What
+    /// IS durable is the record's own <see cref="VerificationRecord.BranchSha"/> (J1, §19.4), and
+    /// <see cref="MergeQueue.NotifyBranchAdvanced"/> already compares against exactly that — so this
+    /// method only has to ask git the question.</para>
+    ///
+    /// <para><b>It runs inline, and that is load-bearing.</b> A tip announced into a queue that has since
+    /// started a verification is recorded as a mid-run move and demotes the run's own green (§19.4's M8
+    /// window). Running before the context is handed back means there is no such queue to race.</para>
+    ///
+    /// <para>A record that predates <c>BranchSha</c> reads as empty, does not match any real tip, and is
+    /// therefore invalidated — a one-time demotion to <c>Working</c> that the readiness trigger re-verifies
+    /// out of. That is the honest answer and not the belt's "both sides must be KNOWN to refuse": the belt
+    /// guards a permanent refusal with no way out, and this walks the row to the one state from which the
+    /// product re-measures it.</para>
+    /// </summary>
+    private void PrimeBranchTipsAfterRestart(string repoHandle, MergeQueue queue)
+    {
+        string barePath;
+        try
+        {
+            barePath = _repos.BareRepoPathFor(repoHandle);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge queue repo={repoHandle} branch-tip prime SKIPPED ({ex.Message})");
+            return;
+        }
+
+        foreach (var agentId in queue.Agents)
+        {
+            // Nothing to protect and nothing to learn: a terminal row is refused by NotifyBranchAdvanced
+            // anyway, and asking git about it is a subprocess for an answer nobody reads.
+            if (!RearmableStates.Contains(queue.GetState(agentId)))
+            {
+                continue;
+            }
+
+            try
+            {
+                // An empty answer (a mirror git could not resolve `agent/<id>` in) is passed through as
+                // empty and ignored: an unknown tip must never be written over a known one.
+                if (queue.NotifyBranchAdvanced(agentId, RevParse(barePath, "agent/" + agentId)))
+                {
+                    _log?.Invoke(
+                        $"merge queue repo={repoHandle} agent={agentId} branch moved while the daemon was "
+                        + "down — the entry is back on Working and is no longer mergeable");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log?.Invoke(
+                    $"merge queue repo={repoHandle} agent={agentId} branch-tip prime FAILED ({ex.Message}) "
+                    + "— this entry's merge gate falls back to the states it can refuse from");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Re-derives, from the mirror, the flagged-change classification a daemon restart destroys — for the
+    /// entries where its absence is a dead end, and only after
+    /// <see cref="PrimeBranchTipsAfterRestart"/> has already thrown out the ones whose evidence is about a
+    /// different tree.
+    ///
+    /// <h3>The defect (L1): <c>Verified</c> plus a restart was a permanent dead end</h3>
+    ///
+    /// <para>Observed live: three <c>Verified</c> rows were unmergeable <b>forever</b> after a bounce.
+    /// <see cref="FlaggedChangeGate"/> holds its per-agent <see cref="AcknowledgmentStore"/>s in memory, so
+    /// a restart wipes every one of them; <see cref="ArmFlaggedChangeReview"/> — the only thing that ever
+    /// creates one — runs solely inside a verification; §19.7 deliberately withholds Verify from a
+    /// <c>Verified</c> row; and <c>WorkerReadinessTrigger</c>'s eligible set excludes <c>Verified</c>. So
+    /// the gate answered its MG-40 default-DENY ("flagged-change review has not run for this branch (no
+    /// acknowledgment record)") and <b>nothing in the product could ever re-arm it</b>. The default is
+    /// right; what was missing was any path back.
+    ///
+    /// <h3>Why re-derive and never restore</h3>
+    ///
+    /// <para>The alternative — persisting the store — is the trap. A flagged set is a CLASSIFICATION OF A
+    /// DIFF, i.e. a measurement, and §19.7 already settled what happens to a measurement written to
+    /// SQLite: it outlives its own truth. Persisted acknowledgments are worse still, because
+    /// <see cref="FlaggedChange.Id"/> is content-bound (<c>kind|path|contentHash</c>) precisely so an ack
+    /// cannot survive the push that changes the bytes it was granted for, and a durable ack is a standing
+    /// invitation to reconstruct the id it was granted under. Re-deriving needs no jail, no container and
+    /// no agent — only the mirror — so the honest fix is to run the review again.</para>
+    ///
+    /// <h3>Why this cannot become a way to merge unreviewed work</h3>
+    ///
+    /// <list type="number">
+    ///   <item><b>Nothing is restored, so nothing is trusted.</b> The pass writes no acknowledgment and
+    ///   reads none from anywhere. A re-armed store comes back with zero acks, so every flagged item must
+    ///   be acknowledged again, by a human, in the cockpit. A restart can only ever INCREASE the review
+    ///   owed — it can never discharge any of it.</item>
+    ///   <item><b>The set describes the bytes that will merge.</b> It is computed from the mirror's
+    ///   current <c>agent/&lt;id&gt;</c> against main, at this instant, exactly as the verification path
+    ///   computes it — so the items and their content hashes bind to today's diff, not to a remembered
+    ///   one.</item>
+    ///   <item><b>The evidence was checked against the tree first.</b>
+    ///   <see cref="PrimeBranchTipsAfterRestart"/> runs inline, before this pass and before the queue is
+    ///   handed to anyone, and walks any entry whose rehydrated
+    ///   <see cref="VerificationRecord.BranchSha"/> does not name the mirror's current tip back to
+    ///   <c>Working</c>. Only what survives that is still in <see cref="RearmableStates"/>, so re-arming
+    ///   can never hand the gate to a row whose green is about bytes nobody will merge.</item>
+    ///   <item><b>Fail-closed is untouched.</b> <see cref="ArmFlaggedChangeReview"/> leaves the store
+    ///   ABSENT on any failure to compute the diff, and an absent store is still the default-DENY. This
+    ///   pass adds a second chance to classify; it never adds a way to skip classification.</item>
+    /// </list>
+    ///
+    /// <h3>Scope</h3>
+    ///
+    /// <para>Re-armed for exactly the states <c>CanMerge</c> admits — <c>Verified</c> and
+    /// <c>AwaitingReview</c>. They are the only states in which a missing store is a dead end: every other
+    /// non-terminal state is already in the readiness trigger's eligible set (or is a run in flight), so
+    /// its next verification arms the gate as it always did. That equality is asserted, not assumed, by
+    /// <c>EveryStateThatCanMerge_IsAStateTheRestartRearmCovers</c>.</para>
+    ///
+    /// <para>Nothing here throws: it runs on a background task nobody awaits in production, and a
+    /// re-arm pass must never be the thing that takes the daemon down.</para>
+    /// </summary>
+    /// <param name="repoHandle">The repo whose queue was just rebuilt.</param>
+    /// <param name="context">That queue and its gates.</param>
+    /// <returns>The agent ids whose flagged-change review this pass re-armed.</returns>
+    public IReadOnlyList<string> RearmAfterRestart(string repoHandle, MergeQueueContext context)
+    {
+        if (context.FlaggedChanges is not { } flaggedGate)
+        {
+            return Array.Empty<string>();
+        }
+
+        var queue = context.Queue;
+        var rearmed = new List<string>();
+
+        foreach (var agentId in queue.Agents)
+        {
+            try
+            {
+                // Only the states that could merge — PrimeBranchTipsAfterRestart has already run, inline,
+                // so anything whose evidence is about a different tree is no longer one of them.
+                if (!RearmableStates.Contains(queue.GetState(agentId)))
+                {
+                    continue;
+                }
+
+                // PeekStore, never StoreFor: this must not manufacture the empty (and therefore
+                // trivially AllAcknowledged) store that FlaggedChangeGate.PeekStore exists to refuse.
+                if (flaggedGate.PeekStore(agentId) is not null)
+                {
+                    continue;
+                }
+
+                ArmFlaggedChangeReview(repoHandle, agentId, flaggedGate);
+                if (flaggedGate.PeekStore(agentId) is null)
+                {
+                    // The diff could not be computed. ArmFlaggedChangeReview already said so; the entry
+                    // stays denied, which is the fail-closed default and not a regression.
+                    continue;
+                }
+
+                rearmed.Add(agentId);
+            }
+            catch (Exception ex)
+            {
+                _log?.Invoke(
+                    $"merge queue repo={repoHandle} agent={agentId} restart re-arm FAILED ({ex.Message}) "
+                    + "— the entry stays unmergeable until it can be classified");
+            }
+        }
+
+        if (rearmed.Count > 0)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} restart re-armed the flagged-change review for "
+                + $"{rearmed.Count} mergeable entr{(rearmed.Count == 1 ? "y" : "ies")} "
+                + "(acknowledgments are NOT restored — every flagged item must be acknowledged again)");
+
+            // The gate's ANSWER changed without any state moving, and that reaches a client only on the
+            // queue stream, which re-pushes only on Changed.
+            queue.NotifyGateChanged();
+        }
+
+        return rearmed;
     }
 
     /// <summary>Audit event appended when a queue row is withheld because its worker has no approved
@@ -714,8 +946,7 @@ public sealed class MergeQueueProvisioner
             }
 
             Block(repoHandle, agentId, queue,
-                "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent",
-                "seeded-no-jail");
+                NoLiveSandboxReason, "seeded-no-jail", sandboxIsGone: true);
             return;
         }
 
@@ -732,9 +963,7 @@ public sealed class MergeQueueProvisioner
         // finding that out twice.
         if (string.IsNullOrEmpty(_resolveContainerId(repoHandle, agentId)))
         {
-            Block(repoHandle, agentId, queue,
-                "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent",
-                "no-live-jail");
+            Block(repoHandle, agentId, queue, NoLiveSandboxReason, "no-live-jail", sandboxIsGone: true);
             return;
         }
 
@@ -831,12 +1060,31 @@ public sealed class MergeQueueProvisioner
         return new AgentWorktreeLocation(worktree, barePath, ResolveDefaultBranch(barePath));
     }
 
+    /// <summary>
+    /// The cascade's terminus for a branch whose agent has been stopped — the one measured reason that
+    /// names BOTH facts a human needs (the branch must be rebased, and there is no sandbox to do it in),
+    /// and therefore the one that must outrank <see cref="MergeQueue.StrandedReason"/>.
+    ///
+    /// <para>A constant because the two writers (the seeded path and the real no-jail probe) say the same
+    /// thing about the same situation, and because a test must be able to name the exact sentence the
+    /// daemon logs rather than a paraphrase of it.</para>
+    /// </summary>
+    public const string NoLiveSandboxReason =
+        "this branch needs rebasing onto the new main and its agent has no live sandbox — resume the agent";
+
     // The one terminus for every way a re-entry can fail to reparent: Working, with the reason a human
     // reads on the queue rail (MergeQueue renders it verbatim as the CanMerge reason) and an audit event.
-    private void Block(string repoHandle, string agentId, MergeQueue queue, string reason, string detail)
+    //
+    // `sandboxIsGone` is what makes that parenthesis true again for the no-jail arm: CanMerge used to
+    // order its generic StrandedReason ahead of every measured reason, so the one branch of this method
+    // that had actually ESTABLISHED the missing sandbox had its sentence replaced by a vaguer one. See
+    // MergeQueue.WorkingReason for why it is a per-reason flag rather than a blanket precedence.
+    private void Block(
+        string repoHandle, string agentId, MergeQueue queue, string reason, string detail,
+        bool sandboxIsGone = false)
     {
         _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} stale re-queue BLOCKED ({detail}) — {reason}");
-        queue.TryReturnToWorking(agentId, reason, detail);
+        queue.TryReturnToWorking(agentId, reason, detail, sandboxIsGone);
     }
 
     /// <summary>

@@ -1752,6 +1752,26 @@
   terminal word cannot tell a coordinator anything is happening — plus the sentence a human reads) with
   `AFailedVerification_NeverReportsVerified_AndReturnsTheAgentToWorking` as the paired negative, which
   is the one that matters most: a red run must never tell a coordinator its worker is done.
+  **L1, the restart:** `AVerifiedEntry_IsReArmedAfterADaemonRestart_AndStillDemandsEveryAcknowledgment`
+  is the one that survives a simulated restart — two provisioners over ONE pair of persisted stores, so
+  the second is a genuine daemon bounce rather than a second empty daemon. It asserts the exit exists
+  (the gate stops saying "flagged-change review has not run", and acking again merges — the sequence the
+  live defect could not reach by any action whatsoever), that acknowledgments are NOT restored (every
+  item pending again; a restart may only increase the review a human owes), that the re-derived item ids
+  are content-identical because the bytes did not change, and that the pass republishes the queue — the
+  gate's answer changed with no transition, and the stream re-pushes only on `Changed`.
+  `ABranchThatMovedWhileTheDaemonWasDown_IsWalkedToWorking_AndNeverReArmedAsMergeable` is the safety
+  half, and the case no observation can catch: the agent commits and publishes while nothing is
+  watching, and the boot prime demotes the row from the record's own `BranchSha` rather than from a
+  watcher that never swept it. `EveryStateThatCanMerge_IsAStateTheRestartRearmCovers` holds
+  `RearmableStates` equal to `CanMerge`'s admit set over all nine states.
+  **L3, the dead-agent rows:**
+  `AStrandedEntryTheCascadeCouldNotReparent_KeepsTheDaemonsOwnReason_AndItsPassingRecord` runs
+  `ReconcileJails` — the production step the older no-jail test omits, and therefore the step under which
+  both facts were lost — and asserts the reason is `MergeQueueProvisioner.NoLiveSandboxReason` verbatim
+  (not the generic `StrandedReason`) and that the PASSING record is still readable, which is what the
+  verification panel renders. `AStrandedEntryWhoseReasonAssumedALiveJail_StillGetsTheStrandedSentence`
+  is its paired negative: a reason measured with a live jail must not outlive the jail it assumed.
   **VM lifetime:** `VmKeepAliveTests` (the MainguardEnv keep-alive
   holder — distro-scoped argv with no lifecycle verbs (G-12), restart-on-exit with capped backoff,
   start failures swallowed and retried, Dispose cancels a live holder session promptly). **Daemon

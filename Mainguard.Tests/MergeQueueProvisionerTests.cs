@@ -893,6 +893,288 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         return dotGit;
     }
 
+    // ---- L1: a Verified row plus a daemon restart was a permanent dead end ----
+    //
+    // Observed live: three Verified rows unmergeable FOREVER after a bounce. FlaggedChangeGate holds its
+    // AcknowledgmentStores in memory; ArmFlaggedChangeReview (the only writer) runs solely inside a
+    // verification; Verify is withheld from a Verified row (§19.7); and the readiness trigger's eligible
+    // set excludes Verified. So the MG-40 default-DENY fired — correctly — and nothing in the product
+    // could ever re-arm it. These tests are about the path back, and about the two things it must never
+    // become.
+
+    /// <summary>
+    /// The dead end, and its exit. A restart re-derives the CLASSIFICATION from the mirror, so the row is
+    /// actionable again — and re-derives it ONLY, so the human has to acknowledge every item a second
+    /// time before anything can merge.
+    /// </summary>
+    [Fact]
+    public async Task AVerifiedEntry_IsReArmedAfterADaemonRestart_AndStillDemandsEveryAcknowledgment()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitFlagWorthyWorkOnAgentBranch(repoHash);
+
+        var stores = new SharedStores();
+
+        // ---- daemon lifetime 1: verify green, and the flagged review blocks the merge until acked ----
+        var ctx = NewProvisioner(stores, out _).EnsureQueue(repoHash)!;
+        Assert.True((await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None)).Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        var items = ctx.FlaggedChanges!.PeekStore(AgentId)!.Items;
+        Assert.NotEmpty(items);
+        foreach (var item in items)
+        {
+            Assert.True(ctx.FlaggedChanges.PeekStore(AgentId)!.Acknowledge(item.Id));
+        }
+
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+
+        // ---- the restart. Same DB, brand-new in-memory gate — which is the whole defect. ----
+        var restarted = NewProvisioner(stores, out _);
+        var ctx2 = restarted.EnsureQueue(repoHash)!;
+
+        // The re-arm changes the gate's ANSWER while moving no state, and a client learns of it only on
+        // the queue stream, which re-pushes only on Changed. Without the republish the daemon holds the
+        // fix and the human's rail goes on rendering the dead end until some unrelated transition fires.
+        var republished = 0;
+        ctx2.Queue.Changed += () => Interlocked.Increment(ref republished);
+
+        await restarted.LastRearm;
+        Assert.True(republished > 0, "the re-arm changed the gate's answer and never republished the queue");
+
+        // The row is still Verified: the branch did not move, so nothing invalidated its evidence.
+        Assert.Equal(WorkerMergeState.Verified, ctx2.Queue.GetState(AgentId));
+
+        // ...and the gate no longer answers the dead-end sentence. Before the re-arm this read
+        // "flagged-change review has not run for this branch (no acknowledgment record)" and NOTHING in
+        // the product could change it: PeekStore was null, so an acknowledgment was a silent no-op.
+        Assert.False(ctx2.Queue.CanMerge(AgentId, out var reason));
+        Assert.DoesNotContain("has not run", reason);
+        Assert.Contains("acknowledgment", reason);
+
+        // The acknowledgments are NOT restored — every item is pending again. A restart may only ever
+        // increase the review a human owes; it can never discharge any of it.
+        var rearmed = ctx2.FlaggedChanges!.PeekStore(AgentId);
+        Assert.NotNull(rearmed);
+        Assert.Equal(items.Count, rearmed!.Items.Count);
+        Assert.Equal(rearmed.Items.Count, rearmed.PendingCount);
+        Assert.False(rearmed.AllAcknowledged);
+
+        // ...and the item ids are the SAME ids, because they are content-bound and the bytes did not
+        // change. That is what makes this a re-derivation of today's diff rather than a restoration of a
+        // remembered one: had the branch pushed, the hashes — and therefore the ids — would differ.
+        Assert.Equal(
+            items.Select(i => i.Id).OrderBy(i => i, StringComparer.Ordinal).ToArray(),
+            rearmed.Items.Select(i => i.Id).OrderBy(i => i, StringComparer.Ordinal).ToArray());
+
+        // The exit exists: acknowledging again merges. This is the assertion the live defect could not
+        // satisfy by any sequence of actions whatsoever.
+        foreach (var item in rearmed.Items)
+        {
+            Assert.True(rearmed.Acknowledge(item.Id));
+        }
+
+        Assert.True(ctx2.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>
+    /// The safety guard, and the reason the pass primes the branch tip BEFORE it arms anything: a branch
+    /// that moved while the daemon was down must not be re-armed as a mergeable row.
+    ///
+    /// <para>This is the case no observation can catch. <c>AgentRefWatcher</c> only sweeps agents it was
+    /// told to <c>Watch</c>, i.e. agents with a live sandbox, so a stopped agent whose branch advanced
+    /// during the outage is announced by nothing — and <c>_branchTip</c> is deliberately not persisted
+    /// (§19.7). The durable half of the compare is the record's own <c>BranchSha</c> (J1): the pass asks
+    /// the mirror what the tree is NOW and lets <c>NotifyBranchAdvanced</c> compare it against what the
+    /// evidence says it measured.</para>
+    /// </summary>
+    [Fact]
+    public async Task ABranchThatMovedWhileTheDaemonWasDown_IsWalkedToWorking_AndNeverReArmedAsMergeable()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var stores = new SharedStores();
+        var ctx = NewProvisioner(stores, out _).EnsureQueue(repoHash)!;
+        Assert.True((await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None)).Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+
+        // ...the daemon goes down, and the agent commits. Published into the mirror the way the daemon's
+        // own mediator would have, because the point is that NOBODY was watching when it happened.
+        var worktree = new WorktreeManager(_vmRoot).WorktreePathFor(repoHash, AgentId);
+        WriteAndCommit(worktree, "second.cs", "public class Second { }\n", "work the daemon never saw");
+        new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, AgentId);
+
+        var restarted = NewProvisioner(stores, out _);
+        var ctx2 = restarted.EnsureQueue(repoHash)!;
+        await restarted.LastRearm;
+
+        // Working, not Verified — and said in the branch's own words rather than "not verified yet".
+        Assert.Equal(WorkerMergeState.Working, ctx2.Queue.GetState(AgentId));
+        Assert.False(ctx2.Queue.CanMerge(AgentId, out var reason));
+        Assert.Equal(MergeQueue.BranchMovedReason, reason);
+
+        // ...and the re-arm did NOT then hand this entry a flagged-change store, because a row that
+        // cannot merge is not the dead end this pass exists to open.
+        Assert.Null(ctx2.FlaggedChanges!.PeekStore(AgentId));
+    }
+
+    /// <summary>
+    /// The invariant behind the pass's scope: the states it re-arms are exactly the states
+    /// <see cref="MergeQueue.CanMerge"/> admits. A state that can merge and is not covered here is a dead
+    /// end again; a state that is covered and cannot merge is a mirror read for nothing.
+    ///
+    /// <para>Asserted over the whole enum rather than the two names, so adding a tenth state cannot
+    /// quietly reopen the defect.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(WorkerMergeState.Working)]
+    [InlineData(WorkerMergeState.Verifying)]
+    [InlineData(WorkerMergeState.Verified)]
+    [InlineData(WorkerMergeState.StaleVerified)]
+    [InlineData(WorkerMergeState.VerificationFailed)]
+    [InlineData(WorkerMergeState.AwaitingReview)]
+    [InlineData(WorkerMergeState.Merged)]
+    [InlineData(WorkerMergeState.Rejected)]
+    [InlineData(WorkerMergeState.Discarded)]
+    public void EveryStateThatCanMerge_IsAStateTheRestartRearmCovers(WorkerMergeState state)
+    {
+        var admitsAMerge = state is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;
+        Assert.Equal(admitsAMerge, MergeQueueProvisioner.RearmableStates.Contains(state));
+    }
+
+    // ---- L3: the dead-agent rows reported the opposite of the truth ------
+    //
+    // After a merge moved main, three rows whose agents had been stopped were walked to Working. The
+    // daemon logged "this branch needs rebasing onto the new main and its agent has no live sandbox —
+    // resume the agent"; the UI said "Not verified yet — no test run has been recorded for this branch",
+    // about rows each holding a PASSING VerificationRow. Two independent losses, both here.
+
+    /// <summary>
+    /// L3(a): the honest reason survives the jail reconciler. <c>CanMerge</c> ordered its generic
+    /// <see cref="MergeQueue.StrandedReason"/> ahead of every measured reason, so the one branch of the
+    /// cascade that had actually established the missing sandbox had its sentence — the strictly more
+    /// informative one — replaced by a restatement of half of it.
+    ///
+    /// <para>L3(b): the passing verification record survives the block. The cascade cleared it, so the
+    /// verification panel reported "no test run has been recorded for this branch" about a branch whose
+    /// tests had passed. The bytes did not change — only the parentage — which is precisely the
+    /// <c>StaleVerified</c> case, and <c>StaleVerified</c> keeps its record.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStrandedEntryTheCascadeCouldNotReparent_KeepsTheDaemonsOwnReason_AndItsPassingRecord()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+
+        var stopped = false;
+        var ctx = NewRebasingProvisioner(out _,
+            jailFor: agentId => stopped && agentId == SecondAgent ? null : ContainerId).EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        var green = await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
+        Assert.True(green.Passed);
+        stopped = true;
+
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        // The daemon's own liveness pass runs in production and is what marks the entry stranded — the
+        // step the earlier no-jail test omits, and therefore the step under which the reason was lost.
+        var report = ctx.Queue.ReconcileJails(agentId => !(stopped && agentId == SecondAgent));
+        Assert.Contains(SecondAgent, report.Stranded);
+
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+
+        // L3(a): verbatim, exactly as MergeQueueProvisioner.Block's comment has always claimed.
+        Assert.Equal(MergeQueueProvisioner.NoLiveSandboxReason, reason);
+        Assert.NotEqual(MergeQueue.StrandedReason, reason);
+
+        // L3(b): the passing run is still readable. This is the record the verification panel renders,
+        // and it is the one the DB row's LastVerificationId has pointed at all along.
+        var record = ctx.Queue.LastVerification(SecondAgent);
+        Assert.NotNull(record);
+        Assert.True(record!.Passed);
+        Assert.Equal(green.When, record.When);
+
+        // ...and keeping it cannot grant a merge: the entry is at Working, which CanMerge never admits,
+        // and the only non-terminal edge out of Working is Verifying, whose settle overwrites the record.
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out _));
+    }
+
+    /// <summary>
+    /// The other half of the precedence, and the reason it is a per-reason flag rather than a blanket
+    /// reorder: a reason measured with a LIVE jail in hand must NOT outlive the jail it assumed. A
+    /// stranded entry whose branch merely moved is told its sandbox is gone — not told to go and resolve
+    /// a rebase inside a container that no longer exists.
+    /// </summary>
+    [Fact]
+    public async Task AStrandedEntryWhoseReasonAssumedALiveJail_StillGetsTheStrandedSentence()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var live = true;
+        var ctx = NewRebasingProvisioner(out _, jailFor: _ => live ? ContainerId : null).EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        // A branch-tip move: measured from the mirror, with nothing asked about the jail.
+        Assert.True(ctx.Queue.NotifyBranchAdvanced(AgentId, "0000000000000000000000000000000000000001"));
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var beforeStranding));
+        Assert.Equal(MergeQueue.BranchMovedReason, beforeStranding);
+
+        // ...and now the sandbox goes. "re-verifying" is a promise that needs a jail, so the newer,
+        // re-measured fact wins.
+        live = false;
+        Assert.Contains(AgentId, ctx.Queue.ReconcileJails(_ => false).Stranded);
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var afterStranding));
+        Assert.Equal(MergeQueue.StrandedReason, afterStranding);
+    }
+
+    /// <summary>Lands work on a path the P2-11 classifier flags (a CI workflow runs with repo
+    /// credentials), so the flagged-change gate has something real to hold.</summary>
+    private void CommitFlagWorthyWorkOnAgentBranch(string repoHash)
+    {
+        var worktree = new WorktreeManager(_vmRoot).CreateAgentWorktree(repoHash, AgentId);
+        WriteAndCommit(worktree, ".github/workflows/ci.yml",
+            "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n",
+            "the agent edits a CI workflow");
+    }
+
+    /// <summary>The two stores a daemon restart does NOT lose — the SQLite-backed pair, shared across two
+    /// provisioners so the second one is a genuine restart rather than a second, empty daemon.</summary>
+    private sealed class SharedStores
+    {
+        public InMemoryMergeQueueStore Queue { get; } = new();
+
+        public InMemoryVerificationStore Verifications { get; } = new();
+    }
+
+    /// <summary>A provisioner over pre-existing persisted state — the restart harness.</summary>
+    private MergeQueueProvisioner NewProvisioner(SharedStores stores, out FakeSandboxEngine engine)
+    {
+        engine = new FakeSandboxEngine(0, null);
+        return new MergeQueueProvisioner(
+            registry: new MergeQueueRegistry(),
+            repos: new RepoProvisioner(_vmRoot),
+            leases: new InMemoryMergeLeaseStore(),
+            resolveContainerId: (_, _) => ContainerId,
+            queueStore: _ => stores.Queue,
+            verificationStore: _ => stores.Verifications,
+            sandboxes: engine,
+            artifactDirectory: NewDir("mainguard-mqprov-artifacts-"),
+            mergeDiff: new MergeBranchDiffService(
+                new RepoProvisioner(_vmRoot),
+                (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId)),
+            audit: _audit,
+            publishAgentRef: (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId),
+            checkAgentBranch: (repoHash, agentId) => new WorktreeManager(_vmRoot).CheckAgentBranch(repoHash, agentId));
+    }
+
     // ---- harness ---------------------------------------------------------
 
     /// <summary>

@@ -1356,7 +1356,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       as `AgentSession.State` was, so an entry kept saying `Working` about an agent whose jail had been
       gone for days, with Verify offered on it. A pass marks/unmarks entries whose sandbox is gone, swaps
       `CanMerge`'s wording to `StrandedReason` for `Working`/`StaleVerified` (both of the old sentences
-      promise something that cannot happen without a sandbox), audits each move as `JailReconciledEvent`
+      promise something that cannot happen without a sandbox) — **except where the cascade's own measured
+      reason already established the missing sandbox (L3)**: `_workingReasons` now carries a
+      `WorkingReason(Reason, AccountsForMissingSandbox)` and the sandbox-aware ones outrank
+      `StrandedReason`, because "this branch needs rebasing onto the new main AND its agent has no live
+      sandbox — resume the agent" says everything the generic line says and also why the branch is at
+      `Working`; a reason measured with a LIVE jail in hand (a parked rebase conflict) still loses to it,
+      or a human would be sent into a container that no longer exists. It is deliberately NOT persisted,
+      for the reason `_branchTip` is not — after a restart the re-measured `_stranded` mark answers
+      instead. Audits each move as `JailReconciledEvent`
       by `ReconcilerActor` (`system:reconciler`, never a person), and republishes via `NotifyGateChanged`
       — the stream re-pushes only on `Changed`, so without it the rail keeps serving the liveness the
       client last heard. **It moves no merge state, deliberately**: `AgentResumeService` exists to give a
@@ -1469,7 +1477,25 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
-      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it; `ArmFlaggedChangeReview` runs the
+      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it. **The restart pair (L1)**, started
+      on `EnsureQueue`'s `created` branch beside `BeginResumeAfterRestart`:
+      **`PrimeBranchTipsAfterRestart`** runs INLINE and FIRST — one `rev-parse` per entry in
+      `RearmableStates`, handed to `MergeQueue.NotifyBranchAdvanced`, which compares it against the
+      rehydrated record's own `BranchSha` (J1) and walks any entry whose evidence is about a different
+      tree to `Working`. It is the DURABLE half of the branch-side freshness compare: `_branchTip` is not
+      persisted (§19.7) and `AgentRefWatcher` only sweeps agents with a live sandbox, so a branch that
+      moved while the daemon was down and whose agent was then stopped is announced by nothing.
+      (Backgrounding it, or dropping its state filter, announces a tip into a live run as a mid-run move
+      and demotes the run's own green — measured: 20 of 44 `MergeQueueProvisionerTests` red.)
+      **`RearmAfterRestart`** / `BeginRearmAfterRestart` / `LastRearm` then re-derives the flagged-change
+      classification for what survives, in background, and republishes via `NotifyGateChanged`. It
+      RE-DERIVES and never restores: acks are content-bound and are not brought back, the set is computed
+      from today's mirror trees, `PeekStore` (never `StoreFor`) decides whether a store is missing, and a
+      diff that cannot be computed still leaves the entry denied. `RearmableStates` is public and asserted
+      equal to `CanMerge`'s admit set over the whole enum
+      (`EveryStateThatCanMerge_IsAStateTheRestartRearmCovers`). `NoLiveSandboxReason` is the cascade's
+      no-jail sentence, passed to `Block(..., sandboxIsGone: true)` so `CanMerge` renders it verbatim
+      instead of the generic `StrandedReason` (L3). `ArmFlaggedChangeReview` runs the
       required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
       same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
       that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
@@ -1568,7 +1594,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       on demand and is for the review that classifies a diff; every READ path (the daemon's flagged-item
       projection, the ack RPC) uses **`PeekStore`**, which never creates — a fresh store holds no items and
       an empty set is `AllAcknowledged`, so creating one from a read would manufacture the "reviewed and
-      clean" record the default-DENY exists to refuse.)
+      clean" record the default-DENY exists to refuse. **L1: `_stores` is in-memory, so a daemon restart
+      wipes every one of them — and `ArmFlaggedChangeReview`, its only writer, runs solely inside a
+      verification.** A `Verified` row therefore came back denied ("flagged-change review has not run for
+      this branch") with Verify withheld (§19.7) and `Verified` outside the readiness trigger's eligible
+      set: unmergeable forever, observed live on three rows. The default-DENY is right; the exit is
+      `MergeQueueProvisioner.RearmAfterRestart`, which RE-DERIVES the classification from the mirror
+      rather than persisting anything — acknowledgments are never restored, so a restart can only ever
+      increase the review a human owes.)
     - `AgentTraceEmitter.cs` (orchestrator-side provenance: `EmitTrace`/`SerializeTrace` write the
       Cognition/Cursor-style Agent Trace JSON artifact that `Review.ProvenanceReader` reads back, + the
       pure `BuildTrailers` that appends idempotent `Agent:`/`Task:`/`Plan:` commit trailers as the durable

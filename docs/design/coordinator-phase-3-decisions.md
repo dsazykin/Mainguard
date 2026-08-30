@@ -2638,3 +2638,224 @@ belt.
   than a decision this queue made, and a measurement written to SQLite outlives its own truth. A restart
   re-learns it from the watcher's first sweep, and an unknown tip declines to answer rather than
   manufacturing a "fresh".
+
+---
+
+## 20. Defects L1 and L3 — the restart dead end, and the rows that reported the opposite of the truth
+
+§19 fixed the freeze that let a stale `Verified` row offer a merge. These two are what the same live run
+found next, and they are the same shape from the other side: a row that could not merge and could never
+be made mergeable, and a row that could not merge for a reason the product refused to say.
+
+### 20.1 What was measured, before anything was changed
+
+`~/.mainguard/mainguard-daemon.db`, `MergeQueueRows` + `VerificationRows`, 2026-08-30:
+
+| row | agent | state | `LastVerificationId` | that record |
+|---|---|---|---|---|
+| 76 | `221760f2` | `Working` | 49 | **passed**, `main@ffbc3bc7`, 21:26 |
+| 77 | `4c43d17a` | `Working` | 50 | **passed**, `main@ffbc3bc7`, 01:35 |
+| 78 | `9b4a546f` | `Working` | 52 | **passed**, `main@ffbc3bc7`, 02:33 |
+
+All three moved at `2026-08-30 05:28:20`, the instant row 79 (`affa7294`) reached `Merged` and main
+advanced `ffbc3bc7 → d8a987ff`. `AuditRecords` holds four `stale_requeue_blocked` events. The daemon log
+carries, for each of them, *"this branch needs rebasing onto the new main and its agent has no live
+sandbox — resume the agent"*. The UI said *"Not verified yet — no test run has been recorded for this
+branch."*
+
+Separately, three `Verified` rows had already been observed unmergeable **forever** after a restart, the
+gate answering *"flagged-change review has not run for this branch (no acknowledgment record)"* with no
+control anywhere that could change the answer.
+
+### 20.2 L1 — `Verified` plus a restart was a permanent dead end
+
+Four true things that only compose into a trap:
+
+1. `FlaggedChangeGate._stores` is an in-memory `ConcurrentDictionary`. A restart wipes every
+   `AcknowledgmentStore`.
+2. `ArmFlaggedChangeReview` — the only thing that has ever created one — runs *only* inside a
+   verification.
+3. Verify is withheld from a `Verified` row, correctly (§19.7: a refused re-run settles to `Working` and
+   loses a legitimate green to a transient failure).
+4. `WorkerReadinessTrigger` starts runs from `Working`/`StaleVerified`/`VerificationFailed` only.
+
+So the gate failed closed — which is right, MG-40 — and **nothing in the product could ever re-arm it**.
+The defect was never the default. It was that the armed state did not survive and there was no path back.
+
+#### The option NOT taken, and why
+
+The obvious move is to persist the store. It is wrong for the reason §19.7 already gave about
+`_branchTip`: a flagged set is a **classification of a diff**, i.e. a measurement, and a measurement
+written to SQLite outlives its own truth. Persisted *acknowledgments* are worse still.
+`FlaggedChange.Id` is `kind|path|contentHash` precisely so an ack cannot survive the push that changes the
+bytes it was granted for; a durable ack is a standing invitation to reconstruct the id it was granted
+under, and the whole gate rests on that being impossible. Persisting the items without the acks fixes
+nothing anyway — an empty store is still a denied store.
+
+The second option, making a `Verified` row re-armable through the Verify button, re-opens the edge §19.7
+closed for a reason that has not changed.
+
+#### What was done: re-derive, never restore
+
+`ArmFlaggedChangeReview` needs **no jail, no container and no agent** — only the mirror. It is a merge
+diff plus a lockfile read. So the honest fix is to run the review again, and the change is a caller, the
+same way §19's was:
+
+- **`MergeQueueProvisioner.RearmAfterRestart`** (+ `BeginRearmAfterRestart` / `LastRearm`), started on
+  `EnsureQueue`'s `created` branch beside `BeginResumeAfterRestart`. For every entry in
+  `RearmableStates` with no store, it re-runs the classification and republishes via
+  `NotifyGateChanged` — the gate's *answer* changed while no state moved, and the stream re-pushes only
+  on `Changed`.
+- **`RearmableStates`** is public and is `{ Verified, AwaitingReview }` — exactly `CanMerge`'s admit set,
+  because those are the only states in which a missing store is a dead end. Everything else is already in
+  the readiness trigger's eligible set (or is a run in flight) and its next verification arms the gate as
+  it always did. `EveryStateThatCanMerge_IsAStateTheRestartRearmCovers` asserts the equality over all nine
+  states rather than the two names.
+
+#### Why this cannot become a way to merge unreviewed work
+
+1. **Nothing is restored, so nothing is trusted.** The pass writes no acknowledgment and reads none from
+   anywhere. A re-armed store comes back with **zero** acks, so every flagged item must be acknowledged
+   again, by a human, in the cockpit. A restart can only ever *increase* the review owed; it can never
+   discharge any of it.
+2. **The set describes the bytes that will merge.** It is computed from the mirror's current
+   `agent/<id>` against main, at that instant, by the same code path verification uses — so the items and
+   their content hashes bind to today's diff, not to a remembered one.
+3. **The evidence is checked against the tree first** — see below.
+4. **Fail-closed is untouched.** A diff that cannot be computed still leaves the store absent, and an
+   absent store is still the default-DENY. This adds a second chance to classify; it adds no way to skip
+   classification.
+
+#### `PrimeBranchTipsAfterRestart`, and why it is inline
+
+Point 3 is the part that needed new code, and §19's own hint is what it rests on: **evidence should
+record what it is evidence for.** J1 gave `VerificationRecord.BranchSha`, and that field is persisted —
+unlike `_branchTip`, which §19.7 deliberately leaves in memory. So at boot the queue can ask a durable
+question: *does the tip this record says it measured still name the tree in the mirror?*
+
+`NotifyBranchAdvanced` already answers it (it compares `newSha` against `VerifiedBranchShaLocked`). The
+missing piece was, again, a caller. `PrimeBranchTipsAfterRestart` does one `rev-parse` per re-armable
+entry and hands the answer to the queue, which demotes anything whose evidence is about a different tree.
+
+This closes a hole the observed path cannot reach at all: `AgentRefWatcher` only sweeps agents something
+called `Watch` for, i.e. agents with a live sandbox. A branch that moved while the daemon was down and
+whose agent has since been stopped is announced by **nothing**, and `_branchTip` is not persisted — so
+without this the entry would rehydrate `Verified`, be re-armed, and be offered.
+
+It runs **inline, before the context is returned**, and that was measured rather than assumed. The first
+implementation put it inside the background pass: a tip announced into a queue that has since started a
+verification is recorded as a mid-run move (§19.4's M8 window) and demotes the run's own green. Twenty of
+forty-four `MergeQueueProvisionerTests` went red. Running before anyone holds the queue means there is no
+queue to race.
+
+Its state filter is deliberate too: an entry outside `RearmableStates` has nothing to protect (the gate
+refuses from the state alone) and asking git about it is a subprocess for an answer nobody reads.
+
+### 20.3 L3 — the honest reason, and the record, both dropped at the same terminus
+
+`MergeQueueProvisioner.Block`'s comment has always claimed the reason is *"rendered verbatim as the
+CanMerge reason"*. Two separate things falsified it, both in `TryReturnToWorking`'s neighbourhood.
+
+**(a) The reason was outranked.** `CanMergeLocked`'s switch ordered
+
+```
+WorkerMergeState.StaleVerified or WorkerMergeState.Working when _stranded.Contains(agentId) => StrandedReason,
+```
+
+*above* the `_workingReasons` arm. `ReconcileJails` had marked all three rows stranded — their agents were
+stopped — so the generic *"the agent's sandbox is gone — resume the entry to give it one, or discard
+it"* replaced the measured *"this branch needs rebasing onto the new main and its agent has no live
+sandbox — resume the agent"*, which says everything the generic line says **and** why the branch is back
+at `Working`.
+
+The fix is not a blanket reorder, and that distinction is the whole design. `_workingReasons` now holds a
+`WorkingReason(Reason, AccountsForMissingSandbox)`, and only a reason that was itself produced BY
+establishing the missing sandbox outranks `StrandedReason`. The cascade's other termini — the parked
+rebase conflict, the skipped reparent — were every one of them measured with a live jail in hand; if the
+sandbox has since gone, they would send a human into a container that no longer exists, and ISSUES-LOG
+#24's argument still applies to them exactly as written.
+
+The flag is not persisted, for the same reason `_branchTip` is not. After a restart the measured reason is
+gone and the re-measured `_stranded` mark answers instead — which is the correct ordering of a remembered
+claim and a fresh one.
+
+**(b) The passing record was erased.** `TryReturnToWorking` did `_lastVerification[agentId] = null`, and
+`LastVerification` is what the wire's verdict and `VerificationPanelViewModel` render. Hence "no test run
+has been recorded for this branch" about three branches holding passing runs.
+
+Its docstring justified this as "whatever evidence existed was against a main this branch is no longer
+parented on" — which is *equally true of `StaleVerified`*, and `StaleVerified` **keeps** the record, for
+the reason §19.3 spells out: the branch's bytes did not change, only its parentage, so the evidence is
+still ABOUT this tree. This method is reached only from entries the cascade just moved through
+`StaleVerified`. The two disagreed and `StaleVerified` was right.
+
+So the record is kept and `VerifiedAtUtc` is still cleared — the row must not claim to be verified against
+anything it can merge into, but it may say what its last run found. It cannot leak into a merge:
+`CanMergeLocked` reads the record only for `Verified`/`AwaitingReview`, and the only non-terminal edge out
+of `Working` is `Verifying`, whose settle overwrites the record before either is reachable.
+
+### 20.4 Is `StaleVerified` reachable? Yes — and it is entered on every cascade
+
+Reported rather than changed, because the premise turned out to be false.
+
+`StaleVerified` **is** entered, and the live DB proves it without needing a transition log.
+`NotifyMainMoved` walks each affected entry to `StaleVerified` under the lock — `SetStateLocked`, so the
+row is persisted — *before* handing it to `RequeueAllAsync`. Every one of the four
+`stale_requeue_blocked` audit events is `TryReturnToWorking` called from `RequeueStaleAsync`, which runs
+only on an entry `NotifyMainMoved` has just placed in `StaleVerified`. Four events is four entries that
+were in that state. `BootStaleCascadeTests`, `StaleCascadeTests` and `MergeQueueJailReconcileTests` all
+assert it directly.
+
+What is true is that it is never **seen**. It is transient by construction: every entry that enters it is
+immediately handed to the cascade, which leaves it in one operation — `Block → Working`, or
+`rebase → Verifying`. The only ways to rest there are the dev seeder's `Hold` and the null-rebaser unit
+path. That is the state doing its job, not a dead member: it exists so the cascade's FIFO walk has
+somewhere to name its subjects, and so `CanMerge` can distinguish "stale, being re-verified" from "never
+verified". A state nobody rests in is not the same defect as a control nobody calls.
+
+### 20.5 The mutation log
+
+Every guard removed in turn, the tier rebuilt (`touch` on restore — an `mv` preserves mtime and MSBuild
+then skips the rebuild, so the mutated binary is what gets tested), and the failure recorded.
+
+| mutation | result |
+|---|---|
+| M1 the restart re-arm never runs | 1 red |
+| M2 no branch-tip prime at boot | 1 red |
+| M3 the re-arm manufactures an empty store instead of classifying | 1 red |
+| M4 `StrandedReason` outranks the measured no-sandbox reason again | 1 red |
+| M5 blanket reorder — every measured reason beats stranded | 1 red |
+| M6 the cascade block erases the passing verification record | 1 red |
+| M7 the no-jail block stops declaring itself sandbox-aware | 1 red |
+| M8 `RearmableStates` drifts from `CanMerge`'s admit set | 2 red |
+| M9 the branch-tip prime moves into the background pass | **0 red — see below** |
+| M10 the re-arm never republishes the queue | 1 red |
+| M11 the prime backgrounded AND unfiltered (the first implementation) | 3 red |
+
+**M3 is the one that matters most.** It is the persisted-store design expressed as a mutation: hand the
+entry a store it did not earn instead of classifying its diff. An empty store is `AllAcknowledged`, so
+the mutant merges a branch nobody reviewed — and the test says so.
+
+**M9 and M11 are a pair, and reading only M9 gets the wrong lesson.** With the state filter in place, a
+backgrounded prime is *nearly* safe: it skips `Verifying`, so it rarely reaches the mid-run window. What
+remains is a check-then-act — `GetState` can answer `Verified` and the entry can enter `Verifying` before
+`NotifyBranchAdvanced` takes the lock — and manufacturing a test for that window would mean weakening the
+mechanism to exercise it, exactly as with §19's M5. M11 removes the filter as well, which is the
+implementation that was actually written first, and it goes red immediately. Inline is kept because it
+makes the window not exist rather than making it small.
+
+### 20.6 Left alone, deliberately
+
+- **The flagged-change store is still not persisted, and neither is the working reason.** Both are
+  measurements. §19.7 settled what happens to a measurement in SQLite, and L1's fix is what makes
+  re-deriving cheap enough that persisting is not tempting.
+- **`StaleVerified` gets no new resting behaviour.** It is entered, it is asserted, and the cascade
+  leaving it promptly is the feature.
+- **The five stale-evidence cases of §19.5 are still open.** Nothing here reaches
+  `MergeReconcileTask`'s synthesized `Merged`, `ForegroundMergeService.ResolveMergeSource`, the
+  non-CAS merge lease, `ExternalPrMergeService.ResolveVerifiedHead`, or the plan-scope/code binding.
+- **Pre-`BranchSha` records are demoted once, not backfilled.** An empty `BranchSha` names no tree, so
+  the boot prime cannot establish that such a record is about the mirror's tree and walks the row to
+  `Working`. That is a one-time re-verification, not a permanent refusal — which is why it is the right
+  answer here while `CanMerge`'s belt still declines to refuse from ignorance: the belt guards a refusal
+  with no way out, this walks the row to the one state the product re-measures from.
