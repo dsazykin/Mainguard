@@ -1300,10 +1300,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `GitMutationGuard.cs` (the **pure**, unit-tested heart: `CanMutate(GitDirState)` → skip verdict when
       the worktree is mid-`rebase-merge`/`rebase-apply`, on a detached HEAD, or mid-merge (`MERGE_HEAD`);
       `Inspect(worktreePath)` reads those preconditions off the resolved per-worktree gitdir;
-      `RunGuarded<T>(IYieldToken, isLockHeld, action, …)` runs the mutation once `.git/index.lock` clears
-      with injectable exponential backoff (base 100 ms ×2, cap 5) and **requires an active yield token**
-      so no worktree mutation is reachable without a completed yield (invariant 2) — a persistent lock →
-      typed `GitMutationLockException`; spawns nothing, the action routes through the shared runner).
+      `RunGuarded<T>(IYieldToken, isLockHeld, action, …, recheck)` runs the mutation once
+      `.git/index.lock` clears with injectable exponential backoff (base 100 ms ×2, cap 5) and
+      **requires an active yield token** so no worktree mutation is reachable without a completed yield
+      (invariant 2) — a persistent lock → typed `GitMutationLockException`; spawns nothing, the action
+      routes through the shared runner. **K6/§23.6: `recheck` re-reads the `GitDirState` the verdict was
+      MADE of, once the lock is clear and immediately before the action.** The backoff used to re-check
+      only the lock — the one precondition that was never part of the verdict — while the three that were
+      are exactly the states a worktree enters while a lock is held, so a snapshot decision was acted on
+      against a worktree it was no longer true of; a refusing re-check raises
+      `GitMutationStateChangedException` and the cycle skips).
     - `YieldProtocol.cs` (`IYieldProtocol.RequestYieldAsync` sends `[IPC_UPDATE_REQUESTED]` on the
       dedicated `IAgentControlChannel` — a named pipe / second channel, **not** the interactive PTY —
       awaits `[IPC_UPDATE_READY]` ≤ 10 s, else `ISandboxEngine.PauseAsync`; always returns an
@@ -2077,7 +2083,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     (`ClassifyFailedFfMerge`): the old code discarded git's exit detail and reported every non-zero exit
     as "verification is stale" with `CasLost: true`, which is wrong — and expensively wrong — for
     `index.lock` contention, a refusing pre-merge hook, a full disk or unrelated histories, since it
-    also told the queue to throw the verification away. It now asks
+    also told the queue to throw the verification away. **K2/§23.3: what the merge CONSUMES is now the
+    ref identified by the lease** — `ResolveMergeSource` preferred the local `refs/heads/agent/<id>` over
+    the tracking ref the fatal-if-failed fetch had just updated, merging exactly the "unknown-age copy"
+    that fetch exists to prevent. It now requires the source to BE the `ExpectedBranchSha` the queue
+    verified (refusing with `CasLost` when neither spelling is), and falls back to the freshly fetched
+    tracking ref — never the stale local one — only when no sha was measured. It now asks
     `merge-base --is-ancestor main <source>`: still an ancestor ⇒ report git's own stderr with `CasLost`
     false, not an ancestor ⇒ the staleness message, earned; a probe that cannot answer ⇒ "cause could
     not be established". `ExternalPrMergeService` does the same at its local leg. Wrapped in one T-19
@@ -2095,8 +2106,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       PR, merge a PR — so this path structurally cannot close/comment/review, P2-12 invariant 1) over the
       ONE audited T-23 transport; it is also what lets tests drive a fake host instead of live GitHub.
       Order: local preconditions first (clean tree, host remote resolvable, HEAD on main, main still ==
-      the lease's expected sha, verified head read from the sync mirror) **because an upstream merge
-      cannot be taken back**; then the upstream state check (already merged / closed unmerged / draft /
+      the lease's expected sha, and — **K4/§23.5** — the verified head READ from the lease rather than
+      re-derived from `refs/heads/agent/pr-<n>`, which `PrHeadFetcher` hard-resets forward before the
+      intake re-queues the entry, so both sides of the head compare were the new head and the CAS could
+      not fail; the local ref is now only asked whether the RECORDED head is present, and an entry with
+      no recorded verified head refuses outright) **because an upstream merge cannot be taken back**; then the upstream state check (already merged / closed unmerged / draft /
       `mergeable_state` `dirty`=conflict, `blocked`=required checks, `behind`; head moved since
       verification ⇒ CasLost); then the merge under the host's own `sha` head-CAS; then the reconcile.
       **"Merged" requires all three: the host merged and named a commit, that commit is provably reachable

@@ -36,7 +36,8 @@ The all-editions base. Git logic goes here.
   same transaction as every state-machine transition so a restart resumes; `VerificationRows` —
   immutable verification records keyed to **both** shas a verdict is only true between, `MainSha` and
   (since `AddVerificationBranchSha`) `BranchSha`, insert-only; `MergeLeaseRows` — the RT-D1
-  per-repo merge lease + idempotency record), and the P2-12 external-PR-intake tables
+  per-repo merge lease + idempotency record, carrying since `AddMergeLeaseExpectedBranchSha` **both**
+  halves of the identity the merge is authorized for, `ExpectedMainSha` and `ExpectedBranchSha`), and the P2-12 external-PR-intake tables
   (`PrIntakeSubscriptions` — one row per `(host, owner, repo, filter)` subscription, unique so a
   duplicate subscribe is idempotent; `PrIntakeHeads` — the last-seen head SHA per
   `(source, PR number)`, the "seen PR heads" store + tracked-PR set) — with the
@@ -66,7 +67,13 @@ The all-editions base. Git logic goes here.
   the queue could ask whether main had moved under its evidence and structurally could not ask whether
   the BRANCH had; a green row survived three further commits and went on offering Merge. Existing rows
   take `""`, which is the correct value rather than a backfill — nothing knows what tip they ran on —
-  and every freshness comparison reads empty as "not measured" and declines to answer).
+  and every freshness comparison reads empty as "not measured" and declines to answer);
+  `AddMergeLeaseExpectedBranchSha` adds `MergeLeaseRows.ExpectedBranchSha` — K3/§23.4, the branch-side
+  half of the identity a merge lease is granted for. The lease pinned the `main@sha` a merge could
+  fast-forward and could not say which COMMITS were authorized to land on it, so the branch could move
+  between the grant and the merge, a namesake ref could be merged instead, and the confirmed post-merge
+  sha could be anything the client reported — and all of it still satisfied the lease. Existing rows take
+  `""`, read everywhere as "not measured" rather than as a mismatch).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +

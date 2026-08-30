@@ -55,7 +55,11 @@
     handles, G-14 — so the App registers the resolved remote without touching `IAgentEnvironment`),
     `gateway.proto` (`GatewayService`: budgets + `StreamSpend` — bodies in P2-08), `mergequeue.proto`
     (P2-10 `MergeQueueService`: `StreamQueue` snapshot-then-deltas, `RunVerification`, `CanMerge`, and
-    the RT-D1 `BeginMerge`/`ConfirmMerge` — no auto-merge RPC by construction; **P2-47 #7 adds
+    the RT-D1 `BeginMerge`/`ConfirmMerge` — no auto-merge RPC by construction;
+    **`BeginMergeResponse.expected_branch_sha`** (K3/§23.4) travels beside `expected_main_sha` and for the
+    same reason: it is the `agent/<id>` tip the daemon's verification was measured on, so the client merges
+    the branch the daemon authorized rather than whatever its own stream snapshot last saw, and
+    `ConfirmMerge` can check the post-merge sha it reports against it; **P2-47 #7 adds
     `GetMergeDiff`** — the agent-branch-vs-main unified diff the review cockpit renders, which
     `StreamQueue` doesn't carry, parsed client-side by `PatchParser`; **`QueueEntry.flagged_items`**
     carries the daemon's must-acknowledge review items

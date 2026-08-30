@@ -657,11 +657,25 @@
   `TryConfirmHumanMerge` (which is where `queue_entry_merged` is appended), and `AcknowledgeFlaggedChange`
   passes the same daemon-derived actor into `ChangedTestCommandGate.Acknowledge`. This service also owns
   **`ConfirmRefusedEvent` (`merge_confirm_refused`)**, appended when a confirm is refused at either the
-  lease or the gate stage — the one merge-conversation fact knowable only here: by `ConfirmMerge` time the
+  lease, identity or gate stage — the one merge-conversation fact knowable only here: by `ConfirmMerge` time the
   git operation has ALREADY RUN on the user's checkout, so a refusal means the daemon and the user's
   repository may now disagree about what main is. Best-effort (swallowed into the daemon log), unlike the
   merge record itself, because the refusal reason must not be replaced by an audit-store error. A refused
-  `BeginMerge` is deliberately NOT audited — it is a merge that has not happened. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  `BeginMerge` is deliberately NOT audited — it is a merge that has not happened.
+  **K3/§23.4 merge identity:** `BeginMerge` puts BOTH halves of the identity on the lease — the queue's
+  `CurrentMainSha` and `LastVerification(agent)?.BranchSha`, the `agent/<id>` tip the verification was
+  measured on — and returns both to the client (`expected_branch_sha`), for the same reason
+  `expected_main_sha` already travelled there: the client's projection is a stream snapshot. `ConfirmMerge`
+  then SCREENS the `new_main_sha` the caller reports, which nothing used to look at even though the daemon
+  wrote it into the idempotency record, set the queue's authoritative main to it, and cascaded every
+  co-tenant onto it. Three checks, all before the transition and all against the daemon's own records:
+  shape (7–64 hex — deliberately a shape check, since the daemon cannot resolve a sha in a repo it does
+  not hold), non-triviality (a confirm reporting the main it was authorized against moved nothing), and —
+  for a `Local` entry only — that the reported sha IS `lease.ExpectedBranchSha`, because
+  `git merge --ff-only agent/<id>` leaves main AT the source's tip. Stated as a limit rather than
+  stretched: the P2-12 external leg lands the host's merge commit, which is not the PR head, so the same
+  equality would be false for every honest external merge (that path has its own head CAS, K4). Each
+  refusal releases the lease and audits `merge_confirm_refused` with `stage = "identity"`. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
   mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
   between a merge and the next repo-open based its worktree on the stale mirror main and
   `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving
