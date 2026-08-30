@@ -5,10 +5,10 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
-using Mainguard.Git.Audit;
 using Mainguard.Agents.UI.ViewModels;
-using Microsoft.EntityFrameworkCore;
+using Mainguard.Git.Audit;
 using Mainguard.Git.Review;
+using Microsoft.EntityFrameworkCore;
 using Xunit;
 using VerificationRecord = Mainguard.Agents.Agents.Orchestrator.VerificationRecord;
 
