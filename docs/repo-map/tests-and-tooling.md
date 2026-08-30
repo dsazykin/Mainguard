@@ -2093,7 +2093,20 @@
   because a spawn binds one. `request_verification` is honest about its limit: it asserts the call gets
   PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
   fake environment goes — a true verification positive needs a real repo and belongs to the Docker
-  tier),**
+  tier). **Extended (the frozen jail):** a worker whose session state is `Paused` or `Conflict` — what a
+  conflicted keep-alive rebase leaves behind — has its prompt REFUSED, and the CLI double proves nothing
+  reached it (no submitted line, empty input box); the same worker accepts a steer moments earlier, so
+  the refusal cannot be a handler that refuses everything. `request_verification` gets the same pair and
+  is asserted to stop at the pause rather than at the substrate's missing queue),**
+  **`PausedJailHarvestTests` (a paused jail is not exec-able, and the log must say that ONCE. The live
+  defect: a conflicted auto-rebase freezes the worker, the harvest sweep still ran, and each declared
+  credential path produced a raw `Docker.DotNet.DockerApiException … Conflict` stack trace — four in one
+  session, a warning that means "as expected". Asserts the skip costs NO exec (catching the Conflict
+  quietly would satisfy a log-only assertion and still spend one per file), the skip line is Information
+  with no exception and says nothing was lost, and — the half that must not be silenced — that a genuine
+  harvest failure on a LIVE jail is still a warning carrying its exception and the file name. Plus: an
+  engine that cannot answer "is it paused?" is read as NOT paused, since guessing would skip a harvest
+  that would have worked. Settings harvest, the twin method with the same hole, gets its own pair),**
   **`RawModeCliDouble` (test support, not a test: a stand-in for a coding CLI attached to a PTY that
   models the CLI's SIDE of the boundary — raw mode, CR submits the input buffer, LF inserts a newline
   into it, input repaints. The behaviour was measured against claude-code v2.1.251 under a real

@@ -1150,6 +1150,12 @@ public sealed class SandboxAgentLauncher
             return Array.Empty<SandboxSettingsFile>();
         }
 
+        if (await IsFrozenAsync(containerId, ct).ConfigureAwait(false))
+        {
+            LogHarvestSkippedForFrozenJail("settings", agentKind, containerId);
+            return Array.Empty<SandboxSettingsFile>();
+        }
+
         var harvested = new List<SandboxSettingsFile>();
         foreach (var entry in declared)
         {
@@ -1247,6 +1253,12 @@ public sealed class SandboxAgentLauncher
             return Array.Empty<SandboxCredentialFile>();
         }
 
+        if (await IsFrozenAsync(containerId, ct).ConfigureAwait(false))
+        {
+            LogHarvestSkippedForFrozenJail("credential", agentKind, containerId);
+            return Array.Empty<SandboxCredentialFile>();
+        }
+
         var harvested = new List<SandboxCredentialFile>();
         foreach (var relative in declared.Where(AdapterManifest.IsHomeRelativeFilePath))
         {
@@ -1281,6 +1293,48 @@ public sealed class SandboxAgentLauncher
 
         return harvested;
     }
+
+    /// <summary>
+    /// Whether this jail is frozen (<c>docker pause</c>) — asked BEFORE either harvest, because
+    /// <c>docker exec</c> into a paused container is not a failure the harvest can learn anything from:
+    /// the engine refuses it outright with <c>Conflict</c>, once per declared path.
+    ///
+    /// <para><b>The defect this closes.</b> A conflicted keep-alive rebase leaves the worker paused, and
+    /// the client's harvest sweep runs against every agent — so a stop or a sweep in that window logged a
+    /// raw <c>Docker.DotNet.DockerApiException … status code=Conflict</c> stack trace per file (four in
+    /// one observed session). Nothing was wrong that an operator could act on, and a warning-with-stack
+    /// that means "as expected" is how the ones that mean something stop being read.</para>
+    ///
+    /// <para>An engine that cannot answer is treated as NOT frozen, deliberately: the harvest then runs
+    /// and its own error is the honest report. Guessing "frozen" from ignorance would silently skip a
+    /// harvest that would have succeeded, and a skipped credential harvest costs the user their login.</para>
+    /// </summary>
+    private async Task<bool> IsFrozenAsync(string containerId, CancellationToken ct)
+    {
+        try
+        {
+            return await _environment.Sandboxes.IsPausedAsync(containerId, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _log.LogDebug(
+                ex, "cli harvest: could not read pause state, harvesting anyway: container={Container}",
+                containerId);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The skip, said once and said as a fact rather than as a failure — Information, no exception. It
+    /// names what was NOT done and that nothing was lost, so an operator reading the log after a
+    /// conflicted merge is not left wondering whether a login was dropped.
+    /// </summary>
+    private void LogHarvestSkippedForFrozenJail(string what, string agentKind, string containerId) =>
+        _log.LogInformation(
+            "cli {What} harvest skipped: kind={Kind} container={Container} — the jail is paused and "
+            + "`docker exec` into a frozen container is refused by the engine. Nothing was harvested and "
+            + "nothing was lost; the files are still in its $HOME and harvest again once it is resumed.",
+            what, agentKind, containerId);
 }
 
 /// <summary>

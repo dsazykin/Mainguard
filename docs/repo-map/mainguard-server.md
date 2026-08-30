@@ -223,7 +223,14 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). It owns the same two halves for the **CLI SETTINGS round-trip**:
+    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
+    `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
+    meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
+    skipped with one Information line saying nothing was lost; an engine that cannot answer is read as NOT
+    frozen (guessing would skip a harvest that would have worked, costing the user their login), and a
+    genuine failure on a live jail is still a warning with its exception.
+    It owns the same two halves for the **CLI SETTINGS round-trip**:
     `FilterCliSettings` admits only (root, path) pairs the marker's `settingsPaths` declares and caps
     each file at `AdapterSettingsPolicy.MaxFileBytes` — the stakes are higher than for a login, because
     these files carry a permission allowlist and an unfiltered path would let a compromised client plant
