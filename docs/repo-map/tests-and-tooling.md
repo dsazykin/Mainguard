@@ -1635,6 +1635,18 @@
   `mainguard-plan await <id>` is the documented crash re-attach, and answering it with an empty prompt
   would strand a worker holding an approved plan — while auditing `worker_task_released` and raising
   `TaskReleased` only on the first call, asserted sequentially and under 25 rounds of 32 racing threads),
+  **`PlanModeToggleTests`** (the operator's **plan-mode toggle**, 2026-08-30, both ways round. The switch
+  itself — fail-closed when nothing is persisted AND when the store will not parse, the setting
+  round-tripping through `JsonPlanModeStore` in both directions, `plan_mode_changed` audited once and only
+  on a real change; and the gate under it — the task released without a plan when off and refused when on,
+  an ungated worker still HELD (mode recorded on `worker_task_withheld`, so "off" is not "skip `Hold`"),
+  every gate predicate answering yes with the toggle off and every one of them still refusing with it on,
+  the toggle NOT leaking to agents the gate never held, the three-way merge record (OFF vs approved vs
+  unmanaged), an ungated worker's plan presentation refused, the mode belonging to the WORKER so a later
+  toggle is retroactive in neither direction, release-once accounting unchanged, no backpressure from
+  ungated workers, and the jail text: the ungated worker/coordinator/kickoff variants dropping every
+  sentence that asserts a gate while keeping the commit half verbatim, plus every mode-taking entry point
+  defaulting to the gated one),
   **`WorkerReadinessTriggerTests`** (phase 2's automatic verification trigger, driven on a virtual clock
   with the sweep hand-cranked so the debounce and the cooldown are asserted rather than slept on. Every fire
   is observed as a REAL `MergeQueue` state walk driven by `RunVerificationAsync`, never as a call count on a
@@ -1946,7 +1958,22 @@
   its own jail socket); `AgentSession.ParentAgentId` records the spawning coordinator;** the
   Unix-socket legs — coordinator IPC endpoint + locked managed-worker spawn via the socket, and the
   REAL python3 `mainguard-agent` shim round-trip — are `LinuxOnly`, authoritative in the Linux CI
-  leg),** **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
+  leg),**
+  **`PlanModeToggleDaemonTests`** (the plan-mode toggle AT THE DAEMON, on its own `PlanGateRig` so the
+  switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
+  coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
+  through the same single exit; an ungated worker's `present`/`revise`/`await` are refused and queue
+  nothing; steering, verification and committing are all permitted off and all refused BY THE GATE on; the
+  G1 merge-queue row is created at spawn off and deferred on; the merge record names which authorisation
+  the worker actually had; `Get`/`SetPlanMode` over gRPC read back the DAEMON's state; the plan stream
+  carries the state on an EMPTY update — the case that needs it most; and `RoleInterceptor` denies
+  `SetPlanMode` to a coordinator, asserted on the role gate's own message so it cannot pass because the
+  bearer layer rejected it first. Note `DaemonFixture` now replaces the `PlanModeSwitch` with an
+  in-memory-store instance for the WHOLE tier: `UseSetting("Daemon:TokenPath")` does not reach the
+  daemon's configuration under this factory, so every host falls back to the one assembly-wide data root
+  — and a test that turned the approval gate off on disk would turn it off for every host built after it,
+  in parallel),
+  **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
   Unix-socket channel a jail uses, through the production `AgentSpawnService` handlers. This is the file
   that answers "is the gate enforced, or merely described?", so nothing in it asserts a prompt: a
   coordinator-spawned worker gets `mainguard-plan` and a brief but **not its task** — and the brief is

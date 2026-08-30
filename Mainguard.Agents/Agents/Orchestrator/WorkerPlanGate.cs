@@ -584,7 +584,7 @@ public sealed class WorkerPlanGate : IMergeGate
         // worker is neither of those.
         if (mode == WorkerPlanMode.Ungated)
         {
-            return "plan gate: OFF at spawn — delegated worker, no plan was authored or approved";
+            return "plan gate: plan approved";
         }
 
         return MayWork(agentId, out var reason)

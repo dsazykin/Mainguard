@@ -46,6 +46,22 @@ git credentials, and no view of repository contents; a plan it authored would de
 not inspect. The worker has the context, so the plan describes what will actually be done rather than
 what was guessed before anyone looked.
 
+### The plan gate is the operator's choice — ON by default (2026-08-30)
+
+Everything in this section describes the gate **when plan mode is on**, which is the default and the
+shipped behaviour. The owner made planning a toggle: with it off, a delegated worker receives its task at
+spawn and implements immediately, with no plan authored and no approval.
+
+Off is a **mode**, not a set of skipped checks: the daemon still holds the worker, still counts it against
+`MaxActiveWorkers`, still lets the merge queue and the readiness trigger ask about it, and records on the
+merge itself that this branch was authorised by a standing operator setting rather than by a human reading
+a plan. The setting lives daemon-side (`PlanModeSwitch`), is denied to the coordinator role at
+`RoleInterceptor` — a coordinator that could turn it off would hold the gate it is denied at, wholesale —
+and fails closed. The full design, and what OFF changes at each enforcement point, is
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.
+
+Human gate #2 — the merge review — is untouched in both modes.
+
 ### The plan gate is blocking, and rejection is feedback
 
 The worker **does not start work until its plan is approved**. Rejection does not kill the worker —
@@ -173,10 +189,21 @@ object the daemon builds its handler table against.
 | op | purpose | gates applied |
 |---|---|---|
 | `brief` | what am I here to plan? | never yields the task prompt |
+| `task` | what am I here to do? | **approved plan** (`MayWork`) — or plan mode off |
 | `present_plan` | present the plan I authored, then block | one live plan per worker |
 | `revise_plan` | re-present after a rejection, then block | plan ownership · revision budget |
 | `await_decision` | re-attach and block on my own plan | plan ownership |
 | `commit_work` | record my approved work on my own branch | **approved plan** (`MayWork`) |
+
+`task` was added on **2026-08-30** with the plan-mode toggle, and is recorded as a contract change in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.4. It is a second **door** onto
+the withheld task, never a second decision about it: it calls the same `WorkerPlanGate.TryReleaseTask` —
+with the same release-once audit record — that an approval fires, and is authorised by the same `MayWork`
+predicate as `commit_work`. It exists because with plan mode off there is no `present`, which until then
+was the only path that ever returned a task, and a worker would otherwise have no way to learn what it was
+spawned to do. The two alternatives were both worse: redefining `brief` would make "never yields the task
+prompt" conditionally false (§13's defect exactly), and putting the task in the launch argv would give up
+the structural guarantee that `AgentKickoffPrompt` *cannot* carry it.
 
 `commit_work` is the step that makes a worker's work outlive its jail, and it is where the loop used to
 end one rung short: a worker finished, stopped on an uncommitted diff, and the worktree was deleted with
