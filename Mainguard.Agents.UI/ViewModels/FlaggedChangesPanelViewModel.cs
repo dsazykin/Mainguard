@@ -47,6 +47,15 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
     [ObservableProperty] private bool _allAcknowledged;
     [ObservableProperty] private string _resetNotice = "";
 
+    /// <summary>
+    /// "WORKER-DECLARED DEVIATIONS (n)", or empty when the branch has none. Called out by name because
+    /// these rows are a different KIND of claim from the rest of the panel: every other item is something
+    /// the daemon detected in the diff, and this is something the worker said about its own work — the
+    /// one row here whose truth nothing verifies, and the one the reviewer should read against the
+    /// approved approach shown above rather than against the file it names.
+    /// </summary>
+    [ObservableProperty] private string _deviationHeading = "";
+
     /// <summary>True when this panel's acknowledgments travel to the daemon-side merge gate.</summary>
     public bool IsLive => _live is not null;
 
@@ -262,6 +271,9 @@ public partial class FlaggedChangesPanelViewModel : ViewModelBase
         PendingCount = pending;
         HasItems = Items.Count > 0;
         AllAcknowledged = pending == 0;
+
+        var declared = Items.Count(i => i.Kind == FlaggedKind.DeclaredDeviation);
+        DeviationHeading = declared > 0 ? $"WORKER-DECLARED DEVIATIONS ({declared})" : "";
     }
 }
 

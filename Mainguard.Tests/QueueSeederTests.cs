@@ -518,10 +518,7 @@ public sealed class QueueSeederTests : IDisposable
             planGate: _planGate,
             // SA-1/F6, read the way the composition root reads it: APPROVED plans only, keyed by the
             // worker's own agent id — which for a seeded entry is the seed id itself.
-            resolveApprovedPlan: agentId =>
-                _plans.LatestForWorker(agentId) is { Status: PlanStatus.Approved } approved
-                    ? approved.Plan
-                    : null,
+            resolveApprovedWork: agentId => _plans.ApprovedWorkFor(agentId),
             syntheticVerifications: _synthetic);
 
         return (

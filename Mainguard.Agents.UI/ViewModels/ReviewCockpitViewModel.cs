@@ -66,6 +66,36 @@ public sealed record ReviewCockpitContext(
 
     /// <summary>The short sha the branch was verified against (freshness at a glance).</summary>
     public string? VerifiedAgainstSha { get; init; }
+
+    // ---- What the human APPROVED (the other half of a review) ---------------------------------------
+    //
+    // A review is a comparison, and until these were carried there was only one side of it on screen.
+    // The approved `approach` — the paragraph the human said yes to — lived on the daemon, was read once
+    // at approval, and never appeared again; so a branch that did the opposite of what it proposed
+    // rendered exactly like one that did it faithfully. Measured: an approved approach said the module
+    // had no validation idiom and the plan would keep plain `a / b`; the branch shipped a throwing
+    // validation layer that silently changed three pre-existing functions, with FlaggedItems EMPTY (the
+    // file scope was honoured) and the verification green (the worker wrote the tests).
+    //
+    // Deliberately NOT folded into ApprovedPlan: that is a full TaskPlan whose Scope is F6-load-bearing,
+    // and the wire carries no scope here. Building one with an invented empty scope to hold a title and
+    // a paragraph is how a fabricated authorisation gets somewhere that reads it as real.
+
+    /// <summary>The approved plan's id (short-rendered beside its title); null when there is no approval.</summary>
+    public string? ApprovedPlanId { get; init; }
+
+    /// <summary>The approved plan's title — what the human decided from.</summary>
+    public string? ApprovedPlanTitle { get; init; }
+
+    /// <summary>The approved <c>approach</c> text, rendered beside the diff. Null when there is no approval.</summary>
+    public string? ApprovedApproach { get; init; }
+
+    /// <summary>
+    /// The worker's commit-time declaration: <c>"NotDeclared"</c> / <c>"None"</c> / <c>"Declared"</c>, or
+    /// null when the entry has no approved plan. A string because it arrives as one on the wire and this
+    /// surface only renders it; the daemon owns the vocabulary.
+    /// </summary>
+    public string? DeviationDeclaration { get; init; }
 }
 
 /// <summary>
@@ -98,6 +128,31 @@ public partial class ReviewCockpitViewModel : ViewModelBase
     [ObservableProperty] private bool _canMerge;
     [ObservableProperty] private string _mergeReason = "";
     [ObservableProperty] private bool _isEmpty;
+
+    // ---- The approved-approach panel (the thing the diff is supposed to match) -----------------------
+
+    /// <summary>True when this branch has an approved plan to render. False draws no panel at all —
+    /// a manual agent and an external-PR head were never approved against anything, and an empty
+    /// "Approved approach" card would assert an approval nobody gave.</summary>
+    [ObservableProperty] private bool _hasApprovedApproach;
+
+    /// <summary>"Approved plan — &lt;title&gt; · &lt;short id&gt;" (the heading of that panel).</summary>
+    [ObservableProperty] private string _approvedPlanHeading = "";
+
+    /// <summary>The approved <c>approach</c> text, verbatim.</summary>
+    [ObservableProperty] private string _approvedApproachText = "";
+
+    /// <summary>
+    /// What the worker said about following that approach, as a sentence. Three outcomes, never two:
+    /// declared departures (which are also must-acknowledge rows below), an explicit "none", and no
+    /// answer at all — the last of which reads as a gap rather than as reassurance.
+    /// </summary>
+    [ObservableProperty] private string _deviationDeclarationText = "";
+
+    /// <summary>True when the declaration line is something other than a clean assertion — used to give
+    /// the line the Warning role instead of the muted one. Rendering only; the merge is gated by the
+    /// flagged panel, never by this.</summary>
+    [ObservableProperty] private bool _deviationNeedsAttention;
 
     // Review-sprint mode (§3.7).
     [ObservableProperty] private bool _sprintActive;
@@ -176,6 +231,7 @@ public partial class ReviewCockpitViewModel : ViewModelBase
 
         BuildRows();
         BuildHeader();
+        BuildApprovedApproach();
         RefreshGate();
     }
 
@@ -193,6 +249,48 @@ public partial class ReviewCockpitViewModel : ViewModelBase
 
         FlaggedPanel.Refresh();
         RefreshGate();
+    }
+
+    /// <summary>
+    /// The approved-approach panel's text. Pure projection — it renders what the daemon sent and derives
+    /// no judgement of its own: nothing here reads the diff, and nothing compares the approach to it.
+    /// That comparison is the human's, and this exists so they have both halves on one screen.
+    /// </summary>
+    private void BuildApprovedApproach()
+    {
+        if (_ctx.ApprovedApproach is not { Length: > 0 } approach)
+        {
+            HasApprovedApproach = false;
+            return;
+        }
+
+        HasApprovedApproach = true;
+        ApprovedApproachText = approach;
+
+        var title = _ctx.ApprovedPlanTitle is { Length: > 0 } t ? t : "(untitled plan)";
+        ApprovedPlanHeading = _ctx.ApprovedPlanId is { Length: > 0 } id
+            ? $"APPROVED APPROACH — {title} · plan {Short(id)}"
+            : $"APPROVED APPROACH — {title}";
+
+        // Three answers, three sentences. Collapsing the first two into "no deviations reported" is the
+        // whole failure mode: it would report "nobody was asked" as "the worker says it matches".
+        (DeviationDeclarationText, DeviationNeedsAttention) = _ctx.DeviationDeclaration switch
+        {
+            "Declared" => (
+                "The worker declared it departed from this approach — each departure is a flagged item below.",
+                true),
+            "None" => (
+                "The worker declared no deviation from this approach. That is its claim, not a check — "
+                + "the branch's tests are the worker's own.",
+                false),
+            "NotDeclared" => (
+                "No deviation declaration is on record for this branch — nothing states whether the work "
+                + "follows this approach.",
+                true),
+            // A daemon that predates the field says nothing, and this surface says nothing back rather
+            // than picking one of the three answers on its behalf.
+            _ => ("", false),
+        };
     }
 
     private void BuildHeader()

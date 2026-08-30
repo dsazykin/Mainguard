@@ -18,9 +18,14 @@
     <Style Selector="PathIcon.sev.info"><Setter Property="Foreground" Value="{DynamicResource TextMuted}"/></Style>
     <Style Selector="Border.diffAdd"><Setter Property="Background" Value="{DynamicResource DiffAddedBg}"/></Style>
     <Style Selector="Border.diffDel"><Setter Property="Background" Value="{DynamicResource DiffRemovedBg}"/></Style>
+    <!-- The declaration line reads muted when the worker asserted it followed the approach, and takes the
+         Warning role when it declared a departure or said nothing at all. Two roles, by meaning — the
+         merge is gated by the flagged panel below, never by this line. -->
+    <Style Selector="TextBlock.declaration"><Setter Property="Foreground" Value="{DynamicResource TextMuted}"/></Style>
+    <Style Selector="TextBlock.declaration.attention"><Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/></Style>
   </UserControl.Styles>
 
-  <Grid RowDefinitions="Auto,Auto,Auto,*,Auto" Margin="12">
+  <Grid RowDefinitions="Auto,Auto,Auto,Auto,*,Auto" Margin="12">
 
     <!-- Header facts -->
     <StackPanel Grid.Row="0" Spacing="2" Margin="0,0,0,8">
@@ -29,20 +34,57 @@
                  IsVisible="{Binding VerifiedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
     </StackPanel>
 
+    <!-- What the human APPROVED — the other half of a review (above the diff, on purpose).
+
+         This surface used to show the diff and nothing to compare it against: the approved `approach`
+         was written by the worker, read once by the human at approval, and then never rendered again.
+         Measured consequence — an approved approach said the module had no validation idiom and the
+         plan would keep plain `a / b`; the branch shipped a throwing validation layer that changed
+         three pre-existing functions. The flagged list was EMPTY (the file scope was honoured) and the
+         verification was green (the worker wrote the tests). Nothing was wrong with the gates; the
+         reviewer simply had only one side of the comparison in front of them.
+
+         Not rendered at all when there is no approved plan — an empty "approved approach" card would
+         assert an approval a manual agent or an external PR never had. -->
+    <Border Grid.Row="1" Padding="8" Margin="0,0,0,8" CornerRadius="8"
+            Background="{DynamicResource SurfaceCard}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1"
+            IsVisible="{Binding HasApprovedApproach}">
+      <StackPanel Spacing="4">
+        <TextBlock Text="{Binding ApprovedPlanHeading}" FontSize="11" FontWeight="SemiBold"
+                   Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
+        <!-- The approach verbatim. Scrolls rather than truncating: an elided approach is worse than
+             none, because the sentence that was cut is exactly the one the diff disagrees with. -->
+        <ScrollViewer MaxHeight="140" VerticalScrollBarVisibility="Auto">
+          <TextBlock Text="{Binding ApprovedApproachText}" FontSize="12" TextWrapping="Wrap"
+                     Foreground="{DynamicResource TextPrimary}"/>
+        </ScrollViewer>
+        <TextBlock Classes="declaration" Classes.attention="{Binding DeviationNeedsAttention}"
+                   Text="{Binding DeviationDeclarationText}" FontSize="10" TextWrapping="Wrap"
+                   IsVisible="{Binding DeviationDeclarationText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+      </StackPanel>
+    </Border>
+
     <!-- Test-delta strip (§6.5) -->
-    <Border Grid.Row="1" Padding="8,4" Margin="0,0,0,8" CornerRadius="6"
+    <Border Grid.Row="2" Padding="8,4" Margin="0,0,0,8" CornerRadius="6"
             Background="{DynamicResource SurfaceCard}" BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1"
             IsVisible="{Binding TestDeltaSummary, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
       <TextBlock Text="{Binding TestDeltaSummary}" FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"/>
     </Border>
 
     <!-- The flagged gate panel (§6.3), pinned above the hunk list -->
-    <Border Grid.Row="2" Padding="8" Margin="0,0,0,8" CornerRadius="8"
+    <Border Grid.Row="3" Padding="8" Margin="0,0,0,8" CornerRadius="8"
             Background="{DynamicResource SurfaceCard}" BorderBrush="{DynamicResource DangerBrush}" BorderThickness="1"
             IsVisible="{Binding FlaggedPanel.HasItems}">
       <StackPanel Spacing="6" DataContext="{Binding FlaggedPanel}" x:DataType="vm:FlaggedChangesPanelViewModel">
         <TextBlock Text="FLAGGED — acknowledge each to enable merge" FontSize="11" FontWeight="SemiBold"
                    Foreground="{DynamicResource DangerBrush}"/>
+        <!-- Named separately because it is a different kind of claim from everything else in this
+             panel: the other rows are what the daemon found in the diff, these are what the worker
+             SAID about its own work — unverifiable by construction, and to be read against the
+             approved approach above rather than against the file the row names. -->
+        <TextBlock Text="{Binding DeviationHeading}" FontSize="10" FontWeight="SemiBold"
+                   Foreground="{DynamicResource WarningBrush}"
+                   IsVisible="{Binding DeviationHeading, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
         <TextBlock Text="{Binding ResetNotice}" FontSize="10" Foreground="{DynamicResource WarningBrush}" TextWrapping="Wrap"
                    IsVisible="{Binding ResetNotice, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
         <!-- Acknowledging cannot reach the gate right now (no repo / no daemon): said plainly, and the
@@ -77,7 +119,7 @@
     </Border>
 
     <!-- Ranked hunks (left) + diff readout (right) -->
-    <Grid Grid.Row="3" ColumnDefinitions="0.9*,1.1*">
+    <Grid Grid.Row="4" ColumnDefinitions="0.9*,1.1*">
       <Border Grid.Column="0" Margin="0,0,4,0" CornerRadius="8" Background="{DynamicResource SurfaceCard}"
               BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
         <ScrollViewer>
@@ -155,7 +197,7 @@
     <!-- Footer: the CanMerge equation as facts + reject + bring-local + merge (§6.4). Reject is the
          review verdict "no" (terminal) — DangerQuiet, destructive by hue not mass, two-step confirm
          with an optional reason; hidden entirely when the composition has no reject handler. -->
-    <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,8,0,0">
+    <Grid Grid.Row="5" ColumnDefinitions="*,Auto,Auto,Auto" Margin="0,8,0,0">
       <TextBlock Grid.Column="0" Text="{Binding MergeReason}" FontSize="11" VerticalAlignment="Center"
                  Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
                  IsVisible="{Binding !IsConfirmingReject}"/>

@@ -858,6 +858,20 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                     "O", System.Globalization.CultureInfo.InvariantCulture);
             }
 
+            // What the human APPROVED, carried to the surface that reviews the result of it. Without
+            // this the cockpit renders a diff and nothing to compare it against: the approved approach
+            // was written by the worker, read by the human, decided on — and then never surfaced again,
+            // so a branch that did the opposite of it looked exactly like one that did not. Left empty
+            // for an entry with no approved plan, which is how the surface knows not to draw a panel
+            // asserting an approval that does not exist.
+            if (ctx.ResolveApprovedWork?.Invoke(agentId) is { } approved)
+            {
+                entry.ApprovedPlanId = approved.Plan.PlanId ?? string.Empty;
+                entry.ApprovedPlanTitle = approved.Plan.Title ?? string.Empty;
+                entry.ApprovedPlanApproach = approved.Plan.Approach ?? string.Empty;
+                entry.DeviationDeclaration = approved.Declaration.ToString();
+            }
+
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));
             update.Entries.Add(entry);
         }

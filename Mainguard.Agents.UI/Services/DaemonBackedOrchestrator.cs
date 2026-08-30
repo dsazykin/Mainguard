@@ -895,7 +895,15 @@ public sealed class DaemonBackedOrchestrator :
                     // The daemon has always sent this and the client has always thrown it away, which is
                     // why the review cockpit's "verified @ <sha>" stamp never rendered: the value existed
                     // on the wire and stopped here.
-                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha));
+                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha,
+                    // What the human APPROVED for this branch — the half of the review that is not the
+                    // diff. Empty means the entry has no approved plan (manual agent, external-PR head,
+                    // plan mode off), and the surface then draws no approval panel at all rather than an
+                    // empty one asserting an approval nobody gave.
+                    ApprovedPlanId: NullIfEmpty(entry.ApprovedPlanId),
+                    ApprovedPlanTitle: NullIfEmpty(entry.ApprovedPlanTitle),
+                    ApprovedApproach: NullIfEmpty(entry.ApprovedPlanApproach),
+                    DeviationDeclaration: NullIfEmpty(entry.DeviationDeclaration)));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -1636,6 +1644,13 @@ public sealed class DaemonBackedOrchestrator :
             value, System.Globalization.CultureInfo.InvariantCulture,
             System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
             ? parsed : null;
+
+    /// <summary>
+    /// proto3's empty string mapped to "the daemon said nothing". Used for the approved-plan fields,
+    /// where an empty approach and an absent approval must not render the same: one is a panel with a
+    /// blank paragraph in it, the other is no panel.
+    /// </summary>
+    private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
     private static string Short(string sha) =>
         string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);

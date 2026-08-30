@@ -262,7 +262,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         var plan = PlanScopedTo("docs/**");
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+            resolveApprovedWork: id => id == AgentId ? Approved(plan) : null).EnsureQueue(repoHash)!;
 
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.True(record.Passed);
@@ -290,7 +290,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         var plan = PlanScopedTo("**/*.cs");
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+            resolveApprovedWork: id => id == AgentId ? Approved(plan) : null).EnsureQueue(repoHash)!;
 
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
@@ -345,7 +345,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
 
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: null, mergeDiff: new UncomputableDiffService()).EnsureQueue(repoHash)!;
+            resolveApprovedWork: null, mergeDiff: new UncomputableDiffService()).EnsureQueue(repoHash)!;
 
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
@@ -378,6 +378,18 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         TestStrategy: "npm test",
         BudgetUsd: 1m,
         DraftedAt: DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// An approval whose worker has already answered "no deviations". That is the default for the SCOPE
+    /// tests in this class on purpose: an approval left at <see cref="DeviationDeclaration.NotDeclared"/>
+    /// also carries the missing-declaration must-ack row, and a second always-present item would let those
+    /// tests pass without the scope comparison producing anything. The declaration's own three outcomes
+    /// are exercised by the deviation tests below instead.
+    /// </summary>
+    private static ApprovedWork Approved(
+        TaskPlan plan,
+        DeviationDeclaration declaration = DeviationDeclaration.None,
+        params string[] deviations) => new(plan, declaration, deviations);
 
     /// <summary>Lands a package.json on the agent branch whose <c>scripts</c> block runs arbitrary shell at
     /// install time — the P2-11 canary for hostile agent code that verifies green.</summary>
@@ -1537,11 +1549,11 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry, Func<IReadOnlyList<string>, int>? exitFor)
-        => NewProvisioner(exitCode, out engine, registry, exitFor, resolveApprovedPlan: null);
+        => NewProvisioner(exitCode, out engine, registry, exitFor, resolveApprovedWork: null);
 
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry,
-        Func<IReadOnlyList<string>, int>? exitFor, Func<string, TaskPlan?>? resolveApprovedPlan,
+        Func<IReadOnlyList<string>, int>? exitFor, Func<string, ApprovedWork?>? resolveApprovedWork,
         IMergeBranchDiffService? mergeDiff = null)
     {
         engine = new FakeSandboxEngine(exitCode, exitFor);
@@ -1559,7 +1571,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             mergeDiff: mergeDiff ?? new MergeBranchDiffService(
                 new RepoProvisioner(_vmRoot),
                 (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId)),
-            resolveApprovedPlan: resolveApprovedPlan,
+            resolveApprovedWork: resolveApprovedWork,
             // MG-3: the production wiring. The agent commits into its OWN repository now, so without the
             // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
             // agent/<id> — the branch's rewritten test command would be invisible and the drift gate
