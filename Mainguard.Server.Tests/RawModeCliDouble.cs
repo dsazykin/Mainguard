@@ -51,6 +51,7 @@ internal sealed class RawModeCliDouble : ITerminalSession
 {
     private readonly object _gate = new();
     private readonly List<string> _submitted = new();
+    private readonly List<(DateTime At, int Bytes)> _writes = new();
     private readonly StringBuilder _pending = new();
     private readonly CliStream _stream;
     private readonly bool _redraws;
@@ -77,6 +78,24 @@ internal sealed class RawModeCliDouble : ITerminalSession
             lock (_gate)
             {
                 return _submitted.ToArray();
+            }
+        }
+    }
+
+    /// <summary>
+    /// When each read landed at the CLI, and how big it was — the axis defect J2 lives on.
+    ///
+    /// <para>Assertions about the <i>gap</i> between the body and the terminator have to be made here
+    /// rather than on wall-clock time around the whole call: a caller that waited before writing at all
+    /// would satisfy an outer stopwatch while still handing the CLI both halves in one read.</para>
+    /// </summary>
+    public IReadOnlyList<(DateTime At, int Bytes)> Writes
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _writes.ToArray();
             }
         }
     }
@@ -151,6 +170,7 @@ internal sealed class RawModeCliDouble : ITerminalSession
 
         lock (_gate)
         {
+            _writes.Add((DateTime.UtcNow, text.Length));
             foreach (var ch in text)
             {
                 if (ch == '\r' && !pasted)

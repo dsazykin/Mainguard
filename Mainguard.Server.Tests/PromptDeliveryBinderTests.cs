@@ -151,18 +151,62 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         using var bound = new BoundTerminalSession(_key.AgentId, cli);
         _terminals.Bind(_key, bound);
 
+        var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
+
+        Assert.True(delivery.Submitted);
+        Assert.False(delivery.Echoed);
+
+        // Measured BETWEEN THE TWO READS at the CLI, not around the call: a caller that idled before
+        // writing anything would satisfy an outer stopwatch while still handing the CLI a single read.
+        var writes = cli.Writes;
+        Assert.Equal(2, writes.Count);
+        var gap = writes[1].At - writes[0].At;
+        Assert.True(
+            gap >= TerminalSubmit.TerminatorSeparation,
+            $"Enter followed the body after only {gap.TotalMilliseconds:0}ms with no echo to separate "
+            + "them — the PTY would hand the CLI a single read and the CR would be swallowed as content");
+
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
+    /// The case the fallback actually exists for: a CLI whose output stream has already completed.
+    ///
+    /// <para>The echo wait returns false <b>immediately</b> then — the stream is done, there is nothing
+    /// left to wait for — so unlike the ordinary no-echo path it reaches the terminator having waited no
+    /// time at all. Without an explicit separation the two writes go out back to back, which is one read
+    /// at the CLI and defect J2 intact. This is what makes the fallback a guard rather than dead code:
+    /// on the common path the lapsed 250 ms echo window has already separated them, which is why
+    /// removing it survived the first mutation pass.</para>
+    /// </summary>
+    [Fact]
+    public async Task WhenTheEchoWaitReturnsInstantly_TheTerminatorIsStillHeldBack()
+    {
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(_key.AgentId, cli);
+        _terminals.Bind(_key, bound);
+
+        cli.Kill(); // completes the output stream: the echo wait now returns false with no delay at all
+
         var started = System.Diagnostics.Stopwatch.StartNew();
         var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
         started.Stop();
 
         Assert.True(delivery.Submitted);
         Assert.False(delivery.Echoed);
-        Assert.True(
-            started.Elapsed >= TerminalSubmit.TerminatorSeparation,
-            $"Enter followed the body after only {started.ElapsedMilliseconds}ms with no echo to "
-            + "separate them — the PTY would hand the CLI one read and the CR would be swallowed");
 
-        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+        // It returned fast, so the echo window did NOT lapse — and the writes were separated anyway.
+        Assert.True(
+            started.Elapsed < AgentCliBinder.PromptEchoWindow,
+            "the echo wait was expected to return instantly on a completed stream");
+
+        var writes = cli.Writes;
+        Assert.Equal(2, writes.Count);
+        var gap = writes[1].At - writes[0].At;
+        Assert.True(
+            gap >= TerminalSubmit.TerminatorSeparation,
+            $"the terminator followed the body after {gap.TotalMilliseconds:0}ms with nothing separating "
+            + "them — one read at the CLI, and the CR is content rather than Enter");
     }
 
     /// <summary>No bound CLI: nothing is claimed, and the caller supplies the "no live CLI" sentence.</summary>

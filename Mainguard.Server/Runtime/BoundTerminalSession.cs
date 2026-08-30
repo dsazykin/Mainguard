@@ -285,12 +285,27 @@ public sealed class BoundTerminalSession : IDisposable
         TimeSpan reactionWindow,
         CancellationToken ct)
     {
+        var sinceBody = System.Diagnostics.Stopwatch.StartNew();
         var echoed = await WriteInputAndAwaitOutputAsync(body, echoWindow, ct).ConfigureAwait(false);
         if (!echoed)
         {
-            // Nothing to key off, so separate the writes in time instead. Without this the PTY hands the
-            // CLI body+CR in a single read and the CR is swallowed as pasted content.
-            await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
+            // Nothing to key off, so the writes must be separated in time instead — without a gap the PTY
+            // hands the CLI body+CR in one read and the CR is swallowed as pasted content.
+            //
+            // Measured against the ELAPSED time rather than slept unconditionally, because "no echo" has
+            // two very different shapes. Usually the echo window lapsed, which is already a 250 ms gap and
+            // needs nothing added. But the wait also returns false IMMEDIATELY when the output stream has
+            // completed — a CLI that has died — and that path arrives here having waited no time at all.
+            // A flat `if (!echoed) delay` reads as the guard and is dead code on the common path; this
+            // covers the path that actually needs it.
+            // The FULL separation, not the remainder: the stopwatch starts marginally before the body
+            // actually reaches the PTY, so subtracting its reading would shave the write's own cost off
+            // the gap the CLI sees. Waiting the whole 50 ms when little time has passed is free, and it
+            // makes the gap a floor rather than an approximation.
+            if (sinceBody.Elapsed < TerminalSubmit.TerminatorSeparation)
+            {
+                await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
+            }
         }
 
         var reacted = await WriteInputAndAwaitOutputAsync(terminator, reactionWindow, ct)
