@@ -71,4 +71,31 @@ public sealed class FlaggedChangeGate : IMergeGate
             : $"{pending} flagged changes need acknowledgment";
         return false;
     }
+
+    /// <summary>
+    /// What this gate had established about the branch at merge time (see
+    /// <see cref="IMergeGate.MergeEvidence"/>). <see cref="PeekStore"/> and never <see cref="StoreFor"/>:
+    /// building an audit record must not create the empty store that reads as "reviewed and clean".
+    ///
+    /// <para>The flagged-set hash is included because it is the only thing that makes the count mean
+    /// anything later — an acknowledgment binds to that hash, and a merged branch whose recorded hash does
+    /// not match what its diff hashes to is the shape of an ack that outlived the bytes it was given
+    /// for.</para>
+    /// </summary>
+    public string? MergeEvidence(string agentId)
+    {
+        if (_stores.TryGetValue(agentId ?? string.Empty, out var store))
+        {
+            var items = store.Items;
+            return items.Count == 0
+                ? $"flagged-change review: no flagged items (set {store.CurrentHash})"
+                : $"flagged-change review: {items.Count - store.PendingCount}/{items.Count} "
+                  + $"acknowledged (set {store.CurrentHash})";
+        }
+
+        // Allows() default-DENIES this case, so a merge recorded with this line means the branch reached
+        // Merged through a path that did not consult the gate (the RT-D1 reconcile is the legitimate one).
+        // Saying so is the entire value of recording it.
+        return "flagged-change review: never ran for this branch";
+    }
 }

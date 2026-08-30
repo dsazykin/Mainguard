@@ -50,6 +50,72 @@ public interface IMergeGate
 {
     /// <summary>True iff this gate permits <paramref name="agentId"/> to merge; otherwise sets a reason.</summary>
     bool Allows(string agentId, out string reason);
+
+    /// <summary>
+    /// One line stating what this gate had actually established about <paramref name="agentId"/> at the
+    /// instant a merge was recorded — the evidence half of <see cref="MergeQueue.MergedEvent"/>. The
+    /// default is null, meaning "this gate has nothing to say about that branch".
+    ///
+    /// <para><b>Why <see cref="Allows"/> returning true is not a record of anything.</b> The question a
+    /// reader of the audit chain asks about a merge is <i>what was waived to get here</i>, and "the gates
+    /// allowed it" answers it with a tautology — it is equally true of every merge that ever happened,
+    /// including the one being investigated. A gate that guards must-acknowledge items says which items,
+    /// how many were acknowledged, and the content hash they were bound to, so a later reader can tell a
+    /// branch that had nothing to acknowledge apart from one whose flags a human cleared.</para>
+    /// </summary>
+    string? MergeEvidence(string agentId) => null;
+}
+
+/// <summary>
+/// Who authorised a merge and through which path — the provenance half of
+/// <see cref="MergeQueue.MergedEvent"/>.
+///
+/// <para>It is a parameter rather than something the queue infers, because the queue genuinely cannot
+/// know: the same <c>Merged</c> transition is reached by a human clicking merge in the cockpit, by the
+/// RT-D1 boot reconcile replaying a journal for a merge that landed before a crash, by the external-PR
+/// dispatch, and by dev seeding. An audit record that could not tell those apart would put a person's
+/// name on a daemon's reconciliation — the exact mistake <see cref="MergeQueue.RestartResumeEvent"/>
+/// exists as a separate event type to avoid.</para>
+/// </summary>
+/// <param name="By">The actor. Daemon-derived for a human path (SA-1/F2 — never client-supplied), or a
+/// <c>system:</c>-prefixed name for a path no person drove.</param>
+/// <param name="Source">Which merge path recorded this — one of the constants below.</param>
+/// <param name="LeaseId">The RT-D1 merge lease the merge was performed under; empty where there is none.</param>
+public sealed record MergeAuthorization(string By, string Source, string LeaseId = "")
+{
+    /// <summary>The human-driven <c>ConfirmMerge</c> RPC — a person merged and the daemon-side gates passed.</summary>
+    public const string ConfirmRpcSource = "confirm_rpc";
+
+    /// <summary>The RT-D1 boot reconcile synthesizing a confirm for a merge that landed before a crash.</summary>
+    public const string BootReconcileSource = "boot_reconcile";
+
+    /// <summary>The P2-12 external-PR merge dispatch.</summary>
+    public const string ExternalDispatchSource = "external_dispatch";
+
+    /// <summary>Dev-only queue seeding (<c>docs/design/queue-seeding.md</c>).</summary>
+    public const string SeededSource = "seeded";
+
+    /// <summary>A caller that named neither actor nor path (test doubles, and the parameterless overloads).</summary>
+    public const string UnattributedSource = "unattributed";
+
+    /// <summary>The record for a merge nobody attributed — it says so rather than guessing a name.</summary>
+    public static MergeAuthorization Unattributed { get; } = new("unknown", UnattributedSource);
+
+    /// <summary>A human merge confirmed through the daemon RPC, under <paramref name="leaseId"/>.</summary>
+    public static MergeAuthorization ConfirmRpc(string by, string leaseId) =>
+        new(string.IsNullOrWhiteSpace(by) ? "unknown" : by, ConfirmRpcSource, leaseId ?? string.Empty);
+
+    /// <summary>The boot reconcile's synthesized confirm. Attributed to the reconciler, never a person.</summary>
+    public static MergeAuthorization BootReconcile(string leaseId = "") =>
+        new(MergeQueue.ReconcilerActor, BootReconcileSource, leaseId ?? string.Empty);
+
+    /// <summary>The external-PR dispatch's confirm.</summary>
+    public static MergeAuthorization ExternalDispatch(string leaseId = "") =>
+        new("system:external-pr-dispatch", ExternalDispatchSource, leaseId ?? string.Empty);
+
+    /// <summary>A seeded entry's synthetic merge — labelled, for the same reason a seeded verification is.</summary>
+    public static MergeAuthorization Seeded(string by = "") =>
+        new(string.IsNullOrWhiteSpace(by) ? "system:seeder" : by, SeededSource);
 }
 
 /// <summary>
@@ -396,6 +462,30 @@ public sealed class MergeQueue : IMergeQueue
     /// <summary>Audit event a human discard appends (the durable half is the entry's own persisted row).</summary>
     public const string DiscardedEvent = "queue_entry_discarded";
     public const string RejectedEvent = "queue_entry_rejected";
+
+    /// <summary>
+    /// The audit event for the one action this whole product exists to make safe: a branch reached
+    /// <see cref="WorkerMergeState.Merged"/> and the user's main moved.
+    ///
+    /// <para><b>It had no event at all until now.</b> The chain recorded the act of DISCARDING an entry
+    /// (<see cref="DiscardedEvent"/>) and not the act of merging one — so the single most consequential
+    /// thing the product does, the one that rewrites the user's main branch, was the only one that left
+    /// no tamper-evident artifact. G-17 exists precisely so a consequential pass leaves one.</para>
+    ///
+    /// <para><b>Emitted from here and not from the RPC, deliberately.</b> Four paths reach
+    /// <c>Merged</c> — the <c>ConfirmMerge</c> RPC, the RT-D1 boot reconcile, the external-PR dispatch and
+    /// dev seeding — and an event wired to only the first would leave a crash-recovered merge exactly as
+    /// unrecorded as every merge is today. Both confirm entry points funnel through
+    /// <see cref="MarkMergedLocked"/>, which is why the invariant "no transition to Merged without exactly
+    /// one <c>queue_entry_merged</c>" is enforceable at all. <see cref="MergeAuthorization.Source"/> says
+    /// which path it was.</para>
+    ///
+    /// <para><b>The append is allowed to throw, and that is the point.</b> The chained log throws when it
+    /// cannot store (see <c>IAuditLog.Append</c>); here that surfaces as a failed <c>ConfirmMerge</c> with
+    /// the lease still outstanding, so the merge that really landed is picked up by the next boot's RT-D1
+    /// reconcile. An audit outage therefore delays the record rather than silently losing it.</para>
+    /// </summary>
+    public const string MergedEvent = "queue_entry_merged";
 
     /// <summary>
     /// Audit event appended when the stale cascade could not reparent a branch, carrying the
@@ -786,14 +876,22 @@ public sealed class MergeQueue : IMergeQueue
     /// NOT yet landed — i.e. every path that is still ASKING for permission — must call
     /// <see cref="TryConfirmHumanMerge"/> instead (MG-11).</para>
     /// </summary>
-    public void ConfirmHumanMerge(string agentId, string newMainSha)
+    /// <param name="agentId">The entry whose branch landed.</param>
+    /// <param name="newMainSha">The post-merge <c>main@sha</c>.</param>
+    /// <param name="authorization">Who authorised it and by which path — carried into
+    /// <see cref="MergedEvent"/>. Null records the merge as
+    /// <see cref="MergeAuthorization.Unattributed"/> rather than inventing an actor.</param>
+    public void ConfirmHumanMerge(string agentId, string newMainSha, MergeAuthorization? authorization = null)
     {
+        Dictionary<string, string> merged;
         lock (_gate)
         {
+            merged = BuildMergedPayloadLocked(agentId, newMainSha, authorization);
             MarkMergedLocked(agentId);
         }
 
         NotifyMainMoved(newMainSha);
+        _audit.Append(new AuditEvent(MergedEvent, merged));
     }
 
     /// <summary>
@@ -816,8 +914,14 @@ public sealed class MergeQueue : IMergeQueue
     /// </summary>
     /// <returns>True when the branch moved to <see cref="WorkerMergeState.Merged"/>; false with a
     /// render-verbatim <paramref name="reason"/> (§3.4 vocabulary) when the gate refused.</returns>
-    public bool TryConfirmHumanMerge(string agentId, string newMainSha, string? expectedMainSha, out string reason)
+    /// <param name="authorization">Who authorised it and by which path — carried into
+    /// <see cref="MergedEvent"/>. Null records the merge as
+    /// <see cref="MergeAuthorization.Unattributed"/> rather than inventing an actor.</param>
+    public bool TryConfirmHumanMerge(
+        string agentId, string newMainSha, string? expectedMainSha, out string reason,
+        MergeAuthorization? authorization = null)
     {
+        Dictionary<string, string> merged;
         lock (_gate)
         {
             // The CAS old-OID compare comes first so a lost race reports "main moved" rather than whatever
@@ -835,13 +939,82 @@ public sealed class MergeQueue : IMergeQueue
                 return false;
             }
 
+            // Built BEFORE the transition, under the same lock that decided it: the pre-merge main, the
+            // state the entry merged FROM, and the gate evidence are all facts about the instant the gates
+            // passed. Read after MarkMergedLocked they would describe the world the merge had already
+            // changed — an audit record of its own effect.
+            merged = BuildMergedPayloadLocked(agentId, newMainSha, authorization);
             MarkMergedLocked(agentId);
         }
 
         // Outside the lock: the cascade re-queues co-tenants and raises Changed.
         NotifyMainMoved(newMainSha);
+        _audit.Append(new AuditEvent(MergedEvent, merged));
         reason = "";
         return true;
+    }
+
+    /// <summary>
+    /// The <see cref="MergedEvent"/> payload for a merge that is about to be recorded. Caller holds
+    /// <c>_gate</c>; the append itself happens outside it (the chained log does I/O and may throw).
+    ///
+    /// <para>What it has to answer, because these are the questions someone reading the chain after a bad
+    /// merge actually asks: <b>who</b> authorised it and through which path, <b>which branch</b> and under
+    /// <b>which lease</b>, <b>which shas</b> main moved between, <b>which verification record</b> the
+    /// merge rode on (and whether that record was even measured against the main it merged into), and
+    /// <b>what the gates had established</b> — i.e. which flagged items a human waived to get here.</para>
+    /// </summary>
+    private Dictionary<string, string> BuildMergedPayloadLocked(
+        string agentId, string newMainSha, MergeAuthorization? authorization)
+    {
+        var auth = authorization ?? MergeAuthorization.Unattributed;
+        var fields = new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["by"] = string.IsNullOrWhiteSpace(auth.By) ? "unknown" : auth.By,
+            ["source"] = auth.Source,
+            ["lease"] = auth.LeaseId,
+            ["from_state"] = GetStateLocked(agentId).ToString(),
+            ["pre_main_sha"] = _currentMainSha,
+            ["post_main_sha"] = newMainSha ?? string.Empty,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        };
+
+        // The verification this merge relied on. Its ABSENCE is a real and important state — the boot
+        // reconcile records merges for entries this queue may never have verified — so it is stated as
+        // such rather than rendered as a row of empty strings that reads like a verification with blank
+        // fields.
+        if (_lastVerification.TryGetValue(agentId, out var record) && record is not null)
+        {
+            fields["verification_main_sha"] = record.MainSha ?? string.Empty;
+            fields["verification_branch_sha"] = record.BranchSha ?? string.Empty;
+            fields["verification_passed"] = record.Passed ? "true" : "false";
+            fields["verification_command"] = record.ResolvedCommand ?? string.Empty;
+            fields["verification_config_hash"] = record.ConfigHash ?? string.Empty;
+            fields["verification_when"] =
+                record.When.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            fields["verification"] = "none recorded";
+        }
+
+        // Per gate, in the order the queue ANDs them, so the line reads the same way twice running. A gate
+        // with nothing to say is omitted rather than padded with "(none)" — an empty evidence list is
+        // itself the honest statement that this queue had no must-acknowledge gates wired.
+        var evidence = new List<string>();
+        foreach (var gate in _gates)
+        {
+            var line = gate.MergeEvidence(agentId);
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                evidence.Add(line!);
+            }
+        }
+
+        fields["gates"] = evidence.Count == 0 ? "no gates wired" : string.Join("; ", evidence);
+        return fields;
     }
 
     // The Verified → AwaitingReview → Merged walk shared by both confirm entry points. Caller holds _gate.

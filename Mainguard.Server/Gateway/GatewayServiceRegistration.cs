@@ -325,7 +325,12 @@ public static class GatewayServiceRegistration
                     // branch stayed "Verified" against a main that had already moved. The reconcile task
                     // now hands us the lease's repo hash, so the owning queue is a direct lookup.
                     // Best-effort: a repo whose swarm has not come up yet simply has no queue to notify.
-                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(agentId, postSha);
+                    //
+                    // Attributed to the reconciler and never to a person: this records the daemon
+                    // reflecting a merge that landed before a crash, so a `by` naming whoever happened to
+                    // be signed in would put a human's name on a decision nobody made at boot.
+                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(
+                        agentId, postSha, MergeAuthorization.BootReconcile());
                 });
 
             // Both reconcile steps now RECORD what they did. Boot reconcile is the one pass that can

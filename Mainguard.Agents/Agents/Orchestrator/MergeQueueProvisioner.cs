@@ -805,8 +805,11 @@ public sealed class MergeQueueProvisioner
     private MergeQueueContext Build(string repoHandle, string mainSha)
     {
         // The RT-D2 gate is per-repo-queue because its flag state is per-branch and its acknowledgment is
-        // the human's; sharing one across repos would let one repo's ack clear another's flag.
-        var changedTestCommand = new ChangedTestCommandGate();
+        // the human's; sharing one across repos would let one repo's ack clear another's flag. It gets the
+        // daemon's audit log for the same reason the flagged-change gate below does: waiving "this branch
+        // changed the command that verifies it" is the single most security-relevant acknowledgment in the
+        // product, and it wrote nothing anywhere until it was handed a sink.
+        var changedTestCommand = new ChangedTestCommandGate(_audit);
 
         // P2-11, and the point of this change: the flagged-change gate is per-repo-queue for the same
         // reason the RT-D2 one is — its acknowledgments are per-branch and belong to the human who read
@@ -1238,22 +1241,37 @@ public sealed class MergeQueueProvisioner
         // it is passed through as empty rather than substituted: see VerificationRecord.BranchSha.
         var branchSha = RevParse(barePath, "agent/" + agentId);
 
+        // Both sides of both RT-D2 comparisons, held as locals rather than passed inline: the gate's
+        // acknowledgment record has to be able to say what changed FROM WHAT TO WHAT, and the only place
+        // those two contents exist together is right here, read from the two trees at one instant.
+        var branchVerifyConfig = ShowFile(barePath, "agent/" + agentId, VerificationConfigPath);
+        var mainVerifyConfig = ShowFile(barePath, mainBranch, VerificationConfigPath);
+        var branchToolchainConfig = ShowFile(barePath, "agent/" + agentId, ToolchainConfigPath);
+        var mainToolchainConfig = ShowFile(barePath, mainBranch, ToolchainConfigPath);
+
         var resolution = VerificationCommandResolver.Resolve(
-            branchConfigContent: ShowFile(barePath, "agent/" + agentId, VerificationConfigPath),
-            mainConfigContent: ShowFile(barePath, mainBranch, VerificationConfigPath));
+            branchConfigContent: branchVerifyConfig,
+            mainConfigContent: mainVerifyConfig);
 
         // The same RT-D2 question asked of the TOOLCHAIN declaration. Note the argument order is
         // identical to the line above — branch vs main — but the resolver's answer is not symmetric:
         // what it hands back to provision is always main's, and the branch's copy only decides the flag.
         var toolchain = ToolchainDeclarationResolver.Resolve(
-            branchConfigContent: ShowFile(barePath, "agent/" + agentId, ToolchainConfigPath),
-            mainConfigContent: ShowFile(barePath, mainBranch, ToolchainConfigPath),
+            branchConfigContent: branchToolchainConfig,
+            mainConfigContent: mainToolchainConfig,
             repoHandle: repoHandle);
 
         // Arm (or clear) the RT-D2 gate BEFORE the run: a branch whose command drifted is unmergeable from
-        // the moment we know, not from whenever a UI happens to look.
-        changedGate.SetFlagged(agentId, ChangedTestCommandGate.TestCommandItem, resolution.ChangedVsMain);
-        changedGate.SetFlagged(agentId, ChangedTestCommandGate.ToolchainItem, toolchain.ChangedVsMain);
+        // the moment we know, not from whenever a UI happens to look. The drift detail rides along so a
+        // later acknowledgment can be recorded as the specific waiver it is.
+        changedGate.SetFlagged(
+            agentId, ChangedTestCommandGate.TestCommandItem, resolution.ChangedVsMain,
+            new ChangedTestCommandGate.CommandDrift(
+                VerificationConfigPath, mainVerifyConfig, branchVerifyConfig));
+        changedGate.SetFlagged(
+            agentId, ChangedTestCommandGate.ToolchainItem, toolchain.ChangedVsMain,
+            new ChangedTestCommandGate.CommandDrift(
+                ToolchainConfigPath, mainToolchainConfig, branchToolchainConfig));
 
         // ...and arm the P2-11 flagged-change gate from the same committed trees, at the same moment, for
         // the same reason: a branch that edits a CI workflow, a git hook, an executable config or a

@@ -190,7 +190,9 @@ public sealed class MergeDispatch : IMergeDispatch
             // lease, so the boot reconcile can tell a landed merge from an abandoned one.
             _leases.Confirm(request.RepoHash, leaseId, result.NewMainSha!);
             confirmed = true;
-            queue.ConfirmHumanMerge(request.AgentId, result.NewMainSha!); // → Merged + NotifyMainMoved
+            // → Merged + NotifyMainMoved, and one queue_entry_merged audit event naming this transport.
+            queue.ConfirmHumanMerge(
+                request.AgentId, result.NewMainSha!, MergeAuthorization.ExternalDispatch(leaseId));
 
             return new MergeDispatchOutcome(Merged: true, result.NewMainSha, CasLost: false, Reason: null);
         }

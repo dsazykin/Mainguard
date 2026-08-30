@@ -66,6 +66,39 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
+    /// <summary>
+    /// L4, the plumbing half: the two committed config trees are the ONLY place the baseline and the
+    /// replacement exist together, so if the provisioner does not hand them to the gate, the
+    /// acknowledgment record can never say what was waived — only that something was.
+    ///
+    /// <para>Asserted through the real mirror rather than by handing the gate a literal: a
+    /// <c>SetFlagged</c> that dropped the drift argument would still flag, still block, and still clear on
+    /// acknowledgment, and every other assertion in this class would stay green. This is the one that
+    /// notices.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheWaiverRecord_NamesTheBaselineAndTheReplacement_ReadFromTheMirror()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "true");
+
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.True(ctx.ChangedTestCommand!.Acknowledge(AgentId, "owner@example"));
+
+        var waiver = Assert.Single(
+            provisioner.AuditLog.Read(),
+            e => e.Type == "acknowledged_flagged_change"
+                 && e.Fields.GetValueOrDefault("item") == ChangedTestCommandGate.TestCommandItem);
+
+        Assert.Equal(MergeQueueProvisioner.VerificationConfigPath, waiver.Fields["path"]);
+        Assert.Equal("npm test", waiver.Fields["from"]);
+        Assert.Equal("true", waiver.Fields["to"]);
+        Assert.Equal("owner@example", waiver.Fields["by"]);
+    }
+
     [Fact]
     public async Task BranchThatLeavesTheTestCommandAlone_IsNotFlagged()
     {

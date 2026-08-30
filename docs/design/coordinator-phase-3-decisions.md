@@ -2859,3 +2859,146 @@ makes the window not exist rather than making it small.
   `Working`. That is a one-time re-verification, not a permanent refusal — which is why it is the right
   answer here while `CanMerge`'s belt still declines to refuse from ignorance: the belt guards a refusal
   with no way out, this walks the row to the one state the product re-measures from.
+## 21. Defects L2 and L4 — the audit chain did not record the merge, or the waiver that allowed it
+
+Two holes in the tamper-evident chain, both found in live testing, both the same shape: the paths that
+*matter most* were the paths that wrote nothing.
+
+### 21.1 What was observed, with ground truth
+
+`~/.mainguard/mainguard-daemon.db`, 2026-08-30, after a real merge driven through the UI:
+
+| table | row |
+|---|---|
+| `MergeLeaseRows` id 14 | `ExpectedMainSha=ffbc3bc7…`, `Confirmed=1`, `PostMergeSha=d8a987ff…`, `BeginUtc=05:28:19` |
+| `AuditRecords` | seq 800/801 `acknowledged_flagged_change`, 802–805 `stop`, 806 `queue_entry_jail_reconciled`, 807 `agent_session_reconcile`, 808 `queue_entry_discarded` |
+| `JournalEntries` | **empty** |
+
+Main moved `ffbc3bc → d8a987f` in the mirror and in the user's checkout, the queue row went `Merged`, the
+lease recorded the merge — and **the chain got nothing**. `SELECT Type, COUNT(*) FROM AuditRecords GROUP BY
+Type` returned **33 types, and none of them was a merge**. They included `queue_entry_discarded`: the
+product recorded the act of DROPPING an entry and not the act of merging one.
+
+**L4** is the same defect one layer down. `ChangedTestCommandGate.Acknowledge` recorded the waiver in a
+plain `HashSet<string>` and audited nothing, while the neighbouring `FlaggedChangeGate`'s acks *did* write
+`acknowledged_flagged_change` — the two events at seq 800/801 above are those. The item waived by the
+silent one is *"(verification command) — a branch cannot be allowed to self-green"*: a human waiving the
+fact that a branch **changed the command that verifies it**. The single most security-relevant click in
+the product was the one click that left no trace.
+
+### 21.2 Which points in the merge conversation deserve an event
+
+The conversation is `BeginMerge` → the client merges on the user's own checkout → `ConfirmMerge`, with
+`AbandonMerge` as the non-merge terminal and the RT-D1 boot reconcile as the crash path. Not every step
+earns a record, and adding one everywhere would have made the chain less useful, not more.
+
+| point | event | why / why not |
+|---|---|---|
+| `BeginMerge` **granted** | — | A grant is not an act. Every grant that leads to a merge is already named by that merge's record (which carries the lease id and the expected sha); every grant that leads nowhere would be a non-event filling the chain. |
+| `BeginMerge` **refused** | — | A merge that has not happened and now will not. Already a daemon log line. |
+| the client's merge | — | It happens on the user's machine, outside the daemon. The T-19 journal is its record; the chain records the daemon's *acceptance* of it. |
+| `ConfirmMerge` **accepted** | **`queue_entry_merged`** | The act. Main moved. |
+| `ConfirmMerge` **refused** | **`merge_confirm_refused`** | The asymmetry that makes this worth an event and a `BeginMerge` refusal not: **by the time this RPC is reached the git operation has already run.** Refusing does not prevent a merge — it means the daemon and the user's repository may now disagree about what main is, which is the one outcome the whole subsystem exists to prevent. That divergence is precisely what someone investigates later. |
+| `AbandonMerge` | — | Nothing landed and nothing was recorded; the design's own words. An event here would record an intention that was withdrawn. |
+| the RT-D2 waiver | **`acknowledged_flagged_change`** | L4 — the same event type the flagged-change acks already use, so "what did a human wave through on this branch" has one answer and not two lists to union. `kind` separates them, exactly as it does across `FlaggedKind`. |
+
+### 21.3 Where `queue_entry_merged` is emitted, and why not at the RPC
+
+**Four paths reach `Merged`**: the `ConfirmMerge` RPC, the RT-D1 boot reconcile (`ConfirmHumanMerge`, wired
+through `GatewayServiceRegistration`'s `onMerged`), the P2-12 external-PR dispatch, and dev seeding. An
+event wired to the RPC alone would have left a crash-recovered merge *exactly as unrecorded as every merge
+was before* — the same defect in the one case nobody watched happen.
+
+So the append lives in `MergeQueue`, at both confirm entry points, which is what makes the real invariant
+enforceable: **no transition to `Merged`, by any path, without exactly one `queue_entry_merged`.** What the
+queue cannot know is *who* and *by which path*, so that is a parameter — `MergeAuthorization` — and its
+`source` field distinguishes `confirm_rpc` from `boot_reconcile` from `external_dispatch` from `seeded`. A
+record that could not tell those apart would put a person's name on a daemon's reconciliation, the mistake
+`verification_restart_resume` exists as a separate type to avoid. A caller that names nobody is recorded as
+`unknown`/`unattributed` rather than borrowing a name.
+
+The payload is built **before** the transition, under the same lock that decided it. Read afterwards,
+`from_state` is always `Merged` and the pre-merge main is gone — an audit record of its own effect.
+
+### 21.4 What the record carries, and why each field is there
+
+`queue_entry_merged`: `repo`, `agent`, `by`, `source`, `lease`, `from_state`, `pre_main_sha`,
+`post_main_sha`, `when`, the verification block (`verification_main_sha`, `verification_branch_sha`,
+`verification_passed`, `verification_command`, `verification_config_hash`, `verification_when`), and
+`gates`.
+
+- **Both shas.** An event carrying only the new one cannot answer "what did main used to be", which is the
+  first question anyone asks when a merge turns out to have been wrong.
+- **The verification block** answers "which run said this was green" — unanswerable from the state machine
+  once the entry is terminal. Its **absence** is a real state (the boot reconcile records merges for
+  entries a rebuilt queue never verified), so it is stated as `verification = none recorded` rather than
+  rendered as blank fields that read like a run which printed nothing. Same distinction as
+  `GetVerificationLog`'s `unavailable_reason`.
+- **`gates`** is the evidence half, and it is the reason a new seam was added. `IMergeGate.Allows`
+  returning true is not a record of anything: it is equally true of every merge that ever happened,
+  including the one under investigation. The default-null `IMergeGate.MergeEvidence(agentId)` lets each
+  gate state what it had *established* — `flagged-change review: 3/3 acknowledged (set <hash>)`,
+  `changed-test-command: test command changed vs main — acknowledged`, `plan gate: plan approved`. The
+  flagged-set hash is included because it is the only thing that makes the count mean anything later.
+
+`acknowledged_flagged_change` from the RT-D2 gate adds `path`, `from`, `to`, `from_hash`, `to_hash` and
+`by` to the shape the flagged-change store already writes. "The test command changed" names a category; the
+record has to say **which command, from what to what, and who waived it**. The two committed config trees
+are the only place the baseline and the replacement exist together, so `MergeQueueProvisioner` now hands
+both to the gate at flag time. Excerpts are capped (a repo's config file must not decide the size of an
+audit payload) with the full content pinned by SHA-256 beside them, and three answers are kept apart —
+`(not recorded)`, `(absent)`, and the content — because collapsing the first two would render "we did not
+capture the baseline" as "this branch invented a verification command out of nothing".
+
+One event **per item waived**, not per click: the click clears every armed item at once by design, but what
+was waived is the items, and a single event would make "the command changed" and "the toolchain changed"
+indistinguishable. Idempotent, so a cockpit that refreshes twice cannot inflate how often a human decided.
+
+### 21.5 What happens when the audit store is down
+
+`queue_entry_merged` lets the append **throw** (the chained log's documented contract). The merge has
+landed on a ref either way; the throw surfaces as a failed `ConfirmMerge` with the lease still outstanding,
+so the next boot's RT-D1 reconcile picks it up. An audit outage therefore *delays* the record instead of
+silently losing it. `merge_confirm_refused` is the opposite — best-effort, swallowed into the daemon log —
+because the refusal reason is the caller's answer and must not be replaced by an audit-store error.
+
+### 21.6 The mutation log
+
+Sixteen mutations, each rebuilt and re-run; every one red. (`touch` on restore — an `mv`/`cp` restore
+preserves mtime, MSBuild skips the rebuild, and the next run tests the *mutated* binary.)
+
+| # | mutation | caught by |
+|---|---|---|
+| M1 | `TryConfirmHumanMerge` drops the merged append | `MergeAuditEventTests` (5 red) |
+| M2 | `ConfirmHumanMerge` (the reconcile entry point) drops it | `MergeAuditEventTests` (3 red) |
+| M3 | payload built *after* `MarkMergedLocked` | `MergedEvent_CarriesBothShas…` |
+| M4 | absent verification rendered as empty fields | `MergedEvent_WithNoVerificationRecord…` |
+| M5 | gate evidence dropped from the record | `MergedEvent_RecordsWhatEachGateHadEstablished` |
+| M6 | merged event appended even when the gate **refuses** | `RefusedConfirm_AuditsNothing` |
+| M7 | `ChangedTestCommandGate.Acknowledge` audits nothing (**the original L4 defect**) | `ChangedTestCommandAuditTests` (8 red) |
+| M8 | the waiver re-appends on every call | `AcknowledgingTwice_AppendsOnce` |
+| M9 | the waiver drops the actor | `AnUnattributedWaiver_SaysUnknown` |
+| M10 | `(not recorded)` collapses into `(absent)` | `AnUnrecordedDrift_AndAnAbsentFile_ReadDifferently` |
+| M11 | excerpt cap removed | `AHugeCommand_IsExcerptedButStillHashedInFull` |
+| M12 | drift detail not refreshed when the item re-arms | `ADriftThatChangesWhileArmed_IsRecordedAsItsLatestForm` |
+| M13 | the provisioner stops handing the gate the two trees | `TheWaiverRecord_NamesTheBaselineAndTheReplacement…` |
+| M14 | `ConfirmMerge` drops the `MergeAuthorization` | `AMergeThroughTheRpcs_LeavesOneRecordInTheChain` |
+| M15 | the lease-stage refusal is not audited | `ARefusedConfirm_IsRecorded_AndRecordsNoMerge` |
+| M16 | `AcknowledgeFlaggedChange` drops the actor | `AcknowledgingTheChangedTestCommand_WritesTheWaiver…` |
+
+M12 was **MISSED on the first pass** and is the useful one. The re-arm test cleared the item before
+re-flagging it, which removes the stored detail on the way through, so a mutation that only refused to
+*overwrite* an existing entry slipped past. The real shape is a branch that pushes again while the item
+stays armed — the provisioner's own cadence — and the test now walks it.
+
+### 21.7 Left alone, deliberately
+
+- **`BeginMerge` is not audited.** See §21.2. Its grant is named by the merge record's `lease` field.
+- **`acknowledged_flagged_change` carries no `repo`.** Neither the RT-D2 gate nor `AcknowledgmentStore`
+  knows its repo, and the requirement was consistency with the event the flagged-change acks already
+  write. Adding the field to one of the two writers would have produced a different inconsistency.
+- **A drift that changes while the item is already flagged does not re-arm the gate.** `SetFlagged` re-arms
+  on `items.Add` returning true, so a *content* change under a still-armed item leaves an existing
+  acknowledgment standing — unlike `AcknowledgmentStore`, whose acks bind to a content hash. That is a
+  pre-existing gap in the RT-D2 gate and is out of scope here; what this change guarantees is that the
+  waiver *record* describes the latest drift rather than the first (M12).

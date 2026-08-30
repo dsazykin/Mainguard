@@ -442,6 +442,27 @@ public sealed class WorkerPlanGate : IMergeGate
         return MayWork(agentId, out reason);
     }
 
+    /// <summary>
+    /// What this gate had established about the branch at merge time (see
+    /// <see cref="IMergeGate.MergeEvidence"/>). It says whether the merged work was governed by an
+    /// approved plan at all: a manual-mode agent and a coordinator worker whose plan a human approved are
+    /// the same <c>Allows == true</c>, and only one of them has a plan behind it.
+    /// </summary>
+    public string? MergeEvidence(string agentId)
+    {
+        lock (_gate)
+        {
+            if (ResolveKeyLocked(agentId) is null)
+            {
+                return "plan gate: not a plan-gated worker";
+            }
+        }
+
+        return MayWork(agentId, out var reason)
+            ? "plan gate: plan approved"
+            : $"plan gate: NOT satisfied — {reason}";
+    }
+
     // ---- backpressure -----------------------------------------------------
 
     /// <summary>The workers this gate is holding that are still at the plan gate.</summary>

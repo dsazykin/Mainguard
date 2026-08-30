@@ -1437,11 +1437,28 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Discarded → Verifying` left the id in the in-flight set permanently and `IsVerificationInFlight`
       answered true forever for an entry with no run (this subsystem's own defect shape, since every path
       that removes an id is downstream of that throw).
+      **L2 — every merge is now audited** (§20 of the phase-3 decisions doc): `MergedEvent`
+      (`queue_entry_merged`) is appended by BOTH confirm entry points, so the invariant is "no transition
+      to `Merged`, by any path, without exactly one record" — the RPC, the RT-D1 boot reconcile, the
+      external-PR dispatch and dev seeding all funnel through `MarkMergedLocked`. There was previously no
+      merge event type in the product at all, while `queue_entry_discarded` existed. The record carries
+      `by`/`source`/`lease` (from the new `MergeAuthorization`, since the queue cannot know who drove it),
+      `from_state`, `pre_main_sha`/`post_main_sha`, the verification block it rode on (or
+      `verification = none recorded`), and `gates` — the per-gate `IMergeGate.MergeEvidence(agentId)`
+      lines, a default-null seam added because `Allows` returning true is equally true of every merge that
+      ever happened. The payload is built BEFORE the transition, under the deciding lock.
       `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
-      drift, honor a human command pin) + the composable `ChangedTestCommandGate : IMergeGate`).
+      drift, honor a human command pin) + the composable `ChangedTestCommandGate : IMergeGate` —
+      which now **audits every acknowledgment** (L2/L4, §20 of the phase-3 decisions doc): its
+      `Acknowledge(agentId, acknowledgedBy)` appends one `acknowledged_flagged_change` per waived item
+      carrying the config `path`, the `from`/`to` excerpt + full SHA-256, and the daemon-derived actor —
+      it previously recorded the waiver in a plain `HashSet` and wrote nothing, for the one click that
+      lets a branch self-green. `SetFlagged` takes an optional `CommandDrift(ConfigPath, FromMain,
+      ToBranch)` (supplied by `MergeQueueProvisioner` from the two committed trees) and `MergeEvidence`
+      reports what it established for the merge record).
       `VerificationStore.cs` (`IVerificationStore` — **insert-only, no update** (invariant 2);
       `InMemoryVerificationStore`/`DbVerificationStore`). `MergeQueuePersistence.cs` (`DbMergeQueueStore`
       + the RT-D1 `IMergeLeaseStore`/`InMemoryMergeLeaseStore`/`DbMergeLeaseStore` — one outstanding lease
@@ -1601,7 +1618,8 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       set: unmergeable forever, observed live on three rows. The default-DENY is right; the exit is
       `MergeQueueProvisioner.RearmAfterRestart`, which RE-DERIVES the classification from the mirror
       rather than persisting anything — acknowledgments are never restored, so a restart can only ever
-      increase the review a human owes.)
+      increase the review a human owes. `MergeEvidence` reports acknowledged/total plus the flagged-set
+      hash into the `queue_entry_merged` record, and uses `PeekStore` for the same reason.)
     - `AgentTraceEmitter.cs` (orchestrator-side provenance: `EmitTrace`/`SerializeTrace` write the
       Cognition/Cursor-style Agent Trace JSON artifact that `Review.ProvenanceReader` reads back, + the
       pure `BuildTrailers` that appends idempotent `Agent:`/`Task:`/`Plan:` commit trailers as the durable

@@ -32,16 +32,22 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// <summary>The queue provisioner, for the post-confirm mirror-main refresh. Optional (null in
     /// the slimmest unit fixtures): without one the mirror simply catches up at the next provision.</summary>
     private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? _queues;
+
+    /// <summary>The G-17 sink for <see cref="ConfirmRefusedEvent"/> — the one merge-conversation fact that
+    /// is knowable only at this layer (see the event's own note).</summary>
+    private readonly Mainguard.Git.Audit.IAuditLog _audit;
     private readonly ILogger _log;
 
     public MergeQueueGrpcService(
         IMergeQueueRegistry registry, KillSwitchGate killGate, IMergeBranchDiffService mergeDiff,
         Mainguard.Server.Auth.IApproverIdentityResolver identity,
         Mainguard.Server.Runtime.AgentSessionStore sessions,
+        Mainguard.Git.Audit.IAuditLog audit,
         ILoggerFactory loggerFactory,
         Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner? queues = null)
     {
         _queues = queues;
+        _audit = audit ?? throw new ArgumentNullException(nameof(audit));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _killGate = killGate ?? throw new ArgumentNullException(nameof(killGate));
         _mergeDiff = mergeDiff ?? throw new ArgumentNullException(nameof(mergeDiff));
@@ -348,6 +354,10 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         ThrowIfFrozen("ConfirmMerge");
         var ctx = Resolve(request.RepoHandle);
 
+        // SA-1/F2: the actor comes from the connection, never from the message — there is no actor field
+        // on ConfirmMergeRequest, precisely so no caller can assert who authorised its own merge.
+        var actor = _identity.Resolve(context);
+
         // (1) A held lease is the caller's proof it went through BeginMerge for THIS agent. Leases.Confirm
         // is idempotent and silently no-ops on an unknown lease, so calling it was never a check.
         var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
@@ -357,12 +367,16 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         {
             _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: no matching outstanding merge lease",
                 request.RepoHandle, request.AgentId);
+            AuditConfirmRefused(request, actor, "lease", lease?.ExpectedMainSha ?? "",
+                "No outstanding merge lease for this repository and agent.");
             throw new RpcException(new Status(StatusCode.FailedPrecondition,
                 "No outstanding merge lease for this repository and agent — call BeginMerge first."));
         }
 
         // (2)+(3) Gate and freshness, atomically with the Merged transition.
-        if (!ctx.Queue.TryConfirmHumanMerge(request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason))
+        if (!ctx.Queue.TryConfirmHumanMerge(
+                request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason,
+                MergeAuthorization.ConfirmRpc(actor, lease.LeaseId)))
         {
             // Nothing moved to Merged, so the lease must not strand the repo — the same "every non-merged
             // exit hands the lease back" rule MergeDispatch follows. A merge that really did land on a ref
@@ -371,6 +385,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
             _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: {Reason}",
                 request.RepoHandle, request.AgentId, reason);
+            AuditConfirmRefused(request, actor, "gate", lease.ExpectedMainSha, reason);
             throw new RpcException(new Status(StatusCode.FailedPrecondition, reason));
         }
 
@@ -395,6 +410,55 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     }
 
     /// <summary>
+    /// The audit event for a <c>ConfirmMerge</c> the daemon REFUSED.
+    ///
+    /// <para><b>Why a refusal is worth a tamper-evident record when a <c>BeginMerge</c> refusal is
+    /// not.</b> The three-step is <c>BeginMerge</c> → the client merges on the user's own checkout →
+    /// <c>ConfirmMerge</c>. By the time this RPC is reached the git operation has ALREADY RUN: the caller
+    /// is reporting a post-merge sha it claims a ref now holds. Refusing therefore does not prevent a
+    /// merge — it means the daemon and the user's repository may now disagree about what main is, which is
+    /// the single failure mode this whole subsystem exists to make impossible. That divergence has to
+    /// leave an artifact for the person who later asks "why does the queue think this never merged". A
+    /// refused <c>BeginMerge</c>, by contrast, is a merge that has not happened and will not, so recording
+    /// it would fill the chain with non-events.</para>
+    ///
+    /// <para>Best-effort, unlike <see cref="MergeQueue.MergedEvent"/>: the refusal itself is the caller's
+    /// answer and must survive an audit outage, so a throwing append is swallowed into the daemon log
+    /// rather than replacing a precise refusal reason with an audit-store error.</para>
+    /// </summary>
+    internal const string ConfirmRefusedEvent = "merge_confirm_refused";
+
+    private void AuditConfirmRefused(
+        ConfirmMergeRequest request, string actor, string stage, string expectedMainSha, string reason)
+    {
+        try
+        {
+            _audit.Append(new Mainguard.Git.Audit.AuditEvent(ConfirmRefusedEvent,
+                new Dictionary<string, string>
+                {
+                    ["repo"] = request.RepoHandle ?? string.Empty,
+                    ["agent"] = request.AgentId ?? string.Empty,
+                    ["by"] = string.IsNullOrWhiteSpace(actor) ? "unknown" : actor,
+                    ["lease"] = request.LeaseId ?? string.Empty,
+                    ["stage"] = stage,
+                    ["expected_main_sha"] = expectedMainSha ?? string.Empty,
+                    // The sha the CALLER says main now is. Named "reported" and never "post_main_sha":
+                    // nothing here verified it, and the whole point of the record is that the daemon
+                    // declined to accept the claim.
+                    ["reported_main_sha"] = request.NewMainSha ?? string.Empty,
+                    ["reason"] = reason ?? string.Empty,
+                    ["when"] = DateTimeOffset.UtcNow.ToString(
+                        "O", System.Globalization.CultureInfo.InvariantCulture),
+                }));
+        }
+        catch (Exception ex)
+        {
+            _log.LogError(ex, "ConfirmMerge refusal could not be audited repo={Repo} agent={Agent}",
+                request.RepoHandle, request.AgentId);
+        }
+    }
+
+    /// <summary>
     /// P2-11 step 4 — acknowledge one must-acknowledge flagged item so the merge gate can pass. A gate the
     /// daemon evaluates but no human can clear is not a gate, it is a permanently unmergeable branch; this
     /// is the missing half of moving the RT-D2 gate daemon-side. Per item, never "all" (a global ack is a
@@ -409,9 +473,13 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         if (string.Equals(request.ItemId, ChangedTestCommandItemId, StringComparison.Ordinal)
             && ctx.ChangedTestCommand is { } changed)
         {
+            // SA-1/F2: the waiver's actor comes from the connection, never from the message. This is the
+            // one acknowledgment in the product that lets a branch self-green, so an unattributed one
+            // would be the least useful record in the chain.
+            changed.Acknowledge(request.AgentId, _identity.Resolve(context));
+
             // Acknowledge is a no-op for an agent that is not flagged, so the "was it really cleared?"
             // answer is read back off the gate rather than assumed from the call having been made.
-            changed.Acknowledge(request.AgentId);
             acknowledged = !changed.IsUnacknowledged(request.AgentId);
         }
         else if (ctx.FlaggedChanges is { } flagged)
