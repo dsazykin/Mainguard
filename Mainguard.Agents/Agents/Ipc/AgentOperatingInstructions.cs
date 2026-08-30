@@ -237,8 +237,10 @@ public static class AgentOperatingInstructions
           front of the human at verification and blocks the merge until they acknowledge it, whether or
           not you asked. Asking is how they hear your reason before they see the diff; not asking only
           means they see it without one.
-        - **A widening the human refuses three times stops being available.** At that point finish what
-          your approved plan covers, or report to the human and wait.
+        - **A widening the human keeps refusing eventually stops being available.** A refused re-scope is
+          revised and re-presented like any other plan, on its own budget, and the daemon reports what is
+          left; once that is spent you may not ask to widen again. Finish what your approved plan covers,
+          or report to the human and wait.
 
         ## When the work is done, commit it — nothing else will
 

@@ -3385,8 +3385,14 @@ it cannot itself become the leak.
 **§13's G3 lesson applies to every sentence written here.** The instructions once told a coordinator
 `--task` "needs no quotes at all" — true of the parser, false of the world, and two of three spawns in a
 stress run died on it. So each claim is one the shipped code actually makes: the command is
-`RescopeUsage` verbatim, "your existing approval stands" is `WorkerRescopeTests`, and "a widening the
-human refuses three times stops being available" is the terminal-escalation rule with its own test.
+`RescopeUsage` verbatim, "your existing approval stands" is `WorkerRescopeTests`, and the sentence about
+a widening that stops being available is the terminal-escalation rule with its own test.
+
+**That last sentence was itself wrong on its first draft**, in exactly the arithmetic phase 2 §2.1 exists
+to pin: it read *"a widening the human refuses three times stops being available"*, and with
+`MaxPlanRevisions = 3` it is the **fourth** rejection that escalates. It now says the budget is finite and
+that the daemon reports what is left — which is true, is the same thing the paragraph above it already
+tells the worker about ordinary revisions, and does not hardcode a number the limit is allowed to change.
 
 **One sentence written in this change was G3 on its first draft.** The id-less `rescope` refusal ends
 *"(`mainguard-plan brief` prints the id of your live plan.)"* — and it did not. The daemon put `planId`
@@ -3420,7 +3426,7 @@ load-bearing, and the first cost a real false green here:
 | M7 | the "already approved" refusal loses the hint — **the defect itself** | `TheDeadEnd_ThatThisOpExistsToRemove` |
 | M8 | `revise`'s refusal stops naming `rescope` | `TheDeadEnd_ThatThisOpExistsToRemove` |
 | M9 | the shim stops refusing an id-less `rescope` | `TheShimsRescope_NamesThePlanItWidens_AndRefusesLocallyWhenItCannot` — the two refusal rows |
-| M10 | the worker's instructions drop the re-scope section | `TheWorkerIsToldAboutEveryOpTheDaemonServesIt`, `TheWorkerIsTaughtTheRescopeFormTheShimActuallyParses`, `TheWorkerIsToldWhatARescopeIs_…` |
+| M10 | the worker's instructions drop the re-scope section | `TheWorkerIsToldWhatARescopeIs_AndThatAskingCostsItNothing` — and **only** that one, correctly: the command list above the section still names the verb, so the two exhaustiveness tests still pass. What M10 deletes is the MEANING, and the meaning test is the guard for it |
 | M11 | `WorkerPlanShim.Verbs` loses the entry | `TheWorkerIsToldAboutEveryOpTheDaemonServesIt` (the set-equality half) |
 | M12 | the decision stops carrying `rescopeOf` | `ARescopeBlocksOnTheHuman_…`, `ADeclinedRescope_LeavesTheWorkerAuthorised_…` |
 | M13 | the handler skips the plan-ownership check | `AWorkerCannotRescopeAnotherWorkersPlan` |
