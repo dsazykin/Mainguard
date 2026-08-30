@@ -218,6 +218,35 @@ public partial class PlanCardViewModel : ViewModelBase
     public bool HasFeedbackHistory { get; }
 
     /// <summary>
+    /// True when this card is a <b>re-scope</b>: the worker is asking to change what an approval it
+    /// already holds authorises.
+    ///
+    /// <para>The card has to say so, because the decision is not the one it looks like. Approving a first
+    /// presentation authorises work that has not started; approving this one CHANGES what a running worker
+    /// is cleared to touch — and rejecting it takes nothing away, which is the opposite of what Reject
+    /// means on every other card here. A human handed an identical-looking card would be answering a
+    /// different question from the one being asked.</para>
+    /// </summary>
+    public bool IsRescope { get; }
+
+    /// <summary>What kind of decision this is, and how many widenings have preceded it.</summary>
+    public string RescopeHeadlineText { get; }
+
+    /// <summary>The paths this plan ADDS to what was already approved — the substance of the widening.</summary>
+    public string AddedScopeText { get; }
+
+    public bool HasAddedScope { get; }
+
+    /// <summary>
+    /// The paths it DROPS. Shown separately and never folded into the added list: a re-scope that removes
+    /// a path the human already agreed to is the one shape of this op that takes something away, and a
+    /// card that rendered only additions is exactly where that would hide.
+    /// </summary>
+    public string RemovedScopeText { get; }
+
+    public bool HasRemovedScope { get; }
+
+    /// <summary>
     /// True when rejecting again would stop the worker rather than produce another plan. The card says so
     /// before the click, because "reject" and "give up on this worker" are different decisions and the
     /// human is the only one who can tell which they meant.
@@ -225,6 +254,13 @@ public partial class PlanCardViewModel : ViewModelBase
     public bool NextRejectionEscalates { get; }
 
     public string RejectButtonText { get; }
+
+    /// <summary>
+    /// What one more "no" would actually do, shown when this is the last round. The two card kinds have
+    /// different consequences and the text must not promise the wrong one: on a first plan the worker
+    /// stops, on a re-scope only the widening closes and the worker keeps its existing approval.
+    /// </summary>
+    public string LastRoundWarningText { get; }
 
     [ObservableProperty] private bool _isDeciding;
 
@@ -253,10 +289,39 @@ public partial class PlanCardViewModel : ViewModelBase
         RevisedAgainstText = plan.RejectionFeedback.Length > 0 ? $"revised against: {plan.RejectionFeedback}" : "";
         HasFeedbackHistory = RevisedAgainstText.Length > 0;
         NextRejectionEscalates = plan.RevisionsRemaining <= 0;
-        RejectButtonText = NextRejectionEscalates ? "Reject — worker will stop" : "Reject with feedback";
         var age = (int)Math.Max(0, (DateTimeOffset.Now - plan.PresentedAt).TotalMinutes);
         var worker = plan.WorkerAgentId.Length > 0 ? plan.WorkerAgentId : "worker";
-        FactsText = $"Written by {worker} · budget ${plan.BudgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
+
+        IsRescope = plan.IsRescope;
+        var added = plan.AddedScope;
+        var removed = plan.RemovedScope;
+        HasAddedScope = added.Count > 0;
+        HasRemovedScope = removed.Count > 0;
+        AddedScopeText = string.Join("\n", added);
+        RemovedScopeText = string.Join("\n", removed);
+        RescopeHeadlineText = IsRescope
+            ? plan.RescopeCount > 1
+                ? $"Widening an approved plan — this worker's scope has already been widened "
+                  + $"{plan.RescopeCount - 1} time(s)"
+                : "Widening an approved plan"
+            : "";
+
+        // The two decisions read differently, so they are worded differently. On a re-scope, Reject does
+        // not stop the worker and does not withdraw anything: it declines the widening and the worker
+        // carries on inside the scope already approved. A button reading "worker will stop" there would be
+        // false, and it is the kind of false that makes a human approve something to avoid a consequence
+        // that was never going to happen.
+        RejectButtonText = IsRescope
+            ? "Decline the widening"
+            : NextRejectionEscalates ? "Reject — worker will stop" : "Reject with feedback";
+        LastRoundWarningText = IsRescope
+            ? "This is the last round — declining again closes the widening for good. The worker is not "
+              + "stopped: it keeps working inside the scope you already approved."
+            : "This is the last revision — rejecting again stops the worker and escalates to you.";
+        FactsText = IsRescope
+            ? $"Asked by {worker} · budget ${plan.BudgetUsd:0.00} · asked {age} min ago · it is still "
+              + "approved for its current scope and is not stopped"
+            : $"Written by {worker} · budget ${plan.BudgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
     }
 
     [RelayCommand] private Task ApproveAsync() => DecideAsync(approve: true, feedback: null);
@@ -359,9 +424,17 @@ public sealed partial class EscalatedPlanViewModel : ViewModelBase
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
         var worker = plan.WorkerAgentId.Length > 0 ? plan.WorkerAgentId : "This worker";
-        HeadlineText =
-            $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. " +
-            "It will not try again — steer it or end it.";
+
+        // An escalated RE-SCOPE has not stopped the worker, and saying it has would be a lie that costs
+        // something: a human reading "it stopped" ends a worker that is still doing approved work. What
+        // actually happened is narrower — the widening was refused enough times that the worker may not
+        // ask again, and it carries on inside the scope that is still approved.
+        HeadlineText = plan.IsRescope
+            ? $"{worker} asked {plan.MaxRevisions} times to widen its approved scope and you declined each "
+              + "time, so it will not ask again. It is NOT stopped — it is still approved for its original "
+              + "scope and still working. Steer it if the answer should change."
+            : $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. " +
+              "It will not try again — steer it or end it.";
         LastFeedbackText = plan.RejectionFeedback.Length > 0 ? $"your last feedback: {plan.RejectionFeedback}" : "";
         HasLastFeedback = LastFeedbackText.Length > 0;
 

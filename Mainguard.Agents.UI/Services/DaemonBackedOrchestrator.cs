@@ -935,7 +935,11 @@ public sealed class DaemonBackedOrchestrator :
                 _workerPlans.Add(new WorkerPlanCard(
                     p.PlanId, p.WorkerAgentId, p.CoordinatorId, p.Title, p.Scope.ToArray(),
                     p.Approach, p.TestStrategy, (decimal)p.BudgetUsd, DateTimeOffset.UtcNow,
-                    p.Status, p.Revision, p.RevisionsRemaining, update.MaxPlanRevisions, p.RejectionFeedback));
+                    p.Status, p.Revision, p.RevisionsRemaining, update.MaxPlanRevisions, p.RejectionFeedback,
+                    // Carried, never re-derived. What the previous scope WAS is a fact the daemon captured
+                    // when the re-scope was presented; a client that looked it up from whatever plan that
+                    // id names *now* would render a different claim as soon as a second re-scope existed.
+                    p.SupersedesPlanId, p.PreviousScope.ToArray(), p.RescopeCount));
             }
 
             // Carried verbatim from the daemon rather than re-derived here: the number that refuses the

@@ -56,6 +56,14 @@
           <Border Classes="Card" Padding="10" Margin="0,0,0,6" CornerRadius="8"
                   BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
             <StackPanel Spacing="6">
+              <!-- A re-scope is a materially DIFFERENT decision from a first presentation: the human is
+                   changing what an already-running worker is cleared to touch, having said yes once
+                   already. The card names that above the title, because the two are otherwise
+                   indistinguishable and the wrong reading of "Reject" here — that it stops the worker —
+                   is the one that pressures a yes. -->
+              <TextBlock Text="{Binding RescopeHeadlineText}" FontSize="10" FontWeight="SemiBold"
+                         TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"
+                         IsVisible="{Binding IsRescope}"/>
               <Grid ColumnDefinitions="*,Auto">
                 <TextBlock Grid.Column="0" Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
                            TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
@@ -66,6 +74,23 @@
               <TextBlock Text="{Binding RevisedAgainstText}" FontSize="11" TextWrapping="Wrap"
                          Foreground="{DynamicResource TextMuted}"
                          IsVisible="{Binding HasFeedbackHistory}"/>
+              <!-- WHAT CHANGED, above the full scope. Approving a widening against a list the human is
+                   expected to be holding in their head is not a decision they can actually make. Drops is
+                   its own row in its own colour: a re-scope that removes a path already agreed to is the
+                   one direction this op can take something away in, and a card rendering only additions
+                   is exactly where that would hide. -->
+              <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto" IsVisible="{Binding IsRescope}">
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Adds" FontSize="11"
+                           Foreground="{DynamicResource TextMuted}" IsVisible="{Binding HasAddedScope}"/>
+                <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding AddedScopeText}" FontSize="11"
+                           TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"
+                           IsVisible="{Binding HasAddedScope}"/>
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Drops" FontSize="11"
+                           Foreground="{DynamicResource TextMuted}" IsVisible="{Binding HasRemovedScope}"/>
+                <TextBlock Grid.Row="1" Grid.Column="1" Classes="Mono" Text="{Binding RemovedScopeText}" FontSize="11"
+                           TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
+                           IsVisible="{Binding HasRemovedScope}"/>
+              </Grid>
               <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto,Auto">
                 <TextBlock Grid.Row="0" Grid.Column="0" Text="Scope" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
                 <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding ScopeText}" FontSize="11"
@@ -84,7 +109,10 @@
                    revises against it and presents again. An empty box costs a round of the budget. -->
               <TextBox Text="{Binding FeedbackText}" FontSize="11" AcceptsReturn="True" MaxHeight="72"
                        Watermark="What should the worker change? This text goes back to it."/>
-              <TextBlock Text="This is the last revision — rejecting again stops the worker and escalates to you."
+              <!-- The consequence of one more no, and it is NOT the same consequence on both card kinds:
+                   on a first plan it stops the worker, on a re-scope it only closes the widening. The VM
+                   owns the wording so the card cannot promise the wrong one. -->
+              <TextBlock Text="{Binding LastRoundWarningText}"
                          FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
                          IsVisible="{Binding NextRejectionEscalates}"/>
 

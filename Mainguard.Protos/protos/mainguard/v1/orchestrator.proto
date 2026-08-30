@@ -54,7 +54,7 @@ message PlanEntry {
   repeated string scope = 4;    // the load-bearing field (SA-1/F6 compares diffs against it)
   string approach = 5;
   string test_strategy = 6;
-  string status = 7;            // PlanStatus name: Pending / Approved / Rejected / Escalated
+  string status = 7;            // PlanStatus name: Pending/Approved/Rejected/Escalated/Superseded
   double budget_usd = 8;
   // The daemon-derived approver identity, present only on an approved plan (SA-1/F2). This is an
   // OUTPUT field the daemon fills — never a client input.
@@ -65,6 +65,17 @@ message PlanEntry {
   int32 revision = 11;           // 0 = the original presentation
   int32 revisions_remaining = 12;// revisions still permitted before the worker must escalate
   string rejection_feedback = 13;// the human's most recent rejection text (what the worker revises against)
+
+  // Phase 3: the re-scope. A worker that discovers mid-task it needs a file its approved scope does not
+  // cover presents a WIDER plan against the approval it already holds, and a human decides it like any
+  // other. These three fields are what make that card a different decision from a first presentation:
+  // the human is approving a WIDENING of something they already said yes to, and cannot judge it without
+  // seeing what changed.
+  string supersedes_plan_id = 14;// the approved plan this one asks to replace; empty on an ordinary plan
+  repeated string previous_scope = 15; // that plan's scope, copied when the re-scope was presented, so
+                                       // the card diffs against what was actually consented to
+  int32 rescope_count = 16;      // how many widenings this worker has already had approved (visibility,
+                                 // not a budget — nothing refuses on this number)
 }
 
 message ApprovePlanRequest {

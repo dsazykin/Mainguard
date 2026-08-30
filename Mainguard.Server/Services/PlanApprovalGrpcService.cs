@@ -223,8 +223,11 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
                 Revision = plan.RevisionCount,
                 RevisionsRemaining = Math.Max(0, _limits.MaxPlanRevisions - plan.RevisionCount),
                 RejectionFeedback = plan.RejectionFeedback ?? "",
+                SupersedesPlanId = plan.SupersedesPlanId ?? "",
+                RescopeCount = plan.RescopeCount,
             });
             update.Plans[^1].Scope.AddRange(plan.Plan.Scope);
+            update.Plans[^1].PreviousScope.AddRange(plan.PreviousScope ?? Array.Empty<string>());
         }
 
         update.PressureSignal = coordinatorId is not null ? _plans.PressureSignal(coordinatorId) ?? "" : "";
