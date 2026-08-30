@@ -102,6 +102,57 @@ public sealed class VerificationVerdictProjectionTests
     }
 
     /// <summary>
+    /// The parked-conflict facts have to survive the wire too, and land as facts rather than as a
+    /// sentence. Before this, everything the daemon knew about a conflicted worktree — where it was
+    /// parked, what conflicted — stopped at the daemon: one audit event and one log line, neither of which
+    /// any surface reads, while the card said "…needs a human to resolve it" and named nothing.
+    /// </summary>
+    [Fact]
+    public void AParkedConflict_ProjectsItsWorktreeAndItsConflictingFiles()
+    {
+        var parked = new DateTimeOffset(2026, 8, 31, 9, 15, 0, TimeSpan.Zero);
+        var entry = Project(e =>
+        {
+            e.State = "Working";
+            e.RebaseConflict = new Proto.RebaseConflict
+            {
+                Worktree = "/srv/mainguard/agents/9f2c/loom-2/worktree",
+                MainBranch = "main",
+                ParkedAt = parked.ToString("O"),
+            };
+            e.RebaseConflict.Paths.Add(new[] { "src/Shared.cs", "docs/repo-map/README.md" });
+        });
+
+        var conflict = Assert.IsType<QueueRebaseConflict>(entry.RebaseConflict);
+        Assert.Equal("/srv/mainguard/agents/9f2c/loom-2/worktree", conflict.Worktree);
+        Assert.Equal("main", conflict.MainBranch);
+        Assert.Equal(new[] { "src/Shared.cs", "docs/repo-map/README.md" }, conflict.Paths);
+        Assert.Equal(parked, conflict.ParkedAt);
+    }
+
+    /// <summary>
+    /// The guard the message field exists for: an entry with nothing parked must project as <c>null</c>,
+    /// never as an empty conflict. An empty conflict lights both conflict controls on a row with no rebase
+    /// to act on — "abort rebase" on a branch that is not rebasing is a button whose entire behaviour is
+    /// an error message — and renders an empty path list, which reads as "nothing conflicts".
+    /// </summary>
+    [Fact]
+    public void AnEntryWithNoConflictOnTheWire_ProjectsAsNull_NotAsAnEmptyConflict()
+    {
+        Assert.Null(Project(e => e.State = "Working").RebaseConflict);
+
+        // …and the control that keeps that from passing for the wrong reason: a conflict whose PATHS the
+        // daemon could not measure is still a conflict, and must not collapse to "no conflict".
+        var unmeasured = Project(e =>
+        {
+            e.State = "Working";
+            e.RebaseConflict = new Proto.RebaseConflict { Worktree = "/srv/wt", MainBranch = "main" };
+        });
+        Assert.NotNull(unmeasured.RebaseConflict);
+        Assert.Empty(unmeasured.RebaseConflict!.Paths);
+    }
+
+    /// <summary>
     /// <b>The fabricated-counts guard.</b> The client-side record this replaced carried
     /// <c>TestsPassed</c>/<c>TestsTotal</c>, and no wire has ever carried either: verification observes a
     /// process exit code inside the worker's jail and parses nobody's test runner. Filling them to satisfy

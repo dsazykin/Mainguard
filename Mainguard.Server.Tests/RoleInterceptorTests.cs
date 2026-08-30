@@ -141,6 +141,35 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesBothParkedConflictActionsToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+        var headers = fixture.AuthHeaders(CoordinatorToken);
+
+        // Handing a parked conflict back UNPAUSES a co-tenant's jail and then types into its CLI — the
+        // PauseAgent/UnpauseAgent denial above plus the terminal input lock's whole purpose, reachable in
+        // one call from a different service. An agent must not be able to get at it by the side door.
+        var handBack = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.ResolveConflictWithAgentAsync(
+                new ResolveConflictWithAgentRequest { RepoHandle = "repo", AgentId = "a" },
+                headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, handBack.StatusCode);
+        Assert.Contains(RoleDenialMarker, handBack.Status.Detail);
+
+        // Aborting rewrites a co-tenant branch's parentage and resumes its jail — merge-adjacent power
+        // over work the calling agent competes with.
+        var abort = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AbortRebaseAsync(
+                new AbortRebaseRequest { RepoHandle = "repo", AgentId = "a" },
+                headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, abort.StatusCode);
+        Assert.Contains(RoleDenialMarker, abort.Status.Detail);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesPauseAndUnpauseToCoordinator()
     {
         using var fixture = new DaemonFixture();

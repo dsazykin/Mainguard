@@ -167,6 +167,104 @@ public sealed class MergeQueueWiringTests
         Assert.Equal(WorkerMergeState.Working.ToString(), entry.State);
     }
 
+    /// <summary>
+    /// The conflict card's facts have to reach the wire, through the real composition root.
+    ///
+    /// <para>The daemon has always known where a conflicted worktree is parked and which files conflict —
+    /// it writes both into an audit event and a log line — and <c>QueueEntry</c> carried neither, so the
+    /// one row on the rail that asks for human judgment reached the client with a sentence naming a
+    /// required action and no evidence at all. This is the mapping from the provisioner's parking store to
+    /// <c>rebase_conflict</c>, asserted where it actually runs: <c>MergeQueueGrpcService</c> holds the
+    /// provisioner as an OPTIONAL dependency, so a composition root that stopped passing it would leave
+    /// every conflict card blank again with nothing failing.</para>
+    /// </summary>
+    [Fact]
+    public async Task AParkedConflict_ReachesTheWire_WithItsWorktreeAndItsConflictingFiles()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+        await sync.CreateWorktreeAsync(new CreateWorktreeRequest
+        {
+            RepoHandle = provisioned.RepoHandle,
+            AgentId = "loom-7",
+        }, headers);
+
+        // The parking the keep-alive cascade's conflict arm writes. Supplied directly rather than driven
+        // through a real conflicting rebase: that path has its own end-to-end coverage in
+        // MergeQueueProvisionerTests over real git, and what is under test HERE is the seam between the
+        // daemon's store and the wire.
+        var parkedAt = new DateTimeOffset(2026, 8, 31, 9, 15, 0, TimeSpan.Zero);
+        host.Services.GetRequiredService<MergeQueueProvisioner>().ParkedConflicts.Park(
+            provisioned.RepoHandle,
+            new ParkedRebaseConflict(
+                "loom-7", "/srv/mainguard/agents/9f2c/loom-7/worktree", "main",
+                new[] { "src/Shared.cs" }, parkedAt));
+
+        var entry = Assert.Single(await SnapshotAsync(client, headers, provisioned.RepoHandle));
+        Assert.NotNull(entry.RebaseConflict);
+        Assert.Equal("/srv/mainguard/agents/9f2c/loom-7/worktree", entry.RebaseConflict.Worktree);
+        Assert.Equal("main", entry.RebaseConflict.MainBranch);
+        Assert.Equal(new[] { "src/Shared.cs" }, entry.RebaseConflict.Paths);
+        Assert.Equal(parkedAt.ToString("O"), entry.RebaseConflict.ParkedAt);
+    }
+
+    /// <summary>
+    /// The other half, and the one that decides whether the two conflict controls appear on rows that have
+    /// no conflict: an entry with nothing parked carries NO <c>rebase_conflict</c> at all. A message field
+    /// filled with defaults would light "Abort rebase" on every branch in the queue — a control whose whole
+    /// behaviour, on a branch that is not rebasing, is an error message.
+    /// </summary>
+    [Fact]
+    public async Task AnOrdinaryEntry_CarriesNoConflictOnTheWire()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+        await sync.CreateWorktreeAsync(new CreateWorktreeRequest
+        {
+            RepoHandle = provisioned.RepoHandle,
+            AgentId = "loom-7",
+        }, headers);
+
+        var entry = Assert.Single(await SnapshotAsync(client, headers, provisioned.RepoHandle));
+        Assert.Null(entry.RebaseConflict);
+    }
+
+    /// <summary>
+    /// Both conflict RPCs refuse an entry that is not parked, as an ordinary answer carrying its reason —
+    /// never a fault and never a silent success. A refusal a client cannot read is indistinguishable from
+    /// a button that did nothing, which is the failure these controls exist to remove.
+    /// </summary>
+    [Fact]
+    public async Task BothConflictRpcs_RefuseAnUnparkedEntry_WithAReadableReason()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+
+        var handBack = await client.ResolveConflictWithAgentAsync(
+            new ResolveConflictWithAgentRequest { RepoHandle = provisioned.RepoHandle, AgentId = "loom-7" },
+            headers);
+        Assert.False(handBack.HandedBack);
+        Assert.Contains("no rebase parked", handBack.Reason);
+
+        var abort = await client.AbortRebaseAsync(
+            new AbortRebaseRequest { RepoHandle = provisioned.RepoHandle, AgentId = "loom-7" },
+            headers);
+        Assert.False(abort.Aborted);
+        Assert.Contains("no rebase parked", abort.Reason);
+    }
+
     private static async Task<System.Collections.Generic.IReadOnlyList<Mainguard.Protos.V1.QueueEntry>>
         SnapshotAsync(MergeQueueService.MergeQueueServiceClient client, Metadata headers, string repoHandle)
     {
