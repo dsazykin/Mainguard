@@ -127,13 +127,26 @@ public sealed class MergeReconcileTask : IBootTask
                 // done is the only irreversible half: nothing is marked Merged and no cascade fires. The
                 // sentence names the ambiguity rather than restating one horn of it as a fact.
                 _leases.Release(lease.RepoHash, lease.LeaseId);
-                _onInterrupted?.Invoke(lease.RepoHash,
-                    $"A merge of agent/{lease.AgentId} was interrupted, and '{lease.MainBranch}' has since "
-                    + $"moved for some other reason — nothing shows this merge landed, so it was NOT "
-                    + $"recorded. Check '{lease.MainBranch}', then merge again if the work is still needed.");
+                _onInterrupted?.Invoke(lease.RepoHash, UndecidableReason(lease, currentMain));
                 break;
         }
     }
+
+    /// <summary>
+    /// What the human is told when the daemon cannot decide. The two ways of not deciding are genuinely
+    /// different situations and get different sentences: a main it could not READ is a repository problem,
+    /// a main that moved for reasons unconnected to this lease is a history problem. Collapsing them would
+    /// send someone looking in the wrong place — and the whole point of this verdict is that the daemon
+    /// says what it does not know instead of picking a horn.
+    /// </summary>
+    private static string UndecidableReason(Mainguard.Git.Models.MergeLeaseRow lease, string currentMain)
+        => string.IsNullOrEmpty(currentMain)
+            ? $"A merge of agent/{lease.AgentId} was interrupted, and '{lease.MainBranch}' could not be "
+              + "read, so whether it landed cannot be established — nothing was recorded. Check the "
+              + "repository, then merge again if the work is still needed."
+            : $"A merge of agent/{lease.AgentId} was interrupted, and '{lease.MainBranch}' has since moved "
+              + "for some other reason — nothing shows this merge landed, so it was NOT recorded. Check "
+              + $"'{lease.MainBranch}', then merge again if the work is still needed.";
 
     /// <summary>
     /// Whether main's current sha is the effect of <b>this lease's</b> merge.

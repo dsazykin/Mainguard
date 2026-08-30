@@ -354,6 +354,12 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     /// the caller's lease must be the repo's outstanding one and name this agent; the queue's merge gate
     /// must pass; and the lease's expected <c>main@sha</c> must still be the queue's current main — the last
     /// two evaluated together under the queue lock by <see cref="MergeQueue.TryConfirmHumanMerge"/>.
+    ///
+    /// <para><b>K3/§23.4 adds a fourth, between the first and the second: the sha the caller REPORTS.</b>
+    /// Every check above is about the daemon's own state; <c>NewMainSha</c> is a claim about a ref on
+    /// somebody else's machine, and it was written into the idempotency record, installed as the queue's
+    /// authoritative main, and cascaded at every co-tenant without anything looking at it. See the call
+    /// site for the three things that can honestly be checked from here, and the one that cannot.</para>
     /// </summary>
     public override Task<ConfirmMergeResponse> ConfirmMerge(ConfirmMergeRequest request, ServerCallContext context)
     {

@@ -369,6 +369,9 @@ public class MergeIdentityTests : IDisposable
         Assert.Empty(outcome.Merged);
         var reason = Assert.Single(outcome.Interrupted).Reason;
         Assert.DoesNotContain("no ref moved", reason, StringComparison.Ordinal);
+        // ...and the sentence names the situation the human is actually in. "Could not be read" and
+        // "moved for some other reason" send someone to different places, so they are different sentences.
+        Assert.Contains("could not be read", reason, StringComparison.Ordinal);
     }
 
     // ---- K2: the merge consumes the ref it fetched, not a namesake ------------------------------
