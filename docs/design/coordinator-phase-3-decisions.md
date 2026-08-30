@@ -3369,6 +3369,11 @@ Three strings change with the card kind, and each of them would otherwise be **f
 No new design tokens (phase 2 §2.9's rule still holds): `WarningBrush`, `DangerBrush`, `TextMuted`,
 `TextPrimary` already say all of it.
 
+The card is rendered headless in all four themes by
+`CoordinatorPlanGateRenderHarness.Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes`,
+whose fake both **adds** and **drops** a path — a fixture that only ever widened would never exercise the
+Drops row, which is the one this section says must not be able to hide.
+
 ### 23.8 Keeping the instructions honest — and the pin that did not exist
 
 `AgentOperatingInstructions.Worker` teaches the op. The **coordinator** text has been pinned against
@@ -3432,6 +3437,7 @@ load-bearing, and the first cost a real false green here:
 | M13 | the handler skips the plan-ownership check | `AWorkerCannotRescopeAnotherWorkersPlan` |
 | M14 | the handler infers the plan id instead of refusing | `ARescopeThatNamesNoPlan_IsRefused_AndQueuesNothing` |
 | M15 | `brief` stops printing the live plan id — **the refusal's advice stops working** | `TheShimsBrief_PrintsTheLivePlanId_BecauseTheRescopeRefusalSendsTheWorkerThere` |
+| M16 | the card's Reject button stops distinguishing a re-scope | `Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes` |
 
 **M13 exposed a weak test, and the test was fixed rather than the mutation excused** — the same shape as
 §13.6's M9. Both M13 and M14 remove a check *in front of* a call that **blocks on a human**, so the

@@ -8,6 +8,7 @@ M="$HERE/../mutate.sh"
 PLANS=Mainguard.Agents/Agents/Orchestrator/PlanApprovalService.cs
 SHIM=Mainguard.Agents/Agents/Ipc/WorkerPlanShim.cs
 INSTR=Mainguard.Agents/Agents/Ipc/AgentOperatingInstructions.cs
+CARD=Mainguard.Agents.UI/ViewModels/CoordinatorPanelViewModel.cs
 SPAWN=Mainguard.Server/Runtime/AgentSpawnService.cs
 
 run() { "$M" "$@" || echo "!! $1 did not behave"; }
@@ -27,3 +28,4 @@ run m12 "$SPAWN" build/mutations/m12_decision_drops_rescope_of.py   Mainguard.Se
 run m13 "$SPAWN" build/mutations/m13_handler_skips_ownership.py     Mainguard.Server.Tests "FullyQualifiedName~WorkerPlanChannelIpcTests"
 run m14 "$SPAWN" build/mutations/m14_handler_infers_the_plan.py     Mainguard.Server.Tests "FullyQualifiedName~WorkerPlanChannelIpcTests"
 run m15 "$SHIM"  build/mutations/m15_brief_hides_the_plan_id.py     Mainguard.Tests        "FullyQualifiedName~AgentIpcProtocolTests"
+run m16 "$CARD"  build/mutations/m16_reject_button_ignores_rescope.py Mainguard.Tests      "FullyQualifiedName~CoordinatorPlanGateRenderHarness"
