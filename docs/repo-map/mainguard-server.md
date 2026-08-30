@@ -304,6 +304,16 @@
     `WorktreeManager.CommitAgentWork`, which owns what/where/onto-which-branch. The worker supplies only
     a message; the (repo, agent) come from the endpoint, never from `request.AgentId`. `NothingToCommit`
     answers `ok:true, committed:false` rather than a commit.
+    **`RescopePlanAsync`** is the worker table's sixth op (`rescope_plan`, 2026-08-30 — contract §3.1 /
+    phase 3 §23): the worker names the APPROVED plan it is widening (required, never inferred — a guessed
+    target produces a plausible card for an authorisation nobody named, §13.3's call), passes the same
+    plan-ownership and schema checks `revise` does, and then **blocks on the human exactly as `present`
+    does**. What it deliberately does NOT touch is `MayWork`: a worker with a re-scope pending still holds
+    the approval it is asking to widen, so steering, verification and `commit_work` keep answering off the
+    old scope. Suspending it would make asking more expensive than widening quietly, and would refuse a
+    running worker the one call that lets its work outlive its jail (F1). `DecisionResponse` carries
+    `RescopeOf` on every decision about a re-scope, not only the approval — a declined one has taken
+    nothing away, and the generic wording would send a still-authorised worker away from its work.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's

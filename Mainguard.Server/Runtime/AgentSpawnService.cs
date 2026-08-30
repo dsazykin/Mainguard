@@ -1158,6 +1158,7 @@ public sealed class AgentSpawnService
             [AgentIpcRequest.BriefOp] = (_, w, _) => Task.FromResult(Brief(w)),
             [AgentIpcRequest.PresentPlanOp] = PresentPlanAsync,
             [AgentIpcRequest.RevisePlanOp] = RevisePlanAsync,
+            [AgentIpcRequest.RescopePlanOp] = RescopePlanAsync,
             [AgentIpcRequest.AwaitDecisionOp] = AwaitDecisionAsync,
             [AgentIpcRequest.CommitWorkOp] = (r, w, _) => Task.FromResult(CommitWork(r, w)),
         };
@@ -1314,6 +1315,54 @@ public sealed class AgentSpawnService
         return await BlockForDecisionAsync(workerAgentId, request.PlanId, ct).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// <c>rescope_plan</c> — the worker asks to widen an APPROVED plan, then blocks on the decision.
+    ///
+    /// <para><b>The worker is not suspended while it waits.</b> Nothing here touches
+    /// <c>WorkerPlanGate.MayWork</c>, so steering, verification and above all <c>commit_work</c> keep
+    /// answering off the approval the worker already holds — for exactly the scope that was approved.
+    /// Blocking it would make asking legally more costly than widening quietly, which is the behaviour
+    /// this op exists to make unnecessary, and it would refuse a mid-task worker the one call that lets
+    /// its work outlive its jail.</para>
+    ///
+    /// <para>Ownership is checked the same way <c>revise</c> checks it, and answers a stranger's plan id
+    /// exactly as it answers one that does not exist — this channel is not an existence oracle for other
+    /// workers' plans.</para>
+    /// </summary>
+    private async Task<AgentIpcResponse> RescopePlanAsync(
+        AgentIpcRequest request, string workerAgentId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.PlanId))
+        {
+            return new AgentIpcResponse(
+                Ok: false,
+                Error: "the approved plan's id is required (mainguard-plan "
+                       + WorkerPlanShim.RescopeUsage + ")");
+        }
+
+        if (!OwnsPlan(workerAgentId, request.PlanId, out var ownershipError))
+        {
+            return ownershipError;
+        }
+
+        if (!TryValidatePlan(request.PlanJson, out var fields, out var invalid))
+        {
+            return invalid;
+        }
+
+        var rescope = _plans.Rescope(
+            request.PlanId,
+            request.Title ?? _planGate.PlanningBriefFor(workerAgentId) ?? "Untitled plan",
+            fields!);
+
+        if (!rescope.IsPresented)
+        {
+            return new AgentIpcResponse(Ok: false, Error: rescope.Message, PlanId: rescope.PlanId);
+        }
+
+        return await BlockForDecisionAsync(workerAgentId, rescope.PlanId!, ct).ConfigureAwait(false);
+    }
+
     /// <summary>Re-attach after a crash or a daemon restart: block on an already-presented plan.</summary>
     private async Task<AgentIpcResponse> AwaitDecisionAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
@@ -1374,7 +1423,11 @@ public sealed class AgentSpawnService
             Feedback: message ?? plan?.RejectionFeedback,
             Revision: plan?.RevisionCount ?? 0,
             RevisionsRemaining: Math.Max(0, _plans.MaxPlanRevisions - (plan?.RevisionCount ?? 0)),
-            MaxRevisions: _plans.MaxPlanRevisions);
+            MaxRevisions: _plans.MaxPlanRevisions,
+            // Carried on EVERY decision about a re-scope, not only the approval, because the refusals are
+            // where it changes what the shim says: a rejected or escalated re-scope has taken nothing
+            // away, and the generic wording would send a still-authorised worker away from its work.
+            RescopeOf: plan?.SupersedesPlanId);
 
     /// <summary>A worker may only act on a plan it authored — checked daemon-side, not assumed.</summary>
     private bool OwnsPlan(string workerAgentId, string planId, out AgentIpcResponse error)

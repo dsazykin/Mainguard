@@ -79,6 +79,35 @@ public class CoordinatorPlanGateRenderHarness
         });
     }
 
+    /// <summary>
+    /// <b>The re-scope card renders, in every theme (phase 3 §23.7).</b> A card whose Adds/Drops rows
+    /// never appear is the UI equivalent of a gate that is never consulted: the human would be approving
+    /// a widening with no way to see what it widens, which is the one thing this card exists to show.
+    ///
+    /// <para>Also pins the three strings that differ by card kind, because each of them is FALSE on the
+    /// other kind: declining a re-scope does not stop the worker, so the button must not say it does.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes()
+    {
+        RenderAllThemes("plan_gate_rescope", () => Fake.Rescope(), vm =>
+        {
+            var card = Assert.Single(vm.PendingPlans);
+            Assert.True(card.IsRescope);
+
+            // What changed, both directions, kept apart.
+            Assert.True(card.HasAddedScope);
+            Assert.Equal("src/Auth/Clock/SystemClock.cs", card.AddedScopeText);
+            Assert.True(card.HasRemovedScope);
+            Assert.Equal("src/Auth/RefreshService.cs", card.RemovedScopeText);
+            Assert.Contains("Widening an approved plan", card.RescopeHeadlineText, StringComparison.Ordinal);
+
+            // ...and the wording that would otherwise lie about what Reject does here.
+            Assert.Equal("Decline the widening", card.RejectButtonText);
+            Assert.Contains("is not stopped", card.FactsText, StringComparison.Ordinal);
+        });
+    }
+
     [AvaloniaFact]
     public void Escalated_HeadlessPng_AllThemes()
     {
@@ -684,6 +713,23 @@ public class CoordinatorPlanGateRenderHarness
             new OrchestrationBackpressure(1, 1, 3, 6, 3,
                 "1 worker is waiting on your approval · 1 escalated after 3 rejected plans."));
 
+        /// <summary>
+        /// A RE-SCOPE (phase 3 §23): a worker asking to widen an approval it already holds. Its previous
+        /// scope both ADDS a path and DROPS one, because the drop is the direction that could take
+        /// something away from the human and a fake that only ever widened would never render that row.
+        /// </summary>
+        public static Fake Rescope() => new(
+            Lines("loom-4 is asking to widen the scope you already approved."),
+            new[]
+            {
+                Card(revision: 0, remaining: 3, status: "Pending", feedback: "",
+                     scope: new[] { "src/Auth/TokenClock.cs", "tests/AuthTests.cs", "src/Auth/Clock/SystemClock.cs" },
+                     supersedes: "plan-6",
+                     previousScope: new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
+                     rescopeCount: 1),
+            },
+            new OrchestrationBackpressure(1, 0, 2, 6, 3, "1 worker is waiting on your approval."));
+
         public static Fake Quiet() => new(
             Lines("Nothing is waiting on you."), Array.Empty<WorkerPlanCard>(), OrchestrationBackpressure.None);
 
@@ -698,12 +744,15 @@ public class CoordinatorPlanGateRenderHarness
         };
 
         private static WorkerPlanCard Card(
-            int revision, int remaining, string status, string feedback, string worker = "loom-4") => new(
+            int revision, int remaining, string status, string feedback, string worker = "loom-4",
+            string[]? scope = null, string supersedes = "", string[]? previousScope = null,
+            int rescopeCount = 0) => new(
             "plan-7", worker, "coordinator", "Fix token expiry off-by-one",
-            new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
+            scope ?? new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
             "Extract the clock behind ITokenClock; inject a fixed clock in tests; correct the expiry comparison.",
             "AuthTests green plus two new expiry-boundary cases.",
-            1.50m, DateTimeOffset.Now.AddMinutes(-2), status, revision, remaining, 3, feedback);
+            1.50m, DateTimeOffset.Now.AddMinutes(-2), status, revision, remaining, 3, feedback,
+            supersedes, previousScope, rescopeCount);
 
         public IReadOnlyList<ChatLine> GetTranscript() => _transcript;
 

@@ -112,11 +112,17 @@ public sealed class QueueEntryResumeTests
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
+        // `rescope_plan` joined the list on 2026-08-30 (coordinator contract §3.1): a worker asks a HUMAN
+        // to widen the scope its own approved plan authorises. It sits on the safe side of the line drawn
+        // below for the same reason `present_plan` does — it queues a card for a person and moves no queue
+        // entry — and it can only ever make an approval NARROWER in effect, never a merge easier: the
+        // scope it changes is the one the flagged-change gate measures the diff against, and every widening
+        // it lands was consented to by the person the gate exists to protect.
         Assert.Equal(
             new[]
             {
                 "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
-                "revise_plan", "spawn", "status", "verify",
+                "rescope_plan", "revise_plan", "spawn", "status", "verify",
             },
             ops);
 

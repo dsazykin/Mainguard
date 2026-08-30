@@ -512,8 +512,154 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         }
     }
 
+    // ---- rescope_plan: the worker's legal way to widen an approved scope ---
+    //
+    // Live testing found a worker that TRIED to widen legitimately and was refused — one live plan per
+    // worker, and no op that acted on an approved one. It had two moves left, both bad: exceed its scope
+    // silently, or stop. Everything below drives the same bytes an in-jail shim writes.
+
+    /// <summary>
+    /// The dead end, at the daemon, and the way out of it. Both refusals are asserted in the same test
+    /// because neither is wrong on its own — it is the PAIR that left the worker with nowhere to go, and a
+    /// test that only checked one would keep passing if the other lost its hint.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorker_IsToldHowToWiden_ByBothOpsThatRefuseIt()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var presentedAgain = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.PresentPlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+        Assert.False(presentedAgain.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, presentedAgain.Error!, StringComparison.Ordinal);
+
+        var revised = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RevisePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+        Assert.False(revised.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, revised.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <b>The whole op, end to end, plus the property the design rests on.</b> The re-scope parks on the
+    /// human exactly as a presentation does — and while it is parked the worker is still authorised: it
+    /// commits, over its own channel, mid-wait. That is asserted here rather than only in the pure tests
+    /// because <c>commit_work</c> asks <c>WorkerPlanGate.MayWork</c>, and "the gate still says yes" is a
+    /// claim about the daemon's wiring, not about the plan store.
+    /// </summary>
+    [Fact]
+    public async Task ARescopeBlocksOnTheHuman_AndTheWorkerKeepsWorkingAndCommittingWhileItWaits()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Also the calculator"));
+        var pending = await WaitForAsync(() =>
+            Rig.Plans.LiveForWorker(workerId) is { IsRescope: true } p ? p : null);
+
+        // Parked: nothing but a human completes it.
+        Assert.False(await Task.WhenAny(call, Task.Delay(200)) == call, "the re-scope returned undecided");
+
+        // ...and the worker is NOT suspended. It still holds the approval it is asking to widen.
+        Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+        var commit = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers"));
+        Assert.True(commit.Ok, commit.Error);
+        Assert.True(commit.Committed);
+
+        Rig.Plans.Approve(pending.PlanId, "uid:1000");
+
+        var decided = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(decided.Ok, decided.Error);
+        Assert.Equal("Approved", decided.Status);
+        Assert.Equal(approvedId, decided.RescopeOf); // the shim needs this to report it as a widening
+        Assert.Equal(pending.PlanId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+    }
+
+    /// <summary>
+    /// A declined widening takes nothing away, and the answer says so — <c>rescopeOf</c> is what stops the
+    /// shim printing the generic "STOP: do not attempt another plan" at a worker that is still cleared for
+    /// its original scope and would otherwise abandon work it may legitimately finish.
+    /// </summary>
+    [Fact]
+    public async Task ADeclinedRescope_LeavesTheWorkerAuthorised_AndSaysWhichApprovalStands()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Also the calculator"));
+        var pending = await WaitForAsync(() =>
+            Rig.Plans.LiveForWorker(workerId) is { IsRescope: true } p ? p : null);
+        Rig.Plans.Reject(pending.PlanId, "src/calc.js belongs to another worker");
+
+        var decided = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("Rejected", decided.Status);
+        Assert.Equal(approvedId, decided.RescopeOf);
+
+        Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+        Assert.True(Rig.Gate.MayWork(workerId, out _));
+        var commit = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope"));
+        Assert.True(commit.Ok, commit.Error);
+    }
+
+    /// <summary>
+    /// Ownership is checked here exactly as it is for <c>revise</c>, and a stranger's plan id is answered
+    /// as a plan that does not exist — otherwise the re-scope op would be the one place on this channel
+    /// that told a worker which other workers' plans are approved.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerCannotRescopeAnotherWorkersPlan()
+    {
+        var (_, mine) = await SpawnCoordinatorAndWorkerAsync("my task");
+        var (_, theirs) = await SpawnCoordinatorAndWorkerAsync("their task");
+        await ApproveAsync(mine);
+        var theirPlan = await ApproveAsync(theirs);
+
+        // BOUNDED, and the bound is part of the assertion. If the ownership check were removed this
+        // re-scope would be ACCEPTED — and then park on a human who is never coming, so the test would
+        // hang rather than fail. A guard whose absence produces a hang is a guard nothing reports on:
+        // mutation m13 was watched doing exactly that before this timeout was added.
+        var refused = await CallAsync(mine, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: theirPlan,
+            PlanJson: PlanJson("src/calc.js"), Title: "Wider")).WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.False(refused.Ok);
+        Assert.Equal($"no plan '{theirPlan}'", refused.Error); // the same answer as a plan that is not there
+        Assert.False(Rig.Plans.LiveForWorker(theirs)!.IsRescope); // and nothing was queued on their behalf
+    }
+
+    /// <summary>
+    /// A re-scope naming no plan is refused with the form to use, and nothing is queued. Deriving the plan
+    /// from "whatever this worker has approved" was the obvious alternative and is the same call §13.3
+    /// made about a missing <c>--title</c>: a guessed target produces a plausible card for an
+    /// authorisation nobody named.
+    /// </summary>
+    [Fact]
+    public async Task ARescopeThatNamesNoPlan_IsRefused_AndQueuesNothing()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        // Bounded for the same reason as the ownership test above: a handler that INFERRED the plan id
+        // instead of refusing would accept this and then block on a decision nobody is going to make.
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"))
+            .WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.False(refused.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(approvedId, Rig.Plans.LiveForWorker(workerId)!.PlanId);
+    }
+
     /// <summary>Presents a plan and has a human approve it, so the worker is past the gate.</summary>
-    private async Task ApproveAsync(string workerId)
+    /// <returns>The approved plan's id — what a re-scope has to name.</returns>
+    private async Task<string> ApproveAsync(string workerId)
     {
         var call = CallAsync(workerId, new AgentIpcRequest(
             AgentIpcRequest.PresentPlanOp, PlanJson: PlanJson("src/a.cs"), Title: "T"));
@@ -521,6 +667,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         Rig.Plans.Approve(pending.PlanId, "uid:1000");
         var approved = await call.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal("Approved", approved.Status);
+        return pending.PlanId;
     }
 }
 

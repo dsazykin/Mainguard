@@ -141,6 +141,12 @@
     backpressure banner names the count and the stopped coordinator — so a render that silently loses one
     fails here rather than in a screenshot nobody opened. Paired with a negative
     (`NoBlockedWorkers_ShowsNoBackpressureLine`): an always-on warning is the same as no warning.
+    **(2026-08-30) A sixth state, the RE-SCOPE card** (`plan_gate_rescope`, phase 3 §23.7) — a worker
+    asking to widen an approval it already holds. Its fake both ADDS and DROPS a path, because a fixture
+    that only ever widened would never exercise the Drops row, which is the one direction this op can take
+    something away in; and it pins the three strings that differ by card kind, each of which is FALSE on
+    the other kind — most importantly the Reject button, which must not claim declining stops a worker
+    that declining does not stop.
     **`TheShippedControlCenterSurface_MountsThePlanGate`** is the one that matters most, and it is here
     because its absence let phase 2 ship undriveable: the five state renders above build
     `CoordinatorPanelView`, a control **the application never constructs**, so the entire gate could be
@@ -1384,6 +1390,18 @@
   suite inside the jail, so its blast radius is the repository — and the first defect it caught
   (`AgentBranchGuard`, #68) was in a file the filter did not name, so the gate could not have re-run on
   its own fix. Measured cost is ~11 min, comparable to `build-and-test`.
+- **`build/mutate.sh`** + **`build/mutations/`** — the mutation harness this repo's non-vacuity
+  discipline has been running by hand. `mutate.sh <label> <file> <patch> <test-project> <filter>` breaks
+  ONE guard (each `build/mutations/*.py` reads the pristine source on stdin and writes the broken version
+  on stdout, failing loudly if its anchor is absent), runs the named tests, restores, and re-runs.
+  `build/mutations/run-all.sh` drives the fourteen mutations of phase 3 §23 (the re-scope op).
+  Two properties are load-bearing: **every restore is followed by `touch`**, because a restore that
+  preserves mtime lets MSBuild skip the rebuild and re-run the tests against the MUTATED binary; and the
+  script **refuses to report** (exit 99) unless the assembly under test actually rebuilt — watching the
+  *owning project's* dll inside the test project's output dir, which is the one the test host loads. The
+  harness caught its own first version watching the test assembly instead: it stayed legitimately up to
+  date while `Mainguard.Agents.dll` rebuilt, and the run exited 99 rather than reporting a green it had
+  not measured.
 - **`build/ci/verify-installer-guardrails.sh`** — the P2-21 §7 rejection-trigger guard (`RunOnce` /
   `--shutdown`), extracted out of `ci.yml` so it can be run and *watched fail* locally. It scans
   `Mainguard.Agents/ Mainguard.Server/ installer/ build/mainguardos/` — the first two are where the
@@ -1626,7 +1644,21 @@
   being non-terminal, the pinned arithmetic *three rejections give three revisions and the **fourth**
   escalates* with a higher-budget negative control proving the escalation comes from the limit, the
   `WorkerPlanAuthor` loop end to end, and revision state surviving a restart so the budget is not handed
-  back), **`WorkerPlanGateTests`** (phase 2 — the daemon-side enforcement: the task withheld at every
+  back),
+  **`WorkerRescopeTests`** (**the re-scope op**, contract §3.1 / phase 3 §23 — a worker that discovers
+  mid-task it needs a file outside its approved scope presents a wider plan against the approval it
+  already holds. It opens with `TheDeadEnd_ThatThisOpExistsToRemove`, the measured defect kept as a test:
+  `present` refused with *"already approved for this worker"* and `revise` with *"only a rejected plan can
+  be revised"*, and both refusals now name `rescope`. Then the four decisions, each pinned where it could
+  silently reverse — the worker stays authorised for exactly the OLD scope while the human decides (so
+  `commit_work` is never refused to a running worker); **`ApprovedForWorker` is the authorisation and
+  `LatestForWorker` is not**, with the pre-fix shape reproduced inside the test so its `null` — and
+  therefore the F6 out-of-scope comparison being SKIPPED — is visible rather than argued; a re-scope
+  spends no revision, set up at the boundary where a worker reaches approval with its budget fully spent;
+  escalation is terminal for the path while the worker keeps its original approval; approval supersedes,
+  so a worker has one approved plan or none; asking LATE is not refused and the flagged-change gate still
+  decides the file either way; and the record survives a restart still knowing what it supersedes),
+  **`WorkerPlanGateTests`** (phase 2 — the daemon-side enforcement: the task withheld at every
   stage before approval and released only after, the brief being available but not being the task, an
   escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
   a branch that verified GREEN**, the paired negative that agents the gate never held are NOT blocked,
@@ -1966,7 +1998,15 @@
   with its own message and gets the sha back; a request carrying ANOTHER worker's `agentId` still lands
   on the caller's own branch (the field exists because coordinator ops need it, so the guarantee is
   behavioural rather than structural); a clean tree answers `committed:false` rather than a commit; and a
-  refused commit is reported as a failure, not as done. Over a shared `PlanGateRig` (one in-proc host per class; each test stops the agents it spawned,
+  refused commit is reported as a failure, not as done.
+  **`rescope_plan` (2026-08-30)** is asserted on the same wire: the DEAD END and the way out of it (both
+  refusals named — `present`'s and `revise`'s — because neither is wrong on its own and it is the pair
+  that trapped the worker); the op parks on the human like a presentation **while the worker keeps
+  committing mid-wait**, which is the property the whole design rests on and is a claim about the daemon's
+  gate rather than about the plan store; a declined re-scope leaves the worker authorised and says which
+  approval stands (`rescopeOf`); a worker cannot re-scope another worker's plan and gets the same answer
+  as for a plan that does not exist; and a re-scope naming no plan is refused with the form to use and
+  queues nothing. Over a shared `PlanGateRig` (one in-proc host per class; each test stops the agents it spawned,
   because `MaxActiveWorkers` is daemon-global and leaked workers make a later test hit the cap — which is
   how the first run failed, and a pleasant way to be reminded the cap is real). **`WorkerCapDaemonEnforcementTests`**
   is its own class, and therefore its own rig, because it asserts a daemon-global population: the cap is
@@ -2681,7 +2721,13 @@
   transport the shim reports an unreachable daemon PROMPTLY rather than parking on a poll loop; and the
   outbox is writable while the rest of the IPC mount — the shim included — is not. Mutation-checked by
   removing the outbox mount, which reproduces the reported failure verbatim:
-  `cannot reach the Mainguard daemon: [Errno 111] Connection refused`),
+  `cannot reach the Mainguard daemon: [Errno 111] Connection refused`. It also carries the two shim
+  argument-shape guards, in a real jail because the point of each is that a slip is DETECTED rather than
+  plausibly parsed: `TheRealShimsSpawn_*` (the §13 `--title`/`--task` pair, and the old title-less form
+  refused) and `TheRealShimsRescope_SendsThePlanItWidens_AndRefusesTheIdLessForm` (the §23 re-scope verb —
+  the taught form reaches the daemon carrying the plan id and the plan document, the worker is told this
+  was a WIDENING rather than a first approval, and the id-less form is refused locally with the working
+  form while sending nothing)),
   `Agents/JailRuntimePostureDockerTests.cs` (**tickets #59/#60** — the
   jail's posture read FROM INSIDE A RUNNING CONTAINER rather than from the create request that asked
   for it, because seven controls were measured removable from a real jail with the whole 98-test suite

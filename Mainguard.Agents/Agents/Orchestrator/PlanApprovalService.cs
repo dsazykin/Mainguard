@@ -39,6 +39,19 @@ public enum PlanStatus
 
     /// <summary>The revision budget is spent. The worker stopped and escalated to the human.</summary>
     Escalated,
+
+    /// <summary>
+    /// This plan was the worker's authorisation and a human has approved a <b>re-scope</b> that replaces
+    /// it. Terminal, and it exists so that "the approved plan" stays exactly one object per worker.
+    ///
+    /// <para>The alternative was to leave both plans <see cref="Approved"/> and let
+    /// <see cref="PlanApprovalService.ApprovedForWorker"/> pick the newest by timestamp. That is the shape
+    /// of a defect rather than a design: the flagged-change gate compares every merge diff against "the
+    /// approved scope" (phase 2 §3a), so an ordering bug there would compare a diff against a superseded
+    /// authorisation and report the result as enforcement. With supersession there is nothing to order —
+    /// a worker has one approved plan or none.</para>
+    /// </summary>
+    Superseded,
 }
 
 /// <summary>Whether a worker's plan presentation was accepted onto the queue.</summary>
@@ -49,6 +62,22 @@ public enum PlanPresentationOutcome
 
     /// <summary>Refused by a daemon-side invariant (one live plan per worker). Nothing was queued.</summary>
     Refused,
+}
+
+/// <summary>The outcome of a worker's attempt to re-scope an approved plan.</summary>
+public enum PlanRescopeOutcome
+{
+    /// <summary>Accepted — a new plan is <see cref="PlanStatus.Pending"/>, and the old one still authorises.</summary>
+    Presented,
+
+    /// <summary>Refused: no such plan, it is not approved, or this worker already has a re-scope in flight.</summary>
+    Refused,
+}
+
+/// <summary>The result of a <see cref="PlanApprovalService.Rescope"/> call.</summary>
+public sealed record PlanRescopeResult(PlanRescopeOutcome Outcome, string Message, string? PlanId)
+{
+    public bool IsPresented => Outcome == PlanRescopeOutcome.Presented;
 }
 
 /// <summary>The outcome of a worker's attempt to revise a rejected plan.</summary>
@@ -79,6 +108,22 @@ public enum PlanRevisionOutcome
 /// <param name="WorkerAgentId">The worker that inspected the repo and authored this plan.</param>
 /// <param name="RevisionCount">How many revisions the worker has produced (0 = the original presentation).</param>
 /// <param name="RejectionFeedback">The human's most recent rejection text — what the worker revises against.</param>
+/// <param name="SupersedesPlanId">
+/// Set only on a <b>re-scope</b>: the id of the approved plan this one asks to replace. It is the field
+/// that makes the whole op legible rather than a second presentation — the human is approving a widening
+/// of something they already approved, and this is how the card knows to say so and what to diff against.
+/// </param>
+/// <param name="PreviousScope">
+/// The scope of the plan named by <see cref="SupersedesPlanId"/>, captured at the moment the re-scope was
+/// presented. <b>Copied, not looked up</b>: the card must show what the human actually consented to, and a
+/// lookup would render whatever that plan says at paint time — which is a different claim as soon as a
+/// second re-scope exists. Empty on an ordinary plan.
+/// </param>
+/// <param name="RescopeCount">
+/// How many times this worker has already had a widening approved (0 on an original plan and on the first
+/// re-scope). It is <b>not a budget</b> — nothing refuses on this number; see
+/// <see cref="PlanApprovalService.Rescope"/> for why the count is shown rather than capped.
+/// </param>
 public sealed record PendingPlan(
     TaskPlan Plan,
     string CoordinatorId,
@@ -88,14 +133,29 @@ public sealed record PendingPlan(
     DateTimeOffset? DecidedAt,
     string WorkerAgentId = "",
     int RevisionCount = 0,
-    string? RejectionFeedback = null)
+    string? RejectionFeedback = null,
+    string? SupersedesPlanId = null,
+    IReadOnlyList<string>? PreviousScope = null,
+    int RescopeCount = 0)
 {
     public string PlanId => Plan.PlanId;
     public string Title => Plan.Title;
     public decimal BudgetUsd => Plan.BudgetUsd;
     public DateTimeOffset DraftedAt => Plan.DraftedAt;
 
-    /// <summary>True while the worker is held at the gate — presented and undecided, or owing a revision.</summary>
+    /// <summary>True when this plan asks to widen an approval the worker already holds.</summary>
+    public bool IsRescope => !string.IsNullOrEmpty(SupersedesPlanId);
+
+    /// <summary>
+    /// True while the worker is held at the gate — presented and undecided, or owing a revision.
+    ///
+    /// <para><b>A pending re-scope counts.</b> It is a card in front of a human and a worker parked on a
+    /// blocking call, which is exactly what this flag feeds (the backpressure sentence and the "N workers
+    /// waiting on your approval" count). What it does NOT mean is that the worker is unauthorised: that
+    /// question is <see cref="PlanApprovalService.HasApprovedPlan"/>, which still answers yes off the plan
+    /// the re-scope is widening. The two were always different questions; the re-scope is the first case
+    /// where they have different answers at the same instant.</para>
+    /// </summary>
     public bool BlocksWorker => Status is PlanStatus.Pending or PlanStatus.Rejected;
 }
 
@@ -241,6 +301,9 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         DecidedAt = p.DecidedAt,
         RevisionCount = p.RevisionCount,
         RejectionFeedback = p.RejectionFeedback,
+        SupersedesPlanId = p.SupersedesPlanId,
+        PreviousScope = p.PreviousScope?.ToList(),
+        RescopeCount = p.RescopeCount,
     };
 
     private static PendingPlan FromDto(PlanDto d) => new(
@@ -252,7 +315,13 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         d.DecidedAt,
         d.WorkerAgentId ?? "",
         d.RevisionCount,
-        d.RejectionFeedback);
+        d.RejectionFeedback,
+        // Persisted, because a daemon restart must not turn a re-scope back into an ordinary plan: the
+        // supersession that runs on approval is what keeps "one approved plan per worker" true, and a
+        // rehydrated plan that had forgotten what it supersedes would leave two.
+        d.SupersedesPlanId,
+        d.PreviousScope,
+        d.RescopeCount);
 
     private sealed class PlanDto
     {
@@ -271,6 +340,9 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         public DateTimeOffset? DecidedAt { get; set; }
         public int RevisionCount { get; set; }
         public string? RejectionFeedback { get; set; }
+        public string? SupersedesPlanId { get; set; }
+        public List<string>? PreviousScope { get; set; }
+        public int RescopeCount { get; set; }
     }
 }
 
@@ -294,6 +366,14 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
 /// <see cref="CoordinatorLimits.MaxPlanRevisions"/> — daemon-side, never prompted — and the rejection that
 /// exhausts it moves the plan to <see cref="PlanStatus.Escalated"/> so the worker cannot even attempt
 /// another round.</para>
+///
+/// <para><b>An approval can be widened, and only by asking.</b> <see cref="Rescope"/> is the op for a
+/// worker that discovers mid-task that the job needs a file its approved scope does not cover. It presents
+/// a new plan against the approved one and a human decides it like any other; the approved plan keeps
+/// authorising the worker until that decision lands, and is retired to
+/// <see cref="PlanStatus.Superseded"/> the moment the wider one is approved. Before it existed the store
+/// answered such a worker <i>"already approved for this worker"</i> and offered nothing further, so its
+/// only remaining moves were to exceed its scope silently or to stop.</para>
 /// </summary>
 public sealed class PlanApprovalService
 {
@@ -383,9 +463,23 @@ public sealed class PlanApprovalService
                 });
                 return new PlanPresentationResult(
                     PlanPresentationOutcome.Refused,
-                    live.Status == PlanStatus.Rejected
-                        ? $"Plan '{live.PlanId}' was sent back for revision — revise that one instead of presenting a new plan."
-                        : $"Plan '{live.PlanId}' is already {live.Status.ToString().ToLowerInvariant()} for this worker.",
+                    live.Status switch
+                    {
+                        PlanStatus.Rejected =>
+                            $"Plan '{live.PlanId}' was sent back for revision — revise that one instead of "
+                            + "presenting a new plan.",
+
+                        // The dead end this branch used to be. "already approved" is true and was the whole
+                        // answer: a worker that had discovered it must touch a neighbouring file was told
+                        // its plan was fine and given no way to change what that plan authorises, so its
+                        // only moves were to exceed the scope silently or to stop. It now names the op.
+                        PlanStatus.Approved =>
+                            $"Plan '{live.PlanId}' is already approved for this worker. To change what it "
+                            + "authorises — a file the approved scope does not cover — re-scope it: "
+                            + "mainguard-plan " + Mainguard.Agents.Agents.Ipc.WorkerPlanShim.RescopeUsage,
+
+                        _ => $"Plan '{live.PlanId}' is already {live.Status.ToString().ToLowerInvariant()} for this worker.",
+                    },
                     live.PlanId);
             }
 
@@ -441,9 +535,17 @@ public sealed class PlanApprovalService
 
             if (plan.Status != PlanStatus.Rejected)
             {
+                // The two verbs are refused in complementary states, and each refusal names the other.
+                // That mutual exclusion is what makes `revise` and `rescope` safe to hand a model: a
+                // mis-picked verb is always refused rather than plausibly accepted, and the refusal is
+                // the correction.
                 return new PlanRevisionResult(
                     PlanRevisionOutcome.Refused,
-                    $"Plan '{planId}' is {plan.Status} — only a rejected plan can be revised.",
+                    plan.Status == PlanStatus.Approved
+                        ? $"Plan '{planId}' is Approved — only a rejected plan can be revised. To widen "
+                          + "what an approved plan authorises, re-scope it: mainguard-plan "
+                          + Mainguard.Agents.Agents.Ipc.WorkerPlanShim.RescopeUsage
+                        : $"Plan '{planId}' is {plan.Status} — only a rejected plan can be revised.",
                     plan);
             }
 
@@ -508,6 +610,164 @@ public sealed class PlanApprovalService
             PlanRevisionOutcome.Revised,
             $"Revision {revised.RevisionCount} of {_limits.MaxPlanRevisions} presented — awaiting approval.",
             revised);
+    }
+
+    /// <summary>
+    /// A worker asks to <b>widen an approved plan</b>: it started the work, found that doing the job
+    /// properly needs a file the approved scope does not cover, and presents a revised plan against the
+    /// approval it already holds. A human decides it exactly as they decide any other plan.
+    ///
+    /// <para><b>Why this is not <see cref="Revise"/>.</b> A revision answers a rejection and spends the
+    /// revision budget; this follows an approval and spends none. Charging it would be wrong in the
+    /// direction that matters: a worker whose plan was rejected three times and then approved would have
+    /// nothing left, so the workers that had the hardest time agreeing a plan would be exactly the ones
+    /// with no legal way to widen it — which re-creates the defect this op exists to remove, for the
+    /// population most likely to hit it. The budget bounds "your plans keep being wrong"; a re-scope is
+    /// "the job is bigger than it looked", and those are different failures with different remedies.</para>
+    ///
+    /// <para><b>The re-scope carries its own, fresh revision budget</b>, because it is a new plan record
+    /// and it can itself be rejected. That would be a hole if it could be re-entered: reject ×4 escalates,
+    /// and a worker allowed to re-scope again would get another three rounds, forever, without a human
+    /// ever having said yes. So escalation is terminal for this path too — a worker whose re-scope
+    /// escalated is refused another, and keeps the approval it already had.</para>
+    ///
+    /// <para><b>Why the number of re-scopes is not capped.</b> Every one of them costs a human approval,
+    /// which is the actual scarce resource and the actual gate; a numeric cap would put a worker back at
+    /// "no legal path" at an arbitrary boundary, which is the defect wearing a limit. What runaway
+    /// widening needs is to be VISIBLE to the person paying for it, so <see cref="PendingPlan.RescopeCount"/>
+    /// travels to the card instead. The two loops that could run without a human — repeated presentation,
+    /// and reject→re-scope→reject — are closed above by "one live re-scope at a time" and by escalation
+    /// being terminal.</para>
+    ///
+    /// <para><b>What it does NOT do: inspect the worktree.</b> A worker may ask to re-scope after it has
+    /// already touched the extra file, and that is neither refused nor separately flagged here. The
+    /// flagged-change gate already puts every file outside the approved scope in front of a human at
+    /// verification and blocks the merge until they acknowledge it (phase 2 §3a, F6) — so the out-of-scope
+    /// work is caught by exactly one mechanism, whatever the answer here. Refusing a late re-scope would
+    /// re-open the dead end (a worker that already slipped could never get legal again), and adding a
+    /// second check here would be two controls answering one question, which is how one of them goes
+    /// decorative (MG-12).</para>
+    /// </summary>
+    /// <param name="planId">The <b>approved</b> plan being widened. Required — never inferred.</param>
+    public PlanRescopeResult Rescope(string planId, string title, TaskPlanFields fields)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+
+        PendingPlan presented;
+        lock (_gate)
+        {
+            if (!_plans.TryGetValue(planId, out var approved))
+            {
+                return new PlanRescopeResult(PlanRescopeOutcome.Refused, $"No plan '{planId}'.", null);
+            }
+
+            if (approved.Status != PlanStatus.Approved)
+            {
+                return new PlanRescopeResult(
+                    PlanRescopeOutcome.Refused,
+                    approved.Status switch
+                    {
+                        PlanStatus.Pending =>
+                            $"Plan '{planId}' is still awaiting the human's decision — wait for it "
+                            + $"(mainguard-plan await {planId}) rather than re-scoping it.",
+                        PlanStatus.Rejected =>
+                            $"Plan '{planId}' was sent back for revision — revise it "
+                            + $"(mainguard-plan revise {planId} <plan.json>) rather than re-scoping it.",
+                        _ =>
+                            $"Plan '{planId}' is {approved.Status} — only an approved plan can be re-scoped.",
+                    },
+                    planId);
+            }
+
+            // Escalation is terminal for this path, which is what stops reject→re-scope→reject being an
+            // unbounded loop with a fresh budget each time round.
+            var escalatedRescope = _plans.Values.FirstOrDefault(p =>
+                p.IsRescope &&
+                p.Status == PlanStatus.Escalated &&
+                string.Equals(p.WorkerAgentId, approved.WorkerAgentId, StringComparison.Ordinal));
+            if (escalatedRescope is not null)
+            {
+                AuditLocked("plan_rescope_refused", new Dictionary<string, string>
+                {
+                    ["worker_agent_id"] = approved.WorkerAgentId,
+                    ["cause"] = "rescope-already-escalated",
+                    ["escalated_plan_id"] = escalatedRescope.PlanId,
+                });
+                return new PlanRescopeResult(
+                    PlanRescopeOutcome.Refused,
+                    $"A re-scope for this worker already escalated after {_limits.MaxPlanRevisions} "
+                    + $"rejections (plan '{escalatedRescope.PlanId}'). You are still approved for plan "
+                    + $"'{planId}' — finish what it covers, or report to the human.",
+                    planId);
+            }
+
+            // One live re-scope at a time, for the same reason there is one live plan: a worker cannot put
+            // more cards in front of a human than the human agreed to look at.
+            var inFlight = _plans.Values.FirstOrDefault(p =>
+                p.IsRescope &&
+                p.BlocksWorker &&
+                string.Equals(p.WorkerAgentId, approved.WorkerAgentId, StringComparison.Ordinal));
+            if (inFlight is not null)
+            {
+                AuditLocked("plan_rescope_refused", new Dictionary<string, string>
+                {
+                    ["worker_agent_id"] = approved.WorkerAgentId,
+                    ["cause"] = "one-live-rescope-per-worker",
+                    ["existing_plan_id"] = inFlight.PlanId,
+                    ["existing_status"] = inFlight.Status.ToString(),
+                });
+                return new PlanRescopeResult(
+                    PlanRescopeOutcome.Refused,
+                    inFlight.Status == PlanStatus.Rejected
+                        ? $"Re-scope '{inFlight.PlanId}' was sent back for revision — revise that one "
+                          + $"(mainguard-plan revise {inFlight.PlanId} <plan.json>)."
+                        : $"Re-scope '{inFlight.PlanId}' is already in front of the human for this worker.",
+                    inFlight.PlanId);
+            }
+
+            var plan = new TaskPlan(
+                PlanId: Guid.NewGuid().ToString("N"),
+                Title: string.IsNullOrWhiteSpace(title) ? approved.Plan.Title : title,
+                Scope: fields.Scope,
+                Approach: fields.Approach,
+                TestStrategy: fields.TestStrategy,
+                BudgetUsd: approved.Plan.BudgetUsd,
+                DraftedAt: _clock());
+
+            presented = new PendingPlan(
+                plan,
+                approved.CoordinatorId,
+                approved.TaskPrompt,
+                PlanStatus.Pending,
+                ApproverIdentity: null,
+                DecidedAt: null,
+                WorkerAgentId: approved.WorkerAgentId,
+                RevisionCount: 0,
+                RejectionFeedback: null,
+                SupersedesPlanId: approved.PlanId,
+                PreviousScope: approved.Plan.Scope.ToList(),
+                RescopeCount: approved.RescopeCount + 1);
+
+            _plans[presented.PlanId] = presented;
+            _store.Save(presented);
+
+            AuditLocked("plan_rescope_presented", new Dictionary<string, string>
+            {
+                ["plan_id"] = presented.PlanId,
+                ["supersedes_plan_id"] = approved.PlanId,
+                ["worker_agent_id"] = presented.WorkerAgentId,
+                ["coordinator_id"] = presented.CoordinatorId,
+                ["scope_count"] = plan.Scope.Count.ToString(),
+                ["previous_scope_count"] = approved.Plan.Scope.Count.ToString(),
+                ["rescope_count"] = presented.RescopeCount.ToString(),
+            });
+        }
+
+        Changed?.Invoke();
+        return new PlanRescopeResult(
+            PlanRescopeOutcome.Presented,
+            "Re-scope presented — your existing approval still stands while the human decides.",
+            presented.PlanId);
     }
 
     /// <summary>
@@ -590,6 +850,7 @@ public sealed class PlanApprovalService
         }
 
         PendingPlan approved;
+        PendingPlan? superseded = null;
         lock (_gate)
         {
             var plan = GetPendingLocked(planId);
@@ -601,6 +862,22 @@ public sealed class PlanApprovalService
             };
             _plans[planId] = approved;
             _store.Save(approved);
+
+            // Approving a re-scope RETIRES the plan it widens, in the same lock that approves it.
+            //
+            // This is what keeps "a worker has one approved plan" an invariant rather than a habit. The
+            // flagged-change gate resolves that plan and compares every merge diff against its scope
+            // (phase 2 §3a), so two approved plans for one worker would not be an untidy record — it
+            // would be a gate measuring against whichever one a lookup happened to return. Under the
+            // lock, because a release racing this must see one or the other and never both.
+            if (approved.IsRescope &&
+                _plans.TryGetValue(approved.SupersedesPlanId!, out var previous) &&
+                previous.Status == PlanStatus.Approved)
+            {
+                superseded = previous with { Status = PlanStatus.Superseded, DecidedAt = _clock() };
+                _plans[superseded.PlanId] = superseded;
+                _store.Save(superseded);
+            }
         }
 
         _audit.Append(new AuditEvent("plan_approved", new Dictionary<string, string>
@@ -611,7 +888,22 @@ public sealed class PlanApprovalService
             ["approver"] = approverIdentity,
             ["revision"] = approved.RevisionCount.ToString(),
             ["scope_count"] = approved.Plan.Scope.Count.ToString(),
+            ["supersedes_plan_id"] = approved.SupersedesPlanId ?? string.Empty,
+            ["rescope_count"] = approved.RescopeCount.ToString(),
         }));
+
+        if (superseded is not null)
+        {
+            _audit.Append(new AuditEvent("plan_superseded", new Dictionary<string, string>
+            {
+                ["plan_id"] = superseded.PlanId,
+                ["superseded_by"] = approved.PlanId,
+                ["worker_agent_id"] = superseded.WorkerAgentId,
+                ["approver"] = approverIdentity,
+                ["previous_scope_count"] = superseded.Plan.Scope.Count.ToString(),
+                ["scope_count"] = approved.Plan.Scope.Count.ToString(),
+            }));
+        }
 
         CompleteWaiters(approved);
         Changed?.Invoke();
@@ -735,16 +1027,50 @@ public sealed class PlanApprovalService
         }
     }
 
-    /// <summary>True iff this worker holds an approved plan — the one fact that clears it to work.</summary>
+    /// <summary>
+    /// True iff this worker holds an approved plan — the one fact that clears it to work.
+    ///
+    /// <para>Unchanged by the re-scope op, and that is the decision rather than an oversight: a worker
+    /// with a re-scope pending still holds the approval it is asking to widen, so it stays authorised for
+    /// exactly the scope that was approved. Suspending it would punish the legal move — the worker that
+    /// stays quiet keeps working and the one that asks is stopped — and would refuse
+    /// <c>commit_work</c> to a worker mid-task, which is how F1's "stopping a worker must not destroy its
+    /// commits" is undone by a human taking an hour to read a card.</para>
+    /// </summary>
     public bool HasApprovedPlan(string workerAgentId)
     {
         lock (_gate)
         {
-            return _plans.Values.Any(p =>
-                p.Status == PlanStatus.Approved &&
-                string.Equals(p.WorkerAgentId, workerAgentId, StringComparison.Ordinal));
+            return ApprovedForWorkerLocked(workerAgentId) is not null;
         }
     }
+
+    /// <summary>
+    /// <b>The</b> plan that currently authorises this worker — approved, and not since superseded — or
+    /// null. This is the single authority for "what is this worker cleared to do", and the composition
+    /// root's <c>resolveApprovedPlan</c> is a call to it.
+    ///
+    /// <para><b>Why it is not <see cref="LatestForWorker"/> filtered on Approved.</b> That was the wiring
+    /// before the re-scope op, and it was correct only while a worker's newest plan was always its
+    /// authorisation. A pending re-scope is newer than the plan it widens, so the filtered-latest read
+    /// answers <c>null</c> — and null means "unmanaged" to the flagged-change gate, which skips the
+    /// out-of-scope comparison entirely. The worker would have lost its F6 coverage by the act of asking
+    /// to widen legally, silently, for as long as the human took to decide. Phase 2 §3a's requirement is
+    /// that F6 measures against the CURRENT authorisation; this method is what that sentence means.</para>
+    /// </summary>
+    public PendingPlan? ApprovedForWorker(string workerAgentId)
+    {
+        lock (_gate)
+        {
+            return ApprovedForWorkerLocked(workerAgentId);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="ApprovedForWorker"/> as the flagged-change gate wants it — the approved
+    /// <see cref="TaskPlan"/> itself, or null. Exists so the composition root holds no policy of its own.
+    /// </summary>
+    public TaskPlan? ApprovedPlanFor(string workerAgentId) => ApprovedForWorker(workerAgentId)?.Plan;
 
     /// <summary>The workers currently held at the plan gate (presented-undecided, or owing a revision).</summary>
     public IReadOnlyList<string> BlockedWorkerIds()
@@ -799,6 +1125,34 @@ public sealed class PlanApprovalService
     }
 
     // ---- internals --------------------------------------------------------
+
+    /// <summary>
+    /// The worker's approved plan — <b>single-or-nothing</b>. The supersession in <see cref="Approve"/> is
+    /// what makes at most one exist; this refuses to guess if that invariant were ever broken, following
+    /// <c>WorkerPlanGate.ResolveKeyLocked</c>'s precedent, because every caller reads null as "not
+    /// authorised" and an arbitrary pick would be an authorisation decided by dictionary order.
+    /// </summary>
+    private PendingPlan? ApprovedForWorkerLocked(string workerAgentId)
+    {
+        PendingPlan? found = null;
+        foreach (var plan in _plans.Values)
+        {
+            if (plan.Status != PlanStatus.Approved ||
+                !string.Equals(plan.WorkerAgentId, workerAgentId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (found is not null)
+            {
+                return null; // ambiguous — refuse rather than authorise by enumeration order.
+            }
+
+            found = plan;
+        }
+
+        return found;
+    }
 
     private PendingPlan? LiveForWorkerLocked(string workerAgentId) =>
         _plans.Values

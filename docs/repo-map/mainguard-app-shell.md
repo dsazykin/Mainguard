@@ -361,8 +361,17 @@
       workers, and one Approve/Reject card per blocked worker with Scope + Approach + the feedback box.
       Split out of `CoordinatorPanelView` because the coordinator conversation moved into a real PTY and a
       PTY cannot render a button: the gate is a decision about a *worker*, taken out of band from whatever
-      the coordinator is saying, so it has to be hostable without the chat. **Mounted by
-      `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
+      the coordinator is saying, so it has to be hostable without the chat. **(2026-08-30) A card can now
+      be a RE-SCOPE** (contract §3.1 / phase 3 §23) — a worker asking to change what an approval it
+      already holds authorises. That is a materially different decision from a first presentation and the
+      card says so above the title, shows **Adds** and **Drops** against the previously approved scope
+      (Drops in `DangerBrush` and never folded into Adds — it is the one direction this op can take
+      something away in), and re-words the three strings that would otherwise be FALSE on it: Reject reads
+      "Decline the widening" because declining stops nothing, the last-round warning says the widening
+      closes rather than that the worker stops, and an escalated re-scope's card says the worker is still
+      working under its original approval instead of "stopped after N rejected plans" — a human who reads
+      the generic sentence ends a worker that is doing approved work. No new tokens (phase 2 §2.9).
+      **Mounted by `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
       that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the

@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+
 namespace Mainguard.Agents.Agents.Ipc;
 
 /// <summary>
@@ -22,10 +24,51 @@ namespace Mainguard.Agents.Agents.Ipc;
 /// </summary>
 public static class WorkerPlanShim
 {
+    /// <summary>
+    /// The CLI verb for every op a worker endpoint serves — <b>single-sourced</b>, and the only place the
+    /// two spellings of one operation are written down together.
+    ///
+    /// <para>A worker meets each op twice: as the verb it types (<c>present</c>) and as the wire op the
+    /// daemon dispatches (<c>present_plan</c>). Keeping the correspondence in an object rather than in
+    /// three prose renderings is what lets <c>AgentOperatingInstructionsTests</c> pin the worker's
+    /// instructions against <see cref="AgentIpcRequest.WorkerOps"/> the way the coordinator's have been
+    /// pinned since phase 3 §13.5: an op added without a verb, or a verb the instructions never teach, is
+    /// a test failure rather than a capability the worker never learns it has.</para>
+    /// </summary>
+    public static readonly IReadOnlyDictionary<string, string> Verbs =
+        new Dictionary<string, string>(System.StringComparer.Ordinal)
+        {
+            [AgentIpcRequest.BriefOp] = "brief",
+            [AgentIpcRequest.PresentPlanOp] = "present",
+            [AgentIpcRequest.RevisePlanOp] = "revise",
+            [AgentIpcRequest.RescopePlanOp] = "rescope",
+            [AgentIpcRequest.AwaitDecisionOp] = "await",
+            [AgentIpcRequest.CommitWorkOp] = "commit",
+        };
+
+    /// <summary>
+    /// The argument form of the re-scope op, interpolated into the shim's usage text, the shim's own
+    /// refusal, <see cref="AgentOperatingInstructions.Worker"/>, and the daemon's refusals — the same
+    /// single-sourcing <see cref="AgentSpawnShim.SpawnUsage"/> exists for, and for the same reason.
+    ///
+    /// <para><b>The id is required and is the APPROVED plan's id</b> — not a bare
+    /// <c>rescope &lt;plan.json&gt;</c>. Naming what is being widened is what makes the daemon able to say
+    /// "that plan is pending / was rejected / has escalated" instead of guessing which of a worker's plans
+    /// the request meant; and it is the same shape as <c>revise</c>, so the two verbs differ in exactly one
+    /// place — the word — rather than in their argument lists as well.</para>
+    /// </summary>
+    /// <remarks>
+    /// The program name is deliberately NOT part of this string — the worker's shim is on PATH as
+    /// <c>mainguard-plan</c> and reached by absolute path in its operating instructions, so a usage line
+    /// carrying one spelling would be wrong in the other place. Same shape as
+    /// <see cref="AgentSpawnShim.SpawnUsage"/>.
+    /// </remarks>
+    public const string RescopeUsage = "rescope <approved-plan-id> <plan.json>";
+
     /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon). Composed
     /// from the shared <see cref="AgentIpcShimTransport"/>, which is the ONLY place either shim's
     /// transport is written.</summary>
-    public static readonly string Script = """"
+    public static readonly string Script = $$""""
 #!/usr/bin/env python3
 """mainguard-plan: present the plan YOU authored, and wait for the human.
 
@@ -34,16 +77,30 @@ You are a Mainguard worker. You do not start work until a human approves your pl
 Usage:
   mainguard-plan brief                  what you are here to plan (never the task itself)
   mainguard-plan present <plan.json>    present the plan you authored, then wait
-  mainguard-plan revise <id> <plan.json>  re-present after a rejection, then wait
+  mainguard-plan revise <id> <plan.json>  re-present after a REJECTION, then wait
+  mainguard-plan {{RescopeUsage}}
+                                        widen an APPROVED plan, then wait
   mainguard-plan await <id>             block until the human decides
   mainguard-plan commit "<message>"     record the approved work on your own branch
 
 plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}. Write it
 OUTSIDE the repository (/tmp/plan.json) — /workspace is the tree your commit records.
 
-`present` and `revise` block until the decision arrives and print it. On approval the
-output includes TASK: followed by the work you are cleared to do — the daemon withholds
+`present`, `revise` and `rescope` block until the decision arrives and print it. On approval
+the output includes TASK: followed by the work you are cleared to do — the daemon withholds
 it until then, so there is nothing to start on before approval.
+
+`revise` and `rescope` are NOT interchangeable, and the daemon will tell you which one you
+wanted. `revise` answers a rejection: the human sent your plan back and you owe a new one,
+and it spends a revision from your budget. `rescope` follows an APPROVAL: your plan was
+accepted, you started work, and you found that doing the job properly needs a file the
+approved scope does not cover. It spends no revision, and it is the ONLY legal way to widen.
+
+While a re-scope is waiting on the human your EXISTING approval still stands: you are cleared
+for exactly the scope that was approved before, and nothing you have already done is undone.
+If it is refused you are still cleared for the original scope. Ask before you widen; if you
+already touched the extra file, ask anyway -- every file outside the approved scope is put in
+front of the human at verification either way, and a re-scope is how you say why.
 
 `commit` is how finished work leaves this jail. The daemon commits everything in
 /workspace onto your own branch; you supply only the message. Work you have not
@@ -61,7 +118,7 @@ whitespace, and your blank lines are gone before this program starts.
   early. Boundary tests cover the DST transition in both directions."
 """
 """"
-        + "\n" + AgentIpcShimTransport.PythonSource + "\n" + """"
+        + "\n" + AgentIpcShimTransport.PythonSource + "\n" + $$""""
 
 def read_plan(path):
     with open(path, "r", encoding="utf-8") as handle:
@@ -70,7 +127,17 @@ def read_plan(path):
 
 def report(response):
     status = response.get("status") or ""
+    # Set only on a re-scope's decision: the id of the approved plan this one was widening. It is what
+    # makes the three outcomes below say something DIFFERENT for a re-scope, and the difference is the
+    # whole point -- a refused re-scope has not taken anything away, and a worker told the generic
+    # "STOP" would abandon work it is still cleared to do.
+    rescope_of = response.get("rescopeOf")
     if status == "Approved":
+        if rescope_of:
+            print("APPROVED: wider scope — plan %s replaces %s as what you are cleared to do."
+                  % (response.get("planId", ""), rescope_of))
+            print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
+            return 0
         print("APPROVED: plan %s" % response.get("planId", ""))
         print("TASK: %s" % (response.get("taskPrompt") or ""))
         # Said HERE, at the one moment the worker is cleared to start, because this is the only
@@ -81,12 +148,21 @@ def report(response):
     if status == "Rejected":
         remaining = response.get("revisionsRemaining")
         print("REJECTED: %s" % (response.get("feedback") or "(no feedback given)"))
+        if rescope_of:
+            print("STILL APPROVED: plan %s — you are cleared for its scope, exactly as before."
+                  % rescope_of)
         print("REVISE: mainguard-plan revise %s <plan.json>  (%s revision(s) left)"
               % (response.get("planId", ""), remaining))
         return 0
     if status == "Escalated":
         print("ESCALATED: the revision budget is spent (%s of %s used)."
               % (response.get("revision"), response.get("maxRevisions")))
+        if rescope_of:
+            print("STILL APPROVED: plan %s — you are cleared for its scope, exactly as before."
+                  % rescope_of)
+            print("STOP WIDENING: do not ask to re-scope again. Finish what plan %s covers, or "
+                  "report to the human and wait." % rescope_of)
+            return 3
         print("STOP: do not attempt another plan. Report to the human and wait.")
         return 3
     print(json.dumps(response))
@@ -102,9 +178,23 @@ def main(argv):
     elif len(argv) >= 3 and argv[1] == "present":
         request = {"op": "present_plan", "planJson": read_plan(argv[2]),
                    "title": " ".join(argv[3:]) or None}
-    elif len(argv) >= 4 and argv[1] == "revise":
-        request = {"op": "revise_plan", "planId": argv[2], "planJson": read_plan(argv[3]),
-                   "title": " ".join(argv[4:]) or None}
+    elif len(argv) >= 4 and argv[1] == "{{Verbs[AgentIpcRequest.RevisePlanOp]}}":
+        request = {"op": "{{AgentIpcRequest.RevisePlanOp}}", "planId": argv[2],
+                   "planJson": read_plan(argv[3]), "title": " ".join(argv[4:]) or None}
+    elif len(argv) >= 2 and argv[1] == "{{Verbs[AgentIpcRequest.RescopePlanOp]}}":
+        # The id is REQUIRED, and refusing here rather than defaulting to "whatever plan this worker
+        # has" is the same call §13.3 made about a missing --title: a re-scope that guessed which
+        # approval it was widening would produce a plausible card for the wrong authorisation. The
+        # daemon refuses this too -- that is the enforcement; this is the affordance that costs no
+        # round trip.
+        if len(argv) < 4:
+            sys.stderr.write(
+                "mainguard-plan: rescope names the APPROVED plan you are widening, and the file\n"
+                "holding the wider plan. Run: mainguard-plan {{RescopeUsage}}\n"
+                "(`mainguard-plan brief` prints the id of your live plan.)\n")
+            return 2
+        request = {"op": "{{AgentIpcRequest.RescopePlanOp}}", "planId": argv[2],
+                   "planJson": read_plan(argv[3]), "title": " ".join(argv[4:]) or None}
     elif len(argv) >= 3 and argv[1] == "await":
         request = {"op": "await_decision", "planId": argv[2]}
     elif len(argv) >= 2 and argv[1] == "commit":
@@ -138,6 +228,12 @@ def main(argv):
     if response.get("ok"):
         if response.get("brief") is not None:
             print(response["brief"])
+            # The live plan's id and state, printed HERE because this is the only place a worker can
+            # learn them without having kept the output of a call it may have made hours ago -- and
+            # `rescope` REQUIRES that id. The id-less rescope refusal points at this command, so if this
+            # line is missing that refusal is advice that does not work (the exact shape of defect G3).
+            if response.get("planId"):
+                print("PLAN: %s (%s)" % (response["planId"], response.get("status") or "unknown"))
             return 0
         if response.get("committed") is not None:
             # Distinguished, not collapsed: "nothing to commit" is an ok answer, and reporting it as a

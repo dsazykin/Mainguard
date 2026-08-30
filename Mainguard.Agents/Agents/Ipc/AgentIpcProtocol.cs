@@ -257,6 +257,28 @@ public sealed record AgentIpcRequest(
     /// <summary>Re-present a plan revised against the human's rejection feedback.</summary>
     public const string RevisePlanOp = "revise_plan";
 
+    /// <summary>
+    /// <c>rescope_plan</c> — present a revised plan against an <b>approved</b> one, because the work
+    /// turned out to need a file the approved scope does not cover.
+    ///
+    /// <para><b>The defect this closes.</b> There is one live plan per worker and, until this op, no way
+    /// to change what an approved one authorises. A worker that discovered mid-task that it had to touch a
+    /// neighbouring file was answered <c>Plan '…' is already approved for this worker.</c> by
+    /// <see cref="PresentPlanOp"/> and <c>only a rejected plan can be revised</c> by
+    /// <see cref="RevisePlanOp"/>. Both refusals are correct about their own op and together they left a
+    /// worker trying to stay legal with nowhere to go: exceed the scope silently, or stop. Measured on this
+    /// branch before the fix, at the daemon, over the real socket.</para>
+    ///
+    /// <para><b>Why not <see cref="RevisePlanOp"/>.</b> A revision answers a REJECTION and spends the
+    /// revision budget; a re-scope follows an APPROVAL and is the worker reporting that the job is bigger
+    /// than it looked. They are refused in complementary states — <c>revise</c> requires
+    /// <c>Rejected</c>, this requires <c>Approved</c> — so picking the wrong one is always refused,
+    /// never silently accepted, and each refusal names the other by name. That mutual exclusion is what
+    /// makes two similarly-spelled verbs safe for a model to be handed (§13.2's argument for detectable
+    /// slips over plausible ones).</para>
+    /// </summary>
+    public const string RescopePlanOp = "rescope_plan";
+
     /// <summary>Block until the human decides. This call is the worker's gate.</summary>
     public const string AwaitDecisionOp = "await_decision";
 
@@ -294,7 +316,7 @@ public sealed record AgentIpcRequest(
     public static readonly System.Collections.Generic.IReadOnlySet<string> WorkerOps =
         new System.Collections.Generic.HashSet<string>(StringComparer.Ordinal)
         {
-            BriefOp, PresentPlanOp, RevisePlanOp, AwaitDecisionOp, CommitWorkOp,
+            BriefOp, PresentPlanOp, RevisePlanOp, RescopePlanOp, AwaitDecisionOp, CommitWorkOp,
         };
 }
 
@@ -304,6 +326,12 @@ public sealed record AgentIpcRequest(
 /// <param name="TaskPrompt">
 /// The withheld task, released <b>only</b> alongside an approved decision. Everything before that point
 /// answers with this field empty — a worker literally does not possess its task until a human approves.
+/// </param>
+/// <param name="RescopeOf">
+/// On a <see cref="AgentIpcRequest.RescopePlanOp"/> decision, the id of the <b>approved</b> plan this one
+/// was widening. It is what lets the shim report a refused re-scope truthfully: the worker's existing
+/// authorisation is untouched, so the generic "STOP: do not attempt another plan" would tell it to abandon
+/// work it is still cleared to do. Null on every ordinary decision.
 /// </param>
 public sealed record AgentIpcResponse(
     [property: JsonPropertyName("ok")] bool Ok,
@@ -320,7 +348,8 @@ public sealed record AgentIpcResponse(
     [property: JsonPropertyName("taskPrompt")] string? TaskPrompt = null,
     [property: JsonPropertyName("planErrors")] string[]? PlanErrors = null,
     [property: JsonPropertyName("commitSha")] string? CommitSha = null,
-    [property: JsonPropertyName("committed")] bool? Committed = null);
+    [property: JsonPropertyName("committed")] bool? Committed = null,
+    [property: JsonPropertyName("rescopeOf")] string? RescopeOf = null);
 
 /// <summary>
 /// The pure wire codec for the coordinator→daemon spawn channel: newline-delimited JSON, one

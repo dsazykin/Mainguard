@@ -137,7 +137,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     and **`commit_work`** — the rung the loop was missing: a worker records its approved work on its own
     branch (message on the wire, repo/worktree/branch computed daemon-side), because the readiness trigger
     observes `refs/heads/agent/<id>` advancing and a finished worker used to stop on an uncommitted diff
-    that died with its worktree.
+    that died with its worktree. **`rescope_plan`** (2026-08-30, contract §3.1) is the sixth and newest
+    worker op: a worker that finds mid-task that the job needs a file its approved scope does not cover
+    presents a wider plan against the approval it already holds. It is deliberately NOT `revise_plan` —
+    a revision answers a rejection and spends the revision budget, a re-scope follows an approval and
+    spends none — and the two are refused in complementary states (`revise` needs `Rejected`, this needs
+    `Approved`), so a mis-picked verb is always refused rather than plausibly accepted and each refusal
+    names the other. `AgentIpcResponse.RescopeOf` carries the widened plan's id back, which is what lets
+    the shim report a DECLINED re-scope truthfully: nothing was taken away, and the generic "stop" would
+    send a still-authorised worker away from its work.
     **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
     object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
     two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
@@ -178,15 +186,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     spawn the shim could NOT build over the channel — nothing derived, so the daemon's channel check
     refuses it and the failure leaves a warning and a `shim_spawn_refused` audit entry instead of only
     this jail's stderr) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
-    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
+    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` /
+    `rescope <approved-plan-id> <plan.json>` / `await <id>` /
     **`commit "<message>"`** (the only route a jailed CLI has to a commit — measured against claude-code
     2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`.
     **G4:** ONE quoted argument, and a second positional is REFUSED rather than joined — `' '.join(argv[2:])`
     rejoined with single spaces whatever a shell had already split, so a subject/blank-line/body arrived
     flat and nothing could tell a structure had been lost).
-    `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
-    the response carries the task prompt the daemon had been withholding, which is what makes "the worker
-    does not start before approval" a property of the system rather than a request in a prompt).
+    `present`/`revise`/`rescope` **block on the socket until a human decides** and print the decision; on
+    approval the response carries the task prompt the daemon had been withholding, which is what makes
+    "the worker does not start before approval" a property of the system rather than a request in a
+    prompt. Two things are single-sourced out of the script: `RescopeUsage` (interpolated into the usage
+    text, the shim's own id-less refusal, the worker's operating instructions and both daemon refusals
+    that point at it — five spellings of one command is how they come to disagree, §13.2), and `Verbs`,
+    the op→verb map, which is the object `AgentOperatingInstructionsTests` set-equals against
+    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test).
     `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
     `Coordinator(InstalledAdapterCatalog)` / `Worker()` / `For(role, InstalledAdapterCatalog)` /
     `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
@@ -206,7 +220,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     — a capability the agent would then never use — fails a test, and (2026-08-29) pins that the
     coordinator text carries `AgentSpawnShim.SpawnUsage` verbatim plus what `--title`/`--task` MEAN: the
     title is the whole brief, the task is withheld until approval, and the title is the headline on the
-    human's approval card. **Delivered two ways, neither
+    human's approval card. **(2026-08-30) The WORKER text is now pinned the same way** — it was pinned
+    against nothing, so an op could be added to `WorkerOps`, served, spelled by the shim and never
+    mentioned to the only reader who can run it, which is how the loop once ended one rung short of
+    `commit_work`. `TheWorkerIsToldAboutEveryOpTheDaemonServesIt` walks `WorkerOps` through
+    `WorkerPlanShim.Verbs`, and the re-scope section is held to three claims a worker gets wrong by
+    default: `rescope` is not `revise`, asking costs it nothing because its existing approval stands
+    while the human decides, and it should ask even if it has already touched the file. **Delivered two ways, neither
     redundant**, via `AdapterSpec`/`InstalledAdapterMarker` `instructionsFile` + `systemPromptArg`
     (claude-code: `CLAUDE.md` + `--append-system-prompt`): the launcher appends the FLAG to the launch
     argv, which is the ONLY channel that reaches a coordinator — the role lock leaves it an empty tmpfs
@@ -1557,7 +1577,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       agent→approved-plan binding existed, and phase-2's worker-authored plans supply that binding
       exactly (a plan is keyed by the worker's own agent id), so the composition root now passes it
       reading APPROVED plans only — an agent with no approved plan still resolves null and is
-      classified as unmanaged, exactly as before. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
+      classified as unmanaged, exactly as before. **(2026-08-30) That lambda is now one call to
+      `PlanApprovalService.ApprovedPlanFor`**, because the shape it used to have —
+      `LatestForWorker(...) is { Status: Approved }` — was correct only while a worker's newest plan was
+      always its authorisation, and the re-scope op ends that: a pending re-scope is newer than the plan
+      it widens, so the filtered-latest read answers null, and null means *unmanaged* here. A worker would
+      have lost its F6 out-of-scope coverage by the act of asking to widen legally. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
       ANDed in beside those two — the backstop that stops a worker whose own plan was never approved from
       merging, whatever it verified. All three gates are independent and all three must say yes, and the
       gate array is built ONCE (`var gates`) and passed to `MergeQueue`: composing a fresh literal at the
@@ -1742,7 +1767,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       worker replaces the removed S-8 per-coordinator caps (keeping those would have deadlocked the Nth
       worker the worker cap admitted). `PressureSignal` renders the "N plans pending" fact line;
       `PlanApproved`/`PlanRejected`/`PlanEscalated` events; `PlanStatus{Pending,Approved,Rejected,
-      Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+      Escalated,Superseded}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`.
+      **`Rescope` (2026-08-30, contract §3.1 / phase 3 §23)** is how an APPROVED plan's scope changes: it
+      lands a NEW plan carrying `SupersedesPlanId`, the copied `PreviousScope` the card diffs against, and
+      `RescopeCount`. The plan it widens keeps authorising the worker until the human decides, and moves
+      to `Superseded` in the same lock that approves the wider one — so a worker has exactly one approved
+      plan or none, which is what `ApprovedForWorker`/`ApprovedPlanFor` (**the single authority the
+      composition root's `resolveApprovedPlan` is now a call to**) rest on. That mattered immediately: the
+      old `LatestForWorker`-filtered-on-`Approved` read answers `null` while a re-scope is pending — and
+      `null` means *unmanaged* to the flagged-change detector, so a worker would have lost its F6
+      out-of-scope coverage by the act of asking to widen legally. A re-scope spends no revision (the
+      budget bounds bad plans, not a growing job); its own reject→revise loop is bounded by a fresh
+      budget, and the loop AROUND that is closed by one live re-scope at a time plus escalation being
+      terminal for the path).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
       a spawned worker's task **without giving it to the worker** — and, since 2026-08-29, refuses to

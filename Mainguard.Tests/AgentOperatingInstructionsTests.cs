@@ -156,6 +156,81 @@ public class AgentOperatingInstructionsTests : IDisposable
     }
 
     /// <summary>
+    /// <b>The worker half of the same pin, which did not exist.</b> The coordinator text has been held to
+    /// <c>CoordinatorOps</c> in both directions since phase 3 §13.5; the worker text was held to nothing,
+    /// so an op could be added to <c>WorkerOps</c>, served by the daemon, spelled by the shim, and never
+    /// mentioned to the only reader who can run it. A capability an agent is never told about is a
+    /// capability it does not have — which is exactly how the loop ended one rung short of
+    /// <c>commit_work</c>, whose instructions had never mentioned committing.
+    ///
+    /// <para>It goes through <see cref="WorkerPlanShim.Verbs"/> because a worker meets each op twice — as
+    /// the wire op (<c>rescope_plan</c>) and as the verb it types (<c>rescope</c>) — and the instructions
+    /// can only ever teach the second. An op with no verb fails here rather than being skipped, so the map
+    /// cannot be the place the exhaustiveness quietly leaks out of.</para>
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldAboutEveryOpTheDaemonServesIt()
+    {
+        var text = Flatten(Worker());
+        var shim = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        Assert.Equal(
+            AgentIpcRequest.WorkerOps.OrderBy(o => o, StringComparer.Ordinal),
+            WorkerPlanShim.Verbs.Keys.OrderBy(o => o, StringComparer.Ordinal));
+
+        foreach (var op in AgentIpcRequest.WorkerOps)
+        {
+            var verb = WorkerPlanShim.Verbs[op];
+            Assert.True(
+                text.Contains($"{shim} {verb}", StringComparison.Ordinal),
+                $"the worker is served '{op}' but its instructions never show `{shim} {verb}` — it will "
+                + "never use a command it was not told about. See AgentOperatingInstructions.Worker.");
+        }
+    }
+
+    /// <summary>
+    /// The re-scope form the shim actually parses, single-sourced into the instructions the same way
+    /// <see cref="AgentSpawnShim.SpawnUsage"/> is into the coordinator's. Two spellings of one command is
+    /// how they come to disagree, and this one has an id argument that a paraphrase would drop.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsTaughtTheRescopeFormTheShimActuallyParses()
+    {
+        Assert.Contains(WorkerPlanShim.RescopeUsage, Worker(), StringComparison.Ordinal);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, WorkerPlanShim.Script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// …and what it MEANS, which is the half that changes behaviour. Three facts, each of which a worker
+    /// gets wrong by default:
+    ///
+    /// <list type="bullet">
+    /// <item><c>rescope</c> is not <c>revise</c> — the two verbs are near-homographs and the daemon
+    /// refuses the wrong one, but a model that has read this once does not have to find that out.</item>
+    /// <item>Its existing approval stands while the human decides, so asking costs it nothing. A worker
+    /// that believed asking would stop it would not ask, which is the defect this op removes.</item>
+    /// <item>It should ask even if it has already touched the file. The flagged-change gate puts that file
+    /// in front of a human either way; asking is how the human hears the reason before seeing the diff.</item>
+    /// </list>
+    ///
+    /// <para><b>Defect G3's lesson applies to every line of this.</b> The instructions once told a
+    /// coordinator that <c>--task</c> needed no quotes; it was true of the parser and false of the world,
+    /// and two of three spawns died on it. So each claim below is one the shipped shim and daemon actually
+    /// make — the "approval stands" sentence is <c>WorkerRescopeTests</c>, the refusal wording is the
+    /// daemon's own, and the command is <see cref="WorkerPlanShim.RescopeUsage"/> verbatim.</para>
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldWhatARescopeIs_AndThatAskingCostsItNothing()
+    {
+        var text = Flatten(Worker());
+
+        Assert.Contains("rescope is not revise", text.Replace("`", ""), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("existing approval stands", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("one legal move", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("already touched", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
     /// The one sentence a worker cannot be allowed to miss. A worker that starts guessing at work before
     /// approval is precisely what the plan gate was built to make impossible — and it would be refused,
     /// so the only thing it can produce is wasted budget and a confusing transcript.

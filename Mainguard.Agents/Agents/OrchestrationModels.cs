@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents;
 
@@ -183,9 +184,23 @@ public sealed record TaskPlan(
 /// notification — a human rejecting a plan for the third time needs to see that the next rejection stops
 /// the worker.</para>
 /// </summary>
-/// <param name="Status">PlanStatus name: Pending / Approved / Rejected / Escalated.</param>
+/// <param name="Status">PlanStatus name: Pending / Approved / Rejected / Escalated / Superseded.</param>
 /// <param name="Revision">0 for the original presentation.</param>
 /// <param name="RevisionsRemaining">Revisions still permitted before the worker must escalate.</param>
+/// <param name="SupersedesPlanId">
+/// Set only on a <b>re-scope</b>: the approved plan this one asks to replace. It is what makes this card a
+/// different decision from a first presentation — the human is approving a WIDENING of something they
+/// already said yes to.
+/// </param>
+/// <param name="PreviousScope">
+/// The superseded plan's scope, so the card can show what CHANGED rather than only what is now being asked
+/// for. A human cannot judge a widening against a list they are expected to remember.
+/// </param>
+/// <param name="RescopeCount">
+/// How many widenings this worker has already had approved. Rendered, not enforced: runaway scope creep is
+/// meant to be visible to the person paying for it rather than silently capped at a number nobody could
+/// justify — see <c>PlanApprovalService.Rescope</c>.
+/// </param>
 public sealed record WorkerPlanCard(
     string PlanId,
     string WorkerAgentId,
@@ -200,11 +215,32 @@ public sealed record WorkerPlanCard(
     int Revision,
     int RevisionsRemaining,
     int MaxRevisions,
-    string RejectionFeedback)
+    string RejectionFeedback,
+    string SupersedesPlanId = "",
+    IReadOnlyList<string>? PreviousScope = null,
+    int RescopeCount = 0)
 {
     public bool IsPending => string.Equals(Status, "Pending", StringComparison.OrdinalIgnoreCase);
 
     public bool IsEscalated => string.Equals(Status, "Escalated", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this card asks to widen an approval the worker already holds.</summary>
+    public bool IsRescope => SupersedesPlanId.Length > 0;
+
+    /// <summary>Paths this plan adds to what was already approved (empty on an ordinary plan).</summary>
+    public IReadOnlyList<string> AddedScope => IsRescope
+        ? Scope.Except(PreviousScope ?? Array.Empty<string>(), StringComparer.Ordinal).ToList()
+        : Array.Empty<string>();
+
+    /// <summary>
+    /// Paths the approved plan covered that this one drops. Rendered because a "re-scope" is not
+    /// necessarily a widening: a plan that quietly removes a path the human already agreed to is the one
+    /// shape of this op that could take something away, and a card that only ever showed additions would
+    /// be the place it hid.
+    /// </summary>
+    public IReadOnlyList<string> RemovedScope => IsRescope
+        ? (PreviousScope ?? Array.Empty<string>()).Except(Scope, StringComparer.Ordinal).ToList()
+        : Array.Empty<string>();
 }
 
 /// <summary>

@@ -3563,3 +3563,289 @@ than a test being relaxed:
 - **`RebaseCycleKind.Skipped` is reused for the K6 refusal** rather than gaining a kind of its own. It is
   the same outcome the start-of-cycle guard skip produces, for the same reason, and the reason string
   carries the difference. A new kind would make every caller switch on a distinction none of them acts on.
+## 24. A contract §3.1 change — a worker may ask to widen an approved scope (`rescope`)
+
+**Decided by the owner, 2026-08-30.** Recorded here and in
+[`coordinator-contract.md`](coordinator-contract.md) §3.1 because it changes the **worker's** exhaustive
+op list, which §3 says is "a deliberate contract change, reviewed as such — not an implementation
+detail". §13 did the same for the coordinator's `--title`.
+
+### 24.1 What was found, measured before anything was changed
+
+Live testing found two things, and they are halves of one shape.
+
+**(a) An approved plan's `scope` does not bind a steered worker's commits.** Approved scope was
+`["test.js"]`; the worker was steered, committed `bf966d1` (added `multiply` to `src/calc.js`) and
+`7828d8c` (`subtract -> a - b + 1`), and `mainguard-plan commit` accepted both with zero scope or
+flagged lines in the daemon log at commit time.
+
+**(b) A worker that tried to widen its scope legitimately was refused**, with
+`Plan '2b3552fd…' is already approved for this worker.`
+
+Both were reproduced on this branch before a line was written — (b) at the daemon over the real socket,
+through the production handlers:
+
+```
+commit ok=True committed=True error=''
+present-again ok=False error='Plan '70664802…' is already approved for this worker.'
+revise ok=False       error='Plan '70664802…' is Approved — only a rejected plan can be revised.'
+served worker ops: await_decision, brief, commit_work, present_plan, revise_plan
+```
+
+**(a) is not a defect in the commit path, and is deliberately not "fixed" here.** Scope is not a
+commit-time control and was never designed as one: phase 2 §3a puts the comparison at *verification*,
+where `FlaggedChangeGate` classifies the merge diff against the approved plan and blocks the merge until
+a human acknowledges every out-of-scope file. That mechanism was confirmed working live. What (a)
+actually establishes is *why* (b) matters: because scope binds at the merge and not at the keystroke,
+the only thing a worker can do about a scope that turned out to be too narrow is **ask** — and there was
+no op for asking. The two refusals in the transcript above are each correct about their own op, and
+together they left a worker trying to stay legal with two moves, both bad: exceed its scope silently, or
+stop.
+
+### 24.2 The op, and why a model will not confuse it with `revise`
+
+```
+mainguard-plan rescope <approved-plan-id> <plan.json>
+```
+
+`WorkerPlanShim.RescopeUsage` is the single source of that string — interpolated into the shim's usage
+text, the shim's own refusal, the worker's operating instructions, and both daemon refusals that point
+at it. Five renderings of one command is how they come to disagree (§13.2).
+
+`rescope` and `revise` are near-homographs, which is a real risk and is answered structurally rather
+than by hoping: **they are refused in complementary states.** `revise` requires a `Rejected` plan;
+`rescope` requires an `Approved` one. So a mis-picked verb is *always* refused — never plausibly
+accepted — and each refusal names the other by name and prints its form. This is §13.2's argument in a
+different place: the property that makes an argument shape safe for a language model is that the slip is
+**detectable**, not that it is unlikely.
+
+Rejected alternatives:
+
+| spelling | why not |
+|---|---|
+| reuse `revise` | it answers a rejection and spends the revision budget; overloading it makes "the human sent this back" and "the job grew" the same event, and the budget arithmetic on the card stops meaning anything |
+| `widen` | a re-scope is not necessarily a widening — a plan may drop a path — and a verb that names one direction is the one place a removal would hide |
+| `amend` | already means "modify the last commit" to every reader in this repo, and the worker's other op is `commit` |
+| no id (`rescope <plan.json>`) | the daemon would have to guess which approval was being widened. §13.3's call: a guessed target produces a plausible card for an authorisation nobody named. The shim refuses locally and the daemon refuses too — the second is the enforcement, the first costs no turn |
+
+### 24.3 The budget: a re-scope spends **no** revision, and the argument both ways
+
+**For charging it:** one counter, one number on the card, and a hard ceiling of `1 + MaxPlanRevisions`
+plan cards per worker for a human to read. It is the simplest thing that is obviously bounded.
+
+**Against, and this is what was decided:** the budget bounds *"your plans keep being wrong"*. A re-scope
+is *"the job is bigger than it looked"* — a different failure with a different remedy, and one that says
+nothing about the quality of the plan the human already approved. Charging it is wrong in the direction
+that matters: a worker rejected three times and *then* approved arrives at its approval with nothing
+left, so **the workers that had the hardest time agreeing a plan would be exactly the ones with no legal
+way to widen it** — the defect re-created, for the population most likely to hit it.
+`AWorkerThatSpentEveryRevisionBeforeApproval_MayStillRescope` sets up at that boundary deliberately.
+
+A re-scope is a new plan record, so it carries its **own** fresh `MaxPlanRevisions` for its own
+reject→revise loop. That is a hole if the path can be re-entered — reject ×4 escalates, and a worker
+allowed to ask again would get another three rounds, forever, without a human ever saying yes. Two
+things close it, and neither is a new number:
+
+- **Escalation is terminal for this path.** A worker whose re-scope escalated is refused another. It
+  keeps the approval it already had and finishes what that covers.
+- **One live re-scope at a time**, the same invariant, for the same reason, as one live plan.
+
+**The number of re-scopes is deliberately not capped.** Every one costs a human approval, which is the
+actual scarce resource and the actual gate; a numeric cap puts a worker back at "no legal path" at a
+boundary nobody could justify. What runaway widening needs is to be *visible to the person paying for
+it*, so `RescopeCount` travels to the card ("this worker's scope has already been widened 2 time(s)")
+rather than silently refusing at 3.
+
+### 24.4 The store: supersede, not stack — and the F6 trap on the way there
+
+A re-scope is a **new** `PendingPlan` with `SupersedesPlanId` set. The plan it widens stays `Approved`
+until the new one is approved, at which moment the old one moves to the new terminal
+`PlanStatus.Superseded`, **in the same lock**. So a worker has exactly one approved plan or none — never
+two.
+
+That invariant is not tidiness. Phase 2 §3a is explicit that the approved plan's scope is what
+`resolveApprovedPlan` hands the flagged-change gate, so two approved plans would be a gate measuring a
+diff against whichever one a lookup happened to return.
+
+**The trap, which this change walked straight into.** The composition root resolved that plan as
+`LatestForWorker(agentId) is { Status: Approved }`. That is correct only while a worker's newest plan is
+always its authorisation — and a **pending re-scope is newer than the plan it widens**, so the read
+answers `null`. `null` means *unmanaged* to `FlaggedChangeDetector`, which then skips the out-of-scope
+comparison entirely. A worker would have lost its F6 coverage **by the act of asking to widen legally**,
+silently, for as long as the human took to decide.
+
+The fix is a single authority, `PlanApprovalService.ApprovedForWorker` (single-or-nothing, following
+`WorkerPlanGate.ResolveKeyLocked`'s fail-closed precedent), with the composition root reduced to a call
+to it — so there is one copy of the rule to be wrong.
+`TheApprovedPlanF6MeasuresAgainst_IsTheAuthorisation_NotTheNewestPlan` asserts **both** halves: that the
+old shape really would have answered null, and that the wired one answers the approved plan.
+
+### 24.5 Work already done outside the scope: allowed, not re-policed
+
+A worker may ask to re-scope *after* it has already touched the extra file. That is **not refused, and
+this path does not look at the worktree.**
+
+- The flagged-change gate already catches out-of-scope files at verification and forces a human
+  acknowledgement before the merge (phase 2 §3a / F6, confirmed working live). The file reaches a human
+  either way; a second check here would be two controls answering one question, which is how one of them
+  becomes decorative (MG-12).
+- Refusing a late re-scope would **re-open the dead end** in its worst form: a worker that had already
+  slipped could never get legal again, which is precisely the state this op exists to remove.
+
+So the two outcomes both end at a human, and `ALateRescope_IsNotRefused_AndTheOneMechanismStillDecides…`
+asserts both: approved, and the file is inside the authorisation F6 measures against; declined, and it is
+flagged exactly as it was. What the op adds is that the human hears the worker's **reason** before they
+see the diff, instead of only after.
+
+### 24.6 While a re-scope is pending, the worker is **not** blocked
+
+It holds an approved plan and is mid-work. Asking for more does not withdraw what it already has, so
+`HasApprovedPlan` — and therefore `MayWork`, steering, verification and `commit_work` — keeps answering
+off the plan being widened, for exactly the scope that was approved.
+
+The alternative (treat a pending re-scope as "no approved plan") is wrong twice:
+
+- it makes the legal move **more expensive than the silent one**. The worker that says nothing keeps
+  working; the worker that asks stops. That trains exactly the behaviour half (a) is made of.
+- it refuses `commit_work` to a running worker, which is how F1's "stopping a worker must NOT destroy
+  the commits it made" gets undone by a human taking an hour to read a card.
+
+What *does* block is the worker's own `rescope` call, exactly as `present` blocks — it asked a question
+and is waiting for the answer, and `await <id>` re-attaches after a crash or a restart like any other
+plan. And a pending re-scope **counts** toward the backpressure sentence, because it is a card in front
+of a human. `PendingPlan.BlocksWorker` and `HasApprovedPlan` were always different questions; the
+re-scope is the first case where they have different answers at the same instant, and both records say
+so.
+
+### 24.7 The card, which is a different decision from the one it resembles
+
+The human is approving a **widening of something they already approved**, so the card says which and
+shows what changed: `SupersedesPlanId`, `PreviousScope` (**copied at presentation**, never looked up — a
+lookup renders a different claim as soon as a second re-scope exists) and `RescopeCount` travel on
+`PlanEntry`, and `WorkerPlanCard` derives **Adds** and **Drops** from them. Drops is its own row in
+`DangerBrush`: a re-scope that removes a path the human already agreed to is the one direction this op
+can take something away in, and a card rendering only additions is exactly where that would hide.
+
+Three strings change with the card kind, and each of them would otherwise be **false**:
+
+- Reject reads *"Decline the widening"*, not *"Reject — worker will stop"*. Declining stops nothing.
+- The last-round warning says the widening closes for good and the worker keeps its existing approval.
+- An escalated re-scope's card no longer says the worker "stopped after N rejected plans" — it says the
+  widening closed and the worker is still working under its original approval. A human who reads the
+  generic sentence ends a worker that is doing approved work.
+
+No new design tokens (phase 2 §2.9's rule still holds): `WarningBrush`, `DangerBrush`, `TextMuted`,
+`TextPrimary` already say all of it.
+
+The card is rendered headless in all four themes by
+`CoordinatorPlanGateRenderHarness.Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes`,
+whose fake both **adds** and **drops** a path — a fixture that only ever widened would never exercise the
+Drops row, which is the one this section says must not be able to hide.
+
+### 24.8 Keeping the instructions honest — and the pin that did not exist
+
+`AgentOperatingInstructions.Worker` teaches the op. The **coordinator** text has been pinned against
+`CoordinatorOps` in both directions since §13.5; the worker text was pinned against nothing, so an op
+could be added to `WorkerOps`, served by the daemon, spelled by the shim, and never mentioned to the only
+reader who can run it — which is how the loop once ended one rung short of `commit_work`, whose
+instructions had never mentioned committing.
+
+`TheWorkerIsToldAboutEveryOpTheDaemonServesIt` closes that, through `WorkerPlanShim.Verbs` — a worker
+meets each op twice, as the wire op (`rescope_plan`) and as the verb it types (`rescope`), and the
+instructions can only teach the second. The map is set-equalled against `WorkerOps` in the same test, so
+it cannot itself become the leak.
+
+**§13's G3 lesson applies to every sentence written here.** The instructions once told a coordinator
+`--task` "needs no quotes at all" — true of the parser, false of the world, and two of three spawns in a
+stress run died on it. So each claim is one the shipped code actually makes: the command is
+`RescopeUsage` verbatim, "your existing approval stands" is `WorkerRescopeTests`, and the sentence about
+a widening that stops being available is the terminal-escalation rule with its own test.
+
+**That last sentence was itself wrong on its first draft**, in exactly the arithmetic phase 2 §2.1 exists
+to pin: it read *"a widening the human refuses three times stops being available"*, and with
+`MaxPlanRevisions = 3` it is the **fourth** rejection that escalates. It now says the budget is finite and
+that the daemon reports what is left — which is true, is the same thing the paragraph above it already
+tells the worker about ordinary revisions, and does not hardcode a number the limit is allowed to change.
+
+**One sentence written in this change was G3 on its first draft.** The id-less `rescope` refusal ends
+*"(`mainguard-plan brief` prints the id of your live plan.)"* — and it did not. The daemon put `planId`
+and `status` on the brief response; the shim printed only the brief text. A worker following that advice
+got a headline and no id, and no way to run the command it had just been told to run. The shim now prints
+`PLAN: <id> (<status>)` beneath the brief, asserted **twice** — host-side through the real `main()` (M15),
+and in a real jail beside the refusal that sends the worker there, because the whole reason that file
+exists is that a claim about the shim has to be checked where the shim runs.
+
+### 24.9 The mutation log — every guard watched failing
+
+Run by `build/mutate.sh` (driver: `build/mutations/run-all.sh`). Two properties of that harness are
+load-bearing, and the first cost a real false green here:
+
+1. **Every restore is followed by `touch`.** Restoring a mutated file with `mv`/`cp` preserves its
+   mtime, so MSBuild skips the rebuild and the "restored" run executes the **mutated** assembly.
+2. **The run refuses to report unless the assembly under test actually rebuilt** — and it must be the
+   assembly that *contains* the mutated code, as the test host loads it (the owning project's dll inside
+   the test project's output dir). The harness caught its own first version doing this wrong: it watched
+   `Mainguard.Tests.dll`, which legitimately stayed up to date while `Mainguard.Agents.dll` rebuilt, and
+   it exited 99 rather than reporting. Watching the wrong file is the same failure as not watching one.
+
+| # | mutation | went red |
+|---|---|---|
+| M1 | `Rescope` stops requiring an `Approved` plan | `OnlyAnApprovedPlanCanBeRescoped` — all 4 rows |
+| M2 | an escalated re-scope stops being terminal | `AnEscalatedRescope_IsTerminal_AndTheWorkerKeepsWorkingUnderItsOldApproval` |
+| M3 | unbounded live re-scopes | `AWorkerMayHaveOnlyOneLiveRescope` |
+| M4 | approving a re-scope stops superseding | `ApprovingARescope_SupersedesTheOldPlan_AndBecomesTheOneAuthorisation` |
+| M5 | `ApprovedPlanFor` goes back to newest-filtered — **the F6 hole** | `TheApprovedPlanF6MeasuresAgainst_IsTheAuthorisation_NotTheNewestPlan`, `WhileARescopeIsPending_…` |
+| M6 | `PreviousScope` is not copied | `ARescopeCarriesWhatChanged_AndTheCopyIsNotALookup` |
+| M7 | the "already approved" refusal loses the hint — **the defect itself** | `TheDeadEnd_ThatThisOpExistsToRemove` |
+| M8 | `revise`'s refusal stops naming `rescope` | `TheDeadEnd_ThatThisOpExistsToRemove` |
+| M9 | the shim stops refusing an id-less `rescope` | `TheShimsRescope_NamesThePlanItWidens_AndRefusesLocallyWhenItCannot` — the two refusal rows |
+| M10 | the worker's instructions drop the re-scope section | `TheWorkerIsToldWhatARescopeIs_AndThatAskingCostsItNothing` — and **only** that one, correctly: the command list above the section still names the verb, so the two exhaustiveness tests still pass. What M10 deletes is the MEANING, and the meaning test is the guard for it |
+| M11 | `WorkerPlanShim.Verbs` loses the entry | `TheWorkerIsToldAboutEveryOpTheDaemonServesIt` (the set-equality half) |
+| M12 | the decision stops carrying `rescopeOf` | `ARescopeBlocksOnTheHuman_…`, `ADeclinedRescope_LeavesTheWorkerAuthorised_…` |
+| M13 | the handler skips the plan-ownership check | `AWorkerCannotRescopeAnotherWorkersPlan` |
+| M14 | the handler infers the plan id instead of refusing | `ARescopeThatNamesNoPlan_IsRefused_AndQueuesNothing` |
+| M15 | `brief` stops printing the live plan id — **the refusal's advice stops working** | `TheShimsBrief_PrintsTheLivePlanId_BecauseTheRescopeRefusalSendsTheWorkerThere` |
+| M16 | the card's Reject button stops distinguishing a re-scope | `Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes` |
+
+**M13 exposed a weak test, and the test was fixed rather than the mutation excused** — the same shape as
+§13.6's M9. Both M13 and M14 remove a check *in front of* a call that **blocks on a human**, so the
+mutated daemon does not refuse the request: it accepts it and parks. Under the first version of those two
+tests the run therefore **hung** instead of failing, and a hung run reports nothing at all. A guard whose
+absence produces a hang is a guard nothing is watching. Both assertions are now bounded
+(`WaitAsync(15s)`), the bound is part of what they assert, and re-run against M13/M14 they go red in 15
+seconds as they should have the first time.
+
+### 24.10 Tier results
+
+All four tiers on the shipped tree, run serially on one machine:
+
+| tier | result |
+|---|---|
+| `dotnet build Mainguard.slnx -c Release` | 0 errors |
+| `dotnet format --verify-no-changes` | exit 0 |
+| `dotnet test Mainguard.Tests -c Release` | **3815 passed**, 0 failed, 25 skipped |
+| `Mainguard.Server.Tests` · `Category!=RequiresDocker` | **778 passed**, 0 failed, 22 skipped |
+| `Mainguard.Server.Tests` · `Category=RequiresDocker` | **131 passed**, 0 failed, 2 skipped |
+
+The Docker tier was **clean**, which is worth stating because it usually is not: neither §12.5's
+`QueueEntryResumeDockerTests` ordering flake nor
+`SandboxNetworkIsolationDockerTests.ReachabilityProbe_…` fired. An earlier run of the same tier on this
+branch did hit the first one — `ACleanStopAfterACommit_KeepsTheBranch_AndTheEntryIsStillResumable`, with
+`OCI runtime exec failed: chdir to cwd ("/workspace") … no such file or directory`, i.e. the jail was gone
+by the time the exec landed. Recorded, not chased: it is the documented flake, its failure is about
+container lifecycle rather than anything this change touches, and it did not reproduce.
+
+### 24.11 Left alone, deliberately
+
+- **Half (a) is not turned into a commit-time scope check.** The owner's brief says not to build a
+  second mechanism that contradicts the flagged-change gate, and it would be one: the gate already
+  refuses the *merge* and asks a human, which is where the decision belongs. A commit-time refusal would
+  also destroy work — a worker unable to record a diff loses it with its jail (F1).
+- **`MaxPlanRevisions` is not retuned.** The re-scope path leans on it (a re-scope's own reject→revise
+  loop, and the terminal escalation) and 3 is still the right number for both readings.
+- **The coordinator learns nothing about re-scopes.** Its four tools are unchanged, it does not author
+  plans, and `get_worker_status` already reports a worker held at the gate. A fifth thing to tell it
+  would be a §3 change with no capability behind it.
+- **A superseded plan keeps its own card history.** It stops being a gate item (it is not `Pending` or
+  `Escalated`) and stays in the store as the record of what was authorised and by whom, which is what
+  the audit chain's `plan_superseded` event points at.
