@@ -1,0 +1,75 @@
+<UserControl xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+             x:Class="Mainguard.Agents.UI.Views.VerificationPanelView"
+             x:DataType="vm:VerificationPanelViewModel">
+
+  <!-- The verification verdict, and its output on demand (H4).
+
+       WHERE THE LOG LIVES, AND WHY IT LIVES HERE. It is inline and expandable, attached to the entry it
+       belongs to, rather than a separate panel or window:
+
+       * every entry has a row, but not every entry has anywhere else. A failed verification on a branch
+         whose agent was stopped has no worker document and cannot reach the review cockpit (that needs
+         Verified), so a log that lived only in either would be unreachable for exactly the entries that
+         most need reading;
+       * a failure is read WHILE deciding what to do with the row — retry, hand it back to the agent,
+         discard — and those controls are on the row. A separate window would put the evidence and the
+         decision in two places;
+       * it is collapsed by default and fetched on first expand. The output is a daemon-side file read per
+         entry, and the rail re-projects on every queue event; loading it eagerly would turn a queue
+         refresh into one file read per row for text nobody asked to see.
+
+       Long output is handled by BOUNDING the reader, not by shortening the log: MaxHeight caps it at about
+       a dozen lines and it scrolls inside itself, so a 256 KiB tail cannot push the row's actions off the
+       surface. Horizontal scrolling is ON here — unlike the rail's wrapping identifiers — for the same
+       reason ReviewCockpitView scrolls its diff sideways: wrapping a stack trace or an aligned assertion
+       diff destroys the column structure that makes it readable. -->
+
+  <UserControl.Styles>
+    <!-- The verdict line's one job is to be unmistakable at a glance. Red for a real failure; muted for a
+         pass and for never-run, because neither of those is a thing to act on. Tokens by role, so this
+         reads correctly in Daylight Loom as well as the dark themes. -->
+    <Style Selector="TextBlock.verdict">
+      <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
+    </Style>
+    <Style Selector="TextBlock.verdict.failed">
+      <Setter Property="Foreground" Value="{DynamicResource DangerBrush}"/>
+    </Style>
+  </UserControl.Styles>
+
+  <StackPanel Spacing="4">
+    <TextBlock Classes="verdict" Classes.failed="{Binding IsFailed}"
+               Text="{Binding FactsText}" FontSize="11" TextWrapping="Wrap"/>
+
+    <!-- Offered only when there IS a record. A never-run entry has nothing to read, and a control that
+         could only ever answer "no record" is the enabled-button-that-only-errors shape this surface has
+         been bitten by before. Secondary, never Accent: reading evidence must not out-shout the rail's one
+         emphasized action. -->
+    <Button Classes="Secondary" Content="{Binding ToggleButtonText}" FontSize="12" Padding="10,3"
+            HorizontalAlignment="Left"
+            Command="{Binding ToggleCommand}" IsVisible="{Binding HasRecord}"
+            ToolTip.Tip="Show what this verification actually printed. It reads the recorded output — it does not run the tests again."/>
+
+    <Border IsVisible="{Binding IsExpanded}" CornerRadius="8" Padding="8"
+            Background="{DynamicResource SurfaceDeep}"
+            BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
+      <StackPanel Spacing="4">
+        <!-- What the surface says ABOUT the log: truncation, a missing artifact, a daemon that did not
+             answer, or a run that genuinely printed nothing. Each is a distinct fact and none of them may
+             be rendered as an empty box. -->
+        <TextBlock Text="{Binding LogNotice}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextMuted}"
+                   IsVisible="{Binding LogNotice, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+        <ScrollViewer MaxHeight="220" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                      IsVisible="{Binding LogText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}">
+          <!-- Selectable: the reason a person opens a failing test log is usually to copy the assertion or
+               the stack out of it. -->
+          <SelectableTextBlock Text="{Binding LogText}" FontSize="11" TextWrapping="NoWrap"
+                               FontFamily="{StaticResource FontMono}"
+                               Foreground="{DynamicResource TextPrimary}"/>
+        </ScrollViewer>
+      </StackPanel>
+    </Border>
+  </StackPanel>
+</UserControl>

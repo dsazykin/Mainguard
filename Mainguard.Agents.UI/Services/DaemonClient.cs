@@ -646,6 +646,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             CallOptions(ct, deadline));
     }
 
+    /// <summary>
+    /// H4: the CONTENT of the entry's last verification artifact — never its daemon path (G-14). The
+    /// daemon bounds it to a tail and says so via <c>Truncated</c>; this is a plain read that runs
+    /// nothing, so it takes the ordinary RPC deadline rather than <c>RunVerification</c>'s minutes-long one.
+    /// </summary>
+    public async Task<GetVerificationLogResponse> GetVerificationLogAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.GetVerificationLogAsync(
+            new GetVerificationLogRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
     // ---- Dev-only queue seeding (docs/design/queue-seeding.md) -----------
     // A daemon started without MAINGUARD_ENABLE_QUEUE_SEEDING never maps this service, so these
     // calls answer UNIMPLEMENTED there — which is the dev panel's hide signal, not an error.

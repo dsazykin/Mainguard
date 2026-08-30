@@ -42,6 +42,51 @@ public interface IAgentService
 /// </summary>
 public sealed record VerificationOutcome(bool Ran, bool Passed, string Reason);
 
+/// <summary>
+/// The stdout/stderr an entry's last verification actually produced — the client half of the
+/// <c>GetVerificationLog</c> RPC (H4).
+///
+/// <para><b>Three answers, kept apart</b>, exactly as the wire keeps them. <c>HasRecord=false</c> is "this
+/// entry has never been verified"; <c>HasRecord=true</c> with a non-empty <see cref="Text"/> is the log;
+/// <c>HasRecord=true</c> with an empty <see cref="Text"/> and a stated <see cref="UnavailableReason"/> is
+/// "the verdict stands but its output is gone". Collapsing the third into the second would render a
+/// deleted artifact as a test suite that printed nothing, which is the same quiet fabrication as the
+/// "not verified yet" this whole change removes.</para>
+///
+/// <para><see cref="Text"/> is <b>jail-produced</b>, and arrives here already sanitized (see the
+/// <c>JailText</c> helper in <c>Mainguard.Agents.UI</c>): control characters and terminal escape sequences
+/// are removed at the projection boundary, so no consumer can forget to. It is also a TAIL — see
+/// <see cref="Truncated"/>.</para>
+/// </summary>
+/// <param name="HasRecord">False when there is no verification record at all. Everything else is then empty
+/// and must be rendered as "not verified yet", never as an empty log.</param>
+/// <param name="Passed">The recorded verdict; meaningless when <paramref name="HasRecord"/> is false.</param>
+/// <param name="ResolvedCommand">The command the run was produced by (RT-D2 provenance).</param>
+/// <param name="MainSha">The main@sha the run was measured against.</param>
+/// <param name="When">When the record was written; null when the daemon sent no timestamp.</param>
+/// <param name="Text">The artifact's content, sanitized. Empty with <paramref name="HasRecord"/> true means
+/// the artifact could not be read — see <paramref name="UnavailableReason"/>.</param>
+/// <param name="Truncated">True when <paramref name="Text"/> is the END of a longer artifact. Named rather
+/// than silently elided: a human reading a failure needs to know they are looking at a fragment.</param>
+/// <param name="UnavailableReason">The daemon's verbatim reason when a record exists and its artifact could
+/// not be read. Empty otherwise.</param>
+public sealed record VerificationLog(
+    bool HasRecord,
+    bool Passed,
+    string ResolvedCommand,
+    string MainSha,
+    DateTimeOffset? When,
+    string Text,
+    bool Truncated,
+    string UnavailableReason)
+{
+    /// <summary>The answer for a surface that has no repo bound or could not reach the daemon: not "there
+    /// is no record" (which is a claim about the entry) but a stated failure to ask.</summary>
+    public static VerificationLog Unreachable(string reason) =>
+        new(HasRecord: true, Passed: false, ResolvedCommand: "", MainSha: "", When: null,
+            Text: "", Truncated: false, UnavailableReason: reason);
+}
+
 /// <summary>The P2-10 queue, UI-facing shape (states + gate + verification trigger + human merge).</summary>
 public interface IMergeQueueService
 {
@@ -69,6 +114,23 @@ public interface IMergeQueueService
     /// cref="ConfirmMergeAsync"/> is reachable.</para>
     /// </summary>
     Task<VerificationOutcome> RunVerificationAsync(string agentId);
+
+    /// <summary>
+    /// <b>Reads</b> the output of the entry's last verification — without running anything.
+    ///
+    /// <para>This is the whole point of it being a separate call from
+    /// <see cref="RunVerificationAsync"/>. A re-run costs minutes of real test time in a jail and can
+    /// legitimately answer differently, so "let me see why it failed" must never be spelled "run it
+    /// again" — which is precisely what the surface forced before this existed: the daemon wrote the real
+    /// output to an artifact, recorded its path in SQLite, and carried none of it on any wire, so the only
+    /// way to see a failure was to pay for a second run.</para>
+    ///
+    /// <para>It is <b>idempotent and side-effect-free</b>: it moves no state, starts no run, and touches no
+    /// gate. Called on demand — never on every queue refresh — because it is a per-entry file read on the
+    /// daemon.</para>
+    /// </summary>
+    Task<VerificationLog> GetVerificationLogAsync(string agentId);
+
     /// <summary>
     /// The human foreground merge; fires the NotifyMainMoved stale cascade.
     /// <para>Returns <see cref="MergeOutcome"/> rather than a bare task because a merge that landed is not

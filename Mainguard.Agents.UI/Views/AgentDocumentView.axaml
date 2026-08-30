@@ -1,6 +1,7 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+             xmlns:views="using:Mainguard.Agents.UI.Views"
              x:Class="Mainguard.Agents.UI.Views.AgentDocumentView"
              x:DataType="vm:AgentDocumentViewModel">
 
@@ -60,7 +61,14 @@
     <Border Grid.Row="3" Classes="Card" CornerRadius="8" BorderBrush="{DynamicResource BorderHairline}"
             BorderThickness="1" Padding="10" Margin="0,8,0,0">
       <StackPanel Spacing="6">
-        <TextBlock Text="{Binding ReviewFactsText}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
+        <!-- H4 — the same verdict panel the merge-queue row carries, so the two surfaces cannot say
+             different things about one record. It replaced a single line that read either an invented
+             "n/m tests green" or "no verification record yet" — the latter being what a branch whose tests
+             had just failed was told. -->
+        <views:VerificationPanelView DataContext="{Binding Verification}"/>
+        <TextBlock Classes="Mono" Text="{Binding VerifiedAgainstText}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextMuted}"
+                   IsVisible="{Binding VerifiedAgainstText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
         <ItemsControl ItemsSource="{Binding FlaggedItems}" IsVisible="{Binding HasFlaggedItems}">
           <ItemsControl.ItemTemplate>
             <DataTemplate x:DataType="vm:FlaggedItemViewModel">

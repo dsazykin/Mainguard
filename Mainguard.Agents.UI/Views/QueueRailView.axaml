@@ -2,6 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
              xmlns:conv="using:Mainguard.Agents.UI.Converters"
+             xmlns:views="using:Mainguard.Agents.UI.Views"
              x:Class="Mainguard.Agents.UI.Views.QueueRailView"
              x:DataType="vm:QueueRailViewModel">
 
@@ -87,6 +88,13 @@
                   <TextBlock Text="{Binding VerifyMessage}" FontSize="11" Foreground="{DynamicResource TextMuted}"
                              TextWrapping="Wrap"
                              IsVisible="{Binding VerifyMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+                  <!-- H4 — the verdict of the last run, and its actual output on demand. It sits on the ROW
+                       because the row is the only surface every entry has: an entry whose agent is gone has
+                       no worker document, and one that never verified cannot reach the review cockpit, so a
+                       log reachable only from either would be missing for exactly the entries that failed.
+                       It reads the recorded output; it never re-runs anything. -->
+                  <views:VerificationPanelView DataContext="{Binding Verification}"/>
 
                   <!-- The row's actions. The rail's ONE accent stays the Review CTA, so nothing else here
                        is Accent: Verify is Secondary (asking for a check is a supporting action) and the

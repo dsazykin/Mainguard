@@ -89,6 +89,9 @@ public sealed class QueueProjectionRenderingTests
         public Task<VerificationOutcome> RunVerificationAsync(string agentId) =>
             throw new NotSupportedException();
 
+        public Task<VerificationLog> GetVerificationLogAsync(string agentId) =>
+            throw new NotSupportedException();
+
         public Task<MergeOutcome> ConfirmMergeAsync(string agentId) => throw new NotSupportedException();
 
         public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId) => Task.CompletedTask;

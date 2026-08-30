@@ -89,8 +89,31 @@ public sealed record AgentInfo(
     DateTimeOffset SpawnedAt,
     string Role = AgentRoles.Manual); // "", "coordinator", or "managed" (subagent)
 
-/// <summary>P2-10: immutable verification record tied to a main SHA.</summary>
-public sealed record VerificationRecord(string AgentId, string MainSha, bool Passed, int TestsPassed, int TestsTotal, DateTimeOffset When);
+/// <summary>
+/// The <b>verdict</b> of an entry's last verification, in exactly the three facts the wire carries (H4:
+/// <c>QueueEntry.last_verification_passed</c> / <c>_command</c> / <c>_at</c>).
+///
+/// <para><b>It deliberately has no test counts.</b> It replaced a <c>VerificationRecord</c> carrying
+/// <c>TestsPassed</c>/<c>TestsTotal</c> — two numbers no wire has ever carried and the daemon has never
+/// measured. Verification observes a process EXIT CODE in the worker's jail; nothing parses anyone's test
+/// runner, so there is no "58 of 58" anywhere in this system to project. Filling those fields to satisfy
+/// the old shape would have printed invented counts into a review surface, which is strictly worse than
+/// printing none: a reviewer who reads "58/58 green" believes a measurement that was never taken. The type
+/// was narrowed to the real fields rather than the projection inventing values for it.</para>
+///
+/// <para>The <c>main@sha</c> the run was measured against is <b>not</b> here either — it is
+/// <see cref="QueueEntry.VerifiedMainSha"/>, straight off the wire's own <c>verified_main_sha</c>. One
+/// fact, one home.</para>
+/// </summary>
+/// <param name="Passed">The verdict itself. A <see cref="QueueEntry.Verification"/> of <c>null</c> is the
+/// materially different answer <i>no record</i> — never-run and failed must not share a representation,
+/// which is exactly why the wire field is <c>optional</c> rather than a plain bool.</param>
+/// <param name="ResolvedCommand">The RT-D2 command the verdict was produced by; empty when the daemon sent
+/// none. Provenance, not decoration — a branch that rewrote its own test command produces a green that
+/// means nothing, and the reviewer has to see WHAT passed.</param>
+/// <param name="When">When the record was written; null when the daemon sent no timestamp. A week-old red
+/// is a different fact from one that landed thirty seconds ago.</param>
+public sealed record VerificationVerdict(bool Passed, string ResolvedCommand, DateTimeOffset? When);
 
 /// <summary>P2-11: one must-acknowledge flagged item; acks bind to the diff hash daemon-side.</summary>
 public sealed record FlaggedItem(string Id, string Path, string Category, string Fact, bool Acknowledged);
@@ -119,10 +142,15 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// only thing that tells a reviewer whether the green they are looking at was measured against today's
 /// main or a week-old one.
 ///
-/// <para>Deliberately NOT folded into <see cref="VerificationRecord"/>: that record also carries
-/// <c>Passed</c> and the test counts, and the wire has none of them. Constructing one here would have
-/// meant inventing a pass/fail verdict to carry a sha, which is exactly the kind of fabricated
-/// reassurance this surface exists to prevent. Null means the daemon did not say.</para>
+/// <para>Deliberately its own field rather than folded into <see cref="Verification"/>: the sha is known
+/// for entries that have no verdict at all, and a verdict-shaped wrapper around it would have meant
+/// inventing a pass/fail to carry a sha — the kind of fabricated reassurance this surface exists to
+/// prevent. Null means the daemon did not say.</para>
+/// </param>
+/// <param name="Verification">
+/// The entry's last verification VERDICT, or <c>null</c> for <b>no record at all</b>. Those two answers are
+/// kept apart at every layer — the wire field is <c>optional</c>, this is nullable, and the surfaces render
+/// three outcomes (green / red / never run) rather than the two the old projection could express.
 /// </param>
 public sealed record QueueEntry(
     string AgentId,
@@ -130,7 +158,7 @@ public sealed record QueueEntry(
     string Branch,
     WorkerMergeState State,
     string Detail,
-    VerificationRecord? Verification,
+    VerificationVerdict? Verification,
     IReadOnlyList<FlaggedItem> FlaggedItems,
     bool VerificationInFlight = false,
     bool? HasLiveSandbox = null,

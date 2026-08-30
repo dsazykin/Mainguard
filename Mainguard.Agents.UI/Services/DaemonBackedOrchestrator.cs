@@ -856,9 +856,31 @@ public sealed class DaemonBackedOrchestrator :
                         .Select(f => new FlaggedItem(f.Id, f.Path, f.Category, f.Fact, f.Acknowledged))
                         .ToArray();
 
+                // H4 — the entry's last verification VERDICT. This was hardcoded to `null`, which is this
+                // projection's own way of saying "never verified": every entry the daemon served, the ones
+                // whose tests had just gone red included, reached the rail claiming no verification had
+                // ever happened. Three real wire fields, and only three.
+                //
+                // `HasLastVerificationPassed` is protobuf's field-presence test, and it is the whole
+                // mechanism here: proto3 would default the bool to false, and a false meaning "never
+                // verified" is indistinguishable from one meaning "the tests failed" — the exact
+                // conflation this change exists to end. Unset stays null, i.e. no record.
+                //
+                // Note what is NOT built here. The old client-side record carried TestsPassed/TestsTotal,
+                // which no wire has ever carried and nothing in this system measures — verification watches
+                // a process exit code in a jail and parses nobody's test runner. There is no honest source
+                // for those numbers, so the type lost them rather than this projection inventing them; a
+                // fabricated "58 of 58 green" in a review surface is worse than no number at all.
+                var verdict = entry.HasLastVerificationPassed
+                    ? new VerificationVerdict(
+                        entry.LastVerificationPassed,
+                        entry.LastVerificationCommand ?? string.Empty,
+                        ParseTimestamp(entry.LastVerificationAt))
+                    : null;
+
                 _queue.Add(new QueueEntry(
                     entry.AgentId, entry.AgentId, $"agent/{entry.AgentId}", state,
-                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged,
+                    entry.GateReason ?? string.Empty, Verification: verdict, FlaggedItems: flagged,
                     // Carried from the daemon rather than inferred from the state: a client that guessed
                     // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
                     // for — the ones a restart left frozen mid-verification.
@@ -1508,6 +1530,76 @@ public sealed class DaemonBackedOrchestrator :
     /// <summary>A verification runs the repo's full test command in a jail, after possibly building its
     /// toolchain image; it is the longest-running RPC the surface issues.</summary>
     private static readonly TimeSpan VerificationDeadline = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// H4 — <b>reads</b> the last verification's output. It runs nothing: this is the whole reason it is a
+    /// separate call from <see cref="RunVerificationAsync"/>. Before it existed, the only way for a human
+    /// to find out why a branch had gone red was to press Verify again, which spends minutes of real test
+    /// time in a jail and can legitimately answer differently — so the surface charged the human a second
+    /// run for information the daemon already had on disk.
+    ///
+    /// <para>The three answers the daemon keeps apart are kept apart here too: no record at all, the log,
+    /// and a record whose artifact could not be read. A daemon we could not reach is a FOURTH answer and is
+    /// reported as such — never as "no record", which is a claim about the entry rather than about the
+    /// call.</para>
+    ///
+    /// <para>The text is jail-produced, so it goes through <see cref="JailText.Sanitize"/> here rather than
+    /// at each surface: sanitizing at the projection boundary is what makes it impossible for a consumer to
+    /// forget.</para>
+    /// </summary>
+    public async Task<VerificationLog> GetVerificationLogAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return VerificationLog.Unreachable("no repository is active for agents yet");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        try
+        {
+            var response = await _client
+                .GetVerificationLogAsync(repoHandle!, agentId, cts.Token)
+                .ConfigureAwait(false);
+
+            if (!response.HasRecord)
+            {
+                return new VerificationLog(
+                    HasRecord: false, Passed: false, ResolvedCommand: "", MainSha: "", When: null,
+                    Text: "", Truncated: false, UnavailableReason: "");
+            }
+
+            return new VerificationLog(
+                HasRecord: true,
+                Passed: response.Passed,
+                ResolvedCommand: response.ResolvedCommand ?? string.Empty,
+                MainSha: response.MainSha ?? string.Empty,
+                When: ParseTimestamp(response.When),
+                Text: JailText.Sanitize(response.Log),
+                Truncated: response.Truncated,
+                UnavailableReason: response.UnavailableReason ?? string.Empty);
+        }
+        catch (Grpc.Core.RpcException ex)
+        {
+            return VerificationLog.Unreachable($"the daemon didn't answer ({ex.StatusCode})");
+        }
+    }
+
+    /// <summary>
+    /// The daemon's ISO-8601 round-trip ("O") timestamps, or null when it sent none. Null rather than a
+    /// sentinel date: "the daemon did not say when" and "this happened at the epoch" are different facts,
+    /// and only one of them should ever reach a surface that ages a verdict.
+    /// </summary>
+    private static DateTimeOffset? ParseTimestamp(string? value) =>
+        DateTimeOffset.TryParse(
+            value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
+            ? parsed : null;
 
     private static string Short(string sha) =>
         string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);

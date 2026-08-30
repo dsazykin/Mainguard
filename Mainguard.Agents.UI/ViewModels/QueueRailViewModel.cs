@@ -148,6 +148,14 @@ public partial class QueueEntryViewModel : ViewModelBase
 
     public string AgentId { get; }
 
+    /// <summary>
+    /// This row's verification verdict and its on-demand output (H4). A child VM rather than more
+    /// properties here because the worker pane composes the identical one: the two surfaces were both
+    /// saying "not verified yet" about a red run, and sharing the projection is what keeps them from
+    /// drifting apart again.
+    /// </summary>
+    public VerificationPanelViewModel Verification { get; }
+
     [ObservableProperty] private string _name = "";
     [ObservableProperty] private string _branch = "";
     [ObservableProperty] private string _stateWord = "";
@@ -250,6 +258,7 @@ public partial class QueueEntryViewModel : ViewModelBase
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _report = report;
         _resumeAgentKind = resumeAgentKind;
+        Verification = new VerificationPanelViewModel(agentId, _queue);
         // Decide the affordance up front rather than leaving it on `bool`'s default false: a row that
         // renders before its first Update would otherwise show a dead Verify button.
         RecomputeCanVerify();
@@ -277,12 +286,14 @@ public partial class QueueEntryViewModel : ViewModelBase
             WorkerMergeState.VerificationFailed => "Tests failed",
             var s => s.ToString(),
         };
-        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in a
-        // VerificationRecord, which would fabricate a pass/fail verdict the daemon didn't send. The old
-        // read looked only at Verification, which the daemon projection never populates, so the stamp
-        // could never render in the shipped app.
-        var verifiedSha = entry.VerifiedMainSha is { Length: > 0 } wireSha ? wireSha : entry.Verification?.MainSha;
-        VerifiedAgainst = verifiedSha is { Length: > 0 } sha
+        // H4: the verdict and its output, from the same projection both surfaces read.
+        Verification.Update(entry);
+
+        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in the
+        // verdict, which would have meant fabricating a pass/fail to carry a sha. The old read fell back to
+        // a client-side record the daemon projection never populated, so the stamp could never render in
+        // the shipped app.
+        VerifiedAgainst = entry.VerifiedMainSha is { Length: > 0 } sha
             && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
             ? $"main@{Shorten(sha)}" : "";
         IsReviewable = entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;

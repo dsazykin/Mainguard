@@ -352,7 +352,10 @@ public class QueueEntryLifecycleRenderHarness
 
         public IReadOnlyList<QueueEntry> GetQueue() => new[]
         {
-            Entry(Ready, WorkerMergeState.Verified, "ready to merge"),
+            // Carries a real (green) verdict, so this fixture's captures show the verdict line saying what
+            // a verified row's record actually is rather than "not verified yet" under a Verified badge.
+            Entry(Ready, WorkerMergeState.Verified, "ready to merge",
+                verdict: new VerificationVerdict(true, "dotnet test", DateTimeOffset.UnixEpoch)),
             // Stalled because a daemon restart lost the in-flight set — the JAIL is still there, so this
             // row is the other agent's case (clear it and re-verify), NOT a resume. Keeping the two
             // separate here is what makes the discrimination assertions mean something.
@@ -363,8 +366,9 @@ public class QueueEntryLifecycleRenderHarness
         };
 
         private static QueueEntry Entry(
-            string id, WorkerMergeState state, string detail, bool inFlight = false, bool hasSandbox = true)
-            => new(id, id, "agent/" + id, state, detail, Verification: null,
+            string id, WorkerMergeState state, string detail, bool inFlight = false, bool hasSandbox = true,
+            VerificationVerdict? verdict = null)
+            => new(id, id, "agent/" + id, state, detail, Verification: verdict,
                 FlaggedItems: Array.Empty<FlaggedItem>(), VerificationInFlight: inFlight,
                 HasLiveSandbox: hasSandbox);
 
@@ -383,6 +387,14 @@ public class QueueEntryLifecycleRenderHarness
             Task.FromResult(new VerificationOutcome(
                 Ran: false, Passed: false,
                 Reason: $"Agent '{agentId}' has no live sandbox — verification runs in the worker's own jail."));
+
+        /// <summary>Reading the recorded output — never a run. Only <see cref="Ready"/> has a record here;
+        /// every other row must be told there is none rather than shown an empty log.</summary>
+        public Task<VerificationLog> GetVerificationLogAsync(string agentId) =>
+            Task.FromResult(agentId == Ready
+                ? new VerificationLog(true, true, "dotnet test", "a1b2c3d4e5", DateTimeOffset.UnixEpoch,
+                    "$ dotnet test\n  All tests passed.", false, "")
+                : new VerificationLog(false, false, "", "", null, "", false, ""));
 
         public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId) => Task.CompletedTask;
 

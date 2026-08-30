@@ -70,6 +70,7 @@ public class QueueChangedRefreshesRailTests
         public IReadOnlyList<QueueEntry> GetQueue() => Entries;
         public bool CanMerge(string agentId, out string reason) => _inner.CanMerge(agentId, out reason);
         public Task<VerificationOutcome> RunVerificationAsync(string agentId) => _inner.RunVerificationAsync(agentId);
+        public Task<VerificationLog> GetVerificationLogAsync(string agentId) => _inner.GetVerificationLogAsync(agentId);
         public Task<MergeOutcome> ConfirmMergeAsync(string agentId) => _inner.ConfirmMergeAsync(agentId);
         public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId) => _inner.AcknowledgeFlaggedChangeAsync(agentId, itemId);
         public Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason) => _inner.DiscardEntryAsync(agentId, reason);
