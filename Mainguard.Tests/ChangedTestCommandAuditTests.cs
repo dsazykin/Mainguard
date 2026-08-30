@@ -38,7 +38,7 @@ public class ChangedTestCommandAuditTests
 
         Assert.True(gate.Acknowledge(AgentId, "owner@example"));
 
-        var ack = Assert.Single(audit.Read().Where(e => e.Type == "acknowledged_flagged_change"));
+        var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.Equal(AgentId, ack.Fields["agent"]);
         Assert.Equal(ChangedTestCommandGate.TestCommandItem, ack.Fields["item"]);
         Assert.Equal(VerifyPath, ack.Fields["path"]);
@@ -116,7 +116,7 @@ public class ChangedTestCommandAuditTests
         Assert.True(gate.Acknowledge(AgentId, "owner@example"));
         Assert.False(gate.Acknowledge(AgentId, "owner@example"));
 
-        Assert.Single(audit.Read().Where(e => e.Type == "acknowledged_flagged_change"));
+        Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
     }
 
     /// <summary>
@@ -235,7 +235,7 @@ public class ChangedTestCommandAuditTests
 
         gate.Acknowledge(AgentId, "owner@example");
 
-        var ack = Assert.Single(audit.Read().Where(e => e.Type == "acknowledged_flagged_change"));
+        var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.EndsWith("…(truncated)", ack.Fields["to"], StringComparison.Ordinal);
         Assert.True(ack.Fields["to"].Length < huge.Length);
         Assert.Equal(64, ack.Fields["to_hash"].Length);
@@ -255,7 +255,7 @@ public class ChangedTestCommandAuditTests
 
         gate.Acknowledge(AgentId);
 
-        var ack = Assert.Single(audit.Read().Where(e => e.Type == "acknowledged_flagged_change"));
+        var ack = Assert.Single(audit.Read(), e => e.Type == "acknowledged_flagged_change");
         Assert.Equal("unknown", ack.Fields["by"]);
     }
 }
