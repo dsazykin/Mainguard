@@ -423,7 +423,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         await ApproveAsync(workerId);
 
         var response = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock", NoDeviations: true));
 
         Assert.True(response.Ok, response.Error);
         Assert.True(response.Committed);
@@ -454,7 +454,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         await ApproveAsync(theirs);
 
         var response = await CallAsync(mine, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch"));
+            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch",
+            NoDeviations: true));
 
         Assert.True(response.Ok, response.Error);
         Assert.Equal("agent/" + mine, response.Status);
@@ -477,7 +478,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         try
         {
             var response = await CallAsync(workerId, new AgentIpcRequest(
-                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened"));
+                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened", NoDeviations: true));
 
             Assert.True(response.Ok, response.Error);
             Assert.False(response.Committed);
@@ -503,7 +504,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         try
         {
             var response = await CallAsync(workerId, new AgentIpcRequest(
-                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else"));
+                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else", NoDeviations: true));
 
             Assert.False(response.Ok);
             Assert.False(response.Committed);
@@ -569,7 +570,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         // ...and the worker is NOT suspended. It still holds the approval it is asking to widen.
         Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
         var commit = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers",
+            NoDeviations: true));
         Assert.True(commit.Ok, commit.Error);
         Assert.True(commit.Committed);
 
@@ -607,7 +609,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
         Assert.True(Rig.Gate.MayWork(workerId, out _));
         var commit = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope",
+            NoDeviations: true));
         Assert.True(commit.Ok, commit.Error);
     }
 

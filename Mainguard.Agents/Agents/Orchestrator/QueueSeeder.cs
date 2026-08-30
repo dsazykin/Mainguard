@@ -348,6 +348,18 @@ public sealed class QueueSeeder
 
         // (3) ...and the operator who called the RPC approves it, attributably.
         _plans.Approve(presented.PlanId, string.IsNullOrWhiteSpace(actor) ? "queue-seeder" : actor);
+
+        // (4) The worker's own commit-time deviation declaration, supplied here for the same reason its
+        // authorship is: there is no worker, and this record already says so of itself in the two
+        // free-text fields a human reads.
+        //
+        // Left at DeviationDeclaration.NotDeclared it would arm a must-acknowledge row on EVERY seeded
+        // plan-gated entry, forever — a row whose real cause is "a dev tool made this entry" rather than
+        // anything about the branch. A blocker that is always present for a whole class of entries and
+        // never means anything is exactly how a gate teaches people to click through it, which is what
+        // the declaration mechanism must not become. The fail-closed default stays where it matters: on
+        // a real worker, which is the only thing that can actually answer.
+        _plans.DeclareDeviations(agentId, deviations: null);
         planId = presented.PlanId;
         _log?.Invoke(
             $"queue seeder agent={agentId} plan={planId} — the REAL plan pipeline ran "

@@ -225,6 +225,12 @@ public sealed class QueueSeederTests : IDisposable
             && e.Fields["plan_id"] == plan.PlanId);
 
         // Default scope is the seed's own path, so with_plan alone changes nothing about mergeability.
+        //
+        // Nor does the deviation declaration: the seeder supplies the worker's half of it (a plain "no
+        // deviations") exactly as it supplies the plan's authorship, because there is no worker to ask
+        // and a must-acknowledge row present on every seeded entry would be about the seeder rather than
+        // about the branch. `SeedPlan` step (4) is where that is written down.
+        Assert.Equal(DeviationDeclaration.None, plan.Deviation);
         Assert.True(_registry.Resolve(repoHash)!.Queue.CanMerge(outcome.AgentId, out var mergeReason), mergeReason);
     }
 

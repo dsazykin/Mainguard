@@ -286,10 +286,10 @@ def main(argv):
                 # G4, unchanged: a second bare argument is REFUSED rather than joined, because by the
                 # time a shell has split an unquoted message the subject/blank-line/body is already gone
                 # and rejoining it with spaces hides that a structure was lost.
-                bad = ("commit takes ONE quoted message. A shell splits an unquoted message on\n"
-                       "whitespace, so the subject, blank line and body you wrote are already one flat\n"
-                       "line by the time this runs. Quote the whole message -- newlines inside the\n"
-                       "quotes are kept.")
+                bad = ("the message is ONE quoted argument, and a second one was given. A shell splits\n"
+                       "an unquoted message on whitespace, so the subject, blank line and body you wrote\n"
+                       "are already one flat line by the time this runs. Quote the whole message --\n"
+                       "newlines inside the quotes are kept.")
                 break
 
         if bad is None and no_deviations and deviations:
