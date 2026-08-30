@@ -980,6 +980,16 @@ public sealed class MergeQueueProvisioner
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);
+
+        // The branch-side half of what this run is evidence FOR, resolved AFTER the publish above so it
+        // names the tree the container is about to be measured on rather than whatever the mirror held
+        // before. Every read below — the RT-D2 configs, the toolchain declaration, the flagged-change
+        // diff — is taken from `agent/<id>` at this same instant, so one sha describes all of them.
+        //
+        // Empty is a possible answer (a mirror git could not answer for, and always the seeded path) and
+        // it is passed through as empty rather than substituted: see VerificationRecord.BranchSha.
+        var branchSha = RevParse(barePath, "agent/" + agentId);
+
         var resolution = VerificationCommandResolver.Resolve(
             branchConfigContent: ShowFile(barePath, "agent/" + agentId, VerificationConfigPath),
             mainConfigContent: ShowFile(barePath, mainBranch, VerificationConfigPath));
@@ -1000,9 +1010,18 @@ public sealed class MergeQueueProvisioner
         // ...and arm the P2-11 flagged-change gate from the same committed trees, at the same moment, for
         // the same reason: a branch that edits a CI workflow, a git hook, an executable config or a
         // security-sensitive path — or that reaches outside its approved scope — is unmergeable from the
-        // instant the daemon can know it, not from whenever a UI happens to look at it. Verification time is
-        // also the correct cadence: the acknowledgment binds to the flagged set's content hash, so a branch
-        // that pushes new work re-verifies, re-classifies, and drops every ack that covered the old bytes.
+        // instant the daemon can know it, not from whenever a UI happens to look at it.
+        //
+        // Verification time is the cadence, and what makes that honest is that a branch which pushes new
+        // work RE-VERIFIES. That sentence used to stand here as a description of behaviour the daemon did
+        // not have: nothing walked a locally-spawned agent's entry out of Verified for its own commits, so
+        // a green branch that pushed again was never re-verified and this gate stayed armed against the
+        // diff of two commits ago — the F6 out-of-scope classification, and every acknowledgment bound to
+        // the old flagged-set hash, silently outliving the bytes they were computed from. That is now a
+        // real edge (MergeQueue.NotifyBranchAdvanced walks Verified/AwaitingReview back to Working on a
+        // tip move, and the readiness trigger re-fires from there), which is what re-arms this call
+        // against the NEW diff. If that invalidation is ever removed, this comment becomes a lie again and
+        // ArmFlaggedChangeReview_IsReArmedAgainstTheNewDiff_AfterAPush is the test that says so.
         ArmFlaggedChangeReview(repoHandle, agentId, flaggedGate);
 
         // The seeded arm ends here, AFTER every gate above was armed for real: the outcome is
@@ -1012,7 +1031,7 @@ public sealed class MergeQueueProvisioner
         if (syntheticPlan is not null)
         {
             return await RunSyntheticVerificationAsync(
-                repoHandle, agentId, queue, syntheticPlan, resolution, ct).ConfigureAwait(false);
+                repoHandle, agentId, queue, syntheticPlan, resolution, branchSha, ct).ConfigureAwait(false);
         }
 
         // ...and before running anything, confirm the jail REALLY carries what main declared. This is a
@@ -1023,12 +1042,14 @@ public sealed class MergeQueueProvisioner
         // the agent's code being broken, on the one screen where that distinction decides a merge.
         await EnsureToolchainPresentAsync(repoHandle, containerId!, toolchain.Provisioned, ct).ConfigureAwait(false);
 
-        // Pin the record to the queue's authoritative main — the same value CanMerge compares against, so a
-        // pass here is a pass against the main this branch will actually merge into.
+        // Pin the record to BOTH shas it is only true between: the queue's authoritative main — the same
+        // value CanMerge compares against, so a pass here is a pass against the main this branch will
+        // actually merge into — and the branch tip resolved above, so a pass here is also a pass on the
+        // tree that will actually merge.
         return await _runner.RunAsync(
             new VerificationRequest(
                 agentId, containerId!, queue.CurrentMainSha,
-                resolution.Command, resolution.ResolvedCommand, resolution.ConfigHash),
+                resolution.Command, resolution.ResolvedCommand, resolution.ConfigHash, branchSha),
             ct).ConfigureAwait(false);
     }
 
@@ -1091,7 +1112,7 @@ public sealed class MergeQueueProvisioner
     /// </summary>
     private async Task<VerificationRecord> RunSyntheticVerificationAsync(
         string repoHandle, string agentId, MergeQueue queue, SyntheticVerificationPlan plan,
-        VerificationCommandResolver.Resolution resolution, CancellationToken ct)
+        VerificationCommandResolver.Resolution resolution, string branchSha, CancellationToken ct)
     {
         if (plan.HoldSeconds > 0)
         {
@@ -1114,7 +1135,11 @@ public sealed class MergeQueueProvisioner
             artifactPath,
             resolution.ResolvedCommand + SyntheticVerificationPlan.SeededProvenanceMarker,
             resolution.ConfigHash,
-            when);
+            when,
+            // The seeded branch IS a real ref with a real tree — every gate above was armed from it — so
+            // its verdict is pinned to a real tip like any other. Only the outcome is supplied, and only
+            // the outcome is marked as supplied.
+            branchSha);
     }
 
     // Mirrors VerificationRunner.WriteArtifact's shape so the log view renders familiarly; the body

@@ -95,6 +95,7 @@ public sealed class DbVerificationStore : IVerificationStore
                 RepoHash = repoHash,
                 AgentId = record.AgentId,
                 MainSha = record.MainSha,
+                BranchSha = record.BranchSha,
                 Passed = record.Passed,
                 LogArtifactPath = record.LogArtifactPath,
                 ResolvedCommand = record.ResolvedCommand,
@@ -147,5 +148,8 @@ public sealed class DbVerificationStore : IVerificationStore
 
     private static VerificationRecord Map(VerificationRow v) => new(
         v.AgentId, v.MainSha, v.Passed, v.LogArtifactPath, v.ResolvedCommand, v.ConfigHash,
-        new DateTimeOffset(v.WhenUtc, TimeSpan.Zero));
+        new DateTimeOffset(v.WhenUtc, TimeSpan.Zero),
+        // Null-coalesced, not defaulted away: a pre-migration row genuinely has no branch sha, and an
+        // empty string is exactly how this record type spells "not measured".
+        v.BranchSha ?? string.Empty);
 }

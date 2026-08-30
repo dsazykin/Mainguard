@@ -644,11 +644,19 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         foreach (var agentId in orderedAgentIds)
         {
             var can = queue.CanMerge(agentId, out var reason);
+            var record = queue.LastVerification(agentId);
             var entry = new QueueEntry
             {
                 AgentId = agentId,
                 State = queue.GetState(agentId).ToString(),
-                VerifiedMainSha = queue.CurrentMainSha,
+                // The main the RECORD ran against, not the main of this instant. The wire has always
+                // documented this field as "the main@sha this branch's verification ran against" and the
+                // daemon has always filled it with `queue.CurrentMainSha`, so the cockpit's "verified @
+                // <sha>" stamp named today's main whatever the evidence was measured on — most visibly for
+                // a StaleVerified entry, where the two are guaranteed to differ and the stamp asserted the
+                // freshness the state exists to deny. Falls back to current main only when there is no
+                // record at all, where nothing is being claimed about a run.
+                VerifiedMainSha = record?.MainSha is { Length: > 0 } ran ? ran : queue.CurrentMainSha,
                 CanMerge = can,
                 GateReason = reason,
                 // P2-13 carried-in from P2-12: badge external-PR intake entries as such.
@@ -677,7 +685,7 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
             // verification actually found. The record is the queue's OWN settled one, so what is rendered
             // cannot disagree with the state it is rendered under. Left absent — not false — when there is
             // no record, because an absent verdict and a failing one must stay distinguishable.
-            if (queue.LastVerification(agentId) is { } verification)
+            if (record is { } verification)
             {
                 entry.LastVerificationPassed = verification.Passed;
                 entry.LastVerificationCommand = verification.ResolvedCommand ?? string.Empty;

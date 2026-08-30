@@ -10,15 +10,20 @@ using Mainguard.Agents.Agents.Sandbox;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
-/// <summary>What one verification run needs: the sandbox to run in, the main sha to pin, and the
+/// <summary>What one verification run needs: the sandbox to run in, the <b>two</b> shas to pin, and the
 /// RT-D2-resolved command + config hash to record.</summary>
+/// <param name="BranchSha">The mirror's <c>refs/heads/agent/&lt;id&gt;</c> tip this run is measured ON,
+/// resolved after the pre-verification publish so it is the tree the container actually holds. Empty
+/// where the caller cannot resolve one (the seeded path); see <see cref="VerificationRecord.BranchSha"/>
+/// for why empty means "not measured" and never "unchanged".</param>
 public sealed record VerificationRequest(
     string AgentId,
     string ContainerId,
     string MainSha,
     IReadOnlyList<string> Command,
     string ResolvedCommand,
-    string ConfigHash);
+    string ConfigHash,
+    string BranchSha = "");
 
 /// <summary>
 /// Runs a project's configured verification command <b>in the worker's own sandbox</b> and returns the
@@ -75,7 +80,8 @@ public sealed class VerificationRunner
             artifactPath,
             request.ResolvedCommand,
             request.ConfigHash,
-            when);
+            when,
+            request.BranchSha);
     }
 
     private string WriteArtifact(VerificationRequest request, SandboxExecResult result, DateTimeOffset when)
@@ -87,6 +93,9 @@ public sealed class VerificationRunner
         var sb = new StringBuilder();
         sb.AppendLine($"agent: {request.AgentId}");
         sb.AppendLine($"main@sha: {request.MainSha}");
+        // BOTH shas in the header, because the verdict below is only true between them. A log naming one
+        // of the pair reads as a statement about the branch when it is a statement about a moment.
+        sb.AppendLine($"branch@sha: {(request.BranchSha.Length > 0 ? request.BranchSha : "(not measured)")}");
         sb.AppendLine($"resolved-command: {request.ResolvedCommand}");
         sb.AppendLine($"config-hash: {request.ConfigHash}");
         sb.AppendLine($"container-runtime-exit: {result.ExitCode}");

@@ -42,6 +42,13 @@ public class QueueEntryLifecycleRenderHarness
     private const string Live = "b2e7d1c4a8f6-33ea9b0d7c1245fe8a2b6d4c9e30f57a";
     private const string Ready = "e9f3b7a1c0d2-58bc4e2a9f7136dd0c5e8b3a1f742d69";
 
+    // A branch whose tests went RED, with its jail intact. It is this suite's positive control for the
+    // Verify affordance, and it has to be a state the DAEMON can actually start a run from: Verified is
+    // not one (there is no Verified → Verifying edge), so a control that used the Ready row was asserting
+    // that the rail offers a button the daemon refuses. VerificationFailed is exactly the case the button
+    // exists for — read the output, push a fix, or ask for the run again.
+    private const string Red = "4a0c8e6b5d17-92fb3c1e7a4d508b6c2e9f0a1d834b57";
+
     /// <summary>
     /// Every non-terminal row can be acted on, and each action means one thing:
     /// Discard everywhere, "Clear stalled run" only where the DAEMON says no run is live.
@@ -56,7 +63,7 @@ public class QueueEntryLifecycleRenderHarness
         win.Show();
         Settle();
 
-        Assert.Equal(4, vm.Entries.Count);
+        Assert.Equal(5, vm.Entries.Count);
 
         foreach (var entry in vm.Entries)
         {
@@ -105,7 +112,8 @@ public class QueueEntryLifecycleRenderHarness
         var discards = view.GetVisualDescendants().OfType<Button>()
             .Where(b => b.IsEffectivelyVisible && Equals(b.Content, "Discard"))
             .ToList();
-        Assert.Equal(4, discards.Count);
+        // One per row: every non-terminal entry can be dropped, and all five of this fixture's rows are.
+        Assert.Equal(5, discards.Count);
         foreach (var d in discards)
         {
             Assert.Contains("DangerQuiet", d.Classes);
@@ -214,7 +222,7 @@ public class QueueEntryLifecycleRenderHarness
         // Every row that still HAS a jail is not stranded, whatever its merge state. The stalled-verifying
         // row is the sharpest case: its state is broken but its sandbox is not, so it gets the clear and
         // not a resume.
-        foreach (var id in new[] { Ready, Frozen, Live })
+        foreach (var id in new[] { Ready, Frozen, Live, Red })
         {
             Assert.False(Button(view, id, "Resume").IsEffectivelyVisible,
                 $"{id} still has a jail — offering to spawn it another is a refusal waiting to happen");
@@ -224,10 +232,18 @@ public class QueueEntryLifecycleRenderHarness
         // error. That enabled-button-that-only-errors is the state the screenshot was taken in.
         Assert.False(Button(view, Stranded, "Verify").IsEffectivelyEnabled,
             "Verify is enabled on an entry with no jail, so pressing it can only produce an error");
-        // The positive control that keeps the assertion above from passing for the wrong reason: the row
-        // that HAS a jail keeps its Verify. (Frozen's is withheld too, but for #307's separate reason —
-        // its state is Verifying — so it cannot serve as this control.)
-        Assert.True(Button(view, Ready, "Verify").IsEffectivelyEnabled);
+        // The positive control that keeps the assertion above from passing for the wrong reason: a row
+        // that HAS a jail, in a state a run can legally start from, keeps its Verify.
+        //
+        // It is the RED row and not the Ready one, which is a correction rather than a preference. Verify
+        // used to be offered on Verified as well, and the daemon has never had a Verified → Verifying
+        // edge, so this control was previously asserting that the rail offers a button whose every press
+        // returns "Illegal merge-state transition Verified → Verifying" — an assertion that the product
+        // lies to the user. (Frozen and Live are withheld for #307's separate reason: their state is
+        // Verifying.)
+        Assert.True(Button(view, Red, "Verify").IsEffectivelyEnabled);
+        Assert.False(Button(view, Ready, "Verify").IsEffectivelyEnabled,
+            "a green entry offers a Verify the daemon refuses from Verified — an action that always fails");
 
         HarnessHygiene.Teardown(win);
     }
@@ -276,7 +292,7 @@ public class QueueEntryLifecycleRenderHarness
             var win = HostWindow(view);
             win.Show();
             Settle();
-            Assert.Equal(4, vm.Entries.Count);
+            Assert.Equal(5, vm.Entries.Count);
             win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), $"queue_lifecycle_{theme}.png"));
 
             // ...and the armed state, which is where the destructive emphasis actually appears.
@@ -361,6 +377,9 @@ public class QueueEntryLifecycleRenderHarness
             // separate here is what makes the discrimination assertions mean something.
             Entry(Frozen, WorkerMergeState.Verifying, "verification stalled — no run in progress"),
             Entry(Live, WorkerMergeState.Verifying, "verifying", inFlight: true),
+            Entry(Red, WorkerMergeState.VerificationFailed,
+                "the verification FAILED (dotnet test) — read the run output, then push a fix or discard the entry",
+                verdict: new VerificationVerdict(false, "dotnet test", DateTimeOffset.UnixEpoch)),
             // The owner's screenshot: commits on the branch, jail gone, "not verified yet".
             Entry(Stranded, WorkerMergeState.Working, "not verified yet", hasSandbox: false),
         };

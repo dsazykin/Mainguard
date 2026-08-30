@@ -27,6 +27,17 @@ public class VerificationRow
     /// <summary>The exact <c>main@sha</c> the mirror pointed at when the run started.</summary>
     public string MainSha { get; set; } = string.Empty;
 
+    /// <summary>
+    /// The exact <c>refs/heads/agent/&lt;id&gt;</c> tip the run was measured ON — the branch-side half of
+    /// the pair a verdict is only true between.
+    ///
+    /// <para>Nullable and empty-tolerated on purpose: every row written before this column existed has no
+    /// value, and "unknown" must stay distinguishable from "unchanged". A freshness comparison declines to
+    /// answer on an empty value rather than manufacturing a fresh one — see
+    /// <c>VerificationRecord.BranchSha</c>.</para>
+    /// </summary>
+    public string BranchSha { get; set; } = string.Empty;
+
     /// <summary>Daemon-observed pass/fail (containerd exit code == 0). Never a supervisor-reported value.</summary>
     public bool Passed { get; set; }
 
