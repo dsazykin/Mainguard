@@ -223,15 +223,19 @@ public static class GatewayServiceRegistration
             // holds at the plan gate and the same id the merge queue tracks the branch under — so this is
             // the exact binding, not an inference from a coordinator or a session field.
             //
-            // Read through `Approved` only: LatestForWorker answers with the worker's newest plan in ANY
-            // state, and a pending or rejected plan's scope has authorised nothing. An id with no approved
-            // plan (a manual-mode agent, an external-PR head, a seeded entry without with_plan) resolves
-            // null exactly as before, which reads as "unmanaged" and skips the scope comparison entirely.
+            // Read through ApprovedForWorker, which is the ONE authority for "what is this worker cleared
+            // to do". An id with no approved plan (a manual-mode agent, an external-PR head, a seeded
+            // entry without with_plan) resolves null, which reads as "unmanaged" and skips the scope
+            // comparison entirely.
+            //
+            // This line used to be `LatestForWorker(...) is { Status: Approved }`, and that was correct
+            // only while a worker's newest plan was always its authorisation. The re-scope op ends that: a
+            // pending re-scope is NEWER than the plan it widens, so the filtered-latest read answers null
+            // — and null means "unmanaged", so a worker would have lost its F6 out-of-scope coverage by
+            // the act of asking to widen legally, silently, for as long as the human took to decide. The
+            // policy lives in PlanApprovalService now rather than here, so there is one copy of it.
             resolveApprovedPlan: agentId =>
-                sp.GetRequiredService<PlanApprovalService>().LatestForWorker(agentId) is
-                { Status: PlanStatus.Approved } approved
-                    ? approved.Plan
-                    : null);
+                sp.GetRequiredService<PlanApprovalService>().ApprovedPlanFor(agentId));
 
             // ---- G1: the other half of "a queue row requires an approved plan" -------------------------
             //

@@ -196,7 +196,8 @@ public static class AgentOperatingInstructions
 
         ```
         {{shimPath}} present <plan.json>         present your plan, then wait for the human
-        {{shimPath}} revise <id> <plan.json>     re-present after a rejection, then wait
+        {{shimPath}} revise <id> <plan.json>     re-present after a REJECTION, then wait
+        {{shimPath}} {{WorkerPlanShim.RescopeUsage}}   widen an APPROVED plan, then wait
         {{shimPath}} await <id>                  block until the human decides
         ```
 
@@ -206,14 +207,38 @@ public static class AgentOperatingInstructions
 
         ## The part that matters
 
-        `present` and `revise` **block** until the human decides, and print the decision. On approval the
-        output includes `TASK:` followed by the work you are cleared to do. **The daemon withholds that
-        text until then**, so there is genuinely nothing to start on before approval — not because you
-        are being polite, but because the work has not been given to you.
+        `present`, `revise` and `rescope` **block** until the human decides, and print the decision. On
+        approval the output includes `TASK:` followed by the work you are cleared to do. **The daemon
+        withholds that text until then**, so there is genuinely nothing to start on before approval — not
+        because you are being polite, but because the work has not been given to you.
 
         A rejection is feedback, not death: it comes back with the reason, and you revise and re-present.
         Your revision budget is finite and the daemon reports what is left; when it is spent the task
         escalates to the human rather than looping.
+
+        ## If the work needs a file your approved scope does not cover, ASK
+
+        ```
+        {{shimPath}} {{WorkerPlanShim.RescopeUsage}}
+        ```
+
+        The `scope` in the plan a human approved is what you are cleared to change. Discovering mid-task
+        that the job cannot be done properly without touching a neighbouring file is normal, and there is
+        exactly one legal move: present a wider plan against the approved one with `rescope`, and let the
+        human decide it the way they decided the first.
+
+        - **`rescope` is not `revise`.** `revise` answers a rejection and spends a revision from your
+          budget. `rescope` follows an approval, spends none, and is the only way to widen. Pick the wrong
+          one and the daemon refuses it and names the other — but read this once and you will not have to.
+        - **Your existing approval stands the whole time.** While the human is deciding you are cleared
+          for exactly the scope that was approved before, and nothing you have already done is undone. If
+          they refuse, you are still cleared for the original scope — continue there, or stop and say why.
+        - **Ask even if you already touched the file.** Every file outside the approved scope is put in
+          front of the human at verification and blocks the merge until they acknowledge it, whether or
+          not you asked. Asking is how they hear your reason before they see the diff; not asking only
+          means they see it without one.
+        - **A widening the human refuses three times stops being available.** At that point finish what
+          your approved plan covers, or report to the human and wait.
 
         ## When the work is done, commit it — nothing else will
 
