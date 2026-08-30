@@ -428,8 +428,79 @@ public class AgentIpcProtocolTests
         }
     }
 
-    /// <summary>Runs <c>mainguard-plan</c>'s own <c>main()</c> with the transport stubbed.</summary>
+    /// <summary>
+    /// <b>The re-scope verb, through the real dispatch.</b> Three properties, and only the first is about
+    /// the happy path:
+    ///
+    /// <list type="number">
+    /// <item>the verb builds a <c>rescope_plan</c> request carrying the plan id AND the plan document — an
+    /// id-less re-scope would leave the daemon guessing which approval was being widened;</item>
+    /// <item>a bare <c>rescope</c> is refused BEFORE any round trip, and the refusal prints the form. The
+    /// daemon refuses it too, and that is the enforcement; this is the affordance that costs no turn;</item>
+    /// <item>the refusal sends NOTHING — asserted as a null request, because "refused" and "sent something
+    /// the daemon then refused" are different facts and only the second leaves a card behind.</item>
+    /// </list>
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "rescope", "plan-7", "PLAN_FILE" }, null)]
+    [InlineData(new[] { "rescope" }, "rescope <approved-plan-id> <plan.json>")]
+    [InlineData(new[] { "rescope", "plan-7" }, "rescope <approved-plan-id> <plan.json>")]
+    public void TheShimsRescope_NamesThePlanItWidens_AndRefusesLocallyWhenItCannot(
+        string[] args, string? expectedRefusal)
+    {
+        var run = RunPlanShimRequest(args);
+        if (run is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        var (requestJson, refusal) = run.Value;
+        if (expectedRefusal is not null)
+        {
+            Assert.Null(requestJson);
+            Assert.Contains(expectedRefusal, refusal!, StringComparison.Ordinal);
+            return;
+        }
+
+        Assert.Null(refusal);
+        using var request = System.Text.Json.JsonDocument.Parse(requestJson!);
+        Assert.Equal(AgentIpcRequest.RescopePlanOp, request.RootElement.GetProperty("op").GetString());
+        Assert.Equal("plan-7", request.RootElement.GetProperty("planId").GetString());
+        Assert.Contains(
+            "src/a.cs", request.RootElement.GetProperty("planJson").GetString()!, StringComparison.Ordinal);
+    }
+
+    /// <summary>Runs <c>mainguard-plan</c>'s own <c>main()</c> with the transport stubbed, and answers
+    /// with the ONE thing this shim's commit path contributes: the message.</summary>
     private static (string? Message, string? Refusal)? RunPlanShim(string[] args)
+    {
+        var run = RunPlanShimRequest(args);
+        if (run is null)
+        {
+            return null;
+        }
+
+        var (requestJson, refusal) = run.Value;
+        if (requestJson is null)
+        {
+            return (null, refusal);
+        }
+
+        using var request = System.Text.Json.JsonDocument.Parse(requestJson);
+        return (request.RootElement.GetProperty("message").GetString(), null);
+    }
+
+    /// <summary>
+    /// Runs <c>mainguard-plan</c>'s own <c>main()</c> with the transport stubbed and returns the REQUEST
+    /// it would have sent, verbatim, or the refusal that stopped it.
+    ///
+    /// <para>Through <c>main()</c> rather than a helper, for the reason §13.6 wrote down: M9 changed only
+    /// the spawn shim's <c>main</c> while its parser stayed correct, and a test that called the parser
+    /// directly stayed green while the shim on disk sent the wrong thing. A correct parser the dispatch
+    /// does not route through is exactly the shape of the defect.</para>
+    /// </summary>
+    private static (string? RequestJson, string? Refusal)? RunPlanShimRequest(
+        string[] args, string? planFileContents = null)
     {
         var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-plan-{Guid.NewGuid():N}");
         System.IO.Directory.CreateDirectory(dir);
@@ -445,11 +516,19 @@ public class AgentIpcProtocolTests
                 RedirectStandardError = true,
                 RedirectStandardOutput = true,
             };
+            // `present`, `revise` and `rescope` read a plan document off disk before they build a
+            // request, so a test of those verbs has to give the real main() a real file. PLAN_FILE is
+            // substituted rather than hardcoded because the path is per-run.
+            var planFile = System.IO.Path.Combine(dir, "plan.json");
+            System.IO.File.WriteAllText(
+                planFile,
+                planFileContents ?? "{\"scope\":[\"src/a.cs\"],\"approach\":\"a\",\"testStrategy\":\"t\"}");
+
             start.ArgumentList.Add(driver);
             start.ArgumentList.Add(shim);
             foreach (var arg in args)
             {
-                start.ArgumentList.Add(arg);
+                start.ArgumentList.Add(arg == "PLAN_FILE" ? planFile : arg);
             }
 
             using var process = System.Diagnostics.Process.Start(start);
@@ -468,7 +547,8 @@ public class AgentIpcProtocolTests
                 return (null, root.GetProperty("stderr").GetString());
             }
 
-            return (root.GetProperty("request").GetProperty("message").GetString(), null);
+            var request = root.GetProperty("request");
+            return (request.ValueKind == System.Text.Json.JsonValueKind.Null ? null : request.GetRawText(), null);
         }
         catch (System.ComponentModel.Win32Exception)
         {
@@ -488,6 +568,8 @@ public class AgentIpcProtocolTests
         + "seen = {}\n"
         + "def fake_call(request, timeout=None):\n"
         + "    seen[\"request\"] = request\n"
+        + "    if request.get(\"op\") in (\"present_plan\", \"revise_plan\", \"rescope_plan\", \"await_decision\"):\n"
+        + "        return {\"ok\": True, \"status\": \"Approved\", \"planId\": \"p1\", \"taskPrompt\": \"t\"}\n"
         + "    return {\"ok\": True, \"committed\": True, \"commitSha\": \"abc\", \"status\": \"agent/x\"}\n"
         + "mod.call = fake_call\n"
         + "err = io.StringIO()\n"
