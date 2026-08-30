@@ -221,6 +221,21 @@ public sealed record QueueEntryDiscardOutcome(
 public sealed record QueueEntryRejectOutcome(
     string AgentId, string RejectedBy, DateTimeOffset? RejectedAt);
 
+/// <summary>
+/// The operator's plan-mode toggle as the client sees it: the state, and the daemon's own sentence for it.
+/// </summary>
+/// <param name="Enabled">True while every delegated worker must have a human-approved plan first.</param>
+/// <param name="Summary">
+/// The daemon's rendering. Carried rather than composed here — two spellings of one setting is how the
+/// screen and the gate come to say different things.
+/// </param>
+public sealed record PlanModeView(bool Enabled, string Summary)
+{
+    /// <summary>What the client shows before the daemon has answered: the gate is on, because that is the
+    /// state it is safe to be wrong about.</summary>
+    public static readonly PlanModeView Unknown = new(true, "");
+}
+
 /// <summary>The coordinator conversation + the worker-authored plan gate (contract §2).</summary>
 public interface ICoordinatorService
 {
@@ -238,6 +253,18 @@ public interface ICoordinatorService
     /// <summary>The daemon's backpressure fact — how many workers are held at the gate, and whether that
     /// is why the coordinator has stopped spawning.</summary>
     OrchestrationBackpressure GetBackpressure();
+
+    /// <summary>
+    /// The operator's plan-mode toggle, as the daemon currently holds it.
+    ///
+    /// <para>Read from the daemon rather than from a client preference, and rendered with the daemon's own
+    /// sentence, for the standing §2.6 reason: a surface that disagrees with its gate is how somebody
+    /// comes to believe they still have an approval step they switched off.</para>
+    /// </summary>
+    PlanModeView GetPlanMode();
+
+    /// <summary>Turns the plan gate on or off for every worker spawned from now on.</summary>
+    Task SetPlanModeAsync(bool enabled);
 
     event Action? Changed;
     Task SendAsync(string text);

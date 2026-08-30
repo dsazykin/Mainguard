@@ -75,7 +75,25 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     /// sentence themselves, the region cannot be visible while empty, or collapsed while something waits.</para>
     /// </summary>
     public bool HasGateContent =>
-        PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0;
+        PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0
+        || !PlanModeEnabled;
+
+    /// <summary>The daemon's plan-mode toggle. True while every worker must have an approved plan.</summary>
+    [ObservableProperty] private bool _planModeEnabled = true;
+
+    /// <summary>The daemon's own sentence for that state — rendered, never re-composed here.</summary>
+    [ObservableProperty] private string _planModeSummary = "";
+
+    /// <summary>
+    /// Re-raise <see cref="HasGateContent"/> when the toggle moves.
+    ///
+    /// <para>This is the whole reason plan mode is part of that flag: with approvals off nothing is ever
+    /// pending, so a gate that only appeared for pending cards would go dark permanently — and a dark
+    /// gate is exactly what an IDLE orchestration looks like. The one state a human must not have to
+    /// guess at is the one where an approval step they think they have is switched off, so an off gate
+    /// stays on screen saying so.</para>
+    /// </summary>
+    partial void OnPlanModeEnabledChanged(bool value) => OnPropertyChanged(nameof(HasGateContent));
 
     /// <param name="endWorker">
     /// Ends an agent by id — the release an escalated card offers. Optional because the design harness and
@@ -147,6 +165,33 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         BackpressureText = backpressure.Signal;
         IsCapSaturatedByBlockedWorkers = backpressure.CapSaturatedByBlockedWorkers;
 
+        // Read from the daemon on every pass, so the checkbox tracks the gate rather than the last click.
+        // A toggle that rendered the requested value would keep showing "on" after a Set that never
+        // arrived — the one disagreement where a human believes they have an approval step and do not.
+        var planMode = _coordinator.GetPlanMode();
+        PlanModeEnabled = planMode.Enabled;
+        PlanModeSummary = planMode.Summary;
+
+    }
+
+    /// <summary>
+    /// Flips the daemon's plan-mode toggle, then re-reads it.
+    ///
+    /// <para>The new value is computed from the property the checkbox has ALREADY moved (the control sets
+    /// its own <c>IsChecked</c> before the command runs), and the refresh afterwards puts the daemon's
+    /// answer back — so a failed call ends with the checkbox showing what the daemon actually holds.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task TogglePlanModeAsync()
+    {
+        try
+        {
+            await _coordinator.SetPlanModeAsync(PlanModeEnabled);
+        }
+        finally
+        {
+            Refresh();
+        }
     }
 
     private async Task DecideAsync(string planId, bool approve, string? feedback)
