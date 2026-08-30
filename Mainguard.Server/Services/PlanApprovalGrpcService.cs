@@ -29,6 +29,7 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
     private readonly Mainguard.Agents.Agents.Orchestrator.PlanApprovalService _plans;
     private readonly Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate _planGate;
     private readonly Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits _limits;
+    private readonly Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch _planMode;
     private readonly Runtime.AgentSessionStore _sessions;
     private readonly IApproverIdentityResolver _identity;
     private readonly ILogger _log;
@@ -37,6 +38,7 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         Mainguard.Agents.Agents.Orchestrator.PlanApprovalService plans,
         Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate planGate,
         Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits limits,
+        Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch planMode,
         Runtime.AgentSessionStore sessions,
         IApproverIdentityResolver identity,
         ILoggerFactory loggerFactory)
@@ -44,6 +46,7 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         _plans = plans ?? throw new ArgumentNullException(nameof(plans));
         _planGate = planGate ?? throw new ArgumentNullException(nameof(planGate));
         _limits = limits ?? throw new ArgumentNullException(nameof(limits));
+        _planMode = planMode ?? throw new ArgumentNullException(nameof(planMode));
         _sessions = sessions ?? throw new ArgumentNullException(nameof(sessions));
         _identity = identity ?? throw new ArgumentNullException(nameof(identity));
         _log = (loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory)))
@@ -244,8 +247,49 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         update.BackpressureSignal = _planGate.BackpressureSignal(
             update.BlockedWorkerCount, update.EscalatedWorkerCount,
             activeWorkers, _limits.MaxActiveWorkers) ?? "";
+
+        // On EVERY update, including the empty one. An empty plan gate has two explanations — nothing is
+        // running, or approvals are off — and this is the only thing that tells them apart.
+        update.PlanModeEnabled = _planMode.Enabled;
+        update.PlanModeSummary = _planMode.Summary;
         return update;
     }
+
+    /// <summary>The current plan-mode setting. A plain read; no role restriction, like the other reads.</summary>
+    public override Task<PlanModeState> GetPlanMode(GetPlanModeRequest request, ServerCallContext context) =>
+        Task.FromResult(State());
+
+    /// <summary>
+    /// Sets the operator's plan-mode toggle.
+    ///
+    /// <para><b>Denied to a coordinator at <c>RoleInterceptor</c>, not here.</b> Same boundary and same
+    /// mechanism as <see cref="ApprovePlan"/>: the check belongs where the daemon serves the call and
+    /// dispatches by method, so it cannot be reached around by a field inside a shared message.</para>
+    ///
+    /// <para>The actor recorded on the audit event is the same daemon-derived OS peer credential that
+    /// records an approver (SA-1/F2) — there is no client-supplied identity field here either, and adding
+    /// one would be the same rejection.</para>
+    /// </summary>
+    public override Task<PlanModeState> SetPlanMode(SetPlanModeRequest request, ServerCallContext context)
+    {
+        var actor = _identity.Resolve(context);
+        if (_planMode.Set(request.Enabled, actor))
+        {
+            _log.LogWarning(
+                "plan mode {State} by {Actor} — this governs every worker spawned from now on",
+                request.Enabled ? "ENABLED" : "DISABLED", actor);
+        }
+
+        // Read BACK from the switch rather than echoing the request. What the client renders must be what
+        // the daemon will act on, and a persistence failure is the case where those differ.
+        return Task.FromResult(State());
+    }
+
+    private PlanModeState State() => new()
+    {
+        Enabled = _planMode.Enabled,
+        Summary = _planMode.Summary,
+    };
 
     /// <summary>Distinct workers among the emitted entries in one status — the banner's arithmetic.</summary>
     private static int CountWorkers(PlanUpdate update, string status) => update.Plans

@@ -88,6 +88,12 @@ public sealed class RoleInterceptor : Interceptor
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
+        // The plan-mode toggle, on exactly the boundary above and for a strictly stronger reason. A
+        // coordinator that could approve one plan would hold the gate for one worker; a coordinator that
+        // could turn plan mode OFF removes the gate for every worker it spawns from then on, without a
+        // human seeing a card at all. Contract §4's "plan approval" denial is about holding the gate it
+        // is denied at, and this is the wholesale form of it.
+        "/mainguard.v1.PlanApprovalService/SetPlanMode",
         // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per
         // page) with no ownership scoping — a coordinator could read a worker's whole session, which
         // is exactly the read the coordinator surface is not supposed to have. The operator token

@@ -89,6 +89,7 @@ public sealed class AgentSpawnService
     private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner _mergeQueues;
     private readonly Mainguard.Agents.Agents.Orchestrator.PlanApprovalService _plans;
     private readonly Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate _planGate;
+    private readonly Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch _planMode;
     private readonly IAuditLog _audit;
     private readonly Gateway.AgentGatewayCredentials _gatewayCredentials;
     private readonly ILogger _spawnLog;
@@ -107,6 +108,7 @@ public sealed class AgentSpawnService
         Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner mergeQueues,
         Mainguard.Agents.Agents.Orchestrator.PlanApprovalService plans,
         Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate planGate,
+        Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch planMode,
         IAuditLog audit,
         Gateway.AgentGatewayCredentials gatewayCredentials,
         ILoggerFactory loggerFactory)
@@ -123,6 +125,8 @@ public sealed class AgentSpawnService
         _mergeQueues = mergeQueues;
         _plans = plans;
         _planGate = planGate;
+        _planMode = planMode
+            ?? throw new ArgumentNullException(nameof(planMode));
         _audit = audit;
         // MG-4. Required, not optional: this is the only thing that revokes a stopped agent's gateway
         // token and drops the daemon's custody of its provider key. Registered unconditionally by
@@ -260,17 +264,36 @@ public sealed class AgentSpawnService
         // leave a window in which the worker's own plan shim could ask for its brief and be told the
         // session was unknown; more importantly, the gate must be armed before anything inside the jail
         // can run, or "the daemon holds the task" is only true most of the time.
-        var planGated = heldTaskTitle is not null || heldTaskPrompt is not null;
-        if (planGated)
+        var delegated = heldTaskTitle is not null || heldTaskPrompt is not null;
+
+        // The operator's plan-mode toggle, read ONCE per spawn and then owned by this worker for its
+        // whole life (WorkerPlanMode). Re-reading the switch later would let a toggle retroactively
+        // authorise a worker still blocked at the gate, or strand one that had already been told to
+        // start — two different lies, in opposite directions.
+        //
+        // A coordinator gets the same value even though it is not itself held: its operating
+        // instructions describe the gate its workers will meet, and that text is rendered here.
+        // Everything else — a manual-mode agent, an external-PR head — is not governed by the toggle at
+        // all and keeps the Gated default, so its jail text is byte-identical to before.
+        var planMode = delegated || role == AgentRoles.Coordinator
+            ? _planMode.ModeForNewWorker
+            : Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated;
+
+        if (delegated)
         {
             // The repo is half the key (see WorkerPlanGate._held): a held task belongs to (repo, agent id),
             // never to the bare id.
             // No `?? "Untitled task"` here any more. That fallback is what made the brief the task: with
             // the shim sending no title, `Title ?? TaskPrompt` upstream never reached the default, and
             // every worker's brief WAS its task. Both values are now required and validated above.
+            // Held in BOTH modes, and that is the design rather than an oversight. "Plan mode off" is
+            // not "skip the gate": an unheld worker is invisible to MayAutoVerify, carries the
+            // manual-agent wording on its merge record, and has no recorded authorisation at all — the
+            // shape SpawnWorkerAsync already calls "strictly worse than the defect being fixed". What
+            // the mode changes is the one thing the toggle names: whether the task is withheld.
             _planGate.Hold(
                 session.Id, parentAgentId ?? "", heldTaskTitle!, heldTaskPrompt!,
-                heldBudgetUsd, session.RepoHash ?? string.Empty);
+                heldBudgetUsd, session.RepoHash ?? string.Empty, planMode);
         }
 
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
@@ -284,7 +307,7 @@ public sealed class AgentSpawnService
         string? ipcDir = null;
         try
         {
-            if (role == AgentRoles.Coordinator || planGated)
+            if (role == AgentRoles.Coordinator || delegated)
             {
                 // The endpoint is a container mount source, so it must exist before the jail does.
                 // Best-effort: a box where the Unix socket cannot bind still gets a working agent
@@ -314,7 +337,7 @@ public sealed class AgentSpawnService
                             ? HandleShimRequestAsync
                             : HandleWorkerPlanRequestAsync,
                         endpointRole,
-                        _launcher.InstructionsFor(endpointRole));
+                        _launcher.InstructionsFor(endpointRole, planMode));
                     _coordLog.LogInformation(
                         "{Role} IPC endpoint created: {Dir}", endpointRole, ipcDir);
                 }
@@ -369,7 +392,11 @@ public sealed class AgentSpawnService
                 // The role goes onto the jail's own labels. The session record that carries it here is
                 // in-memory and dies with the daemon; the container outlives both, so the label is what
                 // lets the next daemon adopt a surviving coordinator back AS a coordinator.
-                agentRole: role).ConfigureAwait(false);
+                agentRole: role,
+                // Same value the endpoint copy above was rendered from — the two deliveries of one
+                // jail's briefing disagreeing about the machine is defect G2, and a mode is exactly the
+                // sort of argument one of two call sites forgets.
+                planMode: planMode).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {
@@ -857,10 +884,16 @@ public sealed class AgentSpawnService
                 heldTaskTitle: request.Title,
                 heldTaskPrompt: request.TaskPrompt).ConfigureAwait(false);
 
+            // Read back from the GATE, not from the switch. The two can differ by a toggle flipped in
+            // the milliseconds since this spawn started, and what the coordinator must be told is what
+            // happened to the worker it now owns. A literal "AwaitingPlan" here — the shipped wording —
+            // would tell a coordinator to wait for an approval that is never coming, which is the
+            // §12.2/F2 failure ("the coordinator could never be told the job finished") arriving at the
+            // other end of the loop.
             return new AgentIpcResponse(
                 Ok: true,
                 AgentId: agentId,
-                Status: "AwaitingPlan",
+                Status: _planGate.IsUngated(agentId) ? "Working" : "AwaitingPlan",
                 Error: null);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1156,6 +1189,7 @@ public sealed class AgentSpawnService
             StringComparer.Ordinal)
         {
             [AgentIpcRequest.BriefOp] = (_, w, _) => Task.FromResult(Brief(w)),
+            [AgentIpcRequest.TaskOp] = (_, w, _) => Task.FromResult(TaskFor(w)),
             [AgentIpcRequest.PresentPlanOp] = PresentPlanAsync,
             [AgentIpcRequest.RevisePlanOp] = RevisePlanAsync,
             [AgentIpcRequest.AwaitDecisionOp] = AwaitDecisionAsync,
@@ -1252,10 +1286,44 @@ public sealed class AgentSpawnService
             MaxRevisions: _plans.MaxPlanRevisions);
     }
 
+    /// <summary>
+    /// What am I here to DO? The withheld task, released through the gate's own
+    /// <c>TryReleaseTask</c> — the same single exit, with the same release-once audit record, that
+    /// <see cref="BlockForDecisionAsync"/> uses on approval.
+    ///
+    /// <para>There is deliberately no second reading of the mode here. Whether this worker may have its
+    /// task is <c>WorkerPlanGate.MayWork</c>'s answer and nothing else's; asking the switch again would
+    /// be the second copy of a policy that MG-12 says goes decorative, and it would be a copy that
+    /// answers about the daemon's CURRENT setting rather than about this worker's.</para>
+    /// </summary>
+    private AgentIpcResponse TaskFor(string workerAgentId)
+    {
+        if (_planGate.ModeFor(workerAgentId) is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: "this worker session is no longer live");
+        }
+
+        if (!_planGate.TryReleaseTask(workerAgentId, out var taskPrompt))
+        {
+            _planGate.MayWork(workerAgentId, out var refusal);
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: refusal);
+        }
+
+        return new AgentIpcResponse(
+            Ok: true, AgentId: workerAgentId, Status: "Task", TaskPrompt: taskPrompt);
+    }
+
     /// <summary>The worker presents the plan it authored — then blocks here until a human decides.</summary>
     private async Task<AgentIpcResponse> PresentPlanAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
     {
+        // Refused BEFORE the schema check, so an ungated worker is told the real reason rather than
+        // being sent to fix a plan that would be refused however well-formed it was.
+        if (_planGate.RefusePlanPresentation(workerAgentId) is { } noPlanWanted)
+        {
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: noPlanWanted);
+        }
+
         if (!TryValidatePlan(request.PlanJson, out var fields, out var invalid))
         {
             return invalid;
@@ -1281,6 +1349,11 @@ public sealed class AgentSpawnService
     private async Task<AgentIpcResponse> RevisePlanAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
     {
+        if (_planGate.RefusePlanPresentation(workerAgentId) is { } noPlanWanted)
+        {
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: noPlanWanted);
+        }
+
         if (string.IsNullOrWhiteSpace(request.PlanId))
         {
             return new AgentIpcResponse(Ok: false, Error: "a plan id is required (mainguard-plan revise <id> <plan.json>)");
@@ -1318,6 +1391,11 @@ public sealed class AgentSpawnService
     private async Task<AgentIpcResponse> AwaitDecisionAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
     {
+        if (_planGate.RefusePlanPresentation(workerAgentId) is { } noPlanWanted)
+        {
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: noPlanWanted);
+        }
+
         if (string.IsNullOrWhiteSpace(request.PlanId))
         {
             return new AgentIpcResponse(Ok: false, Error: "a plan id is required (mainguard-plan await <id>)");
