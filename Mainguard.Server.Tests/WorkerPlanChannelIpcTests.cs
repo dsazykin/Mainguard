@@ -516,6 +516,107 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         }
     }
 
+    // ---- commit_work: the deviation declaration --------------------------
+    //
+    // The defect: a human approved a plan whose `approach` said the module had no validation idiom, so
+    // the worker would keep plain `a / b`. The worker shipped a throwing validation layer that changed
+    // three PRE-EXISTING helpers. The plan's scope was honoured, so the out-of-scope arm saw nothing and
+    // FlaggedItems was []; CanMerge was true and the state Verified, because the worker had also written
+    // the tests asserting its own new behaviour. Nothing anywhere held the approved approach against the
+    // diff, and nothing does now — what changed is that the worker must ANSWER, and cannot answer by
+    // saying nothing.
+
+    /// <summary>
+    /// <b>Silence is refused, and nothing is committed.</b> An optional declaration would be absent on
+    /// exactly the runs that needed it, so a plan-gated commit that carries neither answer does not
+    /// happen. The refusal is safe to make mandatory precisely because it lands BEFORE the commit: the
+    /// worktree is untouched, so it costs the worker one re-run and no work.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorkersCommitWithNoDeclaration_IsRefused_AndNothingIsCommitted()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide, with validation nobody asked for"));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("deviation declaration", refused.Error!, StringComparison.Ordinal);
+        // The refusal names the form, so the correction costs no round trip and no guessing.
+        Assert.Contains(WorkerPlanShim.CommitUsage, refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
+    /// <summary>
+    /// A declared departure is recorded on the plan that AUTHORISED the work — the same record the
+    /// out-of-scope comparison resolves — so the approach shown at review and the deviation shown beside
+    /// it can never describe two different plans. The commit itself is unaffected: the declaration is
+    /// evidence, not a second gate on the work leaving the jail.
+    /// </summary>
+    [Fact]
+    public async Task ADeclaredDeviation_IsRecordedOnTheApprovedPlan_AndTheCommitStillLands()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp,
+            Message: "feat: divide()",
+            Deviations: new[] { "added RangeError on zero; the approach said keep plain a / b" }));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.True(response.Committed);
+
+        var work = Rig.Plans.ApprovedWorkFor(workerId)!;
+        Assert.Equal(DeviationDeclaration.Declared, work.Declaration);
+        Assert.Equal(
+            new[] { "added RangeError on zero; the approach said keep plain a / b" }, work.Deviations);
+    }
+
+    /// <summary>
+    /// The explicit "none" is recorded as the ASSERTION it is. This is the pair that makes the mechanism
+    /// mean anything: a branch whose worker said "I checked, none" and one nobody ever asked must not end
+    /// up in the same state, because the second is a question and only the first is an answer.
+    /// </summary>
+    [Fact]
+    public async Task AnAssertedNoDeviations_IsRecordedAsAnAnswer_NotAsSilence()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        Assert.Equal(DeviationDeclaration.NotDeclared, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal(DeviationDeclaration.None, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+    }
+
+    /// <summary>
+    /// Both answers at once is refused rather than resolved by precedence — they say opposite things
+    /// about the same work, and a rule about which one wins would be invisible at the call site. Refused
+    /// at the daemon as well as at the shim, because the shim's refusal is an affordance and this is the
+    /// enforcement.
+    /// </summary>
+    [Fact]
+    public async Task ACommitThatBothDeclaresAndDeniesDeviations_IsRefused()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()",
+            NoDeviations: true, Deviations: new[] { "added RangeError" }));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("opposite things", refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
     // ---- rescope_plan: the worker's legal way to widen an approved scope ---
     //
     // Live testing found a worker that TRIED to widen legitimately and was refused — one live plan per

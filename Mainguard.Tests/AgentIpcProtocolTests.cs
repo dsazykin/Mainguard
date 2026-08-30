@@ -532,6 +532,14 @@ public class AgentIpcProtocolTests
     /// directly stayed green while the shim on disk sent the wrong thing. A correct parser the dispatch
     /// does not route through is exactly the shape of the defect.</para>
     /// </summary>
+    /// <summary>
+    /// <see cref="RunPlanShimRequest"/> for the deviation-declaration suite, which drives the same
+    /// <c>main()</c> for a different verb. Exposed rather than duplicated: a second copy of this driver
+    /// is a second thing that can stop matching the shim the daemon actually writes.
+    /// </summary>
+    internal static (string? RequestJson, string? Refusal)? RunPlanShimRequestForTests(string[] args)
+        => RunPlanShimRequest(args);
+
     private static (string? RequestJson, string? Refusal)? RunPlanShimRequest(
         string[] args, string? planFileContents = null)
     {

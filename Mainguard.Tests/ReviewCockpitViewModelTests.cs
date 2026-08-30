@@ -49,6 +49,133 @@ public class ReviewCockpitViewModelTests
     private static ReviewCockpitContext Context(IReadOnlyList<FilePatch> diff) =>
         new("loom-1", "Loom-1", "fix/x", diff);
 
+    // ---- The approved approach, beside the diff (2026-08-31) ----------------
+    //
+    // A review is a comparison and this surface only ever had one side of it. The approved `approach`
+    // was written by the worker, decided on by the human, and then never rendered anywhere — so a branch
+    // that did the opposite of what it proposed looked exactly like one that did it faithfully. Measured:
+    // an approved approach said the module had no validation idiom and the plan would keep plain `a / b`;
+    // the branch shipped a throwing validation layer that changed three pre-existing functions, with the
+    // flagged list EMPTY (the file scope was honoured) and the verification green (the worker wrote the
+    // tests). Nothing below judges the diff; it puts the thing it was supposed to match on screen.
+
+    /// <summary>
+    /// The approved plan's approach and its identity are rendered, verbatim. Verbatim matters: a
+    /// summarised approach is the surface choosing which sentence the reviewer gets to compare against,
+    /// and the sentence that gets dropped is the one the diff disagrees with.
+    /// </summary>
+    [Fact]
+    public void TheApprovedApproachIsRenderedBesideTheDiff()
+    {
+        var vm = new ReviewCockpitViewModel(Context(new[] { Patch("src/calc.js", Source()) }) with
+        {
+            ApprovedPlanId = "3f2a9c1b7d4e",
+            ApprovedPlanTitle = "Add divide() to the calculator",
+            ApprovedApproach = "the module has no error-handling or validation idiom anywhere in it, so "
+                + "I will keep plain a / b and let the language semantics stand",
+            DeviationDeclaration = "None",
+        });
+
+        Assert.True(vm.HasApprovedApproach);
+        Assert.Contains("keep plain a / b", vm.ApprovedApproachText, StringComparison.Ordinal);
+        Assert.Contains("Add divide() to the calculator", vm.ApprovedPlanHeading, StringComparison.Ordinal);
+        Assert.Contains("3f2a9c1", vm.ApprovedPlanHeading, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// No approval, no panel. A manual agent and an external-PR head were never approved against
+    /// anything, and an empty "approved approach" card would assert an approval nobody gave — the
+    /// fabricated-reassurance failure this whole surface exists to avoid.
+    /// </summary>
+    [Fact]
+    public void NoPanelIsDrawnForABranchThatWasNeverApprovedAgainstAnything()
+    {
+        var vm = new ReviewCockpitViewModel(Context(new[] { Patch("src/calc.js", Source()) }));
+
+        Assert.False(vm.HasApprovedApproach);
+        Assert.Equal("", vm.ApprovedApproachText);
+        Assert.Equal("", vm.DeviationDeclarationText);
+    }
+
+    /// <summary>
+    /// <b>The three declarations read as three different things.</b> This is the assertion that keeps
+    /// the mechanism from becoming a rubber stamp at the last layer: "the worker says it matches" and
+    /// "nobody ever asked" must not produce the same sentence, and the one that is an unanswered
+    /// question must not read as reassurance.
+    /// </summary>
+    [Theory]
+    [InlineData("None", false, "declared no deviation")]
+    [InlineData("Declared", true, "declared it departed")]
+    [InlineData("NotDeclared", true, "No deviation declaration is on record")]
+    public void TheThreeDeclarationsAreRenderedAsThreeDifferentSentences(
+        string declaration, bool expectedAttention, string expectedText)
+    {
+        var vm = new ReviewCockpitViewModel(Context(new[] { Patch("src/calc.js", Source()) }) with
+        {
+            ApprovedPlanTitle = "Add divide()",
+            ApprovedApproach = "keep plain a / b",
+            DeviationDeclaration = declaration,
+        });
+
+        Assert.Contains(expectedText, vm.DeviationDeclarationText, StringComparison.Ordinal);
+        Assert.Equal(expectedAttention, vm.DeviationNeedsAttention);
+    }
+
+    /// <summary>
+    /// A "None" declaration is rendered as the CLAIM it is, not as a verification. The worker's tests
+    /// are the worker's own, so a line reading like a check would be the surface manufacturing the exact
+    /// reassurance the defect ran on.
+    /// </summary>
+    [Fact]
+    public void AnAssertedNoneIsRenderedAsAClaim_NotAsACheck()
+    {
+        var vm = new ReviewCockpitViewModel(Context(new[] { Patch("src/calc.js", Source()) }) with
+        {
+            ApprovedApproach = "keep plain a / b",
+            DeviationDeclaration = "None",
+        });
+
+        Assert.Contains("its claim, not a check", vm.DeviationDeclarationText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A daemon that sends no declaration at all (one predating the field) gets no sentence — this
+    /// surface does not pick one of the three answers on the daemon's behalf.
+    /// </summary>
+    [Fact]
+    public void ADaemonThatSaysNothingAboutDeviations_GetsNoSentenceInventedForIt()
+    {
+        var vm = new ReviewCockpitViewModel(Context(new[] { Patch("src/calc.js", Source()) }) with
+        {
+            ApprovedApproach = "keep plain a / b",
+            DeviationDeclaration = null,
+        });
+
+        Assert.True(vm.HasApprovedApproach);
+        Assert.Equal("", vm.DeviationDeclarationText);
+    }
+
+    /// <summary>
+    /// The flagged panel names worker-declared rows as their own group. They are a different KIND of
+    /// claim from everything else in that panel — the rest is what the daemon found in the diff, this is
+    /// what the worker said about its own work — and the reviewer has to read it against the approach
+    /// above rather than against the file the row names.
+    /// </summary>
+    [Fact]
+    public void DeclaredDeviationsAreNamedAsTheirOwnGroupInTheFlaggedPanel()
+    {
+        var live = new FakeFlaggedSource { MergeAllowed = false, MergeReason = "1 flagged change" };
+        live.Items.Add(new FlaggedItem(
+            $"{FlaggedKind.DeclaredDeviation}|(worker-declared deviation)|abc",
+            "(worker-declared deviation)", "Source",
+            "the worker declared it departed from the approved approach — \"added RangeError\"", false));
+
+        var vm = new ReviewCockpitViewModel(
+            Context(new[] { Patch("src/calc.js", Source()) }), live: live);
+
+        Assert.Equal("WORKER-DECLARED DEVIATIONS (1)", vm.FlaggedPanel.DeviationHeading);
+    }
+
     [Fact]
     public void RiskOrdering_Reorders_ButNeverHides()
     {
