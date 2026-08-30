@@ -89,6 +89,55 @@ public sealed class WorkerReadinessTriggerWiringTests
             host.Services.GetRequiredService<WorkerReadinessTrigger>().Source, invalidator.Source);
     }
 
+    /// <summary>
+    /// …and the daemon really CONSTRUCTED both of them at boot, asserted without this test resolving
+    /// either one first.
+    ///
+    /// <para>This is the assertion the two tests above structurally cannot make. A DI singleton is built on
+    /// first resolve, so <c>Assert.NotNull(GetService&lt;T&gt;())</c> passes even when the hosted service
+    /// that was supposed to construct it does not — the test itself becomes the only thing that ever built
+    /// the object, and "registered, never running" goes green. Mutating
+    /// <c>WorkerReadinessHostedService</c> to resolve nothing left every other test in this file passing.
+    /// </para>
+    ///
+    /// <para>So the evidence is the WATCHER's subscriber list, read straight off the event's backing field
+    /// before anything here asks the container for a trigger or an invalidator. Both types subscribe in
+    /// their constructors — that is the whole reason they do — so a subscriber of each type on the daemon's
+    /// own watcher is proof that boot built them. Reaching for a private field is deliberate and is cheaper
+    /// than the alternative: the only other honest evidence is a real ref advance, which needs a provisioned
+    /// repo and an agent worktree, and this file's job is the composition root rather than the behaviour.</para>
+    /// </summary>
+    [Fact]
+    public void BothSubscribersAreConstructedAtBoot_NotMerelyRegistered()
+    {
+        using var vmRoot = new TempVmRoot();
+        using var host = NewHost(vmRoot.Path);
+
+        var worktrees = Assert.IsType<WorktreeManager>(
+            host.Services.GetRequiredService<IAgentEnvironment>().Worktrees);
+        var subscribers = AdvancedSubscribers(worktrees.RefWatcher);
+
+        Assert.Contains(subscribers, s => s is WorkerReadinessTrigger);
+        Assert.Contains(subscribers, s => s is BranchTipInvalidator);
+    }
+
+    /// <summary>The objects currently subscribed to <c>AgentRefWatcher.Advanced</c>.</summary>
+    private static object[] AdvancedSubscribers(AgentRefWatcher watcher)
+    {
+        var field = typeof(AgentRefWatcher).GetField(
+            "Advanced",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException(
+                "AgentRefWatcher.Advanced has no backing field — this assertion needs rewriting, not deleting.");
+
+        return field.GetValue(watcher) is not Delegate handler
+            ? Array.Empty<object>()
+            : handler.GetInvocationList()
+                .Select(d => d.Target!)
+                .Where(t => t is not null)
+                .ToArray();
+    }
+
     private static Microsoft.AspNetCore.Mvc.Testing.WebApplicationFactory<Program> NewHost(string vmRoot)
         => new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             services.AddSingleton<IAgentEnvironment>(new Wsl2AgentEnvironment(vmRoot: vmRoot))));

@@ -345,6 +345,43 @@ public class VerifiedFreezeTests
     }
 
     /// <summary>
+    /// The other direction, and the one a defensive check gets wrong: a re-verification after the branch
+    /// moved with NO announcement must NOT be refused.
+    ///
+    /// <para>The stale cascade rebases a branch and then re-runs its tests, and a rebase reaches the mirror
+    /// without ever raising <c>Advanced</c> — so the queue legitimately measures a tip it has never been
+    /// told about. If the settle did not advance the queue's known tip to the one the run measured, the
+    /// branch-side compare in <c>CanMerge</c> would see the pre-rebase tip against a post-rebase record and
+    /// refuse forever: a <c>Verified</c> entry, green by every other check, permanently unmergeable with
+    /// nothing anywhere saying why. That is the same shape as the un-reparented-branch loop
+    /// <c>TryReturnToWorking</c> exists to break, and it is what a freshness gate costs when it answers a
+    /// question it does not have the facts for.</para>
+    /// </summary>
+    [Fact]
+    public async Task ARebasedBranchThatWasNeverAnnounced_IsStillMergeableAfterItReVerifies()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.Advance("w-1", "tip-a");
+        await rig.AutoVerifyAsync("w-1");
+        Assert.Equal("tip-a", rig.Queue.ObservedBranchTip("w-1"));
+
+        // A co-tenant merges; the cascade rebases this branch onto the new main. The rebase moves the
+        // mirror ref without the sweep announcing it — nothing calls NotifyBranchAdvanced.
+        rig.Queue.NotifyMainMoved("main1");
+        Assert.Equal(WorkerMergeState.StaleVerified, rig.Queue.GetState("w-1"));
+        rig.Tip["w-1"] = "tip-a-rebased";
+
+        await rig.Queue.RunVerificationAsync("w-1", CancellationToken.None);
+
+        Assert.Equal(WorkerMergeState.Verified, rig.Queue.GetState("w-1"));
+        Assert.True(
+            rig.Queue.CanMerge("w-1", out var reason),
+            $"a rebased-and-re-verified branch was refused: {reason}");
+        Assert.Equal("tip-a-rebased", rig.Queue.ObservedBranchTip("w-1"));
+    }
+
+    /// <summary>
     /// <b>The structural pairing.</b> Every state <see cref="MergeQueue.CanMerge"/> can answer TRUE from
     /// must be a state an advanced branch invalidates.
     ///

@@ -2232,3 +2232,170 @@ in a review surface.
 - **No history.** The panel reads the LAST verification only, which is what `GetVerificationLog` serves.
   `VerificationStore.History` exists daemon-side and has no RPC; a "previous runs" surface is a separate
   change with its own wire.
+
+## 19. Defect H6 — a `Verified` row froze forever, and the product offered the merge anyway
+
+The most dangerous thing the live testing found. Not "the UI is confusing" — the UI was *confident*, and
+wrong, about the one question a merge rests on.
+
+### 19.1 What was observed, with ground truth
+
+Agent `4c43d17a`, 2026-08-30. `VerificationRows` 50 and `~/.mainguard/logs/{coordinator,merge}.log`:
+
+| time | what happened |
+|---|---|
+| 01:35:12 | auto-verify **PASSED** against `main@ffbc3bc7`; the entry settled to `Verified` |
+| 01:41:20 | `plan-shim request: op=commit_work` |
+| 01:59:28 | `op=commit_work` |
+| 02:13:29 | `op=commit_work` |
+| 02:18:33 | the human pressed Verify: `RunVerification refused … Illegal merge-state transition Verified → Verifying` |
+
+Three commits over ~38 minutes, and `MergeQueueRows` shows the entry's `UpdatedUtc` still equal to its
+`VerifiedAtUtc` — the row never moved again. Meanwhile the review cockpit listed the *old* files, stamped
+the header "verified", footed **"ready to merge"**, and left **Merge enabled**, for a tip carrying an
+out-of-scope change and arithmetic that fails the repo's own tests.
+
+The contrast is in the same log and it is what makes this a design defect rather than an accident: agent
+`9b4a546f` went **red** at 02:23 and was re-verified at 02:33 the moment it pushed a fix — because
+`VerificationFailed` *is* in the readiness trigger's eligible set. Recovery worked for the failing branch
+and not for the passing one.
+
+### 19.2 Three failures, one root
+
+1. **The evidence did not record what it was evidence FOR.** A `VerificationRecord` pinned `main@sha` and
+   nothing else. So the queue could ask "has main moved under this?" — it does, in `CanMerge` and in the
+   stale cascade — and *structurally could not ask* "has the branch moved out from under it?".
+2. **Nothing told the queue the branch had moved.** `MergeQueue.NotifyNewCommits` existed, `Verified →
+   Working` was already legal, and the method had exactly two callers: `ExternalPrIntake` (an upstream PR
+   head moved) and the dev queue seeder. Neither fires for a worker in a jail. `WorkerReadinessTrigger`
+   starts runs only from `Working`/`StaleVerified`/`VerificationFailed`, so with nothing walking the row
+   out of `Verified`, no automatic verification could ever fire again.
+3. **Two gates were disarmed as a consequence.** `ArmFlaggedChangeReview` runs *only* inside a
+   verification, so the F6 out-of-scope classification and every human acknowledgment stayed pinned to a
+   two-commit-old diff — which means a newly introduced CI workflow, git hook, executable config or
+   out-of-scope file was **never detected at all**. The comment at `MergeQueueProvisioner.cs:1003` asserted
+   the opposite ("a branch that pushes new work re-verifies, re-classifies, and drops every ack that
+   covered the old bytes"); it documented behaviour that did not exist.
+
+### 19.3 The state model, and why it is not a new state
+
+The obvious move is a sibling of `StaleVerified`. It is wrong, and the reason is worth stating precisely.
+
+**`StaleVerified` means the evidence is still ABOUT this tree, measured against an old main.** The
+branch's bytes are unchanged. Every acknowledgment still binds to the same flagged-set hash, the F6 scope
+verdict still holds, the diff a human reviewed is still the diff that will merge — and the honest remedy is
+mechanical: rebase onto the new main and re-run. That is exactly what the cascade does, and it is why the
+cascade *keeps* the record.
+
+**The agent's own commits mean the evidence is about a tree that no longer exists.** Different diff,
+different flagged set, void acks, a scope verdict computed from bytes nobody will merge. There is nothing
+to rebase and nothing to salvage; there is only "verify the new thing". Routing it through `StaleVerified`
+would put it in the cascade, retain a `VerificationRecord` and a `VerifiedAtUtc` asserting a verdict about
+a vanished tree, and let the rail go on reading "was green, just needs a refresh" about work nobody has
+ever tested.
+
+The state that already means *there is no evidence about this branch* is `Working`. `Verified → Working` is
+already legal and already documented as "new commits from the agent invalidate", and `NotifyNewCommits`
+already implements it exactly. **So no state was added and no edge was added.** What was added is the
+caller — which is what the defect always was.
+
+The invalidation is scoped to `Verified` and `AwaitingReview`: precisely the two states `CanMerge` admits,
+i.e. the two where stale evidence is not merely wrong but *dangerous*. `StaleVerified` and
+`VerificationFailed` already refuse the merge and are already in the trigger's eligible set, and demoting
+`VerificationFailed` would erase a red verdict a human is reading and replace it with "not verified yet" —
+the exact conflation §16's H2 exists to end.
+
+### 19.4 What changed
+
+- **`VerificationRecord.BranchSha`** (+ `VerificationRow.BranchSha`, migration `AddVerificationBranchSha`,
+  and both shas in the artifact header). The provisioner resolves `agent/<id>` from the mirror *after* the
+  pre-verification publish, so it names the tree the container is measured on. Existing rows take `""`,
+  which is the correct value rather than a backfill: nothing knows what tip they ran on, and every
+  freshness comparison reads empty as "not measured" and declines to answer.
+- **`MergeQueue.NotifyBranchAdvanced`** — records the tip; for `Verified`/`AwaitingReview` clears the
+  record and walks to `Working` with a render-verbatim `BranchMovedReason`.
+- **`BranchTipInvalidator`** — the missing caller, a second subscriber on the `AgentRefWatcher.Advanced`
+  sweep the readiness trigger was already riding. Deliberately **not** a branch of that trigger: the
+  trigger debounces (five commits cost one test run), and the debounce window is exactly the window in
+  which a human can merge a verdict that has already gone void. It also keeps the trigger's own contract
+  intact — it answers *when to verify*, never *what a state means*.
+- **The mid-run window.** A commit that lands *while the tests are running* cannot move the state (the run
+  owns the entry, and a `Working → Verified` settle would throw out of a background completion nobody
+  awaits), so the advance is recorded and the settle refuses to promote the pass — `Working`, not
+  `Verified`. This is measured from a window opened when the run starts, **not** by comparing against the
+  last known tip: a rebase or a commit made while nothing was watching moves the branch with no
+  announcement, so the re-verification that follows legitimately measures a tip the queue has never heard
+  of. Reading that as "moved mid-run" demoted every re-verified entry straight back to `Working` — a
+  cascade that can never finish. Two of `MergeQueueProvisionerTests` caught it; M8 is that guard.
+- **`CanMerge` gained the branch-side compare.** Both shas must be KNOWN to refuse. It is a belt, not the
+  mechanism — a wired queue reaches it with the two equal — and it stays because the invalidation depends
+  on an *observation*, which can be missed, delayed, or absent on a substrate with no watcher. A gate that
+  only holds while an event fires is not a gate.
+- **The Verify button.** Now offered on exactly `Working`/`StaleVerified`/`VerificationFailed`. It was
+  offered on `Verified` and `AwaitingReview` on a comment's belief that "re-verifying against a moved main
+  is the normal way a stale entry gets fresh again" — true, and about `StaleVerified`, which was already in
+  the set. From the other two it did the same thing every press for the life of the feature. An action that
+  is offered and always fails is worse than an absent one: it reads as the recovery the human is looking
+  for, and it teaches them the product is broken rather than that the entry is fine. A green entry needs no
+  Verify; when that stops being true the daemon walks it to `Working` and the button returns on its own.
+- **`MergeQueueProvisioner.cs:1003`** — the false comment now says what is true, and names the test that
+  keeps it true.
+
+### 19.5 The other stale-evidence cases, found and NOT fixed here
+
+Same class — a decision recorded against a sha that has since moved. Reported rather than fixed: each has
+its own blast radius on the merge spine and belongs in its own change.
+
+1. **`MergeReconcileTask` synthesizes a `Merged` confirm from unrelated evidence.** At boot it walks an
+   outstanding lease to terminal `Merged` when `currentMain != lease.ExpectedMainSha` **and** the repo's
+   journal contains *any* entry of kind `Merge` — unfiltered by lease id, agent, branch, sha or timestamp.
+   A `git pull`, a co-tenant's merge or a hand commit satisfies the first; any historical merge satisfies
+   the second. This is the worst of the remaining set: it fabricates a terminal state and fires
+   `NotifyMainMoved` for a merge that never happened.
+2. **`ForegroundMergeService.ResolveMergeSource` prefers a stale local `refs/heads/agent/<id>`** over the
+   ref it just fetched. The fetch is treated as load-bearing ("merging it would land work the queue never
+   verified") and is then discarded by the preference order on any checkout that once brought the branch
+   local. `--ff-only` still guarantees main-ancestry; it guarantees nothing about the source being the
+   verified ref.
+3. **The merge lease is not a CAS on the branch.** `MergeLeaseRow` carries only `ExpectedMainSha`, and
+   `DbMergeLeaseStore.TryBegin` is a uniqueness check, not a compare-and-swap. `ConfirmMerge`'s
+   `NewMainSha` is client-supplied and validated against no ref.
+4. **External-PR merge re-derives its "verified head" at merge time** (`ExternalPrMergeService`
+   `ResolveVerifiedHead`) rather than reading one the queue recorded, so between a force-push and the next
+   intake poll both sides of its head compare are the new head and it passes on unverified code. This is
+   the external-origin twin of H6 and the fix here does not reach it: `PrHeadFetcher` hard-resets
+   `agent/pr-<n>` *before* the intake calls `NotifyNewCommits`.
+5. **The approved `TaskPlan` scope is keyed to a plan id with no tie to code** — no repo sha, no branch, no
+   diff hash. `WorkerPlanGate.Allows` answers "was some plan approved", never "does the current tip still
+   match its scope"; the scope is only re-evaluated when `ArmFlaggedChangeReview` runs, so it inherits this
+   defect's cadence exactly. Fixing the cadence (above) is what makes it correct today.
+6. **`GitMutationGuard`** computes its verdict from a `.git` snapshot and then runs the action after up to
+   five `index.lock` backoff attempts, re-checking only the lock and not the `GitDirState` it decided from.
+
+One more was found and **is** fixed here, because it is the header the observation was made on:
+`verified_main_sha` was projected as `queue.CurrentMainSha` while the wire documented it as "the main@sha
+this branch's verification ran against". The cockpit's "verified @ `<sha>`" stamp therefore named today's
+main whatever the evidence was measured on — most visibly on a `StaleVerified` entry, where the two are
+guaranteed to differ and the stamp asserted the very freshness the state exists to deny. It now projects
+the record's own `MainSha`.
+
+### 19.6 The mutation log
+
+Every guard removed in turn, the tier rebuilt (`touch` on restore — an `mv` preserves mtime and MSBuild
+then skips the rebuild, so the mutated binary is what gets tested), and the failure recorded.
+
+MUTATION_TABLE_PLACEHOLDER
+
+### 19.7 Left alone, deliberately
+
+- **No `Verified → Verifying` edge was added.** It would let a human re-run tests on a green branch, and a
+  *refused* re-run (a jail that died, a drifted branch) settles to `Working` — losing a legitimate green to
+  a transient failure. Withholding the button is the smaller, honest answer, and the invalidation returns
+  it the moment there is something to verify.
+- **`StaleVerified` and `VerificationFailed` are not invalidated** on a tip move. Neither can grant a
+  merge, both are already in the trigger's eligible set, and demoting the red one would delete the verdict
+  a human is reading.
+- **`_branchTip` is not persisted.** Like the jail-liveness axis, it is a MEASUREMENT of the mirror rather
+  than a decision this queue made, and a measurement written to SQLite outlives its own truth. A restart
+  re-learns it from the watcher's first sweep, and an unknown tip declines to answer rather than
+  manufacturing a "fresh".

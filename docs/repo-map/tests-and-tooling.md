@@ -1171,7 +1171,34 @@
   would never subscribe and never sweep while every unit test of its rules stayed green), and the trigger
   observes **the very `AgentRefWatcher` instance** the daemon's `WorktreeManager` sweeps with — a trigger
   wired to a second, unwatched watcher passes everything else in this repository and never fires once in
-  production. Both run through the real `DaemonFixture` composition root.
+  production. Both run through the real `DaemonFixture` composition root. **A third fact joins them**:
+  `BranchTipInvalidator` — the other subscriber on that same sweep — is built and rides the SAME watcher.
+  It is the stricter of the two requirements, not a parallel one: a trigger nobody resolves costs
+  automation (a human can still press Verify), while an invalidator nobody resolves costs correctness —
+  the entry stays green, the cockpit says "ready to merge", and Merge stays enabled for a tip nothing ever
+  ran against.
+- **`Mainguard.Tests/VerifiedFreezeTests.cs`** — the regression suite for **a `Verified` row freezing
+  forever**, the most dangerous defect the live testing found: the UI invited a human to merge broken code
+  it called verified. Ground truth in the header (agent `4c43d17a`, 2026-08-30 — verified 01:35, three
+  further `commit_work` ops, no re-verification, the Verify button refusing `Verified → Verifying` at
+  02:18, Merge still enabled). The rig runs a real `MergeQueue`, a real `BranchTipInvalidator` and a real
+  `WorkerReadinessTrigger` off ONE real `AgentRefWatcher`, with only the jail faked — and the fake returns
+  a record pinned to the rig's mirror tip, exactly as the provisioner does. Every assertion about the harm
+  is on the merge DECISION rather than the state word, because a green badge is embarrassing and an enabled
+  Merge button on untested code is what ships. Covers: **the test that would have caught it** — a new
+  commit on a `Verified` entry leaves it unmergeable, with the record CLEARED rather than merely outranked;
+  the same entry re-verifying on the automatic path against the NEW tip; a new commit that breaks the tests
+  ending red rather than green; a run OVERTAKEN mid-flight refusing to become a green (the settle, which is
+  the only reachable exercise of the branch-side compare, since the invalidator cannot move a `Verifying`
+  entry); the **structural pairing** — every state `CanMerge` admits must be a state an advanced branch
+  invalidates, asserted over all nine states so a future state cannot join one list without the other; the
+  flagged-change gate re-armed against the new diff with the old ack dropped and a newly-introduced
+  out-of-scope file DETECTED (the gate the freeze disarmed, and the reason its cadence comment in
+  `MergeQueueProvisioner` was false); `BranchSha` round-tripping through SQLite, with the empty
+  pre-migration case asserted alongside, because a gate that works until you restart is not a gate; the
+  Verify button offered on exactly the states the daemon can start a run from and no others; and a
+  `Verified → Verifying` refusal still writing nothing and leaving no in-flight latch. Fourteen mutations
+  of the fix were watched go red; the log is in `docs/design/coordinator-phase-3-decisions.md` §19.
 - **`Mainguard.Server.Tests/Agents/SubstrateConformanceTests.cs`** — the ESC §4 rows run against
   THIS host's substrate composition: `SubstrateConformanceTests` (#1 git-objects round-trip through
   the opaque `ResolveSyncRemote` handle, byte-identical; git-only, macOS leg — the WSL2 handle needs
