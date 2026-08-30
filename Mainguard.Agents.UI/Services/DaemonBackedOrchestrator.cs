@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Terminal;
 using Proto = Mainguard.Protos.V1;
 
 namespace Mainguard.Agents.UI.Services;
@@ -1385,10 +1386,20 @@ public sealed class DaemonBackedOrchestrator :
     /// Delivers the agent document's composer prompt into the agent's LIVE PTY — a short-lived attach
     /// on the same <c>TerminalService.Attach</c> bidi stream the terminal pane uses (a bound session
     /// multiplexes subscribers, so this never steals the pane's attach): frame 1 selects the agent
-    /// (raw mode), frame 2 writes the prompt + CR, then the write side completes and the call closes.
-    /// A managed worker's daemon-side input lock arrives as <c>PermissionDenied</c> and is PROPAGATED —
-    /// the caller renders the refusal; for most of this method's life it was a hardcoded no-op that
-    /// reported success and typed nothing.
+    /// (raw mode), frame 2 writes the prompt body, frame 3 writes the CR that submits it, then the write
+    /// side completes and the call closes. A managed worker's daemon-side input lock arrives as
+    /// <c>PermissionDenied</c> and is PROPAGATED — the caller renders the refusal; for most of this
+    /// method's life it was a hardcoded no-op that reported success and typed nothing.
+    ///
+    /// <para><b>Why the CR is a frame of its own, with a wait in front of it (defect J2).</b> This wrote
+    /// <c>prompt + "\r"</c> in one frame, so the daemon wrote body and terminator to the PTY in one go
+    /// and the CLI — which classifies input as typed or pasted by the read burst it arrives in — took the
+    /// CR as pasted content rather than Enter. Short prompts submitted, realistic ones silently did not.
+    /// Splitting the frames is necessary but not sufficient: two frames written back to back are still
+    /// coalesced into one read, measured. The wait is what puts them in separate reads. Unlike the
+    /// daemon's own path this side cannot watch for the CLI's echo, so it uses the fixed
+    /// <see cref="TerminalSubmit.TerminatorSeparation"/> fallback. See
+    /// <c>docs/design/coordinator-phase-3-decisions.md</c> §17.8.</para>
     /// </summary>
     public async Task SendPromptAsync(string agentId, string prompt)
     {
@@ -1416,11 +1427,26 @@ public sealed class DaemonBackedOrchestrator :
 
         try
         {
+            if (!TerminalSubmit.TryEncodeSubmission(prompt, out var body, out var terminator))
+            {
+                return;
+            }
+
             await call.RequestStream.WriteAsync(new Proto.TerminalInput { AgentId = agentId })
                 .ConfigureAwait(false);
             await call.RequestStream.WriteAsync(new Proto.TerminalInput
             {
-                Data = Google.Protobuf.ByteString.CopyFromUtf8(prompt + "\r"),
+                Data = Google.Protobuf.ByteString.CopyFrom(body),
+            }).ConfigureAwait(false);
+
+            // The whole point of the split: without this the two frames reach the PTY back to back, the
+            // CLI reads them as one burst, and the CR is absorbed into the message instead of submitting
+            // it — which is the defect, not a nicety.
+            await Task.Delay(TerminalSubmit.TerminatorSeparation, cts.Token).ConfigureAwait(false);
+
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput
+            {
+                Data = Google.Protobuf.ByteString.CopyFrom(terminator),
             }).ConfigureAwait(false);
             await call.RequestStream.CompleteAsync().ConfigureAwait(false);
         }

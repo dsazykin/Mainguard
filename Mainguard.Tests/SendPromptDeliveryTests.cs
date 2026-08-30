@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Grpc.Net.Client;
+using Mainguard.Agents.Terminal;
 using Mainguard.Agents.UI.Services;
 using Xunit;
 using Proto = Mainguard.Protos.V1;
@@ -72,19 +73,62 @@ public sealed class SendPromptDeliveryTests
             () => new Metadata(),
             () => { });
 
+    /// <summary>
+    /// A steer at the length the composer really sends. The short literal this used to assert is
+    /// submitted correctly even by the encoding that shipped defect J2.
+    /// </summary>
+    private const string RealisticPrompt =
+        "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
+        + "record the result in your mainguard-plan commit.";
+
+    /// <summary>
+    /// <b>Defect J2 on the UI side.</b> The prompt body and the CR that submits it go as <b>separate
+    /// frames</b>, so they reach the CLI in separate reads. Sent as one frame — which is what this
+    /// asserted, at 19 bytes, and passed — the daemon writes body+CR in one go and the CLI takes the CR
+    /// as pasted content rather than Enter: short prompts submit, realistic ones silently do not.
+    /// Measured against claude-code v2.1.251, §17.8.
+    /// </summary>
     [Fact]
-    public async Task SendPrompt_WritesSelectorThenPromptWithCarriageReturn_ThenCompletes()
+    public async Task SendPrompt_WritesTheBodyAndTheCarriageReturnAsSeparateFrames_ThenCompletes()
     {
         using var orchestrator = new DaemonBackedOrchestrator(UncontactedClient());
         var requests = new FakeRequestStream();
         orchestrator.AttachTerminalOverride = _ => FakeCall(requests);
 
-        await orchestrator.SendPromptAsync("agent-1", "fix the failing test");
+        await orchestrator.SendPromptAsync("agent-1", RealisticPrompt);
 
-        Assert.Equal(2, requests.Written.Count);
+        Assert.Equal(3, requests.Written.Count);
         Assert.Equal("agent-1", requests.Written[0].AgentId); // raw-mode selector first
-        Assert.Equal("fix the failing test\r", requests.Written[1].Data.ToStringUtf8());
+
+        // The body, carrying NO terminator of its own — there is nothing for the CLI to coalesce.
+        Assert.Equal(RealisticPrompt, requests.Written[1].Data.ToStringUtf8());
+        Assert.DoesNotContain("\r", requests.Written[1].Data.ToStringUtf8(), StringComparison.Ordinal);
+
+        // Enter, alone, in its own frame.
+        Assert.Equal("\r", requests.Written[2].Data.ToStringUtf8());
         Assert.True(requests.Completed);
+    }
+
+    /// <summary>
+    /// The frames are separated in <b>time</b> as well as in count. Two writes issued back to back are
+    /// coalesced by the PTY into a single read and the defect returns intact — measured — so splitting
+    /// the frames without the wait would be a fix in appearance only.
+    /// </summary>
+    [Fact]
+    public async Task SendPrompt_HoldsTheTerminatorBack_SoItCannotBeCoalescedWithTheBody()
+    {
+        using var orchestrator = new DaemonBackedOrchestrator(UncontactedClient());
+        var requests = new FakeRequestStream();
+        orchestrator.AttachTerminalOverride = _ => FakeCall(requests);
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        await orchestrator.SendPromptAsync("agent-1", RealisticPrompt);
+        started.Stop();
+
+        Assert.True(
+            started.Elapsed >= TerminalSubmit.TerminatorSeparation,
+            $"the terminator followed the body after only {started.ElapsedMilliseconds}ms — with no "
+            + "separation the PTY hands the CLI one read and the CR is swallowed as pasted content");
     }
 
     [Fact]

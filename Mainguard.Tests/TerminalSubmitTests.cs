@@ -18,15 +18,77 @@ namespace Mainguard.Tests;
 /// </summary>
 public class TerminalSubmitTests
 {
-    /// <summary>The terminator is CR. Stated as its own assertion because it is the entire defect.</summary>
+    /// <summary>
+    /// A steer of the length a coordinator actually sends — the exact message from the live run that
+    /// exposed defect J2 (139 bytes). Every encoding assertion below runs against THIS rather than a
+    /// three-word literal, because that is the difference the defect turns on: <c>body + CR</c> in one
+    /// write submits a 3-byte poke and does not submit this. Short fixtures are how a broken encoder
+    /// stayed green through a live failure.
+    /// </summary>
+    private const string RealisticSteer =
+        "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
+        + "record the result in your mainguard-plan commit.";
+
+    /// <summary>Encodes, asserting the call succeeded, and hands back both halves.</summary>
+    private static (byte[] Body, byte[] Terminator) Encode(string? text)
+    {
+        Assert.True(TerminalSubmit.TryEncodeSubmission(text, out var body, out var terminator));
+        return (body, terminator);
+    }
+
+    /// <summary>The terminator is CR. Stated as its own assertion because it is half the defect.</summary>
     [Fact]
     public void ALineIsTerminatedByCarriageReturn_NotByNewline()
     {
-        Assert.True(TerminalSubmit.TryEncodeLine("prefer the stdlib", out var bytes));
+        var (body, terminator) = Encode(RealisticSteer);
 
-        Assert.Equal((byte)0x0D, bytes[^1]);
-        Assert.Equal("prefer the stdlib\r", Encoding.UTF8.GetString(bytes));
-        Assert.DoesNotContain((byte)0x0A, bytes);
+        Assert.Equal(new[] { (byte)0x0D }, terminator);
+        Assert.Equal(RealisticSteer, Encoding.UTF8.GetString(body));
+        Assert.DoesNotContain((byte)0x0A, body);
+    }
+
+    /// <summary>
+    /// The other half, and the one a correct byte alone did not buy: the terminator comes back as its
+    /// <b>own buffer</b>, and the body does not end with it.
+    ///
+    /// <para>A TUI classifies input as typed or pasted by the read burst it arrives in, so a CR appended
+    /// to a realistic message is read as pasted content — a newline — and submits nothing. Measured
+    /// against claude-code v2.1.251: this exact 139-byte string plus CR in one write left the text in the
+    /// input box; the same bytes with the CR written separately submitted every time (§17.8). If this
+    /// ever fails by producing one concatenated buffer, <c>send_worker_prompt</c> is inert again for
+    /// every message longer than a poke.</para>
+    /// </summary>
+    [Fact]
+    public void TheTerminatorIsASeparateBuffer_SoItCannotBeReadAsPastedContent()
+    {
+        var (body, terminator) = Encode(RealisticSteer);
+
+        // Realistic length is the whole point: at 3 bytes the shipped encoder worked.
+        Assert.True(body.Length > 100, $"fixture must be realistic; was {body.Length} bytes");
+
+        Assert.Single(terminator);
+        Assert.Equal(TerminalSubmit.SubmitByte, terminator[0]);
+
+        // The body carries NO terminator of its own — nothing to coalesce.
+        Assert.DoesNotContain(TerminalSubmit.SubmitByte, body);
+        Assert.NotEqual(TerminalSubmit.SubmitByte, body[^1]);
+    }
+
+    /// <summary>
+    /// A poke and a realistic steer encode to the <b>same shape</b>. The defect was precisely that they
+    /// behaved differently — `go` submitted instantly, 139 bytes never did — so length must not change
+    /// anything about the encoding.
+    /// </summary>
+    [Theory]
+    [InlineData("go")]
+    [InlineData("narrow the try block")]
+    [InlineData(RealisticSteer)]
+    public void LengthChangesNothingAboutTheEncoding(string text)
+    {
+        var (body, terminator) = Encode(text);
+
+        Assert.Equal(text, Encoding.UTF8.GetString(body));
+        Assert.Equal(new[] { TerminalSubmit.SubmitByte }, terminator);
     }
 
     /// <summary>
@@ -36,9 +98,11 @@ public class TerminalSubmitTests
     [Fact]
     public void EmbeddedNewlinesAreKept_SoAMultiLineMessageArrivesIntact()
     {
-        Assert.True(TerminalSubmit.TryEncodeLine("first line\nsecond line", out var bytes));
+        var multiLine = RealisticSteer + "\n" + RealisticSteer;
+        var (body, terminator) = Encode(multiLine);
 
-        Assert.Equal("first line\nsecond line\r", Encoding.UTF8.GetString(bytes));
+        Assert.Equal(multiLine, Encoding.UTF8.GetString(body));
+        Assert.Equal(new[] { TerminalSubmit.SubmitByte }, terminator);
     }
 
     /// <summary>
@@ -52,27 +116,29 @@ public class TerminalSubmitTests
     [InlineData("a\r\nb\r\nc", "a\nb\nc")]
     public void AnEmbeddedCarriageReturnCannotSplitAMessageIntoTwoTurns(string text, string expectedBody)
     {
-        Assert.True(TerminalSubmit.TryEncodeLine(text, out var bytes));
+        var (body, terminator) = Encode(text);
 
-        var encoded = Encoding.UTF8.GetString(bytes);
-        Assert.Equal(expectedBody + "\r", encoded);
+        Assert.Equal(expectedBody, Encoding.UTF8.GetString(body));
 
-        // Exactly one CR in the whole payload, and it is the last byte: exactly one submit.
-        Assert.Equal(1, encoded.Length - encoded.Replace("\r", string.Empty).Length);
-        Assert.EndsWith("\r", encoded, System.StringComparison.Ordinal);
+        // Exactly one CR anywhere in what will be written, and it is the standalone terminator: one
+        // submit, at the end, of the whole message.
+        Assert.DoesNotContain(TerminalSubmit.SubmitByte, body);
+        Assert.Equal(new[] { TerminalSubmit.SubmitByte }, terminator);
     }
 
     /// <summary>A caller that already ended its text with a newline does not submit a trailing blank line.</summary>
     [Theory]
-    [InlineData("steer it\n", "steer it\r")]
-    [InlineData("steer it\r\n", "steer it\r")]
-    [InlineData("steer it   ", "steer it\r")]
-    [InlineData("steer it\n\n\n", "steer it\r")]
-    public void TrailingWhitespaceIsTrimmedBeforeTheTerminator(string text, string expected)
+    [InlineData(RealisticSteer + "\n")]
+    [InlineData(RealisticSteer + "\r\n")]
+    [InlineData(RealisticSteer + "   ")]
+    [InlineData(RealisticSteer + "\n\n\n")]
+    [InlineData(RealisticSteer + " \t\r\n")]
+    public void TrailingWhitespaceIsTrimmedBeforeTheTerminator(string text)
     {
-        Assert.True(TerminalSubmit.TryEncodeLine(text, out var bytes));
+        var (body, terminator) = Encode(text);
 
-        Assert.Equal(expected, Encoding.UTF8.GetString(bytes));
+        Assert.Equal(RealisticSteer, Encoding.UTF8.GetString(body));
+        Assert.Equal(new[] { TerminalSubmit.SubmitByte }, terminator);
     }
 
     /// <summary>
@@ -88,9 +154,11 @@ public class TerminalSubmitTests
     [InlineData("   \t  ")]
     public void AnEmptyMessageIsRefused_RatherThanPressingEnterAtWhateverIsOnScreen(string? text)
     {
-        Assert.False(TerminalSubmit.TryEncodeLine(text, out var bytes));
+        Assert.False(TerminalSubmit.TryEncodeSubmission(text, out var body, out var terminator));
 
-        Assert.Empty(bytes);
+        // BOTH empty. A terminator handed back here would be a bare Enter with nothing said.
+        Assert.Empty(body);
+        Assert.Empty(terminator);
     }
 
     /// <summary>Leading whitespace is the caller's business; only the tail is trimmed.</summary>

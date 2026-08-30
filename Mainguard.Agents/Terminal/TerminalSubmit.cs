@@ -28,6 +28,21 @@ namespace Mainguard.Agents.Terminal;
 ///
 /// <para>The app's human-keystroke path already agrees: <c>TerminalControl.MapKey</c> maps
 /// <c>Key.Enter</c> to a bare <c>0x0D</c> for every adapter, consults no manifest, and works.</para>
+///
+/// <para><b>CR is necessary but not sufficient — defect J2.</b> Sending the right byte is only half of
+/// it. The terminator must also arrive in its <b>own read</b> at the CLI, because a modern TUI decides
+/// whether input was <i>typed</i> or <i>pasted</i> from the read burst it arrives in, and inside a paste
+/// a CR is <b>content</b> (a newline), not Enter. The first fix returned body+CR as one buffer — one
+/// write, one read — so a 3-byte poke submitted instantly while a realistic 139-byte steer sat in the
+/// input box with its CR absorbed, which is exactly what the live run produced. Measured against
+/// claude-code v2.1.251 under a real forkpty (§17.8): body+CR in one write does not submit at 139
+/// bytes; the same bytes with the CR written separately, after the CLI has been observed consuming the
+/// body, submit every time. Two back-to-back writes with no separation are NOT enough — the PTY
+/// coalesces them into one read and the defect returns.</para>
+///
+/// <para>That is why <see cref="TryEncodeSubmission"/> hands back <b>two</b> buffers rather than one,
+/// and why nothing here offers to concatenate them: the split is the fix, so it must not be possible to
+/// undo it by accident at a call site.</para>
 /// </summary>
 public static class TerminalSubmit
 {
@@ -36,6 +51,19 @@ public static class TerminalSubmit
 
     /// <summary>The byte that inserts a newline <i>inside</i> a TUI's input buffer without submitting.</summary>
     public const byte NewLineByte = 0x0A;
+
+    /// <summary>
+    /// How long to hold the terminator back when the CLI has <b>not</b> been observed consuming the body
+    /// — the fallback that keeps the two writes in separate reads with no feedback to key off.
+    ///
+    /// <para>The preferred separator is the CLI's own echo, which is causal rather than timed: a CLI
+    /// that has repainted the text it was sent has already read those bytes, so a CR written afterwards
+    /// cannot land in the same read. This delay covers the paths where no echo can be observed — a CLI
+    /// mid-turn that is not repainting its input line, and the UI's fire-and-forget gRPC send. 5 ms was
+    /// measured sufficient against the real CLI (§17.8); 50 ms is that with an order of magnitude of
+    /// headroom, and is still imperceptible beside the 2 s reaction window.</para>
+    /// </summary>
+    public static readonly TimeSpan TerminatorSeparation = TimeSpan.FromMilliseconds(50);
 
     /// <summary>
     /// Builds the bytes for one submitted line, or refuses.
@@ -57,18 +85,27 @@ public static class TerminalSubmit
     /// "there was nothing to say".</para>
     /// </summary>
     /// <param name="text">The message to submit.</param>
-    /// <param name="bytes">The UTF-8 bytes to write toward the PTY, terminator included.</param>
-    /// <returns>False when there is nothing to submit; <paramref name="bytes"/> is then empty.</returns>
-    public static bool TryEncodeLine(string? text, out byte[] bytes)
+    /// <param name="body">The UTF-8 bytes of the message. Written first, on its own.</param>
+    /// <param name="terminator">
+    /// The single CR that submits it. Written <b>second and separately</b>, once the body is known to
+    /// have been read — never appended to <paramref name="body"/>. See the type remarks (defect J2).
+    /// </param>
+    /// <returns>
+    /// False when there is nothing to submit; both buffers are then empty and <b>nothing at all</b> may
+    /// be written — not even the terminator, which on its own is Enter.
+    /// </returns>
+    public static bool TryEncodeSubmission(string? text, out byte[] body, out byte[] terminator)
     {
         var line = NormalizeBody(text);
         if (line.Length == 0)
         {
-            bytes = Array.Empty<byte>();
+            body = Array.Empty<byte>();
+            terminator = Array.Empty<byte>();
             return false;
         }
 
-        bytes = Encoding.UTF8.GetBytes(line + (char)SubmitByte);
+        body = Encoding.UTF8.GetBytes(line);
+        terminator = new[] { SubmitByte };
         return true;
     }
 

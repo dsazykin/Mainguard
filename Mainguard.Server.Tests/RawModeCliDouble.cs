@@ -29,8 +29,19 @@ namespace Mainguard.Server.Tests;
 /// <item><b>LF (0x0A) inserts a newline into the buffer</b> and submits nothing — two prompts sent that
 /// way become one two-line buffer, which is exactly what the live run produced;</item>
 /// <item>a submit makes the CLI <b>redraw</b>, i.e. produce output. That redraw is the only evidence
-/// the daemon can observe, so the double emits it.</item>
+/// the daemon can observe, so the double emits it;</item>
+/// <item><b>a CR arriving in the same read as a substantial body is PASTED CONTENT, not Enter</b> — a
+/// TUI classifies input by the burst it arrives in, so it inserts a newline and submits nothing. That
+/// is defect J2, measured in §17.8, and modelling it is why this double had to change.</item>
 /// </list>
+///
+/// <para><b>Why that last rule had to be added.</b> As first written, <see cref="Feed"/> walked the
+/// incoming bytes one at a time and acted on every CR regardless of which write it arrived in — a CLI
+/// with no paste handling at all, which is a CLI nobody ships. So <c>body + CR</c> in one write
+/// submitted here while silently failing against the real binary, and a green suite reported that the
+/// coordinator's only steering channel worked while a 139-byte steer sat unsubmitted in a live worker's
+/// input box. The double now honours <b>write boundaries</b>, which is the property the whole fix turns
+/// on: what matters is not which bytes are sent but how they are grouped.</para>
 ///
 /// <para>Assertions are therefore about <see cref="SubmittedLines"/> — what the CLI <i>received as a
 /// submitted line</i> — and <see cref="PendingInput"/>, the text left sitting in its box. Those two
@@ -108,20 +119,50 @@ internal sealed class RawModeCliDouble : ITerminalSession
         return SubmittedLines;
     }
 
-    /// <summary>The raw-mode key handling: CR submits, LF is a newline in the buffer, the rest types.</summary>
+    /// <summary>
+    /// Bytes at or above this in a single read make the CLI treat that read as a <b>paste</b>, so a CR
+    /// inside it is content rather than Enter. A stand-in for the fast-input heuristics real TUIs use
+    /// (burst size, inter-byte timing, bracketed paste). The exact threshold is not the point and no test
+    /// leans on its value: they use a body an order of magnitude clear of it on one side and a lone
+    /// terminator on the other, which is how a keystroke and a paste actually differ.
+    /// </summary>
+    internal const int PasteBurstBytes = 16;
+
+    /// <summary>
+    /// The raw-mode key handling: CR submits, LF is a newline in the buffer, the rest types — <b>except
+    /// inside a paste</b>, where a CR is just another character.
+    ///
+    /// <para>One call is one read at the CLI, which is what makes this the interesting boundary. A TUI
+    /// decides typed-vs-pasted per read burst, so a terminator appended to its own message never reads as
+    /// Enter, however correct the byte is. Emitting the echo on <i>every</i> read rather than only on a
+    /// submit is deliberate too: a real CLI repaints as text arrives, and that echo is precisely what the
+    /// daemon waits for to know the body has been consumed before it presses Enter.</para>
+    /// </summary>
     private void Feed(ReadOnlySpan<byte> data)
     {
         var text = Encoding.UTF8.GetString(data);
-        var redraw = false;
+        if (text.Length == 0)
+        {
+            return;
+        }
+
+        // The defect, modelled: a large enough burst is a paste, and a paste contains no keystrokes.
+        var pasted = text.Length >= PasteBurstBytes;
+
         lock (_gate)
         {
             foreach (var ch in text)
             {
-                if (ch == '\r')
+                if (ch == '\r' && !pasted)
                 {
                     _submitted.Add(_pending.ToString());
                     _pending.Clear();
-                    redraw = true;
+                }
+                else if (ch == '\r')
+                {
+                    // Inside a paste a CR is a line break in the pasted text, NOT Enter. This one branch
+                    // is the whole of J2: every byte correct, and nothing submitted.
+                    _pending.Append('\n');
                 }
                 else
                 {
@@ -131,10 +172,11 @@ internal sealed class RawModeCliDouble : ITerminalSession
             }
         }
 
-        if (redraw && _redraws)
+        if (_redraws)
         {
-            // What a CLI does when it accepts a line: repaint. The daemon's reaction window watches for
-            // exactly this, so the double has to produce it or the observation would be untestable.
+            // What a CLI does with input: repaint — while text arrives as well as on accept. The daemon's
+            // echo window and its reaction window both watch for exactly this, so the double has to
+            // produce it or neither observation would be testable.
             _stream.Emit(Encoding.UTF8.GetBytes("\u001b[2K\rworking\r\n"));
         }
     }

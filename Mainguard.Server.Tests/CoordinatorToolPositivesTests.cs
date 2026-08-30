@@ -42,6 +42,21 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassFixture<PlanGateRig>
 {
+    /// <summary>
+    /// A steer of the length a coordinator actually sends — the 139-byte message from the live run that
+    /// exposed defect J2. The steering tests below use THIS rather than a three-word literal, and that is
+    /// not cosmetic: <c>body + CR</c> in one write submits `go` and does <b>not</b> submit this, so a
+    /// suite built on short strings passed for a channel that was inert for every real message. Length is
+    /// the variable the defect lives on, so the fixture has to carry it.
+    /// </summary>
+    private const string RealisticSteer =
+        "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
+        + "record the result in your mainguard-plan commit.";
+
+    private const string SecondRealisticSteer =
+        "Now re-read the acceptance criteria in the plan, confirm the suite is green, and record the "
+        + "exact pass and fail counts before you request verification.";
+
     public CoordinatorToolPositivesTests(PlanGateRig rig) : base(rig)
     {
     }
@@ -62,12 +77,12 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         Rig.Terminals.Bind(KeyFor(workerId), bound);
 
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "prefer the stdlib"));
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
 
         Assert.True(response.Ok, $"an approved worker with a live CLI refused a prompt: {response.Error}");
 
         var submitted = await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "prefer the stdlib" }, submitted);
+        Assert.Equal(new[] { RealisticSteer }, submitted);
 
         // The discriminator. Under the shipped `prompt + "\n"` the bytes still ARRIVE — they just stay
         // here, in the input box, forever.
@@ -89,7 +104,7 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         using var bound = new BoundTerminalSession(workerId, cli);
         Rig.Terminals.Bind(KeyFor(workerId), bound);
 
-        foreach (var text in new[] { "use the stdlib", "and add a test" })
+        foreach (var text in new[] { RealisticSteer, SecondRealisticSteer })
         {
             var response = await CallAsync(coordinatorId, new AgentIpcRequest(
                 AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: text));
@@ -97,7 +112,7 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         }
 
         var submitted = await cli.WaitForSubmittedAsync(2, TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "use the stdlib", "and add a test" }, submitted);
+        Assert.Equal(new[] { RealisticSteer, SecondRealisticSteer }, submitted);
         Assert.Equal(string.Empty, cli.PendingInput);
     }
 
@@ -118,24 +133,26 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         Rig.Terminals.Bind(KeyFor(workerId), bound);
 
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "drop the retry loop\r\nkeep the timeout\n"));
+            AgentIpcRequest.PromptOp,
+            AgentId: workerId,
+            Prompt: RealisticSteer + "\r\n" + SecondRealisticSteer + "\n"));
 
         Assert.True(response.Ok, $"a multi-line steer was refused: {response.Error}");
 
         var submitted = await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5));
-        Assert.Equal(new[] { "drop the retry loop\nkeep the timeout" }, submitted);
+        Assert.Equal(new[] { RealisticSteer + "\n" + SecondRealisticSteer }, submitted);
         Assert.Equal(string.Empty, cli.PendingInput);
     }
 
     /// <summary>
-    /// The observation the coordinator is given, in both readings. A CLI that repaints after Enter is
-    /// reported as having reacted; a CLI that stays silent is reported as <b>not</b> having reacted —
-    /// still <c>Ok</c>, because the daemon really did press Enter, but no longer indistinguishable from
-    /// it. The old response said "PromptSent" either way, and the shim printed the worker id instead of
-    /// the status, so nothing about a steer's fate reached the caller at all.
+    /// The observation the coordinator is given, in both readings. A CLI that repaints is reported as
+    /// having done so; a CLI that stays silent is reported as having produced nothing — still <c>Ok</c>,
+    /// because the daemon really did press Enter, but no longer indistinguishable from it. The old
+    /// response said "PromptSent" either way, and the shim printed the worker id instead of the status,
+    /// so nothing about a steer's fate reached the caller at all.
     /// </summary>
     [Theory]
-    [InlineData(true, "redrew in response")]
+    [InlineData(true, "redrew")]
     [InlineData(false, "produced no output")]
     public async Task SendWorkerPrompt_ReportsWhetherTheCliWasSeenReacting(bool redraws, string expected)
     {
@@ -147,17 +164,100 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         Rig.Terminals.Bind(KeyFor(workerId), bound);
 
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: "status?"));
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
 
         Assert.True(response.Ok, $"a steer was refused: {response.Error}");
         Assert.Contains(expected, response.Status ?? string.Empty, StringComparison.Ordinal);
 
         // Either way the line WAS submitted — the reaction is an observation about the CLI, not a
         // second opinion about whether Enter was pressed.
-        Assert.Equal(new[] { "status?" }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
 
         // And the caller can actually see it: the shim prints `status` only when no agentId is present.
         Assert.Null(response.AgentId);
+    }
+
+    /// <summary>
+    /// <b>Defect J2, as a test at the length that breaks it.</b> A steer of realistic size is submitted —
+    /// and the discriminator is that the CLI's input box is EMPTY afterwards.
+    ///
+    /// <para>Why this is not a duplicate of the first test: this one pins the mechanism. The double
+    /// models what a real TUI does — a CR arriving in the same read as a substantial body is pasted
+    /// content, not Enter — so a regression that appends the terminator to the message leaves the whole
+    /// steer sitting in <see cref="RawModeCliDouble.PendingInput"/> with a literal newline where the CR
+    /// was, which is exactly what the live run's transcript showed
+    /// (<c>'…mainguard-plan commit.\rgo'</c>). Nothing shorter than this catches it: the identical code
+    /// path submits a 3-byte poke correctly.</para>
+    /// </summary>
+    [Fact]
+    public async Task SendWorkerPrompt_AtRealisticLength_Submits_NotAccumulatesInTheInputBox()
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("a realistic steer");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        // The length is the test. A poke through this same path always worked.
+        Assert.True(RealisticSteer.Length > 100);
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
+
+        Assert.True(response.Ok, $"a realistic steer was refused: {response.Error}");
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+
+        // The J2 signature: under body+CR-in-one-write the text lands here instead, un-submitted, and
+        // accumulates with every further steer.
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// <b>Defect J3: the status must not assert what the daemon cannot know.</b>
+    ///
+    /// <para>It used to end "Enter was pressed and its CLI redrew in response." A redraw cannot carry
+    /// that — it fires on the CLI's own echo, and a CLI already mid-turn repaints without having read
+    /// anything — but it read as confirmation. In a live run the same sentence came back for six prompts
+    /// and the coordinator had to reason its way out of trusting it: "prompt confirms keystrokes landed,
+    /// not that the worker accepted anything." A tool whose success message an agent must discount is a
+    /// broken tool, so the limit is stated in the message itself.</para>
+    ///
+    /// <para>Asserted in <b>both</b> readings, because the failure being guarded against is a confident
+    /// sentence, and the confident sentence was the one on the happy path.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SendWorkerPrompt_ReportsWhatWasObserved_WithoutClaimingTheWorkerAccepted(bool redraws)
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync($"honest status {redraws}");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble(redraws);
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
+
+        Assert.True(response.Ok, $"a steer was refused: {response.Error}");
+        var status = response.Status ?? string.Empty;
+
+        // It says what was DONE, and marks the observation as an observation.
+        Assert.Contains("pressed Enter as a separate keystroke", status, StringComparison.Ordinal);
+        Assert.Contains("Observed:", status, StringComparison.Ordinal);
+
+        // And it states the limit outright, so no reader has to derive it.
+        Assert.Contains("NOT confirmation", status, StringComparison.Ordinal);
+        Assert.Contains($"Only {workerId} itself can confirm", status, StringComparison.Ordinal);
+
+        // A second prompt is a second turn: the status must never invite a retry.
+        Assert.Contains("not a retry", status, StringComparison.Ordinal);
+        Assert.DoesNotContain("retry the prompt", status, StringComparison.OrdinalIgnoreCase);
+
+        // The sentence the defect was: a redraw asserted as proof that the prompt landed.
+        Assert.DoesNotContain("redrew in response", status, StringComparison.Ordinal);
     }
 
     /// <summary>

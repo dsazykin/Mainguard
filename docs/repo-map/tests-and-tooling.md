@@ -399,9 +399,13 @@
   queue-only change, e.g. a fresh spawn's `EnsureEntry`, sat correctly in `GetQueue()`'s answer but
   unrendered until an unrelated AgentEvent happened to re-pull it; a proxy `IMergeQueueService` fires
   `Changed` alone, with no other signal, and asserts the rail still picks it up),
-  `SendPromptDeliveryTests` (the agent document's Send writes the raw-mode selector then prompt+CR
-  over a short-lived terminal attach and propagates the locked-terminal PermissionDenied — it was a
-  no-op reporting success),
+  `SendPromptDeliveryTests` (the agent document's Send writes the raw-mode selector, then the prompt
+  body, then the CR as a SEPARATE frame held back by `TerminalSubmit.TerminatorSeparation`, over a
+  short-lived terminal attach, and propagates the locked-terminal PermissionDenied — it was a no-op
+  reporting success. **J2, 2026-08-30:** this asserted one `prompt + "\r"` frame at 19 bytes and passed;
+  one frame means one pty write, and the CLI reads a CR arriving with a realistic body as pasted content
+  rather than Enter, so the UI's Send had the daemon's defect. Now asserted at realistic length, with the
+  frame count, the body carrying no CR of its own, and the elapsed-time floor),
   `RepoProvisioningHonestyTests` (the repo-open provisioning path surfaces failures as reasons and
   detaches the queue projection on repo switch — `ClearActiveRepo` empties + raises `Changed`, the
   cleared adapter refuses to merge, a failed provision on switch leaves no stale queue from the
@@ -1039,16 +1043,22 @@
   message — the one thing a worker supplies — is flattened to a single bounded subject, with an absent
   one defaulting rather than losing the work.
 - **`Mainguard.Tests/TerminalSubmitTests.cs`** — how a line is SUBMITTED to a PTY-attached CLI, at the
-  byte the CLI acts on. The terminator is **CR (0x0D), never LF**, asserted as its own case because it
-  is the entire defect `send_worker_prompt` shipped with: `AgentCliBinder` wrote `prompt + "\n"` for the
+  byte the CLI acts on AND in the write it arrives in. The terminator is **CR (0x0D), never LF**,
+  asserted as its own case because it is half the defect `send_worker_prompt` shipped with: `AgentCliBinder` wrote `prompt + "\n"` for the
   whole life of the coordinator's only steering channel, and in a live run three prompts to two workers
   sat unsubmitted and accumulated in their input boxes while every layer above logged success. Also
   pins the guards around it: embedded newlines survive (a multi-line steer arrives intact, submitted
   once); an embedded CR is rewritten to LF, since it would otherwise submit a *prefix* as its own turn
   and strand the remainder — CRLF text arrives that way routinely; trailing whitespace is trimmed; and
   an empty message is REFUSED rather than encoded as a bare CR, which is Enter pressed at whatever the
-  CLI has focused (a permission dialog's highlighted option). The rules are measured against claude-code
-  v2.1.251 under a real forkpty — transcripts in `docs/design/coordinator-phase-3-decisions.md` §17.1.
+  CLI has focused (a permission dialog's highlighted option). **The other half (defect J2, 2026-08-30):**
+  `TryEncodeSubmission` hands back the body and the terminator as TWO buffers, pinned by a case asserting
+  the body carries no CR of its own — a CR appended to a realistic message is read by a TUI as pasted
+  content and submits nothing, so the CR-only encoder worked at 3 bytes and failed at 139. Every fixture
+  here is now that 139-byte live-run message rather than a three-word literal, plus an explicit case that
+  a poke and a realistic steer encode to the same shape. The rules are measured against claude-code
+  v2.1.251 under a real forkpty — transcripts in `docs/design/coordinator-phase-3-decisions.md` §17.1
+  and §17.8.
 - **`Mainguard.Tests/AdapterInitialPromptTests.cs`** — the manifest half of the first turn:
   `initialPromptStyle`, which only `claude-code` declares (`first-positional`; asserted that no other
   shipped adapter does). Every unreadable spelling is REFUSED at parse with
@@ -1936,20 +1946,34 @@
   over a tool that had never worked, since a PTY-attached CLI submits on **CR** and LF merely typed the
   text into its input box. It is now on what the CLI received as a *submitted line* and on what was left
   in its input box, plus the two-steers-in-a-row case that reproduces the live accumulation, the
-  embedded-CR case, and both readings of the reaction observation. The paired negative RELEASES the binding rather than assuming none,
+  embedded-CR case, and both readings of the reaction observation. **Extended 2026-08-30 (J2/J3):** every
+  steer fixture is now a REALISTIC 139-byte message rather than a three-word literal, because the CR-only
+  fix submitted `go` and silently failed at realistic length — short fixtures are how the second half of
+  the defect stayed green. Adds the J2 case (a realistic steer submits and does not accumulate) and the
+  J3 case (the status reports what was observed and states outright that it is NOT confirmation the
+  prompt became a turn, asserted in BOTH readings since the over-claiming sentence was the happy path).
+  The paired negative RELEASES the binding rather than assuming none,
   because a spawn binds one. `request_verification` is honest about its limit: it asserts the call gets
   PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
   fake environment goes — a true verification positive needs a real repo and belongs to the Docker
   tier),**
   **`RawModeCliDouble` (test support, not a test: a stand-in for a coding CLI attached to a PTY that
   models the CLI's SIDE of the boundary — raw mode, CR submits the input buffer, LF inserts a newline
-  into it, a submit repaints. The behaviour was measured against claude-code v2.1.251 under a real
+  into it, input repaints. The behaviour was measured against claude-code v2.1.251 under a real
   forkpty, not assumed. Exposes `SubmittedLines` / `PendingInput`, which is what lets a test tell "the
   CLI received a submitted line" from "bytes reached the pty" — the distinction a `MemoryStream` byte
-  log cannot make),**
+  log cannot make. **Extended 2026-08-30 (J2):** it now honours WRITE BOUNDARIES — a CR arriving in the
+  same read as a substantial body (`PasteBurstBytes`) is pasted content, not Enter. As first written it
+  walked bytes ignoring which write they came in, i.e. a CLI with no paste handling at all, so
+  `body + CR` in one write submitted here while failing against the real binary; the echo is emitted on
+  every read, not only on a submit, because that is what the daemon waits on before pressing Enter),**
   **`PromptDeliveryBinderTests` (`AgentCliBinder.TrySendPromptAsync` on its own, no IPC in front:
   a whitespace-only prompt is refused and NO Enter is pressed at the CLI — a bare CR would confirm
-  whatever the CLI has focused — with a real-text control beside it, plus the no-bound-CLI case. It
+  whatever the CLI has focused — with a realistic-length control beside it, plus the no-bound-CLI case,
+  that the body is observed being CONSUMED before Enter is pressed (both readings), and that with no
+  echo to wait on the terminator is still separated from the body by
+  `TerminalSubmit.TerminatorSeparation` — without which two back-to-back writes are coalesced into one
+  read and J2 returns intact. It
   exists separately because that guard is unreachable through `AgentSpawnService.PromptAsync`, which
   rejects a blank prompt first, and a guard no test can turn red is indistinguishable from a deleted
   one),**

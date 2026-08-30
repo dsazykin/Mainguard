@@ -21,7 +21,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation
     counting; returns the largest prefix that never splits a VT sequence or UTF-8 codepoint — the
     correctness heart, split-at-every-offset tested).
-  - `TerminalSubmit.cs` (**how a line is SUBMITTED to a PTY-attached CLI**: `TryEncodeLine` normalises
+  - `TerminalSubmit.cs` (**how a line is SUBMITTED to a PTY-attached CLI**: `TryEncodeSubmission`
+    returns the body and the terminator as **two separate buffers** — never concatenated, because the
+    split IS the fix (defect J2): a TUI classifies input as typed or pasted by the read burst it arrives
+    in, so a CR appended to a realistic message is read as pasted *content* and submits nothing. `go`
+    submitted; a 139-byte steer did not. `TerminatorSeparation` (50 ms) is the fallback gap for callers
+    with no echo to wait on — two back-to-back writes are coalesced by the PTY into one read and the
+    defect returns. It also normalises
     embedded CR→LF — an embedded CR submits a *prefix* as its own turn — trims trailing whitespace,
     refuses an empty message rather than writing a bare CR (which is Enter, pressed at whatever the CLI
     has focused), and terminates with **CR (0x0D), never LF**. Measured against a real CLI under a

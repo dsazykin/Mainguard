@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Terminal;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Git.Audit;
 using Mainguard.Server.Runtime;
@@ -28,6 +29,15 @@ public sealed class PromptDeliveryBinderTests : IDisposable
     private readonly TerminalSessionManager _terminals = new();
     private readonly AgentCliBinder _binder;
     private readonly AgentSessionKey _key = new("repo-hash", "pr-7");
+
+    /// <summary>
+    /// A steer at the length a coordinator really sends. The short literal this file used to pass
+    /// ("narrow the try block") is submitted correctly even by the encoder that shipped defect J2 —
+    /// length is the variable the defect lives on, so the fixture has to carry it.
+    /// </summary>
+    private const string RealisticSteer =
+        "Add one more assertion to test.js covering the empty-input case, then re-run the suite and "
+        + "record the result in your mainguard-plan commit.";
 
     public PromptDeliveryBinderTests()
     {
@@ -87,12 +97,72 @@ public sealed class PromptDeliveryBinderTests : IDisposable
         using var bound = new BoundTerminalSession(_key.AgentId, cli);
         _terminals.Bind(_key, bound);
 
-        var delivery = await _binder.TrySendPromptAsync(_key, "narrow the try block", CancellationToken.None);
+        var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
 
         Assert.True(delivery.Submitted);
         Assert.Null(delivery.Refusal);
-        Assert.Equal(new[] { "narrow the try block" }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
         Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// The body is observed being consumed <b>before</b> Enter is pressed — which is what makes the CR a
+    /// keystroke of its own rather than the tail of a paste, and is therefore the daemon's runtime
+    /// detector for a J2 regression.
+    ///
+    /// <para>A CLI that repaints reports <c>Echoed</c>; a silent one reports it false and the delivery
+    /// still succeeds, because the fallback is a timed separation rather than a refusal — a worker that
+    /// was merely mid-turn must not be reported unreachable. Both readings submit.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task TheBodyIsConsumedBeforeEnterIsPressed_AndThatIsReportedSeparately(bool redraws)
+    {
+        using var cli = new RawModeCliDouble(redraws);
+        using var bound = new BoundTerminalSession(_key.AgentId, cli);
+        _terminals.Bind(_key, bound);
+
+        var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
+
+        Assert.True(delivery.Submitted);
+        Assert.Equal(redraws, delivery.Echoed);
+        Assert.Equal(redraws, delivery.Reacted);
+
+        // Whichever way the observation went, the line was submitted and nothing was stranded.
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// When the CLI gives the daemon <b>no echo to key off</b>, the terminator is held back by
+    /// <see cref="TerminalSubmit.TerminatorSeparation"/> instead.
+    ///
+    /// <para>The preferred separator is causal — a CLI that repainted has already read the body, so the
+    /// CR cannot arrive in the same read. A silent CLI (mid-turn, not repainting its input line) offers
+    /// nothing to wait on, and two writes issued back to back are coalesced by the PTY into one read,
+    /// which is defect J2 intact. So the fallback is not a nicety; without it the silent case is exactly
+    /// the broken case. Asserted as a floor only, so there is no upper bound to be flaky about.</para>
+    /// </summary>
+    [Fact]
+    public async Task WithNoEchoToWaitOn_TheTerminatorIsStillSeparatedFromTheBody()
+    {
+        using var cli = new RawModeCliDouble(redraws: false);
+        using var bound = new BoundTerminalSession(_key.AgentId, cli);
+        _terminals.Bind(_key, bound);
+
+        var started = System.Diagnostics.Stopwatch.StartNew();
+        var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
+        started.Stop();
+
+        Assert.True(delivery.Submitted);
+        Assert.False(delivery.Echoed);
+        Assert.True(
+            started.Elapsed >= TerminalSubmit.TerminatorSeparation,
+            $"Enter followed the body after only {started.ElapsedMilliseconds}ms with no echo to "
+            + "separate them — the PTY would hand the CLI one read and the CR would be swallowed");
+
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
     }
 
     /// <summary>No bound CLI: nothing is claimed, and the caller supplies the "no live CLI" sentence.</summary>

@@ -35,24 +35,39 @@ public sealed record CliPtyLaunch(
 /// actually distinguish — because the defect this type replaces was a <c>bool</c> that conflated them.
 /// </summary>
 /// <param name="Submitted">
-/// The line — text plus the CR that submits it — was written to the worker's PTY without error.
+/// The text was written to the worker's PTY without error, and the CR that submits it was written after
+/// it as a separate keystroke.
+/// </param>
+/// <param name="Echoed">
+/// The CLI produced output after the body and before the CR, within
+/// <see cref="AgentCliBinder.PromptEchoWindow"/>. It had therefore already read the body, which is what
+/// makes the CR a keystroke of its own instead of the tail of a paste — so this is the daemon's runtime
+/// detector for a J2 regression, and it is strictly more than "the write returned".
 /// </param>
 /// <param name="Reacted">
-/// The CLI produced output within <see cref="AgentCliBinder.PromptReactionWindow"/> of that write. This
-/// is an <b>observation, not a proof</b>: it says the child read its PTY and re-rendered, which a CLI
-/// that never saw the keystroke cannot do, but a CLI that was already mid-turn would have satisfied it
-/// anyway. Report it; never assert on it. The ground truth that a prompt became a TURN lives in the
-/// CLI's own transcript inside the jail, which the daemon deliberately does not read.
+/// The CLI produced output within <see cref="AgentCliBinder.PromptReactionWindow"/> of the CR.
 /// </param>
 /// <param name="Refusal">Set only when <paramref name="Submitted"/> is false and the reason is known
 /// more precisely than "no live CLI" — the sentence the coordinator is shown.</param>
-internal readonly record struct PromptDelivery(bool Submitted, bool Reacted, string? Refusal)
+/// <remarks>
+/// <b>Neither observation is proof, and the status the coordinator is shown must not read as one.</b>
+/// Each says the child read its PTY and re-rendered — which a CLI that never saw the keystroke cannot
+/// do — but a CLI already mid-turn emits output continuously and would satisfy both without reading
+/// anything. Their evidential weight is in the negative direction: an idle CLI that produces nothing at
+/// all after a keystroke did not see one. The ground truth that a prompt became a TURN lives in the
+/// CLI's own transcript inside the jail, which the daemon deliberately does not read. Report; never
+/// assert. (That rule was already written here and then broken one layer up: the status sentence said
+/// "Enter was pressed and its CLI redrew in response", which a coordinator reasonably read as
+/// confirmation and which the redraw cannot support — defect J3.)
+/// </remarks>
+internal readonly record struct PromptDelivery(
+    bool Submitted, bool Echoed, bool Reacted, string? Refusal)
 {
     /// <summary>Nothing was written: no bound CLI, or the PTY refused the write.</summary>
-    public static PromptDelivery NotDelivered => new(false, false, null);
+    public static PromptDelivery NotDelivered => new(false, false, false, null);
 
     /// <summary>Nothing was written, and the daemon can say exactly why.</summary>
-    public static PromptDelivery Refused(string reason) => new(false, false, reason);
+    public static PromptDelivery Refused(string reason) => new(false, false, false, reason);
 }
 
 /// <summary>
@@ -234,6 +249,15 @@ public sealed class AgentCliBinder
     internal static readonly TimeSpan PromptReactionWindow = TimeSpan.FromSeconds(2);
 
     /// <summary>
+    /// How long the daemon waits for the CLI to repaint the message body <i>before</i> pressing Enter.
+    /// That echo is what separates the two writes causally, so the CR cannot be read as the tail of a
+    /// paste (defect J2). Measured at 0–1 ms against the real CLI even for an 872-byte message, so this
+    /// is generous by three orders of magnitude; when it lapses the caller falls back to a plain delay,
+    /// so a slow CLI costs latency, never correctness.
+    /// </summary>
+    internal static readonly TimeSpan PromptEchoWindow = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
     /// Delivers a coordinator's steering prompt to a managed worker's live CLI (coordinator contract §3,
     /// <c>send_worker_prompt</c>). Reports <see cref="PromptDelivery.NotDelivered"/> when no CLI is bound
     /// for that session — the caller reports that rather than pretending the prompt landed.
@@ -265,18 +289,21 @@ public sealed class AgentCliBinder
             return PromptDelivery.NotDelivered;
         }
 
-        if (!TerminalSubmit.TryEncodeLine(prompt, out var line))
+        if (!TerminalSubmit.TryEncodeSubmission(prompt, out var body, out var terminator))
         {
             // A bare terminator is Enter, which would confirm whatever the CLI has focused (a permission
             // dialog's highlighted option, an autocomplete row). Refuse rather than press it blindly.
             return PromptDelivery.Refused("there is nothing to submit — the prompt is empty.");
         }
 
-        bool reacted;
+        SubmitObservation seen;
         try
         {
-            reacted = await bound
-                .WriteInputAndAwaitOutputAsync(line, PromptReactionWindow, ct)
+            // Two writes, not one. Appending the CR to the body submitted a 3-byte poke and silently
+            // failed a 139-byte steer, because a TUI reads a CR arriving inside one burst as pasted
+            // content rather than as Enter (defect J2, measured — §17.8).
+            seen = await bound
+                .SubmitLineAndAwaitOutputAsync(body, terminator, PromptEchoWindow, PromptReactionWindow, ct)
                 .ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException or InvalidOperationException)
@@ -292,12 +319,13 @@ public sealed class AgentCliBinder
         }
 
         // The old line here said "delivered", off nothing but a write that returned. It now says what was
-        // actually written (terminator included, so a regression to LF is visible in the log itself) and
-        // what the CLI did about it.
+        // actually written (terminator included and separate, so a regression to LF — or to one coalesced
+        // write — is visible in the log itself) and what the CLI did about each half.
         _log.LogInformation(
-            "coordinator prompt submitted to worker={Agent} ({Bytes} bytes, terminator=CR) reacted={Reacted}",
-            key.AgentId, line.Length, reacted);
-        return new PromptDelivery(true, reacted, null);
+            "coordinator prompt submitted to worker={Agent} ({Bytes} bytes, terminator=CR sent separately) "
+            + "echoed={Echoed} reacted={Reacted}",
+            key.AgentId, body.Length, seen.Echoed, seen.Reacted);
+        return new PromptDelivery(true, seen.Echoed, seen.Reacted, null);
     }
 
     /// <summary>Cap on the last-output tail carried into the death reason/audit — enough to name

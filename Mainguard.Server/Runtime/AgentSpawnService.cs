@@ -999,28 +999,64 @@ public sealed class AgentSpawnService
             // a prompt happened — which is exactly what it said for three prompts that were never
             // submitted at all.
             ["terminator"] = "CR",
+            // Separate from the body, which is the J2 fix; recorded so a regression to one coalesced
+            // write is visible in the audit trail and not only in a live run's stranded input box.
+            ["terminator_write"] = "separate",
+            ["cli_echoed"] = delivery.Echoed ? "true" : "false",
             ["cli_reacted"] = delivery.Reacted ? "true" : "false",
         }));
 
         // No agentId on purpose: the shim prints an id when one is present and the status only when one
         // is not, so echoing the target back is what kept every observation below invisible to the
         // caller. A prompt's useful answer is what happened to it, not who it was for.
-        return new AgentIpcResponse(Ok: true, Status: PromptStatus(owned.Id, delivery.Reacted));
+        return new AgentIpcResponse(
+            Ok: true, Status: PromptStatus(owned.Id, delivery.Echoed, delivery.Reacted));
     }
 
     /// <summary>
-    /// What the coordinator is told about its own steer. Both readings are honest: the daemon pressed
-    /// Enter either way, and the difference is whether the worker's CLI was observed reacting to it.
-    /// The unacknowledged sentence deliberately does <b>not</b> say "retry" — a second prompt is a
-    /// second turn, not a redelivery, and a coordinator told to retry would double-steer a worker that
-    /// was simply busy.
+    /// What the coordinator is told about its own steer — <b>an account of what the daemon did and saw,
+    /// never a verdict on what the worker accepted</b> (defect J3).
+    ///
+    /// <para>This used to end "Enter was pressed and its CLI redrew in response." A redraw cannot carry
+    /// that meaning: it fires on the CLI's own echo of the keystrokes, and a CLI already mid-turn
+    /// repaints continuously without having read anything. But the wording read as confirmation, and the
+    /// identical sentence came back for six prompts in a live run — where the coordinator had to work out
+    /// for itself that "prompt confirms keystrokes landed, not that the worker accepted anything." An
+    /// agent should not have to distrust its own tools' success messages, so the tool stops inviting it
+    /// to: the limit is now stated in the message rather than left for the reader to discover.</para>
+    ///
+    /// <para>Every reading states that same limit and points at the one place the answer actually exists
+    /// — the worker itself. Only the observation differs. None says "retry": a second prompt is a second
+    /// turn, not a redelivery, and a coordinator told to retry would double-steer a worker that was
+    /// merely busy.</para>
     /// </summary>
-    internal static string PromptStatus(string workerId, bool reacted) => reacted
-        ? $"prompt submitted to {workerId} — Enter was pressed and its CLI redrew in response."
-        : $"prompt submitted to {workerId}, but its CLI produced no output for "
-            + $"{AgentCliBinder.PromptReactionWindow.TotalSeconds:0}s — it may be mid-turn. Check it with "
-            + $"`mainguard-agent status {workerId}` or its terminal before sending another; a second "
-            + "prompt is a second turn, not a retry.";
+    internal static string PromptStatus(string workerId, bool echoed, bool reacted)
+    {
+        // What was DONE. The same in every reading, because it is the only part the daemon knows rather
+        // than infers — and it names the two-write shape, so a J2 regression is visible in the message.
+        var did = $"typed the prompt into {workerId}'s CLI, then pressed Enter as a separate keystroke";
+
+        var saw = (echoed, reacted) switch
+        {
+            // The strongest reading available: the CLI repainted the text BEFORE Enter, so it had already
+            // read the body and the CR went as its own keystroke rather than as the tail of a paste.
+            // That rules out the J2 failure mode. It does not confirm a turn.
+            (true, true) =>
+                "it redrew both while the text was arriving and after Enter, so it is reading its terminal",
+            (true, false) =>
+                "it redrew while the text was arriving, but produced nothing for "
+                + $"{AgentCliBinder.PromptReactionWindow.TotalSeconds:0}s after Enter",
+            (false, true) =>
+                "it produced nothing while the text was arriving, then redrew after Enter",
+            (false, false) =>
+                "it produced no output at all, so it may be mid-turn or wedged",
+        };
+
+        return $"{did}. Observed: {saw}. That is NOT confirmation the prompt became a turn — a redraw "
+            + "only shows the CLI is reading its terminal, and one already mid-turn redraws regardless. "
+            + $"Only {workerId} itself can confirm it acted: check `mainguard-agent status {workerId}` or "
+            + "its terminal before sending another. A second prompt is a second turn, not a retry.";
+    }
 
     /// <summary>
     /// <c>request_verification</c> (contract §3) — <b>propose</b> an owned worker's branch. The daemon

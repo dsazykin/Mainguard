@@ -263,10 +263,15 @@
     VT-stripped output tail (`BoundTerminalSession.TailText`), the bound session staying registered so
     attaching to the dead agent's terminal still replays its final output (the why).
     Also owns `TrySendPromptAsync` — the ONLY write path into a worker's CLI (coordinator contract §3
-    `send_worker_prompt`), returning `PromptDelivery(Submitted, Reacted, Refusal)`. It encodes the line
+    `send_worker_prompt`), returning `PromptDelivery(Submitted, Echoed, Reacted, Refusal)`. It encodes
     through `TerminalSubmit` (**CR, not LF** — the shipped `prompt + "\n"` typed into the input box and
-    pressed nothing, so the tool had never once worked) and reports whether the CLI was observed
-    reacting inside `PromptReactionWindow`.
+    pressed nothing, so the tool had never once worked) and submits via
+    `BoundTerminalSession.SubmitLineAndAwaitOutputAsync`, which writes the body and the CR as **two
+    separate writes** — the CR appended to the body is read as pasted content, not Enter, so the CR-only
+    fix worked at 3 bytes and failed at 139 (defect J2, §17.8). The writes are separated causally by the
+    CLI's own echo (`PromptEchoWindow`, 250 ms) and by `TerminalSubmit.TerminatorSeparation` when there
+    is no echo. `Echoed`/`Reacted` are **observations, never proof** — a mid-turn CLI satisfies both
+    without reading anything.
   - **`Runtime/AgentSpawnService.cs`** (PR3) — the ONE spawn/stop workflow behind BOTH entry points (the
     `SpawnAgent` RPC and the coordinator's in-jail `mainguard-agent` shim): kill-gate → session record
     (with role) → **the phase-2 task withhold** (`WorkerPlanGate.Hold`, armed the instant the id is
