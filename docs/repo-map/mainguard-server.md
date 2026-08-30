@@ -299,6 +299,14 @@
     `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
     and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
     merge-ready).
+    **`FrozenJailPolicy`** (in this file) is the guard `prompt` and `verify` ask AFTER the plan gate: a
+    worker whose jail is `docker pause`d — the state a conflicted keep-alive rebase leaves it in — is
+    refused, because a prompt delivered into a SIGSTOPped process succeeds and means nothing (the tool
+    answered `Ok` and the coordinator then polled a worker that could never reply), and verification runs
+    its test command in that same frozen jail. The predicate is the session's own state word
+    (`Paused` / `Conflict`), which is what `Row` and `ListAgents` already project — NOT
+    `HumanPauseLedger.IsHumanPaused`, which answers the narrower "did a person press pause" and says no
+    for exactly this case.
     **`CommitWork`** is the worker table's fifth op (`commit_work`) and the rung the loop was missing: a
     finished worker used to stop on an uncommitted diff that died with its worktree, leaving
     `agent/<id>` empty and the readiness trigger — which fires on that ref advancing — with nothing to

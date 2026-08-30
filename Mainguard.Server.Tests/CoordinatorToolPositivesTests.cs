@@ -286,6 +286,97 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
         Assert.DoesNotContain("Input/output error", response.Error ?? string.Empty, StringComparison.Ordinal);
     }
 
+    // ---- the frozen jail: a delivery that succeeds and means nothing ----------------------------
+
+    /// <summary>
+    /// <b>A prompt at a PAUSED worker is refused, and nothing reaches its CLI.</b>
+    ///
+    /// <para>The shipped hole: when a merge's auto-rebase conflicts the daemon <c>docker pause</c>s the
+    /// worker's jail and leaves it frozen for a human to resolve — and <c>send_worker_prompt</c> kept
+    /// answering <c>Ok</c>. Every other guard is about whether the coordinator MAY steer; none of them
+    /// asks whether anything on the other end can still read. The bytes were typed into a channel inside
+    /// a SIGSTOPped process, the tool reported success, and the coordinator polled a worker that could
+    /// never answer.</para>
+    ///
+    /// <para>Both frozen spellings are exercised: <c>Paused</c> is what the reconciler's drift pass and
+    /// the human pause write, <c>Conflict</c> is what the keep-alive rebase writes seconds earlier — and
+    /// the jail is frozen for both. The control at the top is what stops this passing on a handler that
+    /// refused every prompt: the SAME worker, over the SAME socket, accepts one first.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(AgentSessionReconciler.PausedState)]
+    [InlineData("Conflict")]
+    public async Task SendWorkerPrompt_ToAFrozenJail_IsRefused_AndNothingIsTyped(string frozenState)
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync($"frozen {frozenState}");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        // The control: while the jail is running the very same call lands.
+        var accepted = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
+        Assert.True(accepted.Ok, $"the control steer was refused: {accepted.Error}");
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+
+        // …and now the jail is frozen, exactly as a conflicted keep-alive rebase leaves it.
+        Rig.Sessions.MarkState(KeyFor(workerId), frozenState, "the keep-alive rebase conflicted");
+
+        var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: SecondRealisticSteer));
+
+        Assert.False(
+            refused.Ok,
+            $"a {frozenState} worker accepted a prompt (status={refused.Status}, worker={workerId})");
+
+        var error = refused.Error ?? string.Empty;
+        // It names the state, says nothing was sent, and says who has to act — the three things a
+        // coordinator needs to stop the polling loop the defect produced.
+        Assert.Contains($"{workerId} is paused", error, StringComparison.Ordinal);
+        Assert.Contains("nothing was sent", error, StringComparison.Ordinal);
+        Assert.Contains("human", error, StringComparison.Ordinal);
+        Assert.Contains("do not keep polling", error, StringComparison.Ordinal);
+
+        // The assertion that makes it a guard rather than a message: the second steer never reached the
+        // CLI at all — not as a submitted line, and not sitting in its input box either.
+        await Task.Delay(200);
+        Assert.Equal(new[] { RealisticSteer }, cli.SubmittedLines);
+        Assert.Equal(string.Empty, cli.PendingInput);
+    }
+
+    /// <summary>
+    /// The same hole on <c>request_verification</c>, which runs the test command inside that same frozen
+    /// jail. Refused BEFORE the merge-queue step — and the neighbouring positive
+    /// (<see cref="RequestVerification_ForAnApprovedOwnedWorker_ReachesTheQueueStep"/>) is what proves the
+    /// refusal comes from the pause and not from the op being inert; the control here re-establishes it on
+    /// the same worker.
+    /// </summary>
+    [Fact]
+    public async Task RequestVerification_ForAFrozenJail_IsRefused_BeforeTheQueueStep()
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("verify a frozen jail");
+        await ApproveAsync(workerId);
+
+        // Control: unfrozen, this call reaches as far as this substrate goes.
+        var reached = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.VerifyOp, AgentId: workerId));
+        Assert.Contains("merge queue to verify against", reached.Error ?? "", StringComparison.Ordinal);
+
+        Rig.Sessions.MarkState(KeyFor(workerId), AgentSessionReconciler.PausedState, "conflicted rebase");
+
+        var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.VerifyOp, AgentId: workerId));
+
+        Assert.False(refused.Ok);
+        var error = refused.Error ?? string.Empty;
+        Assert.Contains("cannot be verified", error, StringComparison.Ordinal);
+        Assert.Contains("frozen jail runs nothing", error, StringComparison.Ordinal);
+        // It stopped at the pause, not at the substrate's missing queue.
+        Assert.DoesNotContain("merge queue to verify against", error, StringComparison.Ordinal);
+    }
+
     /// <summary>
     /// <c>request_verification</c> gets PAST the two checks that guard it — ownership and the plan gate —
     /// for an approved worker the caller owns, and fails only where this substrate genuinely cannot go:
