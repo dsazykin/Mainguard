@@ -1966,14 +1966,19 @@
   same read as a substantial body (`PasteBurstBytes`) is pasted content, not Enter. As first written it
   walked bytes ignoring which write they came in, i.e. a CLI with no paste handling at all, so
   `body + CR` in one write submitted here while failing against the real binary; the echo is emitted on
-  every read, not only on a submit, because that is what the daemon waits on before pressing Enter),**
+  every read, not only on a submit, because that is what the daemon waits on before pressing Enter. Also
+  exposes `Writes` (when each read landed, and how big) — the separation between the body and the
+  terminator has to be asserted BETWEEN THE READS, since a caller that idled before writing anything
+  would satisfy a stopwatch around the call while still handing the CLI a single read),**
   **`PromptDeliveryBinderTests` (`AgentCliBinder.TrySendPromptAsync` on its own, no IPC in front:
   a whitespace-only prompt is refused and NO Enter is pressed at the CLI — a bare CR would confirm
   whatever the CLI has focused — with a realistic-length control beside it, plus the no-bound-CLI case,
-  that the body is observed being CONSUMED before Enter is pressed (both readings), and that with no
-  echo to wait on the terminator is still separated from the body by
-  `TerminalSubmit.TerminatorSeparation` — without which two back-to-back writes are coalesced into one
-  read and J2 returns intact. It
+  that the body is observed being CONSUMED before Enter is pressed (both readings), and two separation
+  guards: with no echo to wait on the terminator is still held back by
+  `TerminalSubmit.TerminatorSeparation`, and — the case that makes it a guard rather than dead code —
+  when the CLI's output stream has already COMPLETED, where the echo wait returns instantly and the
+  common path's lapsed 250 ms window does not apply. Removing the separation survived the first mutation
+  pass for exactly that reason; the killed-CLI case is what turns it red. It
   exists separately because that guard is unreachable through `AgentSpawnService.PromptAsync`, which
   rejects a blank prompt first, and a guard no test can turn red is indistinguishable from a deleted
   one),**

@@ -2125,6 +2125,199 @@ so the delivery layer is now reached directly rather than left as decoration.
   teaching a quoted `--task`; `prompt` was not. Recorded so the next change to the shim's usage text
   does both.
 
+
+### 17.8 J2 / J3 — the CR fix was real but half of it, and the success signal asserted what it could not know
+
+§17 fixed the byte. A live run then found the tool still did not work: a **132-byte steer did not
+submit, while a 3-byte poke (`go`) submitted instantly.** (The harness fixture below is the same
+message at 139 bytes — the live figure counts the transcript's elided form.) The worker's own transcript carried the proof
+that the right byte had arrived and had not been read as Enter:
+
+```
+USER TURN 2 = 'Add one more assertion to test.js ... mainguard-plan commit.\rgo'
+```
+
+The CR survived **as a literal character inside the message body**. So §17's encoder shipped a defect
+whose symptom is length-dependent — which is exactly why 15 encoder tests and 10 server tests, all
+written against three-word literals, stayed green over it.
+
+#### 17.8.1 What was measured
+
+Same method as §17.1, same binary (`claude-code v2.1.251`) under a real `forkpty`, 120×40, a small VT
+screen model reading the rendered input box. One change to the harness worth recording: the API base URL
+was pointed at a dead port, so the CLI does all of its **local** input handling — echo, paste detection,
+buffer, submit — exactly as normal and then fails the network turn. Submission is a purely local UI
+event, so it is fully observable this way and costs nothing. "A turn started" reads unambiguously off the
+screen as the connection-refused retry line.
+
+The tty modes were re-sampled and are unchanged from §17.1: `ICANON=False, ECHO=False, ISIG=False,
+ICRNL=False, INLCR=False, IGNCR=False`.
+
+| # | written at the master | result |
+|---|---|---|
+| 1 | 139-byte steer **+ CR, one write** — the shipped encoding | **NOT submitted.** The text wraps across two lines *inside* the input box; no turn. The live failure, reproduced on demand |
+| 2 | `go` + CR, one write | **submitted** — `❯ go` moves into the transcript, box empties, a turn starts. The 3-byte case that made the defect look fixed |
+| 3 | 139-byte body, then CR as a second write, **no pause** | **NOT submitted.** Two `write()` calls are not two reads: the PTY coalesces them |
+| 4 | body, pause **5 ms**, then CR | **submitted** (also 10, 15, 20, 50, 100, 200, 500 ms — all submitted, ×2 reps) |
+| 5 | body, **wait for the CLI's echo**, then CR | **submitted** at 2, 139 and 872 bytes, and for a multi-line message. Echo arrived in **0–1 ms** every time |
+| 6 | `ESC[200~` body `ESC[201~` CR, one write (explicit bracketed paste) | submitted — but see 7 |
+| 7 | the same bracketed-paste bytes at `/bin/sh -i` | **corrupted**: `sh: 00~echo: command not found`. The shell has no bracketed-paste mode and ate the escape as text |
+| 8 | body, pause, CR at `/bin/sh -i` | **ran** — as did body+CR in one write, since a line-oriented reader has no paste heuristic at all |
+
+Row 1 is the defect. Row 3 is the important negative: **splitting the write is not enough**; the
+separation has to be real, because the boundary the CLI cares about is the *read*, not the *write*. Row 4
+shows the threshold is tiny — 5 ms already works — which identifies the mechanism as a read boundary
+rather than a byte-rate window. Row 5 is the fix that needs no timing at all.
+
+#### 17.8.2 The mechanism, and why bracketed paste was rejected
+
+A modern TUI classifies input as **typed** or **pasted** by the read burst it arrives in (a human cannot
+type 139 bytes in one `read()`), and **inside a paste a CR is content — a line break — not Enter.**
+`TryEncodeLine` returned `body + CR` as one buffer, so the daemon issued one write, the CLI performed one
+read, and the terminator was absorbed into the message. Every byte was correct.
+
+Rows 6–8 settle the shape of the fix, and they settle it the same way §17.2 settled CR-vs-LF. Bracketed
+paste *works* on the CLI that supports it and **corrupts** the line-oriented class outright — and the
+scripted test adapters (`scripted-agent` and friends) end in `exec sh -i`, so that class is not
+hypothetical. Whether a program understands `ESC[200~` is knowledge about **that program**; a gap between
+two writes is a property of the **terminal transport** and harms nobody. Same argument, same answer: the
+universal mechanism wins.
+
+**Decision.** `TerminalSubmit.TryEncodeSubmission` returns the body and the terminator as **two
+buffers**, and nothing offers to concatenate them — the split is the fix, so it must not be undoable by
+accident at a call site. `BoundTerminalSession.SubmitLineAndAwaitOutputAsync` writes the body, separates,
+then writes the CR. The separator is preferentially **the CLI's own echo** (`PromptEchoWindow`, 250 ms),
+which is causal rather than timed: a CLI that has repainted has already read those bytes, so the CR
+cannot land in the same read. Only when no echo appears — a CLI mid-turn, not repainting its input line —
+does it fall back to `TerminalSubmit.TerminatorSeparation` (50 ms; 5 ms measured sufficient, an order of
+magnitude of headroom, imperceptible beside the 2 s reaction window).
+
+#### 17.8.3 The same defect on the UI side
+
+`DaemonBackedOrchestrator.SendPromptAsync` — the Pro app's agent-document composer — wrote
+`prompt + "\r"` in one gRPC frame, which the daemon turns into one PTY write. Identical defect, identical
+length dependency, and its test asserted the concatenated frame at 19 bytes and passed. §17.5 had cleared
+`TerminalGrpcService` as "forwards bytes the UI already encoded", which was true and not enough: the UI
+was encoding them wrong. It now sends the body and the CR as separate frames with the fixed separation
+between them (this side has no echo to watch).
+
+#### 17.8.4 J3 — the status asserted what it could not know
+
+`BoundTerminalSession` stated the rule correctly — the reaction is "necessary but not sufficient…
+report it as an observation, never assert it as proof" — and `AgentSpawnService.PromptStatus` then
+asserted it anyway:
+
+> prompt submitted to pr-7 — Enter was pressed and its CLI redrew in response.
+
+The redraw fires on the CLI's own echo of the keystrokes; a CLI already mid-turn repaints regardless. The
+sentence nonetheless reads as confirmation, and in the live run **the same sentence came back for all six
+prompt calls** — where the coordinator had to reason its own way out of trusting its tool: *"Six prompt
+calls this session, every one returning that identical redraw line… prompt confirms keystrokes landed,
+not that the worker accepted anything."* An agent should not have to discount its own tools' success
+messages.
+
+The status now reports the act and the observation separately and states the limit in the message rather
+than leaving it to be derived:
+
+```
+typed the prompt into pr-7's CLI, then pressed Enter as a separate keystroke. Observed: it redrew both
+while the text was arriving and after Enter, so it is reading its terminal. That is NOT confirmation the
+prompt became a turn — a redraw only shows the CLI is reading its terminal, and one already mid-turn
+redraws regardless. Only pr-7 itself can confirm it acted: check `mainguard-agent status pr-7` or its
+terminal before sending another. A second prompt is a second turn, not a retry.
+```
+
+**Is a stronger signal available now?** One genuinely is, and it is reported for what it is rather than
+promoted. The two-phase write yields a *new* observation — `Echoed`, the CLI repainting the body
+**before** Enter. That is strictly more than "the write returned": it proves the child consumed the body,
+which is precisely what makes the CR a separate keystroke, so it is the daemon's **runtime detector for a
+J2 regression**. It is still not proof of a turn, and it is not claimed as one. What §17.3 said remains
+true and unchanged: the transcript is the arbiter, out of band, and the daemon does not read it.
+
+#### 17.8.5 The tests that passed over this, and what changed
+
+The J2 half survived §17's correction because of **two** things, and the second is the interesting one.
+
+1. **Every fixture was short.** `"prefer the stdlib"`, `"status?"`, `"fix the failing test"`. The defect
+   is length-dependent, so a suite of pokes proves the case that already worked. All steer fixtures are
+   now the 139-byte live-run message, and `TerminalSubmitTests` adds an explicit case that a poke and a
+   realistic steer encode to the same shape.
+2. **`RawModeCliDouble` modelled a CLI that does not exist.** Its `Feed` walked the incoming bytes one at
+   a time and acted on every CR regardless of which write it arrived in — a CLI with **no paste handling
+   at all**. So `body + CR` in one write submitted against the double while failing against the real
+   binary. §17.4 replaced a byte log with a model of the CLI's side, which was the right move; the model
+   was just not yet faithful on the axis that mattered. It now honours **write boundaries**: a CR
+   arriving in the same read as a substantial body is pasted content, and it emits its echo on every
+   read rather than only on a submit (which is what the daemon waits on).
+
+Mutation N9 pins that second point directly, and the exact result is worth reading. With the double's
+paste rule removed, the defect mutation N1 goes from **11 tests red to 2** — and the 2 survivors are not
+submission tests at all, they are the two that assert the *write structure* (that the CLI saw two reads,
+separated). Every assertion about what was SUBMITTED goes green over the defect. So the paste rule is
+precisely what makes submission-based tests able to see J2, and the write-structure guards are a second,
+independent detector that does not depend on modelling the CLI's heuristic correctly. Two detectors, one
+of them not reliant on the double being faithful, is the property worth having here — the first version
+of this file had one detector and it was the unfaithful one.
+
+#### 17.8.6 The mutation log
+
+Every guard watched failing. Restores were `git checkout` **plus `touch`**, because a restore that
+preserves mtime makes MSBuild skip the rebuild — you then measure the mutated binary and every mutation
+looks survivable.
+
+Suites: `TerminalSubmitTests` (enc, 20), `SendPromptDeliveryTests` (ui, 4),
+`PromptDeliveryBinderTests` + `CoordinatorToolPositivesTests` (srv, 17). All counts are from one pass
+against the final code.
+
+| # | mutation | went red |
+|---|---|---|
+| N1 | body+CR concatenated into ONE write — **the shipped J2 defect** | **11 of 17** srv |
+| N2 | the terminator separation removed | 1 of 17 srv |
+| N3 | an empty message encoded as a bare CR instead of refused | 5 of 20 enc, 1 of 17 srv |
+| N4 | trailing whitespace not trimmed | 9 of 20 enc, 2 of 17 srv |
+| N5 | embedded CR left alone (no CR→LF normalisation) | 6 of 20 enc, 1 of 17 srv |
+| N6 | **J3**: the status asserts the redraw as proof again | 2 of 17 srv |
+| N7 | the UI sends body+CR in one frame | 2 of 4 ui |
+| N8 | the UI drops the separation between its frames | 1 of 4 ui |
+| N9 | *meta*: N1 again, with the double's paste rule removed | 2 of 17 srv (see below) |
+
+Three of these are worth reading rather than counting.
+
+**N2 survived the first pass**, and the reason was real rather than a missing assertion: on the ordinary
+no-echo path the echo window has *already* lapsed 250 ms before the terminator is written, so the extra
+delay added nothing and a flat `if (!echoed) delay` was dead code wearing a guard's clothes. The case it
+genuinely covers is narrower — the echo wait returns `false` **instantly** when the output stream has
+completed (a CLI that has died), reaching the terminator having waited no time at all. The code now
+measures the elapsed time rather than sleeping unconditionally, and the guard is a test that kills the
+CLI first. §17.6's M7 lesson, hit again from the other side: a guard no mutation can turn red is
+indistinguishable from a guard that was deleted — and this one had to be *narrowed to its real case*
+before it could be tested at all.
+
+**N3 survives on the UI suite**, correctly: `SendPromptAsync` rejects an empty prompt itself before the
+encoder is reached, so the encoder's refusal is unreachable from there. Recorded rather than papered
+over; the guard is reached directly from enc and srv.
+
+**N9 is the meta-check** on the double, described above: 11 red becomes 2, and the 2 are the
+write-structure guards rather than any assertion about what was submitted.
+
+#### 17.8.7 What this still does not close
+
+- **§17.7's open items stand.** The live four-tool run of contract §8 has still not been performed (§4),
+  a steer sent while the worker's CLI is showing a modal still types into that modal, and the shim still
+  teaches `mainguard-agent prompt <id> <text …>` unquoted (defect G3, §15.2).
+- **Still no proof of comprehension, and now it is said in the tool's own words.** The daemon reports
+  what it typed, that it pressed Enter separately, and what it saw. The CLI's transcript remains the
+  arbiter, out of band. J3's fix was to stop the status implying otherwise, not to invent the signal.
+- **The paste heuristic is not a specification.** `PasteBurstBytes` in the double is a stand-in; real
+  TUIs use burst size, inter-byte timing, bracketed paste, or some mixture, and a future CLI could draw
+  the line somewhere this model does not. What the fix relies on is weaker and safer than any particular
+  threshold: **the terminator arrives in a read of its own.** That is true regardless of where a given
+  CLI draws its line, and it is what the write-structure guards assert directly.
+- **The 50 ms fallback is a floor, not a guarantee.** If the child is descheduled for longer than the
+  gap, two writes can still be coalesced in the PTY buffer. The echo path has no such hole — it is
+  causal — and it is the path taken whenever the CLI is responsive at all (measured at 0–1 ms). The
+  fallback covers a CLI that is silent, where the alternative is not writing at all.
+
 ---
 
 ## 18. H4, client half — the verdict, and reading the failure without paying for it again
