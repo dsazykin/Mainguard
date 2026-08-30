@@ -470,6 +470,39 @@ public class AgentIpcProtocolTests
             "src/a.cs", request.RootElement.GetProperty("planJson").GetString()!, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// <b>The re-scope refusal points at <c>brief</c>, so <c>brief</c> has to actually show the id.</b>
+    ///
+    /// <para>This is defect G3's lesson applied to a sentence written in this change. The id-less
+    /// <c>rescope</c> refusal ends "(`mainguard-plan brief` prints the id of your live plan.)" — and until
+    /// the line under test existed that was FALSE: the daemon put <c>planId</c> and <c>status</c> on the
+    /// brief response and the shim printed only the brief text, so a worker following the advice got a
+    /// headline and no id, and had no way to run the command it had just been told to run. G3 was exactly
+    /// this shape — advice that was true of the parser and false of the world — and it cost two of three
+    /// spawns in a stress run.</para>
+    ///
+    /// <para>Both directions, because either alone passes on the defect: the refusal must name
+    /// <c>brief</c>, and <c>brief</c> must print the id.</para>
+    /// </summary>
+    [Fact]
+    public void TheShimsBrief_PrintsTheLivePlanId_BecauseTheRescopeRefusalSendsTheWorkerThere()
+    {
+        var refusal = RunPlanShimIo(new[] { "rescope" });
+        var brief = RunPlanShimIo(new[] { "brief" });
+        if (refusal is null || brief is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        Assert.Contains("brief", refusal.Value.Refusal!, StringComparison.Ordinal);
+
+        // …and what that command prints: the headline AND the id the refusal promised, with its state,
+        // because "which plan" and "is it approved yet" are the two facts a re-scope needs.
+        Assert.Contains("Fix the token clock", brief.Value.Stdout, StringComparison.Ordinal);
+        Assert.Contains("p1", brief.Value.Stdout, StringComparison.Ordinal);
+        Assert.Contains("Approved", brief.Value.Stdout, StringComparison.Ordinal);
+    }
+
     /// <summary>Runs <c>mainguard-plan</c>'s own <c>main()</c> with the transport stubbed, and answers
     /// with the ONE thing this shim's commit path contributes: the message.</summary>
     private static (string? Message, string? Refusal)? RunPlanShim(string[] args)
@@ -500,6 +533,14 @@ public class AgentIpcProtocolTests
     /// does not route through is exactly the shape of the defect.</para>
     /// </summary>
     private static (string? RequestJson, string? Refusal)? RunPlanShimRequest(
+        string[] args, string? planFileContents = null)
+    {
+        var run = RunPlanShimIo(args, planFileContents);
+        return run is null ? null : (run.Value.RequestJson, run.Value.Refusal);
+    }
+
+    /// <summary>The same run, with the shim's own STDOUT — what the worker actually reads.</summary>
+    private static (string? RequestJson, string? Refusal, string Stdout)? RunPlanShimIo(
         string[] args, string? planFileContents = null)
     {
         var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-plan-{Guid.NewGuid():N}");
@@ -542,13 +583,17 @@ public class AgentIpcProtocolTests
 
             using var document = System.Text.Json.JsonDocument.Parse(stdout);
             var root = document.RootElement;
+            var stdout_ = root.GetProperty("stdout").GetString() ?? "";
             if (root.GetProperty("exit").GetInt32() != 0)
             {
-                return (null, root.GetProperty("stderr").GetString());
+                return (null, root.GetProperty("stderr").GetString(), stdout_);
             }
 
             var request = root.GetProperty("request");
-            return (request.ValueKind == System.Text.Json.JsonValueKind.Null ? null : request.GetRawText(), null);
+            return (
+                request.ValueKind == System.Text.Json.JsonValueKind.Null ? null : request.GetRawText(),
+                null,
+                stdout_);
         }
         catch (System.ComponentModel.Win32Exception)
         {
@@ -568,14 +613,21 @@ public class AgentIpcProtocolTests
         + "seen = {}\n"
         + "def fake_call(request, timeout=None):\n"
         + "    seen[\"request\"] = request\n"
+        + "    if request.get(\"op\") == \"brief\":\n"
+        // Shaped exactly as AgentSpawnService.Brief answers: the brief, plus the live plan's id and
+        // state. The shim's own output is what this stubs FOR — see TheShimsBrief_PrintsTheLivePlanId.
+        + "        return {\"ok\": True, \"brief\": \"Fix the token clock\", \"planId\": \"p1\",\n"
+        + "                \"status\": \"Approved\", \"revision\": 0, \"maxRevisions\": 3}\n"
         + "    if request.get(\"op\") in (\"present_plan\", \"revise_plan\", \"rescope_plan\", \"await_decision\"):\n"
         + "        return {\"ok\": True, \"status\": \"Approved\", \"planId\": \"p1\", \"taskPrompt\": \"t\"}\n"
         + "    return {\"ok\": True, \"committed\": True, \"commitSha\": \"abc\", \"status\": \"agent/x\"}\n"
         + "mod.call = fake_call\n"
         + "err = io.StringIO()\n"
-        + "with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):\n"
+        + "out = io.StringIO()\n"
+        + "with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):\n"
         + "    code = mod.main([\"/opt/mainguard/ipc/mainguard-plan\"] + sys.argv[2:])\n"
-        + "print(json.dumps({\"exit\": code, \"request\": seen.get(\"request\"), \"stderr\": err.getvalue()}))\n";
+        + "print(json.dumps({\"exit\": code, \"request\": seen.get(\"request\"),\n"
+        + "                  \"stdout\": out.getvalue(), \"stderr\": err.getvalue()}))\n";
 
     [Fact]
     public void IpcPaths_AreTheFixedInJailLayout()

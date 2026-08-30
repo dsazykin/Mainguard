@@ -314,8 +314,14 @@ public class AgentIpcJailDockerTests
         var dir = ipc.CreateEndpoint(agentId, (request, _, _) =>
         {
             seen.Enqueue(request);
-            return Task.FromResult(new AgentIpcResponse(
-                Ok: true, Status: "Approved", PlanId: "new-plan", RescopeOf: "plan-7"));
+            // `brief` is answered the way the daemon answers it — the brief text PLUS the live plan's id
+            // and state — because the id-less refusal below sends the worker to this command to find the
+            // id, and an answer shaped differently would test the advice rather than the shim.
+            return Task.FromResult(request.Op == AgentIpcRequest.BriefOp
+                ? new AgentIpcResponse(
+                    Ok: true, Brief: "Fix the calculator", PlanId: "plan-7", Status: "Approved")
+                : new AgentIpcResponse(
+                    Ok: true, Status: "Approved", PlanId: "new-plan", RescopeOf: "plan-7"));
         }, AgentIpcEndpointRole.Worker, Instructions);
 
         var handle = await fx.SpawnAsync(
@@ -348,5 +354,17 @@ public class AgentIpcJailDockerTests
         Assert.NotEqual(0, refused.ExitCode);
         Assert.Contains(WorkerPlanShim.RescopeUsage, refused.Stderr, StringComparison.Ordinal);
         Assert.Single(seen); // nothing more reached the daemon
+
+        // That refusal sends the worker to `brief` for the id — so `brief` must show it. Asserted in the
+        // jail because the whole point of this file is that a claim about the shim is checked where the
+        // shim actually runs: G3 was advice that was true of the parser and false of the world.
+        Assert.Contains("brief", refused.Stderr, StringComparison.Ordinal);
+        var brief = await fx.ExecAsync(handle.ContainerId, "sh", "-c", shim + " brief");
+        _out.WriteLine($"brief => exit {brief.ExitCode} out='{brief.Stdout.Trim()}'");
+
+        Assert.Equal(0, brief.ExitCode);
+        Assert.Contains("Fix the calculator", brief.Stdout, StringComparison.Ordinal);
+        Assert.Contains("plan-7", brief.Stdout, StringComparison.Ordinal);
+        Assert.Contains("Approved", brief.Stdout, StringComparison.Ordinal);
     }
 }

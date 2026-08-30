@@ -3388,6 +3388,14 @@ stress run died on it. So each claim is one the shipped code actually makes: the
 `RescopeUsage` verbatim, "your existing approval stands" is `WorkerRescopeTests`, and "a widening the
 human refuses three times stops being available" is the terminal-escalation rule with its own test.
 
+**One sentence written in this change was G3 on its first draft.** The id-less `rescope` refusal ends
+*"(`mainguard-plan brief` prints the id of your live plan.)"* — and it did not. The daemon put `planId`
+and `status` on the brief response; the shim printed only the brief text. A worker following that advice
+got a headline and no id, and no way to run the command it had just been told to run. The shim now prints
+`PLAN: <id> (<status>)` beneath the brief, asserted **twice** — host-side through the real `main()` (M15),
+and in a real jail beside the refusal that sends the worker there, because the whole reason that file
+exists is that a claim about the shim has to be checked where the shim runs.
+
 ### 23.9 The mutation log — every guard watched failing
 
 Run by `build/mutate.sh` (driver: `build/mutations/run-all.sh`). Two properties of that harness are
@@ -3417,6 +3425,7 @@ load-bearing, and the first cost a real false green here:
 | M12 | the decision stops carrying `rescopeOf` | `ARescopeBlocksOnTheHuman_…`, `ADeclinedRescope_LeavesTheWorkerAuthorised_…` |
 | M13 | the handler skips the plan-ownership check | `AWorkerCannotRescopeAnotherWorkersPlan` |
 | M14 | the handler infers the plan id instead of refusing | `ARescopeThatNamesNoPlan_IsRefused_AndQueuesNothing` |
+| M15 | `brief` stops printing the live plan id — **the refusal's advice stops working** | `TheShimsBrief_PrintsTheLivePlanId_BecauseTheRescopeRefusalSendsTheWorkerThere` |
 
 **M13 exposed a weak test, and the test was fixed rather than the mutation excused** — the same shape as
 §13.6's M9. Both M13 and M14 remove a check *in front of* a call that **blocks on a human**, so the
