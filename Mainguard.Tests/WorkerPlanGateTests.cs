@@ -137,6 +137,57 @@ public class WorkerPlanGateTests
         Assert.True(gate.TaskWasReleased("w-1"));
     }
 
+    // ---- K5/§23.7: the merge record has to say WHICH plan ------------------------------------
+
+    /// <summary>
+    /// <c>IMergeGate.MergeEvidence</c> is the half of §21's <c>gates</c> field that answers "what did this
+    /// gate have ESTABLISHED", and this one said <c>plan gate: plan approved</c> — naming no plan. A
+    /// worker presents, is sent back, revises and re-presents, so "some plan was approved for this worker"
+    /// is not a reference to anything: the one question a person reading a bad merge asks — which
+    /// decision authorised this — was unanswerable from the record that exists to answer it.
+    ///
+    /// <para>Scope is deliberately untouched here (a concurrent change owns re-scoping); this is only the
+    /// identity.</para>
+    /// </summary>
+    [Fact]
+    public void TheMergeEvidence_NamesTheApprovedPlan_NotMerelyThatSomePlanWasApproved()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock", 2m);
+
+        // The plan a human actually approved is the SECOND one; the first was sent back. A record that
+        // said only "plan approved" could not tell them apart.
+        var planId = plans.Present("w-1", "coord-1", "Fix the clock", Fields(), "", 2m).PlanId!;
+        plans.Reject(planId, "narrow it");
+        plans.Revise(planId, "Narrow the clock fix", Fields("src/Clock.cs"));
+        plans.Approve(planId, "uid:1000");
+
+        var evidence = gate.MergeEvidence("w-1");
+
+        Assert.NotNull(evidence);
+        Assert.Contains("plan approved", evidence!, StringComparison.Ordinal);
+        Assert.Contains(planId, evidence!, StringComparison.Ordinal);
+        Assert.Contains("Narrow the clock fix", evidence!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The two answers that are NOT "approved", kept apart from each other and from the one above. An
+    /// agent this gate never held is not governed by it at all — that is why <c>Allows</c> is true for a
+    /// manual-mode agent — and saying so is different from saying a plan was approved.
+    /// </summary>
+    [Fact]
+    public void TheMergeEvidence_SeparatesAnUngatedAgentFromAWorkerStillAtTheGate()
+    {
+        var (plans, gate) = Rig();
+        Assert.Equal("plan gate: not a plan-gated worker", gate.MergeEvidence("manual-agent"));
+
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock", 2m);
+        plans.Present("w-1", "coord-1", "Fix the clock", Fields(), "", 2m);
+        var held = gate.MergeEvidence("w-1");
+        Assert.NotNull(held);
+        Assert.Contains("NOT satisfied", held!, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void TheBriefIsAvailableBeforeApproval_ButItIsNotTheTask()
     {

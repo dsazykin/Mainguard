@@ -3459,3 +3459,98 @@ Every guard removed in turn, the tier rebuilt, the failure recorded. `touch` on 
 preserves mtime, MSBuild skips the rebuild, and the next run tests the *mutated* binary. §22.5's lesson is
 mechanized here: the runner **refuses to report** unless a built assembly's mtime actually moved.
 
+| # | mutation | result |
+|---|---|---|
+| K1-M1 | the git identity check is dropped (main moved ⇒ Merged) | 2 red |
+| K1-M2 | the forward-descent check is dropped | 1 red — see below |
+| K1-M3 | the journal fallback drops the branch-name filter | 1 red |
+| K1-M4 | an unreadable main is read as `NeverCommitted` | 1 red |
+| K1-M5 | the journal fallback drops the post-state main compare | 1 red — see below |
+| K1-M6 | the containment is asked the wrong way round | 1 red — see below |
+| K1-M7 | `Undecidable` synthesizes the confirm anyway | 4 red |
+| K2-M1 | the stale local ref is preferred again (the original defect) | 1 red |
+| K2-M2 | the identity compare is dropped, falling back to freshness | 1 red |
+| K2-M3 | a source matching neither ref is merged anyway | 1 red |
+| K3-M1 | `BeginMerge` records no branch sha on the lease | 17 red |
+| K3-M2 | the post-merge sha's shape screen is dropped | 1 red |
+| K3-M3 | the non-triviality compare is dropped | 1 red |
+| K3-M4 | the fast-forward identity compare is dropped | 1 red |
+| K3-M5 | that compare is applied to `External` entries too | 4 red |
+| K4-M1 | the verified head is re-derived at merge time (the original defect, restored whole) | 2 red |
+| K4-M2 | an unrecorded verified head no longer refuses | 1 red |
+| K4-M3 | the presence check accepts a head that is not the recorded one | 1 red |
+| K5-M1 | the merge evidence stops naming the plan | 1 red |
+| K5-M2 | an unidentifiable approval reads as an ordinary one | **0 red — deliberately uncovered** |
+| K6-M1 | the re-check is never consulted | 2 red |
+| K6-M2 | the re-check runs and its refusal is ignored | 1 red |
+| K6-M3 | the re-check is evaluated before the lock loop instead of at the action | 1 red |
+| K6-M4 | the rebaser stops handing the guard a re-check | 1 red |
+
+Five are worth reading.
+
+**K1-M2 and K1-M6 were both 0 red on the first pass**, and for the same reason: the K1 control had
+`main == agent/x`'s tip, because a fast-forward leaves them equal. Two different checks are
+indistinguishable when the two shas they compare are the same sha. `…RefusesWhenMainDidNotMoveForwardFrom…`
+now resets main sideways onto `agent/x` itself — main CONTAINS the branch, so the containment half says
+yes, and only the descent check refuses — and `…StillReconciles_WhenMainMovedFurtherAfterTheMerge` lands a
+commit on main after the merge, so `main` contains the branch and the branch does not contain `main`. That
+is §22.5's M5 lesson arriving from a different direction: a control where the operands coincide cannot
+tell an asymmetric check from its own reverse.
+
+**K1-M5 was 0 red at first** because the journal fallback has four independent filters and the test only
+exercised the branch-name one. `…JournalFallback_RefusesWhenTheEntryDoesNotDescribeTodaysMain` walks the
+real shape — the merge landed, a later commit moved main further, the branch ref was deleted — where
+confirming would record this lease's merge with a post-merge sha it did not produce.
+
+**K4-M1's first two attempts were 0 red, and both were bad mutations rather than good news.** Removing only
+the *derivation* left the new presence guard standing, so the mutated code refused for a different reason
+and the tier stayed green — a mutation that does not remove the guard is not a measurement of it. Restoring
+the ORIGINAL method whole (empty-check, presence check and derivation all replaced by local-then-tracking)
+is the honest mutation, and it is 2 red. The rule this reinforces: a mutation has to restore the *defect*,
+not delete a line near it.
+
+**K6-M4 is the wiring mutation**, and it is the one §19.6's M2/M13/M14 exist as precedent for. `RunGuarded`
+honouring a re-check proves nothing if no caller hands it one; the unit tests around the guard stayed green
+under it. `KeepAlive_AgentStartsItsOwnRebase_AfterTheGuardLooked_MutatesNothing` runs the real cycle on a
+real worktree and opens the window exactly where production opens it — the `Rebasing` state callback, which
+fires after the guard's read and before the first mutation — then asserts that neither the wip commit nor
+the reparent happened.
+
+**K5-M2 is deliberately uncovered.** The "the approved plan could not be identified" arm is unreachable
+while `MayWork` and `LatestForWorker` read the same store: `MayWork` returning true implies a plan exists.
+It is kept for the §19.6-M5 reason — it does not depend on the two accessors staying in agreement — and
+manufacturing a test that reached it would have meant weakening one of them to exercise the other.
+
+### 23.9 Tier results
+
+- `dotnet build Mainguard.slnx -c Release` — clean, no new warnings (12 pre-existing).
+- `dotnet test Mainguard.Tests -c Release` — **3810 passed, 25 skipped, 0 failed**.
+- `dotnet test Mainguard.Server.Tests -c Release --filter "Category!=RequiresDocker"` — **786 passed,
+  22 skipped, 0 failed**.
+- `dotnet format --verify-no-changes` — exit 0.
+
+Two test fixtures were changed rather than the product, and both are the fix landing correctly rather
+than a test being relaxed:
+
+- `MergeConfirmGateTests` and `MergeAuditRpcTests` used readable placeholder shas (`"main-sha-0001"`)
+  as the post-merge main the caller reports. That is exactly the class of value `ConfirmMerge` now
+  refuses, and the fixtures use real object ids.
+- `ExternalPrMergePathTests` did not record which head its verification was measured on. The live
+  provisioner does (it resolves `agent/<id>` from the mirror after the pre-verification publish), so the
+  fixture now does too — and the entry that deliberately records none is its own test.
+
+### 23.10 Left alone, deliberately
+
+- **`TryBegin` is still a uniqueness check.** §23.4 argues it; the short form is that mutual exclusion is
+  the right primitive for a human-driven irreversible act, and a CAS retry loop would convert an honest
+  "another merge is already in progress" into a silent later merge against a world nobody looked at.
+- **`ConfirmMerge`'s ordering is unchanged**, for §22.7's reasons. The new checks all sit before the
+  transition and read only the daemon's own records, so none of them needs the mirror refreshed first.
+- **The daemon does not resolve the reported sha in a repository.** It cannot: the merge runs on the
+  user's checkout. The shape screen is a shape screen and says so; pretending otherwise would be the same
+  fabrication as the claim it screens.
+- **K5's tie between an approved plan and the code it was approved for.** §23.7 — a concurrent change owns
+  re-scoping, and the recommended design is recorded there.
+- **`RebaseCycleKind.Skipped` is reused for the K6 refusal** rather than gaining a kind of its own. It is
+  the same outcome the start-of-cycle guard skip produces, for the same reason, and the reason string
+  carries the difference. A new kind would make every caller switch on a distinction none of them acts on.

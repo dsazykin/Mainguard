@@ -76,6 +76,65 @@ public sealed class KeepAliveRebaserTests
         Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
     }
 
+    /// <summary>
+    /// <b>K6/§23.6 — the guard's verdict is a snapshot, and this is the window it was blind to.</b>
+    ///
+    /// <para><c>CanMutate</c> reads the worktree once, at the top of the cycle; the mutations then run
+    /// after an <c>index.lock</c> backoff that re-checked only the lock — which was never one of the three
+    /// preconditions the verdict was made of. So an agent that started its OWN rebase after the guard
+    /// looked, and before the daemon acted, got <c>git add -A; git commit</c> and <c>git rebase main</c>
+    /// run against a worktree the guard would have refused.</para>
+    ///
+    /// <para>The window is opened here exactly where it is in production: the <c>Rebasing</c> state is set
+    /// after the guard and before the first mutation, so the state callback is the honest place to make
+    /// the worktree change underneath. Nothing about the cycle is stubbed.</para>
+    /// </summary>
+    [Fact]
+    public async Task KeepAlive_AgentStartsItsOwnRebase_AfterTheGuardLooked_MutatesNothing()
+    {
+        using var env = new RebaseEnv();
+
+        // The agent has uncommitted work, so the wip-commit leg runs first — the earliest mutation there
+        // is, and therefore the one that proves the re-check happens before ANY of them.
+        File.WriteAllText(Path.Combine(env.Worktree, "agent.txt"), "agent work\n");
+        env.AdvanceMain("human.txt", "human work\n", "human commit on main");
+
+        var rebaseMergeDir = Path.Combine(env.WorktreeGitDir, "rebase-merge");
+        var yield = new FakeYieldProtocol();
+        var states = new List<AgentRunState>();
+        var opened = false; // once — the second cycle is the control and must find a quiescent worktree.
+        var rebaser = new KeepAliveRebaser(yield, _ => env.Location, (_, s) =>
+        {
+            states.Add(s);
+            // The agent starts its own rebase in the window between the guard's read and the mutation.
+            if (s == AgentRunState.Rebasing && !opened)
+            {
+                opened = true;
+                Directory.CreateDirectory(rebaseMergeDir);
+            }
+        });
+
+        var result = await rebaser.RunCycleAsync("a1");
+
+        Assert.Equal(RebaseCycleKind.Skipped, result.Kind);
+        Assert.Contains("mid-rebase", result.Detail ?? "", StringComparison.Ordinal);
+
+        // NOTHING was mutated: no wip commit, and the branch was not reparented.
+        Assert.False(result.WipCommitCreated);
+        Assert.DoesNotContain("wip: sync", AgentTestGit.RunChecked(env.Worktree, "log", "--oneline"));
+        Assert.NotEqual(0,
+            AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
+        // The agent is resumed so it can finish its own rebase; the next cycle retries.
+        Assert.True(yield.LastToken!.Resumed);
+        Assert.DoesNotContain(AgentRunState.Conflict, states);
+
+        // The control: once the agent's rebase is done, the same cycle does the work.
+        Directory.Delete(rebaseMergeDir, recursive: true);
+        var second = await rebaser.RunCycleAsync("a1");
+        Assert.Equal(RebaseCycleKind.Rebased, second.Kind);
+        Assert.True(second.WipCommitCreated);
+    }
+
     [Fact]
     public async Task KeepAlive_Conflict_SetsStatusConflict_RoutesToResolver_LeavesRebaseInProgress()
     {

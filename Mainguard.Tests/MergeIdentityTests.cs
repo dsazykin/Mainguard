@@ -6,8 +6,8 @@ using System.Threading;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Agents.Services;
 using Mainguard.Git;
-using Mainguard.Git.Models;
 using Mainguard.Git.Exceptions;
+using Mainguard.Git.Models;
 using Mainguard.Git.Services;
 using Xunit;
 
@@ -226,17 +226,24 @@ public class MergeIdentityTests : IDisposable
         var authorized = Rev(repo, "main");
         var lease = leases.TryBegin("repohash", "lease-x", "x", authorized, "main")!;
 
-        // ...and main is then rewound behind it, with a real Merge entry in the journal for good measure
-        // (the pre-lease history the old predicate was happy to treat as this lease's evidence).
-        Git(repo, "reset", "--hard", seed);
-        JournaledFfMerge(journal, repo, "agent/y");
-        Git(repo, "reset", "--hard", seed);
-        Assert.Equal(seed, Rev(repo, "main"));
+        // ...and main is then moved SIDEWAYS onto agent/x itself — someone reset main, discarding the
+        // `base` commit the lease was authorized against. Main now CONTAINS agent/x, so the containment
+        // half of the identity says yes; what it does not do is descend from the sha this merge was
+        // authorized to fast-forward, which a fast-forward's effect always would.
+        Git(repo, "reset", "--hard", "agent/x");
+        Assert.NotEqual(authorized, Rev(repo, "main"));
+        Assert.Equal(Rev(repo, "agent/x"), Rev(repo, "main"));
 
         var outcome = RunReconcile(repo, leases, journal, lease);
 
         Assert.Empty(outcome.Merged);
         Assert.Single(outcome.Interrupted);
+        // Not a red herring: the containment half really does pass here, so this is the descent check
+        // and nothing else.
+        var (code, _, _) = GitService.RunGit(
+            repo, "merge-base", "--is-ancestor", "refs/heads/agent/x", "refs/heads/main");
+        Assert.Equal(0, code);
+        _ = journal;
     }
 
     /// <summary>The control: this lease's OWN merge is still reconciled, exactly once.</summary>
@@ -293,6 +300,56 @@ public class MergeIdentityTests : IDisposable
         var outcome2 = RunReconcile(repo2, leases2, journal2, lease2);
         Assert.Empty(outcome2.Merged);
         Assert.Single(outcome2.Interrupted);
+    }
+
+    /// <summary>
+    /// The ancestry is asked in ONE direction and it matters. After this lease's merge landed, a further
+    /// commit went onto main before the daemon came back up — so main CONTAINS <c>agent/x</c> (which is
+    /// the true statement) while <c>agent/x</c> does not contain main. §22.5's M5 is the precedent: a belt
+    /// that asks the containment backwards refuses every real merge it exists to recognise, and a control
+    /// where the two shas are equal cannot tell the two directions apart.
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_StillReconciles_WhenMainMovedFurtherAfterTheMerge()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+        var lease = leases.TryBegin("repohash", "lease-x", "x", seed, "main")!;
+
+        JournaledFfMerge(journal, repo, "agent/x");
+        Commit(repo, "later.txt", "landed after the merge\n", "a later commit on main");
+        var currentMain = Rev(repo, "main");
+        Assert.NotEqual(Rev(repo, "agent/x"), currentMain);
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        Assert.Equal(("repohash", "x", currentMain), Assert.Single(outcome.Merged));
+    }
+
+    /// <summary>
+    /// The journal fallback records what a merge DID, so its snapshots have to describe the world this
+    /// reconcile is looking at. Here the branch ref is gone (so git cannot be asked) and main has moved on
+    /// past the merge, so the entry's post-state no longer names the sha main holds. Confirming on it
+    /// would record this lease's merge with a post-merge sha it did not produce.
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_JournalFallback_RefusesWhenTheEntryDoesNotDescribeTodaysMain()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+        var lease = leases.TryBegin("repohash", "lease-x", "x", seed, "main")!;
+
+        JournaledFfMerge(journal, repo, "agent/x");
+        Commit(repo, "later.txt", "landed after the merge\n", "a later commit on main");
+        Git(repo, "branch", "-D", "agent/x");
+        Assert.Equal(string.Empty, Rev(repo, "refs/heads/agent/x"));
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        Assert.Empty(outcome.Merged);
+        Assert.Single(outcome.Interrupted);
     }
 
     /// <summary>
