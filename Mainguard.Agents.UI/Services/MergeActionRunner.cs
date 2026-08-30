@@ -113,6 +113,65 @@ public static class MergeActionRunner
         }
     }
 
+    /// <summary>
+    /// Drives one "let the agent resolve" to a reported conclusion. Never throws; the daemon's refusal —
+    /// "this entry has no rebase parked for a human", "its sandbox is gone", "the instruction could not be
+    /// delivered to its CLI" — is the sentence the human reads, verbatim.
+    ///
+    /// <para>The success line says what actually changed and deliberately does not claim the conflict is
+    /// resolved: what happened is that the agent was woken and told to resolve it. Over-claiming here
+    /// would be the same shape as the prompt log line that once said "delivered" off nothing but a write
+    /// that returned.</para>
+    /// </summary>
+    public static async Task ResolveConflictWithAgentAsync(
+        IMergeQueueService queue, string agentId, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            await queue.ResolveConflictWithAgentAsync(agentId).ConfigureAwait(false);
+            sink($"Unpaused agent/{agentId} and asked it to finish resolving the rebase itself. "
+                + "It verifies again once the rebase completes.", false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
+    /// <summary>
+    /// Drives one "abort rebase" to a reported conclusion. Never throws.
+    ///
+    /// <para>The success line states the two halves a human has to know: no committed work was lost, and
+    /// the branch is behind main again rather than mergeable. "Aborted the rebase" alone would leave a
+    /// reader guessing which of those it meant.</para>
+    /// </summary>
+    public static async Task AbortRebaseAsync(
+        IMergeQueueService queue, string agentId, Action<string, bool>? report = null)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var sink = report ?? DefaultReport;
+
+        try
+        {
+            await queue.AbortRebaseAsync(agentId).ConfigureAwait(false);
+            sink($"Aborted the rebase on agent/{agentId}. Its commits are untouched and the branch is back "
+                + "where it was — still behind main, so it needs verifying again.", false);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            sink(ex.Message, true);
+        }
+    }
+
     /// <summary>Drives one "clear the stalled verification" to a reported conclusion. Never throws.</summary>
     public static async Task ClearStalledVerificationAsync(
         IMergeQueueService queue, string agentId, Action<string, bool>? report = null)

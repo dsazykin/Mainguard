@@ -42,6 +42,12 @@ public sealed class MockOrchestrator :
         /// the sha now travels where the daemon puts it — QueueEntry.VerifiedMainSha.</summary>
         public string? VerifiedSha;
         public List<FlaggedItem> Flagged = new();
+
+        /// <summary>Set while this mock entry's worktree is "parked" mid-rebase on a conflict — the shape
+        /// the daemon produces when a merge moves main under a co-tenant branch. Modelled rather than
+        /// left permanently null so the demo surface renders (and can exercise) the two conflict
+        /// controls; nothing here touches a real worktree, which is exactly what the mock is.</summary>
+        public QueueRebaseConflict? Conflict;
         public List<string> Terminal = new();
         public List<(string Step, bool Done)> Plan = new();
         public List<string> QueuedPrompts = new();
@@ -521,7 +527,11 @@ public sealed class MockOrchestrator :
                     HasLiveSandbox: a.Life != AgentLifecycleState.Dead,
                     // Where the sha lives now: on the entry, exactly as the daemon sends it, rather than
                     // inside a verification record that would have had to carry a verdict to carry a sha.
-                    VerifiedMainSha: a.VerifiedSha))
+                    VerifiedMainSha: a.VerifiedSha,
+                    // Null for every entry that is not parked mid-rebase, which is the ordinary case. The
+                    // mock never invents an empty conflict: an empty path list reads as "nothing
+                    // conflicts", which is the one thing a conflict card must never say.
+                    RebaseConflict: a.Conflict))
                 .ToList();
 
         static int RailOrder(WorkerMergeState s) => s switch
@@ -789,6 +799,64 @@ public sealed class MockOrchestrator :
         foreach (var e in raised) EventReceived?.Invoke(e);
         Changed?.Invoke();
         return Task.FromResult(outcome);
+    }
+
+    /// <summary>
+    /// Mock hand-back — the same shape the daemon enforces: it is refused unless this entry really is
+    /// parked mid-rebase, and it clears the parking rather than leaving a card that describes a conflict
+    /// nobody is on any more.
+    /// </summary>
+    public Task ResolveConflictWithAgentAsync(string agentId)
+    {
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Conflict is null)
+            {
+                throw new InvalidOperationException(
+                    "Can't hand this back — this entry has no rebase parked for a human, so there is no "
+                    + "conflict to act on.");
+            }
+
+            if (a.Life == AgentLifecycleState.Dead)
+            {
+                throw new InvalidOperationException(
+                    "Can't hand this back — this entry's sandbox is gone, so there is no agent to hand the "
+                    + "conflict back to.");
+            }
+
+            a.Conflict = null;
+            a.Life = AgentLifecycleState.Working;
+            a.Detail = "resolving its own rebase conflict";
+        }
+
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Mock abort — refused unless a rebase is parked; on success the branch is "back where it
+    /// was" and the entry needs verifying again, which is the daemon's own terminus.</summary>
+    public Task AbortRebaseAsync(string agentId)
+    {
+        var raised = new List<AgentEvent>();
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Conflict is null)
+            {
+                throw new InvalidOperationException(
+                    "Can't abort — this entry has no rebase parked for a human, so there is nothing to abort.");
+            }
+
+            a.Conflict = null;
+            a.Life = AgentLifecycleState.Working;
+            SetMerge(a, WorkerMergeState.Working, raised);
+            a.Detail = "rebase aborted — needs verifying against the new main";
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.CompletedTask;
     }
 
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)

@@ -76,6 +76,8 @@ public class QueueChangedRefreshesRailTests
         public Task<QueueEntryDiscardOutcome> DiscardEntryAsync(string agentId, string reason) => _inner.DiscardEntryAsync(agentId, reason);
         public Task<QueueEntryRejectOutcome> RejectEntryAsync(string agentId, string reason) => _inner.RejectEntryAsync(agentId, reason);
         public Task ClearStalledVerificationAsync(string agentId) => _inner.ClearStalledVerificationAsync(agentId);
+        public Task ResolveConflictWithAgentAsync(string agentId) => _inner.ResolveConflictWithAgentAsync(agentId);
+        public Task AbortRebaseAsync(string agentId) => _inner.AbortRebaseAsync(agentId);
         public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind) => _inner.ResumeEntryAsync(agentId, agentKind);
     }
 }

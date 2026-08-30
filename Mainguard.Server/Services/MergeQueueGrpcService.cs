@@ -760,6 +760,97 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         });
     }
 
+    /// <summary>
+    /// "Let the agent resolve": unpause the parked jail and hand the conflict back to the worker that
+    /// wrote half of it. Transport only — the parking record, the unpause, the prompt delivery and every
+    /// refusal live on <see cref="MergeQueueProvisioner.LetAgentResolveConflictAsync"/>.
+    ///
+    /// <para><b>Gated by the kill switch, unlike Discard.</b> Discard is housekeeping on an entry that
+    /// cannot merge either way; this one <c>docker unpause</c>s a jail and then types at its CLI, which is
+    /// exactly the pair of things an emergency stop exists to prevent. A frozen queue must not have a
+    /// button on it that wakes an agent up.</para>
+    /// </summary>
+    public override async Task<ResolveConflictWithAgentResponse> ResolveConflictWithAgent(
+        ResolveConflictWithAgentRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        ThrowIfFrozen("handing a rebase conflict back to its agent");
+        Resolve(request.RepoHandle);
+
+        if (_queues is null)
+        {
+            const string unwired =
+                "this daemon has no queue provisioner wired, so it holds no record of parked conflicts";
+            _log.LogWarning("ResolveConflictWithAgent refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, unwired);
+            return new ResolveConflictWithAgentResponse { HandedBack = false, Reason = unwired };
+        }
+
+        var result = await _queues
+            .LetAgentResolveConflictAsync(request.RepoHandle, request.AgentId, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        _log.Log(result.Done ? LogLevel.Information : LogLevel.Warning,
+            "ResolveConflictWithAgent repo={Repo} agent={Agent} handedBack={HandedBack} {Reason}",
+            request.RepoHandle, request.AgentId, result.Done, result.Reason);
+
+        return new ResolveConflictWithAgentResponse { HandedBack = result.Done, Reason = result.Reason };
+    }
+
+    /// <summary>
+    /// "Abort rebase": <c>git rebase --abort</c> in the parked worktree, then let the jail run again.
+    /// Transport only, same as above.
+    ///
+    /// <para><b>Kill-switch gated for the same reason</b> — it ends by resuming the jail — and refused
+    /// while this entry holds the outstanding merge lease, for the reason <see cref="DiscardEntry"/> is:
+    /// moving a branch's parentage under a merge that is already executing on the user's checkout is the
+    /// queue disagreeing with git.</para>
+    /// </summary>
+    public override async Task<AbortRebaseResponse> AbortRebase(
+        AbortRebaseRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "repo_handle and agent_id are required."));
+        }
+
+        ThrowIfFrozen("aborting a parked rebase");
+        var ctx = Resolve(request.RepoHandle);
+
+        var lease = ctx.Leases.GetOutstanding(request.RepoHandle);
+        if (lease is not null && string.Equals(lease.AgentId, request.AgentId, StringComparison.Ordinal))
+        {
+            const string held =
+                "a merge is in progress for this entry — finish or abandon it before aborting the rebase";
+            _log.LogWarning("AbortRebase refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, held);
+            return new AbortRebaseResponse { Aborted = false, Reason = held };
+        }
+
+        if (_queues is null)
+        {
+            const string unwired =
+                "this daemon has no queue provisioner wired, so it holds no record of parked conflicts";
+            _log.LogWarning("AbortRebase refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, unwired);
+            return new AbortRebaseResponse { Aborted = false, Reason = unwired };
+        }
+
+        var result = await _queues
+            .AbortParkedRebaseAsync(request.RepoHandle, request.AgentId, context.CancellationToken)
+            .ConfigureAwait(false);
+
+        _log.Log(result.Done ? LogLevel.Information : LogLevel.Warning,
+            "AbortRebase repo={Repo} agent={Agent} aborted={Aborted} {Reason}",
+            request.RepoHandle, request.AgentId, result.Done, result.Reason);
+
+        return new AbortRebaseResponse { Aborted = result.Done, Reason = result.Reason };
+    }
+
     public override Task<GetMergeDiffResponse> GetMergeDiff(GetMergeDiffRequest request, ServerCallContext context)
     {
         if (string.IsNullOrWhiteSpace(request.RepoHandle) || string.IsNullOrWhiteSpace(request.AgentId))
@@ -856,6 +947,24 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 entry.LastVerificationCommand = verification.ResolvedCommand ?? string.Empty;
                 entry.LastVerificationAt = verification.When.ToString(
                     "O", System.Globalization.CultureInfo.InvariantCulture);
+            }
+
+            // The facts behind the conflict card. The gate reason has always said that a rebase conflict
+            // needs a human; WHERE the parked worktree is and WHAT conflicts lived only in one audit event
+            // and one log line, so the card named a required human action without saying what it was
+            // about. Present only while something really is parked — the projection never invents an empty
+            // conflict, because an empty path list would read as "nothing conflicts".
+            if (_queues?.ParkedConflicts.Find(repoHandle, agentId) is { } parked)
+            {
+                var conflict = new RebaseConflict
+                {
+                    Worktree = parked.WorktreePath,
+                    MainBranch = parked.MainBranch,
+                    ParkedAt = parked.ParkedAt.ToString(
+                        "O", System.Globalization.CultureInfo.InvariantCulture),
+                };
+                conflict.Paths.Add(parked.ConflictedPaths);
+                entry.RebaseConflict = conflict;
             }
 
             entry.FlaggedItems.Add(FlaggedItemsFor(ctx, agentId));

@@ -636,6 +636,28 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Unpauses a jail parked mid-rebase and asks the worker to finish resolving its own
+    /// conflict. The instruction is composed daemon-side — the request has no prompt field for a client to
+    /// fill, by construction.</summary>
+    public async Task<ResolveConflictWithAgentResponse> ResolveConflictWithAgentAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.ResolveConflictWithAgentAsync(
+            new ResolveConflictWithAgentRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
+    /// <summary><c>git rebase --abort</c> in the parked worktree, then the jail runs again.</summary>
+    public async Task<AbortRebaseResponse> AbortRebaseAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.AbortRebaseAsync(
+            new AbortRebaseRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
     /// <summary>Clears a <c>Verifying</c> entry with no run behind it, returning it to <c>Working</c>.</summary>
     public async Task<ClearStalledVerificationResponse> ClearStalledVerificationAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)

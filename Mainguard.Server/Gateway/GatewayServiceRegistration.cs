@@ -235,7 +235,24 @@ public static class GatewayServiceRegistration
             // the act of asking to widen legally, silently, for as long as the human took to decide. The
             // policy lives in PlanApprovalService now rather than here, so there is one copy of it.
             resolveApprovedPlan: agentId =>
-                sp.GetRequiredService<PlanApprovalService>().ApprovedPlanFor(agentId));
+                sp.GetRequiredService<PlanApprovalService>().ApprovedPlanFor(agentId),
+            // ---- "Let the agent resolve" needs a way to TELL the agent ---------------------------------
+            //
+            // The keep-alive cascade's conflict arm pauses a jail mid-rebase. Unpausing it is half an
+            // action: an agent frozen without explanation resumes whatever it was doing, on top of a
+            // half-finished rebase. So the hand-back sends an instruction, and it sends it through the
+            // SAME prompt-delivery path a coordinator's `send_worker_prompt` uses — the measured
+            // body-then-CR-as-a-separate-frame submission — rather than growing a second way to type at a
+            // worker. Two writers to a PTY is how one of them regresses to "the prompt accumulated
+            // unsubmitted in its input box" while the other stays fixed.
+            //
+            // Resolved lazily inside the delegate: the binder is registered by DaemonHost, and taking it
+            // as a constructor dependency here would tie the queue provisioner's construction to the
+            // terminal stack it has nothing else to do with.
+            promptAgent: async (repoHash, agentId, prompt, ct) =>
+                (await sp.GetRequiredService<Runtime.AgentCliBinder>()
+                    .TrySendPromptAsync(new Runtime.AgentSessionKey(repoHash, agentId), prompt, ct)
+                    .ConfigureAwait(false)).Submitted);
 
             // ---- G1: the other half of "a queue row requires an approved plan" -------------------------
             //

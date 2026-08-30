@@ -895,7 +895,18 @@ public sealed class DaemonBackedOrchestrator :
                     // The daemon has always sent this and the client has always thrown it away, which is
                     // why the review cockpit's "verified @ <sha>" stamp never rendered: the value existed
                     // on the wire and stopped here.
-                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha));
+                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha,
+                    // The facts behind a conflict card. `RebaseConflict` is a MESSAGE field, so protobuf's
+                    // presence test is exact: absent means nothing is parked, and it must not be mapped to
+                    // an empty conflict — an empty path list renders as "nothing conflicts", which is the
+                    // one thing a conflict card must never say.
+                    RebaseConflict: entry.RebaseConflict is null
+                        ? null
+                        : new QueueRebaseConflict(
+                            entry.RebaseConflict.Worktree ?? string.Empty,
+                            entry.RebaseConflict.MainBranch ?? string.Empty,
+                            entry.RebaseConflict.Paths.ToArray(),
+                            ParseTimestamp(entry.RebaseConflict.ParkedAt))));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -1957,6 +1968,71 @@ public sealed class DaemonBackedOrchestrator :
         if (!response.Cleared)
         {
             throw new InvalidOperationException($"Can't clear this verification — {response.Reason}.");
+        }
+    }
+
+    /// <summary>
+    /// Hands a parked rebase conflict back to the worker that produced half of it: the daemon unpauses the
+    /// jail and delivers an instruction through its own prompt path.
+    ///
+    /// <para><b>This adapter asserts nothing</b>, exactly like <see cref="ResumeEntryAsync"/>. Whether a
+    /// rebase is really parked, whether it is still in progress, whether a jail exists and whether the
+    /// instruction was actually submitted to the CLI are all daemon-side facts; a client that guessed at
+    /// them would be building the control in the UI layer again.</para>
+    ///
+    /// <para><b>A refusal is thrown, never swallowed</b> — the daemon answers a decline with
+    /// <c>handed_back=false</c> and a reason on an otherwise successful RPC, so "no exception" is not
+    /// evidence an agent woke up.</para>
+    /// </summary>
+    public async Task ResolveConflictWithAgentAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't hand this back — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .ResolveConflictWithAgentAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.HandedBack)
+        {
+            throw new InvalidOperationException($"Can't hand this back — {response.Reason}.");
+        }
+    }
+
+    /// <summary>Aborts a parked rebase. Same refusal discipline: the daemon's "no" carries its reason and
+    /// leaves the worktree exactly as it was.</summary>
+    public async Task AbortRebaseAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't abort this rebase — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .AbortRebaseAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Aborted)
+        {
+            throw new InvalidOperationException($"Can't abort this rebase — {response.Reason}.");
         }
     }
 

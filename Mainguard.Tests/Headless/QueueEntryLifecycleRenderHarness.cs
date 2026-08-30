@@ -49,6 +49,12 @@ public class QueueEntryLifecycleRenderHarness
     // exists for — read the output, push a fix, or ask for the run again.
     private const string Red = "4a0c8e6b5d17-92fb3c1e7a4d508b6c2e9f0a1d834b57";
 
+    // The row this suite's conflict assertions are about: a merge moved main, the daemon's auto-rebase hit
+    // this branch's changes, and the worktree is parked mid-rebase with the jail paused. Its STATE is
+    // `Working` — identical to the stranded row's — which is exactly why the conflict facts have to travel
+    // as their own field: the state word cannot tell a parked conflict from a branch nobody ever verified.
+    private const string Conflicted = "6d51fa9c3e08-47a1b8d2c6f309e5417b0da8c93e62f1";
+
     /// <summary>
     /// Every non-terminal row can be acted on, and each action means one thing:
     /// Discard everywhere, "Clear stalled run" only where the DAEMON says no run is live.
@@ -63,7 +69,7 @@ public class QueueEntryLifecycleRenderHarness
         win.Show();
         Settle();
 
-        Assert.Equal(5, vm.Entries.Count);
+        Assert.Equal(6, vm.Entries.Count);
 
         foreach (var entry in vm.Entries)
         {
@@ -112,8 +118,8 @@ public class QueueEntryLifecycleRenderHarness
         var discards = view.GetVisualDescendants().OfType<Button>()
             .Where(b => b.IsEffectivelyVisible && Equals(b.Content, "Discard"))
             .ToList();
-        // One per row: every non-terminal entry can be dropped, and all five of this fixture's rows are.
-        Assert.Equal(5, discards.Count);
+        // One per row: every non-terminal entry can be dropped, and all six of this fixture's rows are.
+        Assert.Equal(6, discards.Count);
         foreach (var d in discards)
         {
             Assert.Contains("DangerQuiet", d.Classes);
@@ -292,7 +298,7 @@ public class QueueEntryLifecycleRenderHarness
             var win = HostWindow(view);
             win.Show();
             Settle();
-            Assert.Equal(5, vm.Entries.Count);
+            Assert.Equal(6, vm.Entries.Count);
             win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), $"queue_lifecycle_{theme}.png"));
 
             // ...and the armed state, which is where the destructive emphasis actually appears.
@@ -382,14 +388,23 @@ public class QueueEntryLifecycleRenderHarness
                 verdict: new VerificationVerdict(false, "dotnet test", DateTimeOffset.UnixEpoch)),
             // The owner's screenshot: commits on the branch, jail gone, "not verified yet".
             Entry(Stranded, WorkerMergeState.Working, "not verified yet", hasSandbox: false),
+            // The parked conflict, with the daemon's own gate sentence — the one that names a required
+            // human action the rail had no operation for.
+            Entry(Conflicted, WorkerMergeState.Working,
+                "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
+                + "rebase in progress and needs a human to resolve it",
+                conflict: new QueueRebaseConflict(
+                    "/srv/mainguard/agents/9f2c/6d51fa9c3e08/worktree", "main",
+                    new[] { "src/Merge/MergeQueue.cs", "docs/repo-map/README.md" },
+                    DateTimeOffset.UnixEpoch)),
         };
 
         private static QueueEntry Entry(
             string id, WorkerMergeState state, string detail, bool inFlight = false, bool hasSandbox = true,
-            VerificationVerdict? verdict = null)
+            VerificationVerdict? verdict = null, QueueRebaseConflict? conflict = null)
             => new(id, id, "agent/" + id, state, detail, Verification: verdict,
                 FlaggedItems: Array.Empty<FlaggedItem>(), VerificationInFlight: inFlight,
-                HasLiveSandbox: hasSandbox);
+                HasLiveSandbox: hasSandbox, RebaseConflict: conflict);
 
         public bool CanMerge(string agentId, out string reason)
         {
@@ -433,6 +448,24 @@ public class QueueEntryLifecycleRenderHarness
             Resumed.Add((agentId, agentKind));
             return Task.FromResult(new QueueEntryResumeOutcome(
                 agentId, "agent/" + agentId, WorkerMergeState.Working, ClearedStalledVerification: false));
+        }
+
+        /// <summary>Every entry a hand-back actually reached the seam with.</summary>
+        public List<string> HandedBack { get; } = new();
+
+        /// <summary>Every entry an abort actually reached the seam with.</summary>
+        public List<string> Aborted { get; } = new();
+
+        public Task ResolveConflictWithAgentAsync(string agentId)
+        {
+            HandedBack.Add(agentId);
+            return Task.CompletedTask;
+        }
+
+        public Task AbortRebaseAsync(string agentId)
+        {
+            Aborted.Add(agentId);
+            return Task.CompletedTask;
         }
     }
 }

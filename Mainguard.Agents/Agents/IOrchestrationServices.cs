@@ -189,6 +189,33 @@ public interface IMergeQueueService
     /// <exception cref="InvalidOperationException">The daemon refused; the message is its reason, already
     /// phrased for display, and nothing was changed.</exception>
     Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind);
+
+    /// <summary>
+    /// <b>"Let the agent resolve"</b> — unpause the jail the daemon parked mid-rebase and instruct the
+    /// worker to finish resolving its own conflict.
+    ///
+    /// <para>It acts on an entry the daemon blocked with "the agent is paused with the rebase in progress
+    /// and needs a human to resolve it" — a sentence naming a required human action that, until this
+    /// existed, the surface had no operation for. The jail was paused, so nothing could even be exec'd in
+    /// it, and the row's only controls were Verify (which cannot run in a paused jail), the verification
+    /// log, and Discard.</para>
+    ///
+    /// <para>Every decision is the daemon's: whether a rebase is really parked, whether it is still in
+    /// progress, whether the jail exists, and whether the instruction was actually submitted to the CLI.
+    /// This seam asks; it asserts nothing.</para>
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The daemon declined; the message is its reason, already
+    /// phrased for display, and the conflict is exactly as it was.</exception>
+    Task ResolveConflictWithAgentAsync(string agentId);
+
+    /// <summary>
+    /// <b>"Abort rebase"</b> — <c>git rebase --abort</c> in the parked worktree, then let the jail run
+    /// again. The branch returns to its pre-rebase tip and the entry to the queue, needing verification
+    /// against the new main.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The daemon declined; the message is its reason, and the
+    /// worktree is unchanged.</exception>
+    Task AbortRebaseAsync(string agentId);
 }
 
 /// <summary>
