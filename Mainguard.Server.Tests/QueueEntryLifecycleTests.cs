@@ -401,7 +401,7 @@ public sealed class QueueEntryLifecycleTests
             new[]
             {
                 "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
-                "revise_plan", "spawn", "status", "verify",
+                "revise_plan", "spawn", "status", "task", "verify",
             },
             ops);
 

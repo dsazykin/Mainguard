@@ -93,7 +93,10 @@ public sealed class QueueEntryResumeTests
     /// was two ops about spawning. Phase 2's worker plan shim adds four — <c>brief</c>,
     /// <c>present_plan</c>, <c>revise_plan</c>, <c>await_decision</c> — which carry a plan through the
     /// human decision and back. Phase 3's role lock adds the rest of the coordinator's four permitted
-    /// tools: <c>status</c>, <c>prompt</c>, <c>verify</c> (alongside the existing <c>spawn</c>).</para>
+    /// tools: <c>status</c>, <c>prompt</c>, <c>verify</c> (alongside the existing <c>spawn</c>). The plan-mode
+    /// toggle adds <c>task</c> — a second DOOR onto the gate's one exit for the withheld task, gated by
+    /// the same <c>MayWork</c> predicate as <c>commit_work</c>, and the op a worker uses when the operator
+    /// has turned plan approvals off and there is therefore no <c>present</c> to return one.</para>
     ///
     /// <para>None of the seven names an agent id to adopt or a branch to attach to, and each endpoint is
     /// fixed to ONE role — a worker cannot reach <c>spawn</c>, a coordinator cannot reach the plan ops.
@@ -116,7 +119,7 @@ public sealed class QueueEntryResumeTests
             new[]
             {
                 "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
-                "revise_plan", "spawn", "status", "verify",
+                "revise_plan", "spawn", "status", "task", "verify",
             },
             ops);
 
