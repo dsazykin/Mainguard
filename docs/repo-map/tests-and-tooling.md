@@ -1726,7 +1726,10 @@
   Both files avoid `Assert.ThrowsAsync<TimeoutException>(() => task.WaitAsync(budget))`, which goes GREEN
   for a watchdog that cancels nothing — the helper asserts the task ENDED first) plus, in
   `MergeQueueProvisionerTests`, the drift proof over a REAL bare mirror and REAL agent branch — one
-  claim per test on purpose, since xUnit stops at the first failing assertion and a five-assertion
+  claim per test on purpose (including `TheWaiverRecord_NamesTheBaselineAndTheReplacement_ReadFromTheMirror`,
+  L4's plumbing half: the two committed config trees are the only place the baseline and the replacement
+  exist together, and a `SetFlagged` that dropped the drift argument would still flag, still block and
+  still clear, leaving every other assertion in the class green), since xUnit stops at the first failing assertion and a five-assertion
   test measures only the first: `ABranchsToolchain_IsNeverTheOneProvisioned` (main declares
   `dotnet-10`, the branch demands `rust-stable`, and the observable is which presence probe the daemon
   ran in the jail), the flag/block/reason/acknowledge quartet, comment-edits-are-not-drift,
@@ -2815,6 +2818,26 @@
   envelope round-trip, marker-scoped since the in-proc hosts share the run-scoped daemon DB), the
   coordinator-role denial of both RPCs, and the offline `mainguardd audit verify` CLI exit contract
   (0 intact / 2 after a drop-trigger-and-forge tamper / 0 on a missing store / 64 usage).
+- **`Mainguard.Server.Tests/MergeAuditRpcTests.cs`** (L2/L4 — §20 of the phase-3 decisions doc) — the
+  merge conversation's audit record over the REAL daemon and the REAL hash chain: a merge driven
+  `BeginMerge` → `ConfirmMerge` leaves exactly one `queue_entry_merged` naming the daemon-derived actor,
+  the lease, both shas and the verification it rode on; that record is chained (`VerifyAudit` still
+  valid, `ReadAudit` returns it with 64-char links); a refused confirm writes `merge_confirm_refused` and
+  **no** merge record; acknowledging the RT-D2 `changed-test-command` item writes the waiver with the
+  actor and the drift; and the merge that follows names the waiver in its `gates` evidence. Repo handle
+  AND agent id are per-test GUIDs — the in-proc hosts share one run-scoped chained log, and the
+  acknowledgment event carries no repo field (it is shaped like the flagged-change ack it must match).
+- **`Mainguard.Tests/MergeAuditEventTests.cs`** (L2) — the queue-level invariant, stronger than "the RPC
+  audits": no transition to `Merged`, by any path, without exactly one `queue_entry_merged`. Both confirm
+  entry points (the gated RPC one and the unconditional RT-D1 reconcile one), the pre/post sha pair, the
+  `from_state` captured BEFORE the merge walk, `verification = none recorded` for a rehydrated queue whose
+  verification row is gone, the per-gate evidence line, `no gates wired`, the unattributed record, one
+  record per merge — and the two refusal shapes (gate and lost CAS) auditing **nothing**.
+- **`Mainguard.Tests/ChangedTestCommandAuditTests.cs`** (L4) — the waiver's shape: the same event type the
+  flagged-change acks use (separated by `kind`), one record per item waived rather than per click,
+  idempotent, nothing at all for an unflagged agent, the latest drift rather than the first when an armed
+  item changes, `(not recorded)` vs `(absent)` vs the content kept apart, the excerpt cap with the full
+  content still hashed, and `unknown` when nobody is named.
 Not in the solution (scratch/experiments, don't rely on them): `Mainguard.StyleConsole`, `Mainguard.StyleTests`, `Mainguard.AvaloniaTests`.
 
 ---

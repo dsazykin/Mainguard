@@ -500,7 +500,11 @@ public sealed class QueueSeeder
 
             // Gate + CAS + the Merged transition, atomically, daemon-side — the MG-11 enforcement
             // point, evaluated for a seeded branch exactly as for a real one.
-            if (!queue.TryConfirmHumanMerge(agentId, newMainSha, expectedMainSha, out var reason))
+            // Labelled `seeded` in the merge audit for the same reason a seeded verification carries its
+            // SeededProvenanceMarker: a synthetic merge that recorded itself as a human one would be a
+            // forged entry in the one chain that has to be trustworthy.
+            if (!queue.TryConfirmHumanMerge(
+                    agentId, newMainSha, expectedMainSha, out var reason, MergeAuthorization.Seeded()))
             {
                 // The merge has landed on origin main but the queue refused to record it — surface
                 // the reason verbatim; the mirror refresh below still reconciles main so the queue

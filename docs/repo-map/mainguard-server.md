@@ -652,7 +652,16 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  record and bypass the gate's default-DENY. **L2/L4 audit (§20 of the phase-3 decisions doc):** `ConfirmMerge` derives the actor from
+  `IApproverIdentityResolver` and passes `MergeAuthorization.ConfirmRpc(actor, leaseId)` into
+  `TryConfirmHumanMerge` (which is where `queue_entry_merged` is appended), and `AcknowledgeFlaggedChange`
+  passes the same daemon-derived actor into `ChangedTestCommandGate.Acknowledge`. This service also owns
+  **`ConfirmRefusedEvent` (`merge_confirm_refused`)**, appended when a confirm is refused at either the
+  lease or the gate stage — the one merge-conversation fact knowable only here: by `ConfirmMerge` time the
+  git operation has ALREADY RUN on the user's checkout, so a refusal means the daemon and the user's
+  repository may now disagree about what main is. Best-effort (swallowed into the daemon log), unlike the
+  merge record itself, because the refusal reason must not be replaced by an audit-store error. A refused
+  `BeginMerge` is deliberately NOT audited — it is a merge that has not happened. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
   mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
   between a merge and the next repo-open based its worktree on the stale mirror main and
   `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving

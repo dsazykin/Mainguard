@@ -7,6 +7,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents.Sandbox;
+using Mainguard.Git.Audit;
+using Mainguard.Git.Review;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -261,6 +263,14 @@ public static class VerificationCommandResolver
 /// <see cref="IMergeQueue.CanMerge"/> while a branch's resolved test command has drifted from the main
 /// baseline and the change is unacknowledged. This is the dedicated must-acknowledge flagged item wired
 /// beside the staleness gate; P2-11's diff-review UI acknowledges it per item.
+///
+/// <para><b>Every acknowledgment here is audited (<c>acknowledged_flagged_change</c>).</b> It was not,
+/// for a long time: the ack landed in a plain <see cref="HashSet{T}"/> and wrote nothing anywhere, while
+/// the neighbouring <see cref="FlaggedChangeGate"/>'s acks did write the event. That asymmetry was
+/// backwards — the item being waived here is <i>"the branch changed the command that verifies it"</i>,
+/// the one waiver that lets a branch self-green, and it was the one waiver that left no trace. The record
+/// names the item, the config path, the baseline and the replacement (excerpt + full content hash), and
+/// the human who waived it.</para>
 /// </summary>
 public sealed class ChangedTestCommandGate : IMergeGate
 {
@@ -275,9 +285,30 @@ public sealed class ChangedTestCommandGate : IMergeGate
     /// </summary>
     public const string ToolchainItem = "verification toolchain";
 
+    /// <summary>
+    /// What drifted, for one flagged item: the config file, main's baseline content, and the branch's
+    /// replacement. Carried so the acknowledgment record can say <i>which command changed, from what to
+    /// what</i> — "the test command changed" names a category, not a fact anyone can act on later.
+    /// </summary>
+    /// <param name="ConfigPath">Repo-relative path of the config that defines the item.</param>
+    /// <param name="FromMain">The main-side baseline content (null/empty = absent on main).</param>
+    /// <param name="ToBranch">The branch-side content (null/empty = absent on the branch).</param>
+    public sealed record CommandDrift(string ConfigPath, string? FromMain, string? ToBranch);
+
+    /// <summary>How much of each side's content the audit record quotes verbatim. The full content is
+    /// pinned by its hash beside the excerpt, so nothing is lost — an unbounded quote would let a repo's
+    /// config file decide the size of an audit payload.</summary>
+    internal const int DriftExcerptChars = 256;
+
     private readonly object _gate = new();
     private readonly Dictionary<string, SortedSet<string>> _flagged = new(StringComparer.Ordinal);
     private readonly HashSet<string> _acknowledged = new(StringComparer.Ordinal);
+    private readonly Dictionary<(string Agent, string Item), CommandDrift> _drift = new();
+    private readonly IAuditLog _audit;
+
+    /// <param name="audit">Audit sink for <c>acknowledged_flagged_change</c> (in-memory by default — the
+    /// client-side mirror of this gate has no daemon log to write to, and must not pretend otherwise).</param>
+    public ChangedTestCommandGate(IAuditLog? audit = null) => _audit = audit ?? new InMemoryAuditLog();
 
     /// <summary>Records (or clears) the <see cref="TestCommandItem"/> flag for an agent after a
     /// verification resolves its command.</summary>
@@ -288,7 +319,13 @@ public sealed class ChangedTestCommandGate : IMergeGate
     /// gate (any prior acknowledgment is dropped), which is what stops "I already acknowledged this
     /// branch once" from covering a later, different change.
     /// </summary>
-    public void SetFlagged(string agentId, string item, bool changed)
+    /// <param name="agentId">The branch this flag belongs to.</param>
+    /// <param name="item">The drift item (<see cref="TestCommandItem"/> / <see cref="ToolchainItem"/>).</param>
+    /// <param name="changed">True to arm the item, false to clear it.</param>
+    /// <param name="drift">What changed, from what to what — recorded when the item is acknowledged.
+    /// Null where the caller cannot say, and the audit record then states that rather than inventing a
+    /// baseline.</param>
+    public void SetFlagged(string agentId, string item, bool changed, CommandDrift? drift = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(item);
         lock (_gate)
@@ -305,10 +342,22 @@ public sealed class ChangedTestCommandGate : IMergeGate
                 {
                     _acknowledged.Remove(agentId); // a fresh change re-arms the gate.
                 }
+
+                // Always overwritten while the item is armed: a re-verification against a NEW branch tip
+                // re-arms this same item, and keeping the first run's baseline would make the eventual
+                // acknowledgment record describe a diff the human never saw.
+                if (drift is not null)
+                {
+                    _drift[(agentId, item)] = drift;
+                }
             }
-            else if (items.Remove(item) && items.Count == 0)
+            else
             {
-                _acknowledged.Remove(agentId);
+                _drift.Remove((agentId, item));
+                if (items.Remove(item) && items.Count == 0)
+                {
+                    _acknowledged.Remove(agentId);
+                }
             }
 
             if (items.Count == 0)
@@ -318,16 +367,93 @@ public sealed class ChangedTestCommandGate : IMergeGate
         }
     }
 
-    /// <summary>Acknowledges the changed-test-command item for an agent (P2-11 per-item ack).</summary>
-    public void Acknowledge(string agentId)
+    /// <summary>
+    /// Acknowledges the changed-test-command items for an agent (P2-11 per-item ack) and <b>appends one
+    /// <c>acknowledged_flagged_change</c> audit event per item waived</b>.
+    ///
+    /// <para>One event per item rather than one per click: the click clears every armed item at once (by
+    /// design — see <see cref="ToolchainItem"/>), but what was waived is the items, and a single event
+    /// would make "the command changed" and "the toolchain changed" indistinguishable in the chain.</para>
+    ///
+    /// <para>Idempotent: a second call on an already-acknowledged agent appends nothing. Re-appending
+    /// would let a UI that refreshes twice inflate the record of how often a human waived something.</para>
+    /// </summary>
+    /// <param name="agentId">The branch being waived.</param>
+    /// <param name="acknowledgedBy">Daemon-derived actor (SA-1/F2 — never client-supplied).</param>
+    /// <returns>True iff this call newly acknowledged the agent's armed items.</returns>
+    public bool Acknowledge(string agentId, string? acknowledgedBy = null)
     {
+        List<(string Item, CommandDrift? Drift)> waived;
         lock (_gate)
         {
-            if (_flagged.ContainsKey(agentId))
+            if (!_flagged.TryGetValue(agentId, out var items) || !_acknowledged.Add(agentId))
             {
-                _acknowledged.Add(agentId);
+                return false;
             }
+
+            waived = items
+                .Select(i => (Item: i, Drift: _drift.TryGetValue((agentId, i), out var d) ? d : null))
+                .ToList();
         }
+
+        var by = string.IsNullOrWhiteSpace(acknowledgedBy) ? "unknown" : acknowledgedBy!;
+        foreach (var (item, drift) in waived)
+        {
+            // Deliberately the SAME event type FlaggedChangeGate's acks use: a reader asking "what did a
+            // human wave through on this branch" must get one answer, not two lists to remember to union.
+            // The `kind` field is what separates them, exactly as it does across FlaggedKind.
+            _audit.Append(new AuditEvent("acknowledged_flagged_change", new Dictionary<string, string>
+            {
+                ["agent"] = agentId ?? string.Empty,
+                ["item"] = item,
+                ["path"] = drift?.ConfigPath ?? "(not recorded)",
+                ["category"] = RiskCategory.ExecutableConfig.ToString(),
+                ["kind"] = FlaggedKind.ChangedTestCommand.ToString(),
+                ["by"] = by,
+                ["from"] = Excerpt(drift?.FromMain, drift is null),
+                ["to"] = Excerpt(drift?.ToBranch, drift is null),
+                ["from_hash"] = ContentHash(drift?.FromMain, drift is null),
+                ["to_hash"] = ContentHash(drift?.ToBranch, drift is null),
+            }));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// One side of a drift, quoted for a human reading the chain. Three distinct answers, kept apart:
+    /// the caller recorded no drift at all, the file was absent on that side, or here is (the head of)
+    /// its content. Collapsing the first two would render "we did not capture the baseline" as "this
+    /// branch invented a verification command out of nothing".
+    /// </summary>
+    private static string Excerpt(string? content, bool unrecorded)
+    {
+        if (unrecorded)
+        {
+            return "(not recorded)";
+        }
+
+        var normalized = (content ?? string.Empty).Replace("\r\n", "\n").Trim();
+        if (normalized.Length == 0)
+        {
+            return "(absent)";
+        }
+
+        return normalized.Length <= DriftExcerptChars
+            ? normalized
+            : normalized[..DriftExcerptChars] + "…(truncated)";
+    }
+
+    /// <summary>SHA-256 of the full normalized content, so the excerpt above never has to be the record.</summary>
+    private static string ContentHash(string? content, bool unrecorded)
+    {
+        if (unrecorded)
+        {
+            return "(not recorded)";
+        }
+
+        var normalized = (content ?? string.Empty).Replace("\r\n", "\n").Trim();
+        return normalized.Length == 0 ? "(absent)" : VerificationCommandResolver.Sha256(normalized);
     }
 
     /// <summary>True iff the agent currently has an unacknowledged changed-test-command flag.</summary>
@@ -365,5 +491,27 @@ public sealed class ChangedTestCommandGate : IMergeGate
 
         reason = "";
         return true;
+    }
+
+    /// <summary>
+    /// What this gate had established about the branch at merge time (see
+    /// <see cref="IMergeGate.MergeEvidence"/>).
+    ///
+    /// <para>The distinction it exists to preserve: a branch that never touched how it is verified, and a
+    /// branch that rewrote its own test command and had a human wave it through, are the same
+    /// <c>Allows == true</c> and could not be told apart in the merge record otherwise.</para>
+    /// </summary>
+    public string? MergeEvidence(string agentId)
+    {
+        lock (_gate)
+        {
+            if (!_flagged.TryGetValue(agentId, out var items) || items.Count == 0)
+            {
+                return "changed-test-command: no drift vs main";
+            }
+
+            var state = _acknowledged.Contains(agentId) ? "acknowledged" : "UNACKNOWLEDGED";
+            return $"changed-test-command: {string.Join(" + ", items)} changed vs main — {state}";
+        }
     }
 }
