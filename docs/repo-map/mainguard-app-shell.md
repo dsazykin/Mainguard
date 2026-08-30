@@ -338,7 +338,19 @@
       on the front one — behind a two-step confirm whose question states that the entry will not be
       merged and the branch is left alone, plus a `Button.Secondary` "Clear stalled run" shown only when
       the daemon reports no run behind a `Verifying` state. The rail's ONE accent stays the Review CTA:
-      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
+      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue. Each row
+      also hosts `VerificationPanelView` — see below), **`VerificationPanelView.axaml`** (H4 — the verdict
+      line plus the recorded test output, expandable in place. It lives ON THE ROW because the row is the
+      only surface every entry has: an entry whose agent is gone has no worker document, and one that
+      never verified cannot reach the review cockpit, so a log reachable only from either would be missing
+      for exactly the entries that failed. Collapsed by default and fetched on first expand — the output is
+      a daemon-side file read per entry and the rail re-projects on every queue event. The reader is
+      BOUNDED rather than the log being shortened: a `MaxHeight` cap with its own scroll, so a 256 KiB tail
+      cannot push the row's actions off the surface, and horizontal scrolling is ON here (unlike the rail's
+      wrapping identifiers) for the reason `ReviewCockpitView` scrolls its diff sideways — wrapping a stack
+      trace destroys the alignment that makes it readable. `SelectableTextBlock` in `FontMono`, because the
+      reason a person opens a failing log is usually to copy the assertion out of it. The same control is
+      hosted by `AgentDocumentView`'s review section),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line; **harness-only** — constructed solely by
       `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (the coordinator
@@ -609,7 +621,8 @@
     #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
     `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
     non-accent `ShowSecondaryReview` button on every other reviewable row (the cockpit is the only
-    home of the Merge button, so a verified branch without a Review path is unmergeable), and the
+    home of the Merge button, so a verified branch without a Review path is unmergeable), a per-row
+    **`Verification`** child (`VerificationPanelViewModel` — the verdict and its output, see below), and the
     per-row **`VerifyCommand`** — the human verification trigger. The command is
     deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
     (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
@@ -669,10 +682,23 @@
     a card that latched its buttons disabled — on a throw, or on a decision that returned while the plan
     stayed pending with the same id/revision and `Refresh` therefore kept the same instance mounted — took
     away the operator's only means of clearing backpressure. Built entirely from existing theme tokens — a
-    warning, a stop and a failure are things the design system already has words for), `AgentDocumentViewModel` +
+    warning, a stop and a failure are things the design system already has words for),
+    **`VerificationPanelViewModel.cs`** (H4 — one entry's verification VERDICT and its recorded output on
+    demand, composed identically into `QueueEntryViewModel` and `AgentDocumentViewModel` so the two
+    surfaces cannot drift into saying different things about one record. Three outcomes and never two:
+    green, red, and *no record at all* — the collapse of red into never-run is the defect it exists to end.
+    `ToggleCommand` fetches the log through `IMergeQueueService.GetVerificationLogAsync` on FIRST expand
+    only, caches it against the verdict it belongs to and drops it when a new verdict arrives; it never
+    calls `RunVerificationAsync`, because charging a human a minutes-long jail run to find out why a run
+    failed is the problem, not the fix. `LogNotice` keeps the daemon's distinct answers distinct —
+    truncated tail / artifact gone / run printed nothing / daemon unreachable — so none of them renders as
+    an empty box), `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
-    Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
+    Merge button, plus the shared `Verification` panel and a `VerifiedAgainstText` main@sha stamp — these
+    replaced a single `ReviewFactsText` line that printed either an invented `{TestsPassed}/{TestsTotal}
+    tests green` or, for everything else including a branch whose tests had just failed, "no verification
+    record yet"), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
     `QueueSeedingPanelViewModel` (the DEV-ONLY seeding card, docs/design/queue-seeding.md §6-7 — a thin
     driver over `IQueueSeedingGateway` whose scenario presets are CLIENT-side compositions of the RPC
     primitives ("Stale pair" is literally two specs in one ordered batch; "Merge during verify" holds
@@ -895,6 +921,14 @@
     seam: composes via Core's pure `DaemonRefreshToast.TryCompose` (Refreshed/RefreshFailed only) and
     posts the shell toast onto the UI thread into `MainWindowViewModel.Toasts`; no main window or no
     toast-worthy outcome means nothing happens.
+  - `JailText.cs` — renders sandbox-produced text safe to DISPLAY, the client-side twin of the daemon's
+    `AgentIpcServer.Echo` (which does the same before anything is logged). `GetVerificationLog` is the one
+    path that hands jail bytes straight to a human surface — an artifact written by a test runner inside
+    the worker's own jail — so `DaemonBackedOrchestrator` sanitizes at the projection boundary and no
+    consumer can forget: newlines and tabs kept (structure in a test log), other control characters made
+    visible as `.` rather than silently dropped, CR/CRLF collapsed to one break, and ANSI escape sequences
+    consumed WHOLE (CSI/OSC/two-character, including one the daemon's tail cut in half) so a coloured
+    reporter's output arrives as the plain text underneath it instead of a smear of `.[31m`.
   - `BrowserLauncher.cs` — the single open-a-URL-in-the-browser path (validates via Core's `SafeWebUrl`,
     then platform-dispatches; best-effort, never throws); ViewModels take it as their default `_openUrl`
     delegate instead of private copies.
@@ -929,7 +963,8 @@
     bearer token to a port squatter)** — P2-03 adds `AttachTerminal` (the long-lived
     `TerminalService.Attach` bidi call); P2-06 adds `ProvisionRepoAsync` (→
     `ProvisionedRepo(RepoHandle, SyncRemoteName, SyncRemoteUrl)`); PR3 adds `ListInstalledAdaptersAsync`
-    and a `role` parameter on `SpawnAgentAsync`.
+    and a `role` parameter on `SpawnAgentAsync`; H4 adds `GetVerificationLogAsync` (the CONTENT of an
+    entry's last verification artifact — never its daemon path, G-14).
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
     `raw` frame; a fake backs the ViewModel tests. **Every frame it sends — selector, input, resize —

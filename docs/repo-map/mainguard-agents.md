@@ -66,7 +66,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   Docker, no real agents).
   - `OrchestrationModels.cs` (enums/records shaped like the future gRPC contract: `AgentLifecycleState`
     per OPS §4.1, `WorkerMergeState` per P2-10,
-    `AgentInfo`/`QueueEntry`/`VerificationRecord`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`,
+    `AgentInfo`/`QueueEntry`/`VerificationVerdict`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`
+    (**H4:** `VerificationVerdict` replaced a `VerificationRecord` that carried `TestsPassed`/`TestsTotal`
+    — counts no wire has ever carried and nothing in this system measures, since verification observes a
+    process exit code in a jail and parses nobody's test runner. It is narrowed to the three real
+    `QueueEntry.last_verification_*` fields; a null `QueueEntry.Verification` means NO RECORD, which is a
+    different answer from a failure and must never render as one),
     plus the **phase-2** `WorkerPlanCard` (a worker-authored plan as the approval card needs it —
     authorship, revision-against-budget, and the feedback the last rejection sent back) and
     `OrchestrationBackpressure` (blocked/escalated/active counts + the daemon's rendered stall line;
@@ -76,7 +81,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     UI-facing verification trigger** — the rung whose absence left the whole verification mechanism
     without a production caller, so queue entries sat at `not verified yet` forever. It is a *trigger*
     only: every decision stays in the daemon's `MergeQueue.RunVerificationAsync`, which an automatic
-    phase-2 caller drives directly for identical gates/jail execution/transitions),
+    phase-2 caller drives directly for identical gates/jail execution/transitions;
+    **`GetVerificationLogAsync`** (+ `VerificationLog`) is its counterpart — it READS the recorded output
+    of the last run and starts nothing, because a re-run costs minutes of real jail time and can answer
+    differently, and until it existed "why did this fail?" was spelled "run it again". It keeps the
+    daemon's three answers apart: no record / the log / a record whose artifact could not be read),
     (+ `ResumeEntryAsync`/`QueueEntryResumeOutcome` — the human's way out for a STRANDED entry: the daemon
     spawns a jail onto that entry's existing agent id and branch, so it can be verified and merged instead
     of only discarded. Adoption, not re-creation — same id, same branch, same row; see
@@ -98,7 +107,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     via `App.CreateOrchestratorServices`; the design render harness explicitly injects a mock bundle via
     `App.OrchestratorServicesFactory`), `Mock/MockOrchestrator.cs` (the scripted in-memory stand-in: 4
     seeded agents, a live stale cascade on `ConfirmMergeAsync`, CanMerge gate reasons, plan approval
-    that spawns a worker, freeze-first kill switch, telemetry random walk, scripted deploy phases;
+    that spawns a worker, freeze-first kill switch, telemetry random walk, scripted deploy phases, and a
+    scripted `GetVerificationLogAsync` that answers "no record" — not an empty log — for an agent with no
+    verdict;
     timer-threaded — consumers marshal). Also `PtyProcessShim.cs` (P2-03): the real cross-platform PTY
     shim — `PtySession` (bidirectional `IO` stream, `Resize`/`Kill`/`ExitCode`, idempotent dispose that
     reaps the child) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`

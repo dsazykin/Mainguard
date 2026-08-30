@@ -1921,7 +1921,7 @@ larger failure than the one being repaired.
   the log; `DaemonBackedOrchestrator` still hardcodes `Verification: null` and there is no
   `GetVerificationLogAsync` on the client. That is Agents.UI work, concurrent with this change, and taking
   it here would have meant editing another agent's files mid-flight. Both new wire facts are additive, so
-  the client work is a read, not a migration.
+  the client work is a read, not a migration. **Since closed — see §18.**
 - **`NotifyNewCommits` still has no production caller for local agents**, so a push does not itself
   invalidate a `Verified` entry. The automatic trigger covers the case this change created
   (`VerificationFailed` → re-verify on a new tip) and nothing more; widening it to `Verified` is a change to
@@ -2124,3 +2124,111 @@ so the delivery layer is now reached directly rather than left as decoration.
   text containing `()`, `&&`, `|`, `$` or a quote never gets past the shell. `spawn` was hardened by
   teaching a quoted `--task`; `prompt` was not. Recorded so the next change to the shim's usage text
   does both.
+
+---
+
+## 18. H4, client half — the verdict, and reading the failure without paying for it again
+
+§16.7 left this open on purpose: the daemon carried the verdict and served the log, and
+`DaemonBackedOrchestrator` still hardcoded `Verification: null` with no `GetVerificationLogAsync`. Both wire
+facts were additive, so this is a read, not a migration.
+
+### 18.1 The fabricated-counts trap, and what was done about it
+
+The client-side type the projection would have filled was
+`VerificationRecord(AgentId, MainSha, Passed, TestsPassed, TestsTotal, When)`. **Two of those six fields do
+not exist anywhere in this system.** Verification observes a process exit code inside the worker's jail; it
+parses nobody's test runner, so there is no "58 of 58" for any layer to project. Filling them from the
+nearest available number would have printed an invented count into a review surface — and a reviewer who
+reads "58/58 green" believes a measurement that was never taken, which is worse than a reviewer who sees
+none.
+
+So the **type was narrowed rather than the projection padded**. `VerificationVerdict(Passed,
+ResolvedCommand, When)` mirrors exactly the three fields the wire carries. `MainSha` went too: the wire
+already sends `verified_main_sha` as its own `QueueEntry` field, and that is where the sha now lives — one
+fact, one home. Guarded structurally (M13), because the realistic regression is somebody re-adding
+`TestsPassed` "for the mock" and the projection quietly finding something to put in it.
+
+Null keeps meaning **no record**, matching the wire's `optional`. The projection keys on protobuf field
+PRESENCE (`HasLastVerificationPassed`), not on the value: reading the value would have made every entry an
+older daemon served render as *failed*, which is H2's conflation pointing the other way (M1).
+
+### 18.2 Where the log surfaces, and why there
+
+**On the merge-queue row, inline and expandable**, and — via the same child ViewModel — in the worker pane's
+review section.
+
+- **The row is the only surface every entry has.** An entry whose agent was stopped has no worker document,
+  and one that never reached `Verified` cannot open the review cockpit. A log reachable only from either
+  would be missing for exactly the entries that failed.
+- **The evidence and the decision belong together.** A failure is read *while* deciding whether to retry,
+  hand it back to the agent, or discard — and those controls are on the row. A separate window would put
+  them in two places.
+- **The worker pane gets the identical panel rather than its own wording.** It was the second surface saying
+  "no verification record yet" about a red branch; sharing one projection is what stops the two drifting
+  apart again.
+
+Long output is handled by **bounding the reader, not shortening the log**: a `MaxHeight` cap with its own
+scroll, so the daemon's 256 KiB tail cannot push a row's actions off the surface. Horizontal scrolling is
+ON inside it — unlike the rail's deliberately-wrapping identifiers — for the reason `ReviewCockpitView`
+scrolls its diff sideways: wrapping a stack trace destroys the alignment that makes it readable.
+
+It is **collapsed by default and fetched on first expand**, cached against the verdict it belongs to and
+dropped when a new verdict arrives. The rail re-projects on every queue event; loading eagerly would turn a
+queue refresh into one daemon-side file read per row, for text nobody asked to see.
+
+**Reading is never re-running.** The panel calls `GetVerificationLogAsync` and never `RunVerificationAsync`
+(M7). That is the whole feature: before it, the only way to see why a branch went red was to press Verify
+again — minutes of real jail time, on a run that can legitimately answer differently.
+
+### 18.3 Jail text is sanitized at the projection boundary
+
+`GetVerificationLog` returns the artifact's bytes verbatim, and that artifact was written by a test runner
+executing inside a sandbox. It is the one path handing jail output straight to a human surface, so the
+client applies the discipline the daemon already applies before jail text reaches a log line
+(`AgentIpcServer.Echo` drops control characters and bounds length; `AgentCommitMessage` refuses a message
+carrying one).
+
+`JailText.Sanitize` keeps `\n` and `\t` — in a test log they are structure, exactly the pair
+`AgentCommitMessage` permits — makes other control characters visible as `.` rather than dropping them
+silently, collapses CR and CRLF to one break so a progress bar's redraws become lines, and consumes ANSI
+escape sequences **whole** (CSI / OSC / two-character, including one the daemon's tail cut in half).
+Replacing an ESC character-by-character would smear `.[31m` through the output, which is worse to read than
+the raw text. It runs in `DaemonBackedOrchestrator`, not in each surface, so no consumer can forget.
+
+### 18.4 The mutation log
+
+Every guard was removed in turn, the tier rebuilt, and the failure recorded.
+
+| mutation | result |
+|---|---|
+| M1 the verdict built from the VALUE instead of field presence (never-run becomes failed) | 1 test red |
+| M2 the projection back to `Verification: null` | 3 red |
+| M3 a red verdict worded as "Not verified yet" | 1 red |
+| M4 `IsFailed` never set | 4 red |
+| M5 the `Classes.failed` binding dropped from the view (danger token never resolves) | 1 red |
+| M6 the reader offered on an entry with no record | 1 red |
+| M7 expanding the log also runs a verification | 1 red |
+| M8 a cached log kept under a new verdict | 1 red |
+| M9 truncation silently elided | 1 red |
+| M10 a missing artifact rendered as an empty log | 1 red |
+| M11 escape sequences smeared instead of consumed | 3 red |
+| M12 the worker pane stops reading the verdict | 1 red |
+| M13 `TestsPassed` re-added to the verdict type | 1 red |
+
+M13 is the one worth reading: it is the only guard in this change that protects against a *plausible* edit
+rather than a careless one. Re-adding a count field is exactly what a future author would do to make a mock
+look richer, and the structural assertion is what turns that into a red test instead of a fabricated number
+in a review surface.
+
+### 18.5 Left alone, deliberately
+
+- **`MergeQueueViewModel`** (the in-proc rail bound to the real `MergeQueue`, constructed only by
+  `MergeQueueRenderHarness`) already words `VerificationFailed` and badges it red. It reads the state
+  machine directly, not the wire, so nothing here applies to it and it was not given a log reader.
+- **The review cockpit was not touched.** A failed entry cannot reach it — it requires `Verified` — so the
+  reader would be dead code there. If a rejected-in-review flow ever needs the last run's output, it
+  composes the same panel.
+- **No history.** The panel reads the LAST verification only, which is what `GetVerificationLog` serves.
+  `VerificationStore.History` exists daemon-side and has no RPC; a "previous runs" surface is a separate
+  change with its own wire.

@@ -276,7 +276,18 @@
   not `Accent` (the rail's one accent stays Review), acts on the first press (it destroys nothing), and
   reaches the seam with the row's OWN id plus the selected CLI, which are the two facts the daemon keys
   the adoption on. PNGs: `queue_lifecycle_<Theme>.png`,
-  `queue_lifecycle_confirm_<Theme>.png`; the **P2-11 review-cockpit
+  `queue_lifecycle_confirm_<Theme>.png`;
+  **`Headless/VerificationOutcomeRenderHarness.cs`** — H4's client half, the three verification outcomes on
+  the rail in every theme. **Red is not never-run**: the failed row's state word, verdict sentence and
+  `DangerBrush` are each asserted against a never-run row's and a passing row's, so a render that collapses
+  any pair fails here (a test that only checked the red row would pass just as well if EVERY row said
+  "tests failed"). It pins the feature's central promise — expanding the output reaches
+  `GetVerificationLogAsync` and NEVER `RunVerificationAsync`, and re-expanding does not re-ask — that the
+  expanded log is genuinely on screen in `FontMono` and not merely bound, that an entry with no record is
+  offered no reader at all, that truncation / a missing artifact / a silent run are three distinct
+  sentences rather than one empty box, that a new verdict drops the log the old one was read for, and that
+  the worker pane reads the identical verdict (it composes the same panel). PNGs:
+  `verification_outcomes_<Theme>.png`, `verification_log_open_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix
   present/partial/absent/malformed→nullable, Agent-Trace ours + external-vendor parse + range-join,
@@ -372,8 +383,17 @@
   `DiffViewerViewModelDiffQualityTests` (T-13 VM: partial staging hidden in `-w` mode, syntax-toggle
   persistence, intra-line spans + trailing-whitespace + image-mode detection), `SettingsServiceTests`,
   `QueueProjectionRenderingTests` (wire-shaped facts render: the verified-against stamp comes from
-  `VerifiedMainSha` — the daemon projection never populates `Verification`, so the old read could
-  never draw it — and the cockpit's changed-test-command warning renders without a run-count delta),
+  `VerifiedMainSha` rather than from the verdict, and the cockpit's changed-test-command warning renders
+  without a run-count delta),
+  **`VerificationVerdictProjectionTests.cs`** (H4 client half — `DaemonBackedOrchestrator.ApplyQueueUpdate`
+  now carries the wire's verdict instead of hardcoding `Verification: null`, and it keys on FIELD PRESENCE:
+  an entry the daemon sent no verdict for projects as no record, while an explicit `false` is a failure, the
+  two differing only by presence. Also the **fabricated-counts guard** — a structural assertion that
+  `VerificationVerdict` has exactly `Passed`/`ResolvedCommand`/`When` and the wire has no test-count field,
+  so re-adding `TestsPassed`/`TestsTotal` "for the mock" fails here rather than printing an invented
+  "58 of 58 green" into a review surface — and the `JailText.Sanitize` table: ANSI sequences consumed
+  whole, `\n`/`\t` kept, CR/CRLF collapsed, other controls made visible, a tail cut mid-sequence
+  swallowed),
   `QueueChangedRefreshesRailTests.cs` (field bug found 2026-08-20 in a live click-through: the rail
   never subscribed to `IMergeQueueService.Changed`, only to the coordinator's/kill switch's — so a
   queue-only change, e.g. a fresh spawn's `EnsureEntry`, sat correctly in `GetQueue()`'s answer but

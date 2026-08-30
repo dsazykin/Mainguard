@@ -1,0 +1,166 @@
+using System;
+using System.Linq;
+using Grpc.Net.Client;
+using Mainguard.Agents.Agents;
+using Mainguard.Agents.UI.Services;
+using Xunit;
+using Proto = Mainguard.Protos.V1;
+
+namespace Mainguard.Tests;
+
+/// <summary>
+/// H4, client half: the verification verdict has to survive the wire, and it has to survive it
+/// <b>without gaining facts nobody measured</b>.
+///
+/// <para>The daemon side landed three new <c>QueueEntry</c> fields — an <c>optional</c> verdict, the
+/// resolved command and a timestamp — and <c>DaemonBackedOrchestrator</c> still projected
+/// <c>Verification: null</c> for every entry it received. Null is this projection's own word for "never
+/// verified", so a branch whose tests had just failed reached the rail claiming no verification had ever
+/// happened, and the only way to learn otherwise was to pay for a second run.</para>
+/// </summary>
+public sealed class VerificationVerdictProjectionTests
+{
+    private static DaemonClient UncontactedClient() =>
+        new(() => GrpcChannel.ForAddress("http://127.0.0.1:1"), () => "token");
+
+    private static Proto.QueueUpdate Update(Action<Proto.QueueEntry> shape)
+    {
+        var entry = new Proto.QueueEntry
+        {
+            AgentId = "agent-a",
+            State = "VerificationFailed",
+            GateReason = "tests failed — node test.js",
+        };
+        shape(entry);
+        var update = new Proto.QueueUpdate { MainSha = "abc123" };
+        update.Entries.Add(entry);
+        return update;
+    }
+
+    private static QueueEntry Project(Action<Proto.QueueEntry> shape)
+    {
+        using var client = UncontactedClient();
+        using var adapter = new DaemonBackedOrchestrator(client, ownsClient: false);
+        adapter.ApplyQueueUpdate(Update(shape));
+        return adapter.GetQueue().Single();
+    }
+
+    /// <summary>A red run reaches the client as a red run — verdict, command and time.</summary>
+    [Fact]
+    public void AFailedRun_ProjectsAVerdict_WithItsCommandAndTime()
+    {
+        var when = new DateTimeOffset(2026, 8, 30, 1, 2, 3, TimeSpan.Zero);
+        var entry = Project(e =>
+        {
+            e.LastVerificationPassed = false;
+            e.LastVerificationCommand = "node test.js";
+            e.LastVerificationAt = when.ToString("O");
+        });
+
+        var verdict = Assert.IsType<VerificationVerdict>(entry.Verification);
+        Assert.False(verdict.Passed);
+        Assert.Equal("node test.js", verdict.ResolvedCommand);
+        Assert.Equal(when, verdict.When);
+    }
+
+    /// <summary>
+    /// <b>The guard the whole optional field exists for.</b> An entry the daemon sent NO verdict for must
+    /// project as "no record" — not as a failure. Proto3 defaults a bool to false, so a projection that
+    /// read the value instead of its PRESENCE would turn every never-verified entry into a failed one,
+    /// which is the same conflation pointing the other way.
+    /// </summary>
+    [Fact]
+    public void AnEntryWithNoVerdictOnTheWire_ProjectsAsNoRecord_NotAsAFailure()
+    {
+        var absent = Project(e => e.State = "Working");
+        Assert.Null(absent.Verification);
+
+        // …and the control that keeps that assertion from passing for the wrong reason: an explicit false
+        // IS a failure, and the two differ only by field presence.
+        var explicitFalse = Project(e => e.LastVerificationPassed = false);
+        Assert.NotNull(explicitFalse.Verification);
+        Assert.False(explicitFalse.Verification!.Passed);
+    }
+
+    /// <summary>A green record projects too — the surface has to be able to state a pass's provenance,
+    /// not only a failure's.</summary>
+    [Fact]
+    public void APassingRun_AlsoProjectsAVerdict()
+    {
+        var entry = Project(e =>
+        {
+            e.State = "Verified";
+            e.LastVerificationPassed = true;
+            e.LastVerificationCommand = "dotnet test";
+        });
+
+        Assert.True(entry.Verification!.Passed);
+        Assert.Equal("dotnet test", entry.Verification.ResolvedCommand);
+        // No timestamp on the wire is null, never a sentinel: "the daemon did not say when" and "this
+        // happened at the epoch" age differently on a surface that reports how old a verdict is.
+        Assert.Null(entry.Verification.When);
+    }
+
+    /// <summary>
+    /// <b>The fabricated-counts guard.</b> The client-side record this replaced carried
+    /// <c>TestsPassed</c>/<c>TestsTotal</c>, and no wire has ever carried either: verification observes a
+    /// process exit code inside the worker's jail and parses nobody's test runner. Filling them to satisfy
+    /// the type would have printed an invented "58 of 58 green" into a review surface — a reviewer
+    /// believing a measurement that was never taken is strictly worse than a reviewer seeing no number.
+    ///
+    /// <para>Asserted structurally rather than by inspecting a rendered string, because the failure mode is
+    /// someone re-adding the field "for the mock" and the projection quietly finding something to put in
+    /// it. The verdict type is exactly the three facts the wire carries.</para>
+    /// </summary>
+    [Fact]
+    public void TheVerdictType_CarriesOnlyWhatTheWireCarries_AndNoTestCounts()
+    {
+        var properties = typeof(VerificationVerdict)
+            .GetProperties()
+            .Select(p => p.Name)
+            .Where(n => n != "EqualityContract")
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(new[] { "Passed", "ResolvedCommand", "When" }, properties);
+
+        // The three names above are exactly the three QueueEntry verdict fields on the wire. If one is
+        // added there, this test is the place that says the client is allowed to carry it.
+        var wire = typeof(Proto.QueueEntry).GetProperties().Select(p => p.Name).ToArray();
+        Assert.Contains("LastVerificationPassed", wire);
+        Assert.Contains("LastVerificationCommand", wire);
+        Assert.Contains("LastVerificationAt", wire);
+        Assert.DoesNotContain(wire, n => n.Contains("TestsPassed", StringComparison.Ordinal)
+            || n.Contains("TestsTotal", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Jail-produced text is sanitized at the projection boundary. The daemon returns the artifact's bytes
+    /// verbatim — it is the only path that hands sandbox output straight to a human surface — so the client
+    /// applies the same discipline <c>AgentIpcServer.Echo</c> applies before anything is logged.
+    /// </summary>
+    [Theory]
+    // A coloured reporter's output arrives as the plain text underneath it — the sequence goes as a
+    // sequence, so no "[31m" is smeared through the log.
+    [InlineData("\u001B[31mFAIL\u001B[0m suite", "FAIL suite")]
+    // Newlines and tabs are structure in a test log and are kept, exactly as AgentCommitMessage keeps them.
+    [InlineData("line one\n\tindented", "line one\n\tindented")]
+    // CRLF is one break; a bare CR (a progress bar redrawing its line) becomes one too, rather than
+    // collapsing a whole run into a single unreadable line.
+    [InlineData("a\r\nb\rc", "a\nb\nc")]
+    // Anything else that is a control character is visible rather than silently dropped.
+    [InlineData("nul\u0000here", "nul.here")]
+    // An OSC title-set, consumed whole including its BEL terminator.
+    [InlineData("\u001B]0;title\u0007done", "done")]
+    public void JailText_IsSanitizedForDisplay(string raw, string expected) =>
+        Assert.Equal(expected, JailText.Sanitize(raw));
+
+    /// <summary>A tail cut mid-escape-sequence is normal — the daemon truncates at a byte offset — and must
+    /// not leave a bare ESC or a smear of half a sequence behind.</summary>
+    [Fact]
+    public void JailText_SwallowsAnEscapeSequenceTheTailCutInHalf()
+    {
+        Assert.Equal("ok ", JailText.Sanitize("ok \u001B[3"));
+        Assert.DoesNotContain('\u001B', JailText.Sanitize("ok \u001B"));
+    }
+}
