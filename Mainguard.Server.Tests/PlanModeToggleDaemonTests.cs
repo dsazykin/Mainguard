@@ -125,7 +125,7 @@ public sealed class PlanModeToggleDaemonTests : PlanGateIpcTestBase, IClassFixtu
                      new AgentIpcRequest(AgentIpcRequest.AwaitDecisionOp, PlanId: "p1"),
                  })
         {
-            var response = await CallAsync(workerId, request);
+            var response = await CallWithinAsync(workerId, request);
             Assert.False(response.Ok);
             Assert.Contains("plan mode is off", response.Error!, StringComparison.Ordinal);
         }
@@ -302,6 +302,32 @@ public sealed class PlanModeToggleDaemonTests : PlanGateIpcTestBase, IClassFixtu
 
         // And it did not take effect: the gate is exactly where it was.
         Assert.True(fixture.Services.GetRequiredService<PlanModeSwitch>().Enabled);
+    }
+
+    /// <summary>
+    /// One request with a DEADLINE — and a failed assertion, never a hang, when it is missed.
+    ///
+    /// <para>These three ops block <b>by design</b> once they are accepted: <c>present</c>/<c>revise</c>
+    /// park on the socket until a human decides, and that parking IS the gate, so the shim gives them no
+    /// timeout. The claim under test is that an ungated worker is refused <i>before</i> it can park —
+    /// which makes "the call never returns" the exact failure mode, and a test that hangs on its own
+    /// failure reports nothing at all.</para>
+    ///
+    /// <para>Not hypothetical: with the ungated refusal mutated out, this test parked the whole tier for
+    /// fifteen minutes until the run was killed, and the mutation scored no result. A guard whose failure
+    /// mode is a hang is indistinguishable from a guard nobody tested.</para>
+    /// </summary>
+    private async Task<AgentIpcResponse> CallWithinAsync(
+        string agentId, AgentIpcRequest request, int seconds = 30)
+    {
+        var call = CallAsync(agentId, request);
+        var finished = await Task.WhenAny(call, Task.Delay(TimeSpan.FromSeconds(seconds)));
+        Assert.True(
+            ReferenceEquals(finished, call),
+            $"`{request.Op}` did not return within {seconds}s. An ungated worker's plan ops must be "
+            + "REFUSED, not parked on a gate that nobody is watching — a worker that parks there holds "
+            + "its jail and its cap slot forever, having already been given its task.");
+        return await call;
     }
 
     /// <summary>Waits for this worker's presented plan without racing the blocking present call.</summary>
