@@ -1315,7 +1315,7 @@ public sealed class AgentSpawnService
         if (assertsNone && declared.Count > 0)
         {
             return "--no-deviations and --deviated say opposite things about the same work. Send one: "
-                   + "mainguard-plan " + WorkerPlanShim.CommitUsage;
+                   + "mainguard-plan " + WorkerPlanShim.CommitUsage + NothingLost;
         }
 
         if (_plans.ApprovedForWorker(workerAgentId) is null || assertsNone || declared.Count > 0)
@@ -1326,8 +1326,24 @@ public sealed class AgentSpawnService
         return "this commit needs your deviation declaration. Your plan's approved `approach` is what the "
                + "human agreed you would do; say whether this work follows it. Nothing checks that for "
                + "you — your own tests pass either way — so the declaration is the only thing that tells "
-               + "them otherwise. Run: mainguard-plan " + WorkerPlanShim.CommitUsage;
+               + "them otherwise. Run: mainguard-plan " + WorkerPlanShim.CommitUsage + NothingLost;
     }
+
+    /// <summary>
+    /// Appended to every declaration refusal, and it is load-bearing rather than reassurance.
+    ///
+    /// <para>Commit is the ONLY way a worker's work leaves the jail, and an uncommitted worktree is
+    /// destroyed at teardown — this project has already lost real work that way, which is the whole
+    /// reason <c>commit_work</c> exists. So a refusal on this path has to say, in the same breath, that
+    /// the refusal cost nothing: a worker that read "refused" as "my diff is gone" might stop, and a
+    /// declaration gate that strands a finished diff is worse than the divergence it exists to surface.
+    /// The two audiences that need this sentence most are a worker whose jail was created by a daemon
+    /// that predates the flags (its <c>MAINGUARD.md</c> never mentions them, so the refusal IS its
+    /// documentation) and one that fumbles the flag on its last turn.</para>
+    /// </summary>
+    private const string NothingLost =
+        "  Nothing was committed and nothing is lost — your worktree is untouched. Run the same command "
+        + "again with an answer.";
 
     /// <summary>
     /// Records the worker's declaration on its approved plan and returns the sentence the shim prints

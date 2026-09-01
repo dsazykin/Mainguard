@@ -300,7 +300,13 @@ def main(argv):
                    "  --deviated \"<what and why>\"  it does not, in this way (repeat for each)")
 
         if bad is not None:
-            sys.stderr.write("mainguard-plan: %s\n" % bad)
+            # Said on every local commit refusal for the same reason the daemon says it: commit is the
+            # only way work leaves this jail and an uncommitted worktree dies with it, so a worker that
+            # read "refused" as "my diff is gone" might stop instead of retrying. The refusal costs a
+            # turn, never the work.
+            sys.stderr.write("mainguard-plan: %s\n"
+                             "Nothing was committed and nothing is lost -- your worktree is untouched.\n"
+                             "Run the same command again with the form above.\n" % bad)
             return 2
 
         request = {"op": "commit_work", "message": message if message is not None else ""}

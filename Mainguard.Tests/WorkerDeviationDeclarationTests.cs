@@ -425,6 +425,39 @@ public class WorkerDeviationDeclarationTests
 
         Assert.Null(run.Value.RequestJson);
         Assert.Contains(expectedRefusal, run.Value.Refusal!, StringComparison.Ordinal);
+
+        // Every local commit refusal says the refusal cost nothing. Commit is the ONLY way work leaves
+        // this jail and an uncommitted worktree dies with it, so a worker that read "refused" as "my
+        // diff is gone" could stop with the work still in it.
+        Assert.Contains("nothing is lost", run.Value.Refusal!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// <b>An UNGATED worker is exempt, not blocked.</b> With plan mode off there is no approved approach,
+    /// so there is nothing to have departed from — and a declaration gate that stood between a finished
+    /// diff and the only call that saves it would be worse than the divergence it exists to surface.
+    /// The exemption is keyed on <see cref="PlanApprovalService.ApprovedForWorker"/> rather than on the
+    /// mode switch, which also exempts a manual agent and an external-PR head for the same reason.
+    ///
+    /// <para>Pinned here as the PREDICATE (an agent with no approved plan has nothing to declare
+    /// against), with the daemon-side half — the commit actually landing — in
+    /// <c>PlanModeToggleDaemonTests</c>.</para>
+    /// </summary>
+    [Fact]
+    public void AnAgentWithNoApprovedPlan_IsExemptFromDeclaringAnything()
+    {
+        var plans = new PlanApprovalService();
+
+        Assert.Null(plans.ApprovedWorkFor("manual-agent"));
+        Assert.Null(plans.ApprovedWorkFor("pr-7"));
+
+        // ...and a worker whose plan is still PENDING is equally exempt from this check — it is stopped
+        // one rung earlier by the plan gate itself, never by a declaration it could not have made.
+        var presented = plans.Present(
+            "gated-worker", "coord-1", "Fix the clock",
+            new TaskPlanFields(new[] { "src/a.js" }, "keep it simple", "node test.js"), "", 1m);
+        Assert.NotNull(presented.PlanId);
+        Assert.Null(plans.ApprovedWorkFor("gated-worker"));
     }
 
     // ---- The instructions: what the worker is actually told -----------------

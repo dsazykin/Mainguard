@@ -544,9 +544,43 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
 
         Assert.False(refused.Ok);
         Assert.Contains("deviation declaration", refused.Error!, StringComparison.Ordinal);
-        // The refusal names the form, so the correction costs no round trip and no guessing.
+        // The refusal names the form, so the correction costs no round trip and no guessing. This is
+        // also the ONLY documentation a worker gets whose jail was created by a daemon predating the
+        // flags — its MAINGUARD.md never mentions them — so the refusal has to be self-sufficient.
         Assert.Contains(WorkerPlanShim.CommitUsage, refused.Error!, StringComparison.Ordinal);
+        // ...and it must say the refusal cost nothing. Commit is the only way work leaves the jail and
+        // an uncommitted worktree dies with it, so a worker that read "refused" as "my diff is gone"
+        // could stop with the work still in it — which is worse than the divergence this gate surfaces.
+        Assert.Contains("nothing is lost", refused.Error!, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
+    /// <summary>
+    /// <b>The refusal is recoverable in the same turn.</b> The worker that was just refused re-runs the
+    /// identical command with an answer and its work lands — no lost diff, no lost turn beyond the one,
+    /// no state to clean up. Asserted as the SEQUENCE rather than as two independent facts, because
+    /// "refused" and "can still commit afterwards" being separately true is not the property that
+    /// matters; the property is that the second call, made immediately after the first, succeeds.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedDeclaration_CostsATurnAndNotTheWork()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()"));
+        Assert.False(refused.Ok);
+        Assert.Empty(Rig.Environment.WorkerCommits.Where(c => c.AgentId == workerId));
+
+        // The very next call, same message, with the answer the refusal named.
+        var retried = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(retried.Ok, retried.Error);
+        Assert.True(retried.Committed);
+        var commit = Assert.Single(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+        Assert.Equal("feat: divide()", commit.Message);
     }
 
     /// <summary>

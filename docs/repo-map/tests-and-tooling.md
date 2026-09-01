@@ -1681,7 +1681,13 @@
   file rehydrating as `NotDeclared` rather than `None`; the shim sending only the flag it was given and
   refusing the contradictory/incomplete forms locally without sending anything, driven through the real
   `main()` under python3; and the instructions teaching the exact parsed form plus the reason to a GATED
-  worker and none of it to an ungated one),
+  worker and none of it to an ungated one; the section's heading pinned to START a line, since it is
+  spliced into a raw string literal and an indented `### ` is a markdown code block — which would render
+  the whole section as literal text and is invisible to every substring assertion around it; the record
+  bounded (a cap that states what it dropped, a marked truncation) because this was the one
+  agent-authored field with no oversized guard while `TaskPlanSchema` bounds every sibling; and an agent
+  with no approved plan being EXEMPT from declaring, which is what keeps the gate from standing between
+  a finished diff and the only call that saves it),
   **`WorkerPlanGateTests`** (phase 2 — the daemon-side enforcement: the task withheld at every
   stage before approval and released only after, the brief being available but not being the task, an
   escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
@@ -2030,7 +2036,8 @@
   — and a test that turned the approval gate off on disk would turn it off for every host built after it,
   in parallel; and, from 2026-08-31, that an ungated worker is asked for NO deviation declaration — there
   is no approved approach to have departed from — while one it volunteers anyway is told it was not
-  recorded rather than silently dropped or turned into a failed commit),
+  recorded rather than silently dropped or turned into a failed commit — the commit is the thing that
+  must not be lost),
   **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
   Unix-socket channel a jail uses, through the production `AgentSpawnService` handlers. This is the file
   that answers "is the gate enforced, or merely described?", so nothing in it asserts a prompt: a
@@ -2059,6 +2066,12 @@
   plan that authorised it and the commit still lands; an explicit `--no-deviations` is recorded as an
   ANSWER, with the pre-call `NotDeclared` asserted first so the two states are visibly different; and a
   commit that both declares and denies is refused rather than resolved by precedence.
+  **`ARefusedDeclaration_CostsATurnAndNotTheWork`** is the one that decides whether this gate is safe to
+  ship at all: commit is the ONLY route work has out of the jail and an uncommitted worktree dies with
+  it, so the refusal is asserted as a SEQUENCE — refused with nothing committed, then the identical
+  command re-run with an answer and the work lands — rather than as two independently true facts. The
+  refusal text is pinned to name the form AND to say nothing was lost, because for a worker whose jail
+  predates the flags that refusal is its only documentation.
   **`rescope_plan` (2026-08-30)** is asserted on the same wire: the DEAD END and the way out of it (both
   refusals named — `present`'s and `revise`'s — because neither is wrong on its own and it is the pair
   that trapped the worker); the op parks on the human like a presentation **while the worker keeps

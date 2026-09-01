@@ -4257,16 +4257,41 @@ call `FlaggedKind.LockfileAdvisoryUnknown` makes:
 | `NotDeclared` | nobody ever answered | one must-ack row saying so (fail-closed) |
 
 A gated `commit_work` carrying neither answer is **refused**, before the commit — which is the only reason
-it is safe to make mandatory: the worktree is untouched by a refusal, so it costs the worker one re-run
-and no work. Both answers at once is refused rather than resolved by precedence; a rule about which one
-wins would be invisible at the call site.
+it is safe to make mandatory (see §26.5). Both answers at once is refused rather than resolved by
+precedence; a rule about which one wins would be invisible at the call site.
 
 **A declaration cannot be walked back.** Declarations accumulate across a worker's several commits and
 `Declared` is sticky: a final `--no-deviations` cannot erase a disclosure made three commits earlier. That
 is the specific way this mechanism would have become a rubber stamp, and it would have been reachable by
 accident rather than by malice.
 
-### 26.4 Where it lives, and why there
+### 26.4 The refusal must never strand a finished diff
+
+This is the one way this change could be worse than the defect it closes. **`commit_work` is the only
+route work has out of the jail, and an uncommitted worktree is destroyed at teardown** — that has already
+cost this project a real 20-line diff, and it is why the op exists at all. A declaration gate that
+stranded a finished change would be a strictly worse failure than an undeclared divergence. Three
+properties make it safe, and each is pinned by a test rather than argued:
+
+1. **The refusal lands before the commit, and is recoverable in the same turn.** `DeviationRefusal` runs
+   ahead of `WorktreeManager.CommitAgentWork`, so nothing is written and nothing is undone; the worker
+   re-runs the identical command with an answer and its work lands. Asserted as a *sequence* —
+   refuse, then immediately retry and succeed — because the two facts being separately true is not the
+   property that matters (`ARefusedDeclaration_CostsATurnAndNotTheWork`).
+2. **The refusal is self-sufficient documentation.** It names `WorkerPlanShim.CommitUsage` verbatim *and*
+   says, in the same breath, that nothing was committed and nothing is lost. That sentence is not
+   reassurance — it is for the two workers who need it most: one whose jail was created by a daemon
+   predating the flags (its `MAINGUARD.md` never mentions them, so the refusal is its only teaching) and
+   one that fumbles the flag on its last turn. A worker that read "refused" as "my diff is gone" could
+   stop with the work still in it. The shim's own local refusals carry the same sentence.
+3. **An unapproved agent is exempt, not blocked.** The requirement is keyed on
+   `PlanApprovalService.ApprovedForWorker` — not on `PlanModeSwitch` — so a plan-mode-off worker, a
+   manual agent and an external-PR head all commit exactly as before. A gated worker whose plan is still
+   pending is stopped one rung earlier by the plan gate itself, never by a declaration it could not have
+   made. The ambiguous case (`ApprovedForWorker` refusing to guess between two approved plans) also
+   resolves to *exempt*, which is the safe direction here.
+
+### 26.5 Where it lives, and why there
 
 - **On the plan record** (`PendingPlan.Deviation` / `DeclaredDeviations`, persisted by
   `JsonPlanApprovalStore`). A deviation is a deviation *from that plan*: it belongs to the record that
@@ -4287,7 +4312,7 @@ accident rather than by malice.
   on its own text would survive a push that rewrote the entire diff it was acknowledged against, so
   `FlaggedChangeDetector.HashDiff` (a content hash over the whole diff) is folded into its id.
 
-### 26.5 The ungated case
+### 26.6 The ungated case
 
 With plan mode off there is no approved approach, so there is nothing to have departed from. A declaration
 is therefore **neither required nor recorded** for an ungated worker — demanded anyway, it would be a
@@ -4297,7 +4322,7 @@ ungated worker's operating instructions teach none of it, and a declaration one 
 **told** it was not recorded rather than silently dropped or turned into a failed commit — the commit is
 the thing that must not be lost.
 
-### 26.6 The queue seeder declares "none" for the plans it fabricates
+### 26.7 The queue seeder declares "none" for the plans it fabricates
 
 `QueueSeeder.SeedPlan` records `DeviationDeclaration.None` on the plan it synthesises, alongside the
 authorship and the human approval it already synthesises (and already labels as synthetic in the two
@@ -4307,7 +4332,7 @@ anything about the branch. A blocker that is always present for a whole class of
 anything is precisely how a gate teaches people to click through it. The fail-closed default stays where
 it matters: on a real worker, which is the only thing that can actually answer.
 
-### 26.7 The record is bounded, and what it drops it declares
+### 26.8 The record is bounded, and what it drops it declares
 
 `commit_work` may be called any number of times and records on a clean tree too, so the accumulated
 declaration is an **agent-controlled growth path through a file the daemon rewrites on every save** — and
@@ -4326,7 +4351,7 @@ shape §24 argues against at length.
   over-long deviation is truncated with `…[truncated]` appended. An unmarked cut is the one way
   truncation would be worse than either alternative.
 
-### 26.8 Left alone, deliberately
+### 26.9 Left alone, deliberately
 
 - **No automated approach-vs-diff comparison**, per the decision above.
 - **The declaration does not gate the commit's content**, only its acceptance. The work still leaves the
