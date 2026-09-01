@@ -150,6 +150,8 @@ public sealed class GitMutationGuardTests : IDisposable
 
         public void Resume() { }
 
+        public void ReleaseWithoutResuming() { }
+
         public void Dispose() { }
     }
 }

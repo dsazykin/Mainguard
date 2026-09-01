@@ -276,9 +276,22 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             // concurrent, and last-writer-wins could leave a killed jail running. Re-reading the gate here
             // makes the kill win by construction; the token is deliberately left un-resumed (the jail stays
             // paused, the state stays Paused) until the operator resumes the kill switch.
+            //
+            // ...and on BOTH of those paths the token is still SETTLED, which is the half that was missing.
+            // Leaving it un-settled leaked the arbiter's machine hold, and `AgentPauseService.UnpauseAsync`
+            // refuses while one is outstanding — with "the daemon is briefly holding this agent for a queue
+            // update — try again in a moment", a sentence whose entire promise is that it self-clears. So
+            // the HUMAN's unpause button was refused indefinitely on exactly the agents that need a human,
+            // and the two conflict controls beside it bypass the ledger (they drive the sandbox engine
+            // directly), which made the leak invisible to the paths most likely to be exercised. The jail
+            // staying frozen is deliberate; the machine's claim to OWN that pause is not.
             if (!conflicted && !_killGate.IsFrozen)
             {
                 token.Resume();
+            }
+            else
+            {
+                token.ReleaseWithoutResuming();
             }
         }
     }
