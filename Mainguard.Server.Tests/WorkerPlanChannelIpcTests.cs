@@ -571,7 +571,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         var refused = await CallAsync(workerId, new AgentIpcRequest(
             AgentIpcRequest.CommitWorkOp, Message: "feat: divide()"));
         Assert.False(refused.Ok);
-        Assert.Empty(Rig.Environment.WorkerCommits.Where(c => c.AgentId == workerId));
+        Assert.DoesNotContain(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
 
         // The very next call, same message, with the answer the refusal named.
         var retried = await CallAsync(workerId, new AgentIpcRequest(
