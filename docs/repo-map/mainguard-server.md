@@ -302,6 +302,14 @@
     `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
     and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
     merge-ready).
+    **`FrozenJailPolicy`** (in this file) is the guard `prompt` and `verify` ask AFTER the plan gate: a
+    worker whose jail is `docker pause`d — the state a conflicted keep-alive rebase leaves it in — is
+    refused, because a prompt delivered into a SIGSTOPped process succeeds and means nothing (the tool
+    answered `Ok` and the coordinator then polled a worker that could never reply), and verification runs
+    its test command in that same frozen jail. The predicate is the session's own state word
+    (`Paused` / `Conflict`), which is what `Row` and `ListAgents` already project — NOT
+    `HumanPauseLedger.IsHumanPaused`, which answers the narrower "did a person press pause" and says no
+    for exactly this case.
     **`CommitWork`** is the worker table's fifth op (`commit_work`) and the rung the loop was missing: a
     finished worker used to stop on an uncommitted diff that died with its worktree, leaving
     `agent/<id>` empty and the readiness trigger — which fires on that ref advancing — with nothing to
@@ -637,7 +645,7 @@
   — P2-13 carried-in from P2-08 maps the proto `Budget`'s per-day caps
   (`usd_micros_cap_per_day`/`token_cap_per_day`) too, so per-day is displayable+editable over gRPC;
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
-  stream) / **`MergeQueueGrpcService.cs`** (P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
+  stream) / **`MergeQueueGrpcService.cs`** (**`RunVerification` is FROZEN-JAIL guarded** — the human's Verify button reaches the merge queue by this path, which the sibling fix on the coordinator's `request_verification` op did not cover, so pressing it on a conflicted entry started a run whose `docker exec` answers "Container … is paused" and arrived as a provisioning failure on the one screen where that must never be confused with "your tests failed". The predicate is `FrozenJailPolicy.IsFrozen` — SHARED with that guard on purpose, so the two paths cannot drift apart on what "frozen" means — while the wording is this surface's own: the policy's sentences are written for an agent to act on in one turn, and this reader is a person, so the refusal names the two conflict controls beside it. An unknown or Working session is NOT refused: refusing from ignorance would strand every seeded row and every entry whose session died with a previous daemon. P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
   refusal and never a verdict — and **`GetVerificationLog`** serves the run's artifact CONTENT, bounded to
   the last 256 KiB via `ReadTail` (the tail, because a runner prints its failures last) and answering "no
   record" / "artifact gone" / the log as three distinct things; `Snapshot` carries the entry's verdict,

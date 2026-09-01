@@ -1347,12 +1347,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       dedicated `IAgentControlChannel` — a named pipe / second channel, **not** the interactive PTY —
       awaits `[IPC_UPDATE_READY]` ≤ 10 s, else `ISandboxEngine.PauseAsync`; always returns an
       `IYieldToken` (the sole mutation gateway) whose `Resume`/`Dispose` unpauses the jail / signals
-      resume; `YieldOutcome` ByReady/ByPause).
+      resume; `YieldOutcome` ByReady/ByPause). **The token OWNS the `IPauseArbiter` machine hold** and
+      settles it on either exit: `Resume` (in a `finally`, so a failed unpause still hands the critical
+      section back) or **`ReleaseWithoutResuming`** — the conflict path's terminus, which hands the claim
+      back and leaves the jail frozen. Holding it in the resume closure alone meant a token that is never
+      resumed leaked it forever, and `AgentPauseService.UnpauseAsync` refuses while one is outstanding with
+      "the daemon is briefly holding this agent for a queue update — try again in a moment": a sentence
+      whose whole promise is that it self-clears, refusing the HUMAN's unpause button indefinitely on
+      exactly the agents that need a human.
     - `KeepAliveRebaser.cs` (`IKeepAliveRebaser`: one cycle = yield → `GitMutationGuard` check (skip on
       the agent's own mid-rebase) → dirty? `add -A` + `commit -m "wip: sync"` → `git rebase <main>` onto
       the already-fetched mirror main → conflict? status `Conflict` + route the worktree to the T-04
       resolver via `ConflictHandoff`, keep the PTY paused, **no automatic `rebase --abort`** (rejection
-      trigger) → success? resume; `NotifyMainMoved` is the P2-10 hook; human edits reach worktrees ONLY
+      trigger) → success? resume; both never-resumed paths (a conflict, and a kill switch that fires
+      mid-cycle) still SETTLE the token via `ReleaseWithoutResuming`, so the jail stays frozen without the
+      machine keeping its claim on that pause; `NotifyMainMoved` is the P2-10 hook; human edits reach worktrees ONLY
       via this Git cycle (invariant 1); records `AgentWorktreeLocation`/`RebaseCycleResult`; git via the
       shared `AgentGitCommand` — not a second runner).
     - `RebaseConflictParking.cs` (what the cascade MEASURED about a worktree it parked mid-rebase, so the

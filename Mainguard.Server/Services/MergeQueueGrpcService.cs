@@ -7,6 +7,7 @@ using Grpc.Core;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Protos.V1;
 using Mainguard.Server.Logging;
+using Mainguard.Server.Runtime;
 using Microsoft.Extensions.Logging;
 
 namespace Mainguard.Server.Services;
@@ -103,6 +104,34 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     public override async Task<RunVerificationResponse> RunVerification(RunVerificationRequest request, ServerCallContext context)
     {
         var ctx = Resolve(request.RepoHandle);
+
+        // Asked BEFORE the run, because it is the one condition under which starting a verification is
+        // guaranteed to be pointless: the test command runs inside the worker's own jail (§3.2 — never on
+        // the host), and a frozen jail runs nothing. `docker exec` against a paused container answers
+        // "Container ... is paused, unpause the container before exec", which reaches the human as a
+        // provisioning failure — the one thing that must never be confused with "your tests failed", on
+        // the one screen where that distinction decides a merge.
+        //
+        // The predicate is FrozenJailPolicy's, deliberately shared with the coordinator's
+        // `request_verification` guard rather than restated here: the human's Verify and an agent's
+        // verify op reach the same queue by different paths, and two spellings of "is this jail frozen"
+        // is how one of them stops agreeing with the state word the surface renders. The WORDING is not
+        // shared — that policy's sentences are written for an agent to read and act on in one turn ("do
+        // not keep polling it"), and this reader is a person looking at a card.
+        if (FrozenJailPolicy.IsFrozen(
+                _sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(
+                    request.RepoHandle, request.AgentId))?.State))
+        {
+            var frozen =
+                "this agent's jail is frozen, so its tests cannot run — verification runs the test command "
+                + "inside the worker's own sandbox and a frozen jail runs nothing. If its keep-alive rebase "
+                + "conflicted, hand the conflict back to the agent or abort the rebase; otherwise resume "
+                + "the agent, then verify again.";
+            _log.LogWarning("RunVerification refused repo={Repo} agent={Agent}: {Reason}",
+                request.RepoHandle, request.AgentId, frozen);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, frozen));
+        }
+
         Mainguard.Agents.Agents.Orchestrator.VerificationRecord record;
         try
         {

@@ -10,6 +10,7 @@ using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
 using Mainguard.Protos.V1;
 using Mainguard.Server.Auth;
+using Mainguard.Server.Runtime;
 using Mainguard.Server.Tests.Fixtures;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.TestHost;
@@ -263,6 +264,102 @@ public sealed class MergeQueueWiringTests
             headers);
         Assert.False(abort.Aborted);
         Assert.Contains("no rebase parked", abort.Reason);
+    }
+
+    /// <summary>
+    /// <b>The human's Verify button must not start a run inside a frozen jail.</b>
+    ///
+    /// <para>A sibling fix closed this on the COORDINATOR's <c>request_verification</c> op, in
+    /// <c>AgentSpawnService</c>. The human's Verify reaches the same merge queue by a different path —
+    /// this RPC — and was still unguarded, so pressing it on a conflicted entry started a run whose
+    /// <c>docker exec</c> answers "Container ... is paused, unpause the container before exec". That
+    /// arrives as a provisioning failure, on the one screen where "we could not run your tests" and "your
+    /// tests failed" is the distinction the merge decision rests on.</para>
+    ///
+    /// <para>The predicate is <see cref="FrozenJailPolicy"/>'s, shared with the coordinator's guard on
+    /// purpose: two spellings of "is this jail frozen" is how one of them stops agreeing with the state
+    /// word the surface renders. <c>Conflict</c> is asserted specifically because it is the state a parked
+    /// keep-alive rebase writes — and the one <c>HumanPauseLedger.IsHumanPaused</c> answers FALSE for,
+    /// which is why that ledger is the wrong predicate here.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("Conflict")]
+    [InlineData("Paused")]
+    public async Task Verify_OnAFrozenJail_IsRefusedWithTheReasonAndTheWayOut(string state)
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+        await sync.CreateWorktreeAsync(new CreateWorktreeRequest
+        {
+            RepoHandle = provisioned.RepoHandle,
+            AgentId = "loom-7",
+        }, headers);
+
+        var sessions = host.Services.GetRequiredService<AgentSessionStore>();
+        sessions.Spawn("claude-code", agentId: "loom-7", repoHash: provisioned.RepoHandle);
+        sessions.MarkState(
+            new AgentSessionKey(provisioned.RepoHandle, "loom-7"), state, "frozen for the test");
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            client.RunVerificationAsync(
+                new RunVerificationRequest { RepoHandle = provisioned.RepoHandle, AgentId = "loom-7" },
+                headers).ResponseAsync);
+
+        // A typed refusal, never an opaque fault and never a Passed=false response.
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("frozen", ex.Status.Detail);
+        // …and it names the way out, which is the difference between a refusal and a dead end. Both of
+        // this branch's conflict controls are reachable from the same card.
+        Assert.Contains("abort the rebase", ex.Status.Detail);
+        Assert.Contains("resume the agent", ex.Status.Detail);
+        // It must not read as a test result.
+        Assert.DoesNotContain("failed", ex.Status.Detail);
+    }
+
+    /// <summary>
+    /// The control that keeps the guard from being a blanket refusal: a RUNNING jail still verifies, and
+    /// so does an entry the session store knows nothing about (a seeded row, an entry whose session died
+    /// with a previous daemon). Refusing from ignorance would strand every such entry with the one
+    /// message that sounds like it has a live, frozen jail.
+    /// </summary>
+    [Fact]
+    public async Task Verify_OnARunningOrUnknownJail_IsNotRefusedAsFrozen()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+        await sync.CreateWorktreeAsync(new CreateWorktreeRequest
+        {
+            RepoHandle = provisioned.RepoHandle,
+            AgentId = "loom-7",
+        }, headers);
+
+        // No session at all — the store cannot answer, and "cannot answer" is not "frozen".
+        var unknown = await Assert.ThrowsAsync<RpcException>(() =>
+            client.RunVerificationAsync(
+                new RunVerificationRequest { RepoHandle = provisioned.RepoHandle, AgentId = "loom-7" },
+                headers).ResponseAsync);
+        Assert.DoesNotContain("frozen", unknown.Status.Detail);
+
+        // A live, working session: same answer. (Both fall through to the ordinary no-jail refusal, which
+        // is the honest one for a worktree with no container behind it.)
+        var sessions = host.Services.GetRequiredService<AgentSessionStore>();
+        sessions.Spawn("claude-code", agentId: "loom-7", repoHash: provisioned.RepoHandle);
+        sessions.MarkState(
+            new AgentSessionKey(provisioned.RepoHandle, "loom-7"), "Working", null);
+
+        var working = await Assert.ThrowsAsync<RpcException>(() =>
+            client.RunVerificationAsync(
+                new RunVerificationRequest { RepoHandle = provisioned.RepoHandle, AgentId = "loom-7" },
+                headers).ResponseAsync);
+        Assert.DoesNotContain("frozen", working.Status.Detail);
     }
 
     private static async Task<System.Collections.Generic.IReadOnlyList<Mainguard.Protos.V1.QueueEntry>>
