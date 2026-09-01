@@ -204,7 +204,59 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private bool _isVerificationStalled;
 
     /// <summary>The two-step guard on the destructive action: the row asks before it drops anything.</summary>
-    [ObservableProperty] private bool _isConfirmingDiscard;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsConfirming))]
+    private bool _isConfirmingDiscard;
+
+    // ---- The parked rebase conflict, and the two things a human can do about it ----------------------
+    //
+    // The daemon blocks a conflicted entry with a reason naming a required human action ("the agent is
+    // paused with the rebase in progress and needs a human to resolve it") and, until these existed, the
+    // row offered no operation that could perform it: the jail was paused, so Verify could not run in it,
+    // Review was absent (the entry is not Verified — which is precisely what a conflict makes it), and the
+    // only remaining control threw the work away. A card that names an action the product does not have
+    // reads as the recovery the human is looking for, and teaches them the product is broken.
+
+    /// <summary>True while the daemon reports a worktree parked mid-rebase for this entry. Gates the two
+    /// conflict controls and the fact lines beneath them — never inferred from the state word, which
+    /// cannot tell a conflicted entry from any other <c>Working</c> one.</summary>
+    [ObservableProperty] private bool _hasRebaseConflict;
+
+    /// <summary>Where the parked worktree is, as provenance. Rendered, never opened: on every substrate
+    /// but a Mac host this is a path inside the daemon's environment rather than the user's filesystem.</summary>
+    [ObservableProperty] private string _conflictWorktree = "";
+
+    /// <summary>
+    /// The conflicting files, or the honest admission that they could not be measured.
+    ///
+    /// <para>An empty path list from the daemon means NOT MEASURED, and this is where that distinction
+    /// has to survive: rendering an empty list as "no files conflict" would contradict the card it sits
+    /// on.</para>
+    /// </summary>
+    [ObservableProperty] private string _conflictPathsText = "";
+
+    /// <summary>True only while this row's own conflict action is in flight — the same latch Verify and
+    /// Resume keep, for the same reason: a refused action moves no queue state and therefore pushes no
+    /// stream update, so a double press fires two RPCs and the second reports a failure for the action the
+    /// human just performed.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ResolveConflictButtonText))]
+    private bool _isConflictRequestInFlight;
+
+    public string ResolveConflictButtonText =>
+        IsConflictRequestInFlight ? "Handing back…" : "Let the agent resolve";
+
+    /// <summary>The two-step guard on the abort. It throws away rebase progress and cannot be undone, so
+    /// it asks first — the same idiom Discard uses, and for the same reason.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsConfirming))]
+    private bool _isConfirmingAbortRebase;
+
+    /// <summary>True while EITHER confirmation is showing — what the action row hides behind. One property
+    /// rather than two negated bindings in the view: with two guards on one row, an <c>IsVisible</c> that
+    /// only knew about one of them would leave the action row and a confirmation prompt on screen
+    /// together, each offering to do something to the same entry.</summary>
+    public bool IsConfirming => IsConfirmingDiscard || IsConfirmingAbortRebase;
 
     /// <summary>
     /// True for a <b>stranded</b> entry: non-terminal, and the daemon positively reports that it has no
@@ -312,6 +364,24 @@ public partial class QueueEntryViewModel : ViewModelBase
         if (!CanDiscard)
         {
             IsConfirmingDiscard = false;
+        }
+
+        // The conflict facts, straight from the daemon's measurement. Nothing here is derived from the
+        // state word: a parked rebase leaves the entry at `Working`, which is also where every branch that
+        // has simply never been verified sits, so the two are indistinguishable without this field.
+        HasRebaseConflict = entry.RebaseConflict is not null;
+        ConflictWorktree = entry.RebaseConflict?.Worktree ?? "";
+        ConflictPathsText = entry.RebaseConflict is not { } conflict
+            ? ""
+            : conflict.Paths.Count == 0
+                // NOT "no files conflict". An empty list is the daemon saying it could not measure them,
+                // and rendering that as reassurance would contradict the card it is printed on.
+                ? "Conflicting files: not measured — open the worktree to see them."
+                : $"Conflicting {(conflict.Paths.Count == 1 ? "file" : "files")}: "
+                    + string.Join(", ", conflict.Paths);
+        if (!HasRebaseConflict)
+        {
+            IsConfirmingAbortRebase = false;
         }
 
         // Stranded: a non-terminal entry the daemon says has no jail. `== false` rather than `!= true` on
@@ -482,6 +552,67 @@ public partial class QueueEntryViewModel : ViewModelBase
             // resume the daemon refused moves no queue state, so it pushes no snapshot, so a button left
             // latched would stay dead for the session.
             IsResumeRequestInFlight = false;
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>
+    /// "Let the agent resolve": asks the daemon to unpause the parked jail and instruct the worker to
+    /// finish resolving its own rebase.
+    ///
+    /// <para><b>Not confirmed first, unlike the abort beside it.</b> It changes nothing that cannot be
+    /// undone — the branch stays exactly as it is, mid-rebase — and the entry can still be aborted or
+    /// discarded afterwards. Ceremony on the recovery action while the irreversible one asks is the wrong
+    /// way round, which is the same call <see cref="ResumeAsync"/> makes.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task ResolveConflictWithAgentAsync()
+    {
+        if (_lifecycleRequestInFlight || IsConflictRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        IsConflictRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner
+                .ResolveConflictWithAgentAsync(_queue, AgentId, _report)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            // Re-armed here rather than from the next stream update, for the reason Verify and Resume are:
+            // a refused request moves no queue state, pushes no snapshot, and would leave the button dead
+            // for the session.
+            IsConflictRequestInFlight = false;
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>Arms the abort. Nothing has been asked of the daemon yet.</summary>
+    [RelayCommand]
+    private void BeginAbortRebase() => IsConfirmingAbortRebase = true;
+
+    /// <summary>Disarms it.</summary>
+    [RelayCommand]
+    private void CancelAbortRebase() => IsConfirmingAbortRebase = false;
+
+    /// <summary>The confirmed abort: <c>git rebase --abort</c> in the parked worktree, then the jail runs
+    /// again. Every decision is the daemon's, including whether the rebase is still there to abort.</summary>
+    [RelayCommand]
+    private async Task ConfirmAbortRebaseAsync()
+    {
+        IsConfirmingAbortRebase = false;
+        if (_lifecycleRequestInFlight || IsConflictRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        IsConflictRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner.AbortRebaseAsync(_queue, AgentId, _report).ConfigureAwait(true);
+        }
+        finally
+        {
+            IsConflictRequestInFlight = false;
             _lifecycleRequestInFlight = false;
         }
     }

@@ -656,8 +656,15 @@
     the same fact now withholds `CanVerify` instead of leaving an enabled button whose only behaviour is
     "has no live sandbox". Not two-step, unlike Discard: it adds a sandbox and destroys nothing. The CLI
     to run comes from the injected `resumeAgentKind` callback, read at press time, because the picker
-    lives on `ControlCenterViewModel`), each an equally thin drive of a daemon RPC through
-    `MergeActionRunner`.
+    lives on `ControlCenterViewModel`), and — for an entry whose worktree the daemon has parked mid-rebase
+    (`QueueEntry.RebaseConflict`, never inferred from the state word, which cannot tell a parked conflict
+    from a branch nobody ever verified) — **`ResolveConflictWithAgent`** ("Let the agent resolve": one
+    press, not two-step, because it changes nothing that cannot be undone) and **`BeginAbortRebase` /
+    `CancelAbortRebase` / `ConfirmAbortRebase`** (two-step, on the Discard idiom, because it throws away
+    the replay progress) plus the fact lines `ConflictPathsText` / `ConflictWorktree` — the card used to
+    name a required human action and no file, no branch and no location. `ConflictPathsText` renders an
+    empty daemon path list as "not measured", never as "no files conflict". Each is an equally thin drive
+    of a daemon RPC through `MergeActionRunner`.
     The class can neither remove a row nor invent an outcome — a local "remove from list" would clear
     the rail until the next `StreamQueue` snapshot silently refilled it. `IsVerificationStalled` comes
     from the daemon's `QueueEntry.VerificationInFlight`, never inferred from `Verifying`, which is wrong

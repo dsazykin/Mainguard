@@ -170,6 +170,12 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// departures themselves arrive as must-acknowledge <paramref name="FlaggedItems"/>, so this field's job
 /// is exactly to carry the two answers that produce no item.
 /// </param>
+/// <param name="RebaseConflict">
+/// Set only while this entry's worktree is parked mid-rebase on a conflict; <c>null</c> — the ordinary
+/// case — means nothing is parked. Nullable rather than a set of fields on this record for the same reason
+/// <see cref="Verification"/> is: a blank worktree and an empty path list are indistinguishable from a
+/// conflict nobody measured, and the two answers must not share a representation.
+/// </param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -184,7 +190,34 @@ public sealed record QueueEntry(
     string? ApprovedPlanId = null,
     string? ApprovedPlanTitle = null,
     string? ApprovedApproach = null,
-    string? DeviationDeclaration = null);
+    string? DeviationDeclaration = null,
+    QueueRebaseConflict? RebaseConflict = null);
+
+/// <summary>
+/// The facts behind a conflict card: a worktree the daemon parked mid-rebase, and what git said conflicts
+/// in it.
+///
+/// <para><b>Why the card needs this at all.</b> The gate reason already told the human that a rebase
+/// conflict needs them and named no location and no file, so the one row on the rail asking for human
+/// judgment was the one row carrying the least evidence. These are the daemon's measurements, carried
+/// rather than re-derived — a client cannot see into the daemon's worktrees, and a client that guessed
+/// would be describing a conflict it never observed.</para>
+/// </summary>
+/// <param name="Worktree">The parked worktree, verbatim. Rendered as provenance — where this happened —
+/// never as something the client opens: on every substrate but a Mac host it is a path inside the
+/// daemon's environment, not the user's filesystem.</param>
+/// <param name="MainBranch">The branch the rebase was onto.</param>
+/// <param name="Paths">
+/// The repo-relative unmerged paths, measured when the cascade parked the worktree. <b>Empty means NOT
+/// MEASURED</b>, never "no files conflict" — a surface that rendered an empty list as reassurance would be
+/// contradicting the very state it is rendering.
+/// </param>
+/// <param name="ParkedAt">When it was parked; null when the daemon sent no timestamp.</param>
+public sealed record QueueRebaseConflict(
+    string Worktree,
+    string MainBranch,
+    IReadOnlyList<string> Paths,
+    DateTimeOffset? ParkedAt);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(

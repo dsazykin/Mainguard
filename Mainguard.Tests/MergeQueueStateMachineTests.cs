@@ -163,8 +163,53 @@ public class MergeQueueStateMachineTests
         Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
         Assert.Null(h.Queue.LastVerification("a"));
         Assert.False(h.Queue.CanMerge("a", out var reason));
-        Assert.Equal("not verified yet", reason);
+
+        // ...and the refusal is what the entry SAYS, not only what the daemon logged. This assertion
+        // used to read `Assert.Equal("not verified yet", reason)`, which is the sentence for a branch
+        // nobody has asked anything of — so a human who pressed Verify and was refused got back a row
+        // that had forgotten being asked. The daemon's own words are already sent verbatim as gRPC
+        // FailedPrecondition; recording them on the entry is what makes them survive the next queue
+        // snapshot instead of living in one transient message slot.
+        Assert.Equal("this repo configures no verification command", reason);
+        Assert.DoesNotContain("not verified yet", reason);
     }
+
+    /// <summary>
+    /// The half of the same defect that made the human's one available action tell them LESS: a refused
+    /// verification must not DELETE the reason the stale cascade measured.
+    ///
+    /// <para>Traced live on a rebase-conflict entry. <c>RunVerificationAsync</c> transitions to
+    /// <c>Verifying</c> first, <c>SetStateLocked</c> retires the cascade's measured reason on any move off
+    /// <c>Working</c>, and the run then refuses (the parked worktree is on a detached HEAD mid-rebase, so
+    /// the branch-alignment guard throws) and settles the entry straight back to <c>Working</c> with
+    /// nothing left to say. The card went from "the agent is paused with the rebase in progress and needs
+    /// a human to resolve it" to "not verified yet" — pressing the one button the card offered erased the
+    /// one sentence that explained the card.</para>
+    ///
+    /// <para>The prior measurement wins over the refusal's own message because nothing ran: the world did
+    /// not change, so the more specific true statement is still the true one.</para>
+    /// </summary>
+    [Fact]
+    public async Task RunVerification_Refused_KeepsTheMeasuredWorkingReason_RatherThanClobberingIt()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+
+        // The cascade's conflict terminus, exactly as MergeQueueProvisioner writes it.
+        Assert.True(h.Queue.TryReturnToWorking("a", MergeQueueProvisioner.RebaseConflictReason, "conflict"));
+        Assert.False(h.Queue.CanMerge("a", out var beforeVerify));
+        Assert.Equal(MergeQueueProvisioner.RebaseConflictReason, beforeVerify);
+
+        h.RefuseFor("a");
+        await Assert.ThrowsAsync<NoVerificationCommandException>(
+            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
+        Assert.False(h.Queue.CanMerge("a", out var afterVerify));
+        Assert.Equal(MergeQueueProvisioner.RebaseConflictReason, afterVerify);
+    }
+
 
     /// <summary>
     /// The three ways out of a red verification, and the two that are refused. This is the shape of the

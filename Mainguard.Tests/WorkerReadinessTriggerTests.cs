@@ -327,12 +327,21 @@ public class WorkerReadinessTriggerTests
         Assert.Null(rig.VerStore.Latest("repo", "w-1"));
 
         // The entry is back where it can be acted on, and the refusal did not masquerade as a verdict:
-        // CanMerge says "not verified yet", never anything shaped like a test result.
         // Working — NOT VerificationFailed. A refusal is not a verdict, and H2's new state is reachable
         // only from the arm that has a red record in hand.
         Assert.Equal(WorkerMergeState.Working, rig.Queue.GetState("w-1"));
         Assert.False(rig.Queue.CanMerge("w-1", out var reason));
-        Assert.Equal("not verified yet", reason);
+
+        // …and the refusal is what the entry SAYS. This assertion used to read
+        // `Assert.Equal("not verified yet", reason)`, which is the sentence for a branch nobody has asked
+        // anything of — so the one thing this whole test exists to make visible, a malformed verify
+        // command that cost a real attempt, was legible only in the daemon log. It is still not shaped
+        // like a test result, which is the property the paragraph above is about: nothing here says
+        // failed, or tests, or a command that ran.
+        Assert.Equal(
+            "the verification command for 'w-1' contains shell operators that survived tokenisation",
+            reason);
+        Assert.DoesNotContain("not verified yet", reason);
 
         // …and the refusal is not retried: a deterministic refusal must cost one attempt, not one per
         // sweep, forever. Nothing is armed, and re-announcing the very same tip does not change that.

@@ -36,6 +36,26 @@ public interface IYieldToken : IDisposable
 
     /// <summary>Unpause the jail (pause path) / signal resume; idempotent.</summary>
     void Resume();
+
+    /// <summary>
+    /// Hand the machine's critical section back <b>without waking the jail</b> — for the one path that
+    /// must leave a jail frozen on purpose: a keep-alive rebase that CONFLICTED, whose worktree stays
+    /// parked mid-rebase for a human.
+    ///
+    /// <para><b>Why this exists rather than "just don't call Resume".</b> That is exactly what the conflict
+    /// arm did, and it leaked the <see cref="IPauseArbiter.HoldForMachine"/> hold that
+    /// <see cref="RequestYieldAsync"/> takes: the hold is released inside the resume, so a token that is
+    /// never resumed holds it forever. <c>AgentPauseService.UnpauseAsync</c> refuses while a hold is
+    /// outstanding — with "the daemon is briefly holding this agent for a queue update — try again in a
+    /// moment", a sentence whose whole promise is that it self-clears — so the HUMAN's unpause button was
+    /// refused indefinitely on exactly the agents that need a human. The pause outliving the cycle is
+    /// deliberate; the machine's claim to own it is not.</para>
+    ///
+    /// <para>Idempotent, and mutually exclusive with <see cref="Resume"/>: whichever is called first
+    /// settles the token, and <see cref="IsActive"/> goes false either way, so the mutation gateway closes
+    /// exactly as it would have.</para>
+    /// </summary>
+    void ReleaseWithoutResuming();
 }
 
 /// <summary>
@@ -201,6 +221,9 @@ public sealed class YieldProtocol : IYieldProtocol
 
         // The machine's critical section is marked in the arbiter FIRST, so a human unpause arriving
         // between here and the token's resume is refused rather than breaking the pause open mid-write.
+        // The token OWNS it from here on (see YieldToken): released on resume, and equally released by
+        // ReleaseWithoutResuming for the conflict path that deliberately leaves the jail frozen. Holding
+        // it in the resume closure alone is what made a never-resumed token leak it forever.
         var hold = _arbiter?.HoldForMachine(agentId);
         try
         {
@@ -221,55 +244,77 @@ public sealed class YieldProtocol : IYieldProtocol
 
         return new YieldToken(agentId, YieldOutcome.ByPause, async () =>
         {
-            try
+            // Checked at RESUME time, not capture time: a human who paused the agent DURING the
+            // machine's hold has said "stay frozen", and the machine must not override that on its
+            // way out. The hold is released either way — the token does that, not this closure.
+            if (_arbiter?.IsHumanPaused(agentId) == true)
             {
-                // Checked at RESUME time, not capture time: a human who paused the agent DURING the
-                // machine's hold has said "stay frozen", and the machine must not override that on its
-                // way out. The hold is released either way — the human's own unpause takes over.
-                if (_arbiter?.IsHumanPaused(agentId) == true)
-                {
-                    _supervisor.MarkState(agentId, "Paused", "Paused by you.");
-                    return;
-                }
+                _supervisor.MarkState(agentId, "Paused", "Paused by you.");
+                return;
+            }
 
-                await _sandbox.UnpauseAsync(containerId, CancellationToken.None).ConfigureAwait(false);
-                _supervisor.ResumeInput(agentId);
-                _supervisor.MarkState(agentId, "Working", null);
-            }
-            finally
-            {
-                hold?.Dispose();
-            }
-        });
+            await _sandbox.UnpauseAsync(containerId, CancellationToken.None).ConfigureAwait(false);
+            _supervisor.ResumeInput(agentId);
+            _supervisor.MarkState(agentId, "Working", null);
+        }, hold);
     }
 
-    /// <summary>The active-until-resumed token. <see cref="Resume"/> runs the resume action exactly once.</summary>
+    /// <summary>
+    /// The active-until-settled token. <see cref="Resume"/> runs the resume action exactly once;
+    /// <see cref="ReleaseWithoutResuming"/> settles it without running that action at all.
+    ///
+    /// <para><b>The token owns the arbiter hold</b>, rather than the resume closure owning it. That is the
+    /// difference between a hold that is released on every path out of the cycle and one released only on
+    /// the paths that resume — and the conflict arm is, by design, not one of those.</para>
+    /// </summary>
     private sealed class YieldToken : IYieldToken
     {
         private readonly Func<Task> _resumeAsync;
-        private int _resumed;
+        private readonly IDisposable? _hold;
+        private int _settled;
 
-        public YieldToken(string agentId, YieldOutcome outcome, Func<Task> resumeAsync)
+        public YieldToken(string agentId, YieldOutcome outcome, Func<Task> resumeAsync, IDisposable? hold = null)
         {
             AgentId = agentId;
             Outcome = outcome;
             _resumeAsync = resumeAsync;
+            _hold = hold;
         }
 
         public string AgentId { get; }
 
         public YieldOutcome Outcome { get; }
 
-        public bool IsActive => Volatile.Read(ref _resumed) == 0;
+        public bool IsActive => Volatile.Read(ref _settled) == 0;
 
         public void Resume()
         {
-            if (Interlocked.Exchange(ref _resumed, 1) != 0)
+            if (Interlocked.Exchange(ref _settled, 1) != 0)
             {
                 return;
             }
 
-            _resumeAsync().GetAwaiter().GetResult();
+            try
+            {
+                _resumeAsync().GetAwaiter().GetResult();
+            }
+            finally
+            {
+                // In a finally so a failed unpause still hands the critical section back: a hold that
+                // survives an exception refuses the human's unpause forever, which is strictly worse than
+                // the failure that caused it.
+                _hold?.Dispose();
+            }
+        }
+
+        public void ReleaseWithoutResuming()
+        {
+            if (Interlocked.Exchange(ref _settled, 1) != 0)
+            {
+                return;
+            }
+
+            _hold?.Dispose();
         }
 
         public void Dispose() => Resume();

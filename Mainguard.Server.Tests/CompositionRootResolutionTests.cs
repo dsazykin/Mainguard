@@ -99,6 +99,11 @@ public sealed class CompositionRootResolutionTests
                 // lives at the RPC surface rather than in a conditional wiring this exact-set
                 // assertion could not tell from an oversight.
                 "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
+                // Without `promptAgent`, the "let the agent resolve" control on a conflicted entry
+                // refuses — correctly and loudly, rather than unpausing a jail and telling it nothing —
+                // which would leave the card exactly where it started: naming a human action the product
+                // cannot perform. Precisely the silent degradation this assertion exists to catch.
+                "promptAgent",
                 "publishAgentRef", "publishRebasedAgentRef", "resolveApprovedWork",
                 "syntheticVerifications", "yieldProtocolFor",
             },

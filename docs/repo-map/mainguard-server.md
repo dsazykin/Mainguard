@@ -102,7 +102,10 @@
   `AcknowledgeFlaggedChange` — MG-11, merge power by another name), the human entry-lifecycle RPCs
   (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the
   evidence blocking its own branch instead of clearing the gate, and clearing a stalled verification puts
-  a branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
+  a branch into the state a re-verification starts from), the two parked-conflict actions
+  (`ResolveConflictWithAgent`/`AbortRebase` — the first is `UnpauseAgent` plus the terminal input lock's
+  whole purpose in one call, reached from a different service; the second rewrites a co-tenant branch's
+  parentage and resumes its jail), **`AgentService/ResumeAgent`** (adoption is
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
   writable jail to another agent's branch and have the daemon verify what it put there — and because
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
@@ -664,7 +667,7 @@
   — P2-13 carried-in from P2-08 maps the proto `Budget`'s per-day caps
   (`usd_micros_cap_per_day`/`token_cap_per_day`) too, so per-day is displayable+editable over gRPC;
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
-  stream) / **`MergeQueueGrpcService.cs`** (P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
+  stream) / **`MergeQueueGrpcService.cs`** (**`RunVerification` is FROZEN-JAIL guarded** — the human's Verify button reaches the merge queue by this path, which the sibling fix on the coordinator's `request_verification` op did not cover, so pressing it on a conflicted entry started a run whose `docker exec` answers "Container … is paused" and arrived as a provisioning failure on the one screen where that must never be confused with "your tests failed". The predicate is `FrozenJailPolicy.IsFrozen` — SHARED with that guard on purpose, so the two paths cannot drift apart on what "frozen" means — while the wording is this surface's own: the policy's sentences are written for an agent to act on in one turn, and this reader is a person, so the refusal names the two conflict controls beside it. An unknown or Working session is NOT refused: refusing from ignorance would strand every seeded row and every entry whose session died with a previous daemon. P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
   refusal and never a verdict — and **`GetVerificationLog`** serves the run's artifact CONTENT, bounded to
   the last 256 KiB via `ReadTail` (the tail, because a runner prints its failures last) and answering "no
   record" / "artifact gone" / the log as three distinct things; `Snapshot` carries the entry's verdict,

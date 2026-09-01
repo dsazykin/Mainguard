@@ -104,6 +104,14 @@ public sealed class QueueProjectionRenderingTests
 
         public Task ClearStalledVerificationAsync(string agentId) => Task.CompletedTask;
 
+        // Not exercised by this fixture: nothing here is parked mid-rebase, and a double that pretended
+        // otherwise would let a test pass on a conflict the projection never carried.
+        public Task ResolveConflictWithAgentAsync(string agentId) =>
+            throw new NotSupportedException("this fixture has no parked rebase conflicts");
+
+        public Task AbortRebaseAsync(string agentId) =>
+            throw new NotSupportedException("this fixture has no parked rebase conflicts");
+
         public Task<QueueEntryResumeOutcome> ResumeEntryAsync(string agentId, string agentKind) =>
             throw new NotSupportedException();
     }

@@ -53,6 +53,14 @@ public sealed class RoleInterceptor : Interceptor
         // never re-verifies), and one that could unpause could break the cascade's critical section.
         "/mainguard.v1.AgentService/PauseAgent",
         "/mainguard.v1.AgentService/UnpauseAgent",
+        // The two parked-conflict actions, on exactly the boundary the line above draws. Handing a
+        // conflict back UNPAUSES a co-tenant's jail and then types into its CLI — UnpauseAgent plus the
+        // terminal input lock's whole purpose, in one call; aborting a parked rebase rewrites a co-tenant
+        // branch's parentage and resumes its jail. Both are merge-adjacent power over work an agent
+        // competes with, and neither is anything an agent needs: a worker resolving its OWN conflict does
+        // it with the git already in its own worktree.
+        "/mainguard.v1.MergeQueueService/ResolveConflictWithAgent",
+        "/mainguard.v1.MergeQueueService/AbortRebase",
         // P2-15: the audit chain carries other agents' prompts/outputs and every plan/merge
         // decision. A coordinator that could read it would hold a transcript of work it competes
         // with (and of the human's decisions about it); verify is read power's sibling here.

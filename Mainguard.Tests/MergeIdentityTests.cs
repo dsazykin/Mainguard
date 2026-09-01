@@ -533,6 +533,7 @@ public class MergeIdentityTests : IDisposable
         public bool IsActive => true;
         public YieldOutcome Outcome => YieldOutcome.ByReady;
         public void Resume() { }
+        public void ReleaseWithoutResuming() { }
         public void Dispose() { }
     }
 

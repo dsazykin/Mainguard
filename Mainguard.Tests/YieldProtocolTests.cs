@@ -105,6 +105,45 @@ public sealed class YieldProtocolTests
         Assert.Equal(0, arbiter.Holds);
     }
 
+    /// <summary>
+    /// The conflict path's terminus: hand the machine's critical section back and leave the jail frozen.
+    ///
+    /// <para>Both halves are the point. The hold MUST go — <c>AgentPauseService.UnpauseAsync</c> refuses
+    /// while one is outstanding, with a sentence ("the daemon is briefly holding this agent for a queue
+    /// update — try again in a moment") whose entire promise is that it self-clears, so a hold that
+    /// outlives the cycle refuses the human's unpause button forever on exactly the agents that need a
+    /// human. And the jail MUST stay frozen — the worktree is parked mid-rebase, and waking the agent
+    /// under it is what the conflict arm exists not to do.</para>
+    /// </summary>
+    [Fact]
+    public async Task ReleaseWithoutResuming_HandsBackTheMachineHold_ButLeavesTheJailFrozen()
+    {
+        var channel = new RecordingChannel(readyAnswer: false);
+        var sandbox = new RecordingSandbox();
+        var arbiter = new FakeArbiter { HumanPaused = false };
+        var protocol = new YieldProtocol(_ => channel, sandbox, _ => "container-1",
+            defaultTimeout: TimeSpan.FromMilliseconds(10), arbiter: arbiter);
+
+        var token = await protocol.RequestYieldAsync("a1");
+        Assert.Equal(1, sandbox.PauseCount);
+        Assert.Equal(1, arbiter.Holds);
+
+        token.ReleaseWithoutResuming();
+
+        Assert.Equal(0, arbiter.Holds);
+        Assert.Equal(0, sandbox.UnpauseCount);
+        // Settled either way: the mutation gateway closes exactly as a resume would have closed it, so
+        // nothing can reach the parked worktree through this token afterwards.
+        Assert.False(token.IsActive);
+
+        // Idempotent, and mutually exclusive with Resume — a later Resume must not wake a jail that was
+        // deliberately left frozen, nor underflow another holder's count.
+        token.ReleaseWithoutResuming();
+        token.Resume();
+        Assert.Equal(0, arbiter.Holds);
+        Assert.Equal(0, sandbox.UnpauseCount);
+    }
+
     private sealed class FakeArbiter : IPauseArbiter
     {
         public bool HumanPaused { get; set; }
