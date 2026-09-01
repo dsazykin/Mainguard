@@ -1839,7 +1839,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       departure, because a final `--no-deviations` erasing the first commit's disclosure is the rubber
       stamp the mechanism must not become. `ApprovedWorkFor` is the one lookup that answers both halves
       of an approval (scope + approach/declaration) so the two can never name different plans after a
-      re-scope. `Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+      re-scope. Bounded like every sibling agent-authored field, and **loud rather than closed** because
+      closed is a dead end here: `MaxDeclaredDeviations` (20) drops the excess but records an explicit
+      "…and N further" row, and one over-long text is truncated with a marker at
+      `TaskPlanSchema.MaxFieldLength` rather than refusing a commit over prose. `Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
     - `PlanModeSwitch.cs` (**the operator's plan-mode toggle**, 2026-08-30 — whether a coordinator-delegated
       worker must have a human-approved plan before it is given its task. `Enabled` /
       `ModeForNewWorker` / `Set(enabled, actor)` / `Summary` (the one sentence a human reads, rendered

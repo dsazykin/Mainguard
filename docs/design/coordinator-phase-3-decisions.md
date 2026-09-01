@@ -4307,7 +4307,26 @@ anything about the branch. A blocker that is always present for a whole class of
 anything is precisely how a gate teaches people to click through it. The fail-closed default stays where
 it matters: on a real worker, which is the only thing that can actually answer.
 
-### 26.7 Left alone, deliberately
+### 26.7 The record is bounded, and what it drops it declares
+
+`commit_work` may be called any number of times and records on a clean tree too, so the accumulated
+declaration is an **agent-controlled growth path through a file the daemon rewrites on every save** — and
+it was the one agent-authored field with no oversized guard, while `TaskPlanSchema` bounds every sibling
+(`MaxScopeFiles` 200, `MaxFieldLength` 4 000, `MaxPlanBytes` 64 KiB).
+
+Both bounds fail **loud rather than closed**, because closed here is a dead end: a worker refused at the
+cap could never commit again, and its work dies with the jail — the "limit that is really a dead end"
+shape §24 argues against at length.
+
+- **Count** (`MaxDeclaredDeviations` = 20). Excess texts are not stored, and the record gains an explicit
+  "…and N further declared deviation(s) that this record cannot hold" row, which the human reads like any
+  other. The notice is recomputed from what actually dropped rather than accumulated, so a second
+  overflowing round does not leave two of them, and it never counts toward the cap itself.
+- **Length** (`TaskPlanSchema.MaxFieldLength`, the same bound the `approach` it is about gets). An
+  over-long deviation is truncated with `…[truncated]` appended. An unmarked cut is the one way
+  truncation would be worse than either alternative.
+
+### 26.8 Left alone, deliberately
 
 - **No automated approach-vs-diff comparison**, per the decision above.
 - **The declaration does not gate the commit's content**, only its acceptance. The work still leaves the

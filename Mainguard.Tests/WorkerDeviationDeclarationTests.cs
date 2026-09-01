@@ -214,6 +214,60 @@ public class WorkerDeviationDeclarationTests
     }
 
     /// <summary>
+    /// <b>The record is bounded, and what it drops it declares.</b> <c>commit_work</c> may be called any
+    /// number of times and records on a clean tree too, so accumulation is an agent-controlled growth
+    /// path through a file the daemon rewrites on every save — and this was the ONE agent-authored field
+    /// with no oversized guard, while <c>TaskPlanSchema</c> bounds every sibling (<c>MaxScopeFiles</c>,
+    /// <c>MaxFieldLength</c>, <c>MaxPlanBytes</c>).
+    ///
+    /// <para>Refusing the commit at the cap would be worse than the growth: a worker that hit it could
+    /// never commit again, and its work dies with the jail. So the excess is recorded as a stated
+    /// overflow the human reads, never as silence — and the notice is recomputed rather than
+    /// accumulated, so a second overflowing round does not leave two of them.</para>
+    /// </summary>
+    [Fact]
+    public void TheRecordIsCapped_AndSaysWhatItCouldNotHold()
+    {
+        var plans = new PlanApprovalService();
+        ApprovePlanFor(plans, Worker);
+
+        plans.DeclareDeviations(
+            Worker,
+            Enumerable.Range(0, PlanApprovalService.MaxDeclaredDeviations + 5)
+                .Select(i => $"departure {i}").ToList());
+
+        var first = plans.ApprovedWorkFor(Worker)!.Deviations;
+        Assert.Equal(PlanApprovalService.MaxDeclaredDeviations + 1, first.Count); // the cap, plus the notice
+        Assert.Equal("departure 0", first[0]);
+        Assert.Contains("5 further declared deviation(s)", first[^1], StringComparison.Ordinal);
+
+        // A second overflowing round re-states the overflow rather than stacking a second notice.
+        plans.DeclareDeviations(Worker, new[] { "one more" });
+        var second = plans.ApprovedWorkFor(Worker)!.Deviations;
+        Assert.Equal(PlanApprovalService.MaxDeclaredDeviations + 1, second.Count);
+        Assert.Single(second, d => d.Contains("further declared deviation(s)", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// One over-long deviation is truncated with the cut MARKED, not refused. Refusing would block a
+    /// commit over prose; an unmarked cut is the one way truncation is worse than either.
+    /// </summary>
+    [Fact]
+    public void AnOverLongDeviationIsTruncated_AndSaysThatItWas()
+    {
+        var plans = new PlanApprovalService();
+        ApprovePlanFor(plans, Worker);
+
+        plans.DeclareDeviations(Worker, new[] { new string('x', TaskPlanSchema.MaxFieldLength + 500) });
+
+        var recorded = Assert.Single(plans.ApprovedWorkFor(Worker)!.Deviations);
+        Assert.EndsWith("…[truncated]", recorded, StringComparison.Ordinal);
+        Assert.True(
+            recorded.Length < TaskPlanSchema.MaxFieldLength + 50,
+            $"an over-long deviation was stored at {recorded.Length} characters");
+    }
+
+    /// <summary>
     /// A worker with no approved plan has no approved approach, so there is nothing to deviate from and
     /// nowhere to record it. Refused with that reason rather than written somewhere — a declaration
     /// against no approval is a claim about nothing.
@@ -392,6 +446,13 @@ public class WorkerDeviationDeclarationTests
         // reason to think its own green tests are not already the answer to the question being asked.
         Assert.Contains("nothing compares anything against it", text, StringComparison.Ordinal);
         Assert.Contains("is an assertion, not a default", text, StringComparison.Ordinal);
+
+        // The section is markdown a CLI reads, and it is spliced into a raw string literal — so its
+        // heading has to START a line. An indented `### ` is a fenced code block in markdown, which would
+        // render the whole section as literal text rather than as instructions. Cheap to get wrong
+        // (change the closing delimiter's indentation and the splice silently gains eight spaces) and
+        // invisible to every other assertion here, which only look for substrings.
+        Assert.Contains("\n### Say whether you departed", text, StringComparison.Ordinal);
     }
 
     /// <summary>

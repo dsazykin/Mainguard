@@ -1263,6 +1263,10 @@ public sealed class AgentSpawnService
             ["sha"] = result.Sha ?? string.Empty,
         }));
 
+        // Recorded on both outcomes the worker asked for correctly, because a worker that commits three
+        // times and finds the last one clean has still declared what it declared. Only the Committed
+        // branch renders the note back: NothingToCommit's feedback slot already carries the more urgent
+        // fact (the branch did not move), and the record is written either way.
         var declarationNote = result.Outcome is AgentWorkCommitOutcome.Committed
             or AgentWorkCommitOutcome.NothingToCommit
             ? RecordDeviations(request, workerAgentId)
@@ -1337,7 +1341,7 @@ public sealed class AgentSpawnService
     private string? RecordDeviations(AgentIpcRequest request, string workerAgentId)
     {
         var declared = DeclaredDeviations(request);
-        if (!(request.NoDeviations == true) && declared.Count == 0)
+        if (request.NoDeviations != true && declared.Count == 0)
         {
             return null;
         }

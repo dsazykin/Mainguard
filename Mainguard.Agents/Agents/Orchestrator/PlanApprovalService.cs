@@ -891,7 +891,7 @@ public sealed class PlanApprovalService
     {
         var declared = (deviations ?? Array.Empty<string>())
             .Where(d => !string.IsNullOrWhiteSpace(d))
-            .Select(d => d.Trim())
+            .Select(d => Bound(d.Trim()))
             .ToList();
 
         PendingPlan updated;
@@ -905,13 +905,39 @@ public sealed class PlanApprovalService
                     null);
             }
 
-            var merged = approved.Deviations.ToList();
+            // The overflow notice is not a deviation, so it never counts toward the cap and never
+            // survives into the next round's arithmetic — it is recomputed from what actually dropped.
+            var merged = approved.Deviations
+                .Where(d => !d.StartsWith(OverflowPrefix, StringComparison.Ordinal))
+                .ToList();
+            var dropped = 0;
             foreach (var d in declared)
             {
-                if (!merged.Contains(d, StringComparer.Ordinal))
+                if (merged.Contains(d, StringComparer.Ordinal))
                 {
-                    merged.Add(d);
+                    continue;
                 }
+
+                if (merged.Count >= MaxDeclaredDeviations)
+                {
+                    dropped++;
+                    continue;
+                }
+
+                merged.Add(d);
+            }
+
+            // Loud, not quiet, and never a dead end. `commit_work` may be called any number of times and
+            // records on a clean tree too, so an unbounded accumulation is an agent-controlled growth
+            // path through a file the daemon rewrites on every save — the one agent-authored field with
+            // no oversized guard, while `TaskPlanSchema` bounds every sibling (MaxScopeFiles,
+            // MaxFieldLength, MaxPlanBytes). Refusing the commit at the cap would be worse than the
+            // growth: a worker that hit it could never commit again, which is the "limit that is really
+            // a dead end" shape `Rescope` argues against at length. So the excess is DECLARED as
+            // unrecorded, in a row the human reads, rather than dropped in silence.
+            if (dropped > 0)
+            {
+                merged.Add(OverflowNotice(dropped));
             }
 
             // Sticky: once a departure is on record the branch has departed, whatever a later commit says.
@@ -944,6 +970,30 @@ public sealed class PlanApprovalService
                 : "recorded: no deviation from the approved approach.",
             updated);
     }
+
+    /// <summary>
+    /// The most declared deviations one plan's record will hold. Twenty departures from one approved
+    /// approach describes a plan that was wrong rather than a declaration that needs more room; the cap
+    /// exists to bound the file, and what it drops is stated rather than silently lost.
+    /// </summary>
+    public const int MaxDeclaredDeviations = 20;
+
+    private const string OverflowPrefix = "…and ";
+
+    private static string OverflowNotice(int dropped) =>
+        $"{OverflowPrefix}{dropped} further declared deviation(s) that this record cannot hold "
+        + $"(the cap is {MaxDeclaredDeviations}) — this branch has departed from its approved approach "
+        + "more times than can be listed here.";
+
+    /// <summary>
+    /// One deviation, bounded to the same length <see cref="TaskPlanSchema.MaxFieldLength"/> allows the
+    /// <c>approach</c> it is about. Marked when it truncates: a cut the reader cannot see is the one way
+    /// truncation is worse than refusing, and refusing here would block a commit over prose.
+    /// </summary>
+    private static string Bound(string text) =>
+        text.Length <= TaskPlanSchema.MaxFieldLength
+            ? text
+            : text[..TaskPlanSchema.MaxFieldLength] + " …[truncated]";
 
     /// <summary>
     /// Blocks until the human decides <paramref name="planId"/>, then returns that decision. An
