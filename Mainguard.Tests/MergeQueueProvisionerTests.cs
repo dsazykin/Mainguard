@@ -1252,6 +1252,101 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.Contains("no rebase parked", abort.Reason);
     }
 
+    /// <summary>
+    /// <b>The agent's LAST word must be <c>Conflict</c>, not <c>Working</c>.</b>
+    ///
+    /// <para>Found by composing this branch against the daemon's frozen-jail guards. The run-state axis
+    /// (<c>Yielding</c>/<c>Rebasing</c>/<c>Conflict</c>) and the merge-state axis
+    /// (<c>Working</c>/<c>Verified</c>/…) are two vocabularies sharing ONE field on the session. The
+    /// keep-alive cycle writes <c>Conflict</c>; the cascade then returns the queue entry to
+    /// <c>Working</c>, and that transition's notice reflects the merge word onto the same field. So an
+    /// agent whose jail is <c>docker pause</c>d, parked mid-rebase, reported <c>Working</c> — the word an
+    /// agent making progress reports.</para>
+    ///
+    /// <para>Every frozen-jail guard in the daemon keys on that word (<c>Paused</c> or <c>Conflict</c>),
+    /// deliberately, because it is the fact the surfaces already project. <c>Working</c> is therefore the
+    /// one answer that makes all of them wave a delivery through into a SIGSTOPped process — a prompt that
+    /// returns Ok and is read by nobody, or a verification whose <c>docker exec</c> comes back "Container
+    /// … is paused". It self-corrects only when the session reconciler's interval-driven pause pass gets
+    /// round to it, which is a window rather than a design.</para>
+    ///
+    /// <para>The existing three-places test asserts <c>Conflict</c> appears in the state HISTORY, which it
+    /// does either way. This asserts the state a guard would actually read.</para>
+    /// </summary>
+    [Fact]
+    public async Task AParkedConflict_LeavesConflictAsTheAgentsLastStateWord_NotWorking()
+    {
+        var supervisor = new RecordingSupervisor();
+        var (_, _, _, _, _) = await ParkedConflictWithTipAsync(supervisor: supervisor);
+
+        Assert.Equal(nameof(AgentRunState.Conflict), supervisor.LastStateFor(SecondAgent));
+
+        // The co-tenant that MERGED is untouched by this: its last word is the merge axis's, which is
+        // correct for an agent whose jail is running. The fix must not pin every agent at Conflict.
+        Assert.NotEqual(nameof(AgentRunState.Conflict), supervisor.LastStateFor(FirstAgent));
+    }
+
+    /// <summary>
+    /// <b>The integration hazard, pinned.</b> The daemon guards its coordinator-facing <c>prompt</c> and
+    /// <c>verify</c> ops on the session's STATE WORD — refusing whenever it reads <c>Paused</c> or
+    /// <c>Conflict</c> (<c>FrozenJailPolicy</c>). This control's whole job is to deliver an instruction to
+    /// an agent whose word is <c>Conflict</c>, so the two compose only if the word has already stopped
+    /// being frozen by the time the instruction goes out.
+    ///
+    /// <para>It does, and NOT by a timing window: the unpause and the state mark are both ordered before
+    /// the delivery, inside one method, with no await between the mark and the send. This asserts the word
+    /// sampled at the exact instant of delivery rather than after the call, because "it is right
+    /// afterwards" is the assertion that would still pass if the send moved ahead of the mark.</para>
+    ///
+    /// <para><b>Independently</b>, the composition is also structural: the daemon wires this control's
+    /// <c>promptAgent</c> to <c>AgentCliBinder.TrySendPromptAsync</c> — the delivery primitive — not to
+    /// <c>AgentSpawnService.PromptAsync</c>, which is where that guard lives. This test is the belt: it
+    /// keeps the control correct even if the wiring is ever "simplified" onto the guarded op.</para>
+    /// </summary>
+    [Fact]
+    public async Task LettingTheAgentResolve_ClearsTheFrozenStateWord_BeforeItDeliversTheInstruction()
+    {
+        var supervisor = new RecordingSupervisor();
+        var prompts = new RecordingPrompts(supervisor);
+        var (provisioner, _, _, repoHash, _) =
+            await ParkedConflictWithTipAsync(prompts, supervisor);
+
+        // Precondition: the cascade really did leave this agent wearing the frozen word.
+        Assert.Equal(nameof(AgentRunState.Conflict), supervisor.LastStateFor(SecondAgent));
+
+        var result = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+        Assert.True(result.Done, result.Reason);
+
+        // The words FrozenJailPolicy refuses on, named literally rather than referenced: this assembly
+        // cannot see Mainguard.Server, and spelling them out is what makes a widening of that policy show
+        // up here as a decision rather than as a silent pass.
+        Assert.NotNull(prompts.StateWordAtDelivery);
+        Assert.NotEqual(nameof(AgentRunState.Conflict), prompts.StateWordAtDelivery);
+        Assert.NotEqual("Paused", prompts.StateWordAtDelivery);
+        Assert.Equal(nameof(AgentRunState.Rebasing), prompts.StateWordAtDelivery);
+    }
+
+    /// <summary>
+    /// The other half of the same composition, and the one that keeps the fix from becoming a hole: this
+    /// control must only clear the frozen word when it has actually UNFROZEN the jail. On the refusal path
+    /// — no prompt delivery wired — nothing is unpaused, so the word must still read <c>Conflict</c> and a
+    /// coordinator's ordinary prompt at that jail must still be refused.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedHandBack_LeavesTheFrozenStateWordInPlace_SoTheCoordinatorGuardStillBites()
+    {
+        var supervisor = new RecordingSupervisor();
+        var (provisioner, _, engine, repoHash, _) =
+            await ParkedConflictWithTipAsync(prompts: null, supervisor: supervisor);
+        engine.FreezeLog.Clear();
+
+        var result = await provisioner.LetAgentResolveConflictAsync(repoHash, SecondAgent);
+
+        Assert.False(result.Done);
+        Assert.DoesNotContain("unpause:" + ContainerId, engine.FreezeLog);
+        Assert.Equal(nameof(AgentRunState.Conflict), supervisor.LastStateFor(SecondAgent));
+    }
+
     /// <summary>Drives two co-tenants into the real parked-conflict state and hands back the pieces.</summary>
     private async Task<(MergeQueueProvisioner Provisioner, MergeQueueContext Ctx, FakeSandboxEngine Engine, string RepoHash)>
         ParkedConflictAsync(RecordingPrompts? prompts)
@@ -1263,14 +1358,14 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// <summary>The same, plus the agent branch's tip BEFORE the cascade touched it — what an abort has to
     /// restore.</summary>
     private async Task<(MergeQueueProvisioner Provisioner, MergeQueueContext Ctx, FakeSandboxEngine Engine, string RepoHash, string PreRebaseTip)>
-        ParkedConflictWithTipAsync(RecordingPrompts? prompts = null)
+        ParkedConflictWithTipAsync(RecordingPrompts? prompts = null, RecordingSupervisor? supervisor = null)
     {
         var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
         CommitOnAgentBranchFor(repoHash, FirstAgent, "shared.cs", "public class Shared { int First; }\n");
         CommitOnAgentBranchFor(repoHash, SecondAgent, "shared.cs", "public class Shared { int Second; }\n");
 
         var provisioner = NewRebasingProvisioner(
-            out var engine, jailFor: _ => ContainerId, prompts: prompts);
+            out var engine, jailFor: _ => ContainerId, supervisor: supervisor, prompts: prompts);
         var ctx = provisioner.EnsureQueue(repoHash)!;
         await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
         await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
@@ -1656,12 +1751,23 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// </summary>
     private sealed class RecordingPrompts
     {
+        private readonly RecordingSupervisor? _supervisor;
+
+        public RecordingPrompts(RecordingSupervisor? supervisor = null) => _supervisor = supervisor;
+
         public List<(string Repo, string Agent, string Prompt)> Sent { get; } = new();
 
         public bool Submitted { get; set; } = true;
 
+        /// <summary>
+        /// The agent's session state word AT THE INSTANT the instruction was delivered — the value a
+        /// state-word guard on the delivery path would read. Null when no supervisor was supplied.
+        /// </summary>
+        public string? StateWordAtDelivery { get; private set; }
+
         public bool Deliver(string repoHash, string agentId, string prompt)
         {
+            StateWordAtDelivery = _supervisor?.LastStateFor(agentId);
             Sent.Add((repoHash, agentId, prompt));
             return Submitted;
         }
@@ -1700,6 +1806,24 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             {
                 _states.Add((agentId, state));
                 Marks.Add((agentId, state, reason));
+            }
+        }
+
+        /// <summary>The most recent state word marked on this agent — what the session store would hold,
+        /// and therefore what a state-word guard would read.</summary>
+        public string? LastStateFor(string agentId)
+        {
+            lock (_states)
+            {
+                for (var i = _states.Count - 1; i >= 0; i--)
+                {
+                    if (_states[i].Agent == agentId)
+                    {
+                        return _states[i].State;
+                    }
+                }
+
+                return null;
             }
         }
     }

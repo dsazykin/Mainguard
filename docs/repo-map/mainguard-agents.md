@@ -1556,14 +1556,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       do about it:** `OnRebaseConflict` now records a `ParkedRebaseConflict` (worktree, branch, the
       measured unmerged paths) in the owned `ParkedConflicts` store and carries the paths into the audit
       event, and `RebaseConflictReason` is the named sentence the card renders verbatim.
-      `LetAgentResolveConflictAsync` unpauses the jail and delivers an instruction through the injected
+      `LetAgentResolveConflictAsync` unpauses the jail, moves the session's state word OFF the frozen
+      one (to `Rebasing`) and only THEN delivers an instruction through the injected
       `promptAgent` seam (the daemon passes `AgentCliBinder.TrySendPromptAsync` — the same path a
       coordinator's `send_worker_prompt` uses); with no prompt path wired it REFUSES rather than waking an
       agent that is told nothing. `AbortParkedRebaseAsync` unpauses, takes a real P2-09 yield (so the
       mutation is gated by a token, invariant 2 — a yield over an already-paused container would
       `docker pause` a paused jail), runs `git rebase --abort` under `GitMutationGuard.RunGuarded`, and
       resumes. Both refuse and forget the parking once the rebase is no longer in progress. Neither is the
-      T-04 resolver. Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
+      T-04 resolver.
+      **The conflict arm re-asserts `AgentRunState.Conflict` AFTER `Block`**, because the queue transition
+      `Block` performs reflects the MERGE word onto the same session field the run state uses
+      (`MarkMergeState` and `MarkRunState` are one field, two vocabularies) — so a `docker pause`d worktree
+      parked mid-rebase used to end up reporting `Working`, the word an agent making progress reports.
+      Every frozen-jail guard in the daemon keys on that word (`FrozenJailPolicy`: `Paused` or
+      `Conflict`), so `Working` was the one answer that waved a prompt or a verification through into a
+      SIGSTOPped process until the session reconciler's interval-driven pause pass corrected it. Found by
+      composing this branch against the coordinator-op guards; the ordering is pinned on both sides of the
+      assembly seam. Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off

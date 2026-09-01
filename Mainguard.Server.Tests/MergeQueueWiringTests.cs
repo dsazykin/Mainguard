@@ -321,6 +321,35 @@ public sealed class MergeQueueWiringTests
     }
 
     /// <summary>
+    /// <b>The cross-seam half of the same composition.</b> The "let the agent resolve" control moves the
+    /// session off the frozen word — to <see cref="AgentRunState.Rebasing"/> — and only then delivers its
+    /// instruction, so that a state-word guard on the delivery path cannot refuse the very control that
+    /// unfroze the jail. The ordering is pinned in <c>MergeQueueProvisionerTests</c>, which cannot see this
+    /// assembly; this is the other side of it, holding the real policy to the word that control writes.
+    ///
+    /// <para>It fails if <see cref="FrozenJailPolicy"/> is ever widened to count <c>Rebasing</c> as frozen
+    /// — which would be a defensible-looking change (a rebase IS a moment not to type into) that silently
+    /// breaks the hand-back, and breaks it in the worst way: the button reports success and delivers
+    /// nothing.</para>
+    /// </summary>
+    [Fact]
+    public void TheHandBacksStateWord_IsOneTheFrozenJailGuardsLetThrough()
+    {
+        // What the hand-back leaves on the session at delivery time.
+        Assert.False(FrozenJailPolicy.IsFrozen(nameof(AgentRunState.Rebasing)));
+
+        // ...and the two words it must never be confused with, which the same policy still refuses. The
+        // second is the one HumanPauseLedger.IsHumanPaused answers false for, which is why the policy
+        // keys on the state word instead.
+        Assert.True(FrozenJailPolicy.IsFrozen(AgentSessionReconciler.PausedState));
+        Assert.True(FrozenJailPolicy.IsFrozen(nameof(AgentRunState.Conflict)));
+
+        // An unknown/absent word is NOT frozen: the guards must not refuse from ignorance.
+        Assert.False(FrozenJailPolicy.IsFrozen(null));
+        Assert.False(FrozenJailPolicy.IsFrozen("Working"));
+    }
+
+    /// <summary>
     /// The control that keeps the guard from being a blanket refusal: a RUNNING jail still verifies, and
     /// so does an entry the session store knows nothing about (a seeded row, an entry whose session died
     /// with a previous daemon). Refusing from ignorance would strand every such entry with the one

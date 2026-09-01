@@ -1049,6 +1049,27 @@ public sealed class MergeQueueProvisioner
         if (cycle.Kind == RebaseCycleKind.Conflict)
         {
             Block(repoHandle, agentId, queue, RebaseConflictReason, "conflict");
+
+            // ...and then say CONFLICT again, because the line above just erased it.
+            //
+            // The run-state axis and the merge-state axis are two vocabularies sharing ONE field on the
+            // session (MarkRunState and MarkMergeState call the same IAgentSupervisor.MarkState). The
+            // cycle wrote `Conflict` moments ago; `Block` moves the queue entry to Working, whose
+            // transition notice reflects the MERGE word onto the same field — so a jail that is
+            // `docker pause`d and parked mid-rebase ended up reporting `Working`, which is what an agent
+            // busily making progress reports.
+            //
+            // That is not cosmetic. The daemon's coordinator-facing prompt and verify guards, and this
+            // repo's own RunVerification guard, key on that state word (FrozenJailPolicy: Paused or
+            // Conflict) precisely because it is the fact every surface already projects. Reporting
+            // `Working` for a frozen jail is the one answer that makes all of them wave a delivery through
+            // into a SIGSTOPped process — until AgentSessionReconciler's interval-driven pause pass
+            // happens to correct the word, which is a window, not a design.
+            //
+            // Re-asserted here rather than by teaching MarkMergeState to skip this case: the ordering is
+            // local, it is the last thing the cascade does to this agent, and a suppression rule inside
+            // the merge-state reflection would have to know about a run state it otherwise never reads.
+            MarkRunState(repoHandle, agentId, AgentRunState.Conflict);
             return;
         }
 
