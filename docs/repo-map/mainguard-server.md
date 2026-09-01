@@ -223,7 +223,14 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). It owns the same two halves for the **CLI SETTINGS round-trip**:
+    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
+    `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
+    meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
+    skipped with one Information line saying nothing was lost; an engine that cannot answer is read as NOT
+    frozen (guessing would skip a harvest that would have worked, costing the user their login), and a
+    genuine failure on a live jail is still a warning with its exception.
+    It owns the same two halves for the **CLI SETTINGS round-trip**:
     `FilterCliSettings` admits only (root, path) pairs the marker's `settingsPaths` declares and caps
     each file at `AdapterSettingsPolicy.MaxFileBytes` — the stakes are higher than for a login, because
     these files carry a permission allowlist and an unfiltered path would let a compromised client plant
@@ -299,6 +306,14 @@
     `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
     and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
     merge-ready).
+    **`FrozenJailPolicy`** (in this file) is the guard `prompt` and `verify` ask AFTER the plan gate: a
+    worker whose jail is `docker pause`d — the state a conflicted keep-alive rebase leaves it in — is
+    refused, because a prompt delivered into a SIGSTOPped process succeeds and means nothing (the tool
+    answered `Ok` and the coordinator then polled a worker that could never reply), and verification runs
+    its test command in that same frozen jail. The predicate is the session's own state word
+    (`Paused` / `Conflict`), which is what `Row` and `ListAgents` already project — NOT
+    `HumanPauseLedger.IsHumanPaused`, which answers the narrower "did a person press pause" and says no
+    for exactly this case.
     **`CommitWork`** is the worker table's fifth op (`commit_work`) and the rung the loop was missing: a
     finished worker used to stop on an uncommitted diff that died with its worktree, leaving
     `agent/<id>` empty and the readiness trigger — which fires on that ref advancing — with nothing to
@@ -313,7 +328,12 @@
     does**. What it deliberately does NOT touch is `MayWork`: a worker with a re-scope pending still holds
     the approval it is asking to widen, so steering, verification and `commit_work` keep answering off the
     old scope. Suspending it would make asking more expensive than widening quietly, and would refuse a
-    running worker the one call that lets its work outlive its jail (F1). `DecisionResponse` carries
+    running worker the one call that lets its work outlive its jail (F1). It DOES ask
+    `WorkerPlanGate.RefusePlanPresentation` first, as `present`/`revise`/`await` do: without it an ungated
+    worker fell through to the plan lookup and was told `no plan '<id>'` — true of the lookup and a lie
+    about the world, since it reads as "you named the wrong id" and argues against the one correct
+    response. `PlanApprovalService.Rescope` cannot say it (a plan id that resolves to nothing names no
+    worker, and the mode lives on the worker), so it keeps `No plan` for a genuine miss. `DecisionResponse` carries
     `RescopeOf` on every decision about a re-scope, not only the approval — a declined one has taken
     nothing away, and the generic wording would send a still-authorised worker away from its work.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`

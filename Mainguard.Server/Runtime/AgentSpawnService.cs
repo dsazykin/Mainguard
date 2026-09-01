@@ -53,6 +53,63 @@ public static class CliSettingsHarvestPolicy
         !string.Equals(role, AgentRoles.Managed, StringComparison.Ordinal);
 }
 
+/// <summary>
+/// Whether a worker's jail is FROZEN, and therefore whether anything the coordinator asks the daemon to
+/// do <i>inside</i> it can possibly happen.
+///
+/// <para><b>The defect.</b> A merge whose auto-rebase conflicts leaves the worker <c>docker pause</c>d
+/// with the rebase in progress (<c>KeepAliveRebaser</c> deliberately does not resume that jail). Every
+/// other guard on <c>send_worker_prompt</c> — kill switch, ownership, empty text, the plan gate — kept
+/// answering yes, so the prompt was typed into a channel inside a SIGSTOPped process that cannot read
+/// it, the call returned <c>Ok</c>, and the coordinator sat polling a worker that could never answer.
+/// The same hole was on <c>request_verification</c>, which runs the test command in that same jail.</para>
+///
+/// <para><b>The predicate is the state word, not the human-pause ledger.</b>
+/// <see cref="HumanPauseLedger.IsHumanPaused"/> answers a narrower question — did a PERSON press pause —
+/// and the conflict pause is the daemon's own, so that ledger says no for exactly the case this exists
+/// for. The session's state word is what <c>AgentSpawnService.Row</c> and <c>ListAgents</c> already
+/// project, so the refusal a coordinator gets and the <c>state=Paused</c> it can see agree by
+/// construction rather than by coincidence. <see cref="AgentRunState.Conflict"/> counts too: it is
+/// written by the one path that freezes a jail and leaves it frozen, and it is written seconds before
+/// the reconciler's drift pass gets round to spelling the same fact <c>Paused</c>.</para>
+/// </summary>
+public static class FrozenJailPolicy
+{
+    /// <summary>The state word a conflicted keep-alive rebase leaves on the session.</summary>
+    public static readonly string ConflictState = nameof(AgentRunState.Conflict);
+
+    /// <summary>True when this session's jail is frozen and nothing delivered into it will run.</summary>
+    public static bool IsFrozen(string? state) =>
+        string.Equals(state, AgentSessionReconciler.PausedState, StringComparison.Ordinal)
+        || string.Equals(state, ConflictState, StringComparison.Ordinal);
+
+    /// <summary>Why it is frozen, in the words that tell the reader what has to happen next.</summary>
+    private static string Why(string? state) =>
+        string.Equals(state, ConflictState, StringComparison.Ordinal)
+            ? "its keep-alive rebase onto the new main conflicted, so the daemon froze the jail with the "
+              + "rebase still in progress and a human has to resolve it"
+            : "the jail is frozen (a human paused it, or a conflicted keep-alive rebase did) and only a "
+              + "human can resume it";
+
+    /// <summary>
+    /// The <c>send_worker_prompt</c> refusal — written, like the plan gate's, for the agent that receives
+    /// it to read and act on in one turn. It says nothing was sent, why, and what the human must do; and
+    /// it explicitly closes the loop the defect produced, which was a coordinator polling forever.
+    /// </summary>
+    public static string RefusePrompt(string workerId, string? state) =>
+        $"{workerId} is paused, so nothing was sent: {Why(state)}. A frozen jail reads nothing — a prompt "
+        + "delivered now would sit unread in a channel and this worker would never answer it. Report this "
+        + $"to the human and move on: do not prompt {workerId} again and do not keep polling it until they "
+        + "have resumed it.";
+
+    /// <summary>The <c>request_verification</c> refusal — the same fact, about the op that would have run
+    /// the test command inside that frozen jail.</summary>
+    public static string RefuseVerification(string workerId, string? state) =>
+        $"{workerId} is paused, so its branch cannot be verified: {Why(state)}. Verification runs the test "
+        + "command inside that jail and a frozen jail runs nothing. Report this to the human rather than "
+        + "asking again — verification becomes possible when they resume it.";
+}
+
 /// <summary>A spawn the daemon refuses on policy (kill switch engaged, no repo, …) — not a fault.</summary>
 public sealed class AgentSpawnRefusedException : Exception
 {
@@ -1016,6 +1073,15 @@ public sealed class AgentSpawnService
             return new AgentIpcResponse(Ok: false, Error: planReason);
         }
 
+        // The last thing asked before anything is typed, because it is the one condition under which the
+        // delivery would SUCCEED and still mean nothing: the jail is frozen, so the keystrokes land in a
+        // channel whose reader is SIGSTOPped. See FrozenJailPolicy for the defect this closes.
+        if (FrozenJailPolicy.IsFrozen(owned.State))
+        {
+            return new AgentIpcResponse(
+                Ok: false, Error: FrozenJailPolicy.RefusePrompt(owned.Id, owned.State));
+        }
+
         var delivery = await _binder.TrySendPromptAsync(owned.Key, request.Prompt, ct).ConfigureAwait(false);
         if (!delivery.Submitted)
         {
@@ -1108,6 +1174,14 @@ public sealed class AgentSpawnService
         if (!_planGate.MayRequestVerification(owned.Id, out var planReason))
         {
             return new AgentIpcResponse(Ok: false, Error: planReason);
+        }
+
+        // Same hole, same answer: verification runs the test command in the worker's own jail, so a frozen
+        // one produces a Docker `Conflict` (or a hang) rather than a verdict. Refused in words instead.
+        if (FrozenJailPolicy.IsFrozen(owned.State))
+        {
+            return new AgentIpcResponse(
+                Ok: false, Error: FrozenJailPolicy.RefuseVerification(owned.Id, owned.State));
         }
 
         if (owned.RepoHash is not { Length: > 0 } repoHandle)
@@ -1401,10 +1475,26 @@ public sealed class AgentSpawnService
     /// <para>Ownership is checked the same way <c>revise</c> checks it, and answers a stranger's plan id
     /// exactly as it answers one that does not exist — this channel is not an existence oracle for other
     /// workers' plans.</para>
+    ///
+    /// <para><b>Plan mode off is answered first</b>, in the gate's own words — see the comment on that
+    /// check for why the truth about it cannot live in <c>PlanApprovalService.Rescope</c>.</para>
     /// </summary>
     private async Task<AgentIpcResponse> RescopePlanAsync(
         AgentIpcRequest request, string workerAgentId, CancellationToken ct)
     {
+        // Asked FIRST, exactly as `present` / `revise` / `await` ask it, and for the same reason: a worker
+        // spawned with plan mode OFF has no plans at all, so every check below answers with the wrong
+        // reason. `OwnsPlan` says "no plan '<id>'" and `PlanApprovalService.Rescope` says "No plan
+        // '<id>'." — both true of the lookup, and both implying the id was wrong when the truth is that
+        // there is nothing to widen because no plan was ever required. Only the gate can say that, because
+        // only the gate holds this worker's recorded mode: `Rescope` is handed a plan id, and an id that
+        // resolves to nothing cannot tell it which worker asked. So the true reason is said here, and
+        // `Rescope` keeps "No plan '<id>'." for what it actually means — no such plan.
+        if (_planGate.RefusePlanPresentation(workerAgentId) is { } noPlanWanted)
+        {
+            return new AgentIpcResponse(Ok: false, AgentId: workerAgentId, Error: noPlanWanted);
+        }
+
         if (string.IsNullOrWhiteSpace(request.PlanId))
         {
             return new AgentIpcResponse(

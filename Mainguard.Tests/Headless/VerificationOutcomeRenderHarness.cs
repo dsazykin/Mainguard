@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -43,6 +44,12 @@ public class VerificationOutcomeRenderHarness
     private const string NeverRun = "d3719ea5b8c0-c04f7a2e18d3496bb15f0c8ae2947d63";
 
     private static readonly DateTimeOffset RanAt = new(2026, 8, 30, 0, 41, 0, TimeSpan.Zero);
+
+    /// <summary>The daemon's own sentence for the case this harness reproduces — the one the stale pass
+    /// was rendering directly above (<c>MergeQueueProvisioner</c>'s conflict block).</summary>
+    private const string ConflictDetail =
+        "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
+        + "rebase in progress and needs a human to resolve it";
 
     // ---- the defect, stated as tests -------------------------------------
 
@@ -93,6 +100,97 @@ public class VerificationOutcomeRenderHarness
         Assert.Contains("dotnet test", green.FactsText, StringComparison.Ordinal);
 
         Assert.False(Row(vm, NeverRun).Verification.IsPassed);
+    }
+
+    /// <summary>
+    /// <b>A pass the branch has moved out from under must not read as a current green.</b>
+    ///
+    /// <para>The live defect: an entry whose keep-alive rebase onto the new main had CONFLICTED showed
+    /// <c>Tests passed · node test.js · &lt;timestamp&gt;</c> immediately above "rebasing this branch onto
+    /// the new main hit a conflict…". Both sentences were true of different moments and the pass was the
+    /// one that read as the answer. The record is still a pass — it is not rewritten into a failure — but
+    /// it is now stated as what it is: a result about the branch as it WAS.</para>
+    ///
+    /// <para>The control is the same verdict, same command, same timestamp, on a <c>Verified</c> entry:
+    /// without it this would pass just as well if every row were marked stale, which is the same defect
+    /// mirrored — and a surface that cries stale everywhere teaches people to ignore the word.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void AVerdictTheBranchHasMovedOutFromUnder_ReadsAsStale_NotAsACurrentResult()
+    {
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        var current = Row(Rail(new StubQueue()), Green).Verification;
+        Assert.True(current.IsPassed);
+        Assert.False(current.IsStale);
+        Assert.DoesNotContain("stale", current.FactsText, StringComparison.OrdinalIgnoreCase);
+
+        var conflicted = new StubQueue { GreenBranchConflictedOnRebase = true };
+        var stale = Row(Rail(conflicted), Green).Verification;
+
+        // Still a pass: the record is qualified, never rewritten. Turning a green into a red would be a
+        // second lie in the other direction.
+        Assert.True(stale.IsPassed);
+        Assert.False(stale.IsFailed);
+        Assert.True(stale.IsStale);
+
+        Assert.Contains("Tests passed", stale.FactsText, StringComparison.Ordinal);
+        Assert.Contains("stale", stale.FactsText, StringComparison.OrdinalIgnoreCase);
+        // The qualifier is in the verdict clause, not appended after the provenance — a reader who stops
+        // at the first line of the row has already been told.
+        Assert.Contains("not for the branch as it now stands", stale.FactsText, StringComparison.Ordinal);
+        Assert.EndsWith(
+            "stale · dotnet test · " + RanAt.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture),
+            stale.FactsText,
+            StringComparison.Ordinal);
+
+        // Presentation, not authorisation: the merge was correctly blocked before this change and still is.
+        Assert.False(conflicted.CanMerge(Green, out var why));
+        Assert.Contains("hit a conflict", why, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The second channel for it, in every theme: a stale verdict resolves the theme's own
+    /// <c>WarningBrush</c> — and the current pass beside it does not, which is what makes the colour carry
+    /// information rather than decorate the row. Daylight Loom is LIGHT; the token is what is compared, so
+    /// this holds there too.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheStaleVerdictReadsAsWarning_InEveryTheme_AndOnlyIt()
+    {
+        foreach (var theme in ThemeKeys)
+        {
+            ThemeManager.Apply(theme, persist: false);
+
+            var warning = Resource("WarningBrush");
+            var muted = Resource("TextMuted");
+            var danger = Resource("DangerBrush");
+            Assert.NotEqual(warning, muted);  // the theme itself must distinguish them, or this measures nothing
+            Assert.NotEqual(warning, danger);
+
+            var currentView = new QueueRailView { DataContext = Rail(new StubQueue()) };
+            var currentWin = HostWindow(currentView);
+            currentWin.Show();
+            Settle();
+            Assert.Equal(muted, VerdictColor(currentView, Green));
+            HarnessHygiene.Teardown(currentWin);
+
+            var staleView = new QueueRailView
+            {
+                DataContext = Rail(new StubQueue { GreenBranchConflictedOnRebase = true }),
+            };
+            var staleWin = HostWindow(staleView);
+            staleWin.Show();
+            Settle();
+            Assert.Equal(warning, VerdictColor(staleView, Green));
+            // The other two rows are untouched: a stale marker that repainted the whole rail would be the
+            // same failure to distinguish, one layer along.
+            Assert.Equal(danger, VerdictColor(staleView, Red));
+            Assert.Equal(muted, VerdictColor(staleView, NeverRun));
+            HarnessHygiene.Teardown(staleWin);
+        }
+
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
     }
 
     /// <summary>
@@ -408,6 +506,14 @@ public class VerificationOutcomeRenderHarness
         /// <summary>Re-verifies the failing entry, green this time — a NEW verdict for the same entry.</summary>
         public void Repass(string agentId) => _redPassedNow = agentId == _red;
 
+        /// <summary>
+        /// Puts the GREEN entry where the live defect found it: main moved, the keep-alive rebase onto it
+        /// conflicted, and the stale cascade parked the entry back at <c>Working</c> with the conflict as
+        /// its reason. The verdict record is untouched — that is the point. Off by default so the
+        /// entry count and every existing assertion here stay exactly as they were.
+        /// </summary>
+        public bool GreenBranchConflictedOnRebase { get; set; }
+
         public string MainSha => "a1b2c3d4e5";
 
         /// <summary>Which id carries the failed record. Overridable so the worker-pane test can point it at
@@ -418,8 +524,11 @@ public class VerificationOutcomeRenderHarness
 
         public IReadOnlyList<QueueEntry> GetQueue() => new[]
         {
-            Entry(Green, WorkerMergeState.Verified, "ready to merge",
-                new VerificationVerdict(true, "dotnet test", RanAt)),
+            GreenBranchConflictedOnRebase
+                ? Entry(Green, WorkerMergeState.Working, ConflictDetail,
+                    new VerificationVerdict(true, "dotnet test", RanAt))
+                : Entry(Green, WorkerMergeState.Verified, "ready to merge",
+                    new VerificationVerdict(true, "dotnet test", RanAt)),
             _redPassedNow
                 ? Entry(_red, WorkerMergeState.Verified, "ready to merge",
                     new VerificationVerdict(true, "node test.js", RanAt.AddMinutes(9)))
@@ -439,6 +548,14 @@ public class VerificationOutcomeRenderHarness
 
         public bool CanMerge(string agentId, out string reason)
         {
+            // The conflicted entry is NOT mergeable, and never was — the authorisation was right all
+            // along, which is exactly why the green sentence above it was the whole defect.
+            if (agentId == Green && GreenBranchConflictedOnRebase)
+            {
+                reason = ConflictDetail;
+                return false;
+            }
+
             reason = agentId == Green ? "" : "not verified";
             return agentId == Green;
         }

@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using Mainguard.Agents.Agents.Ipc;
 using Xunit;
 
@@ -83,8 +84,95 @@ public class AgentIpcProtocolTests
             Assert.Contains($"\"op\": \"{op}\"", WorkerPlanShim.Script, StringComparison.Ordinal);
         }
 
-        // …and the command line a worker actually types for the newest one.
-        Assert.Contains("argv[1] == \"commit\"", WorkerPlanShim.Script, StringComparison.Ordinal);
+        // …and the command line a worker actually types for it — for EVERY op, from the verb map that is
+        // supposed to be the single source of those spellings.
+        foreach (var op in AgentIpcRequest.WorkerOps)
+        {
+            Assert.Contains(
+                $"argv[1] == \"{WorkerPlanShim.Verbs[op]}\"", WorkerPlanShim.Script, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// <b>The verb map is the single source, and only a source scan can say so.</b>
+    ///
+    /// <para><see cref="WorkerPlanShim.Verbs"/> exists so the two spellings of one operation — the verb a
+    /// worker types and the wire op the daemon dispatches — are written down together once. Most of the
+    /// generated shim honoured that; <c>brief</c>, <c>present</c>, <c>await</c> and <c>commit</c> were
+    /// still hardcoded literals in both their <c>argv[1] ==</c> comparison and their <c>{"op": …}</c>
+    /// payload. Nothing failed, because the literals happened to equal the map — which is exactly the
+    /// state a drift starts from: change one entry in the map and the shim keeps sending the old spelling,
+    /// silently, to a daemon that no longer serves it.</para>
+    ///
+    /// <para>No runtime assertion can catch that. <see cref="WorkerPlanShim.Script"/> is composed once at
+    /// type-load from the map, so a test can only ever compare the map with a string built from the map —
+    /// which passes either way. The property is about the SOURCE ("no dispatch spelling is written twice"),
+    /// so the source is what is read. Anchored so it cannot pass vacuously: it asserts it found the right
+    /// file, that the interpolated forms are there in the numbers the op table says, and — the real
+    /// control — that the same matchers DO fire on a bare literal.</para>
+    /// </summary>
+    [Fact]
+    public void TheWorkerShimsDispatch_IsGeneratedFromTheVerbMap_NeverWrittenOutAsALiteral()
+    {
+        var source = ShimSource();
+
+        // Anchors, before the assertion that matters: a scan pointed at the wrong file reports a clean
+        // bill of health for a file it never opened.
+        Assert.Contains("public static class WorkerPlanShim", source, StringComparison.Ordinal);
+        Assert.Contains("def main(argv):", source, StringComparison.Ordinal);
+
+        // The control: these matchers can see a bare literal. If they could not, the two emptiness
+        // assertions below would measure nothing at all.
+        Assert.Matches(BareVerbLiteral, "    if len(argv) >= 2 and argv[1] == \"brief\":");
+        Assert.Matches(BareOpLiteral, "        request = {\"op\": \"brief\"}");
+
+        Assert.Empty(BareVerbLiteral.Matches(source).Select(m => m.Value));
+        Assert.Empty(BareOpLiteral.Matches(source).Select(m => m.Value));
+
+        // …and the dispatch really is there: one interpolated verb comparison and one interpolated wire op
+        // per op the daemon serves a worker. Stated as counts so deleting a branch fails here too.
+        Assert.Equal(AgentIpcRequest.WorkerOps.Count, InterpolatedVerb.Matches(source).Count);
+        Assert.Equal(AgentIpcRequest.WorkerOps.Count, InterpolatedOp.Matches(source).Count);
+    }
+
+    /// <summary>A verb spelled out in the shim's dispatch instead of taken from the map.</summary>
+    private static readonly System.Text.RegularExpressions.Regex BareVerbLiteral =
+        new(@"argv\[1\] == ""[a-z_]+""", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>A wire op spelled out in a request payload instead of taken from the constants.</summary>
+    private static readonly System.Text.RegularExpressions.Regex BareOpLiteral =
+        new(@"\{""op"": ""[a-z_]+""", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex InterpolatedVerb =
+        new(@"argv\[1\] == ""\{\{Verbs\[AgentIpcRequest\.\w+\]\}\}""",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static readonly System.Text.RegularExpressions.Regex InterpolatedOp =
+        new(@"\{""op"": ""\{\{AgentIpcRequest\.\w+\}\}""",
+            System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>The shim's own source file. Never falls back to the test binary's directory: a scan that
+    /// found nothing would report success for a file it never read.</summary>
+    private static string ShimSource()
+    {
+        var dir = AppContext.BaseDirectory;
+        while (dir is not null && !System.IO.File.Exists(System.IO.Path.Combine(dir, "Mainguard.slnx")))
+        {
+            dir = System.IO.Path.GetDirectoryName(dir);
+        }
+
+        var path = dir is null
+            ? null
+            : System.IO.Path.Combine(dir, "Mainguard.Agents", "Agents", "Ipc", "WorkerPlanShim.cs");
+
+        if (path is null || !System.IO.File.Exists(path))
+        {
+            throw new System.IO.FileNotFoundException(
+                $"WorkerPlanShim.cs could not be located above '{AppContext.BaseDirectory}', so the "
+                + "single-sourcing of the shim's verbs could not be checked. This is a failure, not a skip.");
+        }
+
+        return System.IO.File.ReadAllText(path);
     }
 
     /// <summary>

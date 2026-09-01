@@ -207,7 +207,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     text, the shim's own id-less refusal, the worker's operating instructions and both daemon refusals
     that point at it — five spellings of one command is how they come to disagree, §13.2), and `Verbs`,
     the op→verb map, which is the object `AgentOperatingInstructionsTests` set-equals against
-    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test).
+    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test — and which the generated
+    dispatch is interpolated from for EVERY verb. `brief`/`present`/`await`/`commit` were literals in both
+    their `argv[1] ==` comparison and their payload op until they were routed back through the map; nothing
+    failed because the literals equalled the map, which is precisely the state a drift starts from. No
+    runtime assertion can see it — the script is composed FROM the map — so
+    `AgentIpcProtocolTests.TheWorkerShimsDispatch_IsGeneratedFromTheVerbMap_NeverWrittenOutAsALiteral`
+    scans this file's SOURCE and fails on a bare literal).
     `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
     `Coordinator(InstalledAdapterCatalog, WorkerPlanMode)` / `Worker(WorkerPlanMode)` /
     `For(role, InstalledAdapterCatalog, WorkerPlanMode)` /

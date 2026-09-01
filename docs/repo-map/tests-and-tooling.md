@@ -292,7 +292,16 @@
   expanded log is genuinely on screen in `FontMono` and not merely bound, that an entry with no record is
   offered no reader at all, that truncation / a missing artifact / a silent run are three distinct
   sentences rather than one empty box, that a new verdict drops the log the old one was read for, and that
-  the worker pane reads the identical verdict (it composes the same panel). PNGs:
+  the worker pane reads the identical verdict (it composes the same panel). **Extended (the stale pass):**
+  the live defect was a card reading `Tests passed · node test.js · <timestamp>` directly above "rebasing
+  this branch onto the new main hit a conflict…", so the stub can put the GREEN entry exactly there —
+  `Working`, the daemon's own conflict sentence as its detail, its passing verdict untouched. Asserted:
+  the row still reports a PASS (the record is qualified, not rewritten into a failure), says "stale" and
+  "not for the branch as it now stands" inside the verdict clause, keeps its command/timestamp provenance,
+  and is still un-mergeable — presentation, not authorisation. Paired with the same verdict on a
+  `Verified` entry, which must stay unqualified, since marking everything stale is the same defect
+  mirrored. Its colour reading is asserted per theme too: `WarningBrush` for the stale row while the
+  failed row stays `DangerBrush` and the never-run row stays `TextMuted`. PNGs:
   `verification_outcomes_<Theme>.png`, `verification_log_open_<Theme>.png`; the **P2-11 review-cockpit
   suite** — `RiskClassifierTests` (fixture corpus: every category + the scripts-vs-dependency-bump
   distinction + rename-by-new-path), `ProvenanceReaderTests` (trailer matrix
@@ -1995,7 +2004,9 @@
   switch it flips is its own host's: with the toggle off the worker's `task` op answers at once and the
   coordinator is told "Working"; with it on the same op is refused and then answers after an approval,
   through the same single exit; an ungated worker's `present`/`revise`/`await` are refused and queue
-  nothing; steering, verification and committing are all permitted off and all refused BY THE GATE on; the
+  nothing, and so is `rescope` — for the REAL reason, paired with a gated worker naming a plan that does
+  not exist, which must keep getting `no plan '<id>'` and must not be told the mode is off;
+  steering, verification and committing are all permitted off and all refused BY THE GATE on; the
   G1 merge-queue row is created at spawn off and deferred on; the merge record names which authorisation
   the worker actually had; `Get`/`SetPlanMode` over gRPC read back the DAEMON's state; the plan stream
   carries the state on an EMPTY update — the case that needs it most; and `RoleInterceptor` denies
@@ -2093,7 +2104,20 @@
   because a spawn binds one. `request_verification` is honest about its limit: it asserts the call gets
   PAST ownership and past the plan gate and stops only at the merge-queue lookup, which is as far as a
   fake environment goes — a true verification positive needs a real repo and belongs to the Docker
-  tier),**
+  tier). **Extended (the frozen jail):** a worker whose session state is `Paused` or `Conflict` — what a
+  conflicted keep-alive rebase leaves behind — has its prompt REFUSED, and the CLI double proves nothing
+  reached it (no submitted line, empty input box); the same worker accepts a steer moments earlier, so
+  the refusal cannot be a handler that refuses everything. `request_verification` gets the same pair and
+  is asserted to stop at the pause rather than at the substrate's missing queue),**
+  **`PausedJailHarvestTests` (a paused jail is not exec-able, and the log must say that ONCE. The live
+  defect: a conflicted auto-rebase freezes the worker, the harvest sweep still ran, and each declared
+  credential path produced a raw `Docker.DotNet.DockerApiException … Conflict` stack trace — four in one
+  session, a warning that means "as expected". Asserts the skip costs NO exec (catching the Conflict
+  quietly would satisfy a log-only assertion and still spend one per file), the skip line is Information
+  with no exception and says nothing was lost, and — the half that must not be silenced — that a genuine
+  harvest failure on a LIVE jail is still a warning carrying its exception and the file name. Plus: an
+  engine that cannot answer "is it paused?" is read as NOT paused, since guessing would skip a harvest
+  that would have worked. Settings harvest, the twin method with the same hole, gets its own pair),**
   **`RawModeCliDouble` (test support, not a test: a stand-in for a coding CLI attached to a PTY that
   models the CLI's SIDE of the boundary — raw mode, CR submits the input buffer, LF inserts a newline
   into it, input repaints. The behaviour was measured against claude-code v2.1.251 under a real

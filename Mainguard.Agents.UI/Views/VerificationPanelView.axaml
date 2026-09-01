@@ -33,13 +33,19 @@
     <Style Selector="TextBlock.verdict">
       <Setter Property="Foreground" Value="{DynamicResource TextMuted}"/>
     </Style>
+    <!-- A record the branch has moved out from under. Warning, not muted: a pass that no longer describes
+         this branch is a thing to notice, and reading identically to a current pass is the defect. Declared
+         BEFORE .failed so a stale red still reads as a failure — same specificity, later wins. -->
+    <Style Selector="TextBlock.verdict.stale">
+      <Setter Property="Foreground" Value="{DynamicResource WarningBrush}"/>
+    </Style>
     <Style Selector="TextBlock.verdict.failed">
       <Setter Property="Foreground" Value="{DynamicResource DangerBrush}"/>
     </Style>
   </UserControl.Styles>
 
   <StackPanel Spacing="4">
-    <TextBlock Classes="verdict" Classes.failed="{Binding IsFailed}"
+    <TextBlock Classes="verdict" Classes.stale="{Binding IsStale}" Classes.failed="{Binding IsFailed}"
                Text="{Binding FactsText}" FontSize="11" TextWrapping="Wrap"/>
 
     <!-- Offered only when there IS a record. A never-run entry has nothing to read, and a control that
