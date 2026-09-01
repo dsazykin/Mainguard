@@ -1488,7 +1488,7 @@ public sealed class MergeQueueProvisioner
             _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} resume-input FAILED ({ex.Message})");
         }
 
-        var prompt = ResolveConflictPrompt(parked!);
+        var prompt = ResolveConflictPrompt(parked);
         bool delivered;
         try
         {
@@ -1510,16 +1510,16 @@ public sealed class MergeQueueProvisioner
                 "the agent's jail was unpaused but the instruction could not be delivered to its CLI — it "
                 + "is awake with the rebase still in progress, so tell it yourself in its terminal or "
                 + "abort the rebase";
-            queue!.TryReturnToWorking(agentId, partial, "conflict-handback-no-prompt");
+            queue.TryReturnToWorking(agentId, partial, "conflict-handback-no-prompt");
             return ConflictActionResult.Refused(partial);
         }
 
         ParkedConflicts.Clear(repoHandle, agentId);
-        queue!.TryReturnToWorking(agentId, ConflictHandedBackReason, "conflict-handed-back");
+        queue.TryReturnToWorking(agentId, ConflictHandedBackReason, "conflict-handed-back");
 
         _log?.Invoke(
             $"merge queue repo={repoHandle} agent={agentId} conflict HANDED BACK — jail unpaused and the "
-            + $"worker told to finish its rebase onto '{parked!.MainBranch}'");
+            + $"worker told to finish its rebase onto '{parked.MainBranch}'");
         _audit.Append(new AuditEvent(ConflictHandedBackEvent, new Dictionary<string, string>
         {
             ["repo"] = repoHandle,
@@ -1606,8 +1606,8 @@ public sealed class MergeQueueProvisioner
             // the jail was running for the few milliseconds above and its CLI may hold the lock.
             var exit = GitMutationGuard.RunGuarded(
                 token,
-                () => GitMutationGuard.IsIndexLockHeld(parked!.WorktreePath),
-                () => AgentGitCommand.TryRun(parked!.WorktreePath, out _, "rebase", "--abort"));
+                () => GitMutationGuard.IsIndexLockHeld(parked.WorktreePath),
+                () => AgentGitCommand.TryRun(parked.WorktreePath, out _, "rebase", "--abort"));
 
             if (exit != 0)
             {
@@ -1630,11 +1630,11 @@ public sealed class MergeQueueProvisioner
 
         ParkedConflicts.Clear(repoHandle, agentId);
         MarkRunState(repoHandle, agentId, AgentRunState.Working);
-        queue!.TryReturnToWorking(agentId, ConflictAbortedReason, "conflict-aborted");
+        queue.TryReturnToWorking(agentId, ConflictAbortedReason, "conflict-aborted");
 
         _log?.Invoke(
             $"merge queue repo={repoHandle} agent={agentId} parked rebase ABORTED — worktree "
-            + $"{parked!.WorktreePath} restored and the jail resumed");
+            + $"{parked.WorktreePath} restored and the jail resumed");
         _audit.Append(new AuditEvent(ConflictRebaseAbortedEvent, new Dictionary<string, string>
         {
             ["repo"] = repoHandle,
@@ -1660,7 +1660,9 @@ public sealed class MergeQueueProvisioner
     /// </summary>
     private bool TryOpenParkedConflict(
         string repoHandle, string agentId,
-        out ParkedRebaseConflict? parked, out MergeQueue? queue, out string refusal)
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ParkedRebaseConflict? parked,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out MergeQueue? queue,
+        out string refusal)
     {
         queue = null;
         parked = ParkedConflicts.Find(repoHandle, agentId);
