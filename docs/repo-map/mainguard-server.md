@@ -102,7 +102,10 @@
   `AcknowledgeFlaggedChange` — MG-11, merge power by another name), the human entry-lifecycle RPCs
   (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the
   evidence blocking its own branch instead of clearing the gate, and clearing a stalled verification puts
-  a branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
+  a branch into the state a re-verification starts from), the two parked-conflict actions
+  (`ResolveConflictWithAgent`/`AbortRebase` — the first is `UnpauseAgent` plus the terminal input lock's
+  whole purpose in one call, reached from a different service; the second rewrites a co-tenant branch's
+  parentage and resumes its jail), **`AgentService/ResumeAgent`** (adoption is
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
   writable jail to another agent's branch and have the daemon verify what it put there — and because
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on

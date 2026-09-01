@@ -90,7 +90,23 @@
     says whether a run is really executing, which the state alone cannot: state is persisted per
     transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
     with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
-    entries that need unsticking. **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
+    entries that need unsticking. **`ResolveConflictWithAgent` / `AbortRebase` + `QueueEntry.rebase_conflict`
+    (S5)** are the two things a human can do about a rebase the daemon parked on a conflict, plus the facts
+    behind the card. The cascade parks the worktree mid-rebase and `docker pause`s the jail deliberately
+    (no automatic `rebase --abort` — a rejection trigger) and blocks the entry with a reason naming a
+    required human action; the surface had no operation that could perform it, because the jail is paused
+    (nothing can be exec'd in it), Verify cannot run there, and Review is absent for a non-Verified entry.
+    The first unpauses the jail and instructs the worker through the daemon's own prompt path (there is
+    deliberately **no prompt field** — a client-supplied one would be an unlogged way to type into another
+    agent's CLI); the second runs `git rebase --abort` and lets the jail run again. Both are on the
+    coordinator's denied list at `RoleInterceptor` — unpausing and steering a co-tenant's jail, or
+    rewriting its branch's parentage, is merge-adjacent power over work an agent competes with. Neither is
+    the T-04 resolver. `rebase_conflict` is a MESSAGE field so absent means "nothing parked" exactly, and
+    its `paths` are measured at parking time — **empty means NOT MEASURED, never "nothing conflicts"**; its
+    `worktree` is the one deliberate G-14 exception, documented in the proto (it is not an address, nothing
+    is looked up by it, and the identical string already reaches a human-facing client verbatim inside
+    `AuditService.ReadAudit`'s payload for `keepalive_rebase_conflict`).
+    **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
     external-PR-intake configuration surface, hosted here because the intake is the queue's other feeder:
     `GetPrIntakeSettings` (settings + persisted `PrIntakeSource` list), `UpdatePrIntakeSettings` and
     `SubscribePrIntakeSource`. Deliberately NO `repo_handle` on any of them — intake config is

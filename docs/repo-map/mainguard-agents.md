@@ -1355,6 +1355,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       trigger) → success? resume; `NotifyMainMoved` is the P2-10 hook; human edits reach worktrees ONLY
       via this Git cycle (invariant 1); records `AgentWorktreeLocation`/`RebaseCycleResult`; git via the
       shared `AgentGitCommand` — not a second runner).
+    - `RebaseConflictParking.cs` (what the cascade MEASURED about a worktree it parked mid-rebase, so the
+      conflict is data rather than one log line: `ParkedRebaseConflict` (worktree, main branch, the
+      repo-relative unmerged paths from `diff --diff-filter=U`, when — **an empty path list means NOT
+      MEASURED, never "nothing conflicts"**), the `(repo, agent)`-keyed in-memory
+      `RebaseConflictParkingStore` the provisioner owns and the gRPC projection reads, and
+      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
+      is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
+      event).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
@@ -1535,7 +1543,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       event. Ids the gate never held (manual agents, external-PR heads, seeded entries) are permitted
       exactly as before; default-deny there would silently empty the queue. `MarkMergeState` gained a
       `VerificationFailed` sentence, so a coordinator's `get_worker_status` learns its worker's tests
-      failed instead of hearing "Back at work". Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
+      failed instead of hearing "Back at work". **S5 — the parked conflict, and the two things a human can
+      do about it:** `OnRebaseConflict` now records a `ParkedRebaseConflict` (worktree, branch, the
+      measured unmerged paths) in the owned `ParkedConflicts` store and carries the paths into the audit
+      event, and `RebaseConflictReason` is the named sentence the card renders verbatim.
+      `LetAgentResolveConflictAsync` unpauses the jail and delivers an instruction through the injected
+      `promptAgent` seam (the daemon passes `AgentCliBinder.TrySendPromptAsync` — the same path a
+      coordinator's `send_worker_prompt` uses); with no prompt path wired it REFUSES rather than waking an
+      agent that is told nothing. `AbortParkedRebaseAsync` unpauses, takes a real P2-09 yield (so the
+      mutation is gated by a token, invariant 2 — a yield over an already-paused container would
+      `docker pause` a paused jail), runs `git rebase --abort` under `GitMutationGuard.RunGuarded`, and
+      resumes. Both refuse and forget the parking once the rebase is no longer in progress. Neither is the
+      T-04 resolver. Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off

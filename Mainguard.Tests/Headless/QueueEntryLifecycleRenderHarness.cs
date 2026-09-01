@@ -330,8 +330,9 @@ public class QueueEntryLifecycleRenderHarness
         Assert.Contains("Secondary", handBack.Classes);
         Assert.Contains("DangerQuiet", abort.Classes);
         Assert.DoesNotContain("Accent", abort.Classes);
-        var accent = Assert.Single(view.GetVisualDescendants().OfType<Button>()
-            .Where(b => b.IsEffectivelyVisible && b.Classes.Contains("Accent")));
+        var accent = Assert.Single(
+            view.GetVisualDescendants().OfType<Button>(),
+            b => b.IsEffectivelyVisible && b.Classes.Contains("Accent"));
         Assert.Equal("Review", accent.Content);
 
         HarnessHygiene.Teardown(win);
