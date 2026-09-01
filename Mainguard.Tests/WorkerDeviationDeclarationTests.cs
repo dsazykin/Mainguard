@@ -189,7 +189,15 @@ public class WorkerDeviationDeclarationTests
         Assert.Equal(new[] { "added validation the approach said not to add" }, work.Deviations);
     }
 
-    /// <summary>Later commits ADD to the record; the same text twice is one row, not two.</summary>
+    /// <summary>
+    /// Later commits ADD to the record rather than replacing it, and the same text twice is one row.
+    ///
+    /// <para>The two declarations here name DIFFERENT departures on purpose. An earlier version of this
+    /// test declared <c>[first]</c> then <c>[first, second]</c>, and a replace-not-accumulate
+    /// implementation passes that identically — the second call already listed both. Mutation M6 caught
+    /// it staying green. A worker that discloses one thing on commit 1 and a different thing on commit 3
+    /// has disclosed two, and only this shape says so.</para>
+    /// </summary>
     [Fact]
     public void DeviationsFromSuccessiveCommitsAccumulate_AndDoNotDuplicate()
     {
@@ -197,7 +205,8 @@ public class WorkerDeviationDeclarationTests
         ApprovePlanFor(plans, Worker);
 
         plans.DeclareDeviations(Worker, new[] { "first departure" });
-        plans.DeclareDeviations(Worker, new[] { "first departure", "second departure" });
+        plans.DeclareDeviations(Worker, new[] { "second departure" });
+        plans.DeclareDeviations(Worker, new[] { "second departure" }); // re-stated, not a third row
 
         Assert.Equal(
             new[] { "first departure", "second departure" },

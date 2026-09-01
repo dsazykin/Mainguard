@@ -315,7 +315,13 @@
   `TestDeltaParserTests` (TRX/pass-fail →
   new-fail/new-pass), `ReviewCockpitViewModelTests` (risk-ordering-reorders-never-hides, provenance
   present/absent, `BringBranchLocal` T-29 round-trip, review-sprint deferred→unviewed, flagged-gate
-  blocks merge), `Integration/PoisonedBranchGateTests` (`PoisonedBranch_EndToEnd` — poisoned
+  blocks merge; and, from 2026-08-31, **the approved approach beside the diff** — a review is a
+  comparison and this surface only ever had one side of it: the approach rendered verbatim with the
+  plan's identity, NO panel at all for a branch that was never approved against anything, the three
+  declarations reading as three different sentences (the assertion that stops the mechanism becoming a
+  rubber stamp at the last layer), an asserted "none" rendered as the CLAIM it is rather than as a
+  check, a daemon that says nothing getting no sentence invented for it, and the flagged panel naming
+  worker-declared rows as their own group), `Integration/PoisonedBranchGateTests` (`PoisonedBranch_EndToEnd` — poisoned
   postinstall → Verified-but-blocked → item-by-item ack → CanMerge, + new-push re-arm),
   `Headless/ReviewCockpitRenderHarness` (the real cockpit in every theme →
   `review_cockpit_<Theme>.png`); `Headless/MainWindowRailRenderHarness` — the integrated MainWindow
@@ -1658,6 +1664,24 @@
   escalation is terminal for the path while the worker keeps its original approval; approval supersedes,
   so a worker has one approved plan or none; asking LATE is not refused and the flagged-change gate still
   decides the file either way; and the record survives a restart still knowing what it supersedes),
+  **`WorkerDeviationDeclarationTests`** (**the APPROACH half of an approved plan**, 2026-08-31 — the
+  defect a worker demonstrated live: its approved `approach` said the module had no validation idiom so
+  it would keep plain `a / b`, and it shipped `RangeError` on zero plus a `checkOperands`/`checkResult`
+  layer that silently changed pre-existing `add`/`subtract`/`square`. Nothing caught it and nothing was
+  broken — the plan's SCOPE was honoured so `FlaggedItems` was `[]`, `CanMerge` was true and the state
+  `Verified`, because *the worker also wrote the tests*. Covers: silence and an explicit "none" producing
+  DIFFERENT flagged sets (the property the whole mechanism rests on — an omitted must-ack item is an
+  acknowledged one); each declared departure becoming its own row carrying the worker's words verbatim;
+  the acknowledgment not surviving the next push (invariant 2, via `FlaggedChangeDetector.HashDiff`, with
+  a control proving that hash is over CONTENT and not the file list); the declaration landing on the plan
+  that authorised the work; a later "none" being unable to clear an earlier departure and successive
+  commits accumulating without duplicating; a worker with no approved plan having nothing to declare
+  against; the record surviving a daemon restart (it is written at COMMIT time and read at VERIFICATION
+  time, so a restart between them must not turn an answer back into a question) and a pre-field store
+  file rehydrating as `NotDeclared` rather than `None`; the shim sending only the flag it was given and
+  refusing the contradictory/incomplete forms locally without sending anything, driven through the real
+  `main()` under python3; and the instructions teaching the exact parsed form plus the reason to a GATED
+  worker and none of it to an ungated one),
   **`WorkerPlanGateTests`** (phase 2 — the daemon-side enforcement: the task withheld at every
   stage before approval and released only after, the brief being available but not being the task, an
   escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
@@ -2004,7 +2028,9 @@
   in-memory-store instance for the WHOLE tier: `UseSetting("Daemon:TokenPath")` does not reach the
   daemon's configuration under this factory, so every host falls back to the one assembly-wide data root
   — and a test that turned the approval gate off on disk would turn it off for every host built after it,
-  in parallel),
+  in parallel; and, from 2026-08-31, that an ungated worker is asked for NO deviation declaration — there
+  is no approved approach to have departed from — while one it volunteers anyway is told it was not
+  recorded rather than silently dropped or turned into a failed commit),
   **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
   Unix-socket channel a jail uses, through the production `AgentSpawnService` handlers. This is the file
   that answers "is the gate enforced, or merely described?", so nothing in it asserts a prompt: a
@@ -2026,6 +2052,13 @@
   on the caller's own branch (the field exists because coordinator ops need it, so the guarantee is
   behavioural rather than structural); a clean tree answers `committed:false` rather than a commit; and a
   refused commit is reported as a failure, not as done.
+  **The deviation declaration (2026-08-31)** rides the same op and is asserted on the same wire: an
+  approved worker's commit carrying NEITHER answer is refused with the form named and NOTHING committed
+  (the refusal lands before the commit, which is the only reason it is safe to make mandatory — the
+  worktree is untouched, so it costs one re-run and no work); a declared departure is recorded on the
+  plan that authorised it and the commit still lands; an explicit `--no-deviations` is recorded as an
+  ANSWER, with the pre-call `NotDeclared` asserted first so the two states are visibly different; and a
+  commit that both declares and denies is refused rather than resolved by precedence.
   **`rescope_plan` (2026-08-30)** is asserted on the same wire: the DEAD END and the way out of it (both
   refusals named — `present`'s and `revise`'s — because neither is wrong on its own and it is the pair
   that trapped the worker); the op parks on the human like a presentation **while the worker keeps
@@ -2306,7 +2339,17 @@
   `GetVerificationLog` returning the artifact's real stdout/stderr with the daemon's own path NOT on the
   wire; the three answers kept apart (no record / artifact gone, verdict retained and reason stated / the
   log); and `ReadTail` keeping the END of a long artifact and declaring the truncation, because a runner
-  prints its failures last); `MergeQueueWiringTests` also carries **G1's end-to-end half** — a
+  prints its failures last); **`ApprovedApproachOnTheWireTests` (what a reviewer can learn about what was
+  APPROVED**, 2026-08-31, at the same edge and for the same reason. The approved plan's `approach` — the
+  paragraph the human said yes to — existed on the daemon, was read once at approval, and never left it,
+  so the review surface rendered a diff and nothing to compare it against. Measured: an approved approach
+  saying "keep plain `a / b`" against a branch that shipped a throwing validation layer, with the scope
+  honoured so `flagged_items` was empty, `can_merge` true, and the verification green because the worker
+  wrote the tests. Through the shipped `StreamQueue`: the plan's id/title/approach reaching the client
+  verbatim; the worker's declaration arriving as one of THREE answers rather than a bool — a bool would
+  reintroduce the "asserted none" vs "never asked" conflation one layer below where any surface could
+  recover it; and an entry with no approved plan carrying nothing at all, so "never approved" and
+  "approved with nothing written" stay distinguishable); `MergeQueueWiringTests` also carries **G1's end-to-end half** — a
   coordinator-held worker with no approved plan gets no queue row, and gets one the moment a human approves
   its plan. It lives here and not only in the provisioner's unit tests because the second half depends on a
   SUBSCRIPTION that exists only in the composition root; a unit test would pass with that line deleted, and

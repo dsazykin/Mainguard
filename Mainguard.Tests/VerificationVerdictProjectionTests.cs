@@ -134,6 +134,49 @@ public sealed class VerificationVerdictProjectionTests
             || n.Contains("TestsTotal", StringComparison.Ordinal));
     }
 
+    // ---- The approved approach: the other half of a review (2026-08-31) -----
+    //
+    // Same shape of defect as the verdict above, one field over: the daemon knows what a human approved,
+    // and until this the client's projection had nowhere to put it — so the review cockpit showed a diff
+    // and nothing to compare it against. That is how a branch whose approved approach said "keep plain
+    // a / b" reached a green, unflagged, mergeable review after shipping a throwing validation layer.
+
+    /// <summary>The approval survives the wire: the plan's identity, its approach, and the worker's
+    /// declaration about following it.</summary>
+    [Fact]
+    public void TheApprovedApproach_SurvivesTheProjection()
+    {
+        var entry = Project(e =>
+        {
+            e.ApprovedPlanId = "plan-1";
+            e.ApprovedPlanTitle = "Add divide() to the calculator";
+            e.ApprovedPlanApproach = "keep plain a / b and let the language semantics stand";
+            e.DeviationDeclaration = "Declared";
+        });
+
+        Assert.Equal("plan-1", entry.ApprovedPlanId);
+        Assert.Equal("Add divide() to the calculator", entry.ApprovedPlanTitle);
+        Assert.Equal("keep plain a / b and let the language semantics stand", entry.ApprovedApproach);
+        Assert.Equal("Declared", entry.DeviationDeclaration);
+    }
+
+    /// <summary>
+    /// An entry the daemon sent no approval for projects as <c>null</c>, not as an empty string. The
+    /// surface decides whether to draw an approval panel from this, and proto3's empty-string default
+    /// would make "never approved against anything" render as "approved, with nothing written down" —
+    /// a card asserting an approval a manual agent or an external PR never had.
+    /// </summary>
+    [Fact]
+    public void AnEntryWithNoApproval_ProjectsAsNull_NotAsAnEmptyApproval()
+    {
+        var entry = Project(_ => { });
+
+        Assert.Null(entry.ApprovedPlanId);
+        Assert.Null(entry.ApprovedPlanTitle);
+        Assert.Null(entry.ApprovedApproach);
+        Assert.Null(entry.DeviationDeclaration);
+    }
+
     /// <summary>
     /// Jail-produced text is sanitized at the projection boundary. The daemon returns the artifact's bytes
     /// verbatim — it is the only path that hands sandbox output straight to a human surface — so the client

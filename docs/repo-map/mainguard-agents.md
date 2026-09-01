@@ -203,11 +203,21 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `present`/`revise`/`rescope` **block on the socket until a human decides** and print the decision; on
     approval the response carries the task prompt the daemon had been withholding, which is what makes
     "the worker does not start before approval" a property of the system rather than a request in a
-    prompt. Two things are single-sourced out of the script: `RescopeUsage` (interpolated into the usage
+    prompt. **The deviation declaration (2026-08-31)** rides `commit`: exactly one of `--no-deviations`
+    or one-or-more `--deviated "<what and why>"`, parsed by the real `main()` and mapped to the wire's
+    `noDeviations` / `deviations`, which are sent ONLY when given so "answered none" and "said nothing"
+    stay different bytes. The shim refuses locally only what is malformed however the run is gated (both
+    flags, a bare `--deviated`, an unknown option, a second positional message) — whether THIS worker
+    owes a declaration depends on holding an approved plan, which only the daemon knows, so a shim that
+    guessed would deny an ungated worker a commit it is entitled to make. Three things are single-sourced
+    out of the script: `RescopeUsage` (interpolated into the usage
     text, the shim's own id-less refusal, the worker's operating instructions and both daemon refusals
-    that point at it — five spellings of one command is how they come to disagree, §13.2), and `Verbs`,
+    that point at it — five spellings of one command is how they come to disagree, §13.2), `CommitUsage`
+    (the same treatment for the declaration form, named by the shim's refusals, the instructions and the
+    daemon's), and `Verbs`,
     the op→verb map, which is the object `AgentOperatingInstructionsTests` set-equals against
-    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test).
+    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26).
     `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
     `Coordinator(InstalledAdapterCatalog, WorkerPlanMode)` / `Worker(WorkerPlanMode)` /
     `For(role, InstalledAdapterCatalog, WorkerPlanMode)` /
@@ -234,7 +244,13 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     `commit_work`. `TheWorkerIsToldAboutEveryOpTheDaemonServesIt` walks `WorkerOps` through
     `WorkerPlanShim.Verbs`, and the re-scope section is held to three claims a worker gets wrong by
     default: `rescope` is not `revise`, asking costs it nothing because its existing approval stands
-    while the human decides, and it should ask even if it has already touched the file. **Delivered two ways, neither
+    while the human decides, and it should ask even if it has already touched the file. **(2026-08-31)
+    The worker text carries a mode-dependent deviation-declaration section**: a GATED worker is taught
+    `WorkerPlanShim.CommitUsage` verbatim plus the reason — its own tests pass either way, so the
+    declaration is the only thing that can tell a human its approval and its diff came apart — while an
+    UNGATED worker is taught none of it, because with no approved `approach` the daemon neither requires
+    nor records one and text describing a mechanism this jail is not under is the MG-12 shape one layer
+    up. **Delivered two ways, neither
     redundant**, via `AdapterSpec`/`InstalledAdapterMarker` `instructionsFile` + `systemPromptArg`
     (claude-code: `CLAUDE.md` + `--append-system-prompt`): the launcher appends the FLAG to the launch
     argv, which is the ONLY channel that reaches a coordinator — the role lock leaves it an empty tmpfs
@@ -1514,7 +1530,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`IMergeQueueRegistry`/`MergeQueueRegistry` + `MergeQueueContext` — the per-repo queue+leases the
       gRPC service resolves through; `Handles()` snapshots the active handles on the READ interface, so
       the ISSUES-LOG #24 jail sweep can enumerate every live queue without being handed the concrete
-      registry and thereby the ability to Register/Remove queues it has no business creating). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
+      registry and thereby the ability to Register/Remove queues it has no business creating.
+      `MergeQueueContext.ResolveApprovedWork` (2026-08-31) is the callback the queue PROJECTION reads the
+      approved plan's `approach` from — the same one the provisioner arms the flagged review with, so the
+      approach a reviewer is shown and the scope the diff was measured against are always the same
+      plan's). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
       `Models/`). **`MergeBranchDiffService.cs`** (P2-47 #7 — `IMergeBranchDiffService`: the daemon-side
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`
@@ -1666,7 +1686,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       outside its `TaskPlan.Scope` (plan-less runs skip the scope compare); `FromLockfileDeltas` folds
       §3.6 CVE/script/advisory-unknown rows in by delegating to `Review.LockfileReview.ItemsFor` — one
       definition, so the cockpit-composed and daemon-armed sets cannot disagree; plus the pure
-      `ScopeMatcher` glob (`**`/`*`/`?`)).
+      `ScopeMatcher` glob (`**`/`*`/`?`), and `HashDiff(mergeDiff)` — a content hash over the WHOLE diff,
+      the seed a branch-level flagged row uses so invariant 2 (a new push resets every ack) holds for it
+      the way it holds for per-file rows).
+    - `DeviationReview.cs` (**the APPROACH half of an approved plan**, 2026-08-31 — the sibling of the
+      out-of-approved-scope arm, for the half of an approval that is not a file list. Pure, no IO:
+      `ItemsFor(declaration, deviations, diffHash)` turns a worker's commit-time
+      `DeviationDeclaration` into `FlaggedChange` rows — one `DeclaredDeviation` row per declared
+      departure carrying the worker's own words, **nothing** for an explicit `None` (that assertion is
+      rendered beside the approach instead), and one `DeviationDeclarationMissing` row for
+      `NotDeclared`, because an omitted item is an acknowledged item and silence must not read as "we
+      checked". Armed daemon-side by `MergeQueueProvisioner.ArmFlaggedChangeReview`, into the store the
+      merge gate actually reads. **Not** an approach-vs-diff comparison: nothing here reads the diff. The
+      defect it closes — an approved approach saying "keep plain `a / b`" against a shipped throwing
+      validation layer, with the scope honoured, `FlaggedItems` empty and verification green because the
+      worker wrote the tests — is written out in its own doc comment. Design:
+      `docs/design/coordinator-phase-3-decisions.md` §26).
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
       item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has
@@ -1785,15 +1820,26 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       lands a NEW plan carrying `SupersedesPlanId`, the copied `PreviousScope` the card diffs against, and
       `RescopeCount`. The plan it widens keeps authorising the worker until the human decides, and moves
       to `Superseded` in the same lock that approves the wider one — so a worker has exactly one approved
-      plan or none, which is what `ApprovedForWorker`/`ApprovedPlanFor` (**the single authority the
-      composition root's `resolveApprovedPlan` is now a call to**) rest on. That mattered immediately: the
+      plan or none, which is what `ApprovedForWorker`/`ApprovedPlanFor`/`ApprovedWorkFor` (**the single
+      authority the composition root's `resolveApprovedWork` is now a call to**) rest on. That mattered immediately: the
       old `LatestForWorker`-filtered-on-`Approved` read answers `null` while a re-scope is pending — and
       `null` means *unmanaged* to the flagged-change detector, so a worker would have lost its F6
       out-of-scope coverage by the act of asking to widen legally. A re-scope spends no revision (the
       budget bounds bad plans, not a growing job); its own reject→revise loop is bounded by a fresh
       budget, and the loop AROUND that is closed by one live re-scope at a time plus escalation being
       terminal for the path).
-      Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+      **`DeclareDeviations(workerAgentId, deviations)` + `DeviationDeclaration{NotDeclared,None,Declared}`
+      + `ApprovedWork` (2026-08-31)** record the worker's commit-time answer about departing from the
+      approved `approach`, ON the plan record — the deviation is a deviation *from that plan*, so it
+      persists with it (`PlanDto.Deviation`/`DeclaredDeviations`, name-serialized; an unparseable or
+      absent value rehydrates as `NotDeclared`, the fail-closed direction) and is resolved by the same
+      `ApprovedForWorker` the scope comparison uses. **Three outcomes, never two** — silence and "I
+      checked, none" are different facts, the call `MergeEvidence` already makes. Declaration is
+      **sticky**: later texts accumulate ordinal-distinct and a later "none" cannot clear an earlier
+      departure, because a final `--no-deviations` erasing the first commit's disclosure is the rubber
+      stamp the mechanism must not become. `ApprovedWorkFor` is the one lookup that answers both halves
+      of an approval (scope + approach/declaration) so the two can never name different plans after a
+      re-scope. `Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
     - `PlanModeSwitch.cs` (**the operator's plan-mode toggle**, 2026-08-30 — whether a coordinator-delegated
       worker must have a human-approved plan before it is given its task. `Enabled` /
       `ModeForNewWorker` / `Set(enabled, actor)` / `Summary` (the one sentence a human reads, rendered
