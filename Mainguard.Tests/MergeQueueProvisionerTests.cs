@@ -262,7 +262,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         var plan = PlanScopedTo("docs/**");
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+            resolveApprovedWork: id => id == AgentId ? Approved(plan) : null).EnsureQueue(repoHash)!;
 
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
         Assert.True(record.Passed);
@@ -290,11 +290,100 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
         var plan = PlanScopedTo("**/*.cs");
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: id => id == AgentId ? plan : null).EnsureQueue(repoHash)!;
+            resolveApprovedWork: id => id == AgentId ? Approved(plan) : null).EnsureQueue(repoHash)!;
 
         await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
         Assert.Empty(ctx.FlaggedChanges!.PeekStore(AgentId)!.Items);
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>
+    /// <b>The APPROACH half of the same approval, armed by the same pass.</b> This is the branch the
+    /// scope arm cannot see: every file it touches is inside the approved scope, its verification is
+    /// green, and it did something the approved approach said it would not do. Before this, that branch
+    /// reached the human as <c>FlaggedItems == []</c> and <c>CanMerge == true</c> — measured, on a real
+    /// run, with the plan text saying it would keep plain <c>a / b</c> and the diff throwing on every
+    /// helper.
+    ///
+    /// <para>Nothing here compares the approach to the diff. The worker's own declaration is what
+    /// produces the row, which is why the row is worth blocking on: it is the one claim in this review
+    /// that a self-verifying branch cannot make go away by writing another test.</para>
+    /// </summary>
+    [Fact]
+    public async Task ADeclaredDeviationBlocksTheMerge_EvenWhenEveryFileIsInsideTheApprovedScope()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var plan = PlanScopedTo("**/*.cs");
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedWork: id => id == AgentId
+                ? Approved(plan, DeviationDeclaration.Declared, "added RangeError; the approach said keep plain a / b")
+                : null).EnsureQueue(repoHash)!;
+
+        var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        // Green, in scope — and still not mergeable, which is the entire point.
+        Assert.True(record.Passed);
+        Assert.False(ctx.Queue.CanMerge(AgentId, out var reason));
+        Assert.Contains("acknowledgment", reason);
+
+        var store = ctx.FlaggedChanges!.PeekStore(AgentId)!;
+        var item = Assert.Single(store.Items, i => i.Kind == FlaggedKind.DeclaredDeviation);
+        Assert.Contains("keep plain a / b", item.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(store.Items, i => i.Kind == FlaggedKind.OutOfApprovedScope);
+
+        Assert.True(store.Acknowledge(item.Id));
+        Assert.True(ctx.Queue.CanMerge(AgentId, out _));
+    }
+
+    /// <summary>
+    /// A managed worker whose branch carries NO declaration at all is blocked too — an absent answer is
+    /// a must-acknowledge row and never silence, for the reason
+    /// <c>FlaggedKind.LockfileAdvisoryUnknown</c> exists: an omitted item is an acknowledged item, so
+    /// staying quiet here would render "nobody established whether this follows the approved approach"
+    /// as "it does".
+    /// </summary>
+    [Fact]
+    public async Task AManagedBranchWithNoDeclarationAtAll_IsFlaggedRatherThanAssumedClean()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var plan = PlanScopedTo("**/*.cs");
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedWork: id => id == AgentId
+                ? Approved(plan, DeviationDeclaration.NotDeclared)
+                : null).EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.False(ctx.Queue.CanMerge(AgentId, out _));
+        Assert.Single(
+            ctx.FlaggedChanges!.PeekStore(AgentId)!.Items,
+            i => i.Kind == FlaggedKind.DeviationDeclarationMissing);
+    }
+
+    /// <summary>
+    /// The negative control for both tests above: an UNMANAGED branch — a manual agent, an external-PR
+    /// head, a worker spawned with plan mode off — has no approved approach, so it gets no deviation row
+    /// of either kind. Without this, a review that flagged every branch would pass them both.
+    /// </summary>
+    [Fact]
+    public async Task ABranchWithNoApprovedPlan_GetsNoDeviationRowAtAll()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
+
+        var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
+            resolveApprovedWork: null).EnsureQueue(repoHash)!;
+
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        Assert.DoesNotContain(
+            ctx.FlaggedChanges!.PeekStore(AgentId)!.Items,
+            i => i.Kind is FlaggedKind.DeclaredDeviation or FlaggedKind.DeviationDeclarationMissing);
         Assert.True(ctx.Queue.CanMerge(AgentId, out _));
     }
 
@@ -345,7 +434,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         CommitOnAgentBranch(repoHash, branchVerifyCommand: "npm test");
 
         var ctx = NewProvisioner(exitCode: 0, out _, new MergeQueueRegistry(), exitFor: null,
-            resolveApprovedPlan: null, mergeDiff: new UncomputableDiffService()).EnsureQueue(repoHash)!;
+            resolveApprovedWork: null, mergeDiff: new UncomputableDiffService()).EnsureQueue(repoHash)!;
 
         var record = await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
 
@@ -378,6 +467,18 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         TestStrategy: "npm test",
         BudgetUsd: 1m,
         DraftedAt: DateTimeOffset.UtcNow);
+
+    /// <summary>
+    /// An approval whose worker has already answered "no deviations". That is the default for the SCOPE
+    /// tests in this class on purpose: an approval left at <see cref="DeviationDeclaration.NotDeclared"/>
+    /// also carries the missing-declaration must-ack row, and a second always-present item would let those
+    /// tests pass without the scope comparison producing anything. The declaration's own three outcomes
+    /// are exercised by the deviation tests below instead.
+    /// </summary>
+    private static ApprovedWork Approved(
+        TaskPlan plan,
+        DeviationDeclaration declaration = DeviationDeclaration.None,
+        params string[] deviations) => new(plan, declaration, deviations);
 
     /// <summary>Lands a package.json on the agent branch whose <c>scripts</c> block runs arbitrary shell at
     /// install time — the P2-11 canary for hostile agent code that verifies green.</summary>
@@ -1537,11 +1638,11 @@ public sealed class MergeQueueProvisionerTests : IDisposable
 
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry, Func<IReadOnlyList<string>, int>? exitFor)
-        => NewProvisioner(exitCode, out engine, registry, exitFor, resolveApprovedPlan: null);
+        => NewProvisioner(exitCode, out engine, registry, exitFor, resolveApprovedWork: null);
 
     private MergeQueueProvisioner NewProvisioner(
         int exitCode, out FakeSandboxEngine engine, MergeQueueRegistry registry,
-        Func<IReadOnlyList<string>, int>? exitFor, Func<string, TaskPlan?>? resolveApprovedPlan,
+        Func<IReadOnlyList<string>, int>? exitFor, Func<string, ApprovedWork?>? resolveApprovedWork,
         IMergeBranchDiffService? mergeDiff = null)
     {
         engine = new FakeSandboxEngine(exitCode, exitFor);
@@ -1559,7 +1660,7 @@ public sealed class MergeQueueProvisionerTests : IDisposable
             mergeDiff: mergeDiff ?? new MergeBranchDiffService(
                 new RepoProvisioner(_vmRoot),
                 (repoHash, agentId) => new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId)),
-            resolveApprovedPlan: resolveApprovedPlan,
+            resolveApprovedWork: resolveApprovedWork,
             // MG-3: the production wiring. The agent commits into its OWN repository now, so without the
             // daemon-side publish the RT-D2 provenance would be read off the mirror's stale copy of
             // agent/<id> — the branch's rewritten test command would be invisible and the drift gate

@@ -26,6 +26,20 @@ public sealed record MergeQueueContext(MergeQueue Queue, IMergeLeaseStore Leases
     /// cleared.
     /// </summary>
     public FlaggedChangeGate? FlaggedChanges { get; init; }
+
+    /// <summary>
+    /// agentId → what a human approved for that worker and what the worker declared about following it, or
+    /// null when the entry has no approval (a manual agent, an external-PR head, a worker spawned with
+    /// plan mode off).
+    ///
+    /// <para>Held here so the queue PROJECTION can carry the approved <c>Approach</c> to the review
+    /// surface. Until it did, a human comparing a diff against what was approved had only the diff: the
+    /// approach text was written, was decided on, and then never appeared again — which is how a branch
+    /// that shipped the opposite of its approved approach read as an ordinary green review. It is the same
+    /// callback the provisioner arms the flagged-change review from, on purpose: one lookup, one answer,
+    /// so the approach on screen and the scope the diff was measured against are the same plan's.</para>
+    /// </summary>
+    public Func<string, ApprovedWork?>? ResolveApprovedWork { get; init; }
 }
 
 /// <summary>

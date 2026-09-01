@@ -90,7 +90,19 @@
     says whether a run is really executing, which the state alone cannot: state is persisted per
     transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
     with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
-    entries that need unsticking. **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
+    entries that need unsticking. **`QueueEntry.approved_plan_id` / `_title` / `_approach` and
+    `deviation_declaration` (13–16, 2026-08-31)** carry what a human APPROVED for the branch, so the
+    review can be a comparison rather than a diff read in isolation: the approved `approach` existed only
+    on the daemon, was read once at approval and never surfaced again — which is how a branch that shipped
+    the opposite of its approved approach reached review with `flagged_items` empty (the file SCOPE was
+    honoured), `can_merge` true and a green verification the worker had written the tests for.
+    `deviation_declaration` is a THREE-valued string (`NotDeclared`/`None`/`Declared`), not a bool, for
+    the reason `last_verification_passed` is `optional`: "the worker asserted it followed the approach"
+    and "nobody ever asked it" are different facts, and a bool would re-collapse them one layer below
+    where any surface could recover it. Declared departures themselves ride `flagged_items` as
+    must-acknowledge rows; this field carries the two answers that produce no item. All four empty for an
+    entry with no approved plan, so "never approved" and "approved with nothing written" stay apart.
+    Design: `docs/design/coordinator-phase-3-decisions.md` §26. **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
     external-PR-intake configuration surface, hosted here because the intake is the queue's other feeder:
     `GetPrIntakeSettings` (settings + persisted `PrIntakeSource` list), `UpdatePrIntakeSettings` and
     `SubscribePrIntakeSource`. Deliberately NO `repo_handle` on any of them — intake config is

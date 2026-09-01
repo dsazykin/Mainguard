@@ -4192,3 +4192,177 @@ app stopped, before the PR merges.
   second entry point would be a second place for the state to be read from and disagree.
 - **Nothing retroactively re-gates or un-gates a live worker**, by design (§25.3), so there is no
   migration and no reconciliation pass.
+
+## 26. The approved plan's *approach* — a control that constrained only the file list
+
+**Found in a live UI test, 2026-08-31.** A worker's plan was approved by a human. Its `approach` read:
+
+> the module has no error-handling or validation idiom anywhere in it, so I will keep plain `a / b` and
+> let the language semantics stand
+
+The worker then shipped `divide()` throwing `RangeError` on zero, plus a `checkOperands`/`checkResult`
+layer throwing `TypeError` on **every** helper — which silently changed the behaviour of the pre-existing
+`add` / `subtract` / `square` (`add('2',3)` began throwing instead of returning `'23'`).
+
+### 26.1 Why every control held and none of them was looking
+
+Nothing was broken. Each mechanism did exactly what it says it does:
+
+- **The plan's `scope` was honoured**, so the SA-1/F6 out-of-approved-scope arm compared the diff against
+  the approved file list, found nothing outside it, and produced `FlaggedItems = []`.
+- **`CanMerge` was true, the state was `Verified`, `node test.js` passed** — because the worker also
+  authored the tests asserting its own new behaviour. **A worker that owns its tests can always turn its
+  divergence green.** Verification proves a diff is self-consistent; it has never proved that the diff
+  matches what was approved, and it cannot.
+- **Nothing anywhere compared the approved approach against the produced diff.** The approach text was
+  written by the worker, read once by the human at approval, and then never surfaced again — it lived on
+  the daemon and reached no review surface.
+
+This is the sibling of the MG-12 class this codebase keeps re-finding: *a control that looks like it
+constrains the work and actually constrains only the file list.* A plan has two halves. One of them is
+machine-comparable and is compared; the other is prose, was never compared, and was also never **shown**.
+
+### 26.2 The decision — two parts, neither claiming more authority than it has
+
+**(1) Put the approved approach in front of the reviewer.** The queue entry now carries
+`approved_plan_id` / `approved_plan_title` / `approved_plan_approach` / `deviation_declaration` (proto
+fields 13–16), the client projects them onto `QueueEntry`, and the Review Cockpit renders the approach
+verbatim above the diff. A review is a comparison; this surface only ever had one side of it on screen.
+Rendered **verbatim**, and scrolled rather than truncated: a summarised approach is the surface choosing
+which sentence the reviewer gets to compare against, and the sentence that would get dropped is the one
+the diff disagrees with. No approved plan ⇒ **no panel at all**, because an empty "approved approach"
+card would assert an approval a manual agent or an external PR never had.
+
+**(2) Make the worker declare its deviations, and route them through `FlaggedItems`.**
+`mainguard-plan commit "<message>"` now takes exactly one of `--no-deviations` or one-or-more
+`--deviated "<what and why>"`. Declared departures become `FlaggedKind.DeclaredDeviation` must-acknowledge
+rows on the same channel that already carries out-of-scope files, rendered under
+`WORKER-DECLARED DEVIATIONS (n)`.
+
+**Explicitly rejected: any automated or LLM comparison of approach-vs-diff.** Nothing in this change reads
+the approach and the diff together. The human does that; this makes it possible for them to.
+
+### 26.3 Silence is not an answer — the three outcomes
+
+The declaration would be worthless as an optional field: it would be empty on exactly the runs that needed
+it. Worse, an **absent** must-acknowledge item is an *acknowledged* one (an empty flagged set is
+`AllAcknowledged`), so an unanswered question would render as reassurance. So
+`DeviationDeclaration` has three values, the same call `WorkerPlanGate.MergeEvidence` makes and the same
+call `FlaggedKind.LockfileAdvisoryUnknown` makes:
+
+| | what it means | what the review does with it |
+|---|---|---|
+| `Declared` | the worker named departures | one must-ack row per departure, carrying its words verbatim |
+| `None` | the worker asserted it followed the approach | **no row** — rendered beside the approach as the claim it is |
+| `NotDeclared` | nobody ever answered | one must-ack row saying so (fail-closed) |
+
+A gated `commit_work` carrying neither answer is **refused**, before the commit — which is the only reason
+it is safe to make mandatory (see §26.5). Both answers at once is refused rather than resolved by
+precedence; a rule about which one wins would be invisible at the call site.
+
+**A declaration cannot be walked back.** Declarations accumulate across a worker's several commits and
+`Declared` is sticky: a final `--no-deviations` cannot erase a disclosure made three commits earlier. That
+is the specific way this mechanism would have become a rubber stamp, and it would have been reachable by
+accident rather than by malice.
+
+### 26.4 The refusal must never strand a finished diff
+
+This is the one way this change could be worse than the defect it closes. **`commit_work` is the only
+route work has out of the jail, and an uncommitted worktree is destroyed at teardown** — that has already
+cost this project a real 20-line diff, and it is why the op exists at all. A declaration gate that
+stranded a finished change would be a strictly worse failure than an undeclared divergence. Three
+properties make it safe, and each is pinned by a test rather than argued:
+
+1. **The refusal lands before the commit, and is recoverable in the same turn.** `DeviationRefusal` runs
+   ahead of `WorktreeManager.CommitAgentWork`, so nothing is written and nothing is undone; the worker
+   re-runs the identical command with an answer and its work lands. Asserted as a *sequence* —
+   refuse, then immediately retry and succeed — because the two facts being separately true is not the
+   property that matters (`ARefusedDeclaration_CostsATurnAndNotTheWork`).
+2. **The refusal is self-sufficient documentation.** It names `WorkerPlanShim.CommitUsage` verbatim *and*
+   says, in the same breath, that nothing was committed and nothing is lost. That sentence is not
+   reassurance — it is for the two workers who need it most: one whose jail was created by a daemon
+   predating the flags (its `MAINGUARD.md` never mentions them, so the refusal is its only teaching) and
+   one that fumbles the flag on its last turn. A worker that read "refused" as "my diff is gone" could
+   stop with the work still in it. The shim's own local refusals carry the same sentence.
+3. **An unapproved agent is exempt, not blocked.** The requirement is keyed on
+   `PlanApprovalService.ApprovedForWorker` — not on `PlanModeSwitch` — so a plan-mode-off worker, a
+   manual agent and an external-PR head all commit exactly as before. A gated worker whose plan is still
+   pending is stopped one rung earlier by the plan gate itself, never by a declaration it could not have
+   made. The ambiguous case (`ApprovedForWorker` refusing to guess between two approved plans) also
+   resolves to *exempt*, which is the safe direction here.
+
+### 26.5 Where it lives, and why there
+
+- **On the plan record** (`PendingPlan.Deviation` / `DeclaredDeviations`, persisted by
+  `JsonPlanApprovalStore`). A deviation is a deviation *from that plan*: it belongs to the record that
+  authorised the work, it is resolved by the same `ApprovedForWorker` the scope comparison uses, and it
+  persists for free. It has to persist — a worker declares at **commit** time and the row is armed at
+  **verification** time, so a daemon restart between the two would otherwise turn an answer back into a
+  question and put a must-ack row in front of a human for something that *was* answered.
+- **Armed daemon-side**, in `MergeQueueProvisioner.ArmFlaggedChangeReview`, into the
+  `AcknowledgmentStore` the merge gate actually reads — the same reasoning `ReviewLockfiles` writes down:
+  rows composed client-side render and block nothing, and an acknowledgment addressed to a locally-minted
+  id clears a store no merge consults.
+- **One resolver, not two.** `resolveApprovedPlan` became `resolveApprovedWork` and returns
+  `ApprovedWork(Plan, Declaration, Deviations)`. The scope the diff is measured against and the approach
+  shown to the reviewer must describe the **same** approved plan; two independent seams would be free to
+  name two different ones the instant a re-scope lands, and the surface would then present an approach the
+  diff was never measured against.
+- **The acknowledgment resets on a push**, like every other flagged row. A branch-level item hashed only
+  on its own text would survive a push that rewrote the entire diff it was acknowledged against, so
+  `FlaggedChangeDetector.HashDiff` (a content hash over the whole diff) is folded into its id.
+
+### 26.6 The ungated case
+
+With plan mode off there is no approved approach, so there is nothing to have departed from. A declaration
+is therefore **neither required nor recorded** for an ungated worker — demanded anyway, it would be a
+ritual, i.e. the "always present, never means anything" shape this codebase deletes on sight. That is
+decided by `ApprovedForWorker` (the single authority), not by a second reading of the mode switch. The
+ungated worker's operating instructions teach none of it, and a declaration one volunteers anyway is
+**told** it was not recorded rather than silently dropped or turned into a failed commit — the commit is
+the thing that must not be lost.
+
+### 26.7 The queue seeder declares "none" for the plans it fabricates
+
+`QueueSeeder.SeedPlan` records `DeviationDeclaration.None` on the plan it synthesises, alongside the
+authorship and the human approval it already synthesises (and already labels as synthetic in the two
+free-text fields a human reads). Left at `NotDeclared` it would arm a must-acknowledge row on **every**
+seeded plan-gated entry, forever — a row whose real cause is "a dev tool made this entry" rather than
+anything about the branch. A blocker that is always present for a whole class of entries and never means
+anything is precisely how a gate teaches people to click through it. The fail-closed default stays where
+it matters: on a real worker, which is the only thing that can actually answer.
+
+### 26.8 The record is bounded, and what it drops it declares
+
+`commit_work` may be called any number of times and records on a clean tree too, so the accumulated
+declaration is an **agent-controlled growth path through a file the daemon rewrites on every save** — and
+it was the one agent-authored field with no oversized guard, while `TaskPlanSchema` bounds every sibling
+(`MaxScopeFiles` 200, `MaxFieldLength` 4 000, `MaxPlanBytes` 64 KiB).
+
+Both bounds fail **loud rather than closed**, because closed here is a dead end: a worker refused at the
+cap could never commit again, and its work dies with the jail — the "limit that is really a dead end"
+shape §24 argues against at length.
+
+- **Count** (`MaxDeclaredDeviations` = 20). Excess texts are not stored, and the record gains an explicit
+  "…and N further declared deviation(s) that this record cannot hold" row, which the human reads like any
+  other. The notice is recomputed from what actually dropped rather than accumulated, so a second
+  overflowing round does not leave two of them, and it never counts toward the cap itself.
+- **Length** (`TaskPlanSchema.MaxFieldLength`, the same bound the `approach` it is about gets). An
+  over-long deviation is truncated with `…[truncated]` appended. An unmarked cut is the one way
+  truncation would be worse than either alternative.
+
+### 26.9 Left alone, deliberately
+
+- **No automated approach-vs-diff comparison**, per the decision above.
+- **The declaration does not gate the commit's content**, only its acceptance. The work still leaves the
+  jail; the declaration is evidence attached to it, and the block lands at the merge, where a human is.
+- **Nothing verifies the declaration.** A worker can assert `--no-deviations` untruthfully, exactly as it
+  could write a passing test for the wrong behaviour. What changed is that the claim now exists, is
+  attributable, is on the audit chain (`worker_deviation_declared`), and sits on the same screen as the
+  approach it is about. That is the honest limit of this control and it is stated in the worker's own
+  instructions rather than implied.
+- **`ControlCenterViewModel.OpenReviewAsync`'s wiring hop is not covered by a test.** The context
+  properties it sets are pinned on both sides (the wire projection and the cockpit's rendering), but the
+  line that joins them needs a live daemon plus a diff RPC. This is the same gap
+  `ReviewCockpitVerifiedShaTests` documents for `VerifiedAgainstSha`, and it is where that defect actually
+  lived — worth closing with a live-wiring harness, by whoever builds one.

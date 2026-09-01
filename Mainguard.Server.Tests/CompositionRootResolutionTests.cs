@@ -73,8 +73,9 @@ public sealed class CompositionRootResolutionTests
     /// someone states whether the daemon passes it. What each name buys is documented on
     /// <see cref="MergeQueueProvisioner.WiredOptionalControls"/>.</para>
     ///
-    /// <para><c>resolveApprovedPlan</c> is in the set as of the coordinator phase-2 merge, and it was pinned
-    /// ABSENT before it for a stated reason: the daemon had no agent→approved-plan binding, so any lambda
+    /// <para><c>resolveApprovedWork</c> (named <c>resolveApprovedPlan</c> until it began carrying the
+    /// worker's deviation declaration alongside the plan) is in the set as of the coordinator phase-2
+    /// merge, and it was pinned ABSENT before it for a stated reason: the daemon had no agent→approved-plan binding, so any lambda
     /// here would have compared diffs against a GUESSED scope and reported that as enforcement.
     /// Worker-authored plans are keyed by the worker's own agent id — the same id the plan gate holds and
     /// the merge queue tracks the branch under — so the binding is now exact rather than inferred, and the
@@ -98,7 +99,7 @@ public sealed class CompositionRootResolutionTests
                 // lives at the RPC surface rather than in a conditional wiring this exact-set
                 // assertion could not tell from an oversight.
                 "agentStates", "audit", "checkAgentBranch", "locateAgentWorktree", "log",
-                "publishAgentRef", "publishRebasedAgentRef", "resolveApprovedPlan",
+                "publishAgentRef", "publishRebasedAgentRef", "resolveApprovedWork",
                 "syntheticVerifications", "yieldProtocolFor",
             },
             provisioner.WiredOptionalControls.OrderBy(n => n, System.StringComparer.Ordinal).ToArray());

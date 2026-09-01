@@ -75,6 +75,20 @@ public static class WorkerPlanShim
     /// </remarks>
     public const string RescopeUsage = "rescope <approved-plan-id> <plan.json>";
 
+    /// <summary>
+    /// The argument form of <c>commit</c> for a <b>plan-gated</b> worker, single-sourced into the shim's
+    /// usage text, the shim's own refusal, <see cref="AgentOperatingInstructions.Worker"/> and the
+    /// daemon's refusal — the same reason <see cref="RescopeUsage"/> exists.
+    ///
+    /// <para><b>The declaration is REQUIRED and has no silent form.</b> An optional flag would be absent
+    /// on exactly the runs that needed it. The two spellings are mutually exclusive and one of them must
+    /// be present, so "I checked, and I did not depart from the approach" is a thing a worker SAYS rather
+    /// than a thing a reader infers from an empty field — which is the distinction the whole
+    /// <see cref="Orchestrator.DeviationDeclaration"/> enum exists to keep.</para>
+    /// </summary>
+    public const string CommitUsage =
+        "commit \"<message>\" --no-deviations | --deviated \"<what you did differently, and why>\"";
+
     /// <summary>The shim's full script text (LF newlines; written mode 0755 by the daemon). Composed
     /// from the shared <see cref="AgentIpcShimTransport"/>, which is the ONLY place either shim's
     /// transport is written.</summary>
@@ -92,7 +106,8 @@ Usage:
   mainguard-plan {{RescopeUsage}}
                                         widen an APPROVED plan, then wait
   mainguard-plan await <id>             block until the human decides
-  mainguard-plan commit "<message>"     record the approved work on your own branch
+  mainguard-plan {{CommitUsage}}
+                                        record the approved work on your own branch
 
 plan.json is {"scope": ["path", ...], "approach": "...", "testStrategy": "..."}. Write it
 OUTSIDE the repository (/tmp/plan.json) — /workspace is the tree your commit records.
@@ -127,13 +142,33 @@ it verbatim and REFUSES anything it cannot record -- it will not shorten your su
 flatten your paragraphs. Quote the whole thing: a shell splits an unquoted message on
 whitespace, and your blank lines are gone before this program starts.
 
+If your plan was approved you must also DECLARE whether the work departs from the
+`approach` the human approved -- exactly one of:
+
+  --no-deviations                       the work follows the approved approach
+  --deviated "<what and why>"           it does not, in this way (repeat for each)
+
+Say it truthfully. This is not a formality and it is not checked for you: the tests you
+wrote pass either way, so this declaration is the only thing that tells the human their
+approval and your diff came apart. A departure you declare is a row they read next to
+your approach; one you do not is a surprise they find in the diff, or do not.
+
   mainguard-plan commit "fix(auth): recompute token expiry in UTC
 
   The clock read the host's local zone, so a token minted at 23:30 expired an hour
-  early. Boundary tests cover the DST transition in both directions."
+  early. Boundary tests cover the DST transition in both directions." --no-deviations
 """
 """"
         + "\n" + AgentIpcShimTransport.PythonSource + "\n" + $$""""
+
+# The one place the "and then commit, with your declaration" line is written. It is printed at every
+# moment a worker is about to start or resume work, because that is the only output it is guaranteed to
+# read -- and a finished worker that never commits leaves nothing behind at all.
+WHEN_DONE = (
+    'WHEN DONE: mainguard-plan commit "<subject>\\n\\n<body>" --no-deviations\n'
+    '           ...or --deviated "<what you did differently, and why>" for each departure from the\n'
+    '           approach your plan had approved. One of the two is required. (Uncommitted work is lost.)')
+
 
 def read_plan(path):
     with open(path, "r", encoding="utf-8") as handle:
@@ -151,14 +186,14 @@ def report(response):
         if rescope_of:
             print("APPROVED: wider scope — plan %s replaces %s as what you are cleared to do."
                   % (response.get("planId", ""), rescope_of))
-            print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
+            print(WHEN_DONE)
             return 0
         print("APPROVED: plan %s" % response.get("planId", ""))
         print("TASK: %s" % (response.get("taskPrompt") or ""))
         # Said HERE, at the one moment the worker is cleared to start, because this is the only
         # output it is guaranteed to read after the gate opens. A finished worker that never
         # commits leaves nothing behind: the worktree goes with the jail.
-        print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
+        print(WHEN_DONE)
         return 0
     if status == "Rejected":
         remaining = response.get("revisionsRemaining")
@@ -227,14 +262,69 @@ def main(argv):
         # message on whitespace, the subject/blank-line/body the worker wrote is already gone, and
         # rejoining it with single spaces hides that a structure was lost. A commit message is the
         # durable record of what this agent did; a slip in it is worth a turn to correct.
-        if len(argv) > 3:
-            sys.stderr.write(
-                "mainguard-plan: commit takes ONE quoted argument and %d were given. A shell splits an\n"
-                "unquoted message on whitespace, so the subject, blank line and body you wrote are\n"
-                "already one flat line by the time this runs. Quote the whole message -- newlines\n"
-                "inside the quotes are kept.\n" % (len(argv) - 2))
+        #
+        # The declaration flags are parsed here and NOT required here. Whether this worker owes one
+        # depends on whether it holds an approved plan, which only the daemon knows -- a shim that
+        # guessed would refuse an ungated worker a commit it is entitled to make. So this refuses only
+        # what is malformed however the run is gated, and the daemon refuses the missing declaration
+        # with the form to use.
+        message = None
+        deviations = []
+        no_deviations = False
+        bad = None
+        i = 2
+        while i < len(argv):
+            arg = argv[i]
+            if arg == "--no-deviations":
+                no_deviations = True
+                i += 1
+            elif arg == "--deviated":
+                if i + 1 >= len(argv):
+                    bad = ("--deviated needs the deviation itself, quoted as ONE argument:\n"
+                           "  --deviated \"kept the helper synchronous; the approved approach said async\"")
+                    break
+                deviations.append(argv[i + 1])
+                i += 2
+            elif arg.startswith("--"):
+                bad = 'unknown option %s. Run: mainguard-plan {{CommitUsage}}' % arg
+                break
+            elif message is None:
+                message = arg
+                i += 1
+            else:
+                # G4, unchanged: a second bare argument is REFUSED rather than joined, because by the
+                # time a shell has split an unquoted message the subject/blank-line/body is already gone
+                # and rejoining it with spaces hides that a structure was lost.
+                bad = ("the message is ONE quoted argument, and a second one was given. A shell splits\n"
+                       "an unquoted message on whitespace, so the subject, blank line and body you wrote\n"
+                       "are already one flat line by the time this runs. Quote the whole message --\n"
+                       "newlines inside the quotes are kept.")
+                break
+
+        if bad is None and no_deviations and deviations:
+            # Both at once is not a stricter answer, it is two contradictory ones. Refused rather than
+            # resolved by precedence: a rule about which wins would be invisible at the call site.
+            bad = ("--no-deviations and --deviated say opposite things about the same work. Send one:\n"
+                   "  --no-deviations              the work follows the approved approach\n"
+                   "  --deviated \"<what and why>\"  it does not, in this way (repeat for each)")
+
+        if bad is not None:
+            # Said on every local commit refusal for the same reason the daemon says it: commit is the
+            # only way work leaves this jail and an uncommitted worktree dies with it, so a worker that
+            # read "refused" as "my diff is gone" might stop instead of retrying. The refusal costs a
+            # turn, never the work.
+            sys.stderr.write("mainguard-plan: %s\n"
+                             "Nothing was committed and nothing is lost -- your worktree is untouched.\n"
+                             "Run the same command again with the form above.\n" % bad)
             return 2
-        request = {"op": "{{AgentIpcRequest.CommitWorkOp}}", "message": argv[2] if len(argv) > 2 else ""}
+
+        request = {"op": "{{AgentIpcRequest.CommitWorkOp}}", "message": message if message is not None else ""}
+        # Sent only when actually given, so "no answer" stays distinguishable on the wire from
+        # "answered none" -- the daemon's refusal depends on being able to tell them apart.
+        if deviations:
+            request["deviations"] = deviations
+        if no_deviations:
+            request["noDeviations"] = True
         timeout = 300
     else:
         sys.stderr.write(__doc__ or "usage: mainguard-plan present <plan.json>\n")
@@ -261,7 +351,7 @@ def main(argv):
             # worker learns what to do, and it is the only output it is guaranteed to read before it
             # starts. A worker that finishes and never commits leaves nothing behind.
             print("TASK: %s" % (response.get("taskPrompt") or ""))
-            print("WHEN DONE: mainguard-plan commit \"<subject>\\n\\n<body>\"  (uncommitted work is lost)")
+            print(WHEN_DONE)
             return 0
         if response.get("committed") is not None:
             # Distinguished, not collapsed: "nothing to commit" is an ok answer, and reporting it as a
@@ -269,6 +359,10 @@ def main(argv):
             if response.get("committed"):
                 print("COMMITTED: %s on %s"
                       % (response.get("commitSha", ""), response.get("status", "")))
+                # What the daemon did with your deviation declaration, in its own words -- including
+                # "there was no approved approach to record it against", which is not a failure.
+                if response.get("feedback"):
+                    print("DECLARATION: %s" % response["feedback"])
             else:
                 print("NOTHING TO COMMIT: %s"
                       % (response.get("feedback") or "the worktree is clean"))

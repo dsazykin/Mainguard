@@ -201,6 +201,36 @@ public sealed class PlanModeToggleDaemonTests : PlanGateIpcTestBase, IClassFixtu
         Assert.True(Rig.Gate.MayAutoVerify(workerId, out _));
     }
 
+    /// <summary>
+    /// <b>An ungated worker is not asked to declare anything.</b> With plan mode off there is no approved
+    /// <c>approach</c>, so there is nothing to have departed from and demanding a declaration would be a
+    /// ritual — the exact "a control that is always present and never means anything" shape this codebase
+    /// keeps deleting. It is <c>ApprovedForWorker</c> that decides this, the same single authority the
+    /// scope comparison uses, and not a second reading of the mode switch.
+    ///
+    /// <para>A declaration it volunteers anyway is <b>told</b> it was not recorded rather than silently
+    /// dropped or turned into a failed commit: the commit is the thing that must not be lost, and quiet
+    /// discarding is what sits at the bottom of most of this subsystem's defects.</para>
+    /// </summary>
+    [Fact]
+    public async Task WithPlanModeOff_ACommitNeedsNoDeclaration_AndAVolunteeredOneIsSaidToBeUnrecorded()
+    {
+        var (_, workerId, _) = await SpawnWithPlanModeAsync(planModeEnabled: false, "do the work");
+
+        var bare = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: do the work"));
+        Assert.True(bare.Ok, bare.Error);
+        Assert.DoesNotContain(
+            "deviation declaration", bare.Error ?? string.Empty, StringComparison.Ordinal);
+
+        var volunteered = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: more work", NoDeviations: true));
+        Assert.True(volunteered.Ok, volunteered.Error);
+        Assert.Contains("not recorded", volunteered.Feedback ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains(
+            "no approved plan", volunteered.Feedback ?? string.Empty, StringComparison.Ordinal);
+    }
+
     /// <summary>The paired negative: with plan mode on, those same three are refused BY THE GATE.</summary>
     [Fact]
     public async Task WithPlanModeOn_SteeringVerificationAndCommittingAreAllRefusedByTheGate()

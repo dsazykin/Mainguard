@@ -173,7 +173,14 @@ The all-editions base. Git logic goes here.
   - `AcknowledgmentStore.cs` (`FlaggedChange`/`FlaggedKind`; the per-branch item-by-item ack ledger
     bound to the **SHA-256 of the canonical flagged set** — a new push resets every ack (invariant 2),
     `LastResetCount` for the "N items reset" copy, `acknowledged_flagged_change` audit events for P2-15;
-    **no bulk-ack method** so a global checkbox is impossible by construction).
+    **no bulk-ack method** so a global checkbox is impossible by construction. `FlaggedKind` gained
+    `DeclaredDeviation` and `DeviationDeclarationMissing` (2026-08-31) — the APPROACH half of an approved
+    plan, the sibling of `OutOfApprovedScope`: a scope is machine-comparable and is compared, an
+    `Approach` is prose and is not, so a worker shipped the opposite of its approved approach with the
+    scope honoured and every gate green. The MISSING kind exists for the reason
+    `LockfileAdvisoryUnknown` does — an omitted item is an acknowledged item, so silence would report
+    "nobody established whether this follows the approved approach" as "it does". Produced by
+    `Agents.Orchestrator.DeviationReview`).
   - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind,osv,asOf)` for
     package-lock.json/pnpm-lock.yaml/`*.csproj` PackageReference/poetry.lock → per-dep rows with
     major-jump/install-scripts/registry-change + offline OSV CVE ids; script/CVE rows feed the flagged

@@ -321,6 +321,16 @@
     `WorktreeManager.CommitAgentWork`, which owns what/where/onto-which-branch. The worker supplies only
     a message; the (repo, agent) come from the endpoint, never from `request.AgentId`. `NothingToCommit`
     answers `ok:true, committed:false` rather than a commit.
+    **(2026-08-31) It also settles the worker's DEVIATION DECLARATION** (`DeviationRefusal` /
+    `RecordDeviations`): a worker holding an approved plan must send exactly one of `noDeviations` or a
+    non-empty `deviations`, and a commit carrying neither — or both — is **refused BEFORE anything is
+    committed**, which is the only reason this is safe to make mandatory (the worktree is untouched by a
+    refusal, so it costs one re-run and no work). Required only where there is something to deviate from:
+    `PlanApprovalService.ApprovedForWorker` decides that, the same single authority the F6 scope
+    comparison uses, never a second reading of `PlanModeSwitch`. An ungated worker that volunteers a
+    declaration anyway COMMITS and is told in `feedback` that it was not recorded — quiet discarding is
+    what sits at the bottom of most of this subsystem's defects. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26.
     **`RescopePlanAsync`** is the worker table's sixth op (`rescope_plan`, 2026-08-30 — contract §3.1 /
     phase 3 §23): the worker names the APPROVED plan it is widening (required, never inferred — a guessed
     target produces a plausible card for an authorisation nobody named, §13.3's call), passes the same
@@ -665,7 +675,13 @@
   leaves a persisted `Verifying` row with nothing executing — plus `has_live_sandbox` (`optional`, from
   the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
   which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
-  enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
+  enabled button whose only behaviour is "has no live sandbox". **(2026-08-31) `Snapshot` also carries
+  what a human APPROVED** — `approved_plan_id`/`_title`/`_approach` and the three-valued
+  `deviation_declaration`, read through `MergeQueueContext.ResolveApprovedWork`, i.e. the same callback
+  the provisioner arms the flagged review from. Without it the review cockpit rendered a diff and nothing
+  to compare it against, which is how a branch that shipped the opposite of its approved approach passed
+  review with an empty flagged list; left empty for an entry with no approved plan so the surface draws
+  no panel rather than an empty one. `optional` because a proto3 `false`
   meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded;
   `Snapshot`'s entry order runs through `OrderForDisplay` (`internal static`, unit-tested in
   `Mainguard.Server.Tests/QueueDisplayOrderTests.cs`) — a stable partition putting actionable states

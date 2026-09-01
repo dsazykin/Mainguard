@@ -132,6 +132,31 @@ message QueueEntry {
   // with no timestamp cannot be told from a stale one, and a week-old red is a different fact from one
   // that landed thirty seconds ago.
   string last_verification_at = 12;
+  // ---- What a human APPROVED for this branch, so the review can be a comparison (13–16) -------------
+  //
+  // The review surface showed the diff and nothing else. The approved plan's `approach` — the paragraph
+  // the human actually said yes to — existed on the daemon, was decided on, and then never appeared
+  // again anywhere, so "does this diff match what was approved" was a question the reviewer had no way
+  // to ask. Measured: an approved plan said it would keep plain `a / b` because the module had no
+  // validation idiom; the branch shipped a throwing validation layer that changed three pre-existing
+  // functions. `flagged_items` was EMPTY (the file scope was honoured), `can_merge` was true, and the
+  // tests were green because the worker had written them.
+  //
+  // Empty for an entry with no approved plan (a manual agent, an external-PR head, a worker spawned
+  // with plan mode off) — the surface then renders no approval panel at all rather than an empty one,
+  // because "nothing was approved" and "an approval with no approach" are different things.
+  string approved_plan_id = 13;
+  string approved_plan_title = 14;
+  string approved_plan_approach = 15;
+  // The worker's own commit-time answer about departing from that approach: "NotDeclared" / "None" /
+  // "Declared" (DeviationDeclaration name), empty when the entry has no approved plan.
+  //
+  // THREE values on the wire and not a bool, for the reason the whole mechanism exists: "the worker
+  // asserted it followed the approach" and "nobody ever asked it" are different facts, and the review
+  // surface has to be able to say which one it is looking at. Declared deviations themselves travel as
+  // flagged_items (they are must-acknowledge); this field is what lets the panel render the assertion
+  // that produced NO item, and tell it apart from the absence of any answer.
+  string deviation_declaration = 16;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the

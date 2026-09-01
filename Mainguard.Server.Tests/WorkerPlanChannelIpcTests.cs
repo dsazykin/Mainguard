@@ -423,7 +423,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         await ApproveAsync(workerId);
 
         var response = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock", NoDeviations: true));
 
         Assert.True(response.Ok, response.Error);
         Assert.True(response.Committed);
@@ -454,7 +454,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         await ApproveAsync(theirs);
 
         var response = await CallAsync(mine, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch"));
+            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch",
+            NoDeviations: true));
 
         Assert.True(response.Ok, response.Error);
         Assert.Equal("agent/" + mine, response.Status);
@@ -477,7 +478,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         try
         {
             var response = await CallAsync(workerId, new AgentIpcRequest(
-                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened"));
+                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened", NoDeviations: true));
 
             Assert.True(response.Ok, response.Error);
             Assert.False(response.Committed);
@@ -503,7 +504,7 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         try
         {
             var response = await CallAsync(workerId, new AgentIpcRequest(
-                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else"));
+                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else", NoDeviations: true));
 
             Assert.False(response.Ok);
             Assert.False(response.Committed);
@@ -513,6 +514,141 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         {
             Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.Committed;
         }
+    }
+
+    // ---- commit_work: the deviation declaration --------------------------
+    //
+    // The defect: a human approved a plan whose `approach` said the module had no validation idiom, so
+    // the worker would keep plain `a / b`. The worker shipped a throwing validation layer that changed
+    // three PRE-EXISTING helpers. The plan's scope was honoured, so the out-of-scope arm saw nothing and
+    // FlaggedItems was []; CanMerge was true and the state Verified, because the worker had also written
+    // the tests asserting its own new behaviour. Nothing anywhere held the approved approach against the
+    // diff, and nothing does now — what changed is that the worker must ANSWER, and cannot answer by
+    // saying nothing.
+
+    /// <summary>
+    /// <b>Silence is refused, and nothing is committed.</b> An optional declaration would be absent on
+    /// exactly the runs that needed it, so a plan-gated commit that carries neither answer does not
+    /// happen. The refusal is safe to make mandatory precisely because it lands BEFORE the commit: the
+    /// worktree is untouched, so it costs the worker one re-run and no work.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorkersCommitWithNoDeclaration_IsRefused_AndNothingIsCommitted()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide, with validation nobody asked for"));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("deviation declaration", refused.Error!, StringComparison.Ordinal);
+        // The refusal names the form, so the correction costs no round trip and no guessing. This is
+        // also the ONLY documentation a worker gets whose jail was created by a daemon predating the
+        // flags — its MAINGUARD.md never mentions them — so the refusal has to be self-sufficient.
+        Assert.Contains(WorkerPlanShim.CommitUsage, refused.Error!, StringComparison.Ordinal);
+        // ...and it must say the refusal cost nothing. Commit is the only way work leaves the jail and
+        // an uncommitted worktree dies with it, so a worker that read "refused" as "my diff is gone"
+        // could stop with the work still in it — which is worse than the divergence this gate surfaces.
+        Assert.Contains("nothing is lost", refused.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
+    /// <summary>
+    /// <b>The refusal is recoverable in the same turn.</b> The worker that was just refused re-runs the
+    /// identical command with an answer and its work lands — no lost diff, no lost turn beyond the one,
+    /// no state to clean up. Asserted as the SEQUENCE rather than as two independent facts, because
+    /// "refused" and "can still commit afterwards" being separately true is not the property that
+    /// matters; the property is that the second call, made immediately after the first, succeeds.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedDeclaration_CostsATurnAndNotTheWork()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()"));
+        Assert.False(refused.Ok);
+        Assert.DoesNotContain(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+
+        // The very next call, same message, with the answer the refusal named.
+        var retried = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(retried.Ok, retried.Error);
+        Assert.True(retried.Committed);
+        var commit = Assert.Single(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+        Assert.Equal("feat: divide()", commit.Message);
+    }
+
+    /// <summary>
+    /// A declared departure is recorded on the plan that AUTHORISED the work — the same record the
+    /// out-of-scope comparison resolves — so the approach shown at review and the deviation shown beside
+    /// it can never describe two different plans. The commit itself is unaffected: the declaration is
+    /// evidence, not a second gate on the work leaving the jail.
+    /// </summary>
+    [Fact]
+    public async Task ADeclaredDeviation_IsRecordedOnTheApprovedPlan_AndTheCommitStillLands()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp,
+            Message: "feat: divide()",
+            Deviations: new[] { "added RangeError on zero; the approach said keep plain a / b" }));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.True(response.Committed);
+
+        var work = Rig.Plans.ApprovedWorkFor(workerId)!;
+        Assert.Equal(DeviationDeclaration.Declared, work.Declaration);
+        Assert.Equal(
+            new[] { "added RangeError on zero; the approach said keep plain a / b" }, work.Deviations);
+    }
+
+    /// <summary>
+    /// The explicit "none" is recorded as the ASSERTION it is. This is the pair that makes the mechanism
+    /// mean anything: a branch whose worker said "I checked, none" and one nobody ever asked must not end
+    /// up in the same state, because the second is a question and only the first is an answer.
+    /// </summary>
+    [Fact]
+    public async Task AnAssertedNoDeviations_IsRecordedAsAnAnswer_NotAsSilence()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        Assert.Equal(DeviationDeclaration.NotDeclared, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal(DeviationDeclaration.None, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+    }
+
+    /// <summary>
+    /// Both answers at once is refused rather than resolved by precedence — they say opposite things
+    /// about the same work, and a rule about which one wins would be invisible at the call site. Refused
+    /// at the daemon as well as at the shim, because the shim's refusal is an affordance and this is the
+    /// enforcement.
+    /// </summary>
+    [Fact]
+    public async Task ACommitThatBothDeclaresAndDeniesDeviations_IsRefused()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()",
+            NoDeviations: true, Deviations: new[] { "added RangeError" }));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("opposite things", refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
     }
 
     // ---- rescope_plan: the worker's legal way to widen an approved scope ---
@@ -569,7 +705,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         // ...and the worker is NOT suspended. It still holds the approval it is asking to widen.
         Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
         var commit = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers",
+            NoDeviations: true));
         Assert.True(commit.Ok, commit.Error);
         Assert.True(commit.Committed);
 
@@ -607,7 +744,8 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
         Assert.True(Rig.Gate.MayWork(workerId, out _));
         var commit = await CallAsync(workerId, new AgentIpcRequest(
-            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope"));
+            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope",
+            NoDeviations: true));
         Assert.True(commit.Ok, commit.Error);
     }
 

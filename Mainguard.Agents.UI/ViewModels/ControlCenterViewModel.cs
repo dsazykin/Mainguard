@@ -1278,6 +1278,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     // the daemon never attested.
                     ChangedTestCommand = entry?.FlaggedItems.Any(
                         f => f.Id == Services.DaemonFlaggedChangeSource.ChangedTestCommandItemId) == true,
+
+                    // The other half of a review: what a human APPROVED. Real daemon data, like the sha
+                    // above — the approved approach has always existed and the client had nowhere to put
+                    // it, so a reviewer comparing a diff against what was agreed had only the diff. Null
+                    // for an entry with no approved plan; the panel then does not render at all, which is
+                    // the honest answer for a manual agent or an external PR.
+                    ApprovedPlanId = entry?.ApprovedPlanId,
+                    ApprovedPlanTitle = entry?.ApprovedPlanTitle,
+                    ApprovedApproach = entry?.ApprovedApproach,
+                    DeviationDeclaration = entry?.DeviationDeclaration,
                 };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same

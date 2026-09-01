@@ -682,7 +682,23 @@
     every daemon-flagged row but one arrived mislabelled `RiskCategory`; and
     `ReviewCockpitContext.LockfileFlags` is **local-composition only** — production always supplies
     `live:`, so the §3.6 lockfile rows are armed daemon-side by
-    `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection),
+    `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection.
+    **(2026-08-31) `ReviewCockpitContext.ApprovedPlanId`/`ApprovedPlanTitle`/`ApprovedApproach`/
+    `DeviationDeclaration` → `HasApprovedApproach`/`ApprovedPlanHeading`/`ApprovedApproachText`/
+    `DeviationDeclarationText`/`DeviationNeedsAttention`**, rendered by `ReviewCockpitView.axaml` as a
+    card ABOVE the diff: a review is a comparison and this surface only ever had one side of it, so a
+    branch that shipped the opposite of its approved approach read as an ordinary green review. The
+    approach is rendered verbatim in a scrolling region rather than truncated (the elided sentence is the
+    one the diff disagrees with), and **no card is drawn at all** when nothing was approved. The
+    declaration is projected as THREE sentences, never two — an asserted "none" says it is a claim and
+    not a check, a missing declaration reads as an open question — and a daemon that says nothing gets no
+    sentence invented for it. Carried as distinct properties rather than folded into
+    `ApprovedPlan` (a full `TaskPlan` whose `Scope` is F6-load-bearing): the wire carries no scope here,
+    and minting one with an empty scope would put a fabricated authorisation somewhere that reads it as
+    real. `FlaggedChangesPanelViewModel.DeviationHeading` names the worker-declared rows as their own
+    group (`WORKER-DECLARED DEVIATIONS (n)`) — every other row in that panel is something the daemon
+    detected in the diff, and these are the one claim in the review that nothing verifies. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26),
     `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel`/`EscalatedPlanViewModel`
     (the coordinator conversation + the **worker-authored** plan approval card; Approve is the panel's
     accent. The conversation half is no longer mounted (the coordinator surface is the inline terminal
@@ -1111,7 +1127,13 @@
     costs a round of the revision budget either way — and it **propagates a failure** instead of the
     blanket `catch (Exception) {}` it used to end in: that swallow made a decision which never reached the
     daemon indistinguishable from one that landed, so the panel could not tell the human their approval was
-    lost while the worker stayed blocked. `CreateBundle()` is the shipped-app factory
+    lost while the worker stayed blocked. **(2026-08-31) `ApplyQueueUpdate` also projects what a human
+    APPROVED** — `ApprovedPlanId`/`ApprovedPlanTitle`/`ApprovedApproach`/`DeviationDeclaration` onto
+    `QueueEntry`, through `NullIfEmpty` so proto3's empty-string default becomes `null`: "never approved
+    against anything" and "approved, with nothing written down" are different, and the review surface
+    decides whether to draw an approval panel from exactly this. Same shape of defect as
+    `VerifiedMainSha`, which the daemon had always sent and this projection had always dropped.
+    `CreateBundle()` is the shipped-app factory
     (`OrchestratorServices` over a loopback `DaemonClient`). **PR3:** it also implements `ICliAgentHost`
     — `ListInstalledClisAsync` (the `ListInstalledAdapters` RPC), `StartCoordinatorAsync` (keystore key
     resolved via `ApiKeyProviderMap` from the adapter's declared env-var name — no provider mapping

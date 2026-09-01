@@ -153,6 +153,23 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// kept apart at every layer — the wire field is <c>optional</c>, this is nullable, and the surfaces render
 /// three outcomes (green / red / never run) rather than the two the old projection could express.
 /// </param>
+/// <param name="ApprovedApproach">
+/// The <c>approach</c> text of the plan a human approved for this branch — the paragraph the diff was
+/// supposed to match. Null/empty when the entry has no approved plan.
+///
+/// <para><b>Why this travels at all.</b> It existed only on the daemon: written by the worker, read once
+/// by the human at approval, and never surfaced again. So the review surface could show a diff and
+/// nothing to hold it against — which is how a branch that shipped the opposite of its approved approach
+/// passed review with an empty flagged list and a green verification (the file scope was honoured, and
+/// the worker had written the tests).</para>
+/// </param>
+/// <param name="DeviationDeclaration">
+/// The worker's commit-time answer about departing from <paramref name="ApprovedApproach"/>:
+/// <c>"NotDeclared"</c> / <c>"None"</c> / <c>"Declared"</c>, or null/empty when the entry has no approved
+/// plan. Three values, because "asserted none" and "never answered" must not render alike — the declared
+/// departures themselves arrive as must-acknowledge <paramref name="FlaggedItems"/>, so this field's job
+/// is exactly to carry the two answers that produce no item.
+/// </param>
 public sealed record QueueEntry(
     string AgentId,
     string Name,
@@ -163,7 +180,11 @@ public sealed record QueueEntry(
     IReadOnlyList<FlaggedItem> FlaggedItems,
     bool VerificationInFlight = false,
     bool? HasLiveSandbox = null,
-    string? VerifiedMainSha = null);
+    string? VerifiedMainSha = null,
+    string? ApprovedPlanId = null,
+    string? ApprovedPlanTitle = null,
+    string? ApprovedApproach = null,
+    string? DeviationDeclaration = null);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(
