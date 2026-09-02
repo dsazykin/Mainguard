@@ -342,7 +342,12 @@ public static class GatewayServiceRegistration
                 journal: dbFactory is null
                     ? new Mainguard.Git.Services.NullOperationJournal()
                     : new Mainguard.Git.Services.OperationJournal(dbFactory),
-                resolveRepoPath: _ => null, // repos map in as their swarms come up; none at boot.
+                // No repo can be resolved at boot, so this slot reconciles NOTHING — and that was, for a
+                // long time, the only reconcile there was. The real one runs per repo in
+                // MergeQueueProvisioner.EnsureQueue's created branch (against the mirror) and on demand
+                // in BeginMerge (TryReconcileLandedLease). This task stays only because the boot sequence
+                // is ordered around its slot.
+                resolveRepoPath: _ => null,
                 onMerged: (repoHash, agentId, postSha) =>
                 {
                     // MG-29: this was `foreach (var handle in Array.Empty<string>())` — a hardcoded

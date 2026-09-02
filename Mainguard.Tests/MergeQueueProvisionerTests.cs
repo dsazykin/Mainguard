@@ -616,6 +616,98 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// RT-D1, made live. The daemon dies between the client's <c>--ff-only</c> merge and its
+    /// <c>ConfirmMerge</c>: the lease is outstanding in SQLite, the merge is on the user's checkout, and
+    /// the mirror has not been told. The boot-sequence reconcile could never resolve a repo path, so this
+    /// lease used to block every later merge on the repo for good. Now the repo's queue reconciles it the
+    /// moment it comes up — against the mirror, refreshed from origin first — and records the merge git
+    /// already holds.
+    /// </summary>
+    [Fact]
+    public async Task AnOutstandingLease_IsReconciledWhenTheQueueComesUp_AndTheLandedMergeIsRecorded()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        CommitOnAgentBranch(repoHash, "npm test");
+        var stores = new SharedStores();
+        var leases = new InMemoryMergeLeaseStore();
+
+        var first = NewProvisioner(stores, out _, leases);
+        var ctx = first.EnsureQueue(repoHash)!;
+        first.EnsureEntry(repoHash, AgentId, MergeEntryOrigin.Local);
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        var preMergeMain = ctx.Queue.CurrentMainSha;
+        Assert.NotNull(leases.TryBegin(repoHash, "lease-crash", AgentId, preMergeMain, "main"));
+
+        // The human's merge lands on ORIGIN (their checkout) — then the daemon dies before ConfirmMerge.
+        var newMain = FastForwardOriginMainTo(repoHash, AgentId);
+        Assert.NotEqual(preMergeMain, newMain);
+
+        var restarted = NewProvisioner(stores, out _, leases);
+        var rebuilt = restarted.EnsureQueue(repoHash)!;
+
+        Assert.Null(leases.GetOutstanding(repoHash));
+        Assert.Equal(WorkerMergeState.Merged, rebuilt.Queue.GetState(AgentId));
+        Assert.Equal(newMain, rebuilt.Queue.CurrentMainSha);
+        var merged = Assert.Single(_audit.Read(), e => e.Type == MergeQueue.MergedEvent);
+        Assert.Equal(MergeAuthorization.BootReconcileSource, merged.Fields["source"]);
+    }
+
+    /// <summary>The other honest verdict: nothing landed, so the lease is handed back and the entry is
+    /// left exactly as it was — no <c>Merged</c>, no merge record, one released-lease record.</summary>
+    [Fact]
+    public async Task AnOutstandingLease_ForAMergeThatNeverLanded_IsReleasedWhenTheQueueComesUp()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        CommitOnAgentBranch(repoHash, "npm test");
+        var stores = new SharedStores();
+        var leases = new InMemoryMergeLeaseStore();
+
+        var first = NewProvisioner(stores, out _, leases);
+        var ctx = first.EnsureQueue(repoHash)!;
+        first.EnsureEntry(repoHash, AgentId, MergeEntryOrigin.Local);
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        Assert.NotNull(leases.TryBegin(repoHash, "lease-crash", AgentId, ctx.Queue.CurrentMainSha, "main"));
+
+        var rebuilt = NewProvisioner(stores, out _, leases).EnsureQueue(repoHash)!;
+
+        Assert.Null(leases.GetOutstanding(repoHash));
+        Assert.Equal(WorkerMergeState.Verified, rebuilt.Queue.GetState(AgentId));
+        Assert.DoesNotContain(_audit.Read(), e => e.Type == MergeQueue.MergedEvent);
+        Assert.Contains(_audit.Read(), e => e.Type == "merge_lease_released");
+    }
+
+    /// <summary>
+    /// The on-demand half, and the line it must not cross. A held lease whose merge git proves LANDED is
+    /// recorded so the next <c>BeginMerge</c> can proceed; a held lease whose merge has not landed is left
+    /// alone — it may be a live human merge mid-conversation, and releasing it would grant a second one.
+    /// </summary>
+    [Fact]
+    public async Task TryReconcileLandedLease_RecordsALandedMerge_AndLeavesAnInFlightLeaseAlone()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        CommitOnAgentBranch(repoHash, "npm test");
+        var leases = new InMemoryMergeLeaseStore();
+        var provisioner = NewProvisioner(new SharedStores(), out _, leases);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        provisioner.EnsureEntry(repoHash, AgentId, MergeEntryOrigin.Local);
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        var lease = leases.TryBegin(repoHash, "lease-live", AgentId, ctx.Queue.CurrentMainSha, "main")!;
+
+        // In flight: nothing has landed yet. Not touched.
+        Assert.False(provisioner.TryReconcileLandedLease(repoHash, out var reason));
+        Assert.Contains("still in progress", reason);
+        Assert.Equal(lease.LeaseId, leases.GetOutstanding(repoHash)!.LeaseId);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(AgentId));
+
+        // Landed on origin, never confirmed: recorded.
+        var newMain = FastForwardOriginMainTo(repoHash, AgentId);
+        Assert.True(provisioner.TryReconcileLandedLease(repoHash, out reason), reason);
+        Assert.Null(leases.GetOutstanding(repoHash));
+        Assert.Equal(WorkerMergeState.Merged, ctx.Queue.GetState(AgentId));
+        Assert.Equal(newMain, ctx.Queue.CurrentMainSha);
+    }
+
+    /// <summary>
     /// The control. Identical declarations on both sides must NOT flag — a gate that fires on every
     /// branch is noise, and noise trains reviewers to acknowledge without reading.
     /// </summary>
@@ -1770,13 +1862,15 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>A provisioner over pre-existing persisted state — the restart harness.</summary>
-    private MergeQueueProvisioner NewProvisioner(SharedStores stores, out FakeSandboxEngine engine)
+    /// <param name="leases">The lease store a restart does not lose either; a fresh empty one by default.</param>
+    private MergeQueueProvisioner NewProvisioner(
+        SharedStores stores, out FakeSandboxEngine engine, IMergeLeaseStore? leases = null)
     {
         engine = new FakeSandboxEngine(0, null);
         return new MergeQueueProvisioner(
             registry: new MergeQueueRegistry(),
             repos: new RepoProvisioner(_vmRoot),
-            leases: new InMemoryMergeLeaseStore(),
+            leases: leases ?? new InMemoryMergeLeaseStore(),
             resolveContainerId: (_, _) => ContainerId,
             queueStore: _ => stores.Queue,
             verificationStore: _ => stores.Verifications,
@@ -1982,6 +2076,33 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     /// <para>A ref update rather than a merge commit on purpose: <c>--ff-only</c> produces exactly this,
     /// and the property under test is what a fast-forward does to everyone ELSE's branch.</para>
     /// </summary>
+    /// <summary>
+    /// The human's merge as it really happens: on ORIGIN (their checkout), by fetching the agent's branch
+    /// from the mirror and fast-forwarding main onto it. The mirror learns nothing here — that is what
+    /// <c>ConfirmMerge</c>'s refresh is for, and the crash these tests model is the one that skips it.
+    /// </summary>
+    private string FastForwardOriginMainTo(string repoHash, string agentId)
+    {
+        new WorktreeManager(_vmRoot).PublishAgentBranch(repoHash, agentId);
+        var mirror = new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash);
+        var branch = "refs/heads/agent/" + agentId;
+        foreach (var args in new[]
+                 {
+                     new[] { "fetch", "--no-tags", mirror, $"{branch}:{branch}" },
+                     new[] { "merge", "--ff-only", branch },
+                 })
+        {
+            var (code, _, err) = Mainguard.Git.Services.GitService.RunGit(_source, args);
+            if (code != 0)
+            {
+                throw new InvalidOperationException($"git {string.Join(' ', args)} failed: {err}");
+            }
+        }
+
+        using var origin = new Repository(_source);
+        return origin.Head.Tip.Sha;
+    }
+
     private string FastForwardMainTo(string repoHash, string reference)
     {
         using var mirror = new Repository(new RepoProvisioner(_vmRoot).BareRepoPathFor(repoHash));

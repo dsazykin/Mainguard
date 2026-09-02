@@ -297,6 +297,16 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         var verifiedBranch = ctx.Queue.LastVerification(request.AgentId)?.BranchSha ?? string.Empty;
         var lease = ctx.Leases.TryBegin(
             request.RepoHandle, leaseId, request.AgentId, verified, "main", verifiedBranch);
+        if (lease is null && _queues is not null
+            && _queues.TryReconcileLandedLease(request.RepoHandle, out _))
+        {
+            // The held lease was a merge that had already landed (a crash after the client's merge and
+            // before its ConfirmMerge). It is recorded now, so this repo is free again — retry once.
+            verified = ctx.Queue.CurrentMainSha;
+            lease = ctx.Leases.TryBegin(
+                request.RepoHandle, leaseId, request.AgentId, verified, "main", verifiedBranch);
+        }
+
         if (lease is null)
         {
             _log.LogInformation("BeginMerge repo={Repo} agent={Agent} granted=False (lease held)",

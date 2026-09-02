@@ -202,6 +202,16 @@ public sealed class MergeReconcileTask : IBootTask
         var branchRef = ResolveAgentRef(repoPath, lease.AgentId);
         if (branchRef is not null)
         {
+            // A branch that was already CONTAINED in the main this lease authorized landed nothing: a
+            // fast-forward of it is "Already up to date". So "main now contains it" is true of every
+            // forward move main could make and proves nothing about this lease — the zero-commit form
+            // of the same coincidence. Undecidable, not Merged: main moved, and not because of this.
+            if (!string.IsNullOrEmpty(lease.ExpectedMainSha)
+                && IsAncestor(repoPath, branchRef, lease.ExpectedMainSha))
+            {
+                return ReconcileVerdict.Undecidable;
+            }
+
             return IsAncestor(repoPath, branchRef, currentMain)
                 ? ReconcileVerdict.Merged
                 : ReconcileVerdict.Undecidable;

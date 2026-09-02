@@ -436,6 +436,15 @@ public sealed class MergeQueueProvisioner
             // entry, no diff, no container.
             PrimeBranchTipsAfterRestart(repoHandle, context.Queue);
 
+            // RT-D1: a merge lease that outlived the daemon (crash between BeginMerge and ConfirmMerge) is
+            // classified HERE, against the mirror, the moment the repo's queue exists. The boot-sequence
+            // slot cannot do it — it runs before any repo is mapped in and has no path to ask git on —
+            // so until this call existed an outstanding lease was never reconciled at all and blocked
+            // every later merge on the repo for good. Inline and before the resume: nothing can be
+            // mid-merge on a queue that did not exist a moment ago, so this is the one instant a lease
+            // that is merely outstanding is known to be a leftover rather than a live conversation.
+            ReconcileOutstandingLease(repoHandle, barePath, context);
+
             // ...and THIS is the restart resume's production trigger. See the class remarks for why it is
             // here and not in DaemonBootSequence. Started only on the created branch: a repeat EnsureQueue
             // is the same live queue, whose Verifying rows are real runs this process started.
@@ -451,6 +460,125 @@ public sealed class MergeQueueProvisioner
 
         return context;
     }
+
+    // ---- Restart lease reconcile (RT-D1) ----------------------------------
+
+    /// <summary>
+    /// Classifies and settles the repo's outstanding merge lease at queue creation. Every verdict acts:
+    /// a merge git proves landed is confirmed (and the cascade fires), a merge that never moved main is
+    /// released and surfaced, and an undecidable one is released with the ambiguity stated. Safe to act on
+    /// all three only because the queue was created this instant, so no merge can be in flight.
+    /// </summary>
+    private void ReconcileOutstandingLease(string repoHandle, string barePath, MergeQueueContext context)
+    {
+        var lease = _leases.GetOutstanding(repoHandle);
+        if (lease is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // The crash this exists for is "the human's merge landed on their checkout and the daemon
+            // died before ConfirmMerge refreshed the mirror" — so an unrefreshed mirror would read the
+            // merge that DID land as NeverCommitted and release the lease over it. Refresh first.
+            TryRefreshMirrorMainAfterMerge(repoHandle, out _);
+            AlignLeaseMainBranch(barePath, lease);
+            BuildLeaseReconcile(barePath, context).Reconcile(lease);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge lease reconcile failed repo={repoHandle} lease={lease.LeaseId}: {ex.Message}");
+            _audit.Append(new AuditEvent("merge_lease_reconcile_failed", new Dictionary<string, string>
+            {
+                ["repo"] = repoHandle,
+                ["agent"] = lease.AgentId,
+                ["lease"] = lease.LeaseId,
+                ["reason"] = ex.Message,
+            }));
+        }
+    }
+
+    /// <summary>
+    /// The on-demand half, for <c>BeginMerge</c>: when the repo's lease is held, ask git whether the merge
+    /// it authorized has already <b>landed</b>, and if so record it so the next merge can proceed.
+    ///
+    /// <para>Acts on the <c>Merged</c> verdict ONLY. A lease that is merely outstanding may be a live
+    /// human merge between <c>BeginMerge</c> and <c>ConfirmMerge</c>; releasing it on a
+    /// <c>NeverCommitted</c> reading would grant a second, concurrent merge on the same repo — the one
+    /// thing the lease exists to prevent. Those verdicts are left to the queue-creation reconcile, where
+    /// nothing can be in flight.</para>
+    /// </summary>
+    /// <returns>True when a landed merge was recorded and the lease is no longer outstanding.</returns>
+    public bool TryReconcileLandedLease(string repoHandle, out string reason)
+    {
+        reason = string.Empty;
+        var context = _registry.Resolve(repoHandle);
+        var lease = _leases.GetOutstanding(repoHandle);
+        if (context is null || lease is null)
+        {
+            return false;
+        }
+
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        try
+        {
+            TryRefreshMirrorMainAfterMerge(repoHandle, out _);
+            AlignLeaseMainBranch(barePath, lease);
+            var task = BuildLeaseReconcile(barePath, context);
+            var currentMain = RevParse(barePath, lease.MainBranch);
+            if (task.Classify(barePath, lease, currentMain) != MergeReconcileTask.ReconcileVerdict.Merged)
+            {
+                reason = $"a merge of agent/{lease.AgentId} is still in progress (lease taken "
+                       + $"{(DateTime.UtcNow - lease.BeginUtc).TotalMinutes:0} min ago)";
+                return false;
+            }
+
+            _leases.Confirm(repoHandle, lease.LeaseId, currentMain);
+            context.Queue.ConfirmHumanMerge(
+                lease.AgentId, currentMain, MergeAuthorization.BootReconcile(lease.LeaseId));
+            _log?.Invoke($"merge lease reconciled on demand repo={repoHandle} agent={lease.AgentId} main={currentMain}");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            reason = $"the outstanding merge lease could not be reconciled: {ex.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// <c>BeginMerge</c> writes the literal <c>"main"</c> onto every lease, and a mirror whose integration
+    /// branch is called something else would read as "main unreadable" — an Undecidable that releases a
+    /// lease over a merge that landed. The mirror's own default branch is the ref the merge moved, so the
+    /// in-memory row is pointed at it when the recorded name resolves to nothing there.
+    /// </summary>
+    private static void AlignLeaseMainBranch(string barePath, Mainguard.Git.Models.MergeLeaseRow lease)
+    {
+        if (RevParse(barePath, lease.MainBranch).Length == 0)
+        {
+            lease.MainBranch = ResolveDefaultBranch(barePath);
+        }
+    }
+
+    private MergeReconcileTask BuildLeaseReconcile(string barePath, MergeQueueContext context) =>
+        new(
+            _leases,
+            // The daemon has no path to the user's checkout, so the T-19 journal fallback is unavailable
+            // by construction — a branch ref that is gone reads Undecidable, which is the honest answer.
+            new Mainguard.Git.Services.NullOperationJournal(),
+            resolveRepoPath: _ => barePath,
+            onMerged: (_, agentId, postSha) =>
+                context.Queue.ConfirmHumanMerge(agentId, postSha, MergeAuthorization.BootReconcile()),
+            onInterrupted: (repoHash, why) =>
+            {
+                _log?.Invoke($"merge lease released repo={repoHash}: {why}");
+                _audit.Append(new AuditEvent("merge_lease_released", new Dictionary<string, string>
+                {
+                    ["repo"] = repoHash,
+                    ["reason"] = why,
+                }));
+            });
 
     // ---- Restart re-arm (L1) ---------------------------------------------
 

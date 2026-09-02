@@ -210,6 +210,33 @@ public class MergeIdentityTests : IDisposable
     }
 
     /// <summary>
+    /// The zero-commit form of the coincidence. An agent branch that never moved off the seed is
+    /// contained in EVERY later main, so "main now contains agent/z" is true of a hotfix, a pull, a
+    /// co-tenant's merge — anything. A lease for it can only ever be undecidable once main moves, because a
+    /// fast-forward of a contained branch is "Already up to date" and lands nothing to prove.
+    /// </summary>
+    [Fact]
+    public void ART_D1_Reconcile_DoesNotMarkALeaseMerged_WhenTheBranchLandedNothing()
+    {
+        var (repo, seed) = BuildTwoAgentRepo();
+        var journal = NewJournal();
+        var leases = new InMemoryMergeLeaseStore();
+
+        Git(repo, "branch", "agent/z", seed); // zero commits ahead of the main the lease authorizes
+        var lease = leases.TryBegin("repohash", "lease-z", "z", seed, "main")!;
+
+        Commit(repo, "hotfix.txt", "by hand\n", "hotfix");
+        var (code, _, _) = GitService.RunGit(repo, "merge-base", "--is-ancestor", "refs/heads/agent/z", "refs/heads/main");
+        Assert.Equal(0, code); // the containment half passes — this is the descent-from-authorized check
+
+        var outcome = RunReconcile(repo, leases, journal, lease);
+
+        Assert.Empty(outcome.Merged);
+        Assert.Single(outcome.Interrupted);
+        Assert.Null(leases.GetOutstanding("repohash"));
+    }
+
+    /// <summary>
     /// A main that did not move FORWARD from the sha this lease was authorized against. A fast-forward
     /// merge only ever advances main from its old-OID, so a rewound (or sideways) main cannot be the
     /// effect of this lease's merge, whatever else is true of the repository.
