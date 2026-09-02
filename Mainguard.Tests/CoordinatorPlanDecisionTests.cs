@@ -275,6 +275,27 @@ public class CoordinatorPlanDecisionTests
         Assert.False(card.IsDeciding);
     }
 
+    // ---- The card's age --------------------------------------------------
+
+    /// <summary>
+    /// The reconciliation keeps a card's instance while its (id, revision) is unchanged — which is right
+    /// for the feedback the human is typing, and wrong for "presented N min ago", which was computed once
+    /// in the constructor and then never moved on the one surface whose purpose is to make waiting visible.
+    /// </summary>
+    [Fact]
+    public void AKeptCardsAge_AdvancesOnRefresh()
+    {
+        var panel = new CoordinatorPanelViewModel(new FakeCoordinator());
+        var card = panel.PendingPlan!;
+        Assert.Contains("presented 2 min ago", card.FactsText, StringComparison.Ordinal);
+
+        panel.Clock = () => DateTimeOffset.Now.AddMinutes(7);
+        panel.Refresh();
+
+        Assert.Same(card, panel.PendingPlan); // still the same decision, not a rebuilt card
+        Assert.Contains("presented 9 min ago", card.FactsText, StringComparison.Ordinal);
+    }
+
     // ---- The plan-mode toggle --------------------------------------------
 
     /// <summary>

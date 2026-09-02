@@ -130,6 +130,9 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
 
     private readonly Func<string, Task>? _endWorker;
 
+    /// <summary>The clock the cards' "presented N min ago" is measured against; injectable for tests.</summary>
+    internal Func<DateTimeOffset> Clock { get; set; } = () => DateTimeOffset.Now;
+
     public void Refresh()
     {
         var lines = _coordinator.GetTranscript();
@@ -146,11 +149,15 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         // typing and the error text from a decision that just failed — on a surface whose whole job is to
         // let them retry. Cards are only created for plans that are new or newly revised.
         var kept = new List<PlanCardViewModel>(pending.Count);
+        var now = Clock();
         foreach (var plan in pending)
         {
             var existing = PendingPlans.FirstOrDefault(
                 c => c.PlanId == plan.PlanId && c.Revision == plan.Revision);
-            kept.Add(existing ?? new PlanCardViewModel(plan, DecideAsync));
+            // A kept instance keeps its typed feedback — and would otherwise keep the age it was born
+            // with, on the one surface whose job is to make waiting visible.
+            existing?.RefreshAge(now);
+            kept.Add(existing ?? new PlanCardViewModel(plan, DecideAsync, now));
         }
 
         for (int i = PendingPlans.Count - 1; i >= 0; i--)
@@ -282,7 +289,13 @@ public partial class PlanCardViewModel : ViewModelBase
     public string ScopeText { get; }
     public string Approach { get; }
     public string TestStrategy { get; }
-    public string FactsText { get; }
+
+    /// <summary>Who wrote it, its budget, and how long it has waited — re-measured on every refresh.</summary>
+    [ObservableProperty] private string _factsText = "";
+
+    private readonly DateTimeOffset _presentedAt;
+    private readonly decimal _budgetUsd;
+    private readonly string _worker;
 
     /// <summary>Which revision this is, e.g. "revision 2 of 3" — empty on the original presentation.</summary>
     public string RevisionText { get; }
@@ -351,9 +364,11 @@ public partial class PlanCardViewModel : ViewModelBase
     /// <summary>What the human types back to the worker on a rejection.</summary>
     [ObservableProperty] private string _feedbackText = "";
 
-    public PlanCardViewModel(WorkerPlanCard plan, Func<string, bool, string?, Task> decide)
+    public PlanCardViewModel(WorkerPlanCard plan, Func<string, bool, string?, Task> decide, DateTimeOffset? now = null)
     {
         _decide = decide;
+        _presentedAt = plan.PresentedAt;
+        _budgetUsd = plan.BudgetUsd;
         PlanId = plan.PlanId;
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
@@ -366,8 +381,8 @@ public partial class PlanCardViewModel : ViewModelBase
         RevisedAgainstText = plan.RejectionFeedback.Length > 0 ? $"revised against: {plan.RejectionFeedback}" : "";
         HasFeedbackHistory = RevisedAgainstText.Length > 0;
         NextRejectionEscalates = plan.RevisionsRemaining <= 0;
-        var age = (int)Math.Max(0, (DateTimeOffset.Now - plan.PresentedAt).TotalMinutes);
         var worker = plan.WorkerAgentId.Length > 0 ? plan.WorkerAgentId : "worker";
+        _worker = worker;
 
         IsRescope = plan.IsRescope;
         var added = plan.AddedScope;
@@ -395,10 +410,17 @@ public partial class PlanCardViewModel : ViewModelBase
             ? "This is the last round — declining again closes the widening for good. The worker is not "
               + "stopped: it keeps working inside the scope you already approved."
             : "This is the last revision — rejecting again stops the worker and escalates to you.";
+        RefreshAge(now ?? DateTimeOffset.Now);
+    }
+
+    /// <summary>Re-measures the "N min ago" against <paramref name="now"/>; the rest of the line is fixed.</summary>
+    public void RefreshAge(DateTimeOffset now)
+    {
+        var age = (int)Math.Max(0, (now - _presentedAt).TotalMinutes);
         FactsText = IsRescope
-            ? $"Asked by {worker} · budget ${plan.BudgetUsd:0.00} · asked {age} min ago · it is still "
+            ? $"Asked by {_worker} · budget ${_budgetUsd:0.00} · asked {age} min ago · it is still "
               + "approved for its current scope and is not stopped"
-            : $"Written by {worker} · budget ${plan.BudgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
+            : $"Written by {_worker} · budget ${_budgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
     }
 
     [RelayCommand] private Task ApproveAsync() => DecideAsync(approve: true, feedback: null);
