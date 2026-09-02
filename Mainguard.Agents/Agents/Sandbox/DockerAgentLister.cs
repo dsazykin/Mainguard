@@ -40,7 +40,8 @@ public static class DockerAgentLister
             // tracked state toward Docker's (ISSUES-LOG #20).
             Paused: string.Equals(c.State, "paused", StringComparison.OrdinalIgnoreCase),
             Kind: Label(c, KindLabel),
-            Role: Label(c, AgentRoleLabel))).ToList();
+            Role: Label(c, AgentRoleLabel),
+            ParentAgentId: Label(c, AgentParentLabel))).ToList();
     }
 
     /// <summary>The agent id label P2-07 stamps on every jail — also the list filter.</summary>
@@ -62,6 +63,11 @@ public static class DockerAgentLister
     /// role-less worker, so the Coordinator surface would find no coordinator for a repo that has one.</para>
     /// </summary>
     public const string AgentRoleLabel = "mainguard.agent.role";
+
+    /// <summary>The coordinator that spawned this jail (empty when none). The session record that carries
+    /// it is in-memory and dies with the daemon; the label is what lets an adopted worker still belong to
+    /// its coordinator's fan-out (contract §7 ownership is keyed on it).</summary>
+    public const string AgentParentLabel = "mainguard.agent.parent";
 
     private static string Label(ContainerListResponse container, string key) =>
         container.Labels is not null && container.Labels.TryGetValue(key, out var value) ? value : string.Empty;

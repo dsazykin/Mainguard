@@ -206,7 +206,10 @@ public sealed record ContainerSpecRequest(
     // adopt this jail back as the agent it actually is. Default "" keeps every existing caller (and the
     // ad-hoc harnesses) compiling and simply yields an unlabelled jail, which adopts as a role-less worker.
     string AgentKind = "",
-    string AgentRole = "");
+    string AgentRole = "",
+    // The spawning coordinator, stamped as mainguard.agent.parent for the same reason as the role: after a
+    // restart the label is the only record of whose fan-out this worker belongs to.
+    string AgentParentId = "");
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -697,6 +700,7 @@ public static class ContainerSpecBuilder
                 ["mainguard.role"] = "agent",
                 [DockerAgentLister.KindLabel] = request.AgentKind,
                 [DockerAgentLister.AgentRoleLabel] = request.AgentRole,
+                [DockerAgentLister.AgentParentLabel] = request.AgentParentId,
             },
             HostConfig = hostConfig,
         };

@@ -127,7 +127,8 @@ public sealed class SandboxAgentLauncher
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
         string agentRole = "",
         Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode =
-            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated)
+            Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Gated,
+        string agentParentId = "")
     {
         _log.LogInformation("launch begin: repo={Repo} kind={Kind}", repoHandle, agentKind);
 
@@ -414,7 +415,8 @@ public sealed class SandboxAgentLauncher
                 // two, a surviving coordinator is adopted back as an unnamed, role-less worker and the
                 // Coordinator surface reports no coordinator for a repo that plainly has one.
                 AgentKind: agentKind,
-                AgentRole: agentRole), ct).ConfigureAwait(false);
+                AgentRole: agentRole,
+                AgentParentId: agentParentId), ct).ConfigureAwait(false);
 
             // MG-3 (design §7, "fetch trigger: both"): from here on the daemon watches this agent's own
             // refs/heads/agent/<id> and publishes it into the mirror the moment it moves. Started only

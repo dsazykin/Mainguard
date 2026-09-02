@@ -1051,7 +1051,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       because the daemon's live session store is in-memory, so after a restart the labels are the ONLY
       record of what an agent IS and a surviving coordinator was otherwise adopted back as an anonymous,
       role-less worker. `mainguard.agent.role` is deliberately not `mainguard.role`, which already means
-      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. The record now also
+      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. `mainguard.agent.parent`
+      (the spawning coordinator) joined them on 2026-09-03: contract §7 ownership is keyed on
+      `ParentAgentId`, so a worker adopted without it was one its coordinator could no longer see, steer or
+      verify after a restart. The record now also
       carries `Paused` and a computed `Live` (`Running || Paused`): Docker reports a frozen container as
       `"paused"`, not `"running"`, so reading `Running` as "still here" made a daemon restart during an
       engaged kill switch declare the agent dead and force-remove its worktree). Seccomp/proxy images live under

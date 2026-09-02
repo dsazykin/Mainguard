@@ -396,7 +396,10 @@ public sealed class AgentSpawnService
                 // Same value the endpoint copy above was rendered from — the two deliveries of one
                 // jail's briefing disagreeing about the machine is defect G2, and a mode is exactly the
                 // sort of argument one of two call sites forgets.
-                planMode: planMode).ConfigureAwait(false);
+                planMode: planMode,
+                // The parent goes onto the labels too: ownership (contract §7) is keyed on it, and an
+                // adopted worker with no parent is one its coordinator can no longer see, steer or verify.
+                agentParentId: parentAgentId ?? string.Empty).ConfigureAwait(false);
             var bound = false;
             if (launch is not null)
             {

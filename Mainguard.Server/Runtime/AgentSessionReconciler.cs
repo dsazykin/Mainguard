@@ -182,6 +182,9 @@ public sealed class AgentSessionReconciler
                 _store.Spawn(
                     kind: string.IsNullOrEmpty(container.Kind) ? "unknown" : container.Kind,
                     role: container.Role ?? string.Empty,
+                    // The parent comes off the label as well: a coordinator's four tools are scoped to
+                    // ParentAgentId, so a worker adopted without it is orphaned from its own coordinator.
+                    parentAgentId: string.IsNullOrEmpty(container.ParentAgentId) ? null : container.ParentAgentId,
                     agentId: container.AgentId,
                     repoHash: key.RepoHash);
                 _store.AttachSandbox(key, container.ContainerId);

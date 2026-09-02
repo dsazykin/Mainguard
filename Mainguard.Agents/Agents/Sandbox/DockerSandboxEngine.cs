@@ -230,7 +230,8 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // Carried onto the jail's labels: what this agent IS, so a restarted daemon can adopt it back
             // as itself rather than as an anonymous worker.
             AgentKind: request.AgentKind,
-            AgentRole: request.AgentRole);
+            AgentRole: request.AgentRole,
+            AgentParentId: request.AgentParentId);
 
         var create = ContainerSpecBuilder.Build(spec);
         var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);

@@ -103,7 +103,8 @@ public sealed record SandboxSpawnRequest(
     string? ToolchainsRootPath = null,
     IReadOnlyList<string>? ToolchainIds = null,
     string AgentKind = "",
-    string AgentRole = "");
+    string AgentRole = "",
+    string AgentParentId = "");
 
 /// <summary>A running sandbox handle. <see cref="Reused"/> is true when a stopped persistent jail was re-started rather than recreated.</summary>
 public sealed record SandboxHandle(string ContainerId, bool Reused);

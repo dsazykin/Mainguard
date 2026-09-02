@@ -25,9 +25,13 @@ namespace Mainguard.Agents.Agents;
 /// <c>mainguard.agent.role</c> label: <c>""</c>, <c>coordinator</c> or <c>managed</c>. Distinct from the
 /// <c>mainguard.role</c> label, which says what KIND of container this is (<c>agent</c> vs
 /// <c>egress-proxy</c>) and is always <c>agent</c> here.</param>
+/// <param name="ParentAgentId">The coordinator that spawned this jail, from the <c>mainguard.agent.parent</c>
+/// label; empty for an agent nobody spawned or a jail created before the label existed. Without it an
+/// adopted worker has no parent, and its coordinator's <c>status</c>/<c>prompt</c>/<c>verify</c> — all
+/// scoped to <c>ParentAgentId</c> — answer "no worker" for every worker it owns after a restart.</param>
 public sealed record AgentContainerState(
     string AgentId, string RepoHash, string ContainerId, bool Running,
-    bool Paused = false, string Kind = "", string Role = "")
+    bool Paused = false, string Kind = "", string Role = "", string ParentAgentId = "")
 {
     /// <summary>
     /// The jail still exists and is holding the agent's process tree — <see cref="Running"/> <b>or</b>
