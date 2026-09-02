@@ -235,6 +235,54 @@ public class CoordinatorPlanDecisionTests
         Assert.False(card.IsDeciding);
     }
 
+    // ---- The plan-mode toggle --------------------------------------------
+
+    /// <summary>
+    /// A toggle that never reached the daemon used to escape the command onto the dispatcher, where the
+    /// crash guard turned it into a generic notice. The checkbox snapped back correctly, but nothing on
+    /// the gate said why — and this is the one disagreement where the human believes they have (or have
+    /// switched off) an approval step and the daemon disagrees.
+    /// </summary>
+    [Fact]
+    public async Task AFailedPlanModeToggle_SaysSoOnTheGate_AndShowsTheDaemonsValue()
+    {
+        var coordinator = new FakeCoordinator { SetPlanModeThrow = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        Assert.True(panel.PlanModeEnabled);
+
+        panel.PlanModeEnabled = false; // the checkbox moved before the command ran
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+
+        Assert.True(panel.HasPlanModeError);
+        Assert.Contains("daemon unreachable", panel.PlanModeErrorText, StringComparison.Ordinal);
+        Assert.True(panel.PlanModeEnabled, "the box must show the daemon's value, not the requested one");
+        Assert.Empty(coordinator.PlanModeSets);
+    }
+
+    /// <summary>The error is cleared by success — a retry that lands, or the daemon seen holding the value.</summary>
+    [Fact]
+    public async Task APlanModeError_ClearsWhenTheDaemonHoldsTheRequestedValue()
+    {
+        var coordinator = new FakeCoordinator { SetPlanModeThrow = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        panel.PlanModeEnabled = false;
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+        Assert.True(panel.HasPlanModeError);
+
+        // An unrelated refresh with the daemon unchanged keeps the error: nothing has been resolved.
+        panel.Refresh();
+        Assert.True(panel.HasPlanModeError);
+
+        coordinator.SetPlanModeThrow = null;
+        panel.PlanModeEnabled = false;
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+
+        Assert.False(panel.HasPlanModeError);
+        Assert.Equal("", panel.PlanModeErrorText);
+        Assert.False(panel.PlanModeEnabled);
+        Assert.Equal(new[] { false }, coordinator.PlanModeSets);
+    }
+
     // ---- The silent failure ----------------------------------------------
 
     /// <summary>
@@ -337,8 +385,16 @@ public class CoordinatorPlanDecisionTests
 
         public PlanModeView GetPlanMode() => PlanMode;
 
+        /// <summary>Set to make the toggle fail the way an unreachable daemon does.</summary>
+        public Exception? SetPlanModeThrow { get; set; }
+
         public Task SetPlanModeAsync(bool enabled)
         {
+            if (SetPlanModeThrow is not null)
+            {
+                throw SetPlanModeThrow;
+            }
+
             PlanModeSets.Add(enabled);
             PlanMode = new PlanModeView(enabled, enabled ? "ON" : "OFF");
             return Task.CompletedTask;

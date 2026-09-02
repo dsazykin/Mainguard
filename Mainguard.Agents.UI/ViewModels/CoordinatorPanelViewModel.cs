@@ -85,6 +85,21 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [ObservableProperty] private string _planModeSummary = "";
 
     /// <summary>
+    /// Why the last toggle did not reach the daemon (empty when nothing is wrong). Said on the gate,
+    /// beside the checkbox that snapped back, rather than escaping to the dispatcher's crash guard as a
+    /// generic notice: the human who clicked is looking here, and the fact they need is that the gate
+    /// is still in the state the box now shows.
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasPlanModeError))]
+    private string _planModeErrorText = "";
+
+    public bool HasPlanModeError => PlanModeErrorText.Length > 0;
+
+    /// <summary>The value a failed toggle asked for; cleared once the daemon is seen holding it.</summary>
+    private bool? _planModeRequested;
+
+    /// <summary>
     /// Re-raise <see cref="HasGateContent"/> when the toggle moves.
     ///
     /// <para>This is the whole reason plan mode is part of that flag: with approvals off nothing is ever
@@ -169,9 +184,15 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         // A toggle that rendered the requested value would keep showing "on" after a Set that never
         // arrived — the one disagreement where a human believes they have an approval step and do not.
         var planMode = _coordinator.GetPlanMode();
+        // A failed toggle's error stands until the daemon is seen holding the value that was asked for.
+        if (_planModeRequested is { } requested && planMode.Enabled == requested)
+        {
+            _planModeRequested = null;
+            PlanModeErrorText = "";
+        }
+
         PlanModeEnabled = planMode.Enabled;
         PlanModeSummary = planMode.Summary;
-
     }
 
     /// <summary>
@@ -184,9 +205,20 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [RelayCommand]
     private async Task TogglePlanModeAsync()
     {
+        var requested = PlanModeEnabled;
         try
         {
-            await _coordinator.SetPlanModeAsync(PlanModeEnabled);
+            await _coordinator.SetPlanModeAsync(requested);
+            _planModeRequested = null;
+            PlanModeErrorText = "";
+        }
+        catch (Exception ex)
+        {
+            // Caught here rather than left to escape the RelayCommand onto the dispatcher: the box snaps
+            // back in the refresh below, and this is the sentence that says why it did.
+            _planModeRequested = requested;
+            PlanModeErrorText =
+                $"Plan mode was not changed — {ex.Message}. The gate is still as the checkbox now shows; try again.";
         }
         finally
         {

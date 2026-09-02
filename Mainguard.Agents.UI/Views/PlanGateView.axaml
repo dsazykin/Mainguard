@@ -53,6 +53,11 @@
         <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
                    Foreground="{DynamicResource WarningBrush}"
                    IsVisible="{Binding !PlanModeEnabled}"/>
+        <!-- A toggle the daemon refused or never received. The box has already snapped back to the
+             daemon's answer; this is the reason, on the surface the click happened on. -->
+        <TextBlock Text="{Binding PlanModeErrorText}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource DangerBrush}"
+                   IsVisible="{Binding HasPlanModeError}"/>
       </StackPanel>
     </Border>
 
