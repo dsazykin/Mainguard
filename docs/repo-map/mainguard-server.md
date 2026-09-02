@@ -820,8 +820,9 @@
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe
     `JsonPlanApprovalStore` (**limits injected** — the revision budget is enforced there, not prompted),
-    the phase-2 `WorkerPlanGate` (also wired into `MergeQueueProvisioner` as an `IMergeGate` by
-    `GatewayServiceRegistration`), the
+    the phase-2 `WorkerPlanGate` over a restart-safe `JsonHeldTaskStore` (`mainguard-held-tasks.json`
+    beside the plan store — a gate whose held tasks died with the process was a gate until the first daemon
+    update; also wired into `MergeQueueProvisioner` as an `IMergeGate` by `GatewayServiceRegistration`), the
     shared `KillSwitchGate`, `IKillTarget`, `KillSwitch`) + the `RoleInterceptor`, the P2-47
     `SandboxAgentLauncher` (real spawn chain) + `IMergeBranchDiffService` (merge-diff bridge)
     singletons, the PR3 CLI-agent singletons (shared `InstalledAdapterCatalog`, `SessionKeyCache`,

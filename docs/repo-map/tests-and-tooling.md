@@ -1759,6 +1759,11 @@
   the daemon hands it to the worker verbatim, so a dropped binding costs one of three revisions and tells
   the worker nothing while the operator's box still shows what they typed; and the latch is asserted as a
   **transition** through a held `TaskCompletionSource`, since only a transition can fail),
+  **`WorkerPlanGateTests` also carries the restart case** — `AHeldTask_SurvivesARestart_InBothDirections_
+  AndTheReleaseLatchWithIt` drives two gates over one `JsonHeldTaskStore` file and asserts the pending
+  worker still cannot merge, the approved worker still receives its task, the plan-mode-off worker keeps
+  its mode, the release audit/announce is not repeated, and `Forget` is durable; an unreadable file
+  rehydrates as nothing held.
   **`WorkerPlanGateTests` also carries the phase-3 key** — held tasks are keyed by `(RepoHash, AgentId)`,
   so two repos may each hold a task for the same `pr-7`, and a bare id held by two repos resolves
   UNIQUE-OR-NOTHING: `TryReleaseTask` refuses rather than letting one repo's approval release another

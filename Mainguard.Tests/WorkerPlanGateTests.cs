@@ -587,4 +587,97 @@ public class WorkerPlanGateTests
             Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
         }
     }
+
+    // ---- The held task outlives the daemon ---------------------------------
+
+    /// <summary>
+    /// <b>The gate's claim is that the DAEMON holds the task — and it held it in memory only.</b> The plan
+    /// store beside it was a file, so a restart with jails alive rehydrated every plan and forgot every
+    /// held task. Two lies followed, in opposite directions: <see cref="WorkerPlanGate.Allows"/> answered
+    /// yes for a worker whose plan was still pending (the merge backstop opened), and
+    /// <see cref="WorkerPlanGate.TryReleaseTask"/> answered no for a worker whose plan was approved (it
+    /// never received its task). This drives two gates over one file and asserts both directions, plus
+    /// that the release latch survives — the re-attach after a restart is exactly the repeat call the
+    /// once-only audit exists for.
+    /// </summary>
+    [Fact]
+    public void AHeldTask_SurvivesARestart_InBothDirections_AndTheReleaseLatchWithIt()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"mg-held-{Guid.NewGuid():N}");
+        var plansPath = Path.Combine(dir, "mainguard-plans.json");
+        var heldPath = Path.Combine(dir, "mainguard-held-tasks.json");
+        var audit = new InMemoryAuditLog();
+        try
+        {
+            var plans1 = new PlanApprovalService(new JsonPlanApprovalStore(plansPath), audit);
+            var gate1 = new WorkerPlanGate(plans1, audit, new JsonHeldTaskStore(heldPath));
+            gate1.Hold("approved-w", "coord-1", "Fix the clock", "rewrite TokenClock", 2m, repoHash: "repo-a");
+            gate1.Hold("pending-w", "coord-1", "Fix the docs", "rewrite README", 0m, repoHash: "repo-a");
+            gate1.Hold("ungated-w", "coord-1", "Fix the tests", "rewrite tests", 0m, repoHash: "repo-a", mode: WorkerPlanMode.Ungated);
+            plans1.Approve(plans1.Present("approved-w", "coord-1", "Fix the clock", Fields(), "", 2m).PlanId!, "uid:1000");
+            plans1.Present("pending-w", "coord-1", "Fix the docs", Fields(), "", 0m);
+            Assert.True(gate1.TryReleaseTask("approved-w", out _));
+
+            // The restart: fresh service and gate over the same two files, the previous ones discarded.
+            var plans2 = new PlanApprovalService(new JsonPlanApprovalStore(plansPath), audit);
+            var gate2 = new WorkerPlanGate(plans2, audit, new JsonHeldTaskStore(heldPath));
+            var announced = 0;
+            gate2.TaskReleased += (_, _) => announced++;
+
+            // The approved worker is still held and still authorised — and still gets its task on re-attach.
+            Assert.Equal("Fix the clock", gate2.PlanningBriefFor("approved-w"));
+            Assert.Equal(2m, gate2.BudgetFor("approved-w"));
+            Assert.Equal("coord-1", gate2.CoordinatorFor("approved-w"));
+            Assert.True(gate2.TryReleaseTask("approved-w", out var task));
+            Assert.Equal("rewrite TokenClock", task);
+            Assert.True(gate2.MayAutoVerify("approved-w", out _));
+            Assert.StartsWith("plan gate: plan approved", gate2.MergeEvidence("approved-w")!, StringComparison.Ordinal);
+
+            // …and the latch survived: the release was audited and announced by the FIRST daemon, once.
+            Assert.Equal(0, announced);
+            Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+            Assert.True(gate2.TaskWasReleased("approved-w"));
+
+            // The pending worker is still held, so the merge backstop still says no — the dangerous direction.
+            Assert.False(gate2.Allows("pending-w", out var reason));
+            Assert.Contains("waiting on your approval", reason, StringComparison.Ordinal);
+            Assert.False(gate2.TryReleaseTask("pending-w", out _));
+            Assert.Equal("Fix the docs", gate2.PlanningBriefFor("pending-w"));
+
+            // The plan-mode-off worker keeps its recorded mode; it is not re-gated by a restart.
+            Assert.True(gate2.IsUngated("ungated-w"));
+            Assert.True(gate2.TryReleaseTask("ungated-w", out var ungatedTask));
+            Assert.Equal("rewrite tests", ungatedTask);
+            Assert.Equal(3, gate2.HeldTaskCount);
+
+            // Forget is durable too: a third daemon does not resurrect a stopped worker's task.
+            gate2.Forget("pending-w");
+            var gate3 = new WorkerPlanGate(plans2, audit, new JsonHeldTaskStore(heldPath));
+            Assert.Null(gate3.PlanningBriefFor("pending-w"));
+            Assert.Equal(2, gate3.HeldTaskCount);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>An unreadable held-task file rehydrates as nothing held — the pre-existing behaviour,
+    /// never as a task handed to a worker whose approval cannot be established.</summary>
+    [Fact]
+    public void AnUnreadableHeldTaskFile_RehydratesAsNothingHeld()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mg-held-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, "{ not json");
+            var (plans, _) = Rig();
+            var gate = new WorkerPlanGate(plans, store: new JsonHeldTaskStore(path));
+            Assert.Equal(0, gate.HeldTaskCount);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }

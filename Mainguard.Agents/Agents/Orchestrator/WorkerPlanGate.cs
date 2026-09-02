@@ -36,6 +36,174 @@ public enum WorkerPlanMode
 }
 
 /// <summary>
+/// One withheld task as the gate persists it. A public mirror of the gate's private record, because the
+/// gate's whole claim — "the DAEMON holds the task" — was only true until the daemon restarted: the
+/// dictionary behind it was memory-only while the plan store beside it was a file, so a restart with jails
+/// alive left every held worker unheld. Unheld means <see cref="WorkerPlanGate.Allows"/> answers yes (the
+/// merge backstop opens for an unapproved branch), <see cref="WorkerPlanGate.TryReleaseTask"/> answers
+/// no (an approved worker never receives its task), and the merge record says "not a plan-gated worker"
+/// about a worker that was. The record carries exactly what <c>Hold</c> was told plus the release latch.
+/// </summary>
+public sealed record HeldTaskRecord(
+    string RepoHash,
+    string AgentId,
+    string CoordinatorId,
+    string Title,
+    string TaskPrompt,
+    decimal BudgetUsd,
+    bool Released,
+    WorkerPlanMode Mode);
+
+/// <summary>The persistence seam for the gate's held tasks (daemon-side, restart-safe).</summary>
+public interface IHeldTaskStore
+{
+    /// <summary>Every persisted held task (rehydrated by the gate's constructor).</summary>
+    IReadOnlyList<HeldTaskRecord> LoadAll();
+
+    /// <summary>Upsert one held task, keyed by (repo, agent).</summary>
+    void Save(HeldTaskRecord record);
+
+    /// <summary>Drop one held task (the worker was stopped, or its spawn failed).</summary>
+    void Remove(string repoHash, string agentId);
+}
+
+/// <summary>An <see cref="IHeldTaskStore"/> that forgets on restart — the default for the pure paths.</summary>
+public sealed class InMemoryHeldTaskStore : IHeldTaskStore
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<(string, string), HeldTaskRecord> _records = new();
+
+    public IReadOnlyList<HeldTaskRecord> LoadAll()
+    {
+        lock (_gate) { return _records.Values.ToList(); }
+    }
+
+    public void Save(HeldTaskRecord record)
+    {
+        lock (_gate) { _records[(record.RepoHash, record.AgentId)] = record; }
+    }
+
+    public void Remove(string repoHash, string agentId)
+    {
+        lock (_gate) { _records.Remove((repoHash, agentId)); }
+    }
+}
+
+/// <summary>
+/// A JSON-file <see cref="IHeldTaskStore"/>, written beside <see cref="JsonPlanApprovalStore"/> with the
+/// same write-rename discipline. Reads fail CLOSED in the only direction that is safe here: an unreadable
+/// file rehydrates as <i>nothing held</i>, which is the pre-existing restart behaviour, never as a task
+/// handed to a worker whose approval cannot be established.
+/// </summary>
+public sealed class JsonHeldTaskStore : IHeldTaskStore
+{
+    private readonly string _path;
+    private readonly object _gate = new();
+
+    public JsonHeldTaskStore(string path)
+    {
+        _path = path ?? throw new ArgumentNullException(nameof(path));
+    }
+
+    public IReadOnlyList<HeldTaskRecord> LoadAll()
+    {
+        lock (_gate)
+        {
+            return LoadDtosLocked().Select(FromDto).ToList();
+        }
+    }
+
+    public void Save(HeldTaskRecord record)
+    {
+        lock (_gate)
+        {
+            var dtos = LoadDtosLocked();
+            dtos.RemoveAll(d => d.RepoHash == record.RepoHash && d.AgentId == record.AgentId);
+            dtos.Add(ToDto(record));
+            WriteLocked(dtos);
+        }
+    }
+
+    public void Remove(string repoHash, string agentId)
+    {
+        lock (_gate)
+        {
+            var dtos = LoadDtosLocked();
+            if (dtos.RemoveAll(d => d.RepoHash == repoHash && d.AgentId == agentId) > 0)
+            {
+                WriteLocked(dtos);
+            }
+        }
+    }
+
+    private void WriteLocked(List<HeldTaskDto> dtos)
+    {
+        var dir = System.IO.Path.GetDirectoryName(_path);
+        if (!string.IsNullOrEmpty(dir))
+        {
+            System.IO.Directory.CreateDirectory(dir);
+        }
+
+        var tmp = _path + ".tmp";
+        System.IO.File.WriteAllText(tmp, System.Text.Json.JsonSerializer.Serialize(dtos));
+        System.IO.File.Move(tmp, _path, overwrite: true);
+    }
+
+    private List<HeldTaskDto> LoadDtosLocked()
+    {
+        if (!System.IO.File.Exists(_path))
+        {
+            return new();
+        }
+
+        try
+        {
+            return System.Text.Json.JsonSerializer.Deserialize<List<HeldTaskDto>>(System.IO.File.ReadAllText(_path)) ?? new();
+        }
+        catch (Exception ex) when (ex is System.Text.Json.JsonException or System.IO.IOException)
+        {
+            return new();
+        }
+    }
+
+    private static HeldTaskDto ToDto(HeldTaskRecord r) => new()
+    {
+        RepoHash = r.RepoHash,
+        AgentId = r.AgentId,
+        CoordinatorId = r.CoordinatorId,
+        Title = r.Title,
+        TaskPrompt = r.TaskPrompt,
+        BudgetUsd = r.BudgetUsd,
+        Released = r.Released,
+        // Written by name, never as an int, so a hand-read store file says what it means — and an
+        // unparseable value rehydrates as Gated, the fail-closed direction.
+        Mode = r.Mode.ToString(),
+    };
+
+    private static HeldTaskRecord FromDto(HeldTaskDto d) => new(
+        d.RepoHash ?? string.Empty,
+        d.AgentId ?? string.Empty,
+        d.CoordinatorId ?? string.Empty,
+        d.Title ?? string.Empty,
+        d.TaskPrompt ?? string.Empty,
+        d.BudgetUsd,
+        d.Released,
+        Enum.TryParse<WorkerPlanMode>(d.Mode, out var mode) ? mode : WorkerPlanMode.Gated);
+
+    private sealed class HeldTaskDto
+    {
+        public string? RepoHash { get; set; }
+        public string? AgentId { get; set; }
+        public string? CoordinatorId { get; set; }
+        public string? Title { get; set; }
+        public string? TaskPrompt { get; set; }
+        public decimal BudgetUsd { get; set; }
+        public bool Released { get; set; }
+        public string? Mode { get; set; }
+    }
+}
+
+/// <summary>
 /// The <b>daemon-side</b> enforcement of the phase-2 plan gate (coordinator contract §2 + §5).
 ///
 /// <para><b>Why this exists separately from <see cref="PlanApprovalService"/>.</b> That service owns the
@@ -79,6 +247,7 @@ public sealed class WorkerPlanGate : IMergeGate
 {
     private readonly PlanApprovalService _plans;
     private readonly IAuditLog _audit;
+    private readonly IHeldTaskStore _store;
     private readonly object _gate = new();
 
     /// <summary>
@@ -99,11 +268,36 @@ public sealed class WorkerPlanGate : IMergeGate
     /// </summary>
     private readonly Dictionary<(string RepoHash, string AgentId), HeldTask> _held = new();
 
-    public WorkerPlanGate(PlanApprovalService plans, IAuditLog? audit = null)
+    /// <param name="store">
+    /// Where held tasks outlive the process. Defaults to memory for the pure paths; the daemon passes a
+    /// <see cref="JsonHeldTaskStore"/> beside the plan store, because a gate that forgets what it is
+    /// holding on restart is a gate only until the first daemon update.
+    /// </param>
+    public WorkerPlanGate(PlanApprovalService plans, IAuditLog? audit = null, IHeldTaskStore? store = null)
     {
         _plans = plans ?? throw new ArgumentNullException(nameof(plans));
         _audit = audit ?? new InMemoryAuditLog();
+        _store = store ?? new InMemoryHeldTaskStore();
+
+        // Restart resume: every task the previous daemon was holding, released latch included. No audit
+        // event here — nothing was withheld or released by this rehydration, and a second
+        // `worker_task_withheld` per restart would inflate how many workers were ever gated.
+        foreach (var record in _store.LoadAll())
+        {
+            if (string.IsNullOrWhiteSpace(record.AgentId))
+            {
+                continue;
+            }
+
+            _held[(record.RepoHash ?? string.Empty, record.AgentId)] = new HeldTask(
+                record.RepoHash ?? string.Empty, record.CoordinatorId ?? string.Empty, record.Title ?? string.Empty,
+                record.TaskPrompt ?? string.Empty, record.BudgetUsd, record.Released, record.Mode);
+        }
     }
+
+    private static HeldTaskRecord ToRecord((string RepoHash, string AgentId) key, HeldTask task) => new(
+        key.RepoHash, key.AgentId, task.CoordinatorId, task.Title, task.TaskPrompt, task.BudgetUsd,
+        task.Released, task.Mode);
 
     /// <summary>A task prompt withheld from a worker until its plan is approved.</summary>
     /// <param name="Mode">
@@ -264,9 +458,11 @@ public sealed class WorkerPlanGate : IMergeGate
                 return;
             }
 
-            _held[key] = new HeldTask(
+            var task = new HeldTask(
                 repoHash ?? string.Empty, coordinatorId ?? "", title ?? "", taskPrompt ?? "", budgetUsd,
                 Released: false, Mode: mode);
+            _held[key] = task;
+            _store.Save(ToRecord(key, task));
         }
 
         // One event, with the mode ON it, rather than two event names. A reader counting "how many
@@ -398,7 +594,11 @@ public sealed class WorkerPlanGate : IMergeGate
                 // `ReleasingTwiceForARepoScopedWorker_StillAuditsAndAnnouncesOnce` is the test that fails
                 // if it ever is — the pre-existing release-once tests all hold at the default empty repo
                 // hash, where the wrong key and the right key coincide.
-                _held[key] = task with { Released = true };
+                var released = task with { Released = true };
+                _held[key] = released;
+                // Persisted with the latch: a restart between the release and the next call must not
+                // re-announce, re-audit or re-deliver a task the previous daemon already handed over.
+                _store.Save(ToRecord(key, released));
             }
         }
 
@@ -433,6 +633,7 @@ public sealed class WorkerPlanGate : IMergeGate
             if (ResolveKeyLocked(workerAgentId) is { } key)
             {
                 _held.Remove(key);
+                _store.Remove(key.RepoHash, key.AgentId);
             }
         }
     }

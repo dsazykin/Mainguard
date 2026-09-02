@@ -114,9 +114,14 @@ public static class DaemonHost
         // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
         // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
         // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
+        // Its held tasks are a FILE beside the plan store, for the same reason the plan store is one: the
+        // gate's claim is that the daemon withholds the task, and a daemon that forgot every held task on
+        // restart (while the jails it held them from survived) was withholding nothing — the merge
+        // backstop answered yes for an unapproved worker and an approved one never received its task.
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate(
             sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>(),
-            sp.GetRequiredService<IAuditLog>()));
+            sp.GetRequiredService<IAuditLog>(),
+            new Mainguard.Agents.Agents.Orchestrator.JsonHeldTaskStore(ResolveHeldTaskStorePath(tokenPath))));
         // P2-47 #9: the coordinator conversation the CoordinatorService streams. Registered with no reply
         // engine in the shipped daemon — the live LLM-backed CoordinatorAgent adapter is the one leg that
         // needs a real model (the documented un-verifiable leg); the transcript store + streaming are real
@@ -510,6 +515,10 @@ public static class DaemonHost
 
         return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-plans.json");
     }
+
+    /// <summary>The plan gate's held-task store: beside the plan store, isolated per in-proc host the same way.</summary>
+    private static string ResolveHeldTaskStorePath(string? tokenPath) =>
+        Path.Combine(Path.GetDirectoryName(ResolvePlanStorePath(tokenPath))!, "mainguard-held-tasks.json");
 
     /// <summary>Where the durable kill journal lands — beside the (test-isolated) session token, exactly
     /// like the plan store, so an in-proc test host never appends to the real daemon's record.</summary>

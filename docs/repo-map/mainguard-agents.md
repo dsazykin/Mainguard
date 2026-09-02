@@ -1900,7 +1900,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       boundary as `ApprovePlan`. Design: `docs/design/coordinator-phase-3-decisions.md` §23).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
-      a spawned worker's task **without giving it to the worker** — and, since 2026-08-29, refuses to
+      a spawned worker's task **without giving it to the worker** (persisted through `IHeldTaskStore` —
+      `JsonHeldTaskStore` beside the plan store in the daemon, `InMemoryHeldTaskStore` in tests — because
+      a held task that lived only in memory was forgotten by every daemon restart while the jail it was
+      withheld from survived: `Allows` then opened for an unapproved worker and `TryReleaseTask` refused an
+      approved one; the release latch is persisted with it so a re-attach after a restart does not
+      re-audit or re-announce) — and, since 2026-08-29, refuses to
       record one at all unless the brief is a brief (`RefuseBrief`/`MaxBriefLength`: a title is required,
       is one line, is at most 120 characters, and **must not equal the task**). That check lives here
       because this is the one object holding both strings and the sole source of `PlanningBriefFor`; the
