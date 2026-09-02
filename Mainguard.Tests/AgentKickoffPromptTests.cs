@@ -59,6 +59,23 @@ public class AgentKickoffPromptTests
     }
 
     /// <summary>
+    /// The turn teaches the commit form the daemon actually accepts. It used to say <c>commit &lt;message&gt;</c>
+    /// — unquoted, and without the deviation declaration a gated <c>commit_work</c> refuses without — so
+    /// every worker's first commit cost a refusal and a turn, and the kickoff contradicted the operating
+    /// instructions delivered beside it. Single-sourced from <see cref="WorkerPlanShim.CommitUsage"/>.
+    /// </summary>
+    [Fact]
+    public void TheTurnTeachesTheCommitFormTheDaemonAccepts()
+    {
+        Assert.Contains(WorkerShim + " " + WorkerPlanShim.CommitUsage,
+            AgentKickoffPrompt.For(AgentIpcEndpointRole.Worker, WorkerShim)!, StringComparison.Ordinal);
+        Assert.Contains(WorkerShim + " " + WorkerPlanShim.CommitUsage,
+            AgentKickoffPrompt.WorkerUngated(WorkerShim), StringComparison.Ordinal);
+        Assert.DoesNotContain("commit <message>",
+            AgentKickoffPrompt.For(AgentIpcEndpointRole.Worker, WorkerShim)!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// The turn tells the worker, in as many words, that it does NOT have the task and must not start.
     /// Phase 2 §2.2 makes the daemon the enforcement, and this text must not contradict it: a first turn
     /// that read like a go-ahead would produce a worker doing unauthorised work that the merge gate then

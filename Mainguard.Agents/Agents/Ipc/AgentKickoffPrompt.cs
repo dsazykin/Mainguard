@@ -57,7 +57,8 @@ public static class AgentKickoffPrompt
         3. Write the plan you author to a JSON file OUTSIDE the repository — /tmp/plan.json —
            `{"scope": ["path", ...], "approach": "...", "testStrategy": "..."}` — and run
            `{{shimPath}} present /tmp/plan.json`. It blocks until a human decides, and prints the decision.
-        4. Once your plan is approved and the work is done, run `{{shimPath}} commit <message>`. That is
+        4. Once your plan is approved and the work is done, run
+           `{{shimPath}} {{WorkerPlanShim.CommitUsage}}`. That is
            the only way your work leaves this jail: the worktree is deleted when the agent stops, so
            anything you have not committed is lost.
 
@@ -89,7 +90,8 @@ public static class AgentKickoffPrompt
         1. Run `{{shimPath}} task` to learn what you are here to do.
         2. Read the code in /workspace that the task points at. Actually read it before you change it.
         3. Do the work.
-        4. Run `{{shimPath}} commit <message>` when it is done, and again after any further change. That
+        4. Run `{{shimPath}} {{WorkerPlanShim.CommitUsage}}` when it is done, and again after any
+           further change. That
            is the only way your work leaves this jail: the worktree is deleted when the agent stops, so
            anything you have not committed is lost.
 
