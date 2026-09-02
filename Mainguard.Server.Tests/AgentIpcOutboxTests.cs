@@ -248,6 +248,102 @@ public sealed class AgentIpcOutboxTests
     }
 
     /// <summary>
+    /// The RESPONSE side of the same defect, and the one that could write. The request's claim was moved
+    /// out of the jail's directory; the response was still staged INSIDE it, under a name the jail chose
+    /// (the ticket), and <c>File.WriteAllText</c> + <c>File.SetUnixFileMode</c> both follow a symlink. So
+    /// <c>ln -s ~/.zshrc outbox/&lt;ticket&gt;.out</c> made the daemon — running natively as the user on the
+    /// macOS substrate — truncate and rewrite a host file and chmod it 0666, from a jail whose whole
+    /// premise is that it has no path into anything outside itself.
+    ///
+    /// <para>Both names the daemon touches are planted as links to a canary: the staging name and the
+    /// final name. The canary must be byte-identical with its mode intact afterwards, and the shim must
+    /// still get its answer — a fix that merely refused to answer would have traded a host write for a
+    /// dead channel.</para>
+    /// </summary>
+    [Fact]
+    public async Task APlantedSymlinkAtTheResponsesName_IsNeverFollowed_AndTheJailStillGetsItsAnswer()
+    {
+        using var server = NewServer();
+        var agentId = NewAgentId();
+        var dir = server.CreateEndpoint(agentId, (_, _, _) =>
+            Task.FromResult(new AgentIpcResponse(Ok: true, Status: "answered")), AgentIpcEndpointRole.Coordinator, Instructions);
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+
+        var canary = Path.Combine(Path.GetDirectoryName(dir)!, agentId + "-canary.txt");
+        const string canaryText = "the daemon must never write here\n";
+        File.WriteAllText(canary, canaryText);
+        if (!OperatingSystem.IsWindows())
+        {
+            File.SetUnixFileMode(canary, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+        }
+
+        // The shim's own sequence, with the two names the daemon will use for its answer pre-planted as
+        // links to the canary — the ticket is the jail's to choose, so it knows both in advance.
+        var ticket = Guid.NewGuid().ToString("N");
+        File.CreateSymbolicLink(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseStagingSuffix), canary);
+        File.CreateSymbolicLink(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix), canary);
+        var staged = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxStagingSuffix);
+        File.WriteAllText(staged, AgentIpcProtocol.SerializeRequest(new AgentIpcRequest(AgentIpcRequest.StatusOp)) + "\n");
+        File.Move(staged, Path.Combine(outbox, ticket + AgentIpcPaths.OutboxRequestSuffix));
+
+        // Wait for the RENAME, not for existence: the planted link already "exists" and reads as the
+        // canary. Only the daemon can turn that name into a regular file, and only by rename.
+        var finalPath = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix);
+        await WaitUntilAsync(
+            () => new FileInfo(finalPath).LinkTarget is null, "the daemon never replaced the planted link with its answer");
+        var response = await ReadResponseAsync(outbox, ticket);
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal("answered", response.Status);
+
+        // The response landed by RENAME, replacing the planted link with a real file — never by writing
+        // through it.
+        var final = new FileInfo(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix));
+        Assert.Null(final.LinkTarget);
+        Assert.Equal(canaryText, File.ReadAllText(canary));
+        if (!OperatingSystem.IsWindows())
+        {
+            Assert.Equal(UnixFileMode.UserRead | UnixFileMode.UserWrite, File.GetUnixFileMode(canary));
+        }
+
+        // The planted staging-name link is exactly as the jail left it: the daemon neither wrote through
+        // it nor replaced it, because it never staged anything under a name in this directory.
+        var plantedStaging = new FileInfo(Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseStagingSuffix));
+        Assert.Equal(canary, plantedStaging.LinkTarget);
+    }
+
+    /// <summary>
+    /// A DIRECTORY planted at the response's name is the one thing a rename cannot replace. The daemon
+    /// must not fall back to anything cleverer — every alternative is a write into a jail-controlled
+    /// name — so the only acceptable outcome is that this jail loses this answer, the staged copy does
+    /// not linger in the daemon's directory, and the endpoint keeps serving.
+    /// </summary>
+    [Fact]
+    public async Task ADirectoryPlantedAtTheResponsesName_OnlyCostsTheJailItsAnswer()
+    {
+        using var server = NewServer();
+        var agentId = NewAgentId();
+        var dir = server.CreateEndpoint(agentId, (_, _, _) =>
+            Task.FromResult(new AgentIpcResponse(Ok: true)), AgentIpcEndpointRole.Coordinator, Instructions);
+        var outbox = AgentIpcPaths.OutboxIn(dir);
+        var inflight = AgentIpcPaths.InflightIn(dir);
+
+        var ticket = Guid.NewGuid().ToString("N");
+        var blocker = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix);
+        Directory.CreateDirectory(blocker);
+        var request = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxRequestSuffix);
+        File.WriteAllText(request, AgentIpcProtocol.SerializeRequest(new AgentIpcRequest(AgentIpcRequest.StatusOp)) + "\n");
+
+        await WaitUntilAsync(() => !File.Exists(request), "the request was never claimed");
+        await WaitUntilAsync(
+            () => !Directory.EnumerateFiles(inflight).Any(),
+            "the daemon left its staged response, or the claim, behind in inflight/");
+        Assert.True(Directory.Exists(blocker), "the daemon removed something the jail put at the response's name");
+
+        var response = await CallOverOutboxAsync(server, agentId, new AgentIpcRequest(AgentIpcRequest.StatusOp));
+        Assert.True(response.Ok, response.Error);
+    }
+
+    /// <summary>
     /// A jail needs no capability at all to <c>mkfifo</c> in a directory it can write, and a FIFO is
     /// indistinguishable from a regular file through every managed API — measured: <c>Attributes</c> is
     /// <c>Normal</c>, <c>LinkTarget</c> is null, <c>Length</c> is 0.

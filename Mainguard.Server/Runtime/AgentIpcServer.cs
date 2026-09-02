@@ -725,20 +725,49 @@ public sealed class AgentIpcServer : IDisposable
 
             try
             {
-                // Staged then renamed, under a suffix the shim never writes: the shim polls for the final
-                // name, so it can only ever observe a response that is complete.
-                var staged = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseStagingSuffix);
+                // Staged in the DAEMON-ONLY directory, then renamed across the boundary into the outbox.
+                //
+                // The response used to be staged inside the outbox itself, and that was a host-file write
+                // for the jail to aim: the ticket is a name the jail chose, the outbox is a directory the
+                // jail can write, and `File.WriteAllText` + `File.SetUnixFileMode` both FOLLOW a symlink.
+                // So `ln -s ~/.zshrc outbox/<ticket>.out` from inside the jail made the daemon — running
+                // natively as the user on the macOS substrate — truncate that file, write a JSON status
+                // response into it and chmod it 0666. The request side had already been moved out of the
+                // jail's reach (see the claim rename in SweepOutboxOnce); the response side had not, and
+                // it was the one that WROTE.
+                //
+                // Every step here therefore touches a jail-writable name exactly once, and only with
+                // rename(2): the file is created, written and chmod'ed under `inflight/` (inside the
+                // read-only mount, no second writer), and the one operation that lands on `<outbox>/
+                // <ticket>.res` is a rename — which replaces a symlink ENTRY without following it, and
+                // fails outright if the jail planted a directory there. In the second case only the jail
+                // loses its answer, which is the treatment every other refusal on this channel gets.
+                var inflight = Path.GetDirectoryName(claim)!;
+                var staged = Path.Combine(inflight, ticket + AgentIpcPaths.OutboxResponseStagingSuffix);
                 var final = Path.Combine(outbox, ticket + AgentIpcPaths.OutboxResponseSuffix);
                 await File.WriteAllTextAsync(
                     staged, AgentIpcProtocol.SerializeResponse(response) + "\n", ct).ConfigureAwait(false);
                 if (!OperatingSystem.IsWindows())
                 {
+                    // Set on the staged file, which no jail can name. The jail's uid still has to read the
+                    // response, so the mode is world-readable; it does not need to be writable by anyone
+                    // but the daemon — the shim deletes it, and deletion is a permission on the DIRECTORY.
                     File.SetUnixFileMode(staged, UnixFileMode.UserRead | UnixFileMode.UserWrite
-                        | UnixFileMode.GroupRead | UnixFileMode.GroupWrite
-                        | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
+                        | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
                 }
 
-                File.Move(staged, final, overwrite: true);
+                try
+                {
+                    File.Move(staged, final, overwrite: true);
+                }
+                catch (Exception)
+                {
+                    // The jail put something rename cannot replace (a directory) at the response's name.
+                    // Its answer is lost — to the jail alone — and the staged copy must not linger in the
+                    // daemon's directory.
+                    TryDelete(staged);
+                    throw;
+                }
             }
             catch (Exception)
             {

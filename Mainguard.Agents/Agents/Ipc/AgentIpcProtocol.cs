@@ -95,8 +95,11 @@ public static class AgentIpcPaths
     /// what stops the jail editing a request the daemon has already decided to read.</summary>
     public const string OutboxClaimSuffix = ".busy";
 
-    /// <summary>Suffix the daemon stages a response under, distinct from <see cref="OutboxStagingSuffix"/>
-    /// so the two writers never name the same file.</summary>
+    /// <summary>Suffix the daemon stages a response under — inside <see cref="InflightDirName"/>, never
+    /// inside the outbox. Distinct from <see cref="OutboxStagingSuffix"/> so the two writers never name
+    /// the same file, and staged outside the jail-writable directory because a write to a jail-chosen
+    /// name in a jail-writable directory follows whatever symlink the jail left there: the only operation
+    /// that ever lands on <c>&lt;outbox&gt;/&lt;ticket&gt;.res</c> is a rename.</summary>
     public const string OutboxResponseStagingSuffix = ".out";
 
     /// <summary>Suffix of a response the shim may read.</summary>
