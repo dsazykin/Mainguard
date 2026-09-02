@@ -147,15 +147,20 @@ public sealed class SendPromptDeliveryTests
         Assert.Contains("locked", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    [Fact]
-    public async Task SendPrompt_WithNothingToSay_SendsNothing()
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task SendPrompt_WithNothingToSay_SendsNothing(string nothing)
     {
         using var orchestrator = new DaemonBackedOrchestrator(UncontactedClient());
         var requests = new FakeRequestStream();
-        orchestrator.AttachTerminalOverride = _ => FakeCall(requests);
+        var attaches = 0;
+        orchestrator.AttachTerminalOverride = _ => { attaches++; return FakeCall(requests); };
 
-        await orchestrator.SendPromptAsync("agent-1", "");
+        await orchestrator.SendPromptAsync("agent-1", nothing);
 
         Assert.Empty(requests.Written);
+        // A blank prompt opens no attach either: the whitespace case used to open one and write nothing.
+        Assert.Equal(0, attaches);
     }
 }

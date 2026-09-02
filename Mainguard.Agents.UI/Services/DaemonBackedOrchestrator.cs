@@ -1432,7 +1432,9 @@ public sealed class DaemonBackedOrchestrator :
     /// </summary>
     public async Task SendPromptAsync(string agentId, string prompt)
     {
-        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrEmpty(prompt))
+        // Whitespace, not merely empty: TryEncodeSubmission below refuses a blank line anyway, but by then
+        // the attach has been opened for a prompt that was never going to be written.
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(prompt))
         {
             return;
         }
