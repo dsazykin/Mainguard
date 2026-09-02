@@ -437,14 +437,37 @@ public partial class PlanCardViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            if (IsAlreadyDecided(ex))
+            {
+                // A second click raced the plan stream: the decision DID land, the card just has not been
+                // dropped yet. Rendering the daemon's "already Approved" as "not recorded — still blocked"
+                // would tell the human the opposite of what happened; the next refresh removes the card.
+                return;
+            }
+
             var verb = approve ? "Approval" : "Rejection";
-            DecisionErrorText = $"{verb} was not recorded — {ex.Message}. The worker is still blocked; try again.";
+            // The consequence differs by card kind and the sentence must not promise the wrong one: a
+            // re-scope's worker is not blocked by the pending widening (it keeps working under the scope
+            // already approved), so "still blocked" would be false there.
+            DecisionErrorText = IsRescope
+                ? $"{verb} was not recorded — {ex.Message}. The worker is not blocked by this: it keeps "
+                  + "working under its current approval. Try again."
+                : $"{verb} was not recorded — {ex.Message}. The worker is still blocked; try again.";
         }
         finally
         {
             IsDeciding = false;
         }
     }
+
+    /// <summary>
+    /// The daemon's refusal for a plan that is no longer pending — <c>PlanApprovalService.GetPendingLocked</c>'s
+    /// own sentence, carried through the RPC's FailedPrecondition. Matched on the sentence because that
+    /// is the only thing the client receives; the status code alone also covers gate refusals that ARE
+    /// failures the human must see.
+    /// </summary>
+    private static bool IsAlreadyDecided(Exception ex) =>
+        ex.Message.Contains("only a plan awaiting your decision", StringComparison.Ordinal);
 }
 
 /// <summary>

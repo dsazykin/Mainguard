@@ -216,6 +216,46 @@ public class CoordinatorPlanDecisionTests
         Assert.Contains("daemon unreachable", card.DecisionErrorText, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A re-scope's worker is NOT blocked by the pending widening — it keeps working under the scope already
+    /// approved — so the generic "the worker is still blocked" would be false on that card.
+    /// </summary>
+    [Fact]
+    public async Task AFailedDecisionOnARescope_DoesNotSayTheWorkerIsBlocked()
+    {
+        var panel = new CoordinatorPanelViewModel(
+            new FakeCoordinator { Rescope = true, Throw = new InvalidOperationException("daemon unreachable") });
+        var card = panel.PendingPlan!;
+        Assert.True(card.IsRescope);
+
+        await card.ApproveCommand.ExecuteAsync(null);
+
+        Assert.True(card.HasDecisionError);
+        Assert.DoesNotContain("still blocked", card.DecisionErrorText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("not blocked", card.DecisionErrorText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A double-click that races the plan stream gets the daemon's "already Approved" refusal back. That
+    /// decision LANDED; rendering it as "not recorded — the worker is still blocked" says the opposite.
+    /// </summary>
+    [Fact]
+    public async Task AnAlreadyDecidedRefusal_IsNotRenderedAsAFailure()
+    {
+        var panel = new CoordinatorPanelViewModel(new FakeCoordinator
+        {
+            Throw = new InvalidOperationException(
+                "Plan 'plan-7' is Approved — only a plan awaiting your decision can be approved or rejected."),
+        });
+        var card = panel.PendingPlan!;
+
+        await card.ApproveCommand.ExecuteAsync(null);
+
+        Assert.False(card.HasDecisionError);
+        Assert.Equal("", card.DecisionErrorText);
+        Assert.False(card.IsDeciding);
+    }
+
     /// <summary>A retry after a failure must clear the stale error, or the card lies about the new attempt.</summary>
     [Fact]
     public async Task ARetryThatSucceeds_ClearsTheError()
@@ -350,6 +390,9 @@ public class CoordinatorPlanDecisionTests
         /// <summary>Set to hold the decision open, so the in-flight latch is observable.</summary>
         public TaskCompletionSource? Gate { get; set; }
 
+        /// <summary>Set to present the plan as a RE-SCOPE of an already-approved plan.</summary>
+        public bool Rescope { get; set; }
+
         /// <summary>
         /// Every decision, in order, with the arguments it carried. This replaces a bare
         /// <c>DecisionCalls</c> counter that no test ever read — and which therefore let an inverted
@@ -366,7 +409,9 @@ public class CoordinatorPlanDecisionTests
                 new[] { "src/Auth/TokenClock.cs" },
                 "Extract the clock behind ITokenClock.",
                 "AuthTests green plus expiry-boundary cases.",
-                1.50m, DateTimeOffset.Now.AddMinutes(-2), _status, 0, 3, 3, ""),
+                1.50m, DateTimeOffset.Now.AddMinutes(-2), _status, 0, 3, 3, "",
+                SupersedesPlanId: Rescope ? "plan-6" : "",
+                PreviousScope: Rescope ? new[] { "src/Auth/ITokenClock.cs" } : null),
         };
 
         public IReadOnlyList<TaskPlan> GetPendingPlans() => GetWorkerPlans()
