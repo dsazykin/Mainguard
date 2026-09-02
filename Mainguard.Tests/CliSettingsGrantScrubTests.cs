@@ -1,4 +1,6 @@
 using System;
+using System.Linq;
+using System.Text.Json.Nodes;
 using System.Text;
 using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.Agents.Ipc;
@@ -107,6 +109,26 @@ public class CliSettingsGrantScrubTests
 
         Assert.DoesNotContain(Mount, scrubbed, StringComparison.Ordinal);
         Assert.Contains("/workspace", scrubbed, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// JSON has more than one spelling of a slash, and the CLI's parser reads all of them. A grant written
+    /// with escaped separators contains no literal mount path, so a scrub that decided on the raw bytes
+    /// let it through byte-identical — and the file is agent-writable in the jail, so the agent is who
+    /// would write it that way. The decision is now made on the parsed document.
+    /// </summary>
+    [Theory]
+    [InlineData("Bash(\\/opt\\/mainguard\\/ipc\\/mainguard-agent *)")]
+    [InlineData("Bash(\\u002fopt\\u002fmainguard\\u002fipc\\u002fmainguard-plan:*)")]
+    public void AnEscapedSpellingOfTheMount_IsScrubbedTheSameAsTheLiteralOne(string escapedRule)
+    {
+        var json = "{ \"permissions\": { \"allow\": [ \"Bash(node *)\", \"" + escapedRule + "\" ] } }";
+
+        var result = CliSettingsGrantScrub.Scrub(Utf8(json));
+
+        Assert.NotNull(result);
+        var allow = JsonNode.Parse(result!)!["permissions"]!["allow"]!.AsArray().Select(n => n!.GetValue<string>()).ToArray();
+        Assert.Equal(new[] { "Bash(node *)" }, allow);
     }
 
     /// <summary>

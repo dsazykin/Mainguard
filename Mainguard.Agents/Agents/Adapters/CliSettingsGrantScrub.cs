@@ -62,11 +62,14 @@ public static class CliSettingsGrantScrub
             return content;
         }
 
-        if (!Mentions(content))
-        {
-            return content;
-        }
-
+        // Decided on the PARSED document, not on the raw bytes. The first cut asked `Mentions(content)`
+        // first and returned early when the bytes held no literal `/opt/mainguard/ipc` — and JSON has
+        // more than one spelling of a slash. A settings file written as
+        // `"Bash(\/opt\/mainguard\/ipc\/mainguard-agent *)"` (or with `\u002f`) contains no such
+        // substring, passed through byte-identical, and the CLI's own parser read the grant straight
+        // back out of it. The file is agent-writable in the jail, so the writer of that spelling is the
+        // agent. Parsing first makes the walk see what the CLI will see; the raw test is kept only for
+        // content that is not JSON at all, where it is the one question that can be asked.
         JsonNode? root;
         try
         {
@@ -76,8 +79,9 @@ public static class CliSettingsGrantScrub
         }
         catch (Exception e) when (e is JsonException or ArgumentException or DecoderFallbackException)
         {
-            // Names the mount, and we cannot see what it says about it. It does not travel.
-            return null;
+            // Not JSON. If it names the mount we cannot see what it says about it, so it does not travel;
+            // if it does not, it is none of this function's business.
+            return Mentions(content) ? null : content;
         }
 
         var scrubbed = Strip(root);
@@ -85,6 +89,12 @@ public static class CliSettingsGrantScrub
         {
             // The whole document was one reference to the mount. There is nothing left to carry.
             return null;
+        }
+
+        if (JsonNode.DeepEquals(scrubbed, root) && !Mentions(content))
+        {
+            // Nothing was removed and the bytes name nothing: the owner's own file, byte-identical.
+            return content;
         }
 
         var bytes = Encoding.UTF8.GetBytes(scrubbed.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
