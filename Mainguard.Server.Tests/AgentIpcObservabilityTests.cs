@@ -268,6 +268,116 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         }
     }
 
+    // ---- the socket framing's bounds: the outbox's guards, on the framing that had none -------------
+
+    /// <summary>
+    /// The G1 defect on the other framing. The socket read was <c>StreamReader.ReadLineAsync</c>, which
+    /// accumulates until a newline with no ceiling — so a jail that wrote bytes with no newline in them
+    /// grew the daemon, and with it every agent's control plane, until it died. The read now stops at the
+    /// same cap the outbox enforces and refuses; the handler is never reached; the endpoint still serves.
+    /// </summary>
+    [Fact]
+    public async Task ASocketLineOverTheCap_IsRefusedUnread_AndTheChannelSurvives()
+    {
+        var (_, factory, audit, server) = NewServer();
+        using (factory)
+        using (server)
+        {
+            var reached = false;
+            var dir = server.CreateEndpoint("big1", (r, a, c) =>
+            {
+                reached = true;
+                return Ok(r, a, c);
+            }, AgentIpcEndpointRole.Coordinator, Instructions);
+
+            var response = await SocketRoundTripAsync(
+                dir, new string('a', AgentIpcPaths.MaxOutboxRequestBytes + 4096));
+
+            Assert.Contains("\"ok\":false", response, StringComparison.Ordinal);
+            Assert.Contains("over the", response, StringComparison.Ordinal);
+            Assert.False(reached, "the handler ran on a request the daemon should have refused unread");
+            var rejected = Assert.Single(audit.Read(), e => e.Type == "ipc_request_rejected");
+            Assert.Contains("cap", rejected.Fields["reason"], StringComparison.Ordinal);
+
+            Assert.Contains("\"ok\":true", await SocketRoundTripAsync(dir, """{"op":"status"}"""), StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// Connections are bounded per endpoint, like the outbox's file count: every accepted connection is a
+    /// parked handler task, and a jail that opens sockets without ever finishing a call would otherwise
+    /// grow the daemon without limit. Past the cap a connection is answered with a refusal and closed;
+    /// once handlers complete the endpoint accepts again.
+    /// </summary>
+    [Fact]
+    public async Task ConnectionsPastTheInFlightCap_AreRefused_AndAcceptedAgainOnceHandlersComplete()
+    {
+        var (_, factory, audit, server) = NewServer();
+        using (factory)
+        using (server)
+        {
+            var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var dir = server.CreateEndpoint("cap1", async (_, _, _) =>
+            {
+                await release.Task;
+                return new AgentIpcResponse(Ok: true, Status: "released");
+            }, AgentIpcEndpointRole.Coordinator, Instructions);
+
+            var parked = new List<(Socket Client, NetworkStream Stream)>();
+            try
+            {
+                for (var i = 0; i < AgentIpcPaths.MaxInFlightConnections; i++)
+                {
+                    var client = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+                    // The listener's backlog is 8, so a burst of connects can be refused by the kernel
+                    // before the accept loop drains it — that is the kernel's bound, not the one under
+                    // test, so a refused connect is simply retried.
+                    for (var attempt = 0; ; attempt++)
+                    {
+                        try
+                        {
+                            await client.ConnectAsync(new UnixDomainSocketEndPoint(Path.Combine(dir, AgentIpcPaths.SocketFileName)));
+                            break;
+                        }
+                        catch (SocketException) when (attempt < 50)
+                        {
+                            await Task.Delay(20);
+                        }
+                    }
+
+                    var stream = new NetworkStream(client, ownsSocket: false);
+                    await stream.WriteAsync(Encoding.UTF8.GetBytes("{\"op\":\"status\"}\n"));
+                    parked.Add((client, stream));
+                }
+
+                // The (cap + 1)th caller is refused, promptly, with a reason — not parked, not ignored.
+                var refused = await SocketRoundTripAsync(dir, """{"op":"status"}""").WaitAsync(TimeSpan.FromSeconds(10));
+                Assert.Contains("\"ok\":false", refused, StringComparison.Ordinal);
+                Assert.Contains("in flight", refused, StringComparison.Ordinal);
+                var rejected = Assert.Single(audit.Read(), e => e.Type == "ipc_request_rejected");
+                Assert.Contains("in flight", rejected.Fields["reason"], StringComparison.Ordinal);
+
+                release.SetResult(true);
+                foreach (var (_, stream) in parked)
+                {
+                    using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
+                    Assert.Contains("released", (await reader.ReadLineAsync())!, StringComparison.Ordinal);
+                }
+            }
+            finally
+            {
+                foreach (var (client, stream) in parked)
+                {
+                    await stream.DisposeAsync();
+                    client.Dispose();
+                }
+            }
+
+            // Recovery is automatic: with the parked handlers gone, the next call is served.
+            await WaitForAsync(() => SocketRoundTripAsync(dir, """{"op":"status"}""").GetAwaiter().GetResult().Contains("\"ok\":true", StringComparison.Ordinal));
+        }
+    }
+
     // ---- rig ---------------------------------------------------------------------------------------
 
     private (CapturingProvider Logs, ILoggerFactory Factory, InMemoryAuditLog Audit, AgentIpcServer Server) NewServer()

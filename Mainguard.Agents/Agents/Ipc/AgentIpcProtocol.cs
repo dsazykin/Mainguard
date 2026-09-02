@@ -152,6 +152,15 @@ public static class AgentIpcPaths
     public const long MaxOutboxBytes = 16L * MaxOutboxRequestBytes;
 
     /// <summary>
+    /// How many socket connections one endpoint will serve at once. The same bound
+    /// <see cref="MaxOutboxFiles"/> puts on the file framing, on the framing that had none: every
+    /// accepted connection is a parked handler task, and a jail that opens connections without ever
+    /// sending a line (or parks thousands of <c>await</c>s) would otherwise grow the daemon without limit.
+    /// A shim holds exactly one connection per call, so a healthy endpoint has a handful open.
+    /// </summary>
+    public const int MaxInFlightConnections = MaxOutboxFiles;
+
+    /// <summary>
     /// The daemon-side outbox directory inside an agent's IPC dir. One function, used by the daemon that
     /// creates it, the launcher that names it as a mount source, and the spec builder that vets it — so
     /// "the read-write mount is that dir and nothing else" is a single fact rather than three spellings.

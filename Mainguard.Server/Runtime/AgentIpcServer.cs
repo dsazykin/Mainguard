@@ -399,6 +399,13 @@ public sealed class AgentIpcServer : IDisposable
         /// one condition and leave nothing to say about the next.</summary>
         private bool _overQuotaReported;
 
+        /// <summary>Socket connections currently being served; the socket-framing twin of the outbox's
+        /// file count, and bounded for the same reason (see <see cref="AgentIpcPaths.MaxInFlightConnections"/>).</summary>
+        private int _inFlight;
+
+        /// <summary>Reported on the transition past the cap, as the outbox breach is.</summary>
+        private bool _inFlightReported;
+
         public string Dir { get; }
 
         public AgentIpcEndpointRole Role { get; }
@@ -527,7 +534,59 @@ public sealed class AgentIpcServer : IDisposable
                     return; // listener closed (teardown) — the loop's normal end
                 }
 
-                _ = ServeConnectionAsync(connection, agentId, handler, _observer, ct);
+                // Bounded like the outbox's file count. Over the cap the connection is answered with a
+                // refusal and closed, and the breach is reported once on the way in — a jail must not be
+                // able to park an unbounded number of handler tasks in the daemon by opening sockets.
+                if (Interlocked.Increment(ref _inFlight) > AgentIpcPaths.MaxInFlightConnections)
+                {
+                    Interlocked.Decrement(ref _inFlight);
+                    if (!_inFlightReported)
+                    {
+                        _inFlightReported = true;
+                        _observer.Rejected(
+                            SocketFraming,
+                            $"more than {AgentIpcPaths.MaxInFlightConnections} connections in flight on one "
+                            + "endpoint — further connections are refused until some complete");
+                    }
+
+                    _ = RefuseConnectionAsync(connection, ct);
+                    continue;
+                }
+
+                _inFlightReported = false;
+                _ = ServeCountedAsync(connection, agentId, handler, ct);
+            }
+        }
+
+        private async Task ServeCountedAsync(
+            Socket connection, string agentId, AgentIpcHandler handler, CancellationToken ct)
+        {
+            try
+            {
+                await ServeConnectionAsync(connection, agentId, handler, _observer, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
+
+        private static async Task RefuseConnectionAsync(Socket connection, CancellationToken ct)
+        {
+            using (connection)
+            {
+                try
+                {
+                    await using var stream = new NetworkStream(connection, ownsSocket: false);
+                    var response = new AgentIpcResponse(
+                        Ok: false, Error: "too many requests in flight on this channel — retry after one completes");
+                    var bytes = Encoding.UTF8.GetBytes(AgentIpcProtocol.SerializeResponse(response) + "\n");
+                    await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
+                }
+                catch (Exception)
+                {
+                    // The refusal is best-effort; closing the connection is the bound.
+                }
             }
         }
 
@@ -942,6 +1001,42 @@ public sealed class AgentIpcServer : IDisposable
             }
         }
 
+        /// <summary>
+        /// Reads one newline-terminated line of at most <paramref name="cap"/> bytes. Returns the line (null
+        /// when the peer closed before sending one), or <c>OverCap</c> once a byte past the cap has arrived
+        /// with no newline — at which point nothing more is read.
+        /// </summary>
+        private static async Task<(string? Line, bool OverCap)> ReadLineBoundedAsync(
+            Stream stream, int cap, CancellationToken ct)
+        {
+            var buffer = new byte[cap];
+            var filled = 0;
+            var chunk = new byte[4096];
+            while (true)
+            {
+                var n = await stream.ReadAsync(chunk, ct).ConfigureAwait(false);
+                if (n == 0)
+                {
+                    return filled == 0 ? (null, false) : (Encoding.UTF8.GetString(buffer, 0, filled), false);
+                }
+
+                for (var i = 0; i < n; i++)
+                {
+                    if (chunk[i] == (byte)'\n')
+                    {
+                        return (Encoding.UTF8.GetString(buffer, 0, filled).TrimEnd('\r'), false);
+                    }
+
+                    if (filled >= cap)
+                    {
+                        return (null, true);
+                    }
+
+                    buffer[filled++] = chunk[i];
+                }
+            }
+        }
+
         private static async Task ServeConnectionAsync(
             Socket connection, string agentId, AgentIpcHandler handler, ChannelObserver observer,
             CancellationToken ct)
@@ -952,10 +1047,20 @@ public sealed class AgentIpcServer : IDisposable
                 AgentIpcResponse response;
                 try
                 {
-                    using var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true);
-                    var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
-                    var request = line is null ? null : AgentIpcProtocol.TryParseRequest(line);
-                    if (request is null)
+                    // Bounded, like the outbox read: `StreamReader.ReadLineAsync` accumulates until a
+                    // newline with no ceiling, so one jail sending bytes with no newline in them grew the
+                    // daemon — every agent's control plane — until it died, which is the G1 outbox defect
+                    // on the other framing. The read stops at cap + 1 and refuses.
+                    var (line, overCap) = await ReadLineBoundedAsync(
+                        stream, AgentIpcPaths.MaxOutboxRequestBytes, ct).ConfigureAwait(false);
+                    var request = line is null || overCap ? null : AgentIpcProtocol.TryParseRequest(line);
+                    if (overCap)
+                    {
+                        var reason = $"socket request over the {AgentIpcPaths.MaxOutboxRequestBytes}-byte cap, refused unread";
+                        observer.Rejected(SocketFraming, reason);
+                        response = new AgentIpcResponse(Ok: false, Error: reason);
+                    }
+                    else if (request is null)
                     {
                         observer.Rejected(SocketFraming, "malformed request (expected one JSON line)");
                         response = new AgentIpcResponse(Ok: false, Error: "malformed request (expected one JSON line)");
