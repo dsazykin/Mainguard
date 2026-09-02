@@ -80,6 +80,36 @@ public sealed class AgentSessionReconcileTests
         Assert.Equal("coord-1", store.Find(Repo, "worker-1")!.ParentAgentId);
     }
 
+    /// <summary>
+    /// Adoption rebuilds the session record and, through this hook, whatever else the jail needs from the
+    /// daemon side — the composition root re-binds the IPC endpoint here. Called AFTER the record exists
+    /// (the hook reads it), once per adopted session, never for sessions that were already known.
+    /// </summary>
+    [Fact]
+    public async Task Reconcile_ShouldHandEachAdoptedSessionToTheHook_AfterItsRecordExists()
+    {
+        var store = NewStore();
+        store.Spawn("claude-code", agentId: "known", repoHash: Repo);
+        store.AttachSandbox("known", "container-known", Repo);
+        var seen = new List<string>();
+        var reconciler = new AgentSessionReconciler(
+            store,
+            _ => Task.FromResult<IReadOnlyList<AgentContainerState>>(new[]
+            {
+                new AgentContainerState("known", Repo, "container-known", Running: true),
+                new AgentContainerState("orphan", Repo, "container-orphan", Running: true, Role: AgentRoles.Coordinator),
+            }),
+            onAdopted: session =>
+            {
+                Assert.Same(store.Find(Repo, session.Id), session);
+                seen.Add(session.Id);
+            });
+
+        await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "orphan" }, seen);
+    }
+
     /// <summary>A jail that was frozen when the daemon died is adopted back <b>as frozen</b> — the surface
     /// must not offer a Pause button for a container that is already paused.</summary>
     [Fact]

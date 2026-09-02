@@ -484,6 +484,68 @@ public sealed class AgentSpawnService
     }
 
     /// <summary>
+    /// Re-binds the IPC endpoint of a jail the daemon has just ADOPTED after a restart — at the same
+    /// directory the jail already has mounted, with the handler and role its session record says it is.
+    ///
+    /// <para>The session store and the IPC listeners both died with the previous process while the jail
+    /// kept running with the endpoint directory mounted. Adoption rebuilt the session record and nothing
+    /// rebuilt the listener, so an adopted coordinator's four tools and an adopted worker's plan channel
+    /// were dead: the socket refused, the outbox fallback wrote where nothing polled, and the shim reported
+    /// "cannot reach the Mainguard daemon" about a daemon that was up. Returns false for a session that
+    /// never had an endpoint (a manual agent, an external-PR head, a worker the plan gate does not hold).</para>
+    /// </summary>
+    internal bool TryReattachEndpoint(AgentSession session)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole role;
+        AgentIpcHandler handler;
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode planMode;
+        if (session.Role == AgentRoles.Coordinator)
+        {
+            role = Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Coordinator;
+            handler = HandleShimRequestAsync;
+            planMode = _planMode.ModeForNewWorker;
+        }
+        else if (session.Role == AgentRoles.Managed && _planGate.ModeFor(session.Id) is { } heldMode)
+        {
+            // Held by the gate ⇒ it was a coordinator-delegated spawn, which is the only worker that ever
+            // gets a channel; its mode comes from the (now persisted) held task, never from today's switch.
+            role = Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Worker;
+            handler = HandleWorkerPlanRequestAsync;
+            planMode = heldMode;
+        }
+        else
+        {
+            return false;
+        }
+
+        try
+        {
+            var dir = _ipc.CreateEndpoint(session.Id, handler, role, _launcher.InstructionsFor(role, planMode));
+            _coordLog.LogInformation(
+                "{Role} IPC endpoint re-bound after adoption: agent={Agent} dir={Dir}", role, session.Id, dir);
+            _audit.Append(new AuditEvent("ipc_endpoint_reattached", new Dictionary<string, string>
+            {
+                ["agent_id"] = session.Id,
+                ["role"] = role.ToString(),
+                ["repo_hash"] = session.RepoHash ?? string.Empty,
+            }));
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _coordLog.LogWarning(ex, "{Role} IPC endpoint re-bind failed after adoption: agent={Agent}", role, session.Id);
+            _audit.Append(new AuditEvent("ipc_endpoint_failed", new Dictionary<string, string>
+            {
+                ["agent_id"] = session.Id,
+                ["role"] = role.ToString(),
+                ["reason"] = ex.Message,
+            }));
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Harvests a LIVE agent's CLI login-state without stopping it.
     ///
     /// <para>The jail's <c>$HOME</c> is tmpfs and the durable store is the host OS keychain, but

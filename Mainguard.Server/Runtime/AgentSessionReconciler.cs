@@ -89,6 +89,7 @@ public sealed class AgentSessionReconciler
     private readonly Mainguard.Git.Audit.IAuditLog? _audit;
     private readonly ILogger _log;
     private readonly Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? _queues;
+    private readonly Action<AgentSession>? _onAdopted;
 
     /// <param name="store">The live session store this pass corrects.</param>
     /// <param name="listContainers">Lists the <c>mainguard.agent</c>-labelled containers. It is allowed —
@@ -110,14 +111,23 @@ public sealed class AgentSessionReconciler
     /// test that predates the queue sweep expects. Only queues this daemon has registered are visited, so
     /// the ownership question <paramref name="ownsRepo"/> answers for adoption is already settled here.
     /// </param>
+    /// <param name="onAdopted">
+    /// Called with each session this pass adopts, after its record exists. The composition root uses it to
+    /// re-bind the jail's IPC endpoint (<c>AgentSpawnService.TryReattachEndpoint</c>): adoption used to
+    /// rebuild the session record and nothing else, so an adopted coordinator's tools and an adopted
+    /// worker's plan channel stayed dead until the agent was restarted. A throwing hook is logged and does
+    /// not fail the pass.
+    /// </param>
     public AgentSessionReconciler(
         AgentSessionStore store,
         Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> listContainers,
         Func<string, bool>? ownsRepo = null,
         Mainguard.Git.Audit.IAuditLog? audit = null,
         ILogger? log = null,
-        Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? queues = null)
+        Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? queues = null,
+        Action<AgentSession>? onAdopted = null)
     {
+        _onAdopted = onAdopted;
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _listContainers = listContainers ?? throw new ArgumentNullException(nameof(listContainers));
         _ownsRepo = ownsRepo ?? (_ => true);
@@ -204,6 +214,19 @@ public sealed class AgentSessionReconciler
             {
                 // A concurrent spawn won the (repo, id) — that session is the real one; leave it.
                 _log.LogDebug(ex, "agent-session reconcile: could not adopt {Agent}", container.AgentId);
+                continue;
+            }
+
+            if (_onAdopted is not null && _store.Find(key) is { } adoptedSession)
+            {
+                try
+                {
+                    _onAdopted(adoptedSession);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "agent-session reconcile: post-adoption hook failed for {Agent}", key.AgentId);
+                }
             }
         }
 

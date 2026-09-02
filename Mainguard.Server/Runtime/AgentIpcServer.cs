@@ -179,21 +179,45 @@ public sealed class AgentIpcServer : IDisposable
     public AgentIpcEndpointRole? RoleOf(string agentId) =>
         agentId is not null && _endpoints.TryGetValue(agentId, out var endpoint) ? endpoint.Role : null;
 
-    /// <summary>Stops the agent's listener and removes its IPC dir. Idempotent.</summary>
+    /// <summary>Stops the agent's listener and removes its IPC dir. Idempotent. This is the STOP path —
+    /// the agent is gone, so its mailbox goes with it.</summary>
     public void CloseEndpoint(string agentId)
     {
         if (agentId is not null && _endpoints.TryRemove(agentId, out var endpoint))
         {
             endpoint.Dispose();
+            try
+            {
+                Directory.Delete(endpoint.Dir, recursive: true);
+            }
+            catch
+            {
+                // Best-effort cleanup; the dir may be mount-busy until the jail is removed.
+            }
         }
     }
 
+    /// <summary>
+    /// Process shutdown. Listeners stop; the directories STAY.
+    ///
+    /// <para>The jail bind-mounts the directory by inode. Deleting it here — which this used to do, by
+    /// routing shutdown through <see cref="CloseEndpoint"/> — left every surviving jail holding a mount
+    /// onto an orphaned inode: after the daemon came back and adopted the jail, the endpoint it recreated
+    /// was a NEW directory the container could not see, the shim's socket connect failed, its outbox
+    /// fallback wrote into the orphan where nothing would ever poll, and every one of the coordinator's
+    /// four tools and the worker's whole plan channel were dead until the agent was restarted by hand.
+    /// Keeping the directory is what lets <see cref="CreateEndpoint"/> re-bind at the same path on adoption
+    /// (<c>Endpoint.Start</c> already sweeps leftovers and replaces a stale socket).</para>
+    /// </summary>
     public void Dispose()
     {
         _disposed = true;
         foreach (var agentId in _endpoints.Keys)
         {
-            CloseEndpoint(agentId);
+            if (_endpoints.TryRemove(agentId, out var endpoint))
+            {
+                endpoint.Dispose();
+            }
         }
     }
 
@@ -1106,15 +1130,8 @@ public sealed class AgentIpcServer : IDisposable
                 // Already closed.
             }
 
-            try
-            {
-                Directory.Delete(Dir, recursive: true);
-            }
-            catch
-            {
-                // Best-effort cleanup; the dir may be mount-busy until the jail is removed.
-            }
-
+            // The directory is deliberately NOT deleted here: this runs on daemon shutdown too, where the
+            // jail survives and keeps this very inode mounted. The stop path (CloseEndpoint) removes it.
             _cts.Dispose();
         }
     }

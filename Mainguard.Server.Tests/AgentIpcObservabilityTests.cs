@@ -393,6 +393,41 @@ public sealed class AgentIpcObservabilityTests : IDisposable
         return (logs, factory, audit, server);
     }
 
+    // ---- the directory outlives the process; the listener is re-bound at the same path -------------
+
+    /// <summary>
+    /// The jail bind-mounts the endpoint directory by inode and survives a daemon restart. Deleting that
+    /// directory on shutdown — which the server used to do — orphaned the mount: the daemon came back,
+    /// adopted the jail, created a NEW directory the container could not see, and every shim call from
+    /// the adopted agent failed with "cannot reach the Mainguard daemon". So shutdown keeps the directory
+    /// (shim, instructions and outbox included), a new server re-binds at exactly that path and serves,
+    /// and only the STOP path removes it.
+    /// </summary>
+    [Fact]
+    public async Task ADaemonShutdown_KeepsTheEndpointDirectory_AndARestartRebindsAtTheSamePath()
+    {
+        var first = new AgentIpcServer(_root);
+        var dir = first.CreateEndpoint("agent-r", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
+        var instructions = Path.Combine(dir, AgentIpcPaths.InstructionsFileName);
+        Assert.True(File.Exists(instructions));
+
+        first.Dispose(); // the process going away — the jail is still running with `dir` mounted
+
+        Assert.True(Directory.Exists(dir));
+        Assert.True(File.Exists(instructions));
+        Assert.True(Directory.Exists(Path.Combine(dir, AgentIpcPaths.OutboxDirName)));
+
+        var second = new AgentIpcServer(_root);
+        var rebound = second.CreateEndpoint("agent-r", Ok, AgentIpcEndpointRole.Coordinator, Instructions);
+        Assert.Equal(dir, rebound);
+        var reply = await SocketRoundTripAsync(rebound, "{\"op\":\"status\"}");
+        Assert.Contains("served", reply, StringComparison.Ordinal);
+
+        second.CloseEndpoint("agent-r"); // the agent was stopped — now the mailbox goes
+        Assert.False(Directory.Exists(dir));
+        second.Dispose();
+    }
+
     private static Task<AgentIpcResponse> Ok(AgentIpcRequest request, string agentId, CancellationToken ct) =>
         Task.FromResult(new AgentIpcResponse(Ok: true, Status: "served"));
 

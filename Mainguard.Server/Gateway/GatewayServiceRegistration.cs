@@ -502,7 +502,11 @@ public static class GatewayServiceRegistration
             // listing. Passed here rather than given its own hosted service because the answer is the same
             // answer — a second Docker timer would poll the engine twice for one fact and then have to
             // decide which copy wins.
-            queues: sp.GetRequiredService<IMergeQueueRegistry>()));
+            queues: sp.GetRequiredService<IMergeQueueRegistry>(),
+            // An adopted jail still has its IPC directory mounted (the server no longer deletes it on
+            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works.
+            // Resolved lazily, at call time, because AgentSpawnService sits above this in the graph.
+            onAdopted: session => sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachEndpoint(session)));
         services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 

@@ -407,6 +407,10 @@
     have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
     daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un limit) that also carries **the one shim
     that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker —
+    and whose directory **outlives the daemon process** since 2026-09-03: `Dispose` (shutdown) only stops
+    the listeners, because the jail bind-mounts that directory by inode and deleting it orphaned every
+    surviving jail's channel; only `CloseEndpoint` (the stop path) removes it, and `CreateEndpoint` re-binds
+    at the same path when the reconciler adopts the jail back (`AgentSpawnService.TryReattachEndpoint`) —
     **and beside it the role's `MAINGUARD.md` operating instructions**, written in the same call so the
     shim and the text that makes it discoverable cannot be staged independently: a shim is useless to a
     CLI that was never told it exists, which is what every jail was until now. Since **defect G2**
@@ -475,7 +479,10 @@
     docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
   - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
     (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
-    startup and every 30 s. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    startup and every 30 s. Adoption reads the parent off `mainguard.agent.parent` and hands each adopted
+    session to an `onAdopted` hook, which the composition root binds to
+    `AgentSpawnService.TryReattachEndpoint` so an adopted coordinator's tools and an adopted worker's plan
+    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
