@@ -166,6 +166,12 @@ public static class AgentOperatingInstructions
 
         Run `{shimPath}` with no arguments for the full usage text.
 
+        **`verify` proposes; it does not wait for the verdict.** It returns as soon as the daemon has
+        accepted the run (or refused it, with the reason). The verdict arrives on that worker's row in
+        `status`, in the daemon's own state words — `Verifying` while the tests run, then `Verified` or
+        `VerificationFailed` (or `Working` if the run was refused before it started). Poll `status`; do
+        not send `verify` again while the row reads `Verifying`.
+
         {briefSection}
 
         - **Quote both.** Your command line is read by a shell before Mainguard sees any of it, so an

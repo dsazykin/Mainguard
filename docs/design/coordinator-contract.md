@@ -149,7 +149,7 @@ These four already exist as `CoordinatorTools`. The contract is that this list i
 | `spawn_worker` | start a worker on a described task | kill switch · worker cap · admission · budget (BYOK only — see §2.1) |
 | `get_worker_status` | status of workers it owns | ownership scope |
 | `send_worker_prompt` | steer a worker it owns | kill switch · ownership scope |
-| `request_verification` | propose a worker's branch for daemon verification | ownership scope |
+| `request_verification` | propose a worker's branch for daemon verification — **returns once the run is accepted or refused; the verdict reaches `get_worker_status`** (decided by the owner 2026-09-03: the shipped op blocked on the whole suite while its shim gave up at 60 s) | ownership scope |
 
 Anything not on this list is denied. Adding to this list is a deliberate contract change, reviewed as
 such — not an implementation detail. So is changing the shape of one of them: `spawn_worker`'s arguments

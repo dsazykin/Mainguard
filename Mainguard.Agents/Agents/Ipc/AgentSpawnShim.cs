@@ -168,6 +168,14 @@ def report_refused_spawn(argv):
         pass
 
 
+# Per-op deadlines, in seconds. One number for every op was the defect: `spawn` builds a jail (an
+# image preflight and, on a first run, a toolchain layer — minutes), and a 60 s deadline turned a spawn
+# the daemon completed into "cannot reach the daemon" on this side, which the coordinator then retried.
+# `verify` PROPOSES a run and answers within a couple of seconds (the verdict arrives on `status`), so
+# it needs no more than the others.
+TIMEOUTS = {"spawn": 600, "status": 60, "prompt": 120, "verify": 120}
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "spawn":
         request, refusal = spawn_request(argv)
@@ -187,9 +195,18 @@ def main(argv):
         sys.stderr.write(__doc__ or "usage: mainguard-agent " + SPAWN_ARGS + "\n")
         return 2
 
+    timeout = TIMEOUTS[request["op"]]
     try:
-        response = call(request)
+        response = call(request, timeout)
     except (OSError, ValueError) as error:
+        if isinstance(error, TimeoutError) or getattr(error, "errno", None) == errno.ETIMEDOUT:
+            # Accepted-but-slow is not unreachable. The daemon may well still be working on this
+            # request, so the honest advice is to look before repeating it — a repeated spawn is a
+            # second worker, a repeated verify a second run.
+            sys.stderr.write(
+                "mainguard-agent: the daemon did not answer within %ss; it may still be working on "
+                "this request. Check `mainguard-agent status` before repeating it.\n" % timeout)
+            return 1
         sys.stderr.write("mainguard-agent: cannot reach the Mainguard daemon: %s\n" % error)
         return 1
 

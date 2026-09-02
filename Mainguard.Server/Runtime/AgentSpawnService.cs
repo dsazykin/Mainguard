@@ -1202,20 +1202,75 @@ public sealed class AgentSpawnService
             ["repo_hash"] = repoHandle,
         }));
 
+        // PROPOSE, then poll (contract §3: "request_verification proposes; the daemon verifies and
+        // decides" — decided by the owner 2026-09-03). The run used to be awaited here for its whole
+        // length, which on a real suite is minutes, while the coordinator's shim gave up at 60 s and
+        // reported "cannot reach the daemon" for an operation the daemon completed — so the coordinator
+        // retried, and one of its four tools was in practice broken. The run is started here and
+        // watched for a short grace, long enough for every refusal that happens before a container is
+        // exec'd (in flight, illegal state, no live jail, malformed verify command) to still be answered
+        // synchronously; past that the answer is "Verifying", and the verdict reaches the coordinator
+        // the way every other merge outcome already does — on the worker's row in `status`, in
+        // WorkerMergeState's own words (`MergeQueueProvisioner.MarkMergeState`).
+        //
+        // No AgentId on the response, for the same reason `prompt` carries none: the shim prints an id
+        // when one is present and the status only when one is not, so the old response — id AND verdict —
+        // showed the coordinator the id it had just typed and never the verdict.
+        var workerId = owned.Id;
+        var run = Task.Run(() => ctx.Queue.RunVerificationAsync(workerId, ct), CancellationToken.None);
+        var finished = await Task.WhenAny(run, Task.Delay(VerifyProposalGrace, ct)).ConfigureAwait(false);
+        if (finished != run)
+        {
+            _ = run.ContinueWith(t =>
+            {
+                if (t.IsCanceled)
+                {
+                    return;
+                }
+
+                if (t.IsFaulted)
+                {
+                    _coordLog.LogWarning(
+                        "coordinator-proposed verification of {Worker} was refused after it was accepted: {Reason}",
+                        workerId, t.Exception?.GetBaseException().Message);
+                    return;
+                }
+
+                _coordLog.LogInformation(
+                    "coordinator-proposed verification of {Worker} settled: passed={Passed}",
+                    workerId, t.Result.Passed);
+            }, TaskScheduler.Default);
+
+            return new AgentIpcResponse(
+                Ok: true,
+                Status: $"Verifying — the daemon is running {workerId}'s test command in its jail. This "
+                      + "call does not wait for the verdict: poll `mainguard-agent status " + workerId
+                      + "` and read the row's state word (Verified, VerificationFailed, or Working if the "
+                      + "run was refused). Do not send verify again while it reads Verifying.");
+        }
+
         try
         {
-            var record = await ctx.Queue.RunVerificationAsync(owned.Id, ct).ConfigureAwait(false);
+            var record = await run.ConfigureAwait(false);
 
             // The daemon decides. The coordinator is told the outcome and nothing else moves because it
             // asked — a green record is what lets the item into the queue, and a human still merges it.
             return new AgentIpcResponse(
-                Ok: true, AgentId: owned.Id, Status: record.Passed ? "Verified" : "VerificationFailed");
+                Ok: true, Status: record.Passed ? "Verified" : "VerificationFailed");
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             return new AgentIpcResponse(Ok: false, Error: ex.Message);
         }
     }
+
+    /// <summary>
+    /// How long <c>request_verification</c> waits for the run before answering "Verifying". Long enough
+    /// for the refusals that happen before any container is exec'd to still arrive synchronously — those
+    /// are the answers a coordinator can act on in the same turn — and far shorter than the shim's
+    /// deadline, which is the whole point.
+    /// </summary>
+    internal static readonly TimeSpan VerifyProposalGrace = TimeSpan.FromSeconds(2);
 
     /// <summary>
     /// The <b>worker</b> plan shim's request handler — the daemon side of the phase-2 plan gate

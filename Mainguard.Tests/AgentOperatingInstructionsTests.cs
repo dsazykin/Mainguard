@@ -53,6 +53,26 @@ public class AgentOperatingInstructionsTests : IDisposable
     /// lock's own §7 question ("is the four-tool surface sufficient?") answered accidentally in the
     /// negative by an editing slip.
     /// </summary>
+    /// <summary>
+    /// <c>verify</c> proposes (contract §3, 2026-09-03): the op answers when the run is accepted and the
+    /// verdict arrives on <c>status</c>. A coordinator not told this reads a "Verifying" answer as a
+    /// failure and sends verify again — a second run — so the text has to carry the state words it will
+    /// actually see and the instruction not to repeat the call.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldThatVerifyProposes_AndWhereTheVerdictArrives()
+    {
+        foreach (var text in new[] { Coordinator(), AgentOperatingInstructions.For(
+            AgentIpcEndpointRole.Coordinator, _registry.Catalog, Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Ungated) })
+        {
+            Assert.Contains("`verify` proposes", text, StringComparison.Ordinal);
+            Assert.Contains("`Verifying`", text, StringComparison.Ordinal);
+            Assert.Contains("`Verified`", text, StringComparison.Ordinal);
+            Assert.Contains("`VerificationFailed`", text, StringComparison.Ordinal);
+            Assert.Contains("do\nnot send `verify` again", text.Replace("\r\n", "\n"), StringComparison.Ordinal);
+        }
+    }
+
     [Fact]
     public void TheCoordinatorIsToldAboutEveryOpTheDaemonServesIt()
     {

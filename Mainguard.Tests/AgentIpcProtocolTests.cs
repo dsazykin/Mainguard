@@ -325,6 +325,59 @@ public class AgentIpcProtocolTests
         Assert.Contains("syntax error", unquoted.Value.Refusal ?? string.Empty, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Every op ran under the transport's one 60 s default. <c>spawn</c> builds a jail — an image
+    /// preflight and, on a first run, a toolchain layer — so the shim reported "cannot reach the daemon"
+    /// for a spawn the daemon completed, and the coordinator retried into a second worker. The deadline
+    /// is now per op, and a deadline that lapses is reported as what it is: accepted but slow, look
+    /// before repeating. Driven through the real <c>main()</c>, because the dispatch is what picks it.
+    /// </summary>
+    [Theory]
+    [InlineData(new[] { "spawn", "claude-code", "--title", "Fix the clock", "--task", "work" }, 600)]
+    [InlineData(new[] { "status" }, 60)]
+    [InlineData(new[] { "prompt", "w-1", "go" }, 120)]
+    [InlineData(new[] { "verify", "w-1" }, 120)]
+    public void EveryCoordinatorOp_RunsUnderItsOwnDeadline(string[] args, int expectedTimeout)
+    {
+        var timeout = RunAndReadTimeout(args);
+        if (timeout is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        Assert.Equal(expectedTimeout, timeout.Value.Timeout);
+    }
+
+    [Fact]
+    public void ADeadlineThatLapses_IsNotReportedAsAnUnreachableDaemon()
+    {
+        var run = RunAndReadTimeout(new[] { "verify", "slow" });
+        if (run is null)
+        {
+            return; // no python3 on this box — nothing measured, nothing claimed
+        }
+
+        Assert.DoesNotContain("cannot reach", run.Value.Stderr, StringComparison.Ordinal);
+        Assert.Contains("may still be working", run.Value.Stderr, StringComparison.Ordinal);
+        Assert.Contains("status", run.Value.Stderr, StringComparison.Ordinal);
+    }
+
+    private static (int? Timeout, string Stderr)? RunAndReadTimeout(string[] args)
+    {
+        var raw = RunSpawnParserRaw(args);
+        if (raw is null)
+        {
+            return null;
+        }
+
+        using var document = System.Text.Json.JsonDocument.Parse(raw);
+        var root = document.RootElement;
+        var timeout = root.GetProperty("timeout");
+        return (
+            timeout.ValueKind == System.Text.Json.JsonValueKind.Number ? timeout.GetInt32() : null,
+            root.GetProperty("stderr").GetString() ?? string.Empty);
+    }
+
     /// <summary>What one driven run of the shim's <c>main()</c> produced.</summary>
     /// <param name="Reported">The JSON of the request that reached the stubbed transport, or null when
     /// none did. On a refusal this is the G3 report — the attempt the shim could not build, sent so the
@@ -385,6 +438,13 @@ public class AgentIpcProtocolTests
     /// <summary>Runs the shim's own <c>main()</c> under python3, or null where there is none.</summary>
     private static DrivenSpawn? RunSpawnParser(string[] args)
     {
+        var stdout = RunSpawnParserRaw(args);
+        return stdout is null ? null : Read(stdout);
+    }
+
+    /// <summary>The driver's one JSON line, or null where python3 is not installed.</summary>
+    private static string? RunSpawnParserRaw(string[] args)
+    {
         var dir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), $"mg-shim-{Guid.NewGuid():N}");
         System.IO.Directory.CreateDirectory(dir);
         try
@@ -412,7 +472,7 @@ public class AgentIpcProtocolTests
             var stderr = process.StandardError.ReadToEnd();
             process.WaitForExit();
             Assert.True(process.ExitCode == 0, $"the shim's spawn parser threw: {stderr}");
-            return Read(stdout);
+            return stdout;
         }
         catch (System.ComponentModel.Win32Exception)
         {
@@ -443,12 +503,15 @@ public class AgentIpcProtocolTests
             seen = {}
             def fake_call(request, timeout=60):
                 seen["request"] = request
+                seen["timeout"] = timeout
+                if request.get("op") == "verify" and request.get("agentId") == "slow":
+                    raise TimeoutError("timed out")
                 return {"ok": True, "agentId": "w-1"}
             mod.call = fake_call
             err = io.StringIO()
             with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
                 code = mod.main(["/opt/mainguard/ipc/mainguard-agent"] + sys.argv[2:])
-            print(json.dumps({"exit": code, "request": seen.get("request"), "stderr": err.getvalue()}))
+            print(json.dumps({"exit": code, "request": seen.get("request"), "timeout": seen.get("timeout"), "stderr": err.getvalue()}))
             """);
         return (shim, driver);
     }
