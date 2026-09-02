@@ -8,6 +8,7 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
+using Avalonia.Input;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using Mainguard.Agents.Agents;
@@ -399,6 +400,54 @@ public class CoordinatorPlanGateRenderHarness
         vm.Coordinator.BackpressureText = "";
         Settle();
         Assert.False(seam.IsEffectivelyVisible);
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// Dragging the seam rewrites the gate's row from Auto to a PIXEL height, and a pixel row does not
+    /// collapse when its only child hides. Clearing the last plan must therefore give the terminal the
+    /// space back rather than leaving a dead band exactly as tall as the gate the human had just enlarged.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheGateRow_ReturnsToAuto_WhenTheGateHides()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = 1296, Height = 759, Content = view };
+        win.Show();
+        Settle();
+
+        var gate = view.GetVisualDescendants().OfType<PlanGateView>().Single();
+        var host = gate.GetVisualAncestors().OfType<ScrollViewer>().First();
+        var pane = Assert.IsType<Grid>(host.Parent);
+        var row = pane.RowDefinitions[Grid.GetRow(host)];
+        var seam = Assert.Single(view.GetVisualDescendants().OfType<GridSplitter>(), g => g.Name == "GateSeam");
+        Assert.True(row.Height.IsAuto, "the gate row must start Auto");
+
+        // A real drag, downward: the gate grows and the row becomes a pixel length — the precondition.
+        var origin = seam.TranslatePoint(new Point(seam.Bounds.Width / 2, seam.Bounds.Height / 2), win)!.Value;
+        win.MouseDown(origin, MouseButton.Left);
+        win.MouseMove(new Point(origin.X, origin.Y + 30));
+        win.MouseMove(new Point(origin.X, origin.Y + 60));
+        win.MouseUp(new Point(origin.X, origin.Y + 60), MouseButton.Left);
+        Settle();
+        Assert.True(row.Height.IsAbsolute, $"dragging the seam should leave a pixel row; got {row.Height}");
+
+        // The last plan clears → the gate hides → the row must be Auto again, not the dragged pixels.
+        vm.Coordinator.PendingPlans.Clear();
+        vm.Coordinator.EscalatedPlans.Clear();
+        vm.Coordinator.BackpressureText = "";
+        Settle();
+        Assert.False(host.IsEffectivelyVisible);
+        Assert.True(row.Height.IsAuto, $"a hidden gate must not reserve its dragged height; row is {row.Height}");
 
         win.Content = null;
         HarnessHygiene.Teardown(win);

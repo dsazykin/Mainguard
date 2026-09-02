@@ -7,6 +7,9 @@ public partial class ControlCenterView : UserControl
     // The height the telemetry row was left at while it was last on screen.
     private GridLength _parkedTelemetryHeight = GridLength.Auto;
 
+    // The same for the plan gate's row (the GateSeam GridSplitter above the terminal).
+    private GridLength _parkedGateHeight = GridLength.Auto;
+
     public ControlCenterView()
     {
         InitializeComponent();
@@ -34,6 +37,29 @@ public partial class ControlCenterView : UserControl
             else
             {
                 _parkedTelemetryHeight = row.Height;
+                row.Height = GridLength.Auto;
+            }
+        };
+
+        // Identical defect, other seam. The gate row is Auto (an idle gate costs nothing) until the
+        // GateSeam is dragged, after which it is a pixel row — and a pixel row keeps its height when the
+        // gate hides (the last plan cleared), leaving a dead band above the terminal for the rest of the
+        // session. Park while hidden, restore when the gate returns.
+        GateHost.PropertyChanged += (_, e) =>
+        {
+            if (e.Property != IsVisibleProperty) return;
+            if (GateHost.Parent is not Grid pane) return;
+            var index = Grid.GetRow(GateHost);
+            if (index < 0 || index >= pane.RowDefinitions.Count) return;
+            var row = pane.RowDefinitions[index];
+
+            if (GateHost.IsVisible)
+            {
+                row.Height = _parkedGateHeight;
+            }
+            else
+            {
+                _parkedGateHeight = row.Height;
                 row.Height = GridLength.Auto;
             }
         };

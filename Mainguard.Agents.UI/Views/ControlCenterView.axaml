@@ -171,7 +171,7 @@
                        to point at it.
                    PlanGateView additionally orders decidable cards ABOVE non-actionable escalated ones,
                    so what a clip can reach first is the card with no button on it. -->
-              <ScrollViewer Grid.Row="1" Margin="0,0,0,8"
+              <ScrollViewer Grid.Row="1" x:Name="GateHost" Margin="0,0,0,8"
                             IsVisible="{Binding Coordinator.HasGateContent}"
                             HorizontalScrollBarVisibility="Disabled"
                             VerticalScrollBarVisibility="Auto"
