@@ -254,6 +254,47 @@ public class MergeAuditEventTests
 
     // ---- harness ---------------------------------------------------------
 
+    /// <summary>
+    /// The reconcile entry point is idempotent. A merge confirmed twice — a reconcile re-driven after a
+    /// confirm that threw past its transition, an on-demand reconcile that raced the boot one — leaves ONE
+    /// record and one Merged, not two records and a second cascade.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmHumanMerge_OnAnAlreadyMergedEntry_AppendsNothing()
+    {
+        var h = new Harness();
+        var queue = h.Build();
+        await queue.RunVerificationAsync(AgentId, CancellationToken.None);
+
+        queue.ConfirmHumanMerge(AgentId, "main-sha-1", MergeAuthorization.BootReconcile("lease-1"));
+        queue.ConfirmHumanMerge(AgentId, "main-sha-1", MergeAuthorization.BootReconcile("lease-1"));
+
+        Assert.Single(h.Audit.Read(), e => e.Type == MergeQueue.MergedEvent);
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+    }
+
+    /// <summary>
+    /// The reconcile records a fact git already holds, whatever the queue believes: a row rehydrated to
+    /// <c>Working</c> (the branch-tip prime, a refused re-run) whose branch main nonetheless contains is
+    /// merged, and refusing to say so left the queue permanently disagreeing with the repository. The
+    /// human RPC path (<c>TryConfirmHumanMerge</c>) stays strict — see <c>RefusedConfirm_AuditsNothing</c>.
+    /// </summary>
+    [Fact]
+    public void ConfirmHumanMerge_FromANonVerifiedRow_StillRecordsTheMergeGitHolds()
+    {
+        var h = new Harness();
+        var queue = h.Build();
+        queue.EnsureEntry(AgentId, MergeEntryOrigin.Local);
+        Assert.Equal(WorkerMergeState.Working, queue.GetState(AgentId));
+
+        queue.ConfirmHumanMerge(AgentId, "main-sha-1", MergeAuthorization.BootReconcile("lease-2"));
+
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+        var merged = Assert.Single(h.Audit.Read(), e => e.Type == MergeQueue.MergedEvent);
+        Assert.Equal("Working", merged.Fields["from_state"]);
+        Assert.Equal("none recorded", merged.Fields["verification"]);
+    }
+
     private sealed class Harness
     {
         public InMemoryAuditLog Audit = new();

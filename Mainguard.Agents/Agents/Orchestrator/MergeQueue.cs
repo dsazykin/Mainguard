@@ -898,8 +898,21 @@ public sealed class MergeQueue : IMergeQueue
         Dictionary<string, string> merged;
         lock (_gate)
         {
+            // Already recorded. A second confirm of the same landed merge (a reconcile re-driven after a
+            // confirm that threw past its transition, a repeated on-demand reconcile) must not append a
+            // second queue_entry_merged or fire the cascade twice: "exactly one record per Merged" is the
+            // invariant the event exists to make enforceable.
+            if (GetStateLocked(agentId) == WorkerMergeState.Merged)
+            {
+                return;
+            }
+
             merged = BuildMergedPayloadLocked(agentId, newMainSha, authorization);
-            MarkMergedLocked(agentId);
+            // Forced: this records a fact git already holds, whatever state the queue believes the row is
+            // in. A rehydrated row primed back to Working, or one whose verification was overtaken mid-run,
+            // still merged if main contains its branch — refusing here left the queue permanently
+            // disagreeing with the repository, which is the one outcome the reconcile exists to prevent.
+            MarkMergedLocked(agentId, force: true);
         }
 
         NotifyMainMoved(newMainSha);
@@ -1030,15 +1043,21 @@ public sealed class MergeQueue : IMergeQueue
     }
 
     // The Verified → AwaitingReview → Merged walk shared by both confirm entry points. Caller holds _gate.
-    private void MarkMergedLocked(string agentId)
+    private void MarkMergedLocked(string agentId, bool force = false)
     {
         // Allow the human merge from a fresh Verified or an opened AwaitingReview.
-        if (GetStateLocked(agentId) == WorkerMergeState.Verified)
+        var from = GetStateLocked(agentId);
+        if (from == WorkerMergeState.Verified)
         {
             SetStateLocked(agentId, WorkerMergeState.AwaitingReview);
         }
 
-        SetStateLocked(agentId, WorkerMergeState.Merged);
+        // The reconcile's walk: any NON-terminal row may be recorded as merged when git says it landed.
+        // Terminal rows (Rejected, Discarded) still throw — a human closed those, and recording a merge
+        // over a human's decision is a conflict to surface, not a transition to force.
+        var forced = force && !IsTerminal(from)
+            && from is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview);
+        SetStateLocked(agentId, WorkerMergeState.Merged, force: forced);
     }
 
     /// <summary>Rejects a branch (AwaitingReview → Rejected); teardown follows per policy.</summary>
@@ -2210,10 +2229,11 @@ public sealed class MergeQueue : IMergeQueue
         }
     }
 
-    private void SetStateLocked(string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null)
+    private void SetStateLocked(
+        string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null, bool force = false)
     {
         var from = GetStateLocked(agentId);
-        if (from != target)
+        if (from != target && !force)
         {
             if (!Legal.TryGetValue(from, out var allowed) || !allowed.Contains(target))
             {

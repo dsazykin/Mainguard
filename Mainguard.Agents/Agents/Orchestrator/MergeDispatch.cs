@@ -196,11 +196,14 @@ public sealed class MergeDispatch : IMergeDispatch
             // The merge is proven landed, so the queue's stale cascade fires — identical to the local
             // path's terminal handling. Confirm writes the RT-D1 idempotency record and releases the
             // lease, so the boot reconcile can tell a landed merge from an abandoned one.
-            _leases.Confirm(request.RepoHash, leaseId, result.NewMainSha!);
-            confirmed = true;
             // → Merged + NotifyMainMoved, and one queue_entry_merged audit event naming this transport.
+            // The queue transition comes FIRST: a confirm written before it would leave a confirmed lease
+            // beside a row that never reached Merged if the transition threw, and the finally below could
+            // no longer hand the lease back.
             queue.ConfirmHumanMerge(
                 request.AgentId, result.NewMainSha!, MergeAuthorization.ExternalDispatch(leaseId));
+            _leases.Confirm(request.RepoHash, leaseId, result.NewMainSha!);
+            confirmed = true;
 
             return new MergeDispatchOutcome(Merged: true, result.NewMainSha, CasLost: false, Reason: null);
         }
