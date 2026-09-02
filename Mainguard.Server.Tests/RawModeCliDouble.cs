@@ -60,10 +60,36 @@ internal sealed class RawModeCliDouble : ITerminalSession
     /// Whether the CLI repaints when it accepts a line. False models the case the daemon cannot tell
     /// apart from a swallowed keystroke by watching the PTY alone — a CLI that is silent after Enter.
     /// </param>
-    public RawModeCliDouble(bool redraws = true)
+    /// <param name="chatty">
+    /// Models a CLI that is MID-TURN: it emits output continuously, whether or not anything was written
+    /// to it. Such a CLI satisfies the daemon's echo wait on its first unsolicited frame, having read
+    /// nothing — which is why the terminator separation must be a floor and not an echo-gated fallback.
+    /// </param>
+    public RawModeCliDouble(bool redraws = true, bool chatty = false)
     {
         _redraws = redraws;
         _stream = new CliStream(this);
+        if (chatty)
+        {
+            _ = ChatterAsync(_chatter.Token);
+        }
+    }
+
+    private readonly CancellationTokenSource _chatter = new();
+
+    private async Task ChatterAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested)
+            {
+                _stream.Emit(Encoding.UTF8.GetBytes("\u001b[2K\rthinking…\r\n"));
+                await Task.Delay(2, ct).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
     }
 
     public Stream IO => _stream;
@@ -118,7 +144,11 @@ internal sealed class RawModeCliDouble : ITerminalSession
 
     public void Kill() => _stream.CompleteOutput();
 
-    public void Dispose() => _stream.Dispose();
+    public void Dispose()
+    {
+        _chatter.Cancel();
+        _stream.Dispose();
+    }
 
     /// <summary>Waits for the CLI to have submitted at least <paramref name="count"/> lines.</summary>
     public async Task<IReadOnlyList<string>> WaitForSubmittedAsync(int count, TimeSpan timeout)

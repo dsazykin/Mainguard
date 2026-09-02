@@ -287,25 +287,25 @@ public sealed class BoundTerminalSession : IDisposable
     {
         var sinceBody = System.Diagnostics.Stopwatch.StartNew();
         var echoed = await WriteInputAndAwaitOutputAsync(body, echoWindow, ct).ConfigureAwait(false);
-        if (!echoed)
+
+        // The separation is a FLOOR in every case, echo or no echo. It used to apply only when nothing
+        // echoed, on the argument that an echo is causal — a CLI that repainted has read the body. But
+        // `echoed` is true on ANY output frame inside the window, and a CLI mid-turn streams output
+        // continuously: it satisfies the wait within a millisecond without having read a byte, the CR
+        // goes out immediately behind the body, and the PTY can coalesce the two writes into one read
+        // — defect J2, on exactly the worker a coordinator most wants to steer (a busy one). The echo
+        // stays what it is, an observation reported to the caller; the gap is what keeps the terminator
+        // in a read of its own.
+        //
+        // Measured against the ELAPSED time rather than slept unconditionally: when the echo window
+        // lapsed there is already a 250 ms gap and nothing to add, but an instant return — an echo on the
+        // first frame, or a CLI whose output stream has completed — arrives here having waited no time at
+        // all. The FULL separation, not the remainder: the stopwatch starts marginally before the body
+        // actually reaches the PTY, so subtracting its reading would shave the write's own cost off the
+        // gap the CLI sees.
+        if (sinceBody.Elapsed < TerminalSubmit.TerminatorSeparation)
         {
-            // Nothing to key off, so the writes must be separated in time instead — without a gap the PTY
-            // hands the CLI body+CR in one read and the CR is swallowed as pasted content.
-            //
-            // Measured against the ELAPSED time rather than slept unconditionally, because "no echo" has
-            // two very different shapes. Usually the echo window lapsed, which is already a 250 ms gap and
-            // needs nothing added. But the wait also returns false IMMEDIATELY when the output stream has
-            // completed — a CLI that has died — and that path arrives here having waited no time at all.
-            // A flat `if (!echoed) delay` reads as the guard and is dead code on the common path; this
-            // covers the path that actually needs it.
-            // The FULL separation, not the remainder: the stopwatch starts marginally before the body
-            // actually reaches the PTY, so subtracting its reading would shave the write's own cost off
-            // the gap the CLI sees. Waiting the whole 50 ms when little time has passed is free, and it
-            // makes the gap a floor rather than an approximation.
-            if (sinceBody.Elapsed < TerminalSubmit.TerminatorSeparation)
-            {
-                await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
-            }
+            await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
         }
 
         var reacted = await WriteInputAndAwaitOutputAsync(terminator, reactionWindow, ct)

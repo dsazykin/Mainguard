@@ -209,6 +209,35 @@ public sealed class PromptDeliveryBinderTests : IDisposable
             + "them — one read at the CLI, and the CR is content rather than Enter");
     }
 
+    /// <summary>
+    /// The case the echo-gated fallback missed: a CLI that is <b>mid-turn</b> streams output whether or
+    /// not it has read anything, so the echo wait returns true within a millisecond on an unsolicited
+    /// frame. With the separation applied only when nothing echoed, the CR then went out straight behind
+    /// the body — one read at the CLI, and J2 intact on precisely the worker a coordinator most wants to
+    /// steer. The separation is a floor in every case; the echo is still reported for what it is.
+    /// </summary>
+    [Fact]
+    public async Task ABusyCliThatEchoesUnsolicited_StillGetsTheTerminatorInAReadOfItsOwn()
+    {
+        using var cli = new RawModeCliDouble(redraws: true, chatty: true);
+        using var bound = new BoundTerminalSession(_key.AgentId, cli);
+        _terminals.Bind(_key, bound);
+
+        var delivery = await _binder.TrySendPromptAsync(_key, RealisticSteer, CancellationToken.None);
+
+        Assert.True(delivery.Submitted);
+        Assert.True(delivery.Echoed, "the chatty double is meant to satisfy the echo wait on its own output");
+
+        var writes = cli.Writes;
+        Assert.Equal(2, writes.Count);
+        var gap = writes[1].At - writes[0].At;
+        Assert.True(
+            gap >= TerminalSubmit.TerminatorSeparation,
+            $"Enter followed the body after only {gap.TotalMilliseconds:0}ms because an unsolicited frame "
+            + "counted as the echo — the PTY would hand the CLI a single read and the CR would be swallowed");
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+    }
+
     /// <summary>No bound CLI: nothing is claimed, and the caller supplies the "no live CLI" sentence.</summary>
     [Fact]
     public async Task WithNoBoundCli_NothingIsClaimed()
