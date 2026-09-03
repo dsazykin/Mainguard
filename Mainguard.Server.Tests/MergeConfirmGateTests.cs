@@ -340,6 +340,78 @@ public sealed class MergeConfirmGateTests : IDisposable
         Assert.Equal(VerifiedBranchSha, queue.CurrentMainSha);
     }
 
+    /// <summary>
+    /// The late confirm. The worker pushed between BeginMerge and ConfirmMerge, so the invalidator walked
+    /// the row off Verified and the gate refuses on state — but the client merged the VERIFIED tip (the
+    /// K2 identity guarantees that), and the reported main is exactly that tip. The reviewed bytes landed
+    /// on the user's main; the daemon records that, late and under its own source, instead of leaving the
+    /// repository and the queue permanently disagreeing.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_WhenTheGateRefusesButTheReportedMainIsTheAuthorizedTip_RecordsTheMergeLate()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host, branchSha: VerifiedBranchSha);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+        Assert.Equal(VerifiedBranchSha, begun.ExpectedBranchSha);
+
+        // The worker pushes while the human is merging: the row is no longer Verified.
+        Assert.True(queue.NotifyBranchAdvanced(AgentId, CoTenantMergedSha));
+        Assert.Equal(WorkerMergeState.Working, queue.GetState(AgentId));
+
+        var confirmed = await client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = VerifiedBranchSha,
+        }, headers);
+
+        Assert.True(confirmed.Confirmed);
+        Assert.Contains("recorded after the fact", confirmed.Note);
+        Assert.Equal(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(VerifiedBranchSha, queue.CurrentMainSha);
+        Assert.Null(_leases!.GetOutstanding(_repoHandle));
+    }
+
+    /// <summary>
+    /// The other arm: a gate refusal whose reported sha is NOT provably the authorized tip (here the lease
+    /// carries no branch sha at all) keeps the lease OUTSTANDING. Releasing it used to rest on a boot
+    /// reconcile that never ran and could not have seen a released lease anyway; held, it is exactly what
+    /// the queue-creation and on-demand reconciles act on.
+    /// </summary>
+    [Fact]
+    public async Task ConfirmMerge_RefusedAtTheGate_WithoutTheAuthorizedTip_KeepsTheLeaseOutstanding()
+    {
+        using var host = new DaemonFixture();
+        var (client, headers) = Client(host);
+        var queue = await SeedVerifiedQueueAsync(host);
+
+        var begun = await client.BeginMergeAsync(
+            new BeginMergeRequest { RepoHandle = _repoHandle, AgentId = AgentId }, headers);
+        Assert.True(begun.Granted);
+        Assert.Equal("", begun.ExpectedBranchSha);
+
+        Assert.True(queue.NotifyBranchAdvanced(AgentId, CoTenantMergedSha));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => client.ConfirmMergeAsync(new ConfirmMergeRequest
+        {
+            RepoHandle = _repoHandle,
+            AgentId = AgentId,
+            LeaseId = begun.LeaseId,
+            NewMainSha = PostMergeSha,
+        }, headers).ResponseAsync);
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("stays outstanding", ex.Status.Detail);
+        Assert.NotEqual(WorkerMergeState.Merged, queue.GetState(AgentId));
+        Assert.Equal(begun.LeaseId, _leases!.GetOutstanding(_repoHandle)?.LeaseId);
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     private static (MergeQueueService.MergeQueueServiceClient Client, Metadata Headers) Client(DaemonFixture host)

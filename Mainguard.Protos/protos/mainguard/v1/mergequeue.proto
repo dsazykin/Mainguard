@@ -299,6 +299,10 @@ message ConfirmMergeRequest {
 
 message ConfirmMergeResponse {
   bool confirmed = 1;
+  // Set when the merge was recorded LATE: the daemon's gate refused this confirm, but the reported sha is
+  // exactly the branch tip the lease authorized, so the reviewed bytes had already landed on the user's
+  // main. Says what the gate said, so the caller can show why the row moved without a clean pass.
+  string note = 2;
 }
 
 message AcknowledgeFlaggedChangeRequest {

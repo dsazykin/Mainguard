@@ -89,6 +89,14 @@ public sealed record MergeAuthorization(string By, string Source, string LeaseId
     /// <summary>The RT-D1 boot reconcile synthesizing a confirm for a merge that landed before a crash.</summary>
     public const string BootReconcileSource = "boot_reconcile";
 
+    /// <summary>
+    /// The <c>ConfirmMerge</c> RPC recording a merge the gate had just REFUSED — because the sha the client
+    /// reported is exactly the branch tip the lease authorized, so the reviewed bytes demonstrably landed
+    /// on the user's main before the refusal was reached. Its own source, so a reader can tell a merge
+    /// the gates admitted from one the daemon reflected after the fact.
+    /// </summary>
+    public const string ConfirmRpcLateSource = "confirm_rpc_late";
+
     /// <summary>The P2-12 external-PR merge dispatch.</summary>
     public const string ExternalDispatchSource = "external_dispatch";
 
@@ -104,6 +112,11 @@ public sealed record MergeAuthorization(string By, string Source, string LeaseId
     /// <summary>A human merge confirmed through the daemon RPC, under <paramref name="leaseId"/>.</summary>
     public static MergeAuthorization ConfirmRpc(string by, string leaseId) =>
         new(string.IsNullOrWhiteSpace(by) ? "unknown" : by, ConfirmRpcSource, leaseId ?? string.Empty);
+
+    /// <summary>A human merge that had already landed when the gate refused its confirm (see
+    /// <see cref="ConfirmRpcLateSource"/>), under <paramref name="leaseId"/>.</summary>
+    public static MergeAuthorization ConfirmRpcLate(string by, string leaseId) =>
+        new(string.IsNullOrWhiteSpace(by) ? "unknown" : by, ConfirmRpcLateSource, leaseId ?? string.Empty);
 
     /// <summary>The boot reconcile's synthesized confirm. Attributed to the reconciler, never a person.</summary>
     public static MergeAuthorization BootReconcile(string leaseId = "") =>

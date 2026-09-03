@@ -488,15 +488,51 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
                 request.AgentId, request.NewMainSha, lease.ExpectedMainSha, out var reason,
                 MergeAuthorization.ConfirmRpc(actor, lease.LeaseId)))
         {
-            // Nothing moved to Merged, so the lease must not strand the repo — the same "every non-merged
-            // exit hands the lease back" rule MergeDispatch follows. A merge that really did land on a ref
-            // despite the refusal is still recoverable: it left a T-19 journal entry, and the boot reconcile
-            // synthesizes the confirm from it.
-            ctx.Leases.Release(request.RepoHandle, lease.LeaseId);
-            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: {Reason}",
+            // By the time this RPC is reached the client's git operation has ALREADY RUN (§21.2), so a
+            // refusal here does not prevent a merge — it decides whether the daemon reflects one. When the
+            // reported sha IS the branch tip the lease authorized (Local entries fast-forward main exactly
+            // there), the reviewed bytes demonstrably landed: record it, late, under its own source. The
+            // shape this closes: the worker pushed between BeginMerge and ConfirmMerge, the invalidator
+            // walked the row to Working, the gate refused on state — and the user's main had moved while
+            // the queue said "not merged", with nothing anywhere that would ever reconcile the two.
+            var landedTheAuthorizedTip =
+                ctx.Queue.GetOrigin(request.AgentId) != Mainguard.Agents.Agents.MergeEntryOrigin.External
+                && !string.IsNullOrEmpty(lease.ExpectedBranchSha)
+                && string.Equals(request.NewMainSha, lease.ExpectedBranchSha, StringComparison.OrdinalIgnoreCase);
+            if (landedTheAuthorizedTip)
+            {
+                ctx.Queue.ConfirmHumanMerge(
+                    request.AgentId, request.NewMainSha, MergeAuthorization.ConfirmRpcLate(actor, lease.LeaseId));
+                ctx.Leases.Confirm(request.RepoHandle, request.LeaseId, request.NewMainSha);
+                _log.LogWarning(
+                    "ConfirmMerge recorded LATE repo={Repo} agent={Agent} newMainSha={Sha}: the gate said "
+                    + "\"{Reason}\" but the reported sha is the authorized branch tip, so the merge had landed",
+                    request.RepoHandle, request.AgentId, request.NewMainSha, reason);
+                if (_queues is not null && !_queues.TryRefreshMirrorMainAfterMerge(request.RepoHandle, out var lateRefresh))
+                {
+                    _log.LogWarning("ConfirmMerge: mirror main refresh failed repo={Repo}: {Reason}",
+                        request.RepoHandle, lateRefresh);
+                }
+
+                return Task.FromResult(new ConfirmMergeResponse
+                {
+                    Confirmed = true,
+                    Note = "recorded after the fact — the daemon's gate refused this confirm (" + reason
+                         + "), but the reported main is exactly the branch tip this merge was authorized "
+                         + "for, so the reviewed work had already landed.",
+                });
+            }
+
+            // Otherwise the lease stays OUTSTANDING. Releasing it here used to be justified by "the boot
+            // reconcile synthesizes the confirm from the journal" — which was false twice over: the
+            // reconcile never resolved a repo, and a released lease is never reconciled at all. Held, the
+            // lease is exactly what the queue-creation and on-demand reconciles act on; the repo is not
+            // stranded, because BeginMerge reconciles a landed merge before refusing on a held lease.
+            _log.LogWarning("ConfirmMerge refused repo={Repo} agent={Agent}: {Reason} (lease kept outstanding for the reconcile)",
                 request.RepoHandle, request.AgentId, reason);
             AuditConfirmRefused(request, actor, "gate", lease.ExpectedMainSha, reason);
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, reason));
+            throw new RpcException(new Status(StatusCode.FailedPrecondition,
+                reason + " The merge lease stays outstanding until the daemon can establish what landed."));
         }
 
         // Only now is the idempotency record written: a confirmed lease is the daemon's statement that this
