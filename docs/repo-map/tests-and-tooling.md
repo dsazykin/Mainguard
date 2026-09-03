@@ -2255,6 +2255,11 @@
   the coordinator jail keeps ZERO writable bind mounts. Both directions mutation-checked: never setting
   the field, and setting it unconditionally. A correct mechanism nobody passes the flag to is the MG-12
   shape the role lock already shipped as once),**
+  **`OneCoordinatorPerDaemonTests` (contract §2.2, owner decision 2026-09-03 — ONE live coordinator per
+  daemon, proved at `AgentSpawnService.SpawnAsync` with the shipped default `CoordinatorLimits`: a second
+  coordinator is refused naming the running one, in the same repo or another; a worker is not a
+  coordinator and is admitted; stopping the first admits the next. The rigs that prove cross-coordinator
+  scoping raise `MaxLiveCoordinators` explicitly),**
   **`CoordinatorRoleLockTests` (phase 3, contract §8 — THE ROLE LOCK, over the same real Unix socket. The
   coordinator's surface is now the contract's four tools and the allow-list is asserted as an object
   (`AgentIpcRequest.CoordinatorOps`, disjoint from `WorkerOps`); 18 op names outside it — every §4

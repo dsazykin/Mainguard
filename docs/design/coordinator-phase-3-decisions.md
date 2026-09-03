@@ -4366,3 +4366,59 @@ shape §24 argues against at length.
   line that joins them needs a live daemon plus a diff RPC. This is the same gap
   `ReviewCockpitVerifiedShaTests` documents for `VerifiedAgainstSha`, and it is where that defect actually
   lived — worth closing with a live-wiring harness, by whoever builds one.
+
+## 27. The 2026-09-02 review — what a green suite was hiding, and the owner's decisions
+
+A full read of this branch against the contract and this document, with the build clean and both
+non-Docker tiers green (3912 + 824), found the class of defect §5 names — a control described here and
+not delivered — in eight places that mattered. Each was verified in code before it was reported; the
+owner decided every design question on 2026-09-03; the fixes landed as narrow commits on this branch.
+
+### 27.1 What was found
+
+| # | finding | where | severity |
+|---|---|---|---|
+| 1 | The outbox **response** write followed a jail-created symlink: `<outbox>/<ticket>.out` was opened, written and chmod-ed under a path the jail chooses, in a 0777 directory with no sticky bit, by a daemon running as the user. One `ln -s ~/.zshrc outbox/<t>.out` and a request wrote the status JSON into the host file. §14 hardened the request side only. | `AgentIpcServer.ServeOutboxRequestAsync` | Critical (macOS substrate) |
+| 2 | The loop **did not survive a daemon restart** with jails alive: `WorkerPlanGate._held` was memory-only (so `Allows` opened for an unapproved worker and an approved one never received its task), adopted sessions had no `ParentAgentId` (so a coordinator owned none of its workers), and `AgentIpcServer.Dispose` deleted the IPC directory (so every adopted jail's shim wrote into an orphaned mount). The restart test covered the JSON plan store only. | `WorkerPlanGate`, `AgentSessionReconciler`, `AgentIpcServer` | High |
+| 3 | The RT-D1 boot reconcile was a **no-op**: `resolveRepoPath: _ => null`, so `MergeReconcileTask.Reconcile` returned for every lease. All of §23's K1 was unreachable, and a lease that survived a crash between `BeginMerge` and `ConfirmMerge` blocked merging, discard and reject on that repo forever (the lease store has no expiry). | `GatewayServiceRegistration`, `MergeReconcileTask` | Critical |
+| 4 | A gate-stage `ConfirmMerge` refusal after the client's `--ff-only` had landed released the lease and claimed the boot reconcile would recover the merge (it could not, and a released lease is never reconciled). User main and the queue diverged, the mirror lagged. | `MergeQueueGrpcService.ConfirmMerge` | High |
+| 5 | The coordinator shim used the 60 s default for every op while `verify` ran the whole suite synchronously and `spawn` could build a toolchain layer: the coordinator was told "cannot reach the daemon" while the daemon completed the operation, and retried. | `AgentSpawnShim`, `AgentSpawnService.VerifyAsync` | High |
+| 6 | Three callers re-verified a branch that did not descend from main — the trigger and the human's Verify on `StaleVerified`, and the post-abort path — minting the §22 loop-forever `Verified`. Only the cascade's own re-entry asked about descent. | `MergeQueueProvisioner.RunVerificationAsync` | High |
+| 7 | Teardown deleted the agent's repository after a publish the mediator **refused** (non-fast-forward after an amend), destroying the only copy of the rewritten commits, under a comment asserting that could not happen. | `SandboxAgentLauncher.TeardownAsync`, `WorktreeManager` | High |
+| 8 | The socket framing read a line with no bound (the §14 defect on the other transport), and had no per-endpoint in-flight cap. | `AgentIpcServer.ServeConnectionAsync` | High |
+| 9 | Escalation was not terminal on the primary plan path: `Present` only refused a *live* plan, and an escalated one is not live, so a worker presented a fresh plan with a fresh budget — the loop the limit exists to bound, reopened from the worker's side. §24.3 had closed exactly this for re-scopes. | `PlanApprovalService.Present` | Medium |
+| 10 | The frozen-jail guard read the session state word, which `MarkMergeState` rewrites on every queue transition, so a paused or conflicted worker read `StaleVerified`/`Working` for up to a reconciler interval and prompt/verify passed. | `FrozenJailPolicy` | Medium |
+| 11 | `EnsureQueue` walked the queue's main backwards to a lagging mirror in the window after a confirm; `CliSettingsGrantScrub` decided on unparsed bytes so `\/opt\/…` passed; the J2 echo separator counted a mid-turn CLI's output as echo and skipped the floor; the readiness trigger spent its once-per-tip attempt on transient refusals; the plan gate streamed every coordinator's cards with no repository on them; escalated cards were rebuilt on every refresh; the gate row kept a dragged pixel height after hiding. | various | Medium |
+
+### 27.2 The decisions (owner, 2026-09-03)
+
+- **Restart:** the loop survives with jails intact — held tasks persisted (`JsonHeldTaskStore`), the parent
+  on a container label, the IPC directory kept across shutdown and the endpoint re-bound on adoption.
+- **Stuck leases:** the reconcile runs per repo when its queue comes up (mirror-based classification), and
+  on demand when `BeginMerge` finds an outstanding lease; `Classify` also refuses the zero-commit
+  coincidence.
+- **Late confirm:** a gate-stage refusal whose reported sha equals the lease's `ExpectedBranchSha`
+  records `Merged` under `confirm_rpc_late`; otherwise the lease stays outstanding for the reconcile.
+- **Refused publish at Stop:** keep the agent's repository, warn, audit (`agent_repo_kept`).
+- **`request_verification` proposes** and returns; the verdict arrives on `get_worker_status` (contract §3
+  amended). The shim gets per-op deadlines.
+- **Escalation:** terminal, with one human-granted exception — the operator-only `RequestNewPlan` RPC
+  (denied to the coordinator role) sends guidance and admits exactly one fresh plan; a second escalation
+  is terminal for good (contract §3.1 amended).
+- **`StaleVerified` re-verification** routes through the cascade; `RunVerificationAsync` refuses a local
+  branch that does not descend from the queue's main.
+- **The frozen guard reads a pause axis of its own** (`AgentSessionStore.MarkFrozen`), written only by the
+  paths that freeze or thaw a jail; the trigger defers on it instead of spending the tip.
+- **One coordinator per daemon** (`CoordinatorLimits.MaxLiveCoordinators = 1`, contract §2.2).
+- **Delivery:** narrow, targeted commits directly on this branch; the Docker tier run even though it
+  sweeps the owner's live jails.
+
+### 27.3 Left alone, deliberately
+
+- The hand-back publish after "let the agent resolve" (a completed rebase is non-fast-forward and the
+  watcher's publish refuses it forever): crosses two layers and needs the parking store in DI; recorded
+  as a proposal in the review notes rather than built inside this pass.
+- Stale `.res` reclaim on a live endpoint: the aggregate bound already reclaims, and the per-op shim
+  deadlines remove the normal source of leftovers.
+- The launcher's teardown routing on a refused publish is pinned at the worktree-manager level (real git,
+  a real amend) and not by a launcher-level fake; the launcher change is four lines.

@@ -269,10 +269,13 @@ public class MergeQueueStateMachineTests
         Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var rejectRefusal));
         Assert.Contains("only a verified branch", rejectRefusal);
 
-        // Merge cannot be reached: the gate refuses, and the transition is not in the table either.
+        // Merge cannot be reached by a HUMAN: the gate refuses, and the transition is not in the table
+        // either. (ConfirmHumanMerge is the reconcile's entry since 2026-09-03 — it records a merge git
+        // already holds and force-walks the row — so the strict path under test is TryConfirmHumanMerge.)
         Assert.False(h.Queue.CanMerge("a", out _));
-        Assert.Throws<InvalidMergeStateTransitionException>(
-            () => h.Queue.ConfirmHumanMerge("a", "sha1"));
+        Assert.False(h.Queue.TryConfirmHumanMerge("a", "sha1", h.Queue.CurrentMainSha, out var mergeRefusal));
+        Assert.Equal(WorkerMergeState.VerificationFailed, h.Queue.GetState("a"));
+        Assert.NotEmpty(mergeRefusal);
 
         // Retry IS available — the human's Verify button walks VerificationFailed → Verifying.
         h.PassFor("a");
