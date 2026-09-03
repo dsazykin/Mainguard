@@ -39,6 +39,17 @@ public interface IAgentSupervisor
 
     /// <summary>Reflect the agent's gateway state in <c>ListAgents</c> metadata (e.g. <c>RateLimited</c>).</summary>
     void MarkState(string agentId, string state, string? reason);
+
+    /// <summary>
+    /// Record — or with <c>null</c>, clear — that this agent's jail is <b>frozen</b> (a parked keep-alive
+    /// conflict holds it paused). A fact of its own, separate from the state word: <see cref="MarkState"/>
+    /// is also how the merge queue reflects every transition onto the session, so a frozen worker's word
+    /// reads <c>StaleVerified</c> or <c>Working</c> the moment its entry moves, and a guard keyed on the
+    /// word alone opened for up to a reconciler interval. Default no-op for supervisors with no session table.
+    /// </summary>
+    void MarkFrozen(string agentId, string? reason)
+    {
+    }
 }
 
 /// <summary>A no-op supervisor for contexts with no worker attached (e.g. pure unit paths).</summary>

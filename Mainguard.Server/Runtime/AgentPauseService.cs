@@ -162,6 +162,7 @@ public sealed class AgentPauseService
             }
 
             _store.MarkState(session.Key, "Paused", "Paused by you.");
+            _store.MarkFrozen(session.Key, "a human paused it");
         }
 
         _ledger.MarkHumanPaused(agentId);
@@ -211,6 +212,7 @@ public sealed class AgentPauseService
             }
 
             _store.MarkState(session.Key, "Working", "Resumed by you.");
+            _store.MarkFrozen(session.Key, null);
         }
 
         _log.LogInformation("pause: agent={Agent} resumed by human ({Count} session(s))", agentId, sessions.Count);

@@ -188,6 +188,7 @@ public sealed class AgentSessionReconciler
                 if (container.Paused)
                 {
                     _store.MarkState(key, PausedState, AdoptedPausedReason);
+                    _store.MarkFrozen(key, DockerPausedFrozenReason);
                 }
                 else
                 {
@@ -232,11 +233,13 @@ public sealed class AgentSessionReconciler
             if (container.Paused && !IsPaused(session.State))
             {
                 _store.MarkState(key, PausedState, DriftedToPausedReason);
+                _store.MarkFrozen(key, DockerPausedFrozenReason);
                 corrected.Add(session.Id);
             }
             else if (!container.Paused && IsPaused(session.State))
             {
                 _store.MarkState(key, WorkingState, DriftedToRunningReason);
+                _store.MarkFrozen(key, null);
                 corrected.Add(session.Id);
             }
         }
@@ -361,6 +364,9 @@ public sealed class AgentSessionReconciler
     /// recoverable-by-pressing-resume and this one is not.
     /// </summary>
     public const string LostState = "Unresponsive";
+
+    /// <summary>The pause-axis reason written from the container engine's own reading of the jail.</summary>
+    internal const string DockerPausedFrozenReason = "the jail is paused (the container engine reports it)";
 
     internal const string AdoptedReason =
         "Adopted after a daemon restart — this jail was already running.";

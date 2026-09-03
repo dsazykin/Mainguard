@@ -118,9 +118,11 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         // is how one of them stops agreeing with the state word the surface renders. The WORDING is not
         // shared — that policy's sentences are written for an agent to read and act on in one turn ("do
         // not keep polling it"), and this reader is a person looking at a card.
+        var frozenSession = _sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(
+            request.RepoHandle, request.AgentId));
         if (FrozenJailPolicy.IsFrozen(
-                _sessions.Find(new Mainguard.Server.Runtime.AgentSessionKey(
-                    request.RepoHandle, request.AgentId))?.State))
+                frozenSession?.State,
+                frozenSession is null ? null : _sessions.FrozenReason(frozenSession.Key)))
         {
             var frozen =
                 "this agent's jail is frozen, so its tests cannot run — verification runs the test command "

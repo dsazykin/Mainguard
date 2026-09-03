@@ -434,8 +434,15 @@ public static class GatewayServiceRegistration
                     queues: sp.GetRequiredService<IMergeQueueRegistry>(),
                     planGate: sp.GetRequiredService<WorkerPlanGate>(),
                     limits: sp.GetRequiredService<CoordinatorLimits>(),
-                    log: log)
+                    log: log,
+                    // The pause axis + the state word, the same predicate the prompt/verify guards ask.
+                    isFrozen: FrozenPredicate(sp.GetRequiredService<AgentSessionStore>()))
                 : null!);
+
+        static Func<string, string, bool> FrozenPredicate(AgentSessionStore sessions) =>
+            (repoHash, agentId) =>
+                sessions.Find(new AgentSessionKey(repoHash, agentId)) is { } session
+                && FrozenJailPolicy.IsFrozen(session.State, sessions.FrozenReason(session.Key));
 
         // ...and the OTHER subscriber on that same sweep. The trigger above answers "when should this
         // branch be verified"; this one answers "is the verification this branch already has still ABOUT

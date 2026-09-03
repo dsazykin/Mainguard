@@ -284,6 +284,11 @@
     CLI's own echo (`PromptEchoWindow`, 250 ms) and by `TerminalSubmit.TerminatorSeparation` when there
     is no echo. `Echoed`/`Reacted` are **observations, never proof** — a mid-turn CLI satisfies both
     without reading anything.
+  - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
+    `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
+    session store's pause axis (`AgentSessionStore.MarkFrozen`/`FrozenReason`), which the merge queue's
+    state reflection cannot overwrite; plus the two refusal sentences an agent reads. Moved out of
+    `AgentSpawnService.cs` on 2026-09-03 when it gained the axis.
   - **`Runtime/AgentSpawnService.cs`** (PR3) — the ONE spawn/stop workflow behind BOTH entry points (the
     `SpawnAgent` RPC and the coordinator's in-jail `mainguard-agent` shim): kill-gate → session record
     (with role) → **the phase-2 task withhold** (`WorkerPlanGate.Hold`, armed the instant the id is

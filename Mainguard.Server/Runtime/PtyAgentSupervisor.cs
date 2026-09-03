@@ -27,4 +27,6 @@ public sealed class PtyAgentSupervisor : IAgentSupervisor
     public void ResumeInput(string agentId) => _leader.ResumeInput(agentId);
 
     public void MarkState(string agentId, string state, string? reason) => _store.MarkState(agentId, state, reason);
+
+    public void MarkFrozen(string agentId, string? reason) => _store.MarkFrozen(agentId, reason);
 }

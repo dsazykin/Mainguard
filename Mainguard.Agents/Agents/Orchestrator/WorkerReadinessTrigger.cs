@@ -132,6 +132,10 @@ public sealed class WorkerReadinessTrigger : IDisposable
     private sealed record Pending(string Sha, DateTimeOffset At);
 
     private readonly object _gate = new();
+    /// <summary>(repoHash, agentId) → is the worker's jail frozen right now? A frozen jail runs nothing, so
+    /// firing would spend the once-per-tip attempt on a run that cannot happen; the tip stays armed instead.</summary>
+    private readonly Func<string, string, bool>? _isFrozen;
+
     private readonly Dictionary<(string RepoHash, string AgentId), Pending> _armed = new();
     private readonly Dictionary<(string RepoHash, string AgentId), string> _lastFiredSha = new();
     private readonly Dictionary<(string RepoHash, string AgentId), DateTimeOffset> _lastFiredAt = new();
@@ -167,8 +171,10 @@ public sealed class WorkerReadinessTrigger : IDisposable
         CoordinatorLimits? limits = null,
         TimeSpan? sweepInterval = null,
         Func<DateTimeOffset>? clock = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Func<string, string, bool>? isFrozen = null)
     {
+        _isFrozen = isFrozen;
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _queues = queues ?? throw new ArgumentNullException(nameof(queues));
         _planGate = planGate ?? throw new ArgumentNullException(nameof(planGate));
@@ -363,6 +369,14 @@ public sealed class WorkerReadinessTrigger : IDisposable
                 + "StaleVerified or VerificationFailed");
         }
 
+        // 6. A frozen jail (a human pause, a parked conflict) runs nothing. Deferred, not spent: the tip
+        //    stays armed and fires when the jail thaws, instead of the once-per-tip bound recording an
+        //    attempt that could never have produced a verdict.
+        if (_isFrozen?.Invoke(key.RepoHash, key.AgentId) == true)
+        {
+            return Keep("the worker's jail is frozen (paused, or parked on a conflict) — it runs nothing until a human resumes it");
+        }
+
         lock (_gate)
         {
             // Mark attempted BEFORE the run starts. A second sweep overlapping the async handoff would
@@ -380,12 +394,12 @@ public sealed class WorkerReadinessTrigger : IDisposable
             $"auto-verify repo={key.RepoHash} agent={key.AgentId} tip={Short(state.Sha)} — the worker's branch "
             + $"has been quiet for {_limits.AutoVerifyQuietSeconds}s and its plan is approved; verifying");
 
-        LastRun = RunAsync(key, queue);
+        LastRun = RunAsync(key, queue, state.Sha);
         return new ReadinessDecision(
             key.RepoHash, key.AgentId, state.Sha, ReadinessOutcome.Fired, "verification started");
     }
 
-    private async Task RunAsync((string RepoHash, string AgentId) key, MergeQueue queue)
+    private async Task RunAsync((string RepoHash, string AgentId) key, MergeQueue queue, string sha)
     {
         try
         {
@@ -439,6 +453,22 @@ public sealed class WorkerReadinessTrigger : IDisposable
         }
         catch (Exception ex)
         {
+            if (ex is not InvalidOperationException)
+            {
+                // A TRANSIENT refusal — the container engine did not answer, an exec failed, an IO error —
+                // says nothing about the tip, so the once-per-tip attempt is handed back: the tip is
+                // re-armed with a fresh quiet window and the cooldown still bounds the retry. Only the
+                // typed refusals (InvalidOperationException and its subclasses: a malformed verify
+                // command, no command, an illegal state) are a verdict about the tip that a retry cannot
+                // change, and those stay spent.
+                lock (_gate)
+                {
+                    _lastFiredSha.Remove(key);
+                }
+
+                NotifyAdvanced(key.RepoHash, key.AgentId, sha);
+            }
+
             // The throw is REPORTED and translated into nothing. A throw out of RunVerificationAsync means
             // the run was REFUSED before it produced a verdict — no live jail, a drifted branch, a missing
             // toolchain, or a verify command whose shell operators survived tokenisation

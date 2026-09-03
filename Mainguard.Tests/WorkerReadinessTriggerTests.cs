@@ -94,7 +94,7 @@ public class WorkerReadinessTriggerTests
                 },
                 requeue: holdStale
                     ? (id, _) => { lock (Requeues) { Requeues.Add(id); } return Task.CompletedTask; }
-                    : null,
+            : null,
                 gates: Array.Empty<IMergeGate>(),
                 audit: Audit,
                 clock: () => Now);
@@ -116,8 +116,14 @@ public class WorkerReadinessTriggerTests
                 limits: limits ?? new CoordinatorLimits(),
                 sweepInterval: WorkerReadinessTrigger.DriveManually,
                 clock: () => Now,
-                log: line => { lock (Log) { Log.Add(line); } });
+                log: line => { lock (Log) { Log.Add(line); } },
+                isFrozen: (_, id) => { lock (Frozen) { return Frozen.Contains(id); } });
         }
+
+        /// <summary>Workers whose jail the rig reports frozen (paused, or parked on a conflict).</summary>
+        public HashSet<string> Frozen { get; } = new(StringComparer.Ordinal);
+
+        public void StopRefusing(string id) => _refusals.Remove(id);
 
         /// <summary>A worker the coordinator delegated to and whose plan a human approved.</summary>
         public void ApprovedWorker(string id)
@@ -358,6 +364,47 @@ public class WorkerReadinessTriggerTests
     /// in a loop: the same tip is never re-attempted, so a malformed verify command costs one refusal rather
     /// than one per sweep, and the fix for it (a commit) is what re-arms the branch.</para>
     /// </summary>
+    [Fact]
+    public void AFrozenJail_DefersTheAttempt_AndTheTipFiresOnceItThaws()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Frozen.Add("w-1");
+        rig.Advance(TimeSpan.FromSeconds(120));
+
+        // Deferred, not spent: a frozen jail runs nothing, and the once-per-tip bound must not record an
+        // attempt that could never have produced a verdict.
+        var deferred = Only(rig.Sweep(), "w-1");
+        Assert.Equal(ReadinessOutcome.Deferred, deferred.Outcome);
+        Assert.Contains("frozen", deferred.Reason, StringComparison.Ordinal);
+        Assert.Empty(rig.Runs);
+
+        rig.Frozen.Remove("w-1");
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        Assert.Equal(new[] { "w-1" }, rig.Runs);
+    }
+
+    [Fact]
+    public async Task ATransientRefusal_HandsTheAttemptBack_SoTheSameTipIsRetriedAfterTheCooldown()
+    {
+        using var rig = new Rig();
+        rig.ApprovedWorker("w-1");
+        rig.RefuseRunFor("w-1", new System.IO.IOException("the container engine did not answer"));
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        await rig.Trigger.LastRun;
+
+        // The engine is back. Nothing was pushed, so nothing re-arms the tip except the trigger itself.
+        rig.StopRefusing("w-1");
+        rig.Advance(TimeSpan.FromSeconds(700)); // past the quiet window AND the cooldown
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        await rig.Trigger.LastRun;
+        Assert.Equal(new[] { "w-1", "w-1" }, rig.Runs);
+        Assert.Equal(WorkerMergeState.Verified, rig.Queue.GetState("w-1"));
+    }
+
     [Fact]
     public async Task ARefusedVerification_RecordsNothing_AndIsNotRetriedOnTheSameTip()
     {

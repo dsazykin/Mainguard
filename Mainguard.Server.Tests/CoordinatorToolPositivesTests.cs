@@ -347,6 +347,43 @@ public sealed class CoordinatorToolPositivesTests : PlanGateIpcTestBase, IClassF
     }
 
     /// <summary>
+    /// The guard reads the PAUSE AXIS, not only the state word. The word is rewritten by the merge queue on
+    /// every transition (a co-tenant merges → <c>StaleVerified</c>; a verification settles → <c>Working</c>),
+    /// so a paused worker read as running for up to a reconciler interval and the prompt went through.
+    /// </summary>
+    [Fact]
+    public async Task SendWorkerPrompt_ToAJailTheStoreKnowsIsFrozen_IsRefused_WhateverTheStateWordSays()
+    {
+        var (coordinatorId, workerId) = await SpawnCoordinatorAndWorkerAsync("frozen axis");
+        await ApproveAsync(workerId);
+
+        using var cli = new RawModeCliDouble();
+        using var bound = new BoundTerminalSession(workerId, cli);
+        Rig.Terminals.Bind(KeyFor(workerId), bound);
+
+        // The axis says frozen; the word says the opposite — exactly what MarkMergeState does to a paused
+        // worker the moment its entry moves.
+        Rig.Sessions.MarkFrozen(KeyFor(workerId), "a human paused it");
+        Rig.Sessions.MarkState(KeyFor(workerId), "StaleVerified", "main moved under this branch");
+
+        var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
+        Assert.False(refused.Ok, $"a frozen worker accepted a prompt (status={refused.Status})");
+        Assert.Contains($"{workerId} is paused", refused.Error, StringComparison.Ordinal);
+        Assert.Contains("a human paused it", refused.Error, StringComparison.Ordinal);
+        await Task.Delay(200);
+        Assert.Empty(cli.SubmittedLines);
+        Assert.Equal(string.Empty, cli.PendingInput);
+
+        // Thawed, the same call lands — the axis clears, it does not latch.
+        Rig.Sessions.MarkFrozen(KeyFor(workerId), null);
+        var accepted = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.PromptOp, AgentId: workerId, Prompt: RealisticSteer));
+        Assert.True(accepted.Ok, $"the thawed steer was refused: {accepted.Error}");
+        Assert.Equal(new[] { RealisticSteer }, await cli.WaitForSubmittedAsync(1, TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
     /// The same hole on <c>request_verification</c>, which runs the test command inside that same frozen
     /// jail. Refused BEFORE the merge-queue step — and the neighbouring positive
     /// (<see cref="RequestVerification_ForAnApprovedOwnedWorker_ReachesTheQueueStep"/>) is what proves the

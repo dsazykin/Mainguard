@@ -1254,6 +1254,10 @@ public sealed class MergeQueueProvisioner
             // local, it is the last thing the cascade does to this agent, and a suppression rule inside
             // the merge-state reflection would have to know about a run state it otherwise never reads.
             MarkRunState(repoHandle, agentId, AgentRunState.Conflict);
+            // …and the pause AXIS, which no later merge transition overwrites. The re-assert above closes
+            // the ordering within this cycle; this closes the window after it, when the queue's next
+            // transition rewrites the word while the jail is still SIGSTOPped.
+            MarkFrozen(repoHandle, agentId, ConflictFrozenReason);
             return;
         }
 
@@ -1467,6 +1471,24 @@ public sealed class MergeQueueProvisioner
     /// Reflects a keep-alive run state on the agent, so the states the cycle transitions through are
     /// observable rather than internal to a background task.
     /// </summary>
+    /// <summary>What the pause axis says while a keep-alive rebase is parked on a conflict.</summary>
+    public const string ConflictFrozenReason =
+        "its keep-alive rebase onto the new main conflicted, so the daemon froze the jail with the rebase "
+        + "still in progress and a human has to resolve it";
+
+    /// <summary>Sets or clears the session's pause axis; reporting must never be able to fail a rebase.</summary>
+    private void MarkFrozen(string repoHandle, string agentId, string? reason)
+    {
+        try
+        {
+            _agentStates.MarkFrozen(agentId, reason);
+        }
+        catch (Exception ex)
+        {
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} frozen mark FAILED ({ex.Message})");
+        }
+    }
+
     private void MarkRunState(string repoHandle, string agentId, AgentRunState state)
     {
         var detail = state switch
@@ -1708,6 +1730,8 @@ public sealed class MergeQueueProvisioner
             }
         }
 
+        // The jail is running again: clear the pause axis before anything is typed into it.
+        MarkFrozen(repoHandle, agentId, null);
         MarkRunState(repoHandle, agentId, AgentRunState.Rebasing);
         try
         {
@@ -1859,6 +1883,7 @@ public sealed class MergeQueueProvisioner
         }
 
         ParkedConflicts.Clear(repoHandle, agentId);
+        MarkFrozen(repoHandle, agentId, null);
         MarkRunState(repoHandle, agentId, AgentRunState.Working);
         queue.TryReturnToWorking(agentId, ConflictAbortedReason, "conflict-aborted");
 
