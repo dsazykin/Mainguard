@@ -708,6 +708,35 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// The window the post-merge refresh could not close on its own: ConfirmMerge has installed the
+    /// client's post-merge sha as the queue's main, the mirror has not been pulled forward (the refresh
+    /// failed, or a spawn's EnsureQueue arrived first), and the reconcile trusted the mirror — walking the
+    /// queue's main BACKWARDS to the pre-merge sha and cascading every Verified entry for a move that
+    /// never happened. A mirror that is merely behind the queue must catch up, not drag the queue back.
+    /// </summary>
+    [Fact]
+    public async Task EnsureQueue_DoesNotWalkMainBackwards_WhenTheMirrorIsMerelyBehindTheQueue()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        CommitOnAgentBranch(repoHash, "npm test");
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        provisioner.EnsureEntry(repoHash, AgentId, MergeEntryOrigin.Local);
+        await ctx.Queue.RunVerificationAsync(AgentId, CancellationToken.None);
+        var preMergeMain = ctx.Queue.CurrentMainSha;
+
+        // The human's merge lands on origin and the queue is told — but the mirror is not refreshed.
+        var newMain = FastForwardOriginMainTo(repoHash, AgentId);
+        ctx.Queue.ConfirmHumanMerge(AgentId, newMain);
+        Assert.Equal(newMain, ctx.Queue.CurrentMainSha);
+
+        // A repeat EnsureQueue (any spawn, any provision) used to regress the queue to preMergeMain here.
+        Assert.Same(ctx, provisioner.EnsureQueue(repoHash));
+        Assert.Equal(newMain, ctx.Queue.CurrentMainSha);
+        Assert.NotEqual(preMergeMain, ctx.Queue.CurrentMainSha);
+    }
+
+    /// <summary>
     /// The control. Identical declarations on both sides must NOT flag — a gate that fires on every
     /// branch is noise, and noise trains reviewers to acknowledge without reading.
     /// </summary>

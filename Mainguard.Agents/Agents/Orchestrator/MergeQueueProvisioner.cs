@@ -419,8 +419,35 @@ public sealed class MergeQueueProvisioner
 
         if (!created && !string.Equals(context.Queue.CurrentMainSha, mainSha, StringComparison.Ordinal))
         {
-            context.Queue.NotifyMainMoved(mainSha);
-            _log?.Invoke($"merge queue repo={repoHandle} main advanced to {mainSha} — stale cascade fired");
+            // The mirror can be BEHIND the queue: ConfirmMerge installs the client's post-merge sha as
+            // the queue's main and only then pulls the mirror forward, and that pull can fail (or not have
+            // run yet). Trusting the mirror here walked the queue's main BACKWARDS to the pre-merge sha and
+            // fired the stale cascade at every Verified entry for a move that never happened. A mirror
+            // whose main is an ancestor of the queue's — or that does not even hold the queue's sha yet —
+            // is behind, so the queue is left where it is and the mirror is pulled forward instead. Only a
+            // mirror the queue is NOT ahead of (main really moved on origin) still moves the queue.
+            var queueMain = context.Queue.CurrentMainSha;
+            var mirrorBehind = !TryGit(barePath, out _, "cat-file", "-e", queueMain + "^{commit}")
+                || TryGit(barePath, out _, "merge-base", "--is-ancestor", mainSha, queueMain);
+            if (mirrorBehind)
+            {
+                _log?.Invoke($"merge queue repo={repoHandle} mirror main {mainSha} is behind the queue's {queueMain} — refreshing the mirror, not the queue");
+                TryRefreshMirrorMainAfterMerge(repoHandle, out _);
+                var refreshed = RevParse(barePath, mainBranch);
+                if (!string.IsNullOrEmpty(refreshed)
+                    && !string.Equals(refreshed, queueMain, StringComparison.Ordinal)
+                    && TryGit(barePath, out _, "cat-file", "-e", queueMain + "^{commit}")
+                    && !TryGit(barePath, out _, "merge-base", "--is-ancestor", refreshed, queueMain))
+                {
+                    context.Queue.NotifyMainMoved(refreshed);
+                    _log?.Invoke($"merge queue repo={repoHandle} main advanced to {refreshed} — stale cascade fired");
+                }
+            }
+            else
+            {
+                context.Queue.NotifyMainMoved(mainSha);
+                _log?.Invoke($"merge queue repo={repoHandle} main advanced to {mainSha} — stale cascade fired");
+            }
         }
 
         if (created)
