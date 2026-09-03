@@ -224,6 +224,26 @@ public sealed class AgentSpawnService
             throw new ArgumentException("agent_kind is required.");
         }
 
+        // One coordinator per daemon (CoordinatorLimits.MaxLiveCoordinators; owner decision 2026-09-03).
+        // The plan gate streams every coordinator's cards to the one operator surface, so a second live
+        // coordinator meant plans a human could approve from the wrong repository's window. Refused here,
+        // before anything is minted, and only for a SPAWN: a restart's adoption pass re-admits what was
+        // already running through the session store directly.
+        if (role == AgentRoles.Coordinator)
+        {
+            var liveCoordinators = _store.List().Where(s => s.Role == AgentRoles.Coordinator).ToList();
+            if (liveCoordinators.Count >= _limits.MaxLiveCoordinators)
+            {
+                var running = liveCoordinators[0];
+                _spawnLog.LogWarning(
+                    "spawn refused: a coordinator is already running (agent={Agent} repo={Repo})",
+                    running.Id, running.RepoHash);
+                throw new AgentSpawnRefusedException(
+                    $"A coordinator is already running ({running.Id}, repo {running.RepoHash}) — one "
+                    + "coordinator per daemon. Stop it before starting another.");
+            }
+        }
+
         // A plan-gated spawn is refused UP FRONT when its brief is not a brief — before _store.Spawn
         // mints a session, so a refusal leaves nothing behind. WorkerPlanGate.Hold enforces the same
         // rule (it is the authority; this is the same function, called early enough to fail cleanly),

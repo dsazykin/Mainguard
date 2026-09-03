@@ -140,6 +140,16 @@ Two consequences worth being explicit about, since both are easy to misread:
   reachable on the egress allowlist (OAuth workers need them), so the limit is not enforced by blocking
   the route. See the residual-bypass note in `oauth-budgeting.md`.
 
+### 2.2 One coordinator per daemon (owner decision, 2026-09-03)
+
+A daemon runs **at most one live coordinator**. `AgentSpawnService.SpawnAsync` refuses a second one
+(`CoordinatorLimits.MaxLiveCoordinators = 1`), naming the one that is running; stop it before starting
+another. The reason is the plan gate: it streams every coordinator's cards to the one operator surface with
+no repository on them, so two live coordinators meant a plan a human could approve from the wrong
+repository's window. The rule governs spawns only — a restart's adoption pass re-admits whatever was
+already running, because adoption records what exists rather than deciding what may. Ownership scoping
+(§7) stays exactly as built, as defence in depth.
+
 ## 3. The surface — the complete set of coordinator operations
 
 These four already exist as `CoordinatorTools`. The contract is that this list is **exhaustive**.
@@ -235,6 +245,15 @@ was the only path that ever returned a task, and a worker would otherwise have n
 spawned to do. The two alternatives were both worse: redefining `brief` would make "never yields the task
 prompt" conditionally false (§13's defect exactly), and putting the task in the launch argv would give up
 the structural guarantee that `AgentKickoffPrompt` *cannot* carry it.
+
+**Escalation is terminal, with one human-granted exception (owner decision, 2026-09-03).** After the
+rejection that spends the revision budget, the daemon refuses any further `present_plan` from that worker
+— until then it merely told the worker to stop, and a worker that presented anyway got a fresh budget
+(the loop the limit exists to bound, reopened from the worker's side). A human may send the escalated plan
+back for **one** fresh plan, with guidance, through the operator-only `RequestNewPlan` RPC (denied to the
+coordinator role, on the `ApprovePlan`/`RejectPlan` boundary). The guidance reaches the worker as the
+feedback on its escalated plan (`brief`, `await <id>`), exactly one more presentation is accepted, and a
+second escalation is terminal for good.
 
 `commit_work` is the step that makes a worker's work outlive its jail, and it is where the loop used to
 end one rung short: a worker finished, stopped on an uncommitted diff, and the worktree was deleted with

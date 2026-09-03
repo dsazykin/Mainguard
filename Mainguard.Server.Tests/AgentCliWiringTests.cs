@@ -438,7 +438,12 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task ShimList_IsScopedToTheCallersOwnWorkers()
     {
-        using var rig = WiringRig.Create(_daemon);
+        using var rig = WiringRig.Create(
+            _daemon,
+            // Two coordinators on one daemon, to prove list scoping between them; the shipped cap is ONE
+            // (contract §2.2), so the rig raises it and the scoping stays as defence in depth.
+            configureServices: c => c.AddSingleton(
+                new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits(MaxLiveCoordinators: 16)));
         var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
 
         // Two independent coordinators, each spawning a worker through its OWN shim socket.
@@ -529,7 +534,12 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task ShimList_ForACoordinatorWithNoWorkers_IsEmpty_NotEveryAgent()
     {
-        using var rig = WiringRig.Create(_daemon);
+        using var rig = WiringRig.Create(
+            _daemon,
+            // Two coordinators on one daemon, to prove list scoping between them; the shipped cap is ONE
+            // (contract §2.2), so the rig raises it and the scoping stays as defence in depth.
+            configureServices: c => c.AddSingleton(
+                new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits(MaxLiveCoordinators: 16)));
         var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
 
         // Another coordinator with a worker exists on this daemon...

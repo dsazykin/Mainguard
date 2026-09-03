@@ -41,7 +41,13 @@ public sealed class PlanGateRig : IDisposable
             _root, new AgentSessionRepoScopingTests.RecordingEngine());
         var environment = Environment;
         _host = _daemon.WithWebHostBuilder(b => b.ConfigureTestServices(services =>
-            services.AddSingleton<IAgentEnvironment>(environment)));
+        {
+            services.AddSingleton<IAgentEnvironment>(environment);
+            // These classes drive several coordinators against one daemon (cross-coordinator plan
+            // ownership, the four-tool simulation). The shipped cap is ONE per daemon (contract §2.2), so
+            // the rig raises it explicitly; OneCoordinatorPerDaemonTests proves the default.
+            services.AddSingleton(new CoordinatorLimits(MaxLiveCoordinators: 16));
+        }));
         _ = _host.Services; // build once, here, not inside the first test
     }
 

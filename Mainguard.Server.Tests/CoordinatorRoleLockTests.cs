@@ -45,7 +45,12 @@ public sealed class RoleLockRig : IDisposable
         Engine = new AgentSessionRepoScopingTests.RecordingEngine();
         var environment = new AgentSessionRepoScopingTests.FakeAgentEnvironment(_root, Engine);
         _host = _daemon.WithWebHostBuilder(b => b.ConfigureTestServices(services =>
-            services.AddSingleton<IAgentEnvironment>(environment)));
+        {
+            services.AddSingleton<IAgentEnvironment>(environment);
+            // Ownership scoping is proved between TWO live coordinators, which the shipped cap (one per
+            // daemon, contract §2.2) refuses; raised here, and the scoping stays as defence in depth.
+            services.AddSingleton(new CoordinatorLimits(MaxLiveCoordinators: 16));
+        }));
         _ = _host.Services;
     }
 

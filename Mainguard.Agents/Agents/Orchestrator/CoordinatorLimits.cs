@@ -52,11 +52,20 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// button or the stale cascade: a cooldown on a human's explicit request would be a control refusing the
 /// person it exists to serve.
 /// </param>
+/// <param name="MaxLiveCoordinators">
+/// How many coordinators may be live on one daemon at once. <b>One</b> (owner decision, 2026-09-03): the
+/// plan gate, the operator's approval cards and the coordinator surface are all built around a single
+/// orchestrating agent, and a second one produced cards a human could approve from the wrong repository's
+/// window. Enforced by <c>AgentSpawnService.SpawnAsync</c>; adoption after a restart is not a spawn and
+/// re-admits whatever was already running. Test rigs that prove cross-coordinator ownership scoping raise
+/// it explicitly — that scoping stays as defence in depth.
+/// </param>
 public sealed record CoordinatorLimits(
     int MaxActiveWorkers = 6,
     int MaxPlanRevisions = 3,
     int AutoVerifyQuietSeconds = 90,
-    int AutoVerifyCooldownSeconds = 600)
+    int AutoVerifyCooldownSeconds = 600,
+    int MaxLiveCoordinators = 1)
 {
     /// <summary><see cref="AutoVerifyQuietSeconds"/> as a <see cref="System.TimeSpan"/>.</summary>
     public System.TimeSpan AutoVerifyQuietPeriod => System.TimeSpan.FromSeconds(AutoVerifyQuietSeconds);
