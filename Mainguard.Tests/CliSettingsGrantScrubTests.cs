@@ -1,7 +1,7 @@
 using System;
 using System.Linq;
-using System.Text.Json.Nodes;
 using System.Text;
+using System.Text.Json.Nodes;
 using Mainguard.Agents.Agents.Adapters;
 using Mainguard.Agents.Agents.Ipc;
 using Xunit;
