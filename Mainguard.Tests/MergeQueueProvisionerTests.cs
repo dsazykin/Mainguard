@@ -993,22 +993,23 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
-    /// The same scenario on the composition this change replaced — re-verify with no rebase — pinned as a
-    /// regression rather than described in a comment.
+    /// The same scenario on the composition the reparenting cascade replaced — re-verify with no rebase.
     ///
-    /// <para>It is the exact shape of the defect: the entry lands back on <c>Verified</c>,
-    /// <c>CanMerge</c> answers TRUE, and the branch does not fast-forward, so the merge refuses with
-    /// "verification is stale" and the refusal re-queues it into the same cascade. Every observable the
-    /// human has says ready; the one that decides says no.</para>
+    /// <para>This test used to PIN the defect: the entry landed back on <c>Verified</c>, <c>CanMerge</c>
+    /// answered TRUE, and the branch did not fast-forward, so every observable the human had said ready
+    /// while the one that decides said no. It now pins the belt that stops it: a verification is refused
+    /// for a local branch that does not descend from the queue's main, whoever asked for it — the null
+    /// rebaser here, the human's Verify button, or the readiness trigger — and the entry rests at
+    /// <c>Working</c> wearing the reason instead of at a green nothing can merge.</para>
     /// </summary>
     [Fact]
-    public async Task WithoutTheKeepAliveRebase_TheCoTenantLooksMergeableAndIsNot()
+    public async Task WithoutTheKeepAliveRebase_TheBeltRefusesTheReVerify_InsteadOfMintingAFalseGreen()
     {
         var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
         CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
         CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
 
-        // No yield, no worktree locator — i.e. the pre-fix daemon.
+        // No yield, no worktree locator — i.e. a daemon that cannot reparent.
         var provisioner = NewProvisioner(exitCode: 0, out _);
         Assert.False(provisioner.ReparentsStaleBranches);
         var ctx = provisioner.EnsureQueue(repoHash)!;
@@ -1019,8 +1020,45 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
         await ctx.Queue.LastCascade;
 
-        Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));       // the queue says yes
-        Assert.False(FastForwardsOntoMain(repoHash, SecondAgent));  // git says no
+        Assert.False(FastForwardsOntoMain(repoHash, SecondAgent));  // git says no...
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason)); // ...and now so does the queue
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.Contains(MergeQueueProvisioner.NotOnTopOfMainReasonPrefix, reason);
+    }
+
+    /// <summary>
+    /// The belt is for LOCAL entries only. An external pull-request head legitimately sits behind main and
+    /// lands by the host's merge commit, never by <c>--ff-only</c>, so refusing to verify it would refuse
+    /// every honest PR the moment main moved. Both origins are set up identically behind the same new
+    /// main; only the local one is refused.
+    /// </summary>
+    [Fact]
+    public async Task TheDescentBelt_RefusesALocalBranchBehindMain_AndLeavesAnExternalOneAlone()
+    {
+        var repoHash = SeedAndProvision(mainVerifyCommand: "npm test");
+        CommitOnAgentBranchFor(repoHash, FirstAgent, "first.cs");
+        CommitOnAgentBranchFor(repoHash, SecondAgent, "second.cs");
+        CommitOnAgentBranchFor(repoHash, "pr-7", "third.cs");
+
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        var ctx = provisioner.EnsureQueue(repoHash)!;
+        provisioner.EnsureEntry(repoHash, "pr-7", MergeEntryOrigin.External);
+
+        // Main moves under both un-verified entries: the first agent merges.
+        await ctx.Queue.RunVerificationAsync(FirstAgent, CancellationToken.None);
+        ctx.Queue.ConfirmHumanMerge(FirstAgent, FastForwardMainTo(repoHash, "refs/heads/agent/" + FirstAgent));
+        await ctx.Queue.LastCascade;
+
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None));
+        Assert.Contains(MergeQueueProvisioner.NotOnTopOfMainReasonPrefix, refused.Message);
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
+        Assert.Contains(MergeQueueProvisioner.NotOnTopOfMainReasonPrefix, reason);
+
+        var external = await ctx.Queue.RunVerificationAsync("pr-7", CancellationToken.None);
+        Assert.True(external.Passed);
+        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState("pr-7"));
     }
 
     /// <summary>
@@ -1212,12 +1250,19 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.Contains(_audit.Read(), e =>
             e.Type == MergeQueue.RequeueBlockedEvent && e.Fields["agent"] == SecondAgent);
 
-        // The entry is not frozen: once the agent is back, an ordinary verification walks it out of
-        // Working, and the block reason retires with the state rather than outliving it.
+        // The entry is not frozen — but once the agent is back, an ordinary verification must NOT walk it
+        // to Verified either: the branch was never reparented, so a direct run would mint the exact green
+        // that `--ff-only` refuses forever. The descent belt refuses it with the reason a human can act on,
+        // and the entry stays at Working wearing that reason rather than the retired no-jail one.
         stopped = false;
-        await ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None);
-        Assert.Equal(WorkerMergeState.Verified, ctx.Queue.GetState(SecondAgent));
-        Assert.True(ctx.Queue.CanMerge(SecondAgent, out _));
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => ctx.Queue.RunVerificationAsync(SecondAgent, CancellationToken.None));
+        Assert.Contains(MergeQueueProvisioner.NotOnTopOfMainReasonPrefix, refused.Message);
+        Assert.Equal(WorkerMergeState.Working, ctx.Queue.GetState(SecondAgent));
+        // A refused run keeps the measured reason that was already on the entry (the cascade's no-jail
+        // sentence), and both sentences name the same remedy.
+        Assert.False(ctx.Queue.CanMerge(SecondAgent, out reason));
+        Assert.Contains("rebas", reason);
     }
 
     /// <summary>

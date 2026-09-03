@@ -389,6 +389,22 @@ public sealed class WorkerReadinessTrigger : IDisposable
     {
         try
         {
+            // A STALE entry goes through the cascade's re-entry — reparent, then re-verify — and never
+            // through the direct run. Verifying a stale branch where it stands pins a pass to the new
+            // main for a branch that does not descend from it, which is the loop-forever `Verified` the
+            // cascade exists to end; this trigger was one of the doors back into it.
+            if (queue.GetState(key.AgentId) == WorkerMergeState.StaleVerified)
+            {
+                await queue.RequeueStaleAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+                var settled = queue.GetState(key.AgentId);
+                var reentry = settled is WorkerMergeState.Verified or WorkerMergeState.VerificationFailed
+                    ? $"re-entered through the cascade; the entry is now {settled}"
+                    : $"the cascade's re-entry ended at {settled}"
+                      + (queue.CanMerge(key.AgentId, out var blocked) ? string.Empty : $" — {blocked}");
+                _log?.Invoke($"auto-verify repo={key.RepoHash} agent={key.AgentId} — {reentry}");
+                return;
+            }
+
             // THE one call. Everything about what a verification is — the Verifying transition, the jail
             // execution, the gates armed from the committed trees, the immutable record, the settle to
             // Verified or to VerificationFailed — belongs to this method and to nothing here.

@@ -1984,6 +1984,32 @@ public sealed class MergeQueue : IMergeQueue
             ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
         }));
 
+    /// <summary>
+    /// Re-enters ONE <see cref="WorkerMergeState.StaleVerified"/> entry through the stale cascade — the
+    /// same <c>requeue</c> delegate <see cref="NotifyMainMoved"/>'s FIFO walk uses (reparent, then
+    /// re-verify), never the direct <see cref="RunVerificationAsync"/>.
+    ///
+    /// <para>Why a second way of asking for the same re-entry exists: the human Verify button and the
+    /// readiness trigger both used to call <see cref="RunVerificationAsync"/> directly on a stale entry,
+    /// which verifies the branch WHERE IT STANDS — a pass pinned to the new main for a branch that does
+    /// not descend from it, i.e. a <c>Verified</c> whose <c>--ff-only</c> merge refuses forever. The
+    /// cascade's re-entry is the only path that reparents first, so a stale entry has exactly one road
+    /// back to green and this is its door. Refused, rather than silently redirected, for any other state:
+    /// the caller asked for a stale re-entry and the entry is not stale.</para>
+    /// </summary>
+    public Task RequeueStaleAsync(string agentId, CancellationToken ct)
+    {
+        var state = GetState(agentId);
+        if (state != WorkerMergeState.StaleVerified)
+        {
+            throw new InvalidOperationException(
+                $"'{agentId}' is {state} — only a StaleVerified entry is re-entered through the cascade.");
+        }
+
+        var requeue = _requeue ?? ((id, token) => RunVerificationAsync(id, token));
+        return requeue(agentId, ct);
+    }
+
     // ---- Internals -------------------------------------------------------
 
     private Task RequeueAllAsync(IReadOnlyList<string> staleFifo)

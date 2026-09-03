@@ -70,7 +70,7 @@ public class MergeQueueStateMachineTests
             // for the gate/override/immutability assertions (production always re-verifies).
             Func<string, CancellationToken, Task> requeue = withRequeue
                 ? (id, ct) => { RequeueOrder.Add(id); return queue.RunVerificationAsync(id, ct); }
-            : (id, ct) => Task.CompletedTask;
+            : (id, ct) => { RequeueOrder.Add(id); return Task.CompletedTask; };
 
             var gates = withChangedGate ? new IMergeGate[] { ChangedGate } : Array.Empty<IMergeGate>();
             queue = new MergeQueue("repo", "sha0", StateStore, VerStore, run, requeue, gates, Audit,
@@ -92,6 +92,48 @@ public class MergeQueueStateMachineTests
         await h.Queue.RunVerificationAsync(agentId, CancellationToken.None);
         Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState(agentId));
         return h.Queue;
+    }
+
+    // ---- The stale re-entry door -----------------------------------------
+
+    /// <summary>
+    /// <see cref="MergeQueue.RequeueStaleAsync"/> is the door the human's Verify and the readiness trigger
+    /// take for a <c>StaleVerified</c> entry: it invokes the SAME requeue delegate the cascade's FIFO walk
+    /// uses (reparent, then re-verify), never the direct run. Built with a requeue that records and holds,
+    /// so the entry rests at StaleVerified and the delegate call is the observable.
+    /// </summary>
+    [Fact]
+    public async Task RequeueStaleAsync_FromStaleVerified_TakesTheCascadesRequeue_NotTheDirectRun()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        await VerifiedAsync(h, "a");
+
+        h.Queue.NotifyMainMoved("sha1");
+        await h.Queue.LastCascade;
+        Assert.Equal(WorkerMergeState.StaleVerified, h.Queue.GetState("a"));
+        Assert.Equal(new[] { "a" }, h.RequeueOrder); // the cascade's own walk
+
+        await h.Queue.RequeueStaleAsync("a", CancellationToken.None);
+
+        Assert.Equal(new[] { "a", "a" }, h.RequeueOrder);                 // the door went through the delegate
+        Assert.Equal(WorkerMergeState.StaleVerified, h.Queue.GetState("a")); // ...and not through a direct run
+    }
+
+    /// <summary>A stale re-entry is refused for an entry that is not stale — the caller asked for a
+    /// reparent-then-verify and there is nothing to reparent. Refused, never silently redirected.</summary>
+    [Fact]
+    public async Task RequeueStaleAsync_FromAnyOtherState_IsRefused_AndRunsNothing()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Queue.RequeueStaleAsync("a", CancellationToken.None));
+
+        Assert.Contains("Working", refused.Message);
+        Assert.Empty(h.RequeueOrder);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
     }
 
     // ---- Legal transitions ----------------------------------------------

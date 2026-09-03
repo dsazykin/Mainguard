@@ -50,7 +50,16 @@ public class WorkerReadinessTriggerTests
         private readonly Dictionary<string, Exception> _refusals = new(StringComparer.Ordinal);
         private long _tick;
 
-        public Rig(CoordinatorLimits? limits = null)
+        /// <summary>Every id the queue's stale-cascade requeue delegate was asked to re-enter.</summary>
+        public readonly List<string> Requeues = new();
+
+        /// <param name="holdStale">
+        /// Wire a requeue delegate that RECORDS and HOLDS (re-verifies nothing), so a stale entry rests at
+        /// StaleVerified and "which road did the trigger take" is observable: the cascade's delegate, or the
+        /// direct run. Null keeps the queue's default (the direct run), which is what every test written
+        /// before the door existed assumes.
+        /// </param>
+        public Rig(CoordinatorLimits? limits = null, bool holdStale = false)
         {
             Plans = new PlanApprovalService(audit: Audit);
             Gate = new WorkerPlanGate(Plans, Audit);
@@ -83,7 +92,9 @@ public class WorkerReadinessTriggerTests
                         id, queue.CurrentMainSha, !_fails.Contains(id), "log.txt", "npm test", "cfg",
                         T0.AddSeconds(Interlocked.Increment(ref _tick)));
                 },
-                requeue: null,
+                requeue: holdStale
+                    ? (id, _) => { lock (Requeues) { Requeues.Add(id); } return Task.CompletedTask; }
+                    : null,
                 gates: Array.Empty<IMergeGate>(),
                 audit: Audit,
                 clock: () => Now);
@@ -149,6 +160,43 @@ public class WorkerReadinessTriggerTests
 
     private static ReadinessDecision Only(IReadOnlyList<ReadinessDecision> decisions, string agentId) =>
         Assert.Single(decisions, d => d.AgentId == agentId);
+
+    // ---- A stale entry goes through the cascade, never the direct run ----
+
+    /// <summary>
+    /// From <c>StaleVerified</c> the trigger asks for the cascade's re-entry (reparent, then re-verify)
+    /// and NOT for a direct run. The direct run verifies the branch where it stands — a pass pinned to the
+    /// new main for a branch that does not descend from it, i.e. the loop-forever <c>Verified</c> the
+    /// cascade exists to end — and this trigger was one of the doors back into it.
+    /// </summary>
+    [Fact]
+    public async Task FromStaleVerified_TheTriggerTakesTheCascadesReEntry_NotTheDirectRun()
+    {
+        using var rig = new Rig(holdStale: true);
+        rig.ApprovedWorker("w-1");
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-a");
+        rig.Advance(TimeSpan.FromSeconds(120));
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        await rig.Trigger.LastRun;
+        Assert.Equal(WorkerMergeState.Verified, rig.Queue.GetState("w-1"));
+        Assert.Equal(1, rig.RunCountFor("w-1"));
+
+        // Main moves; the cascade parks the entry at StaleVerified (the rig's requeue holds).
+        rig.Queue.NotifyMainMoved("main1");
+        await rig.Queue.LastCascade;
+        Assert.Equal(WorkerMergeState.StaleVerified, rig.Queue.GetState("w-1"));
+        Assert.Equal(new[] { "w-1" }, rig.Requeues);
+
+        // The worker pushes again and goes quiet, past the cooldown.
+        rig.Trigger.NotifyAdvanced("repo", "w-1", "tip-b");
+        rig.Advance(TimeSpan.FromSeconds(700));
+        Assert.Equal(ReadinessOutcome.Fired, Only(rig.Sweep(), "w-1").Outcome);
+        await rig.Trigger.LastRun;
+
+        Assert.Equal(new[] { "w-1", "w-1" }, rig.Requeues); // the cascade's door, a second time
+        Assert.Equal(1, rig.RunCountFor("w-1"));            // and no direct run for the stale entry
+        Assert.Contains(rig.Log, l => l.Contains("re-entry", StringComparison.Ordinal));
+    }
 
     // ---- The gap this closes --------------------------------------------
 

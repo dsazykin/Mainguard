@@ -1128,6 +1128,18 @@ public sealed class MergeQueueProvisioner
     private async Task RequeueStaleAsync(
         string repoHandle, string agentId, MergeQueue queue, IKeepAliveRebaser? rebaser, CancellationToken ct)
     {
+        // Still stale? The FIFO was captured when main moved; by the time this entry's turn comes it may
+        // have been discarded, rejected, or re-verified by someone else. Yielding, pausing and rebasing a
+        // worktree on behalf of an entry that is no longer waiting for it would be side effects nobody
+        // asked for, with the re-verify at the end throwing from a state it cannot leave.
+        if (queue.GetState(agentId) != WorkerMergeState.StaleVerified)
+        {
+            _log?.Invoke(
+                $"merge queue repo={repoHandle} agent={agentId} stale re-queue skipped — the entry is "
+                + $"{queue.GetState(agentId)}, not StaleVerified");
+            return;
+        }
+
         // Dev-only seeding (docs/design/queue-seeding.md §5): the cascade's re-queue for a SEEDED
         // entry ends at one of the two termini production itself exhibits, chosen per plan. Hold
         // leaves the entry resting at StaleVerified — indistinguishable from awaiting its FIFO turn,
@@ -1335,6 +1347,17 @@ public sealed class MergeQueueProvisioner
     }
 
     /// <summary>
+    /// Whether the mirror holds <paramref name="sha"/> as a commit at all. The belt in
+    /// <see cref="RunVerificationAsync"/> asks this before asking about descent: a queue main the mirror
+    /// has not yet fetched (the window between a confirm and the mirror refresh) is an UNKNOWN, and
+    /// <c>merge-base --is-ancestor</c> answers "no" for an unknown sha exactly as it does for a real
+    /// non-descent — so without this the belt would refuse from ignorance.
+    /// </summary>
+    private bool MirrorKnowsCommit(string repoHandle, string sha) =>
+        !string.IsNullOrEmpty(sha)
+        && TryGit(_repos.BareRepoPathFor(repoHandle), out _, "rev-parse", "--verify", "--quiet", sha + "^{commit}");
+
+    /// <summary>
     /// Whether the mirror's <c>agent/&lt;id&gt;</c> really contains the queue's main — the predicate the
     /// whole re-entry exists to establish, asked of git. False only when BOTH shas are known and the
     /// answer is no.
@@ -1410,6 +1433,20 @@ public sealed class MergeQueueProvisioner
     public const string RebaseConflictReason =
         "rebasing this branch onto the new main hit a conflict — the agent is paused with the "
         + "rebase in progress and needs a human to resolve it";
+
+    /// <summary>
+    /// The verification refusal for a branch that does not descend from the queue's main. A constant
+    /// prefix, because the queue rail renders it verbatim as the <c>CanMerge</c> reason and a test has to
+    /// be able to name the sentence rather than a paraphrase of it.
+    /// </summary>
+    public const string NotOnTopOfMainReasonPrefix =
+        "this branch is not on top of the queue's main — rebase needed";
+
+    private static string NotOnTopOfMainReason(string agentId, string branchTip, string mainSha) =>
+        $"{NotOnTopOfMainReasonPrefix}: agent/{agentId} at {Short(branchTip)} does not contain "
+        + $"main@{Short(mainSha)}, so a passing run would mint a Verified that `--ff-only` refuses";
+
+    private static string Short(string sha) => sha.Length <= 8 ? sha : sha[..8];
 
     // The one terminus for every way a re-entry can fail to reparent: Working, with the reason a human
     // reads on the queue rail (MergeQueue renders it verbatim as the CanMerge reason) and an audit event.
@@ -1952,6 +1989,26 @@ public sealed class MergeQueueProvisioner
         var containerId = syntheticPlan is null
             ? ResolveJailAndPublishForVerification(repoHandle, agentId)
             : null;
+
+        // The descent belt, asked of git AFTER the publish above so it measures the tip about to be
+        // verified. A run pins its record to the queue's main and asks nothing about ancestry, so a branch
+        // that does not descend from that main passes and looks fresh — and only `--ff-only` finds out, at
+        // merge time, forever. The cascade's re-entry already asks this before ITS re-verify; every other
+        // caller (the human's Verify, the readiness trigger, a branch a human just un-parked) reached this
+        // method without anyone asking. LOCAL entries only: an external pull-request head legitimately
+        // sits behind main and lands by the host's merge commit, never by a fast-forward. Unreadable shas
+        // answer true (the substrate-less doubles), so nothing is refused from ignorance.
+        if (syntheticPlan is null
+            && queue.GetOrigin(agentId) == MergeEntryOrigin.Local
+            && MirrorKnowsCommit(repoHandle, queue.CurrentMainSha)
+            && !BranchDescendsFromMain(repoHandle, agentId, queue.CurrentMainSha, out var tipBehindMain))
+        {
+            var report = NotOnTopOfMainReason(agentId, tipBehindMain, queue.CurrentMainSha);
+            _log?.Invoke($"merge queue repo={repoHandle} agent={agentId} verification REFUSED — {report}");
+            // InvalidOperationException, like the other pre-run refusals: the queue settles the entry to
+            // Working with this sentence as its reason, and the RPC maps it to FAILED_PRECONDITION.
+            throw new InvalidOperationException(report);
+        }
 
         var barePath = _repos.BareRepoPathFor(repoHandle);
         var mainBranch = ResolveDefaultBranch(barePath);

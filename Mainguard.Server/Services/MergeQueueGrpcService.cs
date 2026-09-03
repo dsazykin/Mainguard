@@ -135,8 +135,36 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         Mainguard.Agents.Agents.Orchestrator.VerificationRecord record;
         try
         {
-            record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken)
-                .ConfigureAwait(false);
+            if (ctx.Queue.GetState(request.AgentId) == Mainguard.Agents.Agents.WorkerMergeState.StaleVerified)
+            {
+                // A STALE entry is re-entered through the cascade — reparent, then re-verify — never
+                // verified where it stands. The direct run pins a pass to the new main for a branch that
+                // does not descend from it: green rail, enabled Merge, and a `--ff-only` that refuses
+                // forever. The cascade's re-entry is the one path that puts the branch on top of main
+                // first, so the human's Verify takes that road too.
+                await ctx.Queue.RequeueStaleAsync(request.AgentId, context.CancellationToken).ConfigureAwait(false);
+
+                var settled = ctx.Queue.GetState(request.AgentId);
+                var last = ctx.Queue.LastVerification(request.AgentId);
+                if (settled is not (Mainguard.Agents.Agents.WorkerMergeState.Verified
+                        or Mainguard.Agents.Agents.WorkerMergeState.VerificationFailed)
+                    || last is null)
+                {
+                    // The re-entry ended at one of the cascade's measured termini (no jail, no worktree,
+                    // a conflict, a rebase that did not land) rather than in a run. Its sentence is the
+                    // queue's own reason, and it is a refusal here for the same reason every other
+                    // pre-run refusal is: no verdict exists to answer with.
+                    ctx.Queue.CanMerge(request.AgentId, out var blocked);
+                    throw new InvalidOperationException(blocked);
+                }
+
+                record = last;
+            }
+            else
+            {
+                record = await ctx.Queue.RunVerificationAsync(request.AgentId, context.CancellationToken)
+                    .ConfigureAwait(false);
+            }
         }
         // MalformedVerificationCommandException is already an InvalidOperationException and so is
         // caught below; it is named explicitly because the whole point of the type is that it must
