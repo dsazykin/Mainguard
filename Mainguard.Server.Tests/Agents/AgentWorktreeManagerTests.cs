@@ -403,6 +403,58 @@ public sealed class AgentWorktreeManagerTests
     }
 
     /// <summary>
+    /// A publish the mediator REFUSES (the tip was rewritten, so it is not a fast-forward of the mirror's)
+    /// leaves the agent's own repository holding the only copy of the rewritten commits. The teardown used
+    /// to delete that repository on the comment's belief that every publish had copied its objects across
+    /// — true of every publish but the refused one. The keeping removal clears the worktree and nothing
+    /// else, and says so.
+    /// </summary>
+    [Fact]
+    public void ARefusedPublish_KeepsTheAgentsRepository_AndSaysSoInTheAudit()
+    {
+        var audit = new Mainguard.Git.Audit.InMemoryAuditLog();
+        using var env = new WorktreeEnv(audit: audit);
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "amender");
+        var first = CommitInWorktree(path, "a.txt", "a", "feat: first cut");
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.Published,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "amender"));
+
+        // The rewrite: same change, new sha. The mirror now holds a tip the agent's branch no longer contains.
+        AgentTestGit.RunChecked(path,
+            "-c", "user.name=agent", "-c", "user.email=agent@mainguard.local", "-c", "commit.gpgsign=false",
+            "commit", "--amend", "-m", "feat: first cut, reworded");
+        var amended = AgentTestGit.RunChecked(path, "rev-parse", "HEAD").Trim();
+        Assert.NotEqual(first, amended);
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "amender"));
+
+        var repo = env.Worktrees.AgentRepoPathFor(hash, "amender");
+        env.Worktrees.RemoveAgentWorktreeKeepingRepository(hash, "amender", "the last publish was refused");
+
+        // The worktree is gone; the repository, and the rewritten commit on its branch, are not.
+        Assert.False(Directory.Exists(path));
+        Assert.True(Directory.Exists(repo));
+        Assert.Equal(amended, AgentTestGit.RunChecked(repo, "rev-parse", "--verify", "refs/heads/agent/amender").Trim());
+        // The mirror is untouched — still the tip it was allowed to hold.
+        Assert.Equal(first, AgentTestGit.RunChecked(bare, "rev-parse", "--verify", "refs/heads/agent/amender").Trim());
+
+        var kept = Assert.Single(audit.Read(), e => e.Type == WorktreeManager.AgentRepoKeptEvent);
+        Assert.Equal(amended, kept.Fields["sha"]);
+        Assert.Equal(repo, kept.Fields["repository"]);
+
+        // The control: the ordinary teardown, on a branch whose publish was current, still removes the repo.
+        var other = env.Worktrees.CreateAgentWorktree(hash, "tidy");
+        CommitInWorktree(other, "b.txt", "b", "feat: tidy");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "tidy"));
+        var otherRepo = env.Worktrees.AgentRepoPathFor(hash, "tidy");
+        env.Worktrees.RemoveAgentWorktree(hash, "tidy", force: true);
+        Assert.False(Directory.Exists(otherRepo));
+    }
+
+    /// <summary>
     /// The one deletion taken on a caller's word: an intake'd pull request that closed upstream. Deletes a
     /// branch that carries commits — which every other path now refuses — because those commits live in
     /// the pull request they were fetched from and <c>pr-&lt;n&gt;</c> is a reused id.

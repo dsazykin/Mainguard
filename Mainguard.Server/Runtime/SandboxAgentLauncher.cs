@@ -616,8 +616,12 @@ public sealed class SandboxAgentLauncher
         {
             // MG-3: a LAST publish before anything is removed, then stop watching. Without it the work
             // an agent committed between the final verification and the stop would be lost with its
-            // repository — the agent's own repo is deleted a few lines below.
-            try { _environment.Worktrees.PublishAgentBranch(repoHash, agentId); }
+            // repository — the agent's own repo is deleted a few lines below. The OUTCOME is read, not
+            // discarded: a publish the mediator refuses (a non-fast-forward tip after an amend or a
+            // rebase) leaves the mirror at the old tip, and the agent's repository is then the only copy
+            // of the rewritten commits, so the removal below must keep it.
+            var publish = Mainguard.Agents.Agents.AgentRefPublishOutcome.NothingToPublish;
+            try { publish = _environment.Worktrees.PublishAgentBranchOutcome(repoHash, agentId); }
             catch { /* never fail a stop from housekeeping */ }
             try { _environment.Worktrees.UnwatchAgentRef(repoHash, agentId); }
             catch { /* never fail a stop from housekeeping */ }
@@ -629,8 +633,28 @@ public sealed class SandboxAgentLauncher
             try { await _environment.Egress.RemoveAgentSegmentAsync(repoHash, agentId, ct).ConfigureAwait(false); }
             catch { /* never fail a stop from teardown */ }
 
-            TryRemoveWorktree(repoHash, agentId);
+            if (publish is Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward
+                or Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedTarget)
+            {
+                _log.LogWarning(
+                    "teardown: the last publish of agent/{Agent} in repo={Repo} was refused ({Outcome}) — "
+                    + "keeping the agent's repository so the unpublished commits are not deleted with it",
+                    agentId, repoHash, publish);
+                TryRemoveWorktreeKeepingRepository(repoHash, agentId, $"the last publish was refused ({publish})");
+            }
+            else
+            {
+                TryRemoveWorktree(repoHash, agentId);
+            }
         }
+    }
+
+    /// <summary>The teardown after a REFUSED publish: clear the worktree, keep the branch and the agent's
+    /// repository. Best effort, and deliberately never falling back to the deleting removal.</summary>
+    private void TryRemoveWorktreeKeepingRepository(string repoHash, string agentId, string reason)
+    {
+        try { _environment.Worktrees.RemoveAgentWorktreeKeepingRepository(repoHash, agentId, reason); }
+        catch { /* best effort — residue is strictly better than the only copy of the work */ }
     }
 
     private void TryRemoveWorktree(string repoHash, string agentId)

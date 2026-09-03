@@ -99,6 +99,34 @@ public interface IAgentWorktreeManager
             $"This worktree manager cannot remove agent '{agentId}''s worktree while preserving its "
             + "branch, and a resume's cleanup must never delete the branch it was resuming.");
 
+    /// <summary>
+    /// The teardown's last publish, with its <b>outcome</b> rather than a bool — so a refusal can be told
+    /// apart from "nothing to publish". The default derives it from <see cref="PublishAgentBranch"/>: true
+    /// is current, false is "the mirror lacks nothing", never a refusal, so a substrate-less manager can
+    /// never keep a repository on a guess.
+    /// </summary>
+    AgentRefPublishOutcome PublishAgentBranchOutcome(string repoHash, string agentId)
+        => PublishAgentBranch(repoHash, agentId)
+            ? AgentRefPublishOutcome.Published
+            : AgentRefPublishOutcome.NothingToPublish;
+
+    /// <summary>
+    /// Clears an agent's worktree while keeping <b>both</b> the mirror's <c>refs/heads/agent/&lt;id&gt;</c>
+    /// and the agent's own repository on disk — the teardown path for an agent whose last publish the
+    /// mediator <b>refused</b>. A refused non-fast-forward publish means the mirror holds the pre-rewrite
+    /// tip and the agent's repository holds the only copy of the rewritten commits; the ordinary teardown
+    /// deleted that repository on the comment's belief that every publish had copied its objects across,
+    /// which is false for exactly the publish that was refused.
+    ///
+    /// <para><b>The default throws</b>, for the reason <see cref="RemoveAgentWorktreeKeepingBranch"/>'s
+    /// does: a manager that cannot preserve the work must say so rather than fall back to the deleting
+    /// removal.</para>
+    /// </summary>
+    void RemoveAgentWorktreeKeepingRepository(string repoHash, string agentId, string reason)
+        => throw new System.NotSupportedException(
+            $"This worktree manager cannot remove agent '{agentId}''s worktree while preserving its "
+            + "repository, and a teardown after a refused publish must never delete the only copy of the work.");
+
     /// <summary>Prune stale worktree metadata.</summary>
     void Prune(string repoHash);
 
@@ -329,6 +357,10 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// <summary>The G-17 audit type for a teardown that left <c>agent/&lt;id&gt;</c> standing because the
     /// branch carried commits the mirror's integration branch does not.</summary>
     public const string AgentBranchKeptEvent = "agent_branch_kept";
+
+    /// <summary>G-17 sibling: the agent's own repository was kept through teardown because its last publish
+    /// was refused, so the mirror does not hold its tip.</summary>
+    public const string AgentRepoKeptEvent = "agent_repo_kept";
 
     /// <summary>The G-17 audit type for the one deletion that is taken on a caller's word rather than on a
     /// proof that it costs nothing — <see cref="IAgentWorktreeManager.DiscardAgentBranch"/>.</summary>
@@ -825,9 +857,14 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         // stop — delete the commit it had just published and verified.
         ReapBranch(repoHash, agentId, branch, barePath);
 
-        // MG-3: the agent's own repository goes with it. Its objects were already COPIED into the mirror
-        // by every publish (a fetch across a local transport transfers objects; the mirror borrows from
-        // nobody), so deleting it can never strand a commit the mirror's refs still name.
+        // MG-3: the agent's own repository goes with it. Its objects were COPIED into the mirror by every
+        // publish that SUCCEEDED (a fetch across a local transport transfers objects; the mirror borrows
+        // from nobody), so deleting it strands nothing the mirror's refs name. That sentence used to end
+        // "can never strand a commit" and was false for the one publish the mediator refuses — a
+        // non-fast-forward tip after an amend or a rebase — where this delete removed the only copy of the
+        // rewritten commits. The teardown now reads the publish outcome and takes
+        // RemoveAgentWorktreeKeepingRepository instead on a refusal; this line is reached only when the
+        // mirror is current.
         _agentRepos.Remove(repoHash, agentId);
 
         // MG-43: and so does its package cache. The cache is derived, disposable content that only this
@@ -921,6 +958,54 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
         return true;
+    }
+
+    /// <inheritdoc />
+    public AgentRefPublishOutcome PublishAgentBranchOutcome(string repoHash, string agentId)
+        => Publish(repoHash, agentId).Outcome;
+
+    /// <inheritdoc />
+    public void RemoveAgentWorktreeKeepingRepository(string repoHash, string agentId, string reason)
+    {
+        var barePath = BareRepoPathFor(repoHash);
+        var worktreePath = WorktreePathFor(repoHash, agentId);
+        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
+
+        if (Directory.Exists(worktreePath))
+        {
+            // Forced, as every teardown removal is: the tree belongs to a jail that no longer exists.
+            AgentGitCommand.TryRun(owner, out _, "worktree", "remove", "--force", worktreePath);
+            if (Directory.Exists(worktreePath))
+            {
+                try { Directory.Delete(worktreePath, recursive: true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
+        }
+
+        AgentGitCommand.TryRun(owner, out _, "worktree", "prune");
+        AgentGitCommand.TryRun(barePath, out _, "worktree", "prune");
+
+        // No reap, no repository delete, no cache release: the repository IS the work now. The mirror's
+        // agent/<id> is left where it stands (the pre-refusal tip), so a queue row that names it still
+        // names a real ref.
+        var tip = AgentGitCommand.TryRun(owner, out var head, "rev-parse", "--verify", "--quiet",
+            "refs/heads/" + BranchFor(agentId)) == 0 ? head.Trim() : string.Empty;
+        _warningSink?.Invoke(
+            $"MG-3: kept agent '{agentId}''s own repository in repo '{repoHash}' through teardown — {reason}. "
+            + $"Its {BranchFor(agentId)} is at {tip} and the mirror does not hold it; a human can publish, "
+            + "review or discard it from " + owner + ".");
+        _audit?.Append(new AuditEvent(AgentRepoKeptEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = BranchFor(agentId),
+            ["sha"] = tip,
+            ["repository"] = owner,
+            ["reason"] = reason,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
     }
 
     /// <inheritdoc />
