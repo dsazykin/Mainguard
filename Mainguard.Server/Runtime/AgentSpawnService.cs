@@ -1539,7 +1539,9 @@ public sealed class AgentSpawnService
             return new AgentIpcResponse(Ok: false, Error: "this worker session is no longer live");
         }
 
-        var live = _plans.LiveForWorker(workerAgentId);
+        // No live plan? A human may have sent an escalated one back for a fresh plan — that is the one
+        // path onto a new presentation, and its guidance has to reach the worker somewhere it reads.
+        var live = _plans.LiveForWorker(workerAgentId) ?? _plans.AwaitingNewPlanFor(workerAgentId);
         return new AgentIpcResponse(
             Ok: true,
             Brief: brief,

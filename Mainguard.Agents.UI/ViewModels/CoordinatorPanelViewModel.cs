@@ -173,11 +173,29 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
 
         PendingPlan = PendingPlans.FirstOrDefault();
 
-        // Escalated cards are rebuilt each pass. They carry no half-typed human input to preserve (unlike
-        // a pending card's feedback box), and an in-flight "End" is guarded by the card's own latch.
-        EscalatedPlans.Clear();
-        foreach (var escalated in cards.Where(c => c.IsEscalated))
-            EscalatedPlans.Add(new EscalatedPlanViewModel(escalated, _endWorker));
+        // Escalated cards are reconciled in place by plan id, exactly as pending cards are. Rebuilding
+        // them each pass — which this used to do — collapsed the two-step End confirmation under the
+        // human's cursor on every queue push, and the in-flight latch it relied on lived on the instance
+        // being thrown away. A card is only replaced when the fact it renders changes (a new-plan request).
+        var escalatedNow = cards.Where(c => c.IsEscalated).ToList();
+        var keptEscalated = new List<EscalatedPlanViewModel>(escalatedNow.Count);
+        foreach (var plan in escalatedNow)
+        {
+            var existing = EscalatedPlans.FirstOrDefault(
+                c => c.PlanId == plan.PlanId && c.NewPlanRequested == plan.NewPlanRequested);
+            keptEscalated.Add(existing ?? new EscalatedPlanViewModel(plan, _endWorker, RequestNewPlanAsync));
+        }
+
+        for (int i = EscalatedPlans.Count - 1; i >= 0; i--)
+        {
+            if (!keptEscalated.Contains(EscalatedPlans[i])) EscalatedPlans.RemoveAt(i);
+        }
+
+        for (int i = 0; i < keptEscalated.Count; i++)
+        {
+            if (i >= EscalatedPlans.Count) EscalatedPlans.Add(keptEscalated[i]);
+            else if (!ReferenceEquals(EscalatedPlans[i], keptEscalated[i])) EscalatedPlans[i] = keptEscalated[i];
+        }
 
         PressureText = pending.Count > 2
             ? $"{pending.Count} plans pending — the oldest has waited {(int)(DateTimeOffset.Now - pending.Min(p => p.PresentedAt)).TotalMinutes} min."
@@ -236,6 +254,12 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     private async Task DecideAsync(string planId, bool approve, string? feedback)
     {
         await _coordinator.SubmitPlanDecisionAsync(planId, approve, feedback);
+        Refresh();
+    }
+
+    private async Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        await _coordinator.RequestNewPlanAsync(planId, guidance);
         Refresh();
     }
 
@@ -511,6 +535,7 @@ public partial class PlanCardViewModel : ViewModelBase
 public sealed partial class EscalatedPlanViewModel : ViewModelBase
 {
     private readonly Func<string, Task>? _endWorker;
+    private readonly Func<string, string, Task>? _requestNewPlan;
 
     public string PlanId { get; }
     public string WorkerAgentId { get; }
@@ -539,9 +564,32 @@ public sealed partial class EscalatedPlanViewModel : ViewModelBase
 
     public bool HasEndError => EndErrorText.Length > 0;
 
-    public EscalatedPlanViewModel(WorkerPlanCard plan, Func<string, Task>? endWorker = null)
+    /// <summary>True once a human has sent this escalation back for one fresh plan (owner decision,
+    /// 2026-09-03). Carried from the daemon; the worker's next <c>present</c> is the one it is waiting on.</summary>
+    public bool NewPlanRequested { get; }
+
+    /// <summary>The request is offered on an ordinary escalation that has not been sent back yet, when a
+    /// requesting seam exists. Never on a re-scope escalation — that worker is still approved and working.</summary>
+    public bool ShowRequestAction { get; }
+
+    /// <summary>What the human wants the fresh plan to answer. Delivered to the worker verbatim.</summary>
+    [ObservableProperty] private string _guidanceText = "";
+
+    [ObservableProperty] private bool _isRequesting;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasRequestError))]
+    private string _requestErrorText = "";
+
+    public bool HasRequestError => RequestErrorText.Length > 0;
+
+    public EscalatedPlanViewModel(
+        WorkerPlanCard plan, Func<string, Task>? endWorker = null, Func<string, string, Task>? requestNewPlan = null)
     {
         _endWorker = endWorker;
+        _requestNewPlan = requestNewPlan;
+        NewPlanRequested = plan.NewPlanRequested;
+        ShowRequestAction = requestNewPlan is not null && !plan.IsRescope && !plan.NewPlanRequested;
         PlanId = plan.PlanId;
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
@@ -555,8 +603,11 @@ public sealed partial class EscalatedPlanViewModel : ViewModelBase
             ? $"{worker} asked {plan.MaxRevisions} times to widen its approved scope and you declined each "
               + "time, so it will not ask again. It is NOT stopped — it is still approved for its original "
               + "scope and still working. Steer it if the answer should change."
-            : $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. " +
-              "It will not try again — steer it or end it.";
+            : plan.NewPlanRequested
+                ? $"{worker} stopped after {plan.MaxRevisions} rejected plans and you asked it for one fresh "
+                  + "plan. It is waiting for the worker to present it; if that one escalates too, the worker is done."
+                : $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. It will not "
+                  + "try again on its own — ask it for one fresh plan with guidance, or end it.";
         LastFeedbackText = plan.RejectionFeedback.Length > 0 ? $"your last feedback: {plan.RejectionFeedback}" : "";
         HasLastFeedback = LastFeedbackText.Length > 0;
 
@@ -565,6 +616,29 @@ public sealed partial class EscalatedPlanViewModel : ViewModelBase
         EndConfirmText =
             $"End {named}? Its work is rejected and its sandbox is torn down, which frees the slot it is "
             + "holding against the worker cap. Its branch is kept until teardown, so nothing is silently lost.";
+    }
+
+    [RelayCommand]
+    private async Task RequestNewPlanAsync()
+    {
+        if (IsRequesting || _requestNewPlan is null) return;
+
+        IsRequesting = true;
+        RequestErrorText = "";
+        try
+        {
+            await _requestNewPlan(PlanId, GuidanceText.Trim());
+        }
+        catch (Exception ex)
+        {
+            // Said, never swallowed: a request that silently failed leaves a human waiting for a plan the
+            // worker was never asked for.
+            RequestErrorText = $"Could not ask for a new plan — {ex.Message}";
+        }
+        finally
+        {
+            IsRequesting = false;
+        }
     }
 
     [RelayCommand] private void BeginEnd() => IsConfirmingEnd = true;

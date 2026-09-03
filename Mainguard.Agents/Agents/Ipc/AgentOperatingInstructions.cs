@@ -294,7 +294,10 @@ public static class AgentOperatingInstructions
 
         A rejection is feedback, not death: it comes back with the reason, and you revise and re-present.
         Your revision budget is finite and the daemon reports what is left; when it is spent the task
-        escalates to the human rather than looping.
+        escalates to the human rather than looping. Escalation is terminal on your side: the daemon
+        refuses another `present` from you. The human may ask you for ONE fresh plan — if they do,
+        `{{shimPath}} brief` shows their guidance as feedback on the escalated plan, and exactly one more
+        `present` is accepted. If that plan escalates too, you are done; report and wait.
 
         Once you are approved the task is yours to re-read at any time, and asking again costs nothing:
 

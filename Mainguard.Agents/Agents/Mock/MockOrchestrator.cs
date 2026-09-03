@@ -953,6 +953,35 @@ public sealed class MockOrchestrator :
     /// goes back to its worker, which revises and re-presents, until the revision budget is spent and the
     /// worker escalates. Approval is the only path that starts work.
     /// </summary>
+    public Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        AgentEvent? raised = null;
+        lock (_gate)
+        {
+            var card = _workerPlans.FirstOrDefault(c => c.PlanId == planId);
+            if (card is null || !card.IsEscalated)
+            {
+                throw new InvalidOperationException($"Plan '{planId}' is not an escalated plan.");
+            }
+
+            if (_workerPlans.Any(c => c.WorkerAgentId == card.WorkerAgentId && c.NewPlanRequested))
+            {
+                throw new InvalidOperationException(
+                    "This worker was already asked for a new plan once and escalated again — a second escalation is terminal.");
+            }
+
+            _workerPlans.Remove(card);
+            _workerPlans.Add(card with { NewPlanRequested = true, RejectionFeedback = guidance ?? "" });
+            _transcript.Add(new ChatLine(ChatLineKind.SystemLine,
+                $"You asked {card.WorkerAgentId} for one fresh plan.", DateTimeOffset.Now));
+            raised = NewEvent("plan_decided", "coordinator", $"{planId}=new-plan-requested");
+        }
+
+        EventReceived?.Invoke(raised);
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
     public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
     {
         var raised = new List<AgentEvent>();

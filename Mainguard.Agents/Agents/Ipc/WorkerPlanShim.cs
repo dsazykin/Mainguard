@@ -213,7 +213,8 @@ def report(response):
             print("STOP WIDENING: do not ask to re-scope again. Finish what plan %s covers, or "
                   "report to the human and wait." % rescope_of)
             return 3
-        print("STOP: do not attempt another plan. Report to the human and wait.")
+        print("STOP: do not attempt another plan on your own — the daemon refuses it. Report to the human "
+              "and wait. If they ask you for a fresh plan, `brief` will show their guidance; then present once.")
         return 3
     print(json.dumps(response))
     return 0
@@ -345,6 +346,12 @@ def main(argv):
             # line is missing that refusal is advice that does not work (the exact shape of defect G3).
             if response.get("planId"):
                 print("PLAN: %s (%s)" % (response["planId"], response.get("status") or "unknown"))
+            # An escalated plan the human sent back for a fresh one: their guidance is the feedback, and
+            # this is the only place a worker with no live plan can read it.
+            if response.get("status") == "Escalated" and response.get("feedback"):
+                print("GUIDANCE: %s" % response["feedback"])
+                print("The human asked you for ONE fresh plan answering that. Present it once; a second "
+                      "escalation is terminal.")
             return 0
         if response.get("status") == "Task":
             # Same two lines `present` prints on approval, for the same reason: this is the moment the

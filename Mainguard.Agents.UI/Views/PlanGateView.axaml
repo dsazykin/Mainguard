@@ -197,6 +197,21 @@
                          Foreground="{DynamicResource TextMuted}"
                          IsVisible="{Binding HasLastFeedback}"/>
 
+              <!-- The one human act that reopens an escalation (contract §3.1, 2026-09-03): guidance, then
+                   ONE fresh plan. Not offered once it has been used, and never on a re-scope escalation. -->
+              <StackPanel Spacing="4" IsVisible="{Binding ShowRequestAction}">
+                <TextBox Text="{Binding GuidanceText}" Watermark="What should the fresh plan do differently?"
+                         FontSize="11" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="44"/>
+                <TextBlock Text="{Binding RequestErrorText}" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{DynamicResource DangerBrush}"
+                           IsVisible="{Binding HasRequestError}"/>
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                  <Button Classes="Secondary" Content="Request a new plan" FontSize="12"
+                          Command="{Binding RequestNewPlanCommand}" IsEnabled="{Binding !IsRequesting}"
+                          ToolTip.Tip="Sends your guidance to the worker and accepts exactly one fresh plan from it. A second escalation is terminal."/>
+                </StackPanel>
+              </StackPanel>
+
               <!-- A failed end is said out loud, for the same reason a failed decision is: the card looks
                    identical either way, and a human who is not told waits on a slot they think they freed. -->
               <TextBlock Text="{Binding EndErrorText}" FontSize="11" TextWrapping="Wrap"

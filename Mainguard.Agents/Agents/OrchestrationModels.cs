@@ -272,7 +272,8 @@ public sealed record WorkerPlanCard(
     string RejectionFeedback,
     string SupersedesPlanId = "",
     IReadOnlyList<string>? PreviousScope = null,
-    int RescopeCount = 0)
+    int RescopeCount = 0,
+    bool NewPlanRequested = false)
 {
     public bool IsPending => string.Equals(Status, "Pending", StringComparison.OrdinalIgnoreCase);
 

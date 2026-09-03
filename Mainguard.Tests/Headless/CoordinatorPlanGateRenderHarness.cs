@@ -831,5 +831,7 @@ public class CoordinatorPlanGateRenderHarness
         public Task SendAsync(string text) => Task.CompletedTask;
 
         public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null) => Task.CompletedTask;
+
+        public Task RequestNewPlanAsync(string planId, string guidance) => Task.CompletedTask;
     }
 }

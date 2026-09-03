@@ -178,6 +178,47 @@ public class WorkerAuthoredPlanTests
     }
 
     [Fact]
+    public void AnEscalatedWorker_CannotPresentAgain_UntilAHumanAsksForANewPlan_AndThenOnlyOnce()
+    {
+        var audit = new InMemoryAuditLog();
+        var plans = Service(audit, maxRevisions: 1);
+        var first = plans.Present("w-1", "coord-1", "A", Fields(), "p", 1m).PlanId!;
+        plans.Reject(first, "no");
+        plans.Revise(first, "A", Fields("src/b.cs"));
+        plans.Reject(first, "still no");
+        Assert.Equal(PlanStatus.Escalated, plans.Get(first)!.Status);
+
+        // Escalation is terminal on the worker's side: a fresh present is refused, not re-budgeted.
+        var refused = plans.Present("w-1", "coord-1", "B", Fields(), "p", 1m);
+        Assert.Equal(PlanPresentationOutcome.Refused, refused.Outcome);
+        Assert.Contains("the human owns the next move", refused.Message);
+
+        // The one human act that reopens it, with guidance the worker reads as feedback.
+        var reopened = plans.RequestNewPlan(first, "keep it to src/a.cs", "tester");
+        Assert.True(reopened.NewPlanRequested);
+        Assert.Equal("keep it to src/a.cs", plans.AwaitingNewPlanFor("w-1")!.RejectionFeedback);
+        Assert.Contains("plan_new_plan_requested", audit.Read().Select(e => e.Type));
+
+        var second = plans.Present("w-1", "coord-1", "B", Fields(), "p", 1m);
+        Assert.Equal(PlanPresentationOutcome.Presented, second.Outcome);
+        Assert.Null(plans.AwaitingNewPlanFor("w-1")); // answered: the fresh plan is the live one now
+
+        // A second escalation is terminal for good — no further present, and no second request.
+        plans.Reject(second.PlanId!, "no");
+        plans.Revise(second.PlanId!, "B", Fields("src/c.cs"));
+        plans.Reject(second.PlanId!, "no again");
+        Assert.Equal(PlanStatus.Escalated, plans.Get(second.PlanId!)!.Status);
+        var terminal = plans.Present("w-1", "coord-1", "C", Fields(), "p", 1m);
+        Assert.Equal(PlanPresentationOutcome.Refused, terminal.Outcome);
+        Assert.Contains("escalated twice", terminal.Message);
+        Assert.Throws<InvalidOperationException>(() => plans.RequestNewPlan(second.PlanId!, "again", "tester"));
+
+        // And only an escalated plan can be sent back for a new one.
+        var pending = plans.Present("w-2", "coord-1", "A", Fields(), "p", 1m).PlanId!;
+        Assert.Throws<InvalidOperationException>(() => plans.RequestNewPlan(pending, "x", "tester"));
+    }
+
+    [Fact]
     public async Task TheEscalatingRejection_WakesTheBlockedWorkerWithEscalated_NotRejected()
     {
         var plans = Service(maxRevisions: 1);

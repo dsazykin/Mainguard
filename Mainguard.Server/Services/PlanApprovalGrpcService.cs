@@ -168,6 +168,30 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
         }
     }
 
+    /// <summary>Asks an escalated worker for one fresh plan. Actor daemon-derived, like ApprovePlan.
+    /// Denied to the coordinator role at <c>RoleInterceptor</c>.</summary>
+    public override Task<RequestNewPlanResponse> RequestNewPlan(RequestNewPlanRequest request, ServerCallContext context)
+    {
+        if (string.IsNullOrWhiteSpace(request.PlanId))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "plan_id is required."));
+        }
+
+        var actor = _identity.Resolve(context);
+        try
+        {
+            var reopened = _plans.RequestNewPlan(request.PlanId, request.Guidance ?? "", actor);
+            _log.LogInformation(
+                "RequestNewPlan plan={Plan} worker={Worker} by={Actor}", request.PlanId, reopened.WorkerAgentId, actor);
+            return Task.FromResult(new RequestNewPlanResponse { Requested = true });
+        }
+        catch (InvalidOperationException ex)
+        {
+            _log.LogWarning("RequestNewPlan refused plan={Plan}: {Message}", request.PlanId, ex.Message);
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+    }
+
     /// <summary>
     /// The one projection the plan surface is built from — <b>cards and counts together</b>.
     ///
@@ -228,6 +252,7 @@ public sealed class PlanApprovalGrpcService : PlanApprovalService.PlanApprovalSe
                 RejectionFeedback = plan.RejectionFeedback ?? "",
                 SupersedesPlanId = plan.SupersedesPlanId ?? "",
                 RescopeCount = plan.RescopeCount,
+                NewPlanRequested = plan.NewPlanRequested,
             });
             update.Plans[^1].Scope.AddRange(plan.Plan.Scope);
             update.Plans[^1].PreviousScope.AddRange(plan.PreviousScope ?? Array.Empty<string>());

@@ -301,6 +301,11 @@ public interface ICoordinatorService
     /// so an empty string is a real cost to the human, not just a missing field.
     /// </param>
     Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null);
+
+    /// <summary>Asks an ESCALATED worker for one fresh plan, with guidance (owner decision, 2026-09-03).
+    /// The only human act that reopens an escalation; a second escalation is terminal. Throws on refusal
+    /// so the card can say why, exactly as <see cref="SubmitPlanDecisionAsync"/> does.</summary>
+    Task RequestNewPlanAsync(string planId, string guidance);
 }
 
 /// <summary>P2-14 kill switch: freeze-queue-first, then yield fan-out. Recoverable by design.</summary>

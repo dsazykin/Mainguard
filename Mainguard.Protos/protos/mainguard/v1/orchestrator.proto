@@ -25,6 +25,10 @@ service PlanApprovalService {
   rpc ApprovePlan(ApprovePlanRequest) returns (ApprovePlanResponse);
   // Send a plan back to its worker with feedback. The worker revises and re-presents.
   rpc RejectPlan(RejectPlanRequest) returns (RejectPlanResponse);
+  // Ask an ESCALATED worker for one fresh plan, with guidance (owner decision, 2026-09-03). Escalation
+  // is otherwise terminal; this is the one human act that reopens it, once. Denied to the coordinator
+  // role by the RoleInterceptor — it is a plan decision, on exactly the ApprovePlan/RejectPlan boundary.
+  rpc RequestNewPlan(RequestNewPlanRequest) returns (RequestNewPlanResponse);
 
   // The operator's PLAN-MODE TOGGLE. On (the default) is the model above. Off means a delegated worker
   // is given its task at spawn and no plan is authored, presented or reviewed.
@@ -106,6 +110,7 @@ message PlanEntry {
                                        // the card diffs against what was actually consented to
   int32 rescope_count = 16;      // how many widenings this worker has already had approved (visibility,
                                  // not a budget — nothing refuses on this number)
+  bool new_plan_requested = 17;  // an escalated plan a human has sent back for one fresh plan
 }
 
 message ApprovePlanRequest {
@@ -121,6 +126,15 @@ message ApprovePlanResponse {
 message RejectPlanRequest {
   string plan_id = 1;
   string reason = 2; // FEEDBACK: delivered to the worker, which revises against it and re-presents
+}
+
+message RequestNewPlanRequest {
+  string plan_id = 1;   // the ESCALATED plan
+  string guidance = 2;  // delivered to the worker as the feedback its fresh plan answers
+}
+
+message RequestNewPlanResponse {
+  bool requested = 1;
 }
 
 message RejectPlanResponse {

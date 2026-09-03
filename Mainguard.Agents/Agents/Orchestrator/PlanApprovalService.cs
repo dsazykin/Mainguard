@@ -197,6 +197,12 @@ public enum PlanRevisionOutcome
 /// The departures the worker declared, verbatim and in declaration order. Empty unless
 /// <see cref="Deviation"/> is <see cref="DeviationDeclaration.Declared"/>.
 /// </param>
+/// <param name="NewPlanRequested">
+/// Set on an <see cref="PlanStatus.Escalated"/> plan when a human asked the worker for one fresh plan
+/// (<see cref="PlanApprovalService.RequestNewPlan"/>); the guidance travels in
+/// <see cref="RejectionFeedback"/>. Escalation is otherwise terminal — <see cref="PlanApprovalService.Present"/>
+/// refuses a worker whose plan escalated until this is set, and refuses a worker that has escalated twice.
+/// </param>
 public sealed record PendingPlan(
     TaskPlan Plan,
     string CoordinatorId,
@@ -211,7 +217,8 @@ public sealed record PendingPlan(
     IReadOnlyList<string>? PreviousScope = null,
     int RescopeCount = 0,
     DeviationDeclaration Deviation = DeviationDeclaration.NotDeclared,
-    IReadOnlyList<string>? DeclaredDeviations = null)
+    IReadOnlyList<string>? DeclaredDeviations = null,
+    bool NewPlanRequested = false)
 {
     public string PlanId => Plan.PlanId;
     public string Title => Plan.Title;
@@ -389,6 +396,7 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         // hand-read store file says what it means.
         Deviation = p.Deviation.ToString(),
         DeclaredDeviations = p.DeclaredDeviations?.ToList(),
+        NewPlanRequested = p.NewPlanRequested,
     };
 
     private static PendingPlan FromDto(PlanDto d) => new(
@@ -411,7 +419,8 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         // file written before this field existed genuinely holds no answer, and reading one as "None"
         // would manufacture the assertion this whole mechanism exists to stop being assumed.
         Enum.TryParse<DeviationDeclaration>(d.Deviation, out var dev) ? dev : DeviationDeclaration.NotDeclared,
-        d.DeclaredDeviations);
+        d.DeclaredDeviations,
+        d.NewPlanRequested);
 
     private sealed class PlanDto
     {
@@ -435,6 +444,7 @@ public sealed class JsonPlanApprovalStore : IPlanApprovalStore
         public int RescopeCount { get; set; }
         public string? Deviation { get; set; }
         public List<string>? DeclaredDeviations { get; set; }
+        public bool NewPlanRequested { get; set; }
     }
 }
 
@@ -573,6 +583,37 @@ public sealed class PlanApprovalService
                         _ => $"Plan '{live.PlanId}' is already {live.Status.ToString().ToLowerInvariant()} for this worker.",
                     },
                     live.PlanId);
+            }
+
+            // Escalation is terminal for the worker's own loop (contract §2: "stops and escalates to the
+            // human rather than looping"). Until 2026-09-03 nothing here enforced that: an escalated plan
+            // is not live, so a fresh present was accepted with a fresh budget, and the daemon-side limit
+            // was a limit only on a worker that chose to honour it. One fresh plan is now accepted, and
+            // only after a human asked for it (RequestNewPlan); a worker that escalates again is done.
+            var escalations = _plans.Values
+                .Where(p => p.Status == PlanStatus.Escalated && !p.IsRescope
+                            && string.Equals(p.WorkerAgentId, workerAgentId, StringComparison.Ordinal))
+                .OrderBy(p => p.DraftedAt)
+                .ToList();
+            if (escalations.Count > 0)
+            {
+                var refusal = escalations.Count >= 2
+                    ? "This worker has escalated twice; no further plan is accepted. Report to the human and wait."
+                    : escalations[0].NewPlanRequested
+                        ? null
+                        : $"Plan '{escalations[0].PlanId}' escalated after {_limits.MaxPlanRevisions} rejected "
+                          + "plans — the human owns the next move. Do not present another plan unless they ask "
+                          + "for one; if they do, `brief` will carry their guidance.";
+                if (refusal is not null)
+                {
+                    AuditLocked("plan_presentation_refused", new Dictionary<string, string>
+                    {
+                        ["worker_agent_id"] = workerAgentId,
+                        ["cause"] = escalations.Count >= 2 ? "escalated-twice" : "escalated-not-reopened",
+                        ["existing_plan_id"] = escalations[^1].PlanId,
+                    });
+                    return new PlanPresentationResult(PlanPresentationOutcome.Refused, refusal, escalations[^1].PlanId);
+                }
             }
 
             var plan = new TaskPlan(
@@ -1194,6 +1235,80 @@ public sealed class PlanApprovalService
         }
 
         return decided;
+    }
+
+    /// <summary>
+    /// A human asks an ESCALATED worker for one fresh plan, with guidance (owner decision, 2026-09-03).
+    /// The only thing that reopens an escalation. Records the guidance where the worker reads its
+    /// feedback, marks the plan so <see cref="Present"/> accepts exactly one more, and is itself refused
+    /// for a worker that was already given that chance — a second escalation is terminal.
+    /// </summary>
+    /// <param name="actor">Daemon-derived identity of the human asking (never client-supplied).</param>
+    public PendingPlan RequestNewPlan(string planId, string guidance, string actor)
+    {
+        if (string.IsNullOrWhiteSpace(actor))
+        {
+            throw new ArgumentException("actor is required (daemon-derived).", nameof(actor));
+        }
+
+        PendingPlan reopened;
+        lock (_gate)
+        {
+            if (!_plans.TryGetValue(planId, out var plan))
+            {
+                throw new InvalidOperationException($"No plan '{planId}'.");
+            }
+
+            if (plan.Status != PlanStatus.Escalated || plan.IsRescope)
+            {
+                throw new InvalidOperationException(
+                    $"Plan '{planId}' is {plan.Status} — only a worker's escalated plan can be sent back for a new one.");
+            }
+
+            if (_plans.Values.Any(p => p.NewPlanRequested
+                    && string.Equals(p.WorkerAgentId, plan.WorkerAgentId, StringComparison.Ordinal)))
+            {
+                throw new InvalidOperationException(
+                    "This worker was already asked for a new plan once and escalated again — a second "
+                    + "escalation is terminal. Steer it or end it.");
+            }
+
+            reopened = plan with { NewPlanRequested = true, RejectionFeedback = guidance ?? "" };
+            _plans[planId] = reopened;
+            _store.Save(reopened);
+        }
+
+        _audit.Append(new AuditEvent("plan_new_plan_requested", new Dictionary<string, string>
+        {
+            ["plan_id"] = reopened.PlanId,
+            ["worker_agent_id"] = reopened.WorkerAgentId,
+            ["coordinator_id"] = reopened.CoordinatorId,
+            ["by"] = actor,
+            ["guidance"] = guidance ?? "",
+        }));
+        Changed?.Invoke();
+        return reopened;
+    }
+
+    /// <summary>
+    /// The escalated plan a human has sent back for a fresh one, while the worker has not yet presented
+    /// it — what <c>brief</c> shows a worker that has no live plan, so the guidance reaches it.
+    /// </summary>
+    public PendingPlan? AwaitingNewPlanFor(string workerAgentId)
+    {
+        lock (_gate)
+        {
+            if (LiveForWorkerLocked(workerAgentId) is not null)
+            {
+                return null;
+            }
+
+            return _plans.Values
+                .Where(p => p.NewPlanRequested && p.Status == PlanStatus.Escalated
+                            && string.Equals(p.WorkerAgentId, workerAgentId, StringComparison.Ordinal))
+                .OrderByDescending(p => p.DraftedAt)
+                .FirstOrDefault();
+        }
     }
 
     // ---- Reads ------------------------------------------------------------

@@ -763,6 +763,15 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return response.Rejected;
     }
 
+    /// <summary>Asks an escalated worker for one fresh plan (contract §3.1, 2026-09-03).</summary>
+    public async Task<bool> RequestNewPlanAsync(string planId, string guidance, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        var response = await client.RequestNewPlanAsync(
+            new RequestNewPlanRequest { PlanId = planId, Guidance = guidance ?? string.Empty }, CallOptions(ct, deadline));
+        return response.Requested;
+    }
+
     /// <summary>
     /// Sets the operator's plan-mode toggle and returns the state the DAEMON now holds.
     ///

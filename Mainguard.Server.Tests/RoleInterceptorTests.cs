@@ -123,6 +123,23 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesRequestNewPlanToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            plans.RequestNewPlanAsync(
+                new RequestNewPlanRequest { PlanId = "any", Guidance = "try again" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesRejectToCoordinator()
     {
         using var fixture = new DaemonFixture();

@@ -96,6 +96,9 @@ public sealed class RoleInterceptor : Interceptor
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
+        // Sending an escalated worker back for a fresh plan is a plan decision — the one act that reopens
+        // an escalation. Same boundary as the two above.
+        "/mainguard.v1.PlanApprovalService/RequestNewPlan",
         // The plan-mode toggle, on exactly the boundary above and for a strictly stronger reason. A
         // coordinator that could approve one plan would hold the gate for one worker; a coordinator that
         // could turn plan mode OFF removes the gate for every worker it spawns from then on, without a

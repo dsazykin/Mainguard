@@ -470,6 +470,8 @@ public class CoordinatorPlanDecisionTests
 
         public Task SendAsync(string text) => Task.CompletedTask;
 
+        public Task RequestNewPlanAsync(string planId, string guidance) => Task.CompletedTask;
+
         public async Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
         {
             Decisions.Add(new RecordedDecision(planId, approve, feedback));

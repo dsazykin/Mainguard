@@ -959,7 +959,7 @@ public sealed class DaemonBackedOrchestrator :
                     // Carried, never re-derived. What the previous scope WAS is a fact the daemon captured
                     // when the re-scope was presented; a client that looked it up from whatever plan that
                     // id names *now* would render a different claim as soon as a second re-scope existed.
-                    p.SupersedesPlanId, p.PreviousScope.ToArray(), p.RescopeCount));
+                    p.SupersedesPlanId, p.PreviousScope.ToArray(), p.RescopeCount, p.NewPlanRequested));
             }
 
             // Carried verbatim from the daemon rather than re-derived here: the number that refuses the
@@ -2292,6 +2292,13 @@ public sealed class DaemonBackedOrchestrator :
                 : feedback!;
             await _client.RejectPlanAsync(planId, reason, cts.Token).ConfigureAwait(false);
         }
+    }
+
+    /// <summary>Asks an escalated worker for one fresh plan. Refusals propagate, like a decision's.</summary>
+    public async Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        await _client.RequestNewPlanAsync(planId, guidance, cts.Token).ConfigureAwait(false);
     }
 
     /// <summary>The plan-mode toggle as the last plan update reported it.</summary>

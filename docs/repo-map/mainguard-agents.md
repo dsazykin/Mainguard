@@ -1845,7 +1845,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
       approval** — it is a resource cap and a blocked worker still holds its jail/tmpfs/network
       segment/worktree) and `MaxPlanRevisions` (3; the reject→revise budget, with the arithmetic pinned in
-      prose: reject → revise ×3, and the **4th rejection escalates**), plus the automatic-verify tunables
+      prose: reject → revise ×3, and the **4th rejection escalates**), `MaxLiveCoordinators` (1; owner
+      decision 2026-09-03 — one coordinator per daemon, refused at `AgentSpawnService.SpawnAsync`, never at
+      adoption), plus the automatic-verify tunables
       `AutoVerifyQuietSeconds` (90 — how long a worker's branch must stop advancing before it is read as
       ready) and `AutoVerifyCooldownSeconds` (600 — the floor between two AUTOMATIC runs for one worker; it
       never throttles a human's Verify). Never in a prompt — a limit an agent
