@@ -44,8 +44,10 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
         AgentSessionStore store, AgentSpawnService spawns, InstalledAdapterCatalog adapters,
         DaemonInfoProvider info, AgentResourceProbe resources, AgentResumeService resumes,
         Mainguard.Server.Auth.IApproverIdentityResolver identity, ILoggerFactory loggerFactory,
-        AgentPauseService? pauses = null)
+        AgentPauseService? pauses = null,
+        Mainguard.Agents.Agents.Sandbox.JailLimitsSettings? jailLimits = null)
     {
+        _jailLimits = jailLimits;
         _store = store;
         _spawns = spawns;
         _adapters = adapters;
@@ -59,6 +61,54 @@ public sealed class AgentGrpcService : AgentService.AgentServiceBase
     }
 
     private readonly AgentPauseService? _pauses;
+    private readonly Mainguard.Agents.Agents.Sandbox.JailLimitsSettings? _jailLimits;
+
+    /// <summary>The per-jail ceiling the next spawn gets (owner decision 2026-09-04).</summary>
+    public override Task<JailLimits> GetJailLimits(GetJailLimitsRequest request, ServerCallContext context)
+    {
+        if (_jailLimits is null)
+        {
+            throw new RpcException(new Status(StatusCode.Unavailable, "this daemon has no jail-limits store bound"));
+        }
+
+        return Task.FromResult(ToWire(_jailLimits));
+    }
+
+    /// <summary>Operator-only (RoleInterceptor). Clamps and persists; answers with what was persisted.</summary>
+    public override Task<JailLimits> SetJailLimits(SetJailLimitsRequest request, ServerCallContext context)
+    {
+        if (_jailLimits is null)
+        {
+            throw new RpcException(new Status(StatusCode.Unavailable, "this daemon has no jail-limits store bound"));
+        }
+
+        if (request.MemoryBytes <= 0 || request.Cpus <= 0 || double.IsNaN(request.Cpus))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, "memory_bytes and cpus must be positive."));
+        }
+
+        var persisted = _jailLimits.Set(request.MemoryBytes, request.Cpus, _identity.Resolve(context));
+        _log.LogInformation(
+            "jail limits set: memory={MemoryBytes} cpus={Cpus} (applies to jails created from now on)",
+            persisted.MemoryBytes, persisted.Cpus);
+        return Task.FromResult(ToWire(_jailLimits));
+    }
+
+    private static JailLimits ToWire(Mainguard.Agents.Agents.Sandbox.JailLimitsSettings settings)
+    {
+        var current = settings.Current;
+        return new JailLimits
+        {
+            MemoryBytes = current.MemoryBytes,
+            Cpus = current.Cpus,
+            Pids = current.Pids,
+            IsDefault = settings.IsDefault,
+            MinMemoryBytes = Mainguard.Agents.Agents.Sandbox.JailLimitsSettings.MinMemoryBytes,
+            MaxMemoryBytes = Mainguard.Agents.Agents.Sandbox.JailLimitsSettings.MaxMemoryBytes,
+            MinCpus = Mainguard.Agents.Agents.Sandbox.JailLimitsSettings.MinCpus,
+            MaxCpus = Mainguard.Agents.Agents.Sandbox.JailLimitsSettings.MaxCpus,
+        };
+    }
 
     /// <summary>Human per-agent pause (docker pause on the jail; NOT containment — no terminal lock).
     /// Refusal-as-response, same contract as ResumeAgent.</summary>

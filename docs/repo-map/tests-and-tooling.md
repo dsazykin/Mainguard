@@ -1639,7 +1639,12 @@
   settings half:** the poll filters authors by the SAVED bot list rather than `DefaultBotAuthors`, the
   saved cadence is followed live and clamped at both ends, a disabled intake makes **no list call at
   all** while leaving subscriptions in place, and `DbPrIntakeStore` round-trips settings through real
-  SQLite as a single upserted row), `PrIntakeSettingsPageTests` (the page is REACHABLE — a `"PrIntake"`
+  SQLite as a single upserted row), `JailLimitsSettingsTests` (2026-09-04 — defaults until set; `Set` clamps,
+  persists, audits and answers as persisted; the JSON store round-trips, garbage reads as nothing persisted,
+  and a hand-edited zero is clamped on read), `JailLimitsSettingsPageTests` (the `"AgentJails"` row under the
+  agent platform and absent without it, the View resolves to a `UserControl`, Load renders the daemon's
+  ceiling, Save re-renders the CLAMPED persisted value, a refused save is an error, Reset touches only the
+  page), `PrIntakeSettingsPageTests` (the page is REACHABLE — a `"PrIntake"`
   row in `SettingsViewModel.Pages` under the agent platform and absent without it, which is the
   assertion that would have failed for the whole life of the feature — the ViewModel has **no
   gateway-less constructor** to fall back to, Save/Subscribe go through `IPrIntakeGateway` and re-render
@@ -2260,6 +2265,10 @@
   **`SpawnRollbackTests` (2026-09-04 — a spawn that fails AFTER its jail exists removes that jail: the real
   launcher over a recording engine and a worktree manager whose ref-watch throws; the leak was every such
   failure leaving a container running, unowned, for good),**
+  **`JailLimitsRpcTests` (2026-09-04 — the ceiling over the real composition root: Set answers clamped, Get
+  agrees, the NEXT spawn's `SandboxSpawnRequest.Limits` carries it — the line a setting the launcher never
+  read would lack — the file sits beside the session token, and a non-positive value is InvalidArgument;
+  the coordinator-role denial is in `RoleInterceptorTests`),**
   **`JailReaperTests` (2026-09-04 — the reaper over the real composition root: a jail whose fake CLI is
   bound survives a day of sweeps; once the CLI is released the allowance runs and at 29 min it is kept, at
   31 min the session is gone, the engine was asked to remove the container, and `jail_reaped` is audited

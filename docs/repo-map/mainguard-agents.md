@@ -790,6 +790,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
+    - `JailLimitsSettings.cs` (2026-09-04, owner decision — the per-jail memory/CPU ceiling as an OPERATOR
+      setting: `IJailLimitsStore` (`InMemoryJailLimitsStore` / `JsonJailLimitsStore`, a one-file JSON beside
+      the plan store because the launcher reads it at every spawn), and `JailLimitsSettings` — `Current`
+      is the persisted document clamped over `SandboxLimits.Default`, `Set` clamps to [512 MiB, 64 GiB] ×
+      [0.5, 64] CPUs, persists, audits `jail_limits_changed` and answers AS PERSISTED. Read-side clamp too,
+      so a hand-edited zero is never a ceiling of zero. Defaults kept at 2 GiB / 2 CPUs; no fleet cap.)
     - `ContainerSpecBuilder.cs` (**macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
       `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
       instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the

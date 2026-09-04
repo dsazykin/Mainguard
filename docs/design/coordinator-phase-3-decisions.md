@@ -4475,3 +4475,30 @@ RPC, which the Pro app calls when its window regains focus. `QueueUpdate` carrie
 and `mirror_main_refresh_error`; the queue rail renders "mirror refreshed from your checkout N min ago", or
 the daemon's error as a warning. The RPC is denied to the coordinator role (it can fire the stale cascade).
 
+### 27.5 Jails that nobody stops (owner decisions, 2026-09-04)
+
+The owner measured 26 GB of agent containers on a Mac after a day's use — more memory than most machines
+have. A jail was only ever removed by a human pressing Stop: orphans adopted after a daemon restart,
+workers whose entry had merged, agents whose CLI had exited, and every jail left behind when the app
+closed all ran until Docker itself died. Two leaks made it worse — a spawn that failed after its jail
+existed left the container running and unowned, and boot reconcile listed exited containers as "not
+live" and then left them on disk. The decisions, and what each became:
+
+- **Clear the leaks (both).** `SandboxAgentLauncher.SpawnAsync` removes the jail it started when a later
+  step throws, `AgentSpawnService` tears the launch down on rollback, and `SwarmReconciler` deletes every
+  exited container it finds at boot (`SpawnRollbackTests`, `SwarmReconcilerTests`).
+- **Reclaim on a timer AND at exit.** `JailReapPolicy` (pure) + `JailReaperHostedService`: every
+  `CoordinatorLimits.JailReapSweepSeconds` (60) a jail is stopped through the ordinary Stop when its entry
+  is Merged/Rejected/Discarded, or when no CLI has been bound to it for `IdleJailReapMinutes` (30). A jail
+  with a live CLI is never touched, whatever it is doing. Audits `jail_reaped`. And "Stop agents and
+  Mainguard OS on exit" now does what it says on both platforms: `AppShutdownSequence` gains an agents leg
+  (`IAppShutdownEnvironment.StopAgentsAsync` → `IAgentPlatformSurface.StopAllAgentsAsync`, registered by
+  `ProManifest.CreateControlCenter`) that runs before the VM leg and even under the image-build veto. On
+  macOS, where there is no VM, this is the first thing the setting has ever done.
+- **Size per jail as a setting, keep the defaults, no fleet cap.** `JailLimitsSettings` (daemon-side, a
+  file beside the plan store, clamped to [512 MiB, 64 GiB] × [0.5, 64] CPUs, audited), `AgentService.
+  GetJailLimits`/`SetJailLimits` (Set denied to the coordinator role), the launcher reads it at every
+  spawn, and Settings → Agent Jails edits it over `IJailLimitsGateway`. Defaults stay 2 GiB / 2 CPUs; a
+  running jail keeps the ceiling it was created with. An automatic fleet cap was declined: the reaper and
+  the exit leg remove the jails that should not exist, and the ceiling lets the operator size the ones that
+  should — a cap would refuse the sixth worker on a machine that can hold it.

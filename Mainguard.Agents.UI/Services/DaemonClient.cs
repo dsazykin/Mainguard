@@ -263,6 +263,23 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new Mainguard.Agents.Agents.Bootstrap.DaemonVersionInfo(response.DaemonVersion, response.PayloadVersion);
     }
 
+    /// <summary>The per-jail memory/CPU ceiling the next spawn is created with (2026-09-04).</summary>
+    public async Task<JailLimits> GetJailLimitsAsync(CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.GetJailLimitsAsync(new GetJailLimitsRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Sets the ceiling. Returns it AS PERSISTED — the daemon clamps to the band the response
+    /// carries — so a caller renders what the next jail will get, not what was typed.</summary>
+    public async Task<JailLimits> SetJailLimitsAsync(
+        long memoryBytes, double cpus, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.SetJailLimitsAsync(
+            new SetJailLimitsRequest { MemoryBytes = memoryBytes, Cpus = cpus }, CallOptions(ct, deadline));
+    }
+
     /// <summary>The agent CLIs installed in the VM the daemon can launch (ids/versions/env-var
     /// names only — never key values). What the "Start coordinator" picker lists.</summary>
     public async Task<IReadOnlyList<InstalledAdapterInfo>> ListInstalledAdaptersAsync(

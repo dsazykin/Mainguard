@@ -95,7 +95,8 @@
     Rationale, the measured `localhostForwarding` exposure, and why a UDS + `SO_PEERCRED` was rejected
     for this topology: `docs/security-architecture.md`.
 - **`Auth/BearerTokenInterceptor.cs`** — authenticates **every** RPC (unary/all-streaming) via a constant-time compare (`CryptographicOperations.FixedTimeEquals`); no public-method allowlist (invariant 1); mismatch → `PermissionDenied`.
-- **`Auth/RoleInterceptor.cs`** (P2-14) — daemon-side role + terminal-lock enforcement at the gRPC
+- **`Auth/RoleInterceptor.cs`** (P2-14; 2026-09-04 adds `AgentService/SetJailLimits` to the coordinator's
+  deny list — the ceiling is the operator's lever over the machine's memory) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/

@@ -253,6 +253,7 @@ public class PrIntakeSettingsPageTests
         public object CreateToolchainsPage() => throw new NotSupportedException();
         public object CreateDaemonLogsPage() => throw new NotSupportedException();
         public object CreatePrIntakePage() => new PrIntakeSettingsViewModel(new RecordingGateway());
+        public object CreateJailLimitsPage() => throw new NotSupportedException();
         public object? CreateMainguardOsPage(Avalonia.Controls.Window owner) => null;
         public Task RebuildSandboxImagesAsync() => Task.CompletedTask;
     }

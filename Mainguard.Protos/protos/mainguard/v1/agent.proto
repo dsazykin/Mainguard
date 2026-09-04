@@ -49,6 +49,12 @@ service AgentService {
   // payload version stamped in /etc/mainguardos-release. A daemon that predates this RPC
   // answers Unimplemented — which the client treats as the skew signal itself.
   rpc GetDaemonInfo(GetDaemonInfoRequest) returns (GetDaemonInfoResponse);
+  // The per-jail memory/CPU ceiling every spawn is created with (owner decision 2026-09-04): a daemon-side
+  // setting, so a weaker machine can shrink it. Set is operator-only (RoleInterceptor) and answers with
+  // the ceiling AS PERSISTED — clamped to the band the response carries — so a page renders what the
+  // next jail will actually get. Applies to jails created after the call.
+  rpc GetJailLimits(GetJailLimitsRequest) returns (JailLimits);
+  rpc SetJailLimits(SetJailLimitsRequest) returns (JailLimits);
   // Live per-agent CPU/RAM sampled from the container engine, plus whether each agent's spend
   // is measurable at all. The Resource Monitor was built over this data and it did not exist:
   // the client hard-coded CPU/RAM to 0, so the tab showed a convincing zero for every agent
@@ -250,6 +256,26 @@ message ListInstalledAdaptersResponse {
 }
 
 message GetDaemonInfoRequest {}
+
+message GetJailLimitsRequest {}
+
+message SetJailLimitsRequest {
+  int64 memory_bytes = 1;
+  double cpus = 2;
+}
+
+// The ceiling as persisted, plus the band it was clamped to (so a client renders the daemon's edges,
+// not its own guess) and whether it is still the compiled default.
+message JailLimits {
+  int64 memory_bytes = 1;
+  double cpus = 2;
+  int64 pids = 3;
+  bool is_default = 4;
+  int64 min_memory_bytes = 5;
+  int64 max_memory_bytes = 6;
+  double min_cpus = 7;
+  double max_cpus = 8;
+}
 
 // Versions only — no paths, no secrets (G-14).
 message GetDaemonInfoResponse {

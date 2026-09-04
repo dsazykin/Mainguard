@@ -864,7 +864,11 @@
     launchd toggle; Continue gates only on engine + daemon, marks `MacOobeState` completed and
     hands off to the SAME startup-window path the control-center route takes.
     `ProDesktopHost.DecideLaunchRoute` routes macOS by the completed marker, and the keep-alive /
-    resume-task-sweep Windows machinery no-ops there), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
+    resume-task-sweep Windows machinery no-ops there), `JailLimitsSettingsViewModel` (+ `Views/JailLimitsSettingsView`,
+    a `UserControl` page — 2026-09-04, owner decision: the Settings **Agent Jails** page, memory GiB and CPUs
+    per jail over `IJailLimitsGateway`; a save re-renders from what the daemon PERSISTED (clamped), a refused
+    save is an error on the page, `FleetNote` words what six workers could take, and Reset restores the
+    defaults on the page only until Save), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
     Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
     subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
     gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from
@@ -1082,6 +1086,10 @@
     than re-typing the clamp) serves the render harness/preview only — deliberately not a default
     anywhere, because a settings surface silently defaulting to storage the daemon never reads IS the
     defect this seam exists to remove.)
+  - `IJailLimitsGateway.cs` / `DaemonJailLimitsGateway.cs` (2026-09-04: the Agent Jails page's seam onto the
+    daemon's per-jail ceiling — `JailLimitsView` in GiB/CPUs plus the band the daemon clamps to; the shipped
+    gateway is `AgentService.GetJailLimits`/`SetJailLimits` over the same lazy loopback `DaemonClient` as
+    intake, built via `ProComposition.JailLimitsGatewayFactory`.)
   - `DaemonPrIntakeGateway.cs` (the SHIPPED `IPrIntakeGateway`, over `PrIntakeService`'s
     `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/`SubscribePrIntakeSource`. Stateless — every load is a
     fresh read, and a save returns the daemon's PERSISTED values (clamped cadence, defaulted bot list),

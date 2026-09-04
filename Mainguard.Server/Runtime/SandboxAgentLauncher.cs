@@ -59,14 +59,18 @@ public sealed class SandboxAgentLauncher
     private readonly string _imageRef;
     private readonly InstalledAdapterCatalog _adapters;
     private readonly ILogger _log;
+    private readonly JailLimitsSettings? _jailLimits;
     private readonly Gateway.AgentGatewayCredentials? _credentials;
     private readonly Gateway.GatewayConfinementOptions? _gatewayOptions;
 
     public SandboxAgentLauncher(
         IAgentEnvironment environment, InstalledAdapterCatalog? adapters = null, ILoggerFactory? loggerFactory = null,
         Gateway.AgentGatewayCredentials? credentials = null,
-        Gateway.GatewayConfinementOptions? gatewayOptions = null)
+        Gateway.GatewayConfinementOptions? gatewayOptions = null,
+        JailLimitsSettings? jailLimits = null)
     {
+        // The operator's per-jail ceiling (2026-09-04); absent ⇒ SandboxLimits.Default, as before.
+        _jailLimits = jailLimits;
         // Optional so the many direct-construction tests (and the RequiresDocker spawn tests) keep
         // compiling unchanged; DI supplies both. Absent ⇒ no confinement ⇒ today's behaviour.
         _credentials = credentials;
@@ -359,7 +363,7 @@ public sealed class SandboxAgentLauncher
                 AgentId: agentId,
                 WorktreePath: worktreePath,
                 ImageRef: spawnImageRef,
-                Limits: SandboxLimits.Default,
+                Limits: _jailLimits?.Current ?? SandboxLimits.Default,
                 Secrets: secrets,
                 AgentUid: AgentUid,
                 SupervisorUid: SupervisorUid,

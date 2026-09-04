@@ -88,6 +88,8 @@ public sealed class ProToolsSurface : IProToolsSurface
     // was, in practice, unconfigurable.
     public object CreatePrIntakePage() => new PrIntakeSettingsViewModel(ProComposition.CreatePrIntakeGateway());
 
+    public object CreateJailLimitsPage() => new JailLimitsSettingsViewModel(ProComposition.CreateJailLimitsGateway());
+
     // Mainguard OS (PR2 follow-up + Item 1 repair action): the post-setup repo-onboarding engine + the
     // user-triggered sandbox-image rebuild, combined into one page since Rebuild has no dialog of its
     // own. The VM is composed by ProComposition.AddReposToOsFactory (pickers parent to the Settings

@@ -111,6 +111,12 @@ public static class DaemonHost
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch(
             store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanModeStore(ResolvePlanModePath(tokenPath)),
             audit: sp.GetRequiredService<IAuditLog>()));
+        // The per-jail memory/CPU ceiling (owner decision 2026-09-04): a file beside the plan store because
+        // the launcher reads it at every spawn and must not need a database for it. Unreadable ⇒ the
+        // compiled defaults (2 GiB, 2 CPUs), never a ceiling of zero.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Sandbox.JailLimitsSettings(
+            new Mainguard.Agents.Agents.Sandbox.JsonJailLimitsStore(ResolveJailLimitsPath(tokenPath)),
+            sp.GetRequiredService<IAuditLog>()));
         // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
         // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
         // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
@@ -517,6 +523,23 @@ public static class DaemonHost
     }
 
     /// <summary>The plan gate's held-task store: beside the plan store, isolated per in-proc host the same way.</summary>
+    /// <summary>The jail-limits file, beside the session token like the plan-mode file (and under the
+    /// data-root isolation test for the same reason: a test host that shrank the real ceiling would
+    /// starve the developer's next real spawn).</summary>
+    private static string ResolveJailLimitsPath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-jail-limits.json");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-jail-limits.json");
+    }
+
     private static string ResolveHeldTaskStorePath(string? tokenPath) =>
         Path.Combine(Path.GetDirectoryName(ResolvePlanStorePath(tokenPath))!, "mainguard-held-tasks.json");
 

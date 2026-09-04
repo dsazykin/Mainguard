@@ -3,7 +3,9 @@
 
 - **`protos/mainguard/v1/`** — the `mainguard.v1` proto surface (package name binding; opaque
   handles only, no OS paths — G-14).
-  - `common.proto` (`Handle`/`Empty`), `agent.proto` (`AgentService`:
+  - `common.proto` (`Handle`/`Empty`), `agent.proto` (`AgentService`: **`GetJailLimits`/`SetJailLimits`**
+    (2026-09-04 — the per-jail memory/CPU ceiling; Set is operator-only and answers `JailLimits` AS PERSISTED
+    with the clamp band);
     `SpawnAgent`/`StopAgent`/`ListAgents`/`StreamAgentEvents`; **`ResumeAgent`** gives a STRANDED
     merge-queue entry a live jail again — a spawn onto the agent id that entry ALREADY has, with the
     worktree standing on its existing `agent/<id>`. A separate RPC rather than an `agent_id` field on

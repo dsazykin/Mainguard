@@ -57,6 +57,14 @@ public static class ProComposition
     /// <summary>The gateway the intake settings page runs on — the factory's current value.</summary>
     public static IPrIntakeGateway CreatePrIntakeGateway() => PrIntakeGatewayFactory();
 
+    /// <summary>The Agent Jails page's seam onto the daemon's per-jail ceiling (2026-09-04) — same shape and
+    /// same reason as the intake factory above: the page edits daemon state, and what "the daemon" means
+    /// for a run is decided here where a harness can replace it.</summary>
+    public static Func<IJailLimitsGateway> JailLimitsGatewayFactory { get; set; } =
+        () => new DaemonJailLimitsGateway(SharedIntakeClient.Value);
+
+    public static IJailLimitsGateway CreateJailLimitsGateway() => JailLimitsGatewayFactory();
+
     /// <summary>
     /// One process-lifetime loopback client for the intake page's unary calls. Deliberately shared and
     /// never disposed: Settings pages are cached per Settings window and nothing disposes them, so a

@@ -157,6 +157,24 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesSetJailLimitsToCoordinator_ButLetsItRead()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var agents = new AgentService.AgentServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            agents.SetJailLimitsAsync(
+                new SetJailLimitsRequest { MemoryBytes = 64L * 1024 * 1024 * 1024, Cpus = 64 },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+        Assert.True((await agents.GetJailLimitsAsync(new GetJailLimitsRequest(), fixture.AuthHeaders(CoordinatorToken))).IsDefault);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesRejectToCoordinator()
     {
         using var fixture = new DaemonFixture();

@@ -132,6 +132,10 @@ public class DataRootIsolationTests
     /// which is the one process an emergency stop is followed by restarting. Giving it a file made it a
     /// store, and every daemon store belongs under this test.</para>
     ///
+    /// <para><b>Why it grew again (2026-09-04):</b> <c>ResolveJailLimitsPath</c>, the operator's per-jail
+    /// memory/CPU ceiling. A test host that wrote a 512 MiB ceiling into the developer's real data root
+    /// would starve their next real spawn, silently, until they found the Settings page.</para>
+    ///
     /// <para><b>Why it grew again (2026-08-30):</b> <c>ResolvePlanModePath</c>, for the operator's
     /// plan-mode toggle. It is a one-boolean file and it is still a daemon store — and this one has a
     /// sharper failure than most if it escapes isolation: an in-proc test host that turned plan mode off
@@ -151,6 +155,7 @@ public class DataRootIsolationTests
             "ResolveAgentIpcRoot",
             "ResolveDataPath",
             "ResolveHeldTaskStorePath",
+            "ResolveJailLimitsPath",
             "ResolveKillJournalPath",
             "ResolveLeaderRegistryPath",
             "ResolveLogsDirectory",
