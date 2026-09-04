@@ -26,6 +26,15 @@
       <!-- "main <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
       <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" TextWrapping="Wrap"
                  Foreground="{DynamicResource TextMuted}"/>
+      <!-- The mirror's age (2026-09-04): the daemon's main is a copy of the checkout, refreshed on an
+           interval and when this window regains focus; a human reading "main <sha>" needs to know how
+           old that claim is. A failed refresh is a warning, not a footnote. -->
+      <TextBlock Text="{Binding MirrorText}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource TextMuted}"
+                 IsVisible="{Binding HasMirrorNote}"/>
+      <TextBlock Text="{Binding MirrorText}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource WarningBrush}"
+                 IsVisible="{Binding HasMirrorError}"/>
       <!-- The list scrolls behind a thin, low-contrast thumb, and terminal history sorts to the bottom:
            without a count, a row rendering below the fold reads as an entry that vanished (ISSUES-LOG
            #4, #13 — the second of those was filed as a HIGH data-loss regression against a row that was

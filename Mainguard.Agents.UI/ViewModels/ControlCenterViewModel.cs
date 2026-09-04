@@ -305,6 +305,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // The rail is a thin view over this VM; the shell hosts it as AgentRailContent (2d).
         _agentRail = new AgentRailViewModel(this);
 
+        // The mirror's main is pulled forward from the checkout on the daemon's interval; a human coming
+        // back to this window is the other moment they are about to read it, so it is asked once more then
+        // (owner decision 2026-09-04). Best-effort: no window yet means the interval sweep still covers it.
+        if ((Application.Current?.ApplicationLifetime
+                as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?
+                .MainWindow is { } mainWindow)
+        {
+            mainWindow.Activated += (_, _) => _ = _queue.RefreshMirrorMainAsync();
+        }
+
         // P2-13 §6, finally wired: a transition INTO a waiting/blocked state raises an OS-level
         // notification (Notification Center on macOS, shell toast elsewhere), suppressed only when
         // the app is foregrounded ON that agent. Fed from RefreshAgents — the one reconcile loop.

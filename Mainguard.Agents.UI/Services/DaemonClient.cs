@@ -543,6 +543,15 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             new CanMergeRequest { RepoHandle = repoHandle, AgentId = agentId }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Pulls the daemon-side mirror's main forward from the checkout now (2026-09-04).</summary>
+    public async Task<MirrorMainState> RefreshMirrorMainAsync(
+        string repoHandle, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.RefreshMirrorMainAsync(
+            new RefreshMirrorMainRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
+    }
+
     /// <summary>RT-D1 step 1: take the per-repo merge lease before the human foreground merge.</summary>
     public async Task<BeginMergeResponse> BeginMergeAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)

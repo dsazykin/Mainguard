@@ -306,6 +306,30 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
         return reader.ReadToEnd();
     }
 
+    /// <summary>On-demand mirror refresh (2026-09-04) — the same call the daemon's interval sweep makes.</summary>
+    public override Task<MirrorMainState> RefreshMirrorMain(RefreshMirrorMainRequest request, ServerCallContext context)
+    {
+        var ctx = Resolve(request.RepoHandle);
+        if (_queues is null)
+        {
+            return Task.FromResult(new MirrorMainState
+            {
+                MainSha = ctx.Queue.CurrentMainSha,
+                RefreshedAt = string.Empty,
+                Error = "this daemon has no provisioner to refresh the mirror with",
+            });
+        }
+
+        var refresh = _queues.RefreshMainFromCheckout(request.RepoHandle);
+        return Task.FromResult(new MirrorMainState
+        {
+            MainSha = refresh.MainSha,
+            RefreshedAt = refresh.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+            Error = refresh.Error ?? string.Empty,
+            Moved = refresh.Moved,
+        });
+    }
+
     public override Task<CanMergeResponse> CanMerge(CanMergeRequest request, ServerCallContext context)
     {
         var ctx = Resolve(request.RepoHandle);
@@ -1001,6 +1025,12 @@ public sealed class MergeQueueGrpcService : MergeQueueService.MergeQueueServiceB
     {
         var queue = ctx.Queue;
         var update = new QueueUpdate { MainSha = queue.CurrentMainSha };
+        if (_queues?.LastMainRefresh(repoHandle) is { } refresh)
+        {
+            update.MirrorMainRefreshedAt = refresh.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+            update.MirrorMainRefreshError = refresh.Error ?? string.Empty;
+        }
+
         var orderedAgentIds = OrderForDisplay(queue.Agents, queue.GetState, queue.LastChangedAt);
         foreach (var agentId in orderedAgentIds)
         {

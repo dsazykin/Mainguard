@@ -616,6 +616,59 @@ public sealed class MergeQueueProvisionerTests : IDisposable
     }
 
     /// <summary>
+    /// The interval/on-demand refresh (owner decision 2026-09-04): a commit made on the checkout's main
+    /// outside Mainguard reaches the queue without waiting for a repo-open; a checkout that cannot be read
+    /// is recorded as the error the rail renders and moves nothing; every attempt leaves a stamp.
+    /// </summary>
+    [Fact]
+    public void RefreshMainFromCheckout_FollowsTheCheckout_RecordsEveryAttempt_AndNeverMovesOnAFailedFetch()
+    {
+        var repoHash = SeedAndProvision("npm test");
+        var provisioner = NewProvisioner(exitCode: 0, out _);
+        var queue = provisioner.EnsureQueue(repoHash)!.Queue;
+        var shaBefore = queue.CurrentMainSha;
+        Assert.Null(provisioner.LastMainRefresh(repoHash));
+
+        // Nothing moved on the checkout: a stamp, no move, no error.
+        var idle = provisioner.RefreshMainFromCheckout(repoHash);
+        Assert.False(idle.Moved);
+        Assert.Null(idle.Error);
+        Assert.Equal(shaBefore, idle.MainSha);
+        Assert.Equal(shaBefore, queue.CurrentMainSha);
+        Assert.Equal(idle, provisioner.LastMainRefresh(repoHash));
+
+        // A commit lands on the checkout's main behind Mainguard's back.
+        WriteAndCommit(_source, "outside.cs", "public class Outside { }\n", "a pull made outside Mainguard");
+        string newMain;
+        using (var origin = new Repository(_source))
+        {
+            newMain = origin.Head.Tip.Sha;
+        }
+
+        var moved = provisioner.RefreshMainFromCheckout(repoHash);
+        Assert.True(moved.Moved);
+        Assert.Null(moved.Error);
+        Assert.Equal(newMain, moved.MainSha);
+        Assert.Equal(newMain, queue.CurrentMainSha);
+
+        // The checkout is unreachable: the error is recorded, the queue's main is left exactly where it was.
+        var hidden = _source + "-hidden";
+        Directory.Move(_source, hidden);
+        try
+        {
+            var failed = provisioner.RefreshMainFromCheckout(repoHash);
+            Assert.False(failed.Moved);
+            Assert.NotNull(failed.Error);
+            Assert.Equal(newMain, queue.CurrentMainSha);
+            Assert.Equal(failed, provisioner.LastMainRefresh(repoHash));
+        }
+        finally
+        {
+            Directory.Move(hidden, _source);
+        }
+    }
+
+    /// <summary>
     /// RT-D1, made live. The daemon dies between the client's <c>--ff-only</c> merge and its
     /// <c>ConfirmMerge</c>: the lease is outstanding in SQLite, the merge is on the user's checkout, and
     /// the mirror has not been told. The boot-sequence reconcile could never resolve a repo path, so this

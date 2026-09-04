@@ -243,6 +243,48 @@ public sealed class MergeQueueWiringTests
         Assert.False(provisioner.ParkedConflicts.IsHandedBack("repo-x", "agent-x"));
     }
 
+    /// <summary>
+    /// The mirror-freshness sweep (2026-09-04) is a hosted service the host itself starts, its one pass
+    /// stamps the queue, and the stamp reaches the wire — so "refreshed N min ago" on the rail is a fact
+    /// the daemon produced, not a number the client made up.
+    /// </summary>
+    [Fact]
+    public async Task TheMirrorRefreshSweep_IsHostedAtBoot_AndItsStampReachesTheQueueStream()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+        var (client, sync, headers) = NewClients(host);
+
+        var provisioned = await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers);
+
+        var sweep = Assert.Single(host.Services.GetServices<Microsoft.Extensions.Hosting.IHostedService>()
+            .OfType<MirrorMainRefreshHostedService>());
+        var provisioner = host.Services.GetRequiredService<MergeQueueProvisioner>();
+        Assert.Null(provisioner.LastMainRefresh(provisioned.RepoHandle));
+
+        sweep.SweepOnce();
+
+        var refresh = provisioner.LastMainRefresh(provisioned.RepoHandle);
+        Assert.NotNull(refresh);
+        Assert.Null(refresh!.Error);
+
+        using var cts = new CancellationTokenSource(Timeout);
+        using var stream = client.StreamQueue(
+            new StreamQueueRequest { RepoHandle = provisioned.RepoHandle }, headers, cancellationToken: cts.Token);
+        Assert.True(await stream.ResponseStream.MoveNext(cts.Token));
+        var update = stream.ResponseStream.Current;
+        Assert.Equal(refresh.At.ToString("O", System.Globalization.CultureInfo.InvariantCulture), update.MirrorMainRefreshedAt);
+        Assert.Equal(string.Empty, update.MirrorMainRefreshError);
+
+        // The on-demand RPC is the same call, and answers with what the mirror holds.
+        var state = await client.RefreshMirrorMainAsync(
+            new RefreshMirrorMainRequest { RepoHandle = provisioned.RepoHandle }, headers);
+        Assert.Equal(update.MainSha, state.MainSha);
+        Assert.Equal(string.Empty, state.Error);
+        Assert.False(state.Moved);
+    }
+
     [Fact]
     public async Task AnOrdinaryEntry_CarriesNoConflictOnTheWire()
     {

@@ -284,6 +284,11 @@
     CLI's own echo (`PromptEchoWindow`, 250 ms) and by `TerminalSubmit.TerminatorSeparation` when there
     is no echo. `Echoed`/`Reacted` are **observations, never proof** — a mid-turn CLI satisfies both
     without reading anything.
+  - **`Runtime/MirrorMainRefreshHostedService.cs`** (2026-09-04, owner decision) — the mirror-freshness
+    sweep: every `CoordinatorLimits.MirrorRefreshSeconds` it calls
+    `MergeQueueProvisioner.RefreshMainFromCheckout` for each live queue, so a pull made on main outside
+    Mainguard reaches the queue without a repo-open and the rail's "refreshed N min ago" is a bound.
+    `SweepOnce()` is public for the wiring test; the on-demand `RefreshMirrorMain` RPC is the same call.
   - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
     `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
     session store's pause axis (`AgentSessionStore.MarkFrozen`/`FrozenReason`), which the merge queue's

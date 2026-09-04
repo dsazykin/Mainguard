@@ -4440,3 +4440,22 @@ owner decided every design question on 2026-09-03; the fixes landed as narrow co
   decision: stop here, keep it documented; CI keeps running the tier.
 - `VerifiedFreezeTests` raced its own cascade (no requeue delegate, so `NotifyMainMoved`'s FIFO walk
   direct-ran a re-verify against the test's); the rig now records requeues, as the trigger rig does.
+
+### 27.4 The mirror's age (owner decision, 2026-09-04)
+
+The daemon's mirror is a bare clone of the user's checkout, and its `main` was pulled forward only when
+something else happened to do it — repo-open (the provision RPC's incremental fetch), merge-confirm, the
+cascade's align step, and the reconcile paths. A pull or a commit made on `main` outside Mainguard therefore
+left every entry verified against a `main` the checkout no longer had until one of those moments, and
+nothing on any surface said how old the mirror's claim was. Safe — the merge's identity checks refuse
+rather than land the wrong thing — but silent, and on Windows the mirror lives inside WSL where a user
+cannot easily look.
+
+Built: `MergeQueueProvisioner.RefreshMainFromCheckout` (the same guarded reconcile `EnsureQueue` performs —
+a mirror behind the queue is never walked backwards, a failed fetch is recorded and moves nothing, every
+attempt republishes the queue), run by `MirrorMainRefreshHostedService` every
+`CoordinatorLimits.MirrorRefreshSeconds` (60) and on demand by the new `MergeQueueService.RefreshMirrorMain`
+RPC, which the Pro app calls when its window regains focus. `QueueUpdate` carries `mirror_main_refreshed_at`
+and `mirror_main_refresh_error`; the queue rail renders "mirror refreshed from your checkout N min ago", or
+the daemon's error as a warning. The RPC is denied to the coordinator role (it can fire the stale cascade).
+

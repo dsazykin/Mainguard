@@ -91,6 +91,17 @@ public sealed record VerificationLog(
 public interface IMergeQueueService
 {
     string MainSha { get; }
+
+    /// <summary>When the daemon last tried to pull the mirror's main forward from the checkout, or null
+    /// when it has not yet (2026-09-04). The rail renders the age from this; the daemon states the fact.</summary>
+    DateTimeOffset? MirrorMainRefreshedAt => null;
+
+    /// <summary>Why that last attempt failed, or null when it succeeded / has not run.</summary>
+    string? MirrorMainRefreshError => null;
+
+    /// <summary>Asks the daemon to refresh the mirror's main now — the call a human returning to the window
+    /// makes. Never throws to its caller; a refusal or an outage is the next update's error field.</summary>
+    Task RefreshMirrorMainAsync() => Task.CompletedTask;
     /// <summary>Fires whenever the daemon's queue projection changes — a spawn's <c>EnsureEntry</c>,
     /// a state transition, a stale cascade. Field bug (found live 2026-08-20): nothing subscribed a
     /// rail refresh to this signal, so a fresh spawn's entry sat in <see cref="GetQueue"/>'s answer

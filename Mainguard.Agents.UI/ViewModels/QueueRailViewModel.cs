@@ -25,6 +25,23 @@ public partial class QueueRailViewModel : ViewModelBase
     public ObservableCollection<QueueEntryViewModel> Entries { get; } = new();
 
     [ObservableProperty] private string _mainShaText = "";
+
+    /// <summary>The mirror's freshness (2026-09-04): "mirror refreshed N min ago", or the daemon's error
+    /// when its last pull from the checkout failed. Empty until the daemon has tried once.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMirrorError))]
+    [NotifyPropertyChangedFor(nameof(HasMirrorNote))]
+    private string _mirrorText = "";
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMirrorError))]
+    [NotifyPropertyChangedFor(nameof(HasMirrorNote))]
+    private bool _mirrorRefreshFailed;
+
+    public bool HasMirrorError => MirrorRefreshFailed && MirrorText.Length > 0;
+
+    /// <summary>The quiet form of the line — a successful refresh, rendered muted.</summary>
+    public bool HasMirrorNote => !MirrorRefreshFailed && MirrorText.Length > 0;
     [ObservableProperty] private string _gateText = "";
     [ObservableProperty] private bool _isEmpty;
 
@@ -57,10 +74,30 @@ public partial class QueueRailViewModel : ViewModelBase
         Refresh();
     }
 
+    /// <summary>The freshness line, from the daemon's two facts. Pure so the wording is testable.</summary>
+    internal static (string Text, bool Failed) MirrorFreshness(DateTimeOffset? refreshedAt, string? error, DateTimeOffset now)
+    {
+        if (refreshedAt is null)
+        {
+            return ("", false);
+        }
+
+        var age = now - refreshedAt.Value;
+        var ago = age < TimeSpan.FromMinutes(1) ? "just now"
+            : age < TimeSpan.FromHours(1) ? $"{(int)age.TotalMinutes} min ago"
+            : $"{(int)age.TotalHours} h ago";
+
+        return string.IsNullOrEmpty(error)
+            ? ($"mirror refreshed from your checkout {ago}", false)
+            : ($"mirror could not be refreshed from your checkout ({ago}) — {error}", true);
+    }
+
     public void Refresh()
     {
         var snapshot = _queue.GetQueue();
         MainShaText = "main " + _queue.MainSha;
+        (MirrorText, MirrorRefreshFailed) = MirrorFreshness(
+            _queue.MirrorMainRefreshedAt, _queue.MirrorMainRefreshError, DateTimeOffset.UtcNow);
 
         // In-place sync so unchanged rows keep their visuals (no churn, no reflow).
         for (int i = Entries.Count - 1; i >= 0; i--)

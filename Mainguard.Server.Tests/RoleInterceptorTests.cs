@@ -140,6 +140,23 @@ public class RoleInterceptorTests
     }
 
     [Fact]
+    public async Task RoleInterceptor_DeniesMirrorRefreshToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.RefreshMirrorMainAsync(
+                new RefreshMirrorMainRequest { RepoHandle = "any" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task RoleInterceptor_DeniesRejectToCoordinator()
     {
         using var fixture = new DaemonFixture();

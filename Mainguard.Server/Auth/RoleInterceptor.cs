@@ -70,6 +70,9 @@ public sealed class RoleInterceptor : Interceptor
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.
         "/mainguard.v1.MergeQueueService/ClearStalledVerification",
+        // Refreshing the mirror's main can fire the stale cascade at every co-tenant; that is the merge
+        // conversation's own lever, and an agent does not get to pull it (2026-09-04).
+        "/mainguard.v1.MergeQueueService/RefreshMirrorMain",
         // Resuming a stranded entry ADOPTS an existing agent id: it attaches a fresh, writable jail to
         // somebody else's `agent/<id>` branch and puts that branch back in front of the daemon's
         // verification. That is strictly more power than the merge RPCs above — an agent able to invoke it

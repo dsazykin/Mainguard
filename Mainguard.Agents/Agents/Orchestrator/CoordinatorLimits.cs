@@ -52,6 +52,14 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// button or the stale cascade: a cooldown on a human's explicit request would be a control refusing the
 /// person it exists to serve.
 /// </param>
+/// <param name="MirrorRefreshSeconds">
+/// How often the daemon pulls each live queue's mirror main forward from the user's checkout
+/// (<c>MergeQueueProvisioner.RefreshMainFromCheckout</c>). Owner decision 2026-09-04: before this the
+/// mirror was refreshed only at repo-open, merge-confirm, cascade and reconcile moments, so a pull or a
+/// commit made on main outside Mainguard left every queue entry measured against a main that no longer
+/// existed until one of those moments happened, with nothing on any surface saying so. One local fetch
+/// per repo per minute is cheap; the value is what makes the rail's "refreshed N min ago" a bound.
+/// </param>
 /// <param name="MaxLiveCoordinators">
 /// How many coordinators may be live on one daemon at once. <b>One</b> (owner decision, 2026-09-03): the
 /// plan gate, the operator's approval cards and the coordinator surface are all built around a single
@@ -65,7 +73,8 @@ public sealed record CoordinatorLimits(
     int MaxPlanRevisions = 3,
     int AutoVerifyQuietSeconds = 90,
     int AutoVerifyCooldownSeconds = 600,
-    int MaxLiveCoordinators = 1)
+    int MaxLiveCoordinators = 1,
+    int MirrorRefreshSeconds = 60)
 {
     /// <summary><see cref="AutoVerifyQuietSeconds"/> as a <see cref="System.TimeSpan"/>.</summary>
     public System.TimeSpan AutoVerifyQuietPeriod => System.TimeSpan.FromSeconds(AutoVerifyQuietSeconds);

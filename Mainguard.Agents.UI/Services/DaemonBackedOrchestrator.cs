@@ -832,6 +832,14 @@ public sealed class DaemonBackedOrchestrator :
         lock (_gate)
         {
             _mainSha = update.MainSha ?? string.Empty;
+            _mirrorMainRefreshedAt = DateTimeOffset.TryParse(
+                update.MirrorMainRefreshedAt, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var refreshedAt)
+                ? refreshedAt
+                : null;
+            _mirrorMainRefreshError = string.IsNullOrEmpty(update.MirrorMainRefreshError)
+                ? null
+                : update.MirrorMainRefreshError;
             _queue.Clear();
             _gate_.Clear();
             _origins.Clear();
@@ -1500,6 +1508,43 @@ public sealed class DaemonBackedOrchestrator :
     // ---- IMergeQueueService (LIVE via StreamQueue) ----------------------
 
     public string MainSha { get { lock (_gate) return _mainSha; } }
+
+    private DateTimeOffset? _mirrorMainRefreshedAt;
+    private string? _mirrorMainRefreshError;
+
+    public DateTimeOffset? MirrorMainRefreshedAt { get { lock (_gate) return _mirrorMainRefreshedAt; } }
+
+    public string? MirrorMainRefreshError { get { lock (_gate) return _mirrorMainRefreshError; } }
+
+    /// <summary>The on-demand half of the mirror refresh (2026-09-04): one RPC, and the answer arrives on the
+    /// queue stream like every other queue fact. Failures are logged, never thrown — the stream's error
+    /// field is where a human reads them.</summary>
+    public async Task RefreshMirrorMainAsync()
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return;
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            await _client.RefreshMirrorMainAsync(repoHandle, cts.Token, deadline: TimeSpan.FromSeconds(30))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Swallowed on purpose: the request is a nudge. Whether the mirror could be refreshed, and why
+            // not, arrives on the queue stream's own error field, which is the surface a human reads.
+            _ = ex;
+        }
+    }
 
     public IReadOnlyList<QueueEntry> GetQueue()
     {

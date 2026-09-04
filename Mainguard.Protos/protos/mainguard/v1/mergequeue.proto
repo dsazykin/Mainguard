@@ -15,6 +15,11 @@ service MergeQueueService {
   rpc RunVerification(RunVerificationRequest) returns (RunVerificationResponse);
   // The CanMerge gate query (false unless Verified & fresh & no unacknowledged flagged item).
   rpc CanMerge(CanMergeRequest) returns (CanMergeResponse);
+  // Pull the daemon-side mirror's main forward from the user's checkout NOW (the daemon also does this on
+  // an interval) and report what it holds. Owner decision 2026-09-04: the mirror's freshness was invisible
+  // — refreshed only at repo-open, merge-confirm, cascade and reconcile moments, with nothing on any
+  // surface saying how old it was. Denied to the coordinator role: it can fire the stale cascade.
+  rpc RefreshMirrorMain(RefreshMirrorMainRequest) returns (MirrorMainState);
   // RT-D1 step 1: take the per-repo merge lease.
   rpc BeginMerge(BeginMergeRequest) returns (BeginMergeResponse);
   // RT-D1 step 3: record the merge outcome, release the lease, fire the stale cascade.
@@ -103,6 +108,22 @@ message StreamQueueRequest {
 message QueueUpdate {
   repeated QueueEntry entries = 1;
   string main_sha = 2;
+  // The mirror's freshness (2026-09-04). refreshed_at is ISO-8601 of the last attempt to pull the mirror's
+  // main forward from the user's checkout; refresh_error is that attempt's failure, empty on success. Both
+  // empty when nothing has tried yet. The client renders the age; the daemon states the facts.
+  string mirror_main_refreshed_at = 3;
+  string mirror_main_refresh_error = 4;
+}
+
+message RefreshMirrorMainRequest {
+  string repo_handle = 1;
+}
+
+message MirrorMainState {
+  string main_sha = 1;       // the mirror's main after the attempt
+  string refreshed_at = 2;   // ISO-8601
+  string error = 3;          // empty on success
+  bool moved = 4;            // the queue's main advanced (and the stale cascade fired) on this attempt
 }
 
 message QueueEntry {

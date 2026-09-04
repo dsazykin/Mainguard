@@ -2494,6 +2494,74 @@ public sealed class MergeQueueProvisioner
         return true;
     }
 
+    // ---- mirror freshness (owner decision, 2026-09-04) -------------------------------------------------
+
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, MirrorMainRefresh> _mainRefreshes =
+        new(StringComparer.Ordinal);
+
+    /// <summary>The last attempt to pull this repo's mirror main forward from the checkout, or null.</summary>
+    public MirrorMainRefresh? LastMainRefresh(string repoHandle) =>
+        _mainRefreshes.TryGetValue(repoHandle, out var refresh) ? refresh : null;
+
+    /// <summary>
+    /// Pulls the mirror's main forward from the user's checkout and, when main really moved on the
+    /// checkout, tells the queue — the same guarded reconcile <see cref="EnsureQueue"/> performs, made
+    /// callable on an interval and on demand.
+    ///
+    /// <para><b>Why.</b> The mirror is a bare clone of the checkout, and its main was refreshed only at
+    /// repo-open, merge-confirm, the cascade's align step and the reconcile paths. A pull or a commit made
+    /// on main outside Mainguard therefore left every entry verified against a main the checkout no longer
+    /// had, until one of those moments happened — safe (the merge's identity checks refuse), but silent.
+    /// This is the refresh those moments were the only sources of, plus the record the rail renders.</para>
+    ///
+    /// <para><b>What it will not do.</b> Walk the queue's main backwards: a mirror behind the queue (the
+    /// window after a confirm) is left alone exactly as in <see cref="EnsureQueue"/>. A failed fetch is
+    /// recorded as the error the human reads and changes nothing else. Every attempt republishes the
+    /// queue, so the rail's "refreshed N min ago" advances rather than freezing at the first stamp.</para>
+    /// </summary>
+    public MirrorMainRefresh RefreshMainFromCheckout(string repoHandle)
+    {
+        var at = DateTimeOffset.UtcNow;
+        var context = _registry.Resolve(repoHandle);
+        var barePath = _repos.BareRepoPathFor(repoHandle);
+        MirrorMainRefresh outcome;
+
+        if (context is null)
+        {
+            outcome = new MirrorMainRefresh(RevParse(barePath, ResolveDefaultBranch(barePath)), at, false,
+                "no live merge queue for this repository");
+        }
+        else if (!TryRefreshMirrorMainAfterMerge(repoHandle, out var fetchReason))
+        {
+            outcome = new MirrorMainRefresh(context.Queue.CurrentMainSha, at, false, fetchReason);
+            _log?.Invoke($"merge queue repo={repoHandle} mirror refresh FAILED — {fetchReason}");
+        }
+        else
+        {
+            var mirrorMain = RevParse(barePath, ResolveDefaultBranch(barePath));
+            var queueMain = context.Queue.CurrentMainSha;
+            var moved = false;
+            if (!string.IsNullOrEmpty(mirrorMain)
+                && !string.Equals(mirrorMain, queueMain, StringComparison.Ordinal)
+                && TryGit(barePath, out _, "cat-file", "-e", queueMain + "^{commit}")
+                && !TryGit(barePath, out _, "merge-base", "--is-ancestor", mirrorMain, queueMain))
+            {
+                context.Queue.NotifyMainMoved(mirrorMain);
+                moved = true;
+                _log?.Invoke($"merge queue repo={repoHandle} main advanced to {mirrorMain} on the checkout — stale cascade fired");
+            }
+
+            outcome = new MirrorMainRefresh(string.IsNullOrEmpty(mirrorMain) ? queueMain : mirrorMain, at, moved, null);
+        }
+
+        _mainRefreshes[repoHandle] = outcome;
+        // Republished on EVERY attempt, not only on a move: the stamp is what the rail renders as the
+        // mirror's age, and a stamp that only travelled when main moved would read "refreshed 3 h ago"
+        // about a mirror that was checked a minute ago.
+        context?.Queue.NotifyGateChanged();
+        return outcome;
+    }
+
     private static string RevParse(string barePath, string reference)
         => TryGit(barePath, out var output, "rev-parse", "--verify", reference) ? output.Trim() : string.Empty;
 
@@ -2525,3 +2593,10 @@ public sealed class MergeQueueProvisioner
         return AgentGitCommand.TryRun(barePath, out output, args) == 0;
     }
 }
+
+/// <summary>One attempt to pull a repo's mirror main forward from the user's checkout (2026-09-04).</summary>
+/// <param name="MainSha">The mirror's main after the attempt (the queue's, when the fetch failed).</param>
+/// <param name="At">When the attempt ran.</param>
+/// <param name="Moved">True when the queue's main advanced (and the stale cascade fired) on this attempt.</param>
+/// <param name="Error">Why the fetch failed, or null when it succeeded.</param>
+public sealed record MirrorMainRefresh(string MainSha, DateTimeOffset At, bool Moved, string? Error);
