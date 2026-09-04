@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using CommunityToolkit.Mvvm.Input;
 using Mainguard.UI.ViewModels;
@@ -99,4 +100,14 @@ public interface IAgentPlatformSurface : IDisposable
     /// at nothing rather than at the previously opened repo.
     /// </summary>
     Task<RepoProvisionOutcome?> ProvisionRepoAsync(string repoPath);
+
+    /// <summary>
+    /// Stops every live agent through the ordinary Stop path (owner decision 2026-09-04) — the app-exit
+    /// leg of "Stop agents and Mainguard OS on exit". On Windows the WSL terminate that follows would
+    /// kill the jails anyway, but a clean stop first harvests logins and publishes each branch; on macOS
+    /// there is no VM to stop, and before this the setting did nothing there at all — every jail outlived
+    /// the app until Docker itself died. Best-effort and bounded by <paramref name="ct"/>: one agent's
+    /// refusal must not keep the next from being stopped, or the app from exiting.
+    /// </summary>
+    Task StopAllAgentsAsync(CancellationToken ct) => Task.CompletedTask;
 }

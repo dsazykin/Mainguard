@@ -29,7 +29,11 @@ public sealed class ProManifest : IEditionManifest
     public bool ShowsAgentRail => true;
 
     public IAgentPlatformSurface? CreateControlCenter()
-        => new ControlCenterViewModel(ProComposition.CreateOrchestratorServices());
+    {
+        var surface = new ControlCenterViewModel(ProComposition.CreateOrchestratorServices());
+        ProComposition.LiveAgentSurface = surface; // the exit teardown stops live agents through this
+        return surface;
+    }
 
     // The Pro Tools surface (step 1c) — a single stateless instance holding the five moved command
     // bodies (and, with them, the Mainguard.Agents.Agents + Pro-View references the shared hub no longer carries).

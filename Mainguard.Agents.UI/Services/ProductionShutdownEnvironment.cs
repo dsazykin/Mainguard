@@ -43,4 +43,9 @@ internal sealed class ProductionShutdownEnvironment : IAppShutdownEnvironment
     public bool SandboxProvisioningInFlight => SandboxImageProvisioningTracker.Shared.IsProvisioning;
 
     public void Log(string message) => _log(message);
+
+    // The window's live surface (set by ProManifest.CreateControlCenter); null when no window was ever
+    // shown, in which case there is nothing to stop.
+    public Task StopAgentsAsync(CancellationToken ct) =>
+        ProComposition.LiveAgentSurface?.StopAllAgentsAsync(ct) ?? Task.CompletedTask;
 }

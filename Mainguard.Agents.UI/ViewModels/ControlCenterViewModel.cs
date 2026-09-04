@@ -585,6 +585,30 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         await window.ShowDialog(owner);
     }
 
+    /// <inheritdoc/>
+    public async Task StopAllAgentsAsync(CancellationToken ct)
+    {
+        // A snapshot, not the live list: a stop that lands raises Changed and rewrites the projection
+        // under us. Coordinator last — it is the one that would otherwise react to its workers going.
+        var live = _agents.ListAgents()
+            .Where(a => !IsTerminalState(a.State))
+            .OrderBy(a => a.Role == AgentRoles.Coordinator ? 1 : 0)
+            .ToList();
+        Editions.ProComposition.LogOobe($"exit: stopping {live.Count} live agent(s)");
+        foreach (var agent in live)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await _agents.EndAgentAsync(agent.AgentId).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Editions.ProComposition.LogOobe($"exit: stopping agent {agent.AgentId} failed (continuing): {ex.Message}");
+            }
+        }
+    }
+
     /// <summary>Terminal lifecycle states — the same set <see cref="LiveAgentCount"/> excludes.</summary>
     private static bool IsTerminalState(AgentLifecycleState state) =>
         state is AgentLifecycleState.Merged or AgentLifecycleState.Rejected

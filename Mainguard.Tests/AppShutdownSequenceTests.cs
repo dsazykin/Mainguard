@@ -48,6 +48,15 @@ public class AppShutdownSequenceTests
         }
 
         public void Log(string message) => Calls.Add($"log:{message}");
+
+        public int StopAgentsCount;
+
+        public Task StopAgentsAsync(CancellationToken ct)
+        {
+            Calls.Add("StopAgents");
+            StopAgentsCount++;
+            return Task.CompletedTask;
+        }
     }
 
     [Fact]
@@ -61,13 +70,42 @@ public class AppShutdownSequenceTests
         Assert.Equal(new[]
         {
             ShutdownStatus.ReleasingKeepAlive,
+            ShutdownStatus.StoppingAgents,
             ShutdownStatus.StoppingVm,
             ShutdownStatus.Done,
         }, rec.Lines);
         Assert.Equal(1, env.ReleaseCount);
+        Assert.Equal(1, env.StopAgentsCount);
         Assert.Equal(1, env.StopCount);
         Assert.True(env.Calls.IndexOf("Release") < env.Calls.IndexOf("StopVm"),
             "keep-alive must be released before the VM stop");
+        Assert.True(env.Calls.IndexOf("StopAgents") < env.Calls.IndexOf("StopVm"),
+            "agents must be stopped (harvest + publish) before the VM that holds their jails is terminated");
+    }
+
+    [Fact]
+    public async Task StopVmOnExit_on_still_stops_agents_when_an_image_build_vetoes_the_vm_stop()
+    {
+        var env = new FakeEnv { StopVmOnExitValue = true, ProvisioningInFlightValue = true };
+        var rec = new Recorder();
+
+        await new AppShutdownSequence(env).RunAsync(rec, CancellationToken.None);
+
+        Assert.Equal(1, env.StopAgentsCount);
+        Assert.Equal(0, env.StopCount);
+        Assert.Contains(ShutdownStatus.StoppingAgents, rec.Lines);
+        Assert.Contains(ShutdownStatus.LeavingVmForImageBuild, rec.Lines);
+    }
+
+    [Fact]
+    public async Task StopVmOnExit_off_never_stops_agents_either()
+    {
+        var env = new FakeEnv { StopVmOnExitValue = false };
+
+        await new AppShutdownSequence(env).RunAsync(new Recorder(), CancellationToken.None);
+
+        Assert.Equal(0, env.StopAgentsCount);
+        Assert.DoesNotContain("StopAgents", env.Calls);
     }
 
     [Fact]
@@ -123,6 +161,7 @@ public class AppShutdownSequenceTests
         Assert.Equal(new[]
         {
             ShutdownStatus.ReleasingKeepAlive,
+            ShutdownStatus.StoppingAgents,
             ShutdownStatus.LeavingVmForImageBuild,
             ShutdownStatus.Done,
         }, rec.Lines);

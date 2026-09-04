@@ -2264,6 +2264,10 @@
   bound survives a day of sweeps; once the CLI is released the allowance runs and at 29 min it is kept, at
   31 min the session is gone, the engine was asked to remove the container, and `jail_reaped` is audited
   with the cause. The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
+  **`StopAllAgentsOnExitTests` (2026-09-04 — the exit leg: `ControlCenterViewModel.StopAllAgentsAsync`
+  ends every live mock agent and leaves the records (branches stay until teardown), honours an exhausted
+  budget between agents, and the manifest's surface is the one `ProductionShutdownEnvironment` reaches —
+  the ordering itself is in `AppShutdownSequenceTests`, whose lines now carry "Stopping agents…"),**
   **`MirrorFreshnessTests` (2026-09-04 — the mirror-age line: the wire's `mirror_main_refreshed_at` /
   `mirror_main_refresh_error` reach `IMergeQueueService`, absent stays absent, and
   `QueueRailViewModel.MirrorFreshness` words the age and renders a failed refresh as a warning carrying

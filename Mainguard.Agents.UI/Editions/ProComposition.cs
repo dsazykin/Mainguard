@@ -72,6 +72,13 @@ public static class ProComposition
     /// workspace-layout preset through it. Null until wired (falls back to defaults, as before).</summary>
     public static ISettingsService? Settings { get; set; }
 
+    /// <summary>
+    /// The window's live agent surface, set by <see cref="ProManifest.CreateControlCenter"/> so the exit
+    /// teardown (<c>ProductionShutdownEnvironment</c>) can stop every live agent through it without the
+    /// shell naming Pro types. Null before a window exists and in the tests that never make one.
+    /// </summary>
+    public static IAgentPlatformSurface? LiveAgentSurface { get; set; }
+
     /// <summary>The <c>oobe.log</c> breadcrumb sink (was <c>App.LogOobe</c>) — shared with the shell so a
     /// Pro Tools action leaves a trace in the one log. No-op until wired.</summary>
     public static Action<string> LogOobe { get; set; } = static _ => { };

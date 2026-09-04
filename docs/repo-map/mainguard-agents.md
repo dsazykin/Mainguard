@@ -612,6 +612,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       concurrent request JOIN the run already in flight (same images, same sources) instead of starting a
       rival build, and `IsProvisioning` is the signal `AppShutdownSequence` (and the framework-Exit
       backstop in `ProDesktopHost`) vetoes the VM terminate on.)
+    - `AppShutdownSequence.cs` (the visualized exit teardown: release the keep-alive; when StopVmOnExit is
+      on, `IAppShutdownEnvironment.StopAgentsAsync` — every live agent through the ordinary Stop, added
+      2026-09-04 (owner decision), run BEFORE the VM leg and even when an image build vetoes that leg —
+      then the scoped terminate. `ShutdownStatus` holds the exact status lines the ordering test pins.)
     - `DaemonConnectDiagnosis.cs` (the app→daemon connect path's per-leg verdict: `DaemonConnectStage`
       (distro not running / daemon process down / no session token / transport credentials missing /
       not listening / token rejected / undiagnosed), the `DaemonConnectDiagnosis` record whose `Banner`

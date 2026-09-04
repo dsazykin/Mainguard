@@ -66,7 +66,7 @@
                       IsVisible="{Binding IsMacOS}"
                       ToolTip.Tip="Render the window background, title bar, and sidebar over the system vibrancy blur. Content panels stay opaque."/>
             <CheckBox Content="Close button hides to tray" IsChecked="{Binding CloseToTray, Mode=TwoWay}"/>
-            <CheckBox Content="Stop Mainguard OS on exit" IsChecked="{Binding StopVmOnExit, Mode=TwoWay}" IsVisible="{Binding HasAgentPlatform}"/>
+            <CheckBox Content="Stop agents and Mainguard OS on exit" IsChecked="{Binding StopVmOnExit, Mode=TwoWay}" IsVisible="{Binding HasAgentPlatform}"/>
         </StackPanel>
 
         <StackPanel Spacing="10">
