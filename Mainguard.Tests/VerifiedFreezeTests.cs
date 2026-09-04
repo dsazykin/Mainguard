@@ -79,6 +79,12 @@ public class VerifiedFreezeTests
         public readonly List<string> Runs = new();
         public readonly List<string> Log = new();
 
+        /// <summary>Every stale entry the cascade asked to re-enter. Recorded, never run: with no requeue
+        /// delegate the queue's FIFO walk falls back to the direct run, and that background run raced
+        /// every test that drove its own re-verify after NotifyMainMoved — whichever lost threw
+        /// Verified → Verifying. The re-entry itself is the provisioner's and is pinned there.</summary>
+        public readonly List<string> Requeues = new();
+
         /// <summary>The mirror's <c>agent/&lt;id&gt;</c> tip, per agent, as the rig's git stand-in.</summary>
         public readonly Dictionary<string, string> Tip = new(StringComparer.Ordinal);
 
@@ -126,7 +132,7 @@ public class VerifiedFreezeTests
                         id, queue.CurrentMainSha, !_fails.Contains(id), "log.txt", "npm test", "cfg",
                         Now, TipOf(id));
                 },
-                requeue: null,
+                requeue: (id, _) => { lock (Requeues) { Requeues.Add(id); } return Task.CompletedTask; },
                 gates: withFlaggedGate ? new IMergeGate[] { Flagged } : Array.Empty<IMergeGate>(),
                 audit: Audit,
                 clock: () => Now);
@@ -370,6 +376,7 @@ public class VerifiedFreezeTests
         // mirror ref without the sweep announcing it — nothing calls NotifyBranchAdvanced.
         rig.Queue.NotifyMainMoved("main1");
         Assert.Equal(WorkerMergeState.StaleVerified, rig.Queue.GetState("w-1"));
+        Assert.Equal(new[] { "w-1" }, rig.Requeues); // the cascade asked; this test plays its re-verify
         rig.Tip["w-1"] = "tip-a-rebased";
 
         await rig.Queue.RunVerificationAsync("w-1", CancellationToken.None);

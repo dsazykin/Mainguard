@@ -2255,6 +2255,10 @@
   the coordinator jail keeps ZERO writable bind mounts. Both directions mutation-checked: never setting
   the field, and setting it unconditionally. A correct mechanism nobody passes the flag to is the MG-12
   shape the role lock already shipped as once),**
+  **`TeardownAfterRefusedPublishTests` (2026-09-04 — the launcher's routing on the last publish's outcome:
+  `RefusedNonFastForward`/`RefusedTarget` take `RemoveAgentWorktreeKeepingRepository`, every other outcome
+  the ordinary removal; a recording `IAgentWorktreeManager`, so the line under test is the one a correct
+  manager nobody calls correctly would lack),**
   **`OneCoordinatorPerDaemonTests` (contract §2.2, owner decision 2026-09-03 — ONE live coordinator per
   daemon, proved at `AgentSpawnService.SpawnAsync` with the shipped default `CoordinatorLimits`: a second
   coordinator is refused naming the running one, in the same repo or another; a worker is not a

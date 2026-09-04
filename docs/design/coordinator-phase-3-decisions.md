@@ -4415,10 +4415,20 @@ owner decided every design question on 2026-09-03; the fixes landed as narrow co
 
 ### 27.3 Left alone, deliberately
 
-- The hand-back publish after "let the agent resolve" (a completed rebase is non-fast-forward and the
-  watcher's publish refuses it forever): crosses two layers and needs the parking store in DI; recorded
-  as a proposal in the review notes rather than built inside this pass.
+- ~~The hand-back publish after "let the agent resolve"~~ — **built on 2026-09-04 (owner decision:
+  mark and rebase-publish).** "Let the agent resolve" now sets a hand-back mark in
+  `RebaseConflictParkingStore`; the composition root installs it on the ref mediator as
+  `RewritePermitted`, so the worker's finished rebase — a rewrite of published history, with patches that
+  legitimately differ after conflict resolution — is published exactly once, the mark is consumed on that
+  publish, and rule 2 is absolute again afterwards. The publish raises `Advanced`, the readiness trigger
+  re-verifies, and the descent belt passes because the branch now sits on main. A mark for one agent does
+  not leak to another. Pinned at the worktree manager (real git, an amend, the grant consumed, a bystander
+  still refused), at the provisioner (the hand-back sets the mark), and at the composition root (the
+  policy is installed).
 - Stale `.res` reclaim on a live endpoint: the aggregate bound already reclaims, and the per-op shim
   deadlines remove the normal source of leftovers.
-- The launcher's teardown routing on a refused publish is pinned at the worktree-manager level (real git,
-  a real amend) and not by a launcher-level fake; the launcher change is four lines.
+- ~~The launcher's teardown routing on a refused publish~~ — pinned on 2026-09-04 by
+  `TeardownAfterRefusedPublishTests` (a recording worktree manager; each publish outcome routes to exactly
+  one of the two removals).
+- `VerifiedFreezeTests` raced its own cascade (no requeue delegate, so `NotifyMainMoved`'s FIFO walk
+  direct-ran a re-verify against the test's); the rig now records requeues, as the trigger rig does.
