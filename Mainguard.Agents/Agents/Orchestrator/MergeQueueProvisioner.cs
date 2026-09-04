@@ -1769,6 +1769,10 @@ public sealed class MergeQueueProvisioner
         }
 
         ParkedConflicts.Clear(repoHandle, agentId);
+        // The human's authorisation for the rewrite the finished rebase will be. Without it the worker's
+        // completed rebase is refused by the mirror on every sweep (rule 2) and the promise in the prompt
+        // above — "verified again automatically" — was false. Consumed by the publish it lets through.
+        ParkedConflicts.MarkHandedBack(repoHandle, agentId);
         queue.TryReturnToWorking(agentId, ConflictHandedBackReason, "conflict-handed-back");
 
         _log?.Invoke(

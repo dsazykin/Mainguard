@@ -287,6 +287,17 @@ public static class GatewayServiceRegistration
                 }
             };
 
+            // The conflict hand-back's one exception to the mirror's fast-forward rule: a human chose "let the
+            // agent resolve", so the worker's finished rebase — a rewrite of published history — may reach the
+            // mirror ONCE. Wired here because the mediator lives inside the worktree manager and knows nothing
+            // of parked conflicts; the mark is the provisioner's, consumed on the publish it lets through.
+            if (sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager rewriteHost)
+            {
+                rewriteHost.PermitHandedBackRewrite(
+                    provisioner.ParkedConflicts.IsHandedBack,
+                    (repo, agent) => provisioner.ParkedConflicts.ClearHandedBack(repo, agent));
+            }
+
             return provisioner;
         });
 

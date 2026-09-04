@@ -219,6 +219,30 @@ public sealed class MergeQueueWiringTests
     /// filled with defaults would light "Abort rebase" on every branch in the queue — a control whose whole
     /// behaviour, on a branch that is not rebasing, is an error message.
     /// </summary>
+    /// <summary>
+    /// The hand-back's rewrite grant is wired from the real composition root: the mediator inside the
+    /// worktree manager asks the provisioner's parking store, and a mark set by "let the agent resolve"
+    /// lets exactly one non-fast-forward publish through. Asserted on the composition root because the
+    /// mediator's policy defaults to null — a correct grant nobody installs is rule 2 forever, which is
+    /// the defect this closes.
+    /// </summary>
+    [Fact]
+    public void TheHandBackRewriteGrant_IsWiredFromTheParkingStore()
+    {
+        using var repos = new TempRepos();
+        using var host = NewHost(repos.VmRoot);
+
+        var provisioner = host.Services.GetRequiredService<MergeQueueProvisioner>();
+        var worktrees = Assert.IsType<WorktreeManager>(host.Services.GetRequiredService<IAgentEnvironment>().Worktrees);
+        Assert.True(worktrees.HasHandedBackRewritePolicy);
+
+        // The predicate the mediator holds IS the store's mark, not a copy of it.
+        provisioner.ParkedConflicts.MarkHandedBack("repo-x", "agent-x");
+        Assert.True(provisioner.ParkedConflicts.IsHandedBack("repo-x", "agent-x"));
+        Assert.True(provisioner.ParkedConflicts.ClearHandedBack("repo-x", "agent-x"));
+        Assert.False(provisioner.ParkedConflicts.IsHandedBack("repo-x", "agent-x"));
+    }
+
     [Fact]
     public async Task AnOrdinaryEntry_CarriesNoConflictOnTheWire()
     {

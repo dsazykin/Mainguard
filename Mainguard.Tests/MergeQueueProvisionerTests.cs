@@ -1397,6 +1397,9 @@ public sealed class MergeQueueProvisionerTests : IDisposable
         Assert.False(ctx.Queue.CanMerge(SecondAgent, out var reason));
         Assert.Equal(MergeQueueProvisioner.ConflictHandedBackReason, reason);
         Assert.Null(provisioner.ParkedConflicts.Find(repoHash, SecondAgent));
+        // The human's authorisation for the rewrite the finished rebase will be — without it the mirror
+        // refuses the completed rebase on every sweep and the prompt's promise above is false.
+        Assert.True(provisioner.ParkedConflicts.IsHandedBack(repoHash, SecondAgent));
         Assert.Contains(_audit.Read(), e =>
             e.Type == MergeQueueProvisioner.ConflictHandedBackEvent && e.Fields["agent"] == SecondAgent);
     }

@@ -130,6 +130,19 @@ public sealed class AgentRefMediator
     /// <param name="agentRepos">Locates each agent's own repository (the fetch source).</param>
     /// <param name="bareRepoPathFor">repoHash → the shared mirror (the fetch destination).</param>
     /// <param name="observer">Receives every outcome; refusals are the interesting half.</param>
+    /// <summary>
+    /// The one human-granted exception to rule 2. Answers (repoHash, agentId) → may THIS agent's next
+    /// non-fast-forward tip be published? The provisioner sets it from the conflict parking's hand-back
+    /// mark: a human chose "let the agent resolve", the worker finished the rebase, and the rewritten
+    /// branch is what that human asked for. Null (the default, and every test rig's) means rule 2 is
+    /// absolute. Asked only on the non-fast-forward path, and the grant is consumed on the publish it lets
+    /// through (<see cref="RewriteConsumed"/>), so it authorises one rewrite, not a policy.
+    /// </summary>
+    public Func<string, string, bool>? RewritePermitted { get; set; }
+
+    /// <summary>Invoked after a rewrite <see cref="RewritePermitted"/> allowed has been published.</summary>
+    public Action<string, string>? RewriteConsumed { get; set; }
+
     public AgentRefMediator(
         AgentRepoManager agentRepos,
         Func<string, string> bareRepoPathFor,
@@ -280,12 +293,20 @@ public sealed class AgentRefMediator
 
             // Rule 2: fast-forward only. `merge-base --is-ancestor` is git's own answer to exactly this
             // question, and it is asked about the value we are about to compare-and-swap against.
+            var handedBack = false;
             if (oldSha.Length > 0
                 && AgentGitCommand.TryRun(barePath, out _, "merge-base", "--is-ancestor", oldSha, newSha) != 0)
             {
-                // ...except for the daemon's OWN rebase, where the ancestor test is the wrong instrument
+                // ...except for a rewrite a HUMAN authorised: the conflict hand-back. The worker finished
+                // the rebase the daemon could not, resolving conflicts on the way, so the patches
+                // legitimately differ from what the mirror holds and neither the ancestor test nor the
+                // dropped-commit probe below can vouch for it. The human's click did. One rewrite, then
+                // the grant is consumed.
+                handedBack = !daemonRebase && RewritePermitted?.Invoke(repoHash, agentId) == true;
+
+                // ...and except for the daemon's OWN rebase, where the ancestor test is the wrong instrument
                 // and the property it stands for is asked directly instead. See PublishRebase.
-                if (!daemonRebase)
+                if (!daemonRebase && !handedBack)
                 {
                     return new AgentRefPublishResult(
                         repoHash, agentId, AgentRefPublishOutcome.RefusedNonFastForward, oldSha, newSha,
@@ -293,7 +314,7 @@ public sealed class AgentRefMediator
                         + $"{oldSha[..Math.Min(8, oldSha.Length)]}; the agent rewrote published history");
                 }
 
-                if (DroppedCommits(barePath, oldSha, newSha) is { Length: > 0 } dropped)
+                if (!handedBack && DroppedCommits(barePath, oldSha, newSha) is { Length: > 0 } dropped)
                 {
                     return new AgentRefPublishResult(
                         repoHash, agentId, AgentRefPublishOutcome.RefusedNonFastForward, oldSha, newSha,
@@ -311,6 +332,11 @@ public sealed class AgentRefMediator
                 return new AgentRefPublishResult(
                     repoHash, agentId, AgentRefPublishOutcome.Failed, oldSha, newSha,
                     "the compare-and-swap on the mirror's ref lost; another publish moved it concurrently");
+            }
+
+            if (handedBack)
+            {
+                RewriteConsumed?.Invoke(repoHash, agentId);
             }
 
             return new AgentRefPublishResult(repoHash, agentId, AgentRefPublishOutcome.Published, oldSha, newSha);

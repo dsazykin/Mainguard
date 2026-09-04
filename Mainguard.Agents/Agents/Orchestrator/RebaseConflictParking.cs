@@ -83,6 +83,27 @@ public sealed class RebaseConflictParkingStore
     /// </summary>
     public bool Clear(string repoHandle, string agentId) =>
         _parked.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
+
+    // ---- the hand-back mark ----------------------------------------------------------------------
+    //
+    // "Let the agent resolve" unpauses the worker and tells it to finish the rebase. A finished rebase is
+    // a rewrite of history the mirror already holds, and the ref mediator's rule 2 refuses exactly that —
+    // so without this mark the handed-back branch was refused on every sweep, forever, and the card's
+    // promise of automatic re-verification was false. The mark is the human's authorisation for ONE such
+    // rewrite: set by the hand-back, consumed by the first publish it lets through, keyed like the parking.
+    private readonly ConcurrentDictionary<(string Repo, string Agent), byte> _handedBack = new();
+
+    /// <summary>Records that a human handed this entry's conflict back to its agent to finish the rebase.</summary>
+    public void MarkHandedBack(string repoHandle, string agentId) =>
+        _handedBack[(repoHandle ?? string.Empty, agentId ?? string.Empty)] = 0;
+
+    /// <summary>True while a hand-back is outstanding — the mediator may accept one rewrite of this branch.</summary>
+    public bool IsHandedBack(string repoHandle, string agentId) =>
+        _handedBack.ContainsKey((repoHandle ?? string.Empty, agentId ?? string.Empty));
+
+    /// <summary>Consumes the mark: the rewrite it authorised has reached the mirror (or the entry is gone).</summary>
+    public bool ClearHandedBack(string repoHandle, string agentId) =>
+        _handedBack.TryRemove((repoHandle ?? string.Empty, agentId ?? string.Empty), out _);
 }
 
 /// <summary>

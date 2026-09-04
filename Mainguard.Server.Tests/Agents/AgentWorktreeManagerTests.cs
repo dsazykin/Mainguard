@@ -455,6 +455,65 @@ public sealed class AgentWorktreeManagerTests
     }
 
     /// <summary>
+    /// The conflict hand-back's exception to rule 2: a human handed a parked rebase back to the agent, the
+    /// agent finished it, and the rewritten branch must reach the mirror exactly once. Without the mark the
+    /// refusal is permanent; with it the rewrite lands, the mark is consumed, and the next rewrite is
+    /// refused again.
+    /// </summary>
+    [Fact]
+    public void AHandedBackRewrite_IsPublishedOnce_AndRuleTwoIsBackAfterwards()
+    {
+        using var env = new WorktreeEnv();
+        var hash = env.Provision();
+        var bare = env.BarePath(hash);
+
+        var path = env.Worktrees.CreateAgentWorktree(hash, "resolver");
+        var first = CommitInWorktree(path, "r.txt", "r", "feat: first");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "resolver"));
+
+        static string Rewrite(string worktree, string message)
+        {
+            AgentTestGit.RunChecked(worktree,
+                "-c", "user.name=agent", "-c", "user.email=agent@mainguard.local", "-c", "commit.gpgsign=false",
+                "commit", "--amend", "-m", message);
+            return AgentTestGit.RunChecked(worktree, "rev-parse", "HEAD").Trim();
+        }
+
+        // Rule 2, absolute while nobody has handed anything back.
+        var rewritten = Rewrite(path, "feat: first, resolved onto main");
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "resolver"));
+        Assert.Equal(first, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/resolver").Trim());
+
+        // The human's grant: one rewrite, consumed by the publish it lets through.
+        var granted = new HashSet<string> { "resolver" };
+        var consumed = new List<string>();
+        env.Worktrees.PermitHandedBackRewrite(
+            (_, agent) => granted.Contains(agent),
+            (_, agent) => { granted.Remove(agent); consumed.Add(agent); });
+        Assert.True(env.Worktrees.HasHandedBackRewritePolicy);
+
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.Published,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "resolver"));
+        Assert.Equal(rewritten, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/resolver").Trim());
+        Assert.Equal(new[] { "resolver" }, consumed);
+
+        // Spent: a second rewrite is refused exactly as before the grant.
+        Rewrite(path, "feat: first, rewritten again");
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "resolver"));
+        Assert.Equal(rewritten, AgentTestGit.RunChecked(bare, "rev-parse", "refs/heads/agent/resolver").Trim());
+
+        // And a grant for a DIFFERENT agent does not leak: an ungranted rewrite stays refused.
+        var other = env.Worktrees.CreateAgentWorktree(hash, "bystander");
+        CommitInWorktree(other, "b.txt", "b", "feat: b");
+        Assert.True(env.Worktrees.PublishAgentBranch(hash, "bystander"));
+        Rewrite(other, "feat: b, rewritten");
+        Assert.Equal(Mainguard.Agents.Agents.AgentRefPublishOutcome.RefusedNonFastForward,
+            env.Worktrees.PublishAgentBranchOutcome(hash, "bystander"));
+    }
+
+    /// <summary>
     /// The one deletion taken on a caller's word: an intake'd pull request that closed upstream. Deletes a
     /// branch that carries commits — which every other path now refuses — because those commits live in
     /// the pull request they were fetched from and <c>pr-&lt;n&gt;</c> is a reused id.

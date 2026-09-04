@@ -409,6 +409,20 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// </summary>
     public AgentRefWatcher RefWatcher => _watcher.Value;
 
+    /// <summary>
+    /// Installs the conflict hand-back's one exception to the mediator's fast-forward rule — see
+    /// <see cref="AgentRefMediator.RewritePermitted"/>. The composition root wires it from the
+    /// provisioner's parking store; nothing else may.
+    /// </summary>
+    public void PermitHandedBackRewrite(Func<string, string, bool> permitted, Action<string, string> consumed)
+    {
+        _refs.RewritePermitted = permitted ?? throw new ArgumentNullException(nameof(permitted));
+        _refs.RewriteConsumed = consumed ?? throw new ArgumentNullException(nameof(consumed));
+    }
+
+    /// <summary>True once the hand-back exception is wired — the composition-root test's observable.</summary>
+    public bool HasHandedBackRewritePolicy => _refs.RewritePermitted is not null;
+
     /// <inheritdoc />
     public void WatchAgentRef(string repoHash, string agentId) => RefWatcher.Watch(repoHash, agentId);
 

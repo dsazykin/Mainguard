@@ -1396,7 +1396,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `RebaseConflictParkingStore` the provisioner owns and the gRPC projection reads, and
       `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
       is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
-      event).
+      event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
+      `ClearHandedBack`): "let the agent resolve" sets it, the composition root installs it on the ref
+      mediator as `RewritePermitted`, and the worker's finished rebase — a rewrite of published history —
+      is published exactly once before rule 2 is absolute again).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
