@@ -325,6 +325,10 @@ public sealed class AgentSpawnService
         // waits for the bind instead of latching into echo. Cleared below if no CLI actually binds.
         _binder.MarkBindPending(key);
         string? ipcDir = null;
+        // Hoisted so the rollback below can tear down a jail that DID launch when a later step (the
+        // queue entry, the CLI bind) threw — the old rollback removed the session, endpoint, lock and
+        // held task and left the container running, unowned, for good.
+        SandboxLaunchResult? launch = null;
         try
         {
             if (role == AgentRoles.Coordinator || delegated)
@@ -401,7 +405,7 @@ public sealed class AgentSpawnService
             // AgentSessionStore.MarkState used to swallow. Reported synchronously (not through
             // System.Progress<T>, which hops to the thread pool) so the deltas reach the stream in the
             // order the launcher produced them.
-            var launch = await _launcher.TryLaunchAsync(
+            launch = await _launcher.TryLaunchAsync(
                 repoHandle, session.Id, agentKind, modelApiKey, ipcDir, ct,
                 extraEnv: launchEnv,
                 cliCredentials: launchCredentials,
@@ -482,6 +486,15 @@ public sealed class AgentSpawnService
             // Repo-scoped, so it runs unconditionally: this spawn failed, so THIS session's attaches must
             // stop waiting — and doing so can no longer reach another repo's `pr-7`.
             _binder.ClearBindPending(key); // spawn failed → no bind coming; don't leave attaches waiting
+
+            if (launch is not null)
+            {
+                // The jail launched and then the spawn failed: the ordinary teardown (publish what it
+                // committed, drop the segment, remove the jail and its worktree) is the only thing that
+                // will ever run for it now. Never throws.
+                await _launcher.TeardownAsync(session.RepoHash, session.Id, launch.ContainerId, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
 
             // The coordinator IPC endpoint and the terminal input lock are still keyed by agent id ALONE.
             // Now that two repos can hold one id, tearing them down unconditionally would sever the other

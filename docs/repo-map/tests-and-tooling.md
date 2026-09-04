@@ -2255,6 +2255,9 @@
   the coordinator jail keeps ZERO writable bind mounts. Both directions mutation-checked: never setting
   the field, and setting it unconditionally. A correct mechanism nobody passes the flag to is the MG-12
   shape the role lock already shipped as once),**
+  **`SpawnRollbackTests` (2026-09-04 — a spawn that fails AFTER its jail exists removes that jail: the real
+  launcher over a recording engine and a worktree manager whose ref-watch throws; the leak was every such
+  failure leaving a container running, unowned, for good),**
   **`MirrorFreshnessTests` (2026-09-04 — the mirror-age line: the wire's `mirror_main_refreshed_at` /
   `mirror_main_refresh_error` reach `IMergeQueueService`, absent stays absent, and
   `QueueRailViewModel.MirrorFreshness` words the age and renders a failed refresh as a warning carrying

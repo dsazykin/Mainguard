@@ -308,6 +308,10 @@ public sealed class SandboxAgentLauncher
         {
             TryStageInstructionsFile(worktreePath, adapter, instructions, agentId);
         }
+        // Hoisted out of the try so the rollback can see it: a throw AFTER the container exists (the
+        // ref watch, a post-start probe) used to clean up the worktree and leave the jail running, for
+        // good — one of the ways the engine came to hold a day's worth of jails nobody had stopped.
+        SandboxHandle? handle = null;
         try
         {
             // MG-43: this agent's own package cache on ext4, prepared BEFORE the container exists (its
@@ -350,7 +354,7 @@ public sealed class SandboxAgentLauncher
             var confinement = await TryConfineToGatewayAsync(agentId, modelApiKey, adapter, ct)
                 .ConfigureAwait(false);
             var secrets = BuildSecrets(modelApiKey, adapter, extraEnv, cliCredentials, confinement);
-            var handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
+            handle = await _environment.Sandboxes.SpawnAsync(new SandboxSpawnRequest(
                 RepoHash: repoHandle,
                 AgentId: agentId,
                 WorktreePath: worktreePath,
@@ -449,6 +453,13 @@ public sealed class SandboxAgentLauncher
             _log.LogError(ex,
                 "jail start failed after worktree — cleaning up worktree: repo={Repo} adopt={Adopt}",
                 repoHandle, adoptExistingBranch);
+            if (handle is not null)
+            {
+                // The jail is real and about to be forgotten by everything that could stop it later.
+                try { await _environment.Sandboxes.RemoveAsync(handle.ContainerId, CancellationToken.None).ConfigureAwait(false); }
+                catch (Exception removeEx) { _log.LogWarning(removeEx, "rollback: could not remove jail {Container}", handle.ContainerId); }
+            }
+
             if (withoutRepositoryAccess)
             {
                 // Nothing was created; nothing to remove.

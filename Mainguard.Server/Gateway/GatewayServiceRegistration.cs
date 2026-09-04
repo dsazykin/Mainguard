@@ -338,7 +338,9 @@ public static class GatewayServiceRegistration
             listContainers: BuildContainerLister(),
             expected: sp.GetRequiredService<IExpectedAgentStore>(),
             worktrees: sp.GetRequiredService<IAgentEnvironment>().Worktrees,
-            policy: OrphanPolicy.Adopt));
+            policy: OrphanPolicy.Adopt,
+            // Exited jails are deleted at boot (2026-09-04): unadoptable, and until now never removed.
+            removeContainer: (id, ct) => sp.GetRequiredService<IAgentEnvironment>().Sandboxes.RemoveAsync(id, ct)));
 
         // Boot order: merge-reconcile (RT-D1, FIRST — before admission) → swarm (container) reconcile →
         // P2-09 leader reattach (containers → leaders → PTY reattach; mismatches resolved toward Docker
