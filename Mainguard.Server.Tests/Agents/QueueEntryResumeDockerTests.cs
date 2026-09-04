@@ -353,14 +353,26 @@ public sealed class QueueEntryResumeDockerTests : IAsyncLifetime
             => Merge.CanMergeAsync(
                 new CanMergeRequest { RepoHandle = RepoHandle, AgentId = agentId }, Headers).ResponseAsync;
 
-        public Task<ResumeAgentResponse> ResumeAsync(string agentId)
-            => AgentRpc.ResumeAgentAsync(new ResumeAgentRequest
+        public async Task<ResumeAgentResponse> ResumeAsync(string agentId)
+        {
+            var response = await AgentRpc.ResumeAgentAsync(new ResumeAgentRequest
             {
                 RepoHandle = RepoHandle,
                 AgentId = agentId,
                 AgentKind = "worker",
                 ModelApiKey = "sk-test-not-a-real-key",
             }, Headers).ResponseAsync;
+
+            // The RESUMED jail is a second container for this agent, and it was never recorded for the
+            // class cleanup — twenty of them were found running on the engine after a day of runs, and a
+            // suite whose jails accumulate is the load that made this very class flake (§12.5, §27.3).
+            if (ContainerFor(agentId) is { Length: > 0 } resumed && !_owner._containers.Contains(resumed))
+            {
+                _owner._containers.Add(resumed);
+            }
+
+            return response;
+        }
 
         public async Task<QueueUpdate> SnapshotAsync()
         {

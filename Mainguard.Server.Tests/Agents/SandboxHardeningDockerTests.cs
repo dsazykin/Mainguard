@@ -88,6 +88,48 @@ public class SandboxHardeningDockerTests
     /// behind by a pre-change run, and passed once it was gone. This test recreates that container
     /// deliberately so the next person does not have to discover it by accident.</para>
     /// </summary>
+    /// <summary>
+    /// The resume Docker flake, root-caused (phase-3 decisions §27.3). A bind mount binds the source inode
+    /// at container create; a worktree deleted and re-created at the same path leaves a reused container's
+    /// <c>/workspace</c> dangling, and its first exec dies on runc's chdir. The engine must recreate such a
+    /// jail, not reuse it — and the control at the top proves the recreate is attributable to the
+    /// re-created worktree and not to a spawn that never reuses anything.
+    /// </summary>
+    [RequiresDockerFact]
+    public async Task JailWhoseWorktreeWasRecreated_IsRecreated_NotReused()
+    {
+        await using var fx = new SandboxFixture();
+        var worktree = Path.Combine(Fixtures.CanonicalTemp.Root, "mainguard-sbx-wt-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(worktree);
+        try
+        {
+            var first = await fx.SpawnAsync(agentId: "recreated-wt", worktreePath: worktree);
+            var reused = await fx.SpawnAsync(agentId: "recreated-wt", worktreePath: worktree);
+            Assert.True(reused.Reused);
+            Assert.Equal(first.ContainerId, reused.ContainerId);
+
+            // The teardown-then-resume shape: gone, then back at the same path as a new directory.
+            Directory.Delete(worktree, recursive: true);
+            await Task.Delay(TimeSpan.FromSeconds(3)); // the new birth time must sit past the create's tolerance
+            Directory.CreateDirectory(worktree);
+            File.WriteAllText(Path.Combine(worktree, "after.txt"), "after");
+
+            var after = await fx.SpawnAsync(agentId: "recreated-wt", worktreePath: worktree);
+            Assert.False(after.Reused);
+            Assert.NotEqual(first.ContainerId, after.ContainerId);
+
+            // …and the replacement really sees the re-created worktree, which is the thing a reused jail
+            // could not: its exec would have died on the chdir this test's name is about.
+            var ls = await fx.Engine.ExecAsync(after.ContainerId, new[] { "ls", "/workspace" });
+            Assert.Equal(0, ls.ExitCode);
+            Assert.Contains("after.txt", ls.Stdout);
+        }
+        finally
+        {
+            try { Directory.Delete(worktree, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
     [RequiresDockerFact]
     public async Task JailWithTheOldFlatSecretsTmpfs_IsRecreated_NotReused()
     {

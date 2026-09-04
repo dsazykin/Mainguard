@@ -4438,6 +4438,22 @@ owner decided every design question on 2026-09-03; the fixes landed as narrow co
   first `StopAgent` force-removes the old container and deletes its worktree, and under load a slow
   removal could still be in flight when the resume creates the new worktree at the same path. Owner
   decision: stop here, keep it documented; CI keeps running the tier.
+  **Then it reproduced, on the fourth run, with its real error** — the resumed jail's secret-file exec:
+  *"OCI runtime exec failed: … chdir to cwd ("/workspace") set in config.json failed: no such file or
+  directory"*. Root cause, in `DockerSandboxEngine.SpawnAsync`: an existing container of the same name is
+  **reused** when its image, mounts, network and secret layout match — and the mount check compares
+  destinations only. A bind mount binds the source **inode** at create time, so a worktree deleted (by the
+  teardown) and re-created at the same path (by the resume's adopt) leaves the reused container's
+  `/workspace` dangling; on virtiofs the first exec dies on runc's chdir, and on a native ext4 substrate
+  it would silently run in a detached ghost directory instead. It is ordering-dependent because the old
+  container is only still listed when its force-remove lagged. Fixed: the reuse check asks
+  `WorkspaceMountAliveAsync` — the worktree's birth time against the container's creation time (only when
+  the container's `/workspace` is bound to that very path), and the jail's own `test -d /workspace` run
+  from `/` — and recreates on either refusal. A FRESH container gets the same probe once after start, with
+  one rebuild before giving up, because a guest that caches the host's directory entries can bind the stale
+  inode even on a brand-new create. `JailWhoseWorktreeWasRecreated_IsRecreated_NotReused` pins the reuse
+  half with the healthy-reuse control first; the fresh-create belt has no deterministic test (nothing can
+  force the guest's cache) and is recorded as such.
 - `VerifiedFreezeTests` raced its own cascade (no requeue delegate, so `NotifyMainMoved`'s FIFO walk
   direct-ran a re-verify against the test's); the rig now records requeues, as the trigger rig does.
 

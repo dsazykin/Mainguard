@@ -81,11 +81,12 @@ public sealed class SandboxFixture : IAsyncDisposable
         string? toolchainsRootPath = null,
         string? bareRepoPath = null,
         string? ipcDirPath = null,
-        string? ipcOutboxPath = null)
+        string? ipcOutboxPath = null,
+        string? worktreePath = null)
         => SpawnFromImageAsync(
             ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct,
             cliCredentials, cliSettings, jailWritableWorktree, toolchainsRootPath, bareRepoPath,
-            ipcDirPath, ipcOutboxPath);
+            ipcDirPath, ipcOutboxPath, worktreePath);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -102,14 +103,17 @@ public sealed class SandboxFixture : IAsyncDisposable
         string? toolchainsRootPath = null,
         string? bareRepoPath = null,
         string? ipcDirPath = null,
-        string? ipcOutboxPath = null)
+        string? ipcOutboxPath = null,
+        string? worktreePath = null)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
         // found` failure was pure test-ordering, not a product bug.
         await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
 
-        var worktree = jailWritableWorktree ? NewJailWritableTempWorktree() : NewTempWorktree();
+        // A caller-supplied path is the reuse shape under test (the same worktree across spawns, or one
+        // deleted and re-created between them); the default is a fresh temp worktree per spawn.
+        var worktree = worktreePath ?? (jailWritableWorktree ? NewJailWritableTempWorktree() : NewTempWorktree());
         var secrets = new SandboxSecrets(
             agentEnv ?? new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
             OobKey: oobKey ?? RandomKey(),
