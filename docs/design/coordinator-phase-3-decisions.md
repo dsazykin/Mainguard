@@ -4430,5 +4430,13 @@ owner decided every design question on 2026-09-03; the fixes landed as narrow co
 - ~~The launcher's teardown routing on a refused publish~~ — pinned on 2026-09-04 by
   `TeardownAfterRefusedPublishTests` (a recording worktree manager; each publish outcome routes to exactly
   one of the two removals).
+- **The resume Docker flake** (`QueueEntryResumeDockerTests.ACleanStopAfterACommit…`, §12.5/§22.6): chased
+  on 2026-09-04 with three full instrumented `RequiresDocker` runs (per-test output, ~400 executions) and it
+  did not reproduce once; the network reachability probe fired once instead. Its one occurrence in this
+  pass was during the first integrated run while three other worktrees were building on the same machine,
+  which matches the documented load dependence. The only hypothesis the code offers is unverified: the
+  first `StopAgent` force-removes the old container and deletes its worktree, and under load a slow
+  removal could still be in flight when the resume creates the new worktree at the same path. Owner
+  decision: stop here, keep it documented; CI keeps running the tier.
 - `VerifiedFreezeTests` raced its own cascade (no requeue delegate, so `NotifyMainMoved`'s FIFO walk
   direct-ran a re-verify against the test's); the rig now records requeues, as the trigger rig does.
