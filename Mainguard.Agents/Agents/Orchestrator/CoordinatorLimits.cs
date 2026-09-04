@@ -60,6 +60,18 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// existed until one of those moments happened, with nothing on any surface saying so. One local fetch
 /// per repo per minute is cheap; the value is what makes the rail's "refreshed N min ago" a bound.
 /// </param>
+/// <param name="JailReapSweepSeconds">
+/// How often <c>JailReaperHostedService</c> walks every live session and asks <c>JailReapPolicy</c>
+/// whether its jail should still exist (owner decision 2026-09-04). A jail whose merge-queue entry is
+/// terminal, or that has had no CLI bound to it for <see cref="IdleJailReapMinutes"/>, is stopped through
+/// the ordinary Stop path — harvest, publish, teardown — so nothing it committed is lost.
+/// </param>
+/// <param name="IdleJailReapMinutes">
+/// How long a jail may sit with no CLI bound to it (an orphan adopted after a restart whose PTY was not
+/// re-attached, a CLI that exited, a spawn whose bind never came) before the reaper stops it. Thirty
+/// minutes is long past any startup, and short enough that a laptop does not carry a day's worth of
+/// idle 2 GiB jails.
+/// </param>
 /// <param name="MaxLiveCoordinators">
 /// How many coordinators may be live on one daemon at once. <b>One</b> (owner decision, 2026-09-03): the
 /// plan gate, the operator's approval cards and the coordinator surface are all built around a single
@@ -74,7 +86,9 @@ public sealed record CoordinatorLimits(
     int AutoVerifyQuietSeconds = 90,
     int AutoVerifyCooldownSeconds = 600,
     int MaxLiveCoordinators = 1,
-    int MirrorRefreshSeconds = 60)
+    int MirrorRefreshSeconds = 60,
+    int JailReapSweepSeconds = 60,
+    int IdleJailReapMinutes = 30)
 {
     /// <summary><see cref="AutoVerifyQuietSeconds"/> as a <see cref="System.TimeSpan"/>.</summary>
     public System.TimeSpan AutoVerifyQuietPeriod => System.TimeSpan.FromSeconds(AutoVerifyQuietSeconds);

@@ -289,6 +289,12 @@
     `MergeQueueProvisioner.RefreshMainFromCheckout` for each live queue, so a pull made on main outside
     Mainguard reaches the queue without a repo-open and the rail's "refreshed N min ago" is a bound.
     `SweepOnce()` is public for the wiring test; the on-demand `RefreshMirrorMain` RPC is the same call.
+  - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
+    `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
+    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, and how long it
+    has not, and stops what the policy names through the ordinary `AgentSpawnService.StopAsync` (harvest,
+    publish, teardown — nothing committed is lost). Audits `jail_reaped`. `SweepOnceAsync(now)` is public
+    and caller-clocked so the daemon-tier test drives the idle allowance without waiting it out.
   - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
     `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
     session store's pause axis (`AgentSessionStore.MarkFrozen`/`FrozenReason`), which the merge queue's

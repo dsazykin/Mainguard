@@ -1844,6 +1844,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       triple; **unknown top-level fields are rejected** (forward-compat honesty) + oversized guards; the
       fields combine into the ONE canonical `Mainguard.Agents.Agents.TaskPlan` the whole stack shares —
       there is deliberately no second `TaskPlan` type).
+    - `JailReapPolicy.cs` (2026-09-04, owner decision — the pure rule behind the daemon's jail reaper:
+      a jail is stopped when its merge-queue entry is terminal (Merged/Rejected/Discarded — the work has
+      left it) or when no CLI has been bound to it for `CoordinatorLimits.IdleJailReapMinutes`; a jail
+      with a live CLI is never touched, whatever it is doing. `JailReapVerdict` carries the cause the
+      audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
+      idle 2 GiB jails an owner measured.)
     - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
       approval** — it is a resource cap and a blocked worker still holds its jail/tmpfs/network

@@ -485,6 +485,10 @@ public static class GatewayServiceRegistration
         // forward from the checkout on an interval, so the rail's "refreshed N min ago" is a bound and a
         // pull made outside Mainguard reaches the queue without waiting for the next repo-open.
         services.AddHostedService<Runtime.MirrorMainRefreshHostedService>();
+        // The jail reaper (owner decision 2026-09-04): a jail whose entry is terminal, or that has had no
+        // CLI bound to it for the idle allowance, is stopped through the ordinary Stop path. Before this,
+        // only a human pressing Stop ever removed a jail.
+        services.AddHostedService<Runtime.JailReaperHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();

@@ -1613,7 +1613,9 @@
   (refill-never-exceeds-capacity / grants-≤-refill / estimate-actual conservation / FIFO fairness on a
   virtual clock), `BackoffTests` (Retry-After-as-floor exponential), `BudgetLedgerTests` (caps +
   typed-pause-not-kill + `budget_exceeded` audit + snapshot + price table), `AdmissionControllerTests`
-  (86% → reject with honest reason, cache TTL), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
+  (86% → reject with honest reason, cache TTL), `JailReapPolicyTests` (2026-09-04 — terminal entries reap
+  even with a live CLI; a live CLI is otherwise never reaped; no CLI is kept until the allowance and reaped
+  at it), `SwarmReconcilerTests` (dead-prune/orphan-adopt/stop +
   Docker-as-truth + RT-D1 ordering + `BootStep_RecordsWhatItPruned_RatherThanDiscardingTheReport`, since
   a boot pass that destroys agents must leave an audit entry and a log line naming them, and its
   counterpart that a pass changing nothing logs but does not audit), and the shared `GatewayTestDoubles` (`FakeAgentSupervisor`).
@@ -2258,6 +2260,10 @@
   **`SpawnRollbackTests` (2026-09-04 — a spawn that fails AFTER its jail exists removes that jail: the real
   launcher over a recording engine and a worktree manager whose ref-watch throws; the leak was every such
   failure leaving a container running, unowned, for good),**
+  **`JailReaperTests` (2026-09-04 — the reaper over the real composition root: a jail whose fake CLI is
+  bound survives a day of sweeps; once the CLI is released the allowance runs and at 29 min it is kept, at
+  31 min the session is gone, the engine was asked to remove the container, and `jail_reaped` is audited
+  with the cause. The policy's own table lives in `Mainguard.Tests/JailReapPolicyTests`),**
   **`MirrorFreshnessTests` (2026-09-04 — the mirror-age line: the wire's `mirror_main_refreshed_at` /
   `mirror_main_refresh_error` reach `IMergeQueueService`, absent stays absent, and
   `QueueRailViewModel.MirrorFreshness` words the age and renders a failed refresh as a warning carrying
