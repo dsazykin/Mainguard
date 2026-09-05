@@ -389,7 +389,7 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // Run the REAL shim the daemon wrote, exactly as a coordinator CLI would (socket path
         // overridden to the host-side dir — inside a jail the fixed mount path is the default).
-        var psi = new System.Diagnostics.ProcessStartInfo("python3", $"\"{shim}\" spawn claude-code do the thing")
+        var psi = new System.Diagnostics.ProcessStartInfo("python3", $"\"{shim}\" spawn claude-code --title \"Do the thing\" --task \"do the thing\"")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,

@@ -376,6 +376,7 @@ public class VerifiedFreezeTests
         // mirror ref without the sweep announcing it — nothing calls NotifyBranchAdvanced.
         rig.Queue.NotifyMainMoved("main1");
         Assert.Equal(WorkerMergeState.StaleVerified, rig.Queue.GetState("w-1"));
+        await rig.Queue.LastCascade; // the requeue is dispatched, not called — drain it before reading the record
         Assert.Equal(new[] { "w-1" }, rig.Requeues); // the cascade asked; this test plays its re-verify
         rig.Tip["w-1"] = "tip-a-rebased";
 

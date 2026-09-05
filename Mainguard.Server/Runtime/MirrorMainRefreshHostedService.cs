@@ -84,7 +84,17 @@ public sealed class MirrorMainRefreshHostedService : IHostedService, IDisposable
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
-        _stop.Cancel();
+        // Idempotent, and safe after Dispose: a WebApplicationFactory parent disposes its derived hosts
+        // again, so StopAsync can arrive after Dispose — a throw here fails every test in that host.
+        try
+        {
+            _stop.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
         if (_loop is not null)
         {
             try
@@ -97,5 +107,13 @@ public sealed class MirrorMainRefreshHostedService : IHostedService, IDisposable
         }
     }
 
-    public void Dispose() => _stop.Dispose();
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+        {
+            _stop.Dispose();
+        }
+    }
+
+    private int _disposed;
 }

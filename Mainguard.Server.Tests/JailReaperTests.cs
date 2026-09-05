@@ -52,13 +52,18 @@ public sealed class JailReaperTests : IDisposable
         Assert.False(string.IsNullOrEmpty(session?.ContainerId), "the fake substrate must produce a jail");
 
         var t0 = new DateTimeOffset(2026, 9, 4, 12, 0, 0, TimeSpan.Zero);
-        // The fixture binds a fake CLI to every spawn; while it is bound the jail is untouchable, however
-        // long the clock runs — that is the rule that keeps a working agent's conversation alive.
-        Assert.Empty(await Reaper.SweepOnceAsync(t0.AddDays(1)));
-        Assert.NotNull(store.Find(new AgentSessionKey(Repo, agentId)));
+        var terminals = _host.Services.GetRequiredService<TerminalSessionManager>();
+        if (terminals.TryGetBound(new AgentSessionKey(Repo, agentId)) is not null)
+        {
+            // Where the fixture manages to bind a fake CLI (a PTY is available), the jail is untouchable
+            // while it is bound, however long the clock runs — the rule that keeps a working agent's
+            // conversation alive. A bound sweep seeds no idle clock, so the timeline below is unaffected.
+            Assert.Empty(await Reaper.SweepOnceAsync(t0.AddDays(1)));
+            Assert.NotNull(store.Find(new AgentSessionKey(Repo, agentId)));
+        }
 
-        // The CLI exits: the binder's exit watcher releases the bound session. From here the allowance runs.
-        _host.Services.GetRequiredService<TerminalSessionManager>().Release(new AgentSessionKey(Repo, agentId));
+        // The CLI is gone (exited, or never bound on this platform): from the first sighting the allowance runs.
+        terminals.Release(new AgentSessionKey(Repo, agentId));
         Assert.Empty(await Reaper.SweepOnceAsync(t0));                     // first sighting: the clock starts
         Assert.Empty(await Reaper.SweepOnceAsync(t0.AddMinutes(29)));      // inside the allowance: kept
         Assert.NotNull(store.Find(new AgentSessionKey(Repo, agentId)));

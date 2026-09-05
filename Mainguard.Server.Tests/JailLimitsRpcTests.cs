@@ -43,8 +43,11 @@ public sealed class JailLimitsRpcTests : IDisposable
     [Fact]
     public async Task Set_IsClampedAndPersisted_GetAgrees_AndTheNextSpawnIsCreatedWithIt()
     {
-        var client = new AgentService.AgentServiceClient(_daemon.CreateChannel());
-        var headers = _daemon.AuthHeaders();
+        // The derived host's own channel: each host carries its own limits store, and the spawn below
+        // runs in THIS host, so the Set must land here too.
+        var client = new AgentService.AgentServiceClient(Grpc.Net.Client.GrpcChannel.ForAddress(
+            _host.Server.BaseAddress, new Grpc.Net.Client.GrpcChannelOptions { HttpHandler = _host.Server.CreateHandler() }));
+        var headers = _daemon.AuthHeaders(_host.Services.GetRequiredService<Mainguard.Server.Auth.SessionTokenFile>().Token);
 
         var before = await client.GetJailLimitsAsync(new GetJailLimitsRequest(), headers);
         Assert.True(before.IsDefault);
@@ -66,11 +69,8 @@ public sealed class JailLimitsRpcTests : IDisposable
         Assert.Equal(1 * GiB, request.Limits.MemoryBytes);
         Assert.Equal(JailLimitsSettings.MinCpus, request.Limits.Cpus);
         Assert.Equal(SandboxLimits.Default.Pids, request.Limits.Pids);
-
-        // Persisted beside the session token, where DataRootIsolationTests keeps every daemon store.
-        Assert.True(File.Exists(Path.Combine(
-            Path.GetDirectoryName(_daemon.Services.GetRequiredService<Mainguard.Server.Auth.SessionTokenFile>().Path)!,
-            "mainguard-jail-limits.json")));
+        // (The fixture gives each host an in-memory store; the file's placement beside the session token is
+        // DataRootIsolationTests' business, and its persistence JailLimitsSettingsTests'.)
     }
 
     [Fact]

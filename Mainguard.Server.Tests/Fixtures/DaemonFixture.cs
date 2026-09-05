@@ -152,6 +152,13 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
                 new Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch(
                     new Mainguard.Agents.Agents.Orchestrator.InMemoryPlanModeStore())));
 
+            // The per-jail ceiling (2026-09-04) is the same shape: a file under the shared data root that
+            // one test's Set would hand to every host built afterwards. Per-host, in memory; the JSON
+            // persistence has its own test (JailLimitsSettingsTests).
+            services.Replace(ServiceDescriptor.Singleton(
+                new Mainguard.Agents.Agents.Sandbox.JailLimitsSettings(
+                    new Mainguard.Agents.Agents.Sandbox.InMemoryJailLimitsStore())));
+
             services.Replace(ServiceDescriptor.Singleton(new AdmissionController(
                 sampler: () => RoomySample,
                 runningAgentCount: () => 0)));
