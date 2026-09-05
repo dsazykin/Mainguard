@@ -53,6 +53,14 @@ public sealed class RoleInterceptor : Interceptor
         // never re-verifies), and one that could unpause could break the cascade's critical section.
         "/mainguard.v1.AgentService/PauseAgent",
         "/mainguard.v1.AgentService/UnpauseAgent",
+        // The two parked-conflict actions, on exactly the boundary the line above draws. Handing a
+        // conflict back UNPAUSES a co-tenant's jail and then types into its CLI — UnpauseAgent plus the
+        // terminal input lock's whole purpose, in one call; aborting a parked rebase rewrites a co-tenant
+        // branch's parentage and resumes its jail. Both are merge-adjacent power over work an agent
+        // competes with, and neither is anything an agent needs: a worker resolving its OWN conflict does
+        // it with the git already in its own worktree.
+        "/mainguard.v1.MergeQueueService/ResolveConflictWithAgent",
+        "/mainguard.v1.MergeQueueService/AbortRebase",
         // P2-15: the audit chain carries other agents' prompts/outputs and every plan/merge
         // decision. A coordinator that could read it would hold a transcript of work it competes
         // with (and of the human's decisions about it); verify is read power's sibling here.
@@ -62,6 +70,12 @@ public sealed class RoleInterceptor : Interceptor
         // a re-verification starts from. A coordinator that could reset its own branch's verification state
         // would be steering the merge conversation it is denied every other leg of.
         "/mainguard.v1.MergeQueueService/ClearStalledVerification",
+        // Refreshing the mirror's main can fire the stale cascade at every co-tenant; that is the merge
+        // conversation's own lever, and an agent does not get to pull it (2026-09-04).
+        "/mainguard.v1.MergeQueueService/RefreshMirrorMain",
+        // The per-jail ceiling is the operator's lever over the machine's memory. A coordinator that could
+        // raise it would size its own workers' jails (2026-09-04); reading it is harmless.
+        "/mainguard.v1.AgentService/SetJailLimits",
         // Resuming a stranded entry ADOPTS an existing agent id: it attaches a fresh, writable jail to
         // somebody else's `agent/<id>` branch and puts that branch back in front of the daemon's
         // verification. That is strictly more power than the merge RPCs above — an agent able to invoke it
@@ -88,6 +102,15 @@ public sealed class RoleInterceptor : Interceptor
         "/mainguard.v1.AgentService/ResumeAgent",
         "/mainguard.v1.PlanApprovalService/ApprovePlan",
         "/mainguard.v1.PlanApprovalService/RejectPlan",
+        // Sending an escalated worker back for a fresh plan is a plan decision — the one act that reopens
+        // an escalation. Same boundary as the two above.
+        "/mainguard.v1.PlanApprovalService/RequestNewPlan",
+        // The plan-mode toggle, on exactly the boundary above and for a strictly stronger reason. A
+        // coordinator that could approve one plan would hold the gate for one worker; a coordinator that
+        // could turn plan mode OFF removes the gate for every worker it spawns from then on, without a
+        // human seeing a card at all. Contract §4's "plan approval" denial is about holding the gate it
+        // is denied at, and this is the wholesale form of it.
+        "/mainguard.v1.PlanApprovalService/SetPlanMode",
         // MG-30: GetScrollback serves any agent's daemon-side scrollback ring (up to 1000 rows per
         // page) with no ownership scoping — a coordinator could read a worker's whole session, which
         // is exactly the read the coordinator surface is not supposed to have. The operator token
@@ -96,6 +119,17 @@ public sealed class RoleInterceptor : Interceptor
         // coordinator token authenticate, so this check is reached instead of being dead code.
         // Per-agent ownership scoping (one connection ↔ its own agents) remains a separate concern.
         "/mainguard.v1.TerminalService/GetScrollback",
+        // Phase 3 §6: StreamPlans filters on a CLIENT-ASSERTED coordinator_id, so any caller may name any
+        // coordinator — or omit the field and receive every pending plan on the daemon, across every
+        // repository and every coordinator. That is the read GetScrollback is denied for, arriving by a
+        // different door: plans carry other agents' scope, approach and task prompts, plus the human's
+        // decisions about work this coordinator competes with. The durable fix is a DERIVED caller
+        // identity rather than a trusted field — the same missing-identity root cause as
+        // IssueCoordinatorToken having no production callers — and that is a change to the daemon's
+        // authentication model, not this one. Denying the role closes the coordinator-shaped half now.
+        // It is unreachable today (the in-jail coordinator has no gRPC route), which is precisely the
+        // condition under which a control quietly stops being true (MG-12).
+        "/mainguard.v1.PlanApprovalService/StreamPlans",
     };
 
     private const string AttachMethod = "/mainguard.v1.TerminalService/Attach";

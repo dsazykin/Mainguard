@@ -1,0 +1,441 @@
+using System;
+using System.IO;
+using System.Linq;
+using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Ipc;
+using Xunit;
+
+namespace Mainguard.Tests;
+
+/// <summary>
+/// The instructions a jailed CLI is handed at spawn, held to the surface the daemon actually serves.
+///
+/// <para>Phase 3 §1.2 found the coordinator's boundary text was never delivered. Delivering it creates a
+/// second failure mode immediately: text that describes a surface the daemon no longer has. That is the
+/// MG-12 shape this codebase keeps re-finding — a description outliving the thing it described — and it
+/// is worse than silence here, because a CLI told to run a command that does not exist will burn its
+/// turns discovering that. So the coordinator text is pinned against
+/// <see cref="AgentIpcRequest.CoordinatorOps"/> in both directions.</para>
+/// </summary>
+public class AgentOperatingInstructionsTests : IDisposable
+{
+    /// <summary>Stand-ins for "what this daemon has installed" — deliberately not the shipped ids, so a
+    /// test that passes only because it recognised a real adapter name cannot exist.</summary>
+    private static readonly string[] Kinds = { "alpha-cli", "beta-cli" };
+
+    /// <summary>
+    /// The installed set reaches the text as a <see cref="InstalledAdapterCatalog"/> and never as a bare
+    /// list, which is what defect G2 turned into a structural fix: an optional list argument is one a
+    /// caller can omit, and one caller did — so the file copy of these instructions told a coordinator
+    /// nothing was installed while the launch-flag copy named everything. A catalog over a registry this
+    /// test owns keeps the assertions independent of what the developer happens to have installed.
+    /// </summary>
+    private readonly TempRegistry _registry = new(Kinds);
+
+    private readonly TempRegistry _emptyRegistry = new(Array.Empty<string>());
+
+    public void Dispose()
+    {
+        _registry.Dispose();
+        _emptyRegistry.Dispose();
+        GC.SuppressFinalize(this);
+    }
+
+    private string Coordinator() =>
+        AgentOperatingInstructions.For(AgentIpcEndpointRole.Coordinator, _registry.Catalog);
+
+    private string Worker() =>
+        AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, _registry.Catalog);
+
+    /// <summary>
+    /// Every op the daemon serves a coordinator is named in what the coordinator is told. A tool the
+    /// contract grants but the instructions omit is a capability the agent will never use — the role
+    /// lock's own §7 question ("is the four-tool surface sufficient?") answered accidentally in the
+    /// negative by an editing slip.
+    /// </summary>
+    /// <summary>
+    /// <c>verify</c> proposes (contract §3, 2026-09-03): the op answers when the run is accepted and the
+    /// verdict arrives on <c>status</c>. A coordinator not told this reads a "Verifying" answer as a
+    /// failure and sends verify again — a second run — so the text has to carry the state words it will
+    /// actually see and the instruction not to repeat the call.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldThatVerifyProposes_AndWhereTheVerdictArrives()
+    {
+        foreach (var text in new[] { Coordinator(), AgentOperatingInstructions.For(
+            AgentIpcEndpointRole.Coordinator, _registry.Catalog, Mainguard.Agents.Agents.Orchestrator.WorkerPlanMode.Ungated) })
+        {
+            Assert.Contains("`verify` proposes", text, StringComparison.Ordinal);
+            Assert.Contains("`Verifying`", text, StringComparison.Ordinal);
+            Assert.Contains("`Verified`", text, StringComparison.Ordinal);
+            Assert.Contains("`VerificationFailed`", text, StringComparison.Ordinal);
+            Assert.Contains("do\nnot send `verify` again", text.Replace("\r\n", "\n"), StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void TheCoordinatorIsToldAboutEveryOpTheDaemonServesIt()
+    {
+        var text = Coordinator();
+        foreach (var op in AgentIpcRequest.CoordinatorOps)
+        {
+            Assert.True(
+                text.Contains($" {op} ", StringComparison.Ordinal) || text.Contains($" {op}\n", StringComparison.Ordinal),
+                $"the coordinator is served '{op}' but its instructions never mention it — it will never use "
+                + "a tool it was not told about. See AgentOperatingInstructions.");
+        }
+    }
+
+    /// <summary>
+    /// <b>The contract §3 change of 2026-08-29.</b> The coordinator is taught the spawn form the shim
+    /// actually parses — the same string, not a second spelling of it.
+    ///
+    /// <para>Single-sourcing is the whole mechanism: <c>AgentSpawnShim.SpawnUsage</c> is interpolated
+    /// into the shim's <c>--help</c>, into the shim's refusals, and into this text, so the three places a
+    /// model reads this command cannot disagree. What that leaves for a test is to prove the instructions
+    /// really use it rather than restating it — a copy-pasted line would satisfy a reader and drift on the
+    /// next edit.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsTaughtTheSpawnFormTheShimActuallyParses()
+    {
+        Assert.Contains(AgentSpawnShim.SpawnUsage, Coordinator(), StringComparison.Ordinal);
+        Assert.Contains(AgentSpawnShim.SpawnUsage, AgentSpawnShim.Script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// …and is told what the two arguments MEAN, which is the half that changes behaviour. A coordinator
+    /// that knows the flag but not that `--title` is all the worker gets writes the task into both — the
+    /// defect this change removed, re-created by hand.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldThatTheTitleIsTheBrief_AndTheTaskIsWithheld()
+    {
+        var text = Flatten(Coordinator());
+
+        Assert.Contains("--title", text, StringComparison.Ordinal);
+        Assert.Contains("--task", text, StringComparison.Ordinal);
+        Assert.Contains("withheld", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("must not be the task", text, StringComparison.OrdinalIgnoreCase);
+
+        // The UI consequence: the title is the headline a human decides from, so the text must say so —
+        // otherwise a model optimises the title for itself and the approval card becomes unreadable.
+        Assert.Contains("headline", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// <b>Defect G3 — the quoting advice has to be TRUE.</b> The text used to say <c>--task</c> "needs no
+    /// quotes at all", which is right about the shim's parser and wrong about the world: the coordinator
+    /// reaches its one command through its CLI's Bash tool, so a task describing code
+    /// (<c>rewrite add() …</c>) dies at <c>syntax error near unexpected token '('</c> before the parser
+    /// exists. Two of three first spawns in a stress run failed exactly there, with exit 2 and no daemon
+    /// log line, because nothing ran.
+    ///
+    /// <para>Pinned both ways: the warning must be present, and the sentence that caused it must be gone.
+    /// A negative assertion is worth having here because the failure mode is a well-meant edit restoring
+    /// the shorter, friendlier, false advice.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldAShellReadsItsCommandLine_AndIsNotToldTheTaskNeedsNoQuotes()
+    {
+        var text = Flatten(Coordinator());
+
+        Assert.Contains("read by a shell", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("syntax error near unexpected token", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("needs no quotes", text, StringComparison.OrdinalIgnoreCase);
+
+        // …and the form it is taught quotes the task, so the advice and the usage cannot disagree.
+        Assert.Contains("--task \"", AgentSpawnShim.SpawnUsage, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And nothing else. An instruction naming a command the daemon refuses sends the agent to spend
+    /// turns on a wall, then improvise around it — which is exactly the behaviour the role lock exists
+    /// to remove.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsNotToldAboutAnythingTheDaemonRefuses()
+    {
+        var text = Coordinator();
+        var served = AgentIpcRequest.CoordinatorOps;
+
+        foreach (var workerOnly in new[]
+                 {
+                     AgentIpcRequest.PresentPlanOp,
+                     AgentIpcRequest.RevisePlanOp,
+                     AgentIpcRequest.AwaitDecisionOp,
+                 })
+        {
+            if (served.Contains(workerOnly))
+            {
+                continue; // the contract grew; the positive test above covers it
+            }
+
+            Assert.DoesNotContain($"mainguard-agent {workerOnly}", text, StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>
+    /// <b>The worker half of the same pin, which did not exist.</b> The coordinator text has been held to
+    /// <c>CoordinatorOps</c> in both directions since phase 3 §13.5; the worker text was held to nothing,
+    /// so an op could be added to <c>WorkerOps</c>, served by the daemon, spelled by the shim, and never
+    /// mentioned to the only reader who can run it. A capability an agent is never told about is a
+    /// capability it does not have — which is exactly how the loop ended one rung short of
+    /// <c>commit_work</c>, whose instructions had never mentioned committing.
+    ///
+    /// <para>It goes through <see cref="WorkerPlanShim.Verbs"/> because a worker meets each op twice — as
+    /// the wire op (<c>rescope_plan</c>) and as the verb it types (<c>rescope</c>) — and the instructions
+    /// can only ever teach the second. An op with no verb fails here rather than being skipped, so the map
+    /// cannot be the place the exhaustiveness quietly leaks out of.</para>
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldAboutEveryOpTheDaemonServesIt()
+    {
+        var text = Flatten(Worker());
+        var shim = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        Assert.Equal(
+            AgentIpcRequest.WorkerOps.OrderBy(o => o, StringComparer.Ordinal),
+            WorkerPlanShim.Verbs.Keys.OrderBy(o => o, StringComparer.Ordinal));
+
+        foreach (var op in AgentIpcRequest.WorkerOps)
+        {
+            var verb = WorkerPlanShim.Verbs[op];
+            Assert.True(
+                text.Contains($"{shim} {verb}", StringComparison.Ordinal),
+                $"the worker is served '{op}' but its instructions never show `{shim} {verb}` — it will "
+                + "never use a command it was not told about. See AgentOperatingInstructions.Worker.");
+        }
+    }
+
+    /// <summary>
+    /// The re-scope form the shim actually parses, single-sourced into the instructions the same way
+    /// <see cref="AgentSpawnShim.SpawnUsage"/> is into the coordinator's. Two spellings of one command is
+    /// how they come to disagree, and this one has an id argument that a paraphrase would drop.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsTaughtTheRescopeFormTheShimActuallyParses()
+    {
+        Assert.Contains(WorkerPlanShim.RescopeUsage, Worker(), StringComparison.Ordinal);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, WorkerPlanShim.Script, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// …and what it MEANS, which is the half that changes behaviour. Three facts, each of which a worker
+    /// gets wrong by default:
+    ///
+    /// <list type="bullet">
+    /// <item><c>rescope</c> is not <c>revise</c> — the two verbs are near-homographs and the daemon
+    /// refuses the wrong one, but a model that has read this once does not have to find that out.</item>
+    /// <item>Its existing approval stands while the human decides, so asking costs it nothing. A worker
+    /// that believed asking would stop it would not ask, which is the defect this op removes.</item>
+    /// <item>It should ask even if it has already touched the file. The flagged-change gate puts that file
+    /// in front of a human either way; asking is how the human hears the reason before seeing the diff.</item>
+    /// </list>
+    ///
+    /// <para><b>Defect G3's lesson applies to every line of this.</b> The instructions once told a
+    /// coordinator that <c>--task</c> needed no quotes; it was true of the parser and false of the world,
+    /// and two of three spawns died on it. So each claim below is one the shipped shim and daemon actually
+    /// make — the "approval stands" sentence is <c>WorkerRescopeTests</c>, the refusal wording is the
+    /// daemon's own, and the command is <see cref="WorkerPlanShim.RescopeUsage"/> verbatim.</para>
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldWhatARescopeIs_AndThatAskingCostsItNothing()
+    {
+        var text = Flatten(Worker());
+
+        Assert.Contains("rescope is not revise", text.Replace("`", ""), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("existing approval stands", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("one legal move", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("already touched", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The one sentence a worker cannot be allowed to miss. A worker that starts guessing at work before
+    /// approval is precisely what the plan gate was built to make impossible — and it would be refused,
+    /// so the only thing it can produce is wasted budget and a confusing transcript.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldThatNoTaskExistsUntilItsPlanIsApproved()
+    {
+        // Whitespace-normalised: these assertions are about what the worker is told, not about where the
+        // prose happens to wrap. Matching the raw literal makes a reflow look like a policy change.
+        var text = Flatten(Worker());
+
+        Assert.Contains("do not start work until", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("withholds", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(AgentIpcPaths.PlanShimFileName, text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other sentence a worker cannot be allowed to miss — the one that was missing. In the first
+    /// end-to-end run a worker did the approved work and stopped with an UNCOMMITTED diff; its worktree
+    /// went with the jail, its branch carried no commit, and the readiness trigger — which fires on that
+    /// branch advancing and then going quiet — had nothing to observe. These instructions had never
+    /// mentioned committing at all.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldToCommit_AndThatUncommittedWorkIsLost()
+    {
+        var text = Flatten(Worker());
+
+        // The command, spelled with the shim path this role's jail actually has.
+        Assert.Contains(
+            AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker) + " commit",
+            text, StringComparison.Ordinal);
+
+        // …and WHY, which is the half that makes an agent act on it rather than note it.
+        Assert.Contains("lost", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// <b>Defect G4.</b> The daemon now records a worker's commit message verbatim and REFUSES one it
+    /// cannot record, instead of flattening the newlines out of it and cutting it at 200 characters. A
+    /// rule the worker is not told about is a rule it discovers by having a commit refused, so the shape
+    /// — subject, blank line, body — and the cap are in the text, and so is the quoting.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldTheShapeOfACommitMessage_AndThatABadOneIsRefused()
+    {
+        var text = Flatten(Worker());
+
+        Assert.Contains("blank line", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(
+            Mainguard.Agents.Agents.AgentCommitMessage.MaxSubjectLength.ToString(
+                System.Globalization.CultureInfo.InvariantCulture),
+            text, StringComparison.Ordinal);
+        Assert.Contains("refused", text, StringComparison.OrdinalIgnoreCase);
+
+        // The shell lesson, which is the same one G3 taught the coordinator: an unquoted message has
+        // already lost its blank lines by the time the shim runs.
+        Assert.Contains("ONE argument", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A worker's plan file must not land in the tree its own commit records. That commit is
+    /// <c>git add -A</c> over <c>/workspace</c>, and the shim takes a path — so an unqualified "write the
+    /// plan to a JSON file" puts it in the working directory, which IS the repository.
+    /// </summary>
+    [Fact]
+    public void TheWorkerIsToldToWriteItsPlanOutsideTheRepository()
+    {
+        var shim = AgentIpcPaths.SandboxShimPath(AgentIpcEndpointRole.Worker);
+
+        Assert.Contains("/tmp/plan.json", Flatten(Worker()), StringComparison.Ordinal);
+        Assert.Contains("/tmp/plan.json", Flatten(AgentKickoffPrompt.Worker(shim)), StringComparison.Ordinal);
+    }
+
+    private static string Flatten(string text) =>
+        string.Join(' ', text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    /// <summary>
+    /// Each role is told about its OWN shim and not the other's. The shims are staged per-role for least
+    /// privilege (one endpoint publishes exactly one shim), so naming the wrong one sends the agent to a
+    /// file that is not in its jail.
+    /// </summary>
+    [Fact]
+    public void EachRoleIsPointedAtTheShimItsJailActuallyHas()
+    {
+        Assert.Contains(AgentIpcPaths.SpawnShimFileName, Coordinator(), StringComparison.Ordinal);
+        Assert.DoesNotContain(AgentIpcPaths.PlanShimFileName, Coordinator(), StringComparison.Ordinal);
+
+        Assert.Contains(AgentIpcPaths.PlanShimFileName, Worker(), StringComparison.Ordinal);
+        Assert.DoesNotContain(AgentIpcPaths.SpawnShimFileName, Worker(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The coordinator must be told it has no repository. Phase 3 removed the worktree; an agent that
+    /// does not know that spends its turns looking for code, concludes the jail is broken, and says so
+    /// to the operator.
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldItHasNoRepository()
+    {
+        var text = Coordinator();
+        Assert.Contains("no repository", text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("deliberate", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// <b>Defect D1's other half.</b> A coordinator is told which agent kinds exist. It was not, and its
+    /// natural first move — <c>spawn coder</c>, a plausible reading of <c>spawn &lt;agent-kind&gt;</c> —
+    /// produced a jail with no CLI in it that reported success.
+    ///
+    /// <para>The list is rendered from what the daemon has installed, never written into the prose: a
+    /// hardcoded list stops describing the machine the first time a CLI is added or removed, which is the
+    /// MG-12 shape this file's header is already about.</para>
+    /// </summary>
+    [Fact]
+    public void TheCoordinatorIsToldWhichAgentKindsExist()
+    {
+        var text = Coordinator();
+
+        foreach (var kind in Kinds)
+        {
+            Assert.Contains(kind, text, StringComparison.Ordinal);
+        }
+
+        // And the list is the ONE the caller supplied — not a shipped set that happens to be around.
+        Assert.DoesNotContain("claude-code", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The permissive box states itself rather than rendering an empty list. "One of: " followed by
+    /// nothing reads to an agent as a broken prompt, which is the failure mode this whole file exists to
+    /// avoid; a dev box with no CLIs installed is a real state, and spawns there are deliberately not
+    /// refused.
+    /// </summary>
+    [Fact]
+    public void ACoordinatorOnABoxWithNothingInstalled_IsToldThat_NotAnEmptyList()
+    {
+        var text = AgentOperatingInstructions.For(
+            AgentIpcEndpointRole.Coordinator, _emptyRegistry.Catalog);
+
+        Assert.Contains("none installed", text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>A worker has no <c>spawn</c>, so nothing about what is installed belongs in its text —
+    /// and the catalog must not leak into it by being threaded through one shared renderer.</summary>
+    [Fact]
+    public void TheWorkerTextDoesNotDependOnWhatIsInstalled()
+    {
+        Assert.Equal(
+            Worker(),
+            AgentOperatingInstructions.For(AgentIpcEndpointRole.Worker, _emptyRegistry.Catalog));
+    }
+
+    /// <summary>An unknown role gets the text that cannot start work without a human.</summary>
+    [Fact]
+    public void AnUnknownRoleFallsBackToTheWorkerText()
+        => Assert.Equal(
+            Worker(), AgentOperatingInstructions.For((AgentIpcEndpointRole)999, _registry.Catalog));
+
+    /// <summary>A registry directory holding exactly the adapter markers a test names.</summary>
+    private sealed class TempRegistry : IDisposable
+    {
+        private readonly string _path;
+
+        public TempRegistry(params string[] ids)
+        {
+            _path = Path.Combine(
+                Path.GetTempPath(), "mg-instr-registry-" + Guid.NewGuid().ToString("N")[..8]);
+            Directory.CreateDirectory(_path);
+            foreach (var id in ids)
+            {
+                File.WriteAllText(
+                    Path.Combine(_path, id + ".json"),
+                    InstalledAdapterMarker.Serialize(
+                        new InstalledAdapterMarker(id, "1.0.0", new[] { "/bin/" + id })));
+            }
+
+            Catalog = new InstalledAdapterCatalog(_path);
+        }
+
+        public InstalledAdapterCatalog Catalog { get; }
+
+        public void Dispose()
+        {
+            try { Directory.Delete(_path, recursive: true); } catch { /* best effort */ }
+        }
+    }
+}

@@ -133,6 +133,32 @@ public sealed class DaemonFixture : WebApplicationFactory<Program>
                 services.Replace(ServiceDescriptor.Singleton(new QueueSeedingOptions(Enabled: true)));
             }
 
+            // The plan-mode toggle gets a PER-HOST, in-memory store, for the same class of reason as
+            // the admission sampler above: the tier must not share it, and the shared thing here is on
+            // disk.
+            //
+            // `UseSetting("Daemon:TokenPath")` measurably does not reach `builder.Configuration` during
+            // this factory's ConfigureServices (see EnableQueueSeeding's remarks), so every daemon store
+            // path falls back to MainguardPaths.DataRoot() — which TestDataRootIsolation gives the WHOLE
+            // assembly as one directory. That is already documented for the plan store (phase 2 §3: every
+            // DaemonFixture rehydrates from the same one). For plan mode it would be worse than shared
+            // state: one test turning the human approval gate OFF would turn it off for every host built
+            // afterwards, in parallel, and the tests it broke would be the ones asserting that the gate
+            // holds. Replaced here rather than per test, because the exposure is the tier's.
+            //
+            // A test that wants a specific starting state sets it on this instance; a test that wants to
+            // assert the PERSISTENCE uses JsonPlanModeStore directly (PlanModeToggleTests).
+            services.Replace(ServiceDescriptor.Singleton(
+                new Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch(
+                    new Mainguard.Agents.Agents.Orchestrator.InMemoryPlanModeStore())));
+
+            // The per-jail ceiling (2026-09-04) is the same shape: a file under the shared data root that
+            // one test's Set would hand to every host built afterwards. Per-host, in memory; the JSON
+            // persistence has its own test (JailLimitsSettingsTests).
+            services.Replace(ServiceDescriptor.Singleton(
+                new Mainguard.Agents.Agents.Sandbox.JailLimitsSettings(
+                    new Mainguard.Agents.Agents.Sandbox.InMemoryJailLimitsStore())));
+
             services.Replace(ServiceDescriptor.Singleton(new AdmissionController(
                 sampler: () => RoomySample,
                 runningAgentCount: () => 0)));

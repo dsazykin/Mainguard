@@ -71,10 +71,12 @@ public class MainWindowRailRenderHarness
         Assert.Equal(4, vm.Rows.Count);
         win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), "resource_monitor.png"));
 
-        // The End-task confirmation names the agent and what is kept (C-1/C-2).
-        vm.RequestEnd(vm.Rows[0].AgentId, vm.Rows[0].Name);
+        // The End-task confirmation names the agent and what is kept (C-1/C-2) — and "names the agent"
+        // means the ROW's identity, not the CLI kind every row shares.
+        vm.RequestEnd(vm.Rows[0]);
         Settle();
         Assert.True(vm.IsEndConfirmVisible);
+        Assert.Contains(vm.Rows[0].IdentityLine, vm.EndConfirmTitle, StringComparison.Ordinal);
         win.CaptureRenderedFrame()?.Save(Path.Combine(ArtifactsDir(), "resource_monitor_end_confirm.png"));
         vm.CancelEndCommand.Execute(null);
         HarnessHygiene.Teardown(win);

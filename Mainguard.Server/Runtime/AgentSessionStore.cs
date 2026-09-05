@@ -69,6 +69,15 @@ public sealed class AgentSessionStore
     private readonly Dictionary<AgentSessionKey, AgentSession> _sessions = new();
     private readonly List<Channel<AgentDelta>> _subscribers = new();
     private readonly IAuditLog _audit;
+
+    /// <summary>
+    /// The PAUSE AXIS, kept apart from the state word. The word is written by the merge queue's reflection
+    /// on every transition (<c>MergeQueueProvisioner.MarkMergeState</c>), so a paused or conflicted jail
+    /// read <c>StaleVerified</c>/<c>Working</c> the moment its entry moved and every frozen-jail guard
+    /// keyed on the word waved a delivery into a SIGSTOPped process until the reconciler's next pass. This
+    /// is the fact those guards read; the writers are the paths that actually freeze or thaw a jail.
+    /// </summary>
+    private readonly Dictionary<AgentSessionKey, string> _frozen = new();
     private ulong _seq;
 
     public AgentSessionStore(IAuditLog audit)
@@ -194,6 +203,40 @@ public sealed class AgentSessionStore
         }
     }
 
+    /// <summary>Records — or with <c>null</c>, clears — that this session's jail is frozen. See <c>_frozen</c>.</summary>
+    public void MarkFrozen(AgentSessionKey key, string? reason)
+    {
+        lock (_gate)
+        {
+            if (string.IsNullOrEmpty(reason))
+            {
+                _frozen.Remove(key);
+            }
+            else if (_sessions.ContainsKey(key))
+            {
+                _frozen[key] = reason;
+            }
+        }
+    }
+
+    /// <summary>The id-only form, for the supervisor seam; a no-op when two repos hold the id.</summary>
+    public void MarkFrozen(string agentId, string? reason)
+    {
+        if (FindUnique(agentId) is { } session)
+        {
+            MarkFrozen(session.Key, reason);
+        }
+    }
+
+    /// <summary>Why this session's jail is frozen, or <c>null</c> when nothing has frozen it.</summary>
+    public string? FrozenReason(AgentSessionKey key)
+    {
+        lock (_gate)
+        {
+            return _frozen.TryGetValue(key, out var reason) ? reason : null;
+        }
+    }
+
     /// <summary>Look up a live session by its full identity (daemon-side; carries the container id for
     /// teardown). Null if this repo has no session under that id — including when ANOTHER repo does,
     /// which is exactly the isolation this key exists for.</summary>
@@ -298,6 +341,7 @@ public sealed class AgentSessionStore
         lock (_gate)
         {
             removed = _sessions.Remove(key);
+            _frozen.Remove(key);
         }
 
         if (removed)

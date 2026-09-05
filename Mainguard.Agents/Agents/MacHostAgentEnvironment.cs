@@ -72,7 +72,11 @@ public sealed class MacHostAgentEnvironment : IAgentEnvironment
     /// </summary>
     public SubstrateCapabilities Capabilities { get; } =
         new(SupportsMaxIsolationBackend: false, SupportsWarmPoolPrestart: false,
-            FilesystemTransport: "virtiofs", LifecycleDialect: "docker");
+            FilesystemTransport: "virtiofs", LifecycleDialect: "docker",
+            // The one that cost a whole feature: virtiofs carries files, not sockets. A daemon-bound
+            // Unix socket bind-mounted from this host is inert inside the jail (ECONNREFUSED against a
+            // listening daemon), so the agent-IPC channel uses its file-framed outbox here instead.
+            SupportsBindMountedUnixSockets: false);
 
     public IRepoProvisioner Repos { get; }
 

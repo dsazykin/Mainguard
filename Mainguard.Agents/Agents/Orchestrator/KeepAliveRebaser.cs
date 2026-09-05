@@ -1,6 +1,7 @@
 using System;
 using System.Threading;
 using System.Threading.Tasks;
+using Mainguard.Git.Exceptions;
 
 namespace Mainguard.Agents.Agents.Orchestrator;
 
@@ -72,6 +73,11 @@ public interface IKeepAliveRebaser
 ///   <item><see cref="GitMutationGuard.CanMutate"/> — skip the cycle if the agent is mid its own rebase / detached / mid-merge.</item>
 ///   <item>If the worktree is dirty: <c>git add -A</c> + <c>git commit -m "wip: sync"</c> (guarded against a transient lock).</item>
 ///   <item><c>git rebase &lt;main&gt;</c> onto the already-fetched mirror main.</item>
+///   <item><b>K6/§23.6</b> — both mutations hand <see cref="GitMutationGuard.RunGuarded{T}"/> a re-read of
+///     step 2's verdict, evaluated once the <c>index.lock</c> backoff clears and immediately before the
+///     mutation. Step 2 is a snapshot, the backoff is up to ~1.5 s, and the three states it checks are
+///     exactly the ones an agent enters while a lock is held; a refusal there ends the cycle as
+///     <see cref="RebaseCycleKind.Skipped"/>, the same terminus step 2's own refusal has.</item>
 ///   <item>Conflict → status <see cref="AgentRunState.Conflict"/>, hand the worktree to the T-04 resolver, keep the PTY paused
 ///     (resume-after-resolve is a later hook). <b>No automatic <c>rebase --abort</c></b> (rejection trigger).</item>
 ///   <item>Success → resume the agent.</item>
@@ -186,26 +192,50 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
 
             _setState(agentId, AgentRunState.Rebasing);
 
+            // K6 — the verdict above is a SNAPSHOT, and both mutations below wait out an index.lock
+            // backoff before they run. Handing the guard a re-read of the same three preconditions is what
+            // makes the decision hold at the moment of action rather than at the moment of decision; the
+            // refusal comes back typed and this cycle skips, exactly as the start-of-cycle refusal does.
+            Func<MutationVerdict> recheck =
+                () => GitMutationGuard.CanMutate(GitMutationGuard.Inspect(loc.WorktreePath));
+
             var wip = false;
-            if (IsDirty(loc.WorktreePath))
+            int rebaseExit;
+            string headBefore;
+            try
             {
-                GitMutationGuard.RunGuarded(
+                if (IsDirty(loc.WorktreePath))
+                {
+                    GitMutationGuard.RunGuarded(
+                        token,
+                        () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
+                        () =>
+                        {
+                            AgentGitCommand.Run(loc.WorktreePath, "add", "-A");
+                            AgentGitCommand.Run(loc.WorktreePath, Args("commit", "-m", "wip: sync"));
+                            return 0;
+                        },
+                        recheck: recheck);
+                    wip = true;
+                }
+
+                headBefore = HeadSha(loc.WorktreePath);
+                rebaseExit = GitMutationGuard.RunGuarded(
                     token,
                     () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
-                    () =>
-                    {
-                        AgentGitCommand.Run(loc.WorktreePath, "add", "-A");
-                        AgentGitCommand.Run(loc.WorktreePath, Args("commit", "-m", "wip: sync"));
-                        return 0;
-                    });
-                wip = true;
+                    () => AgentGitCommand.TryRun(loc.WorktreePath, out _, Args("rebase", loc.MainBranch)),
+                    recheck: recheck);
             }
-
-            var headBefore = HeadSha(loc.WorktreePath);
-            var rebaseExit = GitMutationGuard.RunGuarded(
-                token,
-                () => GitMutationGuard.IsIndexLockHeld(loc.WorktreePath),
-                () => AgentGitCommand.TryRun(loc.WorktreePath, out _, Args("rebase", loc.MainBranch)));
+            catch (GitMutationStateChangedException ex)
+            {
+                // The agent started its own rebase (or detached, or opened a merge) while we waited for
+                // its index.lock. Nothing was mutated. Same terminus as the start-of-cycle guard skip:
+                // resume the agent and let the next cycle retry, with the measured reason rather than a
+                // restatement of it. WipCommitCreated is reported honestly — the wip commit may already
+                // have landed before the rebase leg refused.
+                _setState(agentId, AgentRunState.Working);
+                return new RebaseCycleResult(RebaseCycleKind.Skipped, ex.Message, wip);
+            }
 
             if (rebaseExit != 0)
             {
@@ -246,9 +276,22 @@ public sealed class KeepAliveRebaser : IKeepAliveRebaser
             // concurrent, and last-writer-wins could leave a killed jail running. Re-reading the gate here
             // makes the kill win by construction; the token is deliberately left un-resumed (the jail stays
             // paused, the state stays Paused) until the operator resumes the kill switch.
+            //
+            // ...and on BOTH of those paths the token is still SETTLED, which is the half that was missing.
+            // Leaving it un-settled leaked the arbiter's machine hold, and `AgentPauseService.UnpauseAsync`
+            // refuses while one is outstanding — with "the daemon is briefly holding this agent for a queue
+            // update — try again in a moment", a sentence whose entire promise is that it self-clears. So
+            // the HUMAN's unpause button was refused indefinitely on exactly the agents that need a human,
+            // and the two conflict controls beside it bypass the ledger (they drive the sandbox engine
+            // directly), which made the leak invisible to the paths most likely to be exercised. The jail
+            // staying frozen is deliberate; the machine's claim to OWN that pause is not.
             if (!conflicted && !_killGate.IsFrozen)
             {
                 token.Resume();
+            }
+            else
+            {
+                token.ReleaseWithoutResuming();
             }
         }
     }

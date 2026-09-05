@@ -263,6 +263,23 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         return new Mainguard.Agents.Agents.Bootstrap.DaemonVersionInfo(response.DaemonVersion, response.PayloadVersion);
     }
 
+    /// <summary>The per-jail memory/CPU ceiling the next spawn is created with (2026-09-04).</summary>
+    public async Task<JailLimits> GetJailLimitsAsync(CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.GetJailLimitsAsync(new GetJailLimitsRequest(), CallOptions(ct, deadline));
+    }
+
+    /// <summary>Sets the ceiling. Returns it AS PERSISTED — the daemon clamps to the band the response
+    /// carries — so a caller renders what the next jail will get, not what was typed.</summary>
+    public async Task<JailLimits> SetJailLimitsAsync(
+        long memoryBytes, double cpus, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new AgentService.AgentServiceClient(Channel());
+        return await client.SetJailLimitsAsync(
+            new SetJailLimitsRequest { MemoryBytes = memoryBytes, Cpus = cpus }, CallOptions(ct, deadline));
+    }
+
     /// <summary>The agent CLIs installed in the VM the daemon can launch (ids/versions/env-var
     /// names only — never key values). What the "Start coordinator" picker lists.</summary>
     public async Task<IReadOnlyList<InstalledAdapterInfo>> ListInstalledAdaptersAsync(
@@ -543,6 +560,15 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
             new CanMergeRequest { RepoHandle = repoHandle, AgentId = agentId }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Pulls the daemon-side mirror's main forward from the checkout now (2026-09-04).</summary>
+    public async Task<MirrorMainState> RefreshMirrorMainAsync(
+        string repoHandle, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.RefreshMirrorMainAsync(
+            new RefreshMirrorMainRequest { RepoHandle = repoHandle }, CallOptions(ct, deadline));
+    }
+
     /// <summary>RT-D1 step 1: take the per-repo merge lease before the human foreground merge.</summary>
     public async Task<BeginMergeResponse> BeginMergeAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
@@ -636,6 +662,28 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         }, CallOptions(ct, deadline));
     }
 
+    /// <summary>Unpauses a jail parked mid-rebase and asks the worker to finish resolving its own
+    /// conflict. The instruction is composed daemon-side — the request has no prompt field for a client to
+    /// fill, by construction.</summary>
+    public async Task<ResolveConflictWithAgentResponse> ResolveConflictWithAgentAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.ResolveConflictWithAgentAsync(
+            new ResolveConflictWithAgentRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
+    /// <summary><c>git rebase --abort</c> in the parked worktree, then the jail runs again.</summary>
+    public async Task<AbortRebaseResponse> AbortRebaseAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.AbortRebaseAsync(
+            new AbortRebaseRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
     /// <summary>Clears a <c>Verifying</c> entry with no run behind it, returning it to <c>Working</c>.</summary>
     public async Task<ClearStalledVerificationResponse> ClearStalledVerificationAsync(
         string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
@@ -643,6 +691,20 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         var client = new MergeQueueService.MergeQueueServiceClient(Channel());
         return await client.ClearStalledVerificationAsync(
             new ClearStalledVerificationRequest { RepoHandle = repoHandle, AgentId = agentId },
+            CallOptions(ct, deadline));
+    }
+
+    /// <summary>
+    /// H4: the CONTENT of the entry's last verification artifact — never its daemon path (G-14). The
+    /// daemon bounds it to a tail and says so via <c>Truncated</c>; this is a plain read that runs
+    /// nothing, so it takes the ordinary RPC deadline rather than <c>RunVerification</c>'s minutes-long one.
+    /// </summary>
+    public async Task<GetVerificationLogResponse> GetVerificationLogAsync(
+        string repoHandle, string agentId, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new MergeQueueService.MergeQueueServiceClient(Channel());
+        return await client.GetVerificationLogAsync(
+            new GetVerificationLogRequest { RepoHandle = repoHandle, AgentId = agentId },
             CallOptions(ct, deadline));
     }
 
@@ -725,6 +787,35 @@ public sealed class DaemonClient : INotifyPropertyChanged, IDisposable
         var response = await client.RejectPlanAsync(
             new RejectPlanRequest { PlanId = planId, Reason = reason ?? string.Empty }, CallOptions(ct, deadline));
         return response.Rejected;
+    }
+
+    /// <summary>Asks an escalated worker for one fresh plan (contract §3.1, 2026-09-03).</summary>
+    public async Task<bool> RequestNewPlanAsync(string planId, string guidance, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        var response = await client.RequestNewPlanAsync(
+            new RequestNewPlanRequest { PlanId = planId, Guidance = guidance ?? string.Empty }, CallOptions(ct, deadline));
+        return response.Requested;
+    }
+
+    /// <summary>
+    /// Sets the operator's plan-mode toggle and returns the state the DAEMON now holds.
+    ///
+    /// <para>The response is read back rather than assumed: it is the daemon's own answer, so a client
+    /// that renders it cannot show a gate the daemon is not applying.</para>
+    /// </summary>
+    public async Task<PlanModeState> SetPlanModeAsync(bool enabled, CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        return await client.SetPlanModeAsync(
+            new SetPlanModeRequest { Enabled = enabled }, CallOptions(ct, deadline));
+    }
+
+    /// <summary>Reads the operator's plan-mode toggle.</summary>
+    public async Task<PlanModeState> GetPlanModeAsync(CancellationToken ct, TimeSpan? deadline = null)
+    {
+        var client = new PlanApprovalService.PlanApprovalServiceClient(Channel());
+        return await client.GetPlanModeAsync(new GetPlanModeRequest(), CallOptions(ct, deadline));
     }
 
     // ---- P2-14 kill switch (P2-47 #3) ----

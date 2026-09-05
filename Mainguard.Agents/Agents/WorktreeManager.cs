@@ -49,8 +49,36 @@ public interface IAgentWorktreeManager
             $"This worktree manager cannot adopt an existing branch, so agent '{agentId}' in repo "
             + $"'{repoHash}' cannot be resumed here.");
 
-    /// <summary>Remove an agent's worktree; <paramref name="force"/> discards a dirty tree, otherwise a dirty tree is refused (typed).</summary>
+    /// <summary>
+    /// Remove an agent's worktree; <paramref name="force"/> discards a dirty tree, otherwise a dirty tree
+    /// is refused (typed).
+    ///
+    /// <para><b>The mirror's <c>agent/&lt;id&gt;</c> goes with it only when deleting it destroys
+    /// nothing</b> — i.e. when the branch tip is already contained in the mirror's integration branch. A
+    /// branch that carries a commit of its own survives the teardown, because this is the documented end
+    /// of a worker's life (commit, report, stop) and the ref is the only name its commits have. The
+    /// difference from <see cref="RemoveAgentWorktreeKeepingBranch"/> is therefore no longer "does it
+    /// delete the branch" but "is it allowed to ask": a teardown may reap what is spent, a resume's
+    /// rollback may not reap at all.</para>
+    /// </summary>
     void RemoveAgentWorktree(string repoHash, string agentId, bool force);
+
+    /// <summary>
+    /// Deletes <c>refs/heads/agent/&lt;id&gt;</c> from the mirror <b>because the thing it represented was
+    /// withdrawn</b> — the external-PR intake's pull request closed upstream or was discarded by a human.
+    /// Returns true when the mirror no longer carries the branch.
+    ///
+    /// <para><b>This is the one deletion taken on a caller's word.</b> <see cref="RemoveAgentWorktree"/>
+    /// proves first that a delete costs nothing; this one is called where the commits provably live
+    /// somewhere else (the pull request they were fetched from) and the entry has already left the queue,
+    /// so keeping the ref would only make the next intake of that same <c>pr-&lt;n&gt;</c> collide with a
+    /// branch nobody is coming back for. It is audited with the sha for that reason.</para>
+    ///
+    /// <para>The default returns false — a manager with no mirror deleted nothing and says so. Not a
+    /// throw: a failure to tidy must never take an intake poll down, and residue here is residue, never
+    /// lost work.</para>
+    /// </summary>
+    bool DiscardAgentBranch(string repoHash, string agentId) => false;
 
     /// <summary>
     /// Clears an agent's worktree + per-agent repository while <b>leaving
@@ -70,6 +98,34 @@ public interface IAgentWorktreeManager
         => throw new System.NotSupportedException(
             $"This worktree manager cannot remove agent '{agentId}''s worktree while preserving its "
             + "branch, and a resume's cleanup must never delete the branch it was resuming.");
+
+    /// <summary>
+    /// The teardown's last publish, with its <b>outcome</b> rather than a bool — so a refusal can be told
+    /// apart from "nothing to publish". The default derives it from <see cref="PublishAgentBranch"/>: true
+    /// is current, false is "the mirror lacks nothing", never a refusal, so a substrate-less manager can
+    /// never keep a repository on a guess.
+    /// </summary>
+    AgentRefPublishOutcome PublishAgentBranchOutcome(string repoHash, string agentId)
+        => PublishAgentBranch(repoHash, agentId)
+            ? AgentRefPublishOutcome.Published
+            : AgentRefPublishOutcome.NothingToPublish;
+
+    /// <summary>
+    /// Clears an agent's worktree while keeping <b>both</b> the mirror's <c>refs/heads/agent/&lt;id&gt;</c>
+    /// and the agent's own repository on disk — the teardown path for an agent whose last publish the
+    /// mediator <b>refused</b>. A refused non-fast-forward publish means the mirror holds the pre-rewrite
+    /// tip and the agent's repository holds the only copy of the rewritten commits; the ordinary teardown
+    /// deleted that repository on the comment's belief that every publish had copied its objects across,
+    /// which is false for exactly the publish that was refused.
+    ///
+    /// <para><b>The default throws</b>, for the reason <see cref="RemoveAgentWorktreeKeepingBranch"/>'s
+    /// does: a manager that cannot preserve the work must say so rather than fall back to the deleting
+    /// removal.</para>
+    /// </summary>
+    void RemoveAgentWorktreeKeepingRepository(string repoHash, string agentId, string reason)
+        => throw new System.NotSupportedException(
+            $"This worktree manager cannot remove agent '{agentId}''s worktree while preserving its "
+            + "repository, and a teardown after a refused publish must never delete the only copy of the work.");
 
     /// <summary>Prune stale worktree metadata.</summary>
     void Prune(string repoHash);
@@ -125,6 +181,75 @@ public interface IAgentWorktreeManager
     AgentBranchAlignment CheckAgentBranch(string repoHash, string agentId)
         => new(AgentBranchAlignmentState.Unknown, AgentRepoLayout.BranchPrefix + agentId,
             Detail: "this worktree manager has no worktree to inspect");
+
+    /// <summary>
+    /// Records everything in an agent's worktree as one commit on <c>agent/&lt;id&gt;</c> — the step that
+    /// makes a worker's work outlive its jail, and the only thing the verification trigger can observe.
+    ///
+    /// <para><b>Why the daemon does this rather than the agent's CLI.</b> Not for want of permission on
+    /// the repository: <see cref="CreateAgentWorktree"/> exists precisely so <c>git commit</c> stays
+    /// available to an agent. It is that the agent supplies a MESSAGE and nothing else — repository,
+    /// worktree and branch are computed here, from the id the endpoint already proves. An agent cannot
+    /// commit onto another branch, into another agent's tree, or with a pathspec of its choosing: the
+    /// same structural argument that makes <see cref="AgentRefMediator"/> safe.</para>
+    ///
+    /// <para><b>The default is a refusal.</b> A manager with no substrate has no worktree to commit, and
+    /// answering "committed" for a commit that did not happen is the failure this codebase keeps paying
+    /// for — the caller would report success to the worker while the branch stayed empty.</para>
+    /// </summary>
+    /// <param name="message">The commit message — subject, blank line, body, exactly as git means it.
+    /// It travels as one argv element through the audited arg-list git primitive, never through a shell,
+    /// so newlines in it are ordinary characters. Judged by <see cref="AgentCommitMessage"/>: a message
+    /// that cannot be recorded is REFUSED, never repaired into something the worker did not write.</param>
+    AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+        => new(AgentWorkCommitOutcome.Unsupported, AgentRepoLayout.BranchPrefix + agentId,
+            Detail: "this worktree manager has no worktree to commit");
+}
+
+/// <summary>What one <see cref="IAgentWorktreeManager.CommitAgentWork"/> did, or why it refused.</summary>
+public enum AgentWorkCommitOutcome
+{
+    /// <summary>A new commit exists on <c>agent/&lt;id&gt;</c>. The ref moved.</summary>
+    Committed,
+
+    /// <summary>The worktree was clean — nothing to record. Not an error, and deliberately distinct from
+    /// <see cref="Committed"/>: the ref did NOT move, so nothing downstream observes anything, and a
+    /// caller that reported this as a commit would be telling a worker its work is safe while the branch
+    /// sits exactly where it was.</summary>
+    NothingToCommit,
+
+    /// <summary>HEAD is not <c>agent/&lt;id&gt;</c> (another branch, or detached). Refused: a commit made
+    /// there is stranded where nothing — the mediator, the queue, the trigger — ever looks.</summary>
+    RefusedBranch,
+
+    /// <summary>There is no worktree for this agent (never created, or already torn down).</summary>
+    NoWorktree,
+
+    /// <summary>The message cannot be recorded as a commit message (G4). Refused rather than repaired:
+    /// the alternative shipped for weeks and it flattened newlines to spaces, cut the result at 200
+    /// characters mid-word, left <c>%b</c> empty, and reported success. See
+    /// <see cref="AgentCommitMessage"/>.</summary>
+    RefusedMessage,
+
+    /// <summary>Git itself failed. Nothing is claimed about what did or did not land.</summary>
+    Failed,
+
+    /// <summary>This worktree manager cannot commit at all (the substrate-less test doubles).</summary>
+    Unsupported,
+}
+
+/// <summary>The outcome of one agent-work commit, with the sha when there is one.</summary>
+/// <param name="Outcome">What happened.</param>
+/// <param name="Branch">The branch the commit was aimed at — always <c>agent/&lt;id&gt;</c>, computed by
+/// the daemon, echoed here so a refusal can name it.</param>
+/// <param name="Sha">The new tip on success; null otherwise. Never a guess.</param>
+/// <param name="Detail">Human-readable reason, for a refusal or a failure.</param>
+public sealed record AgentWorkCommitResult(
+    AgentWorkCommitOutcome Outcome, string Branch, string? Sha = null, string? Detail = null)
+{
+    /// <summary>True only when the branch actually moved — i.e. when there is something for the ref
+    /// watcher to see.</summary>
+    public bool Committed => Outcome == AgentWorkCommitOutcome.Committed;
 }
 
 /// <summary>
@@ -229,6 +354,18 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// because the very next step deletes the repository it looked in.</summary>
     public const string AgentRescueEmptyEvent = "agent_rescue_empty";
 
+    /// <summary>The G-17 audit type for a teardown that left <c>agent/&lt;id&gt;</c> standing because the
+    /// branch carried commits the mirror's integration branch does not.</summary>
+    public const string AgentBranchKeptEvent = "agent_branch_kept";
+
+    /// <summary>G-17 sibling: the agent's own repository was kept through teardown because its last publish
+    /// was refused, so the mirror does not hold its tip.</summary>
+    public const string AgentRepoKeptEvent = "agent_repo_kept";
+
+    /// <summary>The G-17 audit type for the one deletion that is taken on a caller's word rather than on a
+    /// proof that it costs nothing — <see cref="IAgentWorktreeManager.DiscardAgentBranch"/>.</summary>
+    public const string AgentBranchDiscardedEvent = "agent_branch_discarded";
+
     // A refusal is the interesting half: it means an agent rewrote history the mirror had already
     // published (or aimed at something that is not its own branch), and it must not pass silently just
     // because the caller wanted a bool.
@@ -271,6 +408,20 @@ public sealed class WorktreeManager : IAgentWorktreeManager
     /// dispose.
     /// </summary>
     public AgentRefWatcher RefWatcher => _watcher.Value;
+
+    /// <summary>
+    /// Installs the conflict hand-back's one exception to the mediator's fast-forward rule — see
+    /// <see cref="AgentRefMediator.RewritePermitted"/>. The composition root wires it from the
+    /// provisioner's parking store; nothing else may.
+    /// </summary>
+    public void PermitHandedBackRewrite(Func<string, string, bool> permitted, Action<string, string> consumed)
+    {
+        _refs.RewritePermitted = permitted ?? throw new ArgumentNullException(nameof(permitted));
+        _refs.RewriteConsumed = consumed ?? throw new ArgumentNullException(nameof(consumed));
+    }
+
+    /// <summary>True once the hand-back exception is wired — the composition-root test's observable.</summary>
+    public bool HasHandedBackRewritePolicy => _refs.RewritePermitted is not null;
 
     /// <inheritdoc />
     public void WatchAgentRef(string repoHash, string agentId) => RefWatcher.Watch(repoHash, agentId);
@@ -484,6 +635,113 @@ public sealed class WorktreeManager : IAgentWorktreeManager
         => AgentBranchGuard.Probe(
             WorktreePathFor(repoHash, agentId), _agentRepos.PathFor(repoHash, agentId), agentId);
 
+    /// <summary>
+    /// Daemon-side identity for an agent's work commit. The agent id is IN the name, so a reader of the
+    /// user's history can tell which agent produced a commit without consulting anything else, and the
+    /// address is under <c>.invalid</c> (RFC 2606) so it can never be mistaken for a mailbox. Passed with
+    /// <c>-c</c> rather than configured, so the commit never depends on the worktree having an identity —
+    /// the same choice <see cref="Orchestrator.KeepAliveRebaser"/> made for the same reason.
+    /// </summary>
+    private static string[] IdentityFor(string agentId) => new[]
+    {
+        "-c", "user.name=Mainguard agent " + agentId,
+        "-c", "user.email=" + agentId + "@agents.mainguard.invalid",
+    };
+
+    /// <inheritdoc />
+    public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? rawMessage)
+    {
+        var branch = BranchFor(agentId);
+
+        // The message is judged FIRST, before any git runs. It is the one pure check here, it costs
+        // nothing, and a refusal that arrives before `add -A` leaves the worktree exactly as the worker
+        // left it — so a rewritten message is a retry rather than a recovery.
+        var message = AgentCommitMessage.Normalize(rawMessage);
+        if (AgentCommitMessage.Refuse(message) is { } messageRefusal)
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.RefusedMessage, branch, Detail: messageRefusal);
+        }
+
+        if (message.Length == 0)
+        {
+            message = AgentCommitMessage.DefaultFor(agentId);
+        }
+
+        var worktreePath = WorktreePathFor(repoHash, agentId);
+        if (!Directory.Exists(worktreePath))
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.NoWorktree, branch,
+                Detail: $"agent '{agentId}' has no worktree in repo '{repoHash}' — nothing to commit.");
+        }
+
+        // The alignment authority is the EXISTING one. A second opinion about which branch an agent is on
+        // is how one of the two becomes decorative (MG-12), and this one already knows how to answer
+        // "detached", "some other branch" and "could not tell" as three different things. `Unknown` is
+        // refused with the rest: an unread state is not evidence of alignment, which is the whole reason
+        // AgentBranchGuard has that member at all.
+        var alignment = CheckAgentBranch(repoHash, agentId);
+        if (alignment.State != AgentBranchAlignmentState.OnAgentBranch)
+        {
+            return new AgentWorkCommitResult(
+                AgentWorkCommitOutcome.RefusedBranch, branch,
+                Detail: $"this worktree's HEAD is not {branch} ({alignment.State}"
+                    + (alignment.ActualBranch is { Length: > 0 } actual ? $": {actual}" : string.Empty)
+                    + "). A commit made there would be reachable from no branch the merge queue reads.");
+        }
+
+        try
+        {
+            // `add -A` honours the agent repository's local info/exclude, which is where the daemon's own
+            // droppings in /workspace are listed (the CLI's settings file and the operating-instructions
+            // file). That is not incidental: this method is what would otherwise commit them, and the
+            // exclusion and this call ship together for exactly that reason.
+            AgentGitCommand.Run(worktreePath, "add", "-A");
+
+            // Ask git whether there is anything staged BEFORE committing, so "nothing to commit" is an
+            // outcome rather than a swallowed non-zero exit that also hides real failures.
+            if (AgentGitCommand.TryRun(worktreePath, out _, "diff", "--cached", "--quiet") == 0)
+            {
+                return new AgentWorkCommitResult(
+                    AgentWorkCommitOutcome.NothingToCommit, branch,
+                    Sha: HeadShaOrNull(worktreePath),
+                    Detail: "the worktree is clean — there is no change to record.");
+            }
+
+            var args = new List<string>(IdentityFor(agentId));
+
+            // `--cleanup=verbatim` is explicit for two reasons. The default for `-m` is `whitespace`,
+            // which COLLAPSES consecutive blank lines — so a two-paragraph body would come back with its
+            // spacing quietly altered, which is a smaller version of the defect this change removes. And
+            // the default is `commit.cleanup`-configurable, so leaving it implicit means the shape of an
+            // agent's commit depends on a config key nobody set deliberately. The text was normalised
+            // and judged before this point; git is asked to record it and nothing else.
+            args.AddRange(new[] { "commit", "--cleanup=verbatim", "-m", message });
+            AgentGitCommand.Run(worktreePath, args.ToArray());
+
+            var sha = HeadShaOrNull(worktreePath);
+
+            // NOT published here, and that is load-bearing rather than an omission. AgentRefWatcher's
+            // sweep raises `Advanced` only for an outcome of `Published` — a publish that already happened
+            // makes the sweep's own publish `Unchanged`, which is `Current` (so the snapshot is recorded)
+            // and NOT `Published` (so no event is raised). Publishing eagerly here would therefore
+            // silently disarm WorkerReadinessTrigger for the very commit it exists to react to. The
+            // watcher carries it across within its tick, and the pre-verification re-fetch is the other
+            // half; both were already there.
+            return new AgentWorkCommitResult(AgentWorkCommitOutcome.Committed, branch, sha);
+        }
+        catch (RepoProvisioningException ex)
+        {
+            return new AgentWorkCommitResult(AgentWorkCommitOutcome.Failed, branch, Detail: ex.Message);
+        }
+    }
+
+    private static string? HeadShaOrNull(string worktreePath) =>
+        AgentGitCommand.TryRun(worktreePath, out var sha, "rev-parse", "HEAD") == 0
+            ? sha.Trim() is { Length: > 0 } trimmed ? trimmed : null
+            : null;
+
     /// <inheritdoc />
     public bool PublishAgentBranch(string repoHash, string agentId) => Publish(repoHash, agentId).Current;
 
@@ -604,15 +862,23 @@ public sealed class WorktreeManager : IAgentWorktreeManager
             }
         }
 
-        // Prune any dangling metadata and delete the agent branch so no residue survives either way.
-        // The mirror's copy of agent/<id> is what the merge queue consumed, so it is deleted too.
+        // Prune any dangling metadata. Always safe: metadata names no objects.
         AgentGitCommand.TryRun(owner, out _, "worktree", "prune");
         AgentGitCommand.TryRun(barePath, out _, "worktree", "prune");
-        AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch);
 
-        // MG-3: the agent's own repository goes with it. Its objects were already COPIED into the mirror
-        // by every publish (a fetch across a local transport transfers objects; the mirror borrows from
-        // nobody), so deleting it can never strand a commit the mirror's refs still name.
+        // ...and then delete agent/<id> ONLY when deleting it destroys nothing. See ReapBranch: this line
+        // used to be unconditional, which made the documented end of a worker's life — commit, report,
+        // stop — delete the commit it had just published and verified.
+        ReapBranch(repoHash, agentId, branch, barePath);
+
+        // MG-3: the agent's own repository goes with it. Its objects were COPIED into the mirror by every
+        // publish that SUCCEEDED (a fetch across a local transport transfers objects; the mirror borrows
+        // from nobody), so deleting it strands nothing the mirror's refs name. That sentence used to end
+        // "can never strand a commit" and was false for the one publish the mediator refuses — a
+        // non-fast-forward tip after an amend or a rebase — where this delete removed the only copy of the
+        // rewritten commits. The teardown now reads the publish outcome and takes
+        // RemoveAgentWorktreeKeepingRepository instead on a refusal; this line is reached only when the
+        // mirror is current.
         _agentRepos.Remove(repoHash, agentId);
 
         // MG-43: and so does its package cache. The cache is derived, disposable content that only this
@@ -623,6 +889,136 @@ public sealed class WorktreeManager : IAgentWorktreeManager
 
         // §4 gc policy: this is the natural idle point — if that was the last borrower, unreachable
         // objects in the mirror may finally be pruned.
+        MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
+    }
+
+    /// <summary>
+    /// The teardown's last act: delete <c>agent/&lt;id&gt;</c> from the mirror <b>iff</b> the mediator says
+    /// deleting it destroys nothing, and leave a durable record when it does not.
+    ///
+    /// <para><b>The boundary.</b> "No residue" exists because a mirror that accumulates a ref per agent
+    /// forever is a mirror nothing can ever prune (MG-3 §4: unreachable objects are only deleted while no
+    /// borrower is attached, and a live ref makes them reachable, not unreachable). That reason applies in
+    /// full to a branch that never left the base commit — every coordinator, every failed spawn, every
+    /// worker that did nothing — and it is those that the rule still reaps. It does not apply to a branch
+    /// that carries a commit: there the ref is not residue, it is the only name for work, and
+    /// <see cref="MirrorMaintenance.AfterAgentDetached"/> runs a prune two lines later.</para>
+    ///
+    /// <para><b>A kept branch is not silent.</b> An operator who stops an agent and finds a branch left
+    /// behind must be able to see why, and a queue row that offers Review for a branch has to be able to
+    /// trust the branch is there. The warning and the G-17 audit event are that record.</para>
+    /// </summary>
+    private void ReapBranch(string repoHash, string agentId, string branch, string barePath)
+    {
+        var verdict = _refs.MayReap(repoHash, agentId);
+        if (verdict.MayDelete)
+        {
+            AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch);
+            return;
+        }
+
+        _warningSink?.Invoke(
+            $"MG-3: kept '{branch}' in repo '{repoHash}' through teardown — {verdict.Reason}. "
+            + "The agent is gone; the branch stays so its commits do, and a human can still review, merge "
+            + "or discard it.");
+
+        _audit?.Append(new AuditEvent(AgentBranchKeptEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = branch,
+            ["outcome"] = verdict.Outcome.ToString(),
+            ["sha"] = verdict.Sha ?? string.Empty,
+            ["reason"] = verdict.Reason ?? string.Empty,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+    }
+
+    /// <inheritdoc />
+    public bool DiscardAgentBranch(string repoHash, string agentId)
+    {
+        var barePath = BareRepoPathFor(repoHash);
+        var branch = BranchFor(agentId);
+        if (!Directory.Exists(barePath))
+        {
+            return false;
+        }
+
+        var sha = AgentGitCommand.TryRun(barePath, out var head, "rev-parse", "--verify", "--quiet",
+            "refs/heads/" + branch) == 0 ? head.Trim() : string.Empty;
+
+        // Nothing there is success: the caller asked for the branch to be gone and it is.
+        if (sha.Length == 0)
+        {
+            return true;
+        }
+
+        if (AgentGitCommand.TryRun(barePath, out _, "branch", "-D", branch) != 0)
+        {
+            return false;
+        }
+
+        // Audited, and this one is not optional. Every OTHER way a branch is deleted now proves first that
+        // the delete costs nothing; this is the single path that deletes work on a caller's say-so, so the
+        // say-so has to be on the record with the sha it destroyed.
+        _audit?.Append(new AuditEvent(AgentBranchDiscardedEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = branch,
+            ["sha"] = sha,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
+        MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
+        return true;
+    }
+
+    /// <inheritdoc />
+    public AgentRefPublishOutcome PublishAgentBranchOutcome(string repoHash, string agentId)
+        => Publish(repoHash, agentId).Outcome;
+
+    /// <inheritdoc />
+    public void RemoveAgentWorktreeKeepingRepository(string repoHash, string agentId, string reason)
+    {
+        var barePath = BareRepoPathFor(repoHash);
+        var worktreePath = WorktreePathFor(repoHash, agentId);
+        var owner = _agentRepos.Exists(repoHash, agentId) ? _agentRepos.PathFor(repoHash, agentId) : barePath;
+
+        if (Directory.Exists(worktreePath))
+        {
+            // Forced, as every teardown removal is: the tree belongs to a jail that no longer exists.
+            AgentGitCommand.TryRun(owner, out _, "worktree", "remove", "--force", worktreePath);
+            if (Directory.Exists(worktreePath))
+            {
+                try { Directory.Delete(worktreePath, recursive: true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
+        }
+
+        AgentGitCommand.TryRun(owner, out _, "worktree", "prune");
+        AgentGitCommand.TryRun(barePath, out _, "worktree", "prune");
+
+        // No reap, no repository delete, no cache release: the repository IS the work now. The mirror's
+        // agent/<id> is left where it stands (the pre-refusal tip), so a queue row that names it still
+        // names a real ref.
+        var tip = AgentGitCommand.TryRun(owner, out var head, "rev-parse", "--verify", "--quiet",
+            "refs/heads/" + BranchFor(agentId)) == 0 ? head.Trim() : string.Empty;
+        _warningSink?.Invoke(
+            $"MG-3: kept agent '{agentId}''s own repository in repo '{repoHash}' through teardown — {reason}. "
+            + $"Its {BranchFor(agentId)} is at {tip} and the mirror does not hold it; a human can publish, "
+            + "review or discard it from " + owner + ".");
+        _audit?.Append(new AuditEvent(AgentRepoKeptEvent, new Dictionary<string, string>
+        {
+            ["repo"] = repoHash,
+            ["agent"] = agentId,
+            ["branch"] = BranchFor(agentId),
+            ["sha"] = tip,
+            ["repository"] = owner,
+            ["reason"] = reason,
+            ["when"] = DateTimeOffset.UtcNow.ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        }));
+
         MirrorMaintenance.AfterAgentDetached(barePath, _agentRepos, repoHash, _warningSink);
     }
 

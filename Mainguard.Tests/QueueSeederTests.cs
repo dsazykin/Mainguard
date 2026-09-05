@@ -92,7 +92,7 @@ public sealed class QueueSeederTests : IDisposable
     }
 
     [Fact]
-    public async Task SeedVerifyFail_SettlesToWorking_ThroughTheRealFailurePath()
+    public async Task SeedVerifyFail_SettlesToVerificationFailed_ThroughTheRealFailurePath()
     {
         var (seeder, repoHash, verifications) = Provision();
 
@@ -100,10 +100,14 @@ public sealed class QueueSeederTests : IDisposable
             new[] { new SeedSpec(WorkerMergeState.Working, VerificationFails: true) }, Actor, CancellationToken.None);
 
         var outcome = Assert.Single(report.Results);
-        Assert.Equal("Working", outcome.ReachedState);
+        // H2 — the seeded failure lands where a real one now does. The SPEC still says `Working` (that is
+        // the spelling the seeding RPC and its UI send), but the state it reaches is the honest one; the
+        // failure is no longer indistinguishable from an entry nobody ran.
+        Assert.Equal("VerificationFailed", outcome.ReachedState);
 
         var ctx = _registry.Resolve(repoHash)!;
-        Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out _));
+        Assert.False(ctx.Queue.CanMerge(outcome.AgentId, out var reason));
+        Assert.Contains("FAILED", reason);
         Assert.False(verifications.Latest(repoHash, outcome.AgentId)!.Passed);
     }
 
@@ -221,6 +225,12 @@ public sealed class QueueSeederTests : IDisposable
             && e.Fields["plan_id"] == plan.PlanId);
 
         // Default scope is the seed's own path, so with_plan alone changes nothing about mergeability.
+        //
+        // Nor does the deviation declaration: the seeder supplies the worker's half of it (a plain "no
+        // deviations") exactly as it supplies the plan's authorship, because there is no worker to ask
+        // and a must-acknowledge row present on every seeded entry would be about the seeder rather than
+        // about the branch. `SeedPlan` step (4) is where that is written down.
+        Assert.Equal(DeviationDeclaration.None, plan.Deviation);
         Assert.True(_registry.Resolve(repoHash)!.Queue.CanMerge(outcome.AgentId, out var mergeReason), mergeReason);
     }
 
@@ -514,10 +524,7 @@ public sealed class QueueSeederTests : IDisposable
             planGate: _planGate,
             // SA-1/F6, read the way the composition root reads it: APPROVED plans only, keyed by the
             // worker's own agent id — which for a seeded entry is the seed id itself.
-            resolveApprovedPlan: agentId =>
-                _plans.LatestForWorker(agentId) is { Status: PlanStatus.Approved } approved
-                    ? approved.Plan
-                    : null,
+            resolveApprovedWork: agentId => _plans.ApprovedWorkFor(agentId),
             syntheticVerifications: _synthetic);
 
         return (

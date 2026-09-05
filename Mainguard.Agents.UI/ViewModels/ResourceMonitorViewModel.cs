@@ -215,12 +215,20 @@ public partial class ResourceMonitorViewModel : ViewModelBase, IDisposable
         Refresh();
     }
 
-    public void RequestEnd(string agentId, string name)
+    /// <summary>
+    /// Arms the End-task confirmation for one row.
+    ///
+    /// <para><b>It takes the row, not a name.</b> The name is the CLI kind — <c>claude-code</c> — so the
+    /// dialog used to read "End claude-code?" for every agent on the machine, including the coordinator
+    /// whose death ends the whole session. Asking a human to confirm an irreversible act against a label
+    /// that four rows share is not a confirmation; it is a coin toss. The dialog now names what a human
+    /// recognises (role, brief, short id) and, for a coordinator, says what ending it costs.</para>
+    /// </summary>
+    public void RequestEnd(AgentUsageRowViewModel row)
     {
-        _pendingEndAgentId = agentId;
-        EndConfirmTitle = $"End {name}?";
-        EndConfirmMessage = $"{name}'s work is rejected and its sandbox is torn down. " +
-                            "Its branch is kept until teardown, so nothing is silently lost.";
+        _pendingEndAgentId = row.AgentId;
+        EndConfirmTitle = $"End {row.IdentityLine}?";
+        EndConfirmMessage = row.EndConfirmMessage;
         IsEndConfirmVisible = true;
     }
 
@@ -253,7 +261,37 @@ public partial class AgentUsageRowViewModel : ViewModelBase
 
     public string AgentId { get; }
 
+    /// <summary>The CLI kind — "claude-code". Kept, but demoted to the row's second line: it is what the
+    /// agent RUNS, never which agent it is.</summary>
     [ObservableProperty] private string _name = "";
+
+    /// <summary>
+    /// What this row is, in the order a human recognises it: the role word, then the short id.
+    ///
+    /// <para>Role first because it is the fact that decides how bad ending this row is — a coordinator's
+    /// death ends the session, a worker's does not — and the id because it is the handle every other
+    /// surface (the agent rail, the merge queue, the plan card's "Written by …") uses for the same agent.
+    /// Shortened to the first eight characters: enough to tell four rows apart and to match against those
+    /// surfaces, without a 32-character GUID crowding out the rest of the row.</para>
+    /// </summary>
+    [ObservableProperty] private string _identityLine = "";
+
+    /// <summary>The agent's brief, when it has one — the worker's plan title. This is the line that
+    /// actually says which worker it is; the id only says that it is a different one.</summary>
+    [ObservableProperty] private string _title = "";
+
+    [ObservableProperty] private bool _hasTitle;
+
+    /// <summary>The row's second line: the CLI kind, plus the brief when there is one.</summary>
+    [ObservableProperty] private string _kindLine = "";
+
+    /// <summary>True for the coordinator row. Ending it is a different act with a different blast radius,
+    /// and the confirm says so.</summary>
+    [ObservableProperty] private bool _isCoordinator;
+
+    /// <summary>The consequence sentence the End-task confirm shows for THIS row.</summary>
+    [ObservableProperty] private string _endConfirmMessage = "";
+
     [ObservableProperty] private string _stateWord = "";
     [ObservableProperty] private string _cpuText = "";
     [ObservableProperty] private string _ramText = "";
@@ -276,9 +314,38 @@ public partial class AgentUsageRowViewModel : ViewModelBase
         _owner = owner;
     }
 
+    /// <summary>The id, shortened to what a human can compare across surfaces without reading 32 hex
+    /// characters. Short enough to scan, long enough that two live agents do not collide.</summary>
+    public static string ShortId(string agentId) =>
+        agentId.Length > 8 ? agentId[..8] : agentId;
+
+    /// <summary>The role, in the word the surface uses for it. Manual sessions are just "Agent" — they
+    /// were started by hand and have no place in the coordinator hierarchy.</summary>
+    public static string RoleWord(string role) => role switch
+    {
+        AgentRoles.Coordinator => "Coordinator",
+        AgentRoles.Managed => "Worker",
+        _ => "Agent",
+    };
+
     public void Update(AgentResourceUsage usage)
     {
         Name = usage.Name;
+        IsCoordinator = usage.Role == AgentRoles.Coordinator;
+        IdentityLine = $"{RoleWord(usage.Role)} {ShortId(usage.AgentId)}";
+        Title = usage.Title;
+        HasTitle = usage.Title.Length > 0;
+        KindLine = HasTitle ? $"{usage.Name} · {usage.Title}" : usage.Name;
+        EndConfirmMessage = IsCoordinator
+            // The coordinator is the session. Ending it does not end its workers, and a human who thinks
+            // it does will end it expecting a clean stop and get an orphaned fleet instead — so the
+            // sentence says both halves.
+            ? $"{IdentityLine} is the agent that plans and delegates. Ending it stops the whole session: "
+              + "nothing will spawn, steer or review after this. Workers already running keep running — "
+              + "end them from their own rows. Its sandbox is torn down; branches are kept until teardown."
+            : $"{IdentityLine}'s work is rejected and its sandbox is torn down, which frees the slot it is "
+              + "holding against the worker cap. Its branch is kept until teardown, so nothing is "
+              + "silently lost.";
         StateWord = usage.StateWord;
         // Unknown renders as an em dash, never as 0 — "0%" is a measurement, "—" is the absence of one.
         CpuText = usage.CpuPercent is { } cpu ? FormattableString.Invariant($"{cpu:0}%") : Unknown;
@@ -299,5 +366,5 @@ public partial class AgentUsageRowViewModel : ViewModelBase
     private System.Threading.Tasks.Task PauseOrResumeAsync() => _owner.PauseOrResumeAsync(AgentId, IsPaused);
 
     [RelayCommand]
-    private void EndTask() => _owner.RequestEnd(AgentId, Name);
+    private void EndTask() => _owner.RequestEnd(this);
 }

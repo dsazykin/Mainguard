@@ -3,7 +3,9 @@
 
 - **`protos/mainguard/v1/`** — the `mainguard.v1` proto surface (package name binding; opaque
   handles only, no OS paths — G-14).
-  - `common.proto` (`Handle`/`Empty`), `agent.proto` (`AgentService`:
+  - `common.proto` (`Handle`/`Empty`), `agent.proto` (`AgentService`: **`GetJailLimits`/`SetJailLimits`**
+    (2026-09-04 — the per-jail memory/CPU ceiling; Set is operator-only and answers `JailLimits` AS PERSISTED
+    with the clamp band);
     `SpawnAgent`/`StopAgent`/`ListAgents`/`StreamAgentEvents`; **`ResumeAgent`** gives a STRANDED
     merge-queue entry a live jail again — a spawn onto the agent id that entry ALREADY has, with the
     worktree standing on its existing `agent/<id>`. A separate RPC rather than an `agent_id` field on
@@ -55,14 +57,24 @@
     handles, G-14 — so the App registers the resolved remote without touching `IAgentEnvironment`),
     `gateway.proto` (`GatewayService`: budgets + `StreamSpend` — bodies in P2-08), `mergequeue.proto`
     (P2-10 `MergeQueueService`: `StreamQueue` snapshot-then-deltas, `RunVerification`, `CanMerge`, and
-    the RT-D1 `BeginMerge`/`ConfirmMerge` — no auto-merge RPC by construction; **P2-47 #7 adds
+    the RT-D1 `BeginMerge`/`ConfirmMerge` — no auto-merge RPC by construction;
+    **`BeginMergeResponse.expected_branch_sha`** (K3/§23.4) travels beside `expected_main_sha` and for the
+    same reason: it is the `agent/<id>` tip the daemon's verification was measured on, so the client merges
+    the branch the daemon authorized rather than whatever its own stream snapshot last saw, and
+    `ConfirmMerge` can check the post-merge sha it reports against it; **P2-47 #7 adds
     `GetMergeDiff`** — the agent-branch-vs-main unified diff the review cockpit renders, which
     `StreamQueue` doesn't carry, parsed client-side by `PatchParser`; **`QueueEntry.flagged_items`**
     carries the daemon's must-acknowledge review items
     (`FlaggedItem{id,path,category,fact,acknowledged}`) — the gate that owns them is daemon-side and
     `AcknowledgeFlaggedChange` is addressed BY ITEM ID, so without them on the wire a flagged branch
     reaches the review surface with a refusal reason and no item to clear, which is a permanently
-    unmergeable branch rather than a gate; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
+    unmergeable branch rather than a gate; **H2/H4 add the entry's last VERDICT and a way to read its
+    output** — `QueueEntry.last_verification_passed` (**`optional`** for the same reason
+    `has_live_sandbox` is: a proto3 `bool` defaults to false, so a plain field would make "never verified"
+    and "failed" the same value again, which is the very defect the new `VerificationFailed` state fixes
+    one layer up), `last_verification_command`, `last_verification_at`, and the **`GetVerificationLog`**
+    rpc returning the artifact's CONTENT (never its daemon path — G-14), tail-bounded with an explicit
+    `truncated`, and distinguishing "no record" from "a record whose artifact is gone" from "the log"; **`DiscardEntry`/`RejectEntry`/`ClearStalledVerification`** are the human
     entry-lifecycle RPCs — `DiscardEntry` walks an entry to the terminal `Discarded` (never `Merged`; it
     takes no lease, fires no cascade and writes no T-19 journal entry, so `NoAutoMergePathExists` is
     untouched); `RejectEntry` is the review verdict "no" — terminal `Rejected`, legal only from
@@ -80,7 +92,36 @@
     says whether a run is really executing, which the state alone cannot: state is persisted per
     transition while the in-flight set is daemon memory, so a restart mid-run leaves a `Verifying` row
     with nothing behind it and a client that inferred "Verifying ⇒ busy" would be wrong for exactly the
-    entries that need unsticking. **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
+    entries that need unsticking. **`QueueEntry.approved_plan_id` / `_title` / `_approach` and
+    `deviation_declaration` (13–16, 2026-08-31)** carry what a human APPROVED for the branch, so the
+    review can be a comparison rather than a diff read in isolation: the approved `approach` existed only
+    on the daemon, was read once at approval and never surfaced again — which is how a branch that shipped
+    the opposite of its approved approach reached review with `flagged_items` empty (the file SCOPE was
+    honoured), `can_merge` true and a green verification the worker had written the tests for.
+    `deviation_declaration` is a THREE-valued string (`NotDeclared`/`None`/`Declared`), not a bool, for
+    the reason `last_verification_passed` is `optional`: "the worker asserted it followed the approach"
+    and "nobody ever asked it" are different facts, and a bool would re-collapse them one layer below
+    where any surface could recover it. Declared departures themselves ride `flagged_items` as
+    must-acknowledge rows; this field carries the two answers that produce no item. All four empty for an
+    entry with no approved plan, so "never approved" and "approved with nothing written" stay apart.
+    Design: `docs/design/coordinator-phase-3-decisions.md` §26.
+        entries that need unsticking. **`ResolveConflictWithAgent` / `AbortRebase` + `QueueEntry.rebase_conflict`
+    (S5)** are the two things a human can do about a rebase the daemon parked on a conflict, plus the facts
+    behind the card. The cascade parks the worktree mid-rebase and `docker pause`s the jail deliberately
+    (no automatic `rebase --abort` — a rejection trigger) and blocks the entry with a reason naming a
+    required human action; the surface had no operation that could perform it, because the jail is paused
+    (nothing can be exec'd in it), Verify cannot run there, and Review is absent for a non-Verified entry.
+    The first unpauses the jail and instructs the worker through the daemon's own prompt path (there is
+    deliberately **no prompt field** — a client-supplied one would be an unlogged way to type into another
+    agent's CLI); the second runs `git rebase --abort` and lets the jail run again. Both are on the
+    coordinator's denied list at `RoleInterceptor` — unpausing and steering a co-tenant's jail, or
+    rewriting its branch's parentage, is merge-adjacent power over work an agent competes with. Neither is
+    the T-04 resolver. `rebase_conflict` is a MESSAGE field so absent means "nothing parked" exactly, and
+    its `paths` are measured at parking time — **empty means NOT MEASURED, never "nothing conflicts"**; its
+    `worktree` is the one deliberate G-14 exception, documented in the proto (it is not an address, nothing
+    is looked up by it, and the identical string already reaches a human-facing client verbatim inside
+    `AuditService.ReadAudit`'s payload for `keepalive_rebase_conflict`).
+    **`mergequeue.proto` also carries `PrIntakeService`** — the P2-12
     external-PR-intake configuration surface, hosted here because the intake is the queue's other feeder:
     `GetPrIntakeSettings` (settings + persisted `PrIntakeSource` list), `UpdatePrIntakeSettings` and
     `SubscribePrIntakeSource`. Deliberately NO `repo_handle` on any of them — intake config is
@@ -110,6 +151,14 @@
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`
     `StreamConversation`/`SendMessage`** — the coordinator chat bridge, snapshot-then-deltas
     conversation turns + a send-message RPC, carrying no merge/git/worktree capability.
+    **The plan-mode toggle (2026-08-30):** `GetPlanMode`/`SetPlanMode` + `PlanModeState{enabled,summary}`
+    — the operator's switch for whether a delegated worker must have an approved plan before it gets its
+    task. **`SetPlanMode` is denied to the coordinator role** at the `RoleInterceptor`, on the same
+    boundary as `ApprovePlan` and for a stronger reason (approving one plan holds the gate for one worker;
+    turning the mode off removes it for every future worker). The summary sentence is rendered
+    daemon-side, and `PlanUpdate` also carries `plan_mode_enabled`/`plan_mode_summary`, so the state
+    arrives with the cards it explains — an EMPTY plan gate has two explanations and only the daemon can
+    tell them apart. Design: `docs/design/coordinator-phase-3-decisions.md` §23.
     **Phase 2** (worker-authored plans): `PlanEntry` gains `worker_agent_id` (the plan is the
     *worker's* now — it wrote it after inspecting the repo), `revision`, `revisions_remaining` and
     `rejection_feedback`; `RejectPlanRequest.reason` becomes load-bearing — it is **delivered to the
@@ -119,7 +168,13 @@
     (`blocked_worker_count`, `escalated_worker_count`, `active_worker_count`, `max_active_workers`,
     `max_plan_revisions`, `backpressure_signal`) — a blocked worker counts against the worker cap, so a
     saturated cap means the coordinator has stopped spawning, and the contract makes saying so a
-    requirement rather than a nicety).
+    requirement rather than a nicety. **Phase 3 (2026-08-30) adds the re-scope's three fields** —
+    `supersedes_plan_id`, `previous_scope` and `rescope_count` — because that card is a different decision
+    from a first presentation: the human is approving a WIDENING of something they already approved, and
+    cannot judge it against a scope they are expected to remember. `previous_scope` is the scope COPIED
+    when the re-scope was presented, not a lookup, so the card diffs against what was actually consented
+    to rather than against whatever that plan says by the time a second re-scope exists; `rescope_count`
+    is visibility, not a budget — nothing refuses on it).
   - `Mainguard.Protos.csproj` runs `Grpc.Tools` with `GrpcServices="Both"`.
 
 ## Role in the solution

@@ -105,8 +105,12 @@ public partial class MergeQueueViewModel : ViewModelBase, IDisposable
         WorkerMergeState.Verified => 0,
         WorkerMergeState.AwaitingReview => 0,
         WorkerMergeState.Verifying => 1,
-        WorkerMergeState.Working => 2,
-        WorkerMergeState.StaleVerified => 3,
+        // H2 — a red verification sorts with the branches that need a person, ABOVE the ones that are
+        // merely unverified. Falling through to the `_ => 5` bucket would have put the one row on the
+        // rail that has actually failed below every row that has not been tested at all.
+        WorkerMergeState.VerificationFailed => 2,
+        WorkerMergeState.Working => 3,
+        WorkerMergeState.StaleVerified => 4,
         WorkerMergeState.Merged => 4,
         _ => 5,
     };
@@ -154,6 +158,7 @@ public partial class MergeQueueRowViewModel : ViewModelBase
         {
             WorkerMergeState.StaleVerified => "Stale — re-verifying",
             WorkerMergeState.AwaitingReview => "Awaiting review",
+            WorkerMergeState.VerificationFailed => "Tests failed",
             _ => state.ToString(),
         };
 
@@ -180,6 +185,9 @@ public partial class MergeQueueRowViewModel : ViewModelBase
             WorkerMergeState.Rejected => ("DismissIcon", false, false, false, false, false, true),
             // Finished and NOT merged: muted, and pointedly not the success green Merged wears.
             WorkerMergeState.Discarded => ("DismissIcon", false, true, false, false, false, false),
+            // Red, because it is: the tests ran and did not pass. The gate reason beside it carries the
+            // command, and the entry keeps its retry.
+            WorkerMergeState.VerificationFailed => ("DismissIcon", false, false, false, false, false, true),
             _ => ("AgentWorkingIcon", false, true, false, false, false, false),
         };
     }

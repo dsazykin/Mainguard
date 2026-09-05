@@ -23,7 +23,8 @@ public sealed record MergeDispatchRequest(
     string ExpectedMainSha,
     string MainBranch = "main",
     bool AllowStaleOverride = false,
-    string? OverrideReason = null);
+    string? OverrideReason = null,
+    string ExpectedBranchSha = "");
 
 /// <summary>The outcome of a dispatched merge (mirrors <see cref="ForegroundMergeResult"/> for both paths).</summary>
 public sealed record MergeDispatchOutcome(bool Merged, string? NewMainSha, bool CasLost, string? Reason);
@@ -124,7 +125,8 @@ public sealed class MergeDispatch : IMergeDispatch
             request.ExpectedMainSha,
             request.MainBranch,
             request.AllowStaleOverride,
-            request.OverrideReason));
+            request.OverrideReason,
+            request.ExpectedBranchSha));
 
         return new MergeDispatchOutcome(result.Merged, result.NewMainSha, result.CasLost, result.Reason);
     }
@@ -139,8 +141,13 @@ public sealed class MergeDispatch : IMergeDispatch
         // to wait in the identical words. Without this the external transport ran wholly outside the
         // one-outstanding-merge-per-repo invariant.
         var leaseId = Guid.NewGuid().ToString("N");
+        // K3 — the lease records the identity, not just the fact: the agent/<id> tip the queue's
+        // verification was measured on travels with the main@sha it may fast-forward. The external leg
+        // REQUIRES it (K4): its "verified head" used to be re-derived at merge time from a ref the intake
+        // had already reset forward, which made the head compare tautological.
         var lease = _leases.TryBegin(
-            request.RepoHash, leaseId, request.AgentId, request.ExpectedMainSha, request.MainBranch);
+            request.RepoHash, leaseId, request.AgentId, request.ExpectedMainSha, request.MainBranch,
+            queue.LastVerification(request.AgentId)?.BranchSha ?? string.Empty);
         if (lease is null)
         {
             return new MergeDispatchOutcome(false, null, CasLost: false, LeaseHeldReason);
@@ -174,7 +181,8 @@ public sealed class MergeDispatch : IMergeDispatch
                 .MergeExternalPrAsync(
                     new ForegroundMergeRequest(
                         request.RepoPath, request.RepoHash, request.AgentId,
-                        request.ExpectedMainSha, request.MainBranch),
+                        request.ExpectedMainSha, request.MainBranch,
+                        ExpectedBranchSha: lease.ExpectedBranchSha),
                     lease, ct)
                 .ConfigureAwait(false);
 
@@ -188,9 +196,14 @@ public sealed class MergeDispatch : IMergeDispatch
             // The merge is proven landed, so the queue's stale cascade fires — identical to the local
             // path's terminal handling. Confirm writes the RT-D1 idempotency record and releases the
             // lease, so the boot reconcile can tell a landed merge from an abandoned one.
+            // → Merged + NotifyMainMoved, and one queue_entry_merged audit event naming this transport.
+            // The queue transition comes FIRST: a confirm written before it would leave a confirmed lease
+            // beside a row that never reached Merged if the transition threw, and the finally below could
+            // no longer hand the lease back.
+            queue.ConfirmHumanMerge(
+                request.AgentId, result.NewMainSha!, MergeAuthorization.ExternalDispatch(leaseId));
             _leases.Confirm(request.RepoHash, leaseId, result.NewMainSha!);
             confirmed = true;
-            queue.ConfirmHumanMerge(request.AgentId, result.NewMainSha!); // → Merged + NotifyMainMoved
 
             return new MergeDispatchOutcome(Merged: true, result.NewMainSha, CasLost: false, Reason: null);
         }

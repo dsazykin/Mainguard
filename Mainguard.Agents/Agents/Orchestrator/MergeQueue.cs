@@ -15,6 +15,22 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// <para>RT-D2 provenance: <see cref="ResolvedCommand"/> + <see cref="ConfigHash"/> pin what actually
 /// ran, so a branch that rewrites its own test command is flagged before a merge is possible.</para>
 /// </summary>
+/// <param name="BranchSha">The <c>refs/heads/agent/&lt;id&gt;</c> tip in the mirror the run was measured
+/// ON — the branch-side half of the two shas a verdict is only true between.
+///
+/// <para><b>Its absence was the freeze.</b> A record pinned <c>main@sha</c> and nothing else, so the queue
+/// could ask "has main moved under this evidence?" — it does, in <see cref="MergeQueue.CanMerge"/> and in
+/// the stale cascade — and structurally could not ask "has the BRANCH moved out from under it?". A worker
+/// that pushed three more commits onto a green branch kept the green: verified @ an old tip, footer
+/// "ready to merge", Merge enabled, for a tree nobody had ever tested (observed 2026-08-30, agent
+/// <c>4c43d17a</c> — verification 50 at 01:35, then <c>commit_work</c> at 01:41, 01:59 and 02:13 with no
+/// re-verification of any kind).</para>
+///
+/// <para>Empty means <b>not measured</b>, never "unchanged": the seeded/synthetic path has no mirror ref
+/// to resolve, and every record written before this field existed has none either. Freshness comparisons
+/// treat an empty value as unknown and decline to answer, so the branch-side compare can only ever ADD a
+/// refusal — the state-machine invalidation (<see cref="MergeQueue.NotifyBranchAdvanced"/>) is the other
+/// half, and it does not depend on this field at all.</para></param>
 public sealed record VerificationRecord(
     string AgentId,
     string MainSha,
@@ -22,7 +38,8 @@ public sealed record VerificationRecord(
     string LogArtifactPath,
     string ResolvedCommand,
     string ConfigHash,
-    DateTimeOffset When);
+    DateTimeOffset When,
+    string BranchSha = "");
 
 /// <summary>
 /// A composable merge-gate predicate (P2-10 step 4). The queue owns the staleness gate; P2-11 adds its
@@ -33,6 +50,85 @@ public interface IMergeGate
 {
     /// <summary>True iff this gate permits <paramref name="agentId"/> to merge; otherwise sets a reason.</summary>
     bool Allows(string agentId, out string reason);
+
+    /// <summary>
+    /// One line stating what this gate had actually established about <paramref name="agentId"/> at the
+    /// instant a merge was recorded — the evidence half of <see cref="MergeQueue.MergedEvent"/>. The
+    /// default is null, meaning "this gate has nothing to say about that branch".
+    ///
+    /// <para><b>Why <see cref="Allows"/> returning true is not a record of anything.</b> The question a
+    /// reader of the audit chain asks about a merge is <i>what was waived to get here</i>, and "the gates
+    /// allowed it" answers it with a tautology — it is equally true of every merge that ever happened,
+    /// including the one being investigated. A gate that guards must-acknowledge items says which items,
+    /// how many were acknowledged, and the content hash they were bound to, so a later reader can tell a
+    /// branch that had nothing to acknowledge apart from one whose flags a human cleared.</para>
+    /// </summary>
+    string? MergeEvidence(string agentId) => null;
+}
+
+/// <summary>
+/// Who authorised a merge and through which path — the provenance half of
+/// <see cref="MergeQueue.MergedEvent"/>.
+///
+/// <para>It is a parameter rather than something the queue infers, because the queue genuinely cannot
+/// know: the same <c>Merged</c> transition is reached by a human clicking merge in the cockpit, by the
+/// RT-D1 boot reconcile replaying a journal for a merge that landed before a crash, by the external-PR
+/// dispatch, and by dev seeding. An audit record that could not tell those apart would put a person's
+/// name on a daemon's reconciliation — the exact mistake <see cref="MergeQueue.RestartResumeEvent"/>
+/// exists as a separate event type to avoid.</para>
+/// </summary>
+/// <param name="By">The actor. Daemon-derived for a human path (SA-1/F2 — never client-supplied), or a
+/// <c>system:</c>-prefixed name for a path no person drove.</param>
+/// <param name="Source">Which merge path recorded this — one of the constants below.</param>
+/// <param name="LeaseId">The RT-D1 merge lease the merge was performed under; empty where there is none.</param>
+public sealed record MergeAuthorization(string By, string Source, string LeaseId = "")
+{
+    /// <summary>The human-driven <c>ConfirmMerge</c> RPC — a person merged and the daemon-side gates passed.</summary>
+    public const string ConfirmRpcSource = "confirm_rpc";
+
+    /// <summary>The RT-D1 boot reconcile synthesizing a confirm for a merge that landed before a crash.</summary>
+    public const string BootReconcileSource = "boot_reconcile";
+
+    /// <summary>
+    /// The <c>ConfirmMerge</c> RPC recording a merge the gate had just REFUSED — because the sha the client
+    /// reported is exactly the branch tip the lease authorized, so the reviewed bytes demonstrably landed
+    /// on the user's main before the refusal was reached. Its own source, so a reader can tell a merge
+    /// the gates admitted from one the daemon reflected after the fact.
+    /// </summary>
+    public const string ConfirmRpcLateSource = "confirm_rpc_late";
+
+    /// <summary>The P2-12 external-PR merge dispatch.</summary>
+    public const string ExternalDispatchSource = "external_dispatch";
+
+    /// <summary>Dev-only queue seeding (<c>docs/design/queue-seeding.md</c>).</summary>
+    public const string SeededSource = "seeded";
+
+    /// <summary>A caller that named neither actor nor path (test doubles, and the parameterless overloads).</summary>
+    public const string UnattributedSource = "unattributed";
+
+    /// <summary>The record for a merge nobody attributed — it says so rather than guessing a name.</summary>
+    public static MergeAuthorization Unattributed { get; } = new("unknown", UnattributedSource);
+
+    /// <summary>A human merge confirmed through the daemon RPC, under <paramref name="leaseId"/>.</summary>
+    public static MergeAuthorization ConfirmRpc(string by, string leaseId) =>
+        new(string.IsNullOrWhiteSpace(by) ? "unknown" : by, ConfirmRpcSource, leaseId ?? string.Empty);
+
+    /// <summary>A human merge that had already landed when the gate refused its confirm (see
+    /// <see cref="ConfirmRpcLateSource"/>), under <paramref name="leaseId"/>.</summary>
+    public static MergeAuthorization ConfirmRpcLate(string by, string leaseId) =>
+        new(string.IsNullOrWhiteSpace(by) ? "unknown" : by, ConfirmRpcLateSource, leaseId ?? string.Empty);
+
+    /// <summary>The boot reconcile's synthesized confirm. Attributed to the reconciler, never a person.</summary>
+    public static MergeAuthorization BootReconcile(string leaseId = "") =>
+        new(MergeQueue.ReconcilerActor, BootReconcileSource, leaseId ?? string.Empty);
+
+    /// <summary>The external-PR dispatch's confirm.</summary>
+    public static MergeAuthorization ExternalDispatch(string leaseId = "") =>
+        new("system:external-pr-dispatch", ExternalDispatchSource, leaseId ?? string.Empty);
+
+    /// <summary>A seeded entry's synthetic merge — labelled, for the same reason a seeded verification is.</summary>
+    public static MergeAuthorization Seeded(string by = "") =>
+        new(string.IsNullOrWhiteSpace(by) ? "system:seeder" : by, SeededSource);
 }
 
 /// <summary>
@@ -239,14 +335,24 @@ public sealed class MergeQueue : IMergeQueue
     // frozen at Verifying (the daemon restarted mid-run before ResumeAfterRestartAsync could re-drive it),
     // and an action that only worked from AwaitingReview — where Rejected already lives — would not reach a
     // single one of them.
+    //
+    // VerificationFailed (H2) is reachable ONLY from Verifying, and only from the arm that has a red
+    // VerificationRecord in hand. It is deliberately NOT reachable from the refusal path: a run that could
+    // not start (no jail, a drifted branch, a malformed verify command) writes no record and settles to
+    // Working, and routing it here would turn "we could not run your tests" into "your tests failed" —
+    // the one distinction the merge decision rests on.
     private static readonly IReadOnlyDictionary<WorkerMergeState, WorkerMergeState[]> Legal =
         new Dictionary<WorkerMergeState, WorkerMergeState[]>
         {
             [WorkerMergeState.Working] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
-            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.Working, WorkerMergeState.Verifying, WorkerMergeState.Discarded },
+            [WorkerMergeState.Verifying] = new[] { WorkerMergeState.Verified, WorkerMergeState.VerificationFailed, WorkerMergeState.Working, WorkerMergeState.Verifying, WorkerMergeState.Discarded },
             [WorkerMergeState.Verified] = new[] { WorkerMergeState.StaleVerified, WorkerMergeState.AwaitingReview, WorkerMergeState.Working, WorkerMergeState.Discarded },
             [WorkerMergeState.StaleVerified] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.Discarded },
             [WorkerMergeState.AwaitingReview] = new[] { WorkerMergeState.Merged, WorkerMergeState.Rejected, WorkerMergeState.StaleVerified, WorkerMergeState.Working, WorkerMergeState.Discarded },
+            // The three honest moves out of a red verification: retry it, let the agent's fix reset it, or
+            // let the human drop it. No edge to Merged (there is no passing record) and none to Rejected
+            // (that is a verdict on reviewed work, and nothing here has been reviewed).
+            [WorkerMergeState.VerificationFailed] = new[] { WorkerMergeState.Verifying, WorkerMergeState.Working, WorkerMergeState.VerificationFailed, WorkerMergeState.Discarded },
             [WorkerMergeState.Merged] = Array.Empty<WorkerMergeState>(),
             [WorkerMergeState.Rejected] = Array.Empty<WorkerMergeState>(),
             [WorkerMergeState.Discarded] = Array.Empty<WorkerMergeState>(),
@@ -265,6 +371,7 @@ public sealed class MergeQueue : IMergeQueue
     private readonly IReadOnlyList<IMergeGate> _gates;
     private readonly IAuditLog _audit;
     private readonly Func<DateTimeOffset> _clock;
+    private readonly Action<string, WorkerMergeState>? _onStateChanged;
 
     private readonly Dictionary<string, WorkerMergeState> _states = new(StringComparer.Ordinal);
     private readonly Dictionary<string, VerificationRecord?> _lastVerification = new(StringComparer.Ordinal);
@@ -273,7 +380,79 @@ public sealed class MergeQueue : IMergeQueue
     private readonly Dictionary<string, QueueEntryDiscard> _discards = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> _lastChangedAt = new(StringComparer.Ordinal);
     private readonly HashSet<string> _verifying = new(StringComparer.Ordinal);
-    private readonly Dictionary<string, string> _requeueBlocks = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The render-verbatim reason an entry is sitting at <c>Working</c> when "not verified yet" would
+    /// understate it. Two writers, and they are the same fact told twice: the stale cascade could not
+    /// reparent the branch (<see cref="TryReturnToWorking"/>), or the branch moved out from under its own
+    /// verification (<see cref="NotifyBranchAdvanced"/> and the settle in
+    /// <see cref="RunVerificationAsync"/>). Cleared by any move OFF <c>Working</c>.
+    /// </summary>
+    private readonly Dictionary<string, WorkingReason> _workingReasons = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// A measured refusal for a <c>Working</c> entry, and whether it already accounts for that entry's
+    /// sandbox being gone.
+    ///
+    /// <para><b>Why the flag exists.</b> <see cref="CanMergeLocked"/> has two candidate sentences for a
+    /// stranded <c>Working</c> entry — this measured one and the generic <see cref="StrandedReason"/> —
+    /// and neither is right in both directions. The cascade's no-jail terminus ("this branch needs
+    /// rebasing onto the new main and its agent has no live sandbox — resume the agent") says everything
+    /// <see cref="StrandedReason"/> says <i>and</i> why the branch is back at <c>Working</c>, so letting
+    /// the generic line win discards the only sentence naming both facts — which is exactly what happened
+    /// live on 2026-08-30 to the three co-tenants of the merge that moved main. But the cascade's OTHER
+    /// termini ("the agent is paused with the rebase in progress", "the keep-alive rebase was skipped")
+    /// were every one of them measured with a live jail in hand; if the sandbox has since gone, they
+    /// instruct a human to act inside a container that no longer exists. So the measured reason outranks
+    /// the generic one exactly when it was itself derived from the missing sandbox, and never otherwise.</para>
+    ///
+    /// <para>Not persisted, deliberately, for the reason <see cref="_branchTip"/> is not: it is a
+    /// MEASUREMENT of one cascade attempt at one instant, and a measurement written to SQLite outlives its
+    /// own truth. After a restart the reason is gone and <see cref="_stranded"/> — which
+    /// <see cref="ReconcileJails"/> re-measures against the live container runtime — is what answers, which
+    /// is the correct ordering of a remembered claim and a fresh one.</para>
+    /// </summary>
+    /// <param name="Reason">The sentence <see cref="CanMerge"/> renders verbatim.</param>
+    /// <param name="AccountsForMissingSandbox">True when the reason was produced BY observing that this
+    /// entry has no live sandbox, so <see cref="StrandedReason"/> would only restate it less precisely.</param>
+    private readonly record struct WorkingReason(string Reason, bool AccountsForMissingSandbox);
+
+    /// <summary>
+    /// The newest <c>refs/heads/agent/&lt;id&gt;</c> tip this queue has been told about, per entry — the
+    /// branch-side counterpart of <see cref="_currentMainSha"/>.
+    ///
+    /// <para>Two writers, both monotone in mirror time: the ref watcher's sweep, through
+    /// <see cref="NotifyBranchAdvanced"/> (a mediated agent-ref publish is fast-forward-only), and the
+    /// settle in <see cref="RunVerificationAsync"/>, which advances it to the tip the run was actually
+    /// measured on. The second writer is not redundant — the watcher announces only publishes IT
+    /// performed, and the verification path re-publishes the agent's ref itself (MG-3), so the sweep that
+    /// follows sees <c>Unchanged</c> and stays silent about a tip the queue would otherwise never learn.
+    /// Without it a legitimately fresh verification could be compared against an older observed tip and
+    /// refused.</para>
+    ///
+    /// <para>Deliberately NOT persisted, for the same reason the jail-liveness axis is not: it is a
+    /// MEASUREMENT of the mirror rather than a decision this queue made, and a restart re-learns it from
+    /// the watcher's first sweep. Its absence is honest — an unknown tip declines to answer the freshness
+    /// question rather than manufacturing a "fresh".</para>
+    /// </summary>
+    private readonly Dictionary<string, string> _branchTip = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Per entry, a tip observed WHILE a verification of that entry was in flight — the agent committing
+    /// during its own test run. Cleared when a run starts and again when it settles, so its presence means
+    /// exactly "something moved between those two instants" and nothing else.
+    ///
+    /// <para>It is a separate dictionary rather than a comparison against <see cref="_branchTip"/>, and
+    /// that distinction is load-bearing: <see cref="_branchTip"/> is only as current as the last thing that
+    /// told the queue, and the queue is told by a watcher that does not observe every mover. A rebase (the
+    /// stale cascade) or a commit made while nothing was watching moves the branch without any
+    /// announcement, so the re-verification that follows legitimately measures a tip <see cref="_branchTip"/>
+    /// has never heard of. Reading that difference as "the branch moved mid-run" demoted every re-verified
+    /// entry straight back to <c>Working</c> — a cascade that could never finish, which is precisely the
+    /// unbreakable loop the cascade's own design notes warn about. Two of the provisioner's tests caught
+    /// it. Only an advance the queue was told about DURING the run is evidence of a mid-run move.</para>
+    /// </summary>
+    private readonly Dictionary<string, string> _tipDuringRun = new(StringComparer.Ordinal);
     private string _currentMainSha;
 
     // ---- The jail-liveness axis (ISSUES-LOG #24) ------------------------------------------------------
@@ -296,6 +475,30 @@ public sealed class MergeQueue : IMergeQueue
     /// <summary>Audit event a human discard appends (the durable half is the entry's own persisted row).</summary>
     public const string DiscardedEvent = "queue_entry_discarded";
     public const string RejectedEvent = "queue_entry_rejected";
+
+    /// <summary>
+    /// The audit event for the one action this whole product exists to make safe: a branch reached
+    /// <see cref="WorkerMergeState.Merged"/> and the user's main moved.
+    ///
+    /// <para><b>It had no event at all until now.</b> The chain recorded the act of DISCARDING an entry
+    /// (<see cref="DiscardedEvent"/>) and not the act of merging one — so the single most consequential
+    /// thing the product does, the one that rewrites the user's main branch, was the only one that left
+    /// no tamper-evident artifact. G-17 exists precisely so a consequential pass leaves one.</para>
+    ///
+    /// <para><b>Emitted from here and not from the RPC, deliberately.</b> Four paths reach
+    /// <c>Merged</c> — the <c>ConfirmMerge</c> RPC, the RT-D1 boot reconcile, the external-PR dispatch and
+    /// dev seeding — and an event wired to only the first would leave a crash-recovered merge exactly as
+    /// unrecorded as every merge is today. Both confirm entry points funnel through
+    /// <see cref="MarkMergedLocked"/>, which is why the invariant "no transition to Merged without exactly
+    /// one <c>queue_entry_merged</c>" is enforceable at all. <see cref="MergeAuthorization.Source"/> says
+    /// which path it was.</para>
+    ///
+    /// <para><b>The append is allowed to throw, and that is the point.</b> The chained log throws when it
+    /// cannot store (see <c>IAuditLog.Append</c>); here that surfaces as a failed <c>ConfirmMerge</c> with
+    /// the lease still outstanding, so the merge that really landed is picked up by the next boot's RT-D1
+    /// reconcile. An audit outage therefore delays the record rather than silently losing it.</para>
+    /// </summary>
+    public const string MergedEvent = "queue_entry_merged";
 
     /// <summary>
     /// Audit event appended when the stale cascade could not reparent a branch, carrying the
@@ -427,6 +630,22 @@ public sealed class MergeQueue : IMergeQueue
     /// <param name="gates">Composable merge gates ANDed into <see cref="CanMerge"/> (P2-11/P2-35 hooks).</param>
     /// <param name="audit">Audit sink for the loud override path (<c>stale_override_used</c>).</param>
     /// <param name="clock">Injectable clock (tests use a virtual one).</param>
+    /// <param name="onStateChanged">
+    /// Called with <c>(agentId, newState)</c> after every REAL transition — the seam the daemon reports a
+    /// branch's merge state back onto its agent session through.
+    ///
+    /// <para><b>Why the queue has to say it and the session cannot infer it.</b> An agent session's state
+    /// word is a liveness word: the store writes <c>Working</c> when the sandbox attaches and nothing in
+    /// the session's own world ever learns that the branch verified. So a coordinator asking
+    /// <c>get_worker_status</c> after a green verification was told <c>Working</c> — permanently, and
+    /// while the queue said <c>Verified</c> — which makes a coordinator structurally unable to report the
+    /// completion of its own fan-out (coordinator contract §3). It is deliberately a notification and not
+    /// a second state machine: the words are <see cref="WorkerMergeState"/>'s own, and this queue stays
+    /// the only thing that decides them.</para>
+    ///
+    /// <para>Null in every test that does not care. Never allowed to fail a transition — see the guard at
+    /// the call site.</para>
+    /// </param>
     public MergeQueue(
         string repoHash,
         string currentMainSha,
@@ -436,7 +655,8 @@ public sealed class MergeQueue : IMergeQueue
         Func<string, CancellationToken, Task>? requeue = null,
         IReadOnlyList<IMergeGate>? gates = null,
         IAuditLog? audit = null,
-        Func<DateTimeOffset>? clock = null)
+        Func<DateTimeOffset>? clock = null,
+        Action<string, WorkerMergeState>? onStateChanged = null)
     {
         _repoHash = repoHash ?? throw new ArgumentNullException(nameof(repoHash));
         _currentMainSha = currentMainSha ?? string.Empty;
@@ -447,6 +667,7 @@ public sealed class MergeQueue : IMergeQueue
         _gates = gates ?? Array.Empty<IMergeGate>();
         _audit = audit ?? new InMemoryAuditLog();
         _clock = clock ?? (() => DateTimeOffset.UtcNow);
+        _onStateChanged = onStateChanged;
 
         Hydrate();
     }
@@ -491,6 +712,13 @@ public sealed class MergeQueue : IMergeQueue
             throw new ArgumentException("agentId is required.", nameof(agentId));
         }
 
+        // The measured reason this entry was resting at Working BEFORE anyone asked for a run — captured
+        // here because the transition below is about to delete it (SetStateLocked retires the cascade's
+        // refusal on any move OFF Working, correctly, for a run that actually happens). A run that is
+        // REFUSED never happens, and it must not be able to erase the only sentence naming why the branch
+        // needs a person. See the catch below for the defect this closes.
+        WorkingReason? reasonBeforeRun;
+
         lock (_gate)
         {
             if (!_verifying.Add(agentId))
@@ -498,10 +726,18 @@ public sealed class MergeQueue : IMergeQueue
                 throw new InvalidOperationException($"A verification for '{agentId}' is already in flight.");
             }
 
+            reasonBeforeRun = _workingReasons.TryGetValue(agentId, out var measuredBefore)
+                ? measuredBefore
+                : null;
+
             try
             {
                 // Transition into Verifying (legal from Working / StaleVerified / Verifying-resume).
                 SetStateLocked(agentId, WorkerMergeState.Verifying);
+
+                // Opens the mid-run window. Anything the queue is TOLD about this branch from here until
+                // the settle below happened while its own tests were running.
+                _tipDuringRun.Remove(agentId);
             }
             catch
             {
@@ -524,13 +760,14 @@ public sealed class MergeQueue : IMergeQueue
             record = await _runVerification(agentId, ct).ConfigureAwait(false);
             _verifications.Insert(_repoHash, record);
         }
-        catch
+        catch (Exception ex)
         {
             lock (_gate)
             {
                 _verifying.Remove(agentId);
                 // A failed run surfaces the branch back to Working (not silently retried — edge row 2).
                 SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
+                RestoreWorkingReasonAfterRefusedRunLocked(agentId, reasonBeforeRun, ex);
             }
             Changed?.Invoke();
             throw;
@@ -540,15 +777,59 @@ public sealed class MergeQueue : IMergeQueue
         {
             _verifying.Remove(agentId);
             _lastVerification[agentId] = record;
-            if (record.Passed)
+
+            // Did the branch move while its own tests were running? Answered ONLY from what the queue was
+            // told inside the run window — see _tipDuringRun for why a comparison against the last known
+            // tip is not the same question and gets the cascade wrong.
+            var movedMidRun = _tipDuringRun.TryGetValue(agentId, out var during)
+                && !string.Equals(during, record.BranchSha, StringComparison.Ordinal);
+            _tipDuringRun.Remove(agentId);
+
+            // The queue's knowledge of the branch advances to the newest tip it can justify: the one the
+            // run measured, or the one that overtook it. This writer is not redundant with the watcher —
+            // the verification path re-publishes the agent's ref itself (MG-3), so the sweep that follows
+            // reports `Unchanged` and never announces the tip it just verified, and a freshness compare
+            // against an older observed tip would then refuse a genuinely fresh run.
+            if (movedMidRun)
+            {
+                _branchTip[agentId] = during;
+            }
+            else if (!string.IsNullOrEmpty(record.BranchSha))
+            {
+                _branchTip[agentId] = record.BranchSha;
+            }
+
+            if (record.Passed && movedMidRun)
+            {
+                // The agent committed while its own tests were running. The verdict is true and it is
+                // about a tree nobody is going to merge, so it must not become a green: settling Verified
+                // here is the freeze all over again, one run later and with a fresher timestamp on it.
+                // Working is where an entry with no evidence about its current tip belongs, and the
+                // readiness trigger picks the new tip up on its next sweep.
+                //
+                // The RECORD is still inserted and still returned — it is immutable history and the
+                // caller asked for it. What is refused is promoting it to this entry's standing evidence.
+                _lastVerification[agentId] = null;
+                _verifiedAt[agentId] = null;
+                // Not sandbox-aware: nothing here probed the jail. A stranded entry carrying this reason
+                // gets StrandedReason instead — see WorkingReason.
+                _workingReasons[agentId] = new WorkingReason(BranchMovedReason, AccountsForMissingSandbox: false);
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
+            }
+            else if (record.Passed)
             {
                 _verifiedAt[agentId] = record.When;
                 SettleAfterVerificationLocked(agentId, WorkerMergeState.Verified, verifiedAt: record.When);
             }
             else
             {
-                // Failure surfaced, not silently retried (edge row 2).
-                SettleAfterVerificationLocked(agentId, WorkerMergeState.Working);
+                // H2 — a FAILED verification is its own outcome and gets its own state. This used to settle
+                // to Working, which is where an entry that has NEVER been verified sits, so a red run was
+                // indistinguishable from no run at all: the rail and the worker pane both said "not
+                // verified yet" about a branch whose tests had just failed, Verify was still offered, and
+                // the only way to see the failure was to pay for a second run. Failure surfaced, not
+                // silently retried (edge row 2) — and now surfaced as itself.
+                SettleAfterVerificationLocked(agentId, WorkerMergeState.VerificationFailed);
             }
         }
 
@@ -620,14 +901,35 @@ public sealed class MergeQueue : IMergeQueue
     /// NOT yet landed — i.e. every path that is still ASKING for permission — must call
     /// <see cref="TryConfirmHumanMerge"/> instead (MG-11).</para>
     /// </summary>
-    public void ConfirmHumanMerge(string agentId, string newMainSha)
+    /// <param name="agentId">The entry whose branch landed.</param>
+    /// <param name="newMainSha">The post-merge <c>main@sha</c>.</param>
+    /// <param name="authorization">Who authorised it and by which path — carried into
+    /// <see cref="MergedEvent"/>. Null records the merge as
+    /// <see cref="MergeAuthorization.Unattributed"/> rather than inventing an actor.</param>
+    public void ConfirmHumanMerge(string agentId, string newMainSha, MergeAuthorization? authorization = null)
     {
+        Dictionary<string, string> merged;
         lock (_gate)
         {
-            MarkMergedLocked(agentId);
+            // Already recorded. A second confirm of the same landed merge (a reconcile re-driven after a
+            // confirm that threw past its transition, a repeated on-demand reconcile) must not append a
+            // second queue_entry_merged or fire the cascade twice: "exactly one record per Merged" is the
+            // invariant the event exists to make enforceable.
+            if (GetStateLocked(agentId) == WorkerMergeState.Merged)
+            {
+                return;
+            }
+
+            merged = BuildMergedPayloadLocked(agentId, newMainSha, authorization);
+            // Forced: this records a fact git already holds, whatever state the queue believes the row is
+            // in. A rehydrated row primed back to Working, or one whose verification was overtaken mid-run,
+            // still merged if main contains its branch — refusing here left the queue permanently
+            // disagreeing with the repository, which is the one outcome the reconcile exists to prevent.
+            MarkMergedLocked(agentId, force: true);
         }
 
         NotifyMainMoved(newMainSha);
+        _audit.Append(new AuditEvent(MergedEvent, merged));
     }
 
     /// <summary>
@@ -650,8 +952,14 @@ public sealed class MergeQueue : IMergeQueue
     /// </summary>
     /// <returns>True when the branch moved to <see cref="WorkerMergeState.Merged"/>; false with a
     /// render-verbatim <paramref name="reason"/> (§3.4 vocabulary) when the gate refused.</returns>
-    public bool TryConfirmHumanMerge(string agentId, string newMainSha, string? expectedMainSha, out string reason)
+    /// <param name="authorization">Who authorised it and by which path — carried into
+    /// <see cref="MergedEvent"/>. Null records the merge as
+    /// <see cref="MergeAuthorization.Unattributed"/> rather than inventing an actor.</param>
+    public bool TryConfirmHumanMerge(
+        string agentId, string newMainSha, string? expectedMainSha, out string reason,
+        MergeAuthorization? authorization = null)
     {
+        Dictionary<string, string> merged;
         lock (_gate)
         {
             // The CAS old-OID compare comes first so a lost race reports "main moved" rather than whatever
@@ -669,25 +977,100 @@ public sealed class MergeQueue : IMergeQueue
                 return false;
             }
 
+            // Built BEFORE the transition, under the same lock that decided it: the pre-merge main, the
+            // state the entry merged FROM, and the gate evidence are all facts about the instant the gates
+            // passed. Read after MarkMergedLocked they would describe the world the merge had already
+            // changed — an audit record of its own effect.
+            merged = BuildMergedPayloadLocked(agentId, newMainSha, authorization);
             MarkMergedLocked(agentId);
         }
 
         // Outside the lock: the cascade re-queues co-tenants and raises Changed.
         NotifyMainMoved(newMainSha);
+        _audit.Append(new AuditEvent(MergedEvent, merged));
         reason = "";
         return true;
     }
 
+    /// <summary>
+    /// The <see cref="MergedEvent"/> payload for a merge that is about to be recorded. Caller holds
+    /// <c>_gate</c>; the append itself happens outside it (the chained log does I/O and may throw).
+    ///
+    /// <para>What it has to answer, because these are the questions someone reading the chain after a bad
+    /// merge actually asks: <b>who</b> authorised it and through which path, <b>which branch</b> and under
+    /// <b>which lease</b>, <b>which shas</b> main moved between, <b>which verification record</b> the
+    /// merge rode on (and whether that record was even measured against the main it merged into), and
+    /// <b>what the gates had established</b> — i.e. which flagged items a human waived to get here.</para>
+    /// </summary>
+    private Dictionary<string, string> BuildMergedPayloadLocked(
+        string agentId, string newMainSha, MergeAuthorization? authorization)
+    {
+        var auth = authorization ?? MergeAuthorization.Unattributed;
+        var fields = new Dictionary<string, string>
+        {
+            ["repo"] = _repoHash,
+            ["agent"] = agentId,
+            ["by"] = string.IsNullOrWhiteSpace(auth.By) ? "unknown" : auth.By,
+            ["source"] = auth.Source,
+            ["lease"] = auth.LeaseId,
+            ["from_state"] = GetStateLocked(agentId).ToString(),
+            ["pre_main_sha"] = _currentMainSha,
+            ["post_main_sha"] = newMainSha ?? string.Empty,
+            ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
+        };
+
+        // The verification this merge relied on. Its ABSENCE is a real and important state — the boot
+        // reconcile records merges for entries this queue may never have verified — so it is stated as
+        // such rather than rendered as a row of empty strings that reads like a verification with blank
+        // fields.
+        if (_lastVerification.TryGetValue(agentId, out var record) && record is not null)
+        {
+            fields["verification_main_sha"] = record.MainSha ?? string.Empty;
+            fields["verification_branch_sha"] = record.BranchSha ?? string.Empty;
+            fields["verification_passed"] = record.Passed ? "true" : "false";
+            fields["verification_command"] = record.ResolvedCommand ?? string.Empty;
+            fields["verification_config_hash"] = record.ConfigHash ?? string.Empty;
+            fields["verification_when"] =
+                record.When.ToString("O", System.Globalization.CultureInfo.InvariantCulture);
+        }
+        else
+        {
+            fields["verification"] = "none recorded";
+        }
+
+        // Per gate, in the order the queue ANDs them, so the line reads the same way twice running. A gate
+        // with nothing to say is omitted rather than padded with "(none)" — an empty evidence list is
+        // itself the honest statement that this queue had no must-acknowledge gates wired.
+        var evidence = new List<string>();
+        foreach (var gate in _gates)
+        {
+            var line = gate.MergeEvidence(agentId);
+            if (!string.IsNullOrWhiteSpace(line))
+            {
+                evidence.Add(line!);
+            }
+        }
+
+        fields["gates"] = evidence.Count == 0 ? "no gates wired" : string.Join("; ", evidence);
+        return fields;
+    }
+
     // The Verified → AwaitingReview → Merged walk shared by both confirm entry points. Caller holds _gate.
-    private void MarkMergedLocked(string agentId)
+    private void MarkMergedLocked(string agentId, bool force = false)
     {
         // Allow the human merge from a fresh Verified or an opened AwaitingReview.
-        if (GetStateLocked(agentId) == WorkerMergeState.Verified)
+        var from = GetStateLocked(agentId);
+        if (from == WorkerMergeState.Verified)
         {
             SetStateLocked(agentId, WorkerMergeState.AwaitingReview);
         }
 
-        SetStateLocked(agentId, WorkerMergeState.Merged);
+        // The reconcile's walk: any NON-terminal row may be recorded as merged when git says it landed.
+        // Terminal rows (Rejected, Discarded) still throw — a human closed those, and recording a merge
+        // over a human's decision is a conflict to surface, not a transition to force.
+        var forced = force && !IsTerminal(from)
+            && from is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview);
+        SetStateLocked(agentId, WorkerMergeState.Merged, force: forced);
     }
 
     /// <summary>Rejects a branch (AwaitingReview → Rejected); teardown follows per policy.</summary>
@@ -721,11 +1104,141 @@ public sealed class MergeQueue : IMergeQueue
             _verifiedAt[agentId] = null;
             // The agent moved on, so whatever the last cascade could not reparent is no longer the story
             // of this branch: the new commits are, and they are verifiable from Working like any other.
-            _requeueBlocks.Remove(agentId);
+            _workingReasons.Remove(agentId);
             SetStateLocked(agentId, WorkerMergeState.Working);
         }
 
         Changed?.Invoke();
+    }
+
+    /// <summary>The render-verbatim gate reason for an entry whose branch moved out from under its own
+    /// verification. Public so the surfaces and the tests name the same sentence.</summary>
+    public const string BranchMovedReason =
+        "the branch has new commits since it was verified — re-verifying";
+
+    /// <summary>
+    /// The mirror's <c>refs/heads/agent/&lt;id&gt;</c> for this entry advanced to <paramref name="newSha"/>.
+    /// Records the tip, and — for the two states in which stale evidence would GRANT a merge — invalidates
+    /// the verification the way <see cref="NotifyNewCommits"/> does.
+    ///
+    /// <h3>Why this exists, and why it is not a new state</h3>
+    ///
+    /// <para><b>The defect.</b> <c>Verified</c> was a trap door. Nothing walked a locally-spawned agent's
+    /// entry out of it for the agent's OWN new commits: <see cref="NotifyNewCommits"/> had exactly two
+    /// callers — <c>ExternalPrIntake</c> (an upstream PR head moved) and the dev queue seeder — and neither
+    /// fires for a worker in a jail. <c>WorkerReadinessTrigger</c> only starts runs from
+    /// <c>Working</c>/<c>StaleVerified</c>/<c>VerificationFailed</c>, so nothing re-verified; the human
+    /// Verify button was still offered and threw <c>Verified → Verifying</c> every time; and
+    /// <c>ArmFlaggedChangeReview</c> runs only inside a verification, so the F6 out-of-scope gate stayed
+    /// armed against the diff of two commits ago. The cockpit therefore offered <b>Merge</b> for a tip
+    /// carrying an out-of-scope change and arithmetic that fails the repo's own tests, under the word
+    /// "verified" (2026-08-30, agent <c>4c43d17a</c>).
+    ///
+    /// <para><b>Why <c>Working</c> and not <c>StaleVerified</c>.</b> They look like siblings and they are
+    /// not. <c>StaleVerified</c> says <i>the evidence is still ABOUT this tree, but was measured against an
+    /// old main</i>: the branch's bytes are unchanged, so every acknowledgment still binds to the same
+    /// flagged-set hash, the F6 scope verdict still holds, and the honest remedy is mechanical — rebase
+    /// onto the new main and re-run (which is exactly what the cascade does, and why it KEEPS the record).
+    /// The agent's own commits invalidate something else entirely: the evidence is about a <b>tree that no
+    /// longer exists</b>. Its diff is different, its flagged set is different, every ack is void, and its
+    /// scope classification was computed from bytes nobody will merge. There is nothing to rebase and
+    /// nothing to salvage — there is only "verify the new thing". Routing it through <c>StaleVerified</c>
+    /// would put it in the cascade, retain a <see cref="VerificationRecord"/> and a
+    /// <c>VerifiedAtUtc</c> that assert a verdict about a vanished tree, and let the rail keep reading
+    /// "was green, just needs a refresh" about work nobody has ever tested.</para>
+    ///
+    /// <para>The state that already means <i>there is no evidence about this branch</i> is <c>Working</c>,
+    /// <c>Verified → Working</c> is <b>already</b> a legal edge documented as "new commits from the agent
+    /// invalidate", and <see cref="NotifyNewCommits"/> already implements it exactly. So this change adds no
+    /// state and no edge. It adds the missing CALLER — which is what the defect always was.</para>
+    ///
+    /// <h3>Which states it acts on</h3>
+    ///
+    /// <para>State is moved for <c>Verified</c> and <c>AwaitingReview</c> only: they are precisely the two
+    /// <see cref="CanMergeLocked"/> admits, i.e. the two where stale evidence is not merely wrong but
+    /// dangerous. <c>StaleVerified</c> and <c>VerificationFailed</c> already refuse the merge AND are
+    /// already in the trigger's auto-verify whitelist, so they need nothing here — and demoting
+    /// <c>VerificationFailed</c> would erase the red verdict a human is reading and replace it with "not
+    /// verified yet", the exact conflation H2 exists to end. <c>Verifying</c> is left alone because the run
+    /// owns the entry; the settle in <see cref="RunVerificationAsync"/> compares the tip it measured
+    /// against the tip recorded here and refuses to hand a green to a tree that moved mid-run.</para>
+    /// </summary>
+    /// <param name="agentId">The entry whose branch moved.</param>
+    /// <param name="newSha">The mirror's new tip. Empty is ignored — an unknown tip must never be written
+    /// over a known one, or the freshness compare would start declining to answer.</param>
+    /// <returns>True when this call invalidated a verification (i.e. moved the entry to <c>Working</c>).</returns>
+    public bool NotifyBranchAdvanced(string agentId, string newSha)
+    {
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(newSha))
+        {
+            return false;
+        }
+
+        bool invalidated;
+        lock (_gate)
+        {
+            var state = GetStateLocked(agentId);
+            if (IsTerminal(state))
+            {
+                return false;
+            }
+
+            var previous = _branchTip.TryGetValue(agentId, out var t) ? t : string.Empty;
+            _branchTip[agentId] = newSha;
+
+            // A run owns this entry: the state must not move under it (the settle would then throw
+            // Working → Verified out of a background completion nobody is awaiting). Record the move
+            // instead, and let RunVerificationAsync's settle refuse to promote a verdict the branch has
+            // already overtaken.
+            if (state == WorkerMergeState.Verifying)
+            {
+                _tipDuringRun[agentId] = newSha;
+                return false;
+            }
+
+            // Nothing to invalidate: either this is the tip the entry already stands on (announced twice,
+            // or announced back to the queue after its own verification measured it), or the entry is in a
+            // state where stale evidence cannot grant a merge — see the note above for why that set is
+            // exactly the two states CanMerge admits.
+            invalidated = state is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
+                && !string.Equals(previous, newSha, StringComparison.Ordinal)
+                && !string.Equals(VerifiedBranchShaLocked(agentId), newSha, StringComparison.Ordinal);
+
+            if (!invalidated)
+            {
+                return false;
+            }
+
+            _lastVerification[agentId] = null;
+            _verifiedAt[agentId] = null;
+            // Said out loud rather than left to fall into "not verified yet": the human was one click from
+            // merging this entry a moment ago, and the reason it is no longer offered is a fact about
+            // THEIR branch, not a generic absence.
+            // Not sandbox-aware: this was decided from a ref moving in the mirror, with no question asked
+            // about the agent's jail. A stranded entry carrying this reason gets StrandedReason instead.
+            _workingReasons[agentId] = new WorkingReason(BranchMovedReason, AccountsForMissingSandbox: false);
+            SetStateLocked(agentId, WorkerMergeState.Working);
+        }
+
+        Changed?.Invoke();
+        return true;
+    }
+
+    /// <summary>The branch tip the entry's last verification was measured on, or empty when there is no
+    /// record or the record predates the field. Caller holds <c>_gate</c>.</summary>
+    private string VerifiedBranchShaLocked(string agentId) =>
+        _lastVerification.TryGetValue(agentId, out var r) && r is not null ? r.BranchSha : string.Empty;
+
+    /// <summary>
+    /// The newest branch tip this queue has been told about for an entry, or null when it has never been
+    /// told one. Exposed so the daemon's projection and the tests read the same value the merge gate does.
+    /// </summary>
+    public string? ObservedBranchTip(string agentId)
+    {
+        lock (_gate)
+        {
+            return _branchTip.TryGetValue(agentId, out var tip) ? tip : null;
+        }
     }
 
     /// <summary>
@@ -741,16 +1254,34 @@ public sealed class MergeQueue : IMergeQueue
     /// the measured reason is the difference between an entry a human can act on and one that lies to
     /// them on every refresh.</para>
     ///
-    /// <para>The verification record is cleared with the state, exactly as <see cref="NotifyNewCommits"/>
-    /// does: whatever evidence existed was against a main this branch is no longer parented on.</para>
+    /// <para><b>The verification RECORD is kept</b> — and this is the half that was wrong. The
+    /// <c>VerifiedAtUtc</c> stamp goes, because the entry is no longer verified against anything it could
+    /// merge into; the record itself stays, because it is still evidence about THIS tree. That is exactly
+    /// the distinction <c>StaleVerified</c> is built on (§19.3: "the evidence is still ABOUT this tree,
+    /// measured against an old main"), and this method is reached only from entries the cascade just moved
+    /// through <c>StaleVerified</c> — the branch's bytes did not change, only its parentage. Clearing it
+    /// erased the one thing the row could still honestly say. Observed live on 2026-08-30: three
+    /// co-tenants of a merge, each holding a PASSING <c>VerificationRow</c> (ids 49, 50, 52), rendered
+    /// "Not verified yet — no test run has been recorded for this branch."</para>
+    ///
+    /// <para><b>And it cannot leak into a merge.</b> <see cref="CanMergeLocked"/> reads the record only for
+    /// <c>Verified</c>/<c>AwaitingReview</c>; the only edge out of <c>Working</c> that is not terminal is
+    /// <c>Verifying</c>, whose settle overwrites the record before it can reach either. A retained record
+    /// is readable history and never standing evidence.</para>
     /// </summary>
     /// <param name="agentId">The entry the cascade could not reparent.</param>
     /// <param name="reason">Render-verbatim explanation (§3.4 vocabulary), e.g. the missing jail or the
     /// rebase conflict. Empty falls back to the generic wording.</param>
     /// <param name="detail">Optional extra field for the audit event (never shown as the gate reason).</param>
+    /// <param name="sandboxIsGone">True when <paramref name="reason"/> was produced BY establishing that
+    /// this entry has no live sandbox. It makes the reason outrank <see cref="StrandedReason"/>, which
+    /// would otherwise replace the cascade's own measurement with a strictly less informative restatement
+    /// of half of it. Leave false for every reason measured with a live jail in hand — see
+    /// <see cref="WorkingReason"/>.</param>
     /// <returns>False when the entry is unknown or already terminal — a human discard that landed while
     /// the cascade was running has decided, and this must not walk it back.</returns>
-    public bool TryReturnToWorking(string agentId, string reason, string? detail = null)
+    public bool TryReturnToWorking(
+        string agentId, string reason, string? detail = null, bool sandboxIsGone = false)
     {
         lock (_gate)
         {
@@ -759,11 +1290,10 @@ public sealed class MergeQueue : IMergeQueue
                 return false;
             }
 
-            _lastVerification[agentId] = null;
             _verifiedAt[agentId] = null;
             if (!string.IsNullOrWhiteSpace(reason))
             {
-                _requeueBlocks[agentId] = reason;
+                _workingReasons[agentId] = new WorkingReason(reason, sandboxIsGone);
             }
 
             SetStateLocked(agentId, WorkerMergeState.Working);
@@ -1072,7 +1602,9 @@ public sealed class MergeQueue : IMergeQueue
             _lastVerification.Remove(agentId);
             _verifiedAt.Remove(agentId);
             _verifying.Remove(agentId);
-            _requeueBlocks.Remove(agentId);
+            _workingReasons.Remove(agentId);
+            _branchTip.Remove(agentId);
+            _tipDuringRun.Remove(agentId);
             _stranded.Remove(agentId);
             _jailMeasured.Remove(agentId);
             _store.Delete(_repoHash, agentId);
@@ -1452,6 +1984,32 @@ public sealed class MergeQueue : IMergeQueue
             ["when"] = _clock().ToString("O", System.Globalization.CultureInfo.InvariantCulture),
         }));
 
+    /// <summary>
+    /// Re-enters ONE <see cref="WorkerMergeState.StaleVerified"/> entry through the stale cascade — the
+    /// same <c>requeue</c> delegate <see cref="NotifyMainMoved"/>'s FIFO walk uses (reparent, then
+    /// re-verify), never the direct <see cref="RunVerificationAsync"/>.
+    ///
+    /// <para>Why a second way of asking for the same re-entry exists: the human Verify button and the
+    /// readiness trigger both used to call <see cref="RunVerificationAsync"/> directly on a stale entry,
+    /// which verifies the branch WHERE IT STANDS — a pass pinned to the new main for a branch that does
+    /// not descend from it, i.e. a <c>Verified</c> whose <c>--ff-only</c> merge refuses forever. The
+    /// cascade's re-entry is the only path that reparents first, so a stale entry has exactly one road
+    /// back to green and this is its door. Refused, rather than silently redirected, for any other state:
+    /// the caller asked for a stale re-entry and the entry is not stale.</para>
+    /// </summary>
+    public Task RequeueStaleAsync(string agentId, CancellationToken ct)
+    {
+        var state = GetState(agentId);
+        if (state != WorkerMergeState.StaleVerified)
+        {
+            throw new InvalidOperationException(
+                $"'{agentId}' is {state} — only a StaleVerified entry is re-entered through the cascade.");
+        }
+
+        var requeue = _requeue ?? ((id, token) => RunVerificationAsync(id, token));
+        return requeue(agentId, ct);
+    }
+
     // ---- Internals -------------------------------------------------------
 
     private Task RequeueAllAsync(IReadOnlyList<string> staleFifo)
@@ -1486,6 +2044,21 @@ public sealed class MergeQueue : IMergeQueue
         {
             reason = state switch
             {
+                // FIRST, and ahead of the jail-liveness arm below: a measured reason that was itself
+                // derived from the missing sandbox. It says everything StrandedReason says and also why
+                // the branch is at Working — "this branch needs rebasing onto the new main AND its agent
+                // has no live sandbox — resume the agent". Ordering StrandedReason above it replaced the
+                // cascade's own measurement with a less informative restatement of half of it, which is
+                // what the three co-tenants of the 2026-08-30 merge were shown while the daemon log
+                // carried the honest sentence, and which contradicted MergeQueueProvisioner.Block's own
+                // comment ("rendered verbatim as the CanMerge reason"). See WorkingReason for why this is
+                // a flag on the reason and not a blanket reorder: a reason measured with a LIVE jail in
+                // hand ("the agent is paused with the rebase in progress") would, on an entry whose
+                // sandbox has since gone, send a human into a container that no longer exists.
+                WorkerMergeState.Working
+                    when _workingReasons.TryGetValue(agentId, out var measured)
+                        && (measured.AccountsForMissingSandbox || !_stranded.Contains(agentId))
+                    => measured.Reason,
                 // ISSUES-LOG #24 — the jail-liveness axis outranks both of these, because both of them
                 // promise something that cannot happen without a sandbox. "Re-verifying" is the cascade's
                 // promise and the cascade needs a jail to keep it; "not verified yet" is a sentence about a
@@ -1503,16 +2076,18 @@ public sealed class MergeQueue : IMergeQueue
                 WorkerMergeState.Verifying => _verifying.Contains(agentId)
                     ? "verifying"
                     : "verification stalled — no run in progress",
+                // H2 — the red verdict, said out loud and with the command that produced it. The whole
+                // reason this state exists is that this sentence used to be "not verified yet", which is a
+                // statement about a branch nobody has tested. The gate reason is rendered verbatim, so it
+                // is the one place a human reliably sees the outcome without paying for a second run; it
+                // names the command so the failure is attributable, and points at the output the entry's
+                // own verification log now carries (H4).
+                WorkerMergeState.VerificationFailed => VerificationFailedReason(agentId),
                 // Terminal states get their own words. They used to fall into "not verified yet", which is
                 // a statement about a branch that might still get there.
                 WorkerMergeState.Merged => "already merged",
                 WorkerMergeState.Rejected => "rejected in review",
                 WorkerMergeState.Discarded => "discarded — this entry was dropped from the queue",
-                // A branch the stale cascade could not reparent is at Working like any other unverified
-                // branch, and "not verified yet" would be the second time that fact was reported as
-                // something milder than it is. The measured reason replaces it until the entry moves.
-                WorkerMergeState.Working when _requeueBlocks.TryGetValue(agentId, out var blocked)
-                    => blocked,
                 _ => "not verified yet",
             };
             return false;
@@ -1522,6 +2097,31 @@ public sealed class MergeQueue : IMergeQueue
         if (record is null || !record.Passed || !string.Equals(record.MainSha, _currentMainSha, StringComparison.Ordinal))
         {
             reason = "verification is stale — re-verifying";
+            return false;
+        }
+
+        // The BRANCH-side half of freshness. The compare above proves the evidence was measured against
+        // the main this branch will merge INTO; this one proves it was measured on the branch that will
+        // merge. Without it "fresh" was one-sided, and a Verified entry whose worker pushed three more
+        // commits was still, by every check the daemon made, ready to merge.
+        //
+        // This is a belt, not the mechanism: NotifyBranchAdvanced has already walked such an entry out of
+        // Verified, so a queue whose invalidation is wired reaches here with the two shas equal. It stays
+        // because the invalidation depends on a ref watcher — an observation that can be missed, delayed,
+        // or absent on a substrate that has no watcher at all — and the failure it guards is a human being
+        // shown a green Merge button for untested code. A gate that only holds while an event fires is not
+        // a gate.
+        //
+        // Both sides must be KNOWN to refuse: an empty BranchSha is a record from the seeded path or from
+        // before the field existed, and an absent observed tip is a queue nobody has told. Neither is
+        // evidence of drift, and inventing a refusal from ignorance would make every pre-existing record
+        // unmergeable forever.
+        if (!string.IsNullOrEmpty(record.BranchSha)
+            && _branchTip.TryGetValue(agentId, out var tip)
+            && !string.IsNullOrEmpty(tip)
+            && !string.Equals(record.BranchSha, tip, StringComparison.Ordinal))
+        {
+            reason = BranchMovedReason;
             return false;
         }
 
@@ -1537,6 +2137,47 @@ public sealed class MergeQueue : IMergeQueue
 
         reason = "";
         return true;
+    }
+
+    /// <summary>
+    /// The verbatim gate reason for a <see cref="WorkerMergeState.VerificationFailed"/> entry. Caller
+    /// holds <c>_gate</c>.
+    ///
+    /// <para>The command is included when the record has one and omitted when it does not, rather than
+    /// substituted: a reason that names a command the queue cannot actually evidence would be the same
+    /// class of fabrication as the "not verified yet" it replaces. The fallback wording still says the one
+    /// load-bearing thing — the tests FAILED — because that fact comes from the state, which only the
+    /// record-carrying arm of <see cref="RunVerificationAsync"/> can set.</para>
+    /// </summary>
+    private string VerificationFailedReason(string agentId)
+    {
+        var record = _lastVerification.TryGetValue(agentId, out var r) ? r : null;
+        var command = record?.ResolvedCommand;
+        return string.IsNullOrWhiteSpace(command)
+            ? "the verification FAILED — read the run output, then push a fix or discard the entry"
+            : $"the verification FAILED ({command}) — read the run output, then push a fix or discard the entry";
+    }
+
+    /// <summary>
+    /// The most recent verification this queue settled for an entry — <b>pass or fail</b> — or null when
+    /// it has never produced one.
+    ///
+    /// <para>H4: the daemon held this record and nothing carried it out. The wire's <c>QueueEntry</c> had
+    /// no verification field at all and the client's projection hardcoded <c>Verification: null</c>, so a
+    /// human looking at a failed branch was shown a one-line gate reason and had no route of any kind to
+    /// the stdout/stderr the run actually produced — which sat in an artifact file on the daemon's disk
+    /// that nothing linked to. This is the accessor that lets the transport carry it.</para>
+    ///
+    /// <para>Deliberately the queue's own settled record rather than a store lookup: it is the exact
+    /// record the state was decided from, so what a human reads can never disagree with the state word
+    /// they are reading it under.</para>
+    /// </summary>
+    public VerificationRecord? LastVerification(string agentId)
+    {
+        lock (_gate)
+        {
+            return _lastVerification.TryGetValue(agentId, out var r) ? r : null;
+        }
     }
 
     private bool IsVerificationStaleLocked(string agentId)
@@ -1566,10 +2207,72 @@ public sealed class MergeQueue : IMergeQueue
         SetStateLocked(agentId, target, verifiedAt);
     }
 
-    private void SetStateLocked(string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null)
+    /// <summary>
+    /// Puts a <c>Working</c> entry's render-verbatim reason back after a verification that was
+    /// <b>refused</b> — and, when there was none to put back, records the refusal's own words instead.
+    ///
+    /// <para><b>The defect.</b> Pressing Verify on an entry the stale cascade had blocked used to make
+    /// the surface say LESS than it did before the press. <see cref="RunVerificationAsync"/> transitions
+    /// to <c>Verifying</c> first, <see cref="SetStateLocked"/> drops the measured reason on any move off
+    /// <c>Working</c>, and then the run refuses (no jail, no verification command, a worktree parked on a
+    /// detached HEAD mid-rebase) and settles the entry straight back to <c>Working</c> — now with nothing
+    /// to say. The accurate refusal went to the daemon log and to gRPC's <c>FailedPrecondition</c>, and
+    /// the entry's own gate line fell back to the generic "not verified yet": the human's one available
+    /// action deleted the actionable sentence it was offered next to. Observed live on a rebase-conflict
+    /// entry, whose card went from "the agent is paused with the rebase in progress and needs a human to
+    /// resolve it" to "not verified yet".</para>
+    ///
+    /// <para><b>Why the prior reason wins over the refusal's.</b> Nothing ran, so nothing about the world
+    /// changed: the cascade's measurement is still the most specific true statement about this entry, and
+    /// it is the one written for a human to act on. The refusal is the second-best answer and is used only
+    /// when there was no measurement to keep — which is the ordinary case for an entry that had simply
+    /// never been verified.</para>
+    ///
+    /// <para><b>And only for a TYPED refusal.</b> The set mirrors <c>MergeQueueGrpcService.RunVerification</c>'s
+    /// own catch filter exactly: those are the messages the daemon already puts on the wire verbatim, so
+    /// recording one here exposes nothing new. Anything else — an IO fault, a cancellation — keeps its
+    /// message off a render-verbatim surface rather than leaking whatever a stack happened to contain.</para>
+    /// </summary>
+    private void RestoreWorkingReasonAfterRefusedRunLocked(
+        string agentId, WorkingReason? reasonBeforeRun, Exception failure)
+    {
+        // The settle above is a no-op for an entry that went terminal mid-run (a human discard), so this
+        // is the case where the state is NOT Working and a Working reason would be a "this branch
+        // needs…" sentence recorded under a decision already made.
+        //
+        // Stated plainly: this branch is not separately observable today. `CanMergeLocked` reads
+        // `_workingReasons` only on its Working arm, so a stray entry for a Discarded row changes no
+        // rendered sentence and no test can watch this line fail — it is an invariant kept for the next
+        // reader of the map, not a live behaviour. It is one comparison, and the alternative is a
+        // dictionary that accumulates reasons for entries whose decision is final.
+        if (GetStateLocked(agentId) != WorkerMergeState.Working)
+        {
+            return;
+        }
+
+        if (reasonBeforeRun is { } measured)
+        {
+            _workingReasons[agentId] = measured;
+            return;
+        }
+
+        var quotable = failure is NoVerificationCommandException
+            or MalformedVerificationCommandException
+            or Mainguard.Git.Exceptions.ToolchainProvisioningException
+            or InvalidOperationException;
+        if (quotable && !string.IsNullOrWhiteSpace(failure.Message))
+        {
+            // Not sandbox-aware: this reason was not derived from probing the jail, so a stranded entry
+            // still gets StrandedReason — see WorkingReason.
+            _workingReasons[agentId] = new WorkingReason(failure.Message, AccountsForMissingSandbox: false);
+        }
+    }
+
+    private void SetStateLocked(
+        string agentId, WorkerMergeState target, DateTimeOffset? verifiedAt = null, bool force = false)
     {
         var from = GetStateLocked(agentId);
-        if (from != target)
+        if (from != target && !force)
         {
             if (!Legal.TryGetValue(from, out var allowed) || !allowed.Contains(target))
             {
@@ -1581,11 +2284,52 @@ public sealed class MergeQueue : IMergeQueue
         // and a stale reason outliving the state it explained is how a fixed branch keeps reading broken.
         if (target != WorkerMergeState.Working)
         {
-            _requeueBlocks.Remove(agentId);
+            _workingReasons.Remove(agentId);
         }
 
         _states[agentId] = target;
         SaveRowLocked(agentId, verifiedAt);
+
+        // AFTER the row is persisted, so nothing can be told a state the store does not yet hold — and
+        // only for a REAL move, because a notification for a transition that did not happen is how a
+        // reporting seam starts describing something other than the state machine.
+        if (from != target)
+        {
+            NotifyStateChangedLocked(agentId, target);
+        }
+    }
+
+    /// <summary>
+    /// Reports one transition to <c>onStateChanged</c>, swallowing anything it throws.
+    ///
+    /// <para><b>Reporting a state may never fail a transition.</b> The row is already written when this
+    /// runs; letting an exception out would abort the caller mid-move and leave the persisted state and
+    /// the in-memory state disagreeing about a branch's merge eligibility. Same posture, for the same
+    /// reason, as <c>MergeQueueProvisioner.MarkRunState</c>.</para>
+    ///
+    /// <para>Called under <c>_gate</c>, deliberately. The alternative — deferring to the ~15 sites that
+    /// raise <see cref="Changed"/> outside the lock — is a second, hand-maintained list of transition
+    /// points, and the one that gets forgotten is the one that stops reporting. The sink is a bounded,
+    /// non-blocking in-memory write (<c>AgentSessionStore.MarkState</c> → <c>TryWrite</c>), strictly
+    /// cheaper than the SQLite <c>Save</c> this method already performs under the same lock, and nothing
+    /// in the session store ever calls back into a queue.</para>
+    /// </summary>
+    private void NotifyStateChangedLocked(string agentId, WorkerMergeState target)
+    {
+        if (_onStateChanged is null)
+        {
+            return;
+        }
+
+        try
+        {
+            _onStateChanged(agentId, target);
+        }
+        catch (Exception)
+        {
+            // Deliberately swallowed and deliberately not logged from here: this type has no log sink,
+            // and the only caller that supplies a sink (MergeQueueProvisioner) logs its own failures.
+        }
     }
 
     // Persists the current row for an agent (state + origin) without moving state. Used by EnsureEntry

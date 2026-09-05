@@ -25,9 +25,13 @@ namespace Mainguard.Agents.Agents;
 /// <c>mainguard.agent.role</c> label: <c>""</c>, <c>coordinator</c> or <c>managed</c>. Distinct from the
 /// <c>mainguard.role</c> label, which says what KIND of container this is (<c>agent</c> vs
 /// <c>egress-proxy</c>) and is always <c>agent</c> here.</param>
+/// <param name="ParentAgentId">The coordinator that spawned this jail, from the <c>mainguard.agent.parent</c>
+/// label; empty for an agent nobody spawned or a jail created before the label existed. Without it an
+/// adopted worker has no parent, and its coordinator's <c>status</c>/<c>prompt</c>/<c>verify</c> — all
+/// scoped to <c>ParentAgentId</c> — answer "no worker" for every worker it owns after a restart.</param>
 public sealed record AgentContainerState(
     string AgentId, string RepoHash, string ContainerId, bool Running,
-    bool Paused = false, string Kind = "", string Role = "")
+    bool Paused = false, string Kind = "", string Role = "", string ParentAgentId = "")
 {
     /// <summary>
     /// The jail still exists and is holding the agent's process tree — <see cref="Running"/> <b>or</b>
@@ -68,7 +72,14 @@ public interface IExpectedAgentStore
 public sealed record ReconcileReport(
     IReadOnlyList<string> Pruned,
     IReadOnlyList<string> Adopted,
-    IReadOnlyList<string> Stopped);
+    IReadOnlyList<string> Stopped,
+    IReadOnlyList<string>? Removed = null)
+{
+    /// <summary>Exited containers deleted from the engine (2026-09-04): a jail that is not running is not
+    /// adoptable — its tmpfs home is gone — and until this pass nothing ever removed one, so they
+    /// accumulated on the engine forever. Empty, never null.</summary>
+    public IReadOnlyList<string> RemovedContainers => Removed ?? Array.Empty<string>();
+}
 
 /// <summary>
 /// P2-08 swarm reconciler. On daemon boot it makes <b>Docker the single source of truth</b> for swarm
@@ -96,6 +107,7 @@ public sealed class SwarmReconciler
     private readonly IExpectedAgentStore _expected;
     private readonly IAgentWorktreeManager _worktrees;
     private readonly Func<string, CancellationToken, Task> _stopContainer;
+    private readonly Func<string, CancellationToken, Task> _removeContainer;
     private readonly OrphanPolicy _policy;
 
     /// <param name="listContainers">Lists live <c>mainguard.agent</c> containers from Docker (injected for tests).</param>
@@ -108,8 +120,13 @@ public sealed class SwarmReconciler
         IExpectedAgentStore expected,
         IAgentWorktreeManager worktrees,
         Func<string, CancellationToken, Task>? stopContainer = null,
-        OrphanPolicy policy = OrphanPolicy.Adopt)
+        OrphanPolicy policy = OrphanPolicy.Adopt,
+        Func<string, CancellationToken, Task>? removeContainer = null)
     {
+        // removeContainer deletes an EXITED container by id (the engine's force-remove). A stopped jail is
+        // never adoptable — its tmpfs home died with it — and nothing else ever removed one, so every
+        // crash, OOM kill and engine restart left a dead container behind for good (2026-09-04).
+        _removeContainer = removeContainer ?? ((_, _) => Task.CompletedTask);
         _listContainers = listContainers ?? throw new ArgumentNullException(nameof(listContainers));
         _expected = expected ?? throw new ArgumentNullException(nameof(expected));
         _worktrees = worktrees ?? throw new ArgumentNullException(nameof(worktrees));
@@ -141,6 +158,28 @@ public sealed class SwarmReconciler
         var pruned = new List<string>();
         var adopted = new List<string>();
         var stopped = new List<string>();
+        var removed = new List<string>();
+
+        // Exited jails go first: they are unadoptable by construction, and a record that names one as
+        // "Live" or "Adopted" would be describing a container that cannot run anything.
+        foreach (var container in containers)
+        {
+            if (container.Live)
+            {
+                continue;
+            }
+
+            try
+            {
+                await _removeContainer(container.ContainerId, ct).ConfigureAwait(false);
+                removed.Add(container.AgentId);
+            }
+            catch (Exception)
+            {
+                // Best effort: an exited container the engine will not delete now is the same residue it
+                // was before this pass, and the next boot asks again.
+            }
+        }
 
         // 1. Expected agents whose container is gone → prune + mark Dead.
         foreach (var agent in _expected.All())
@@ -187,7 +226,7 @@ public sealed class SwarmReconciler
             }
         }
 
-        return new ReconcileReport(pruned, adopted, stopped);
+        return new ReconcileReport(pruned, adopted, stopped, removed);
     }
 
     /// <summary>

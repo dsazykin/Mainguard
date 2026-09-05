@@ -429,11 +429,23 @@ public sealed class AgentSessionRepoScopingTests
     internal sealed class RecordingEngine : ISandboxEngine
     {
         private readonly List<(string Repo, string Agent)> _spawns = new();
+        private readonly List<SandboxSpawnRequest> _requests = new();
         private readonly List<string> _removed = new();
 
         public IReadOnlyList<(string Repo, string Agent)> Spawns
         {
             get { lock (_spawns) return _spawns.ToList(); }
+        }
+
+        /// <summary>
+        /// The full spawn requests, so a test can assert what the jail was actually asked for rather than
+        /// only that a spawn happened. Phase 3 needs this: the coordinator role lock is expressed entirely
+        /// in the request's mount fields, and "a coordinator was spawned" says nothing about whether it was
+        /// handed a worktree.
+        /// </summary>
+        public IReadOnlyList<SandboxSpawnRequest> Requests
+        {
+            get { lock (_spawns) return _requests.ToList(); }
         }
 
         public IReadOnlyList<string> Removed
@@ -446,6 +458,7 @@ public sealed class AgentSessionRepoScopingTests
             lock (_spawns)
             {
                 _spawns.Add((request.RepoHash, request.AgentId));
+                _requests.Add(request);
             }
 
             return Task.FromResult(new SandboxHandle($"ctr-{request.RepoHash}-{request.AgentId}", Reused: false));
@@ -477,21 +490,41 @@ public sealed class AgentSessionRepoScopingTests
     {
         private readonly RecordingEngine _engine;
 
-        public FakeAgentEnvironment(string root, RecordingEngine engine)
+        /// <param name="supportsBindMountedUnixSockets">The macOS substrate answers FALSE here — its
+        /// daemon runs on the host while jails run in the engine's Linux VM, and a bind-mounted Unix
+        /// socket is inert across that boundary. A test that wants to stand where that is true (the
+        /// agent-IPC outbox wiring) passes false; everything else keeps the world every other substrate
+        /// lives in.</param>
+        public FakeAgentEnvironment(
+            string root, RecordingEngine engine, bool supportsBindMountedUnixSockets = true)
         {
             _engine = engine;
             Sandboxes = engine;
             Repos = new FakeProvisioner(root);
             Worktrees = new FakeWorktrees(root);
+            Capabilities = new(false, false, "none", "test", supportsBindMountedUnixSockets);
         }
 
         public string SubstrateId => "fake";
 
-        public SubstrateCapabilities Capabilities { get; } = new(false, false, "none", "test");
+        public SubstrateCapabilities Capabilities { get; }
 
         public IRepoProvisioner Repos { get; }
 
         public IAgentWorktreeManager Worktrees { get; }
+
+        /// <summary>The <c>commit_work</c> calls this substrate received — the observable behind "the
+        /// daemon committed for the worker, on the worker's own (repo, agent)".</summary>
+        public IReadOnlyList<(string RepoHash, string AgentId, string? Message)> WorkerCommits =>
+            ((FakeWorktrees)Worktrees).Commits;
+
+        /// <summary>What this substrate's next <c>commit_work</c> will answer, so each outcome's mapping
+        /// onto a response can be exercised at the channel.</summary>
+        public AgentWorkCommitOutcome NextCommitOutcome
+        {
+            get => ((FakeWorktrees)Worktrees).NextCommitOutcome;
+            set => ((FakeWorktrees)Worktrees).NextCommitOutcome = value;
+        }
 
         public ISandboxEngine Sandboxes { get; }
 
@@ -545,6 +578,27 @@ public sealed class AgentSessionRepoScopingTests
 
             public IReadOnlyList<Mainguard.Git.Models.WorktreeItem> List(string repoHash) =>
                 Array.Empty<Mainguard.Git.Models.WorktreeItem>();
+
+            /// <summary>Every <c>commit_work</c> this substrate was asked to perform, in order. Recorded
+            /// rather than performed: what git does with such a commit is pinned against real git in
+            /// <c>Mainguard.Tests.AgentWorkCommitTests</c>, and what belongs here is whether the daemon
+            /// asked for the right (repo, agent) and passed the worker's message through unchanged.</summary>
+            public List<(string RepoHash, string AgentId, string? Message)> Commits { get; } = new();
+
+            /// <summary>What the next commit will answer. Settable so the daemon's mapping of each
+            /// outcome onto a response is testable at the channel — the mapping is where "nothing to
+            /// commit" could quietly become "committed", which is the original defect wearing a success
+            /// message.</summary>
+            public AgentWorkCommitOutcome NextCommitOutcome { get; set; } = AgentWorkCommitOutcome.Committed;
+
+            public AgentWorkCommitResult CommitAgentWork(string repoHash, string agentId, string? message)
+            {
+                Commits.Add((repoHash, agentId, message));
+                return new AgentWorkCommitResult(
+                    NextCommitOutcome, "agent/" + agentId,
+                    Sha: NextCommitOutcome == AgentWorkCommitOutcome.Committed ? new string('a', 40) : null,
+                    Detail: NextCommitOutcome == AgentWorkCommitOutcome.Committed ? null : NextCommitOutcome.ToString());
+            }
         }
 
         private sealed class FakeEgress : IEgressPolicy

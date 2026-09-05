@@ -46,6 +46,22 @@ git credentials, and no view of repository contents; a plan it authored would de
 not inspect. The worker has the context, so the plan describes what will actually be done rather than
 what was guessed before anyone looked.
 
+### The plan gate is the operator's choice — ON by default (2026-08-30)
+
+Everything in this section describes the gate **when plan mode is on**, which is the default and the
+shipped behaviour. The owner made planning a toggle: with it off, a delegated worker receives its task at
+spawn and implements immediately, with no plan authored and no approval.
+
+Off is a **mode**, not a set of skipped checks: the daemon still holds the worker, still counts it against
+`MaxActiveWorkers`, still lets the merge queue and the readiness trigger ask about it, and records on the
+merge itself that this branch was authorised by a standing operator setting rather than by a human reading
+a plan. The setting lives daemon-side (`PlanModeSwitch`), is denied to the coordinator role at
+`RoleInterceptor` — a coordinator that could turn it off would hold the gate it is denied at, wholesale —
+and fails closed. The full design, and what OFF changes at each enforcement point, is
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.
+
+Human gate #2 — the merge review — is untouched in both modes.
+
 ### The plan gate is blocking, and rejection is feedback
 
 The worker **does not start work until its plan is approved**. Rejection does not kill the worker —
@@ -124,6 +140,16 @@ Two consequences worth being explicit about, since both are easy to misread:
   reachable on the egress allowlist (OAuth workers need them), so the limit is not enforced by blocking
   the route. See the residual-bypass note in `oauth-budgeting.md`.
 
+### 2.2 One coordinator per daemon (owner decision, 2026-09-03)
+
+A daemon runs **at most one live coordinator**. `AgentSpawnService.SpawnAsync` refuses a second one
+(`CoordinatorLimits.MaxLiveCoordinators = 1`), naming the one that is running; stop it before starting
+another. The reason is the plan gate: it streams every coordinator's cards to the one operator surface with
+no repository on them, so two live coordinators meant a plan a human could approve from the wrong
+repository's window. The rule governs spawns only — a restart's adoption pass re-admits whatever was
+already running, because adoption records what exists rather than deciding what may. Ownership scoping
+(§7) stays exactly as built, as defence in depth.
+
 ## 3. The surface — the complete set of coordinator operations
 
 These four already exist as `CoordinatorTools`. The contract is that this list is **exhaustive**.
@@ -133,10 +159,111 @@ These four already exist as `CoordinatorTools`. The contract is that this list i
 | `spawn_worker` | start a worker on a described task | kill switch · worker cap · admission · budget (BYOK only — see §2.1) |
 | `get_worker_status` | status of workers it owns | ownership scope |
 | `send_worker_prompt` | steer a worker it owns | kill switch · ownership scope |
-| `request_verification` | propose a worker's branch for daemon verification | ownership scope |
+| `request_verification` | propose a worker's branch for daemon verification — **returns once the run is accepted or refused; the verdict reaches `get_worker_status`** (decided by the owner 2026-09-03: the shipped op blocked on the whole suite while its shim gave up at 60 s) | ownership scope |
 
 Anything not on this list is denied. Adding to this list is a deliberate contract change, reviewed as
-such — not an implementation detail.
+such — not an implementation detail. So is changing the shape of one of them: `spawn_worker`'s arguments
+were changed on **2026-08-29** and that change is recorded as a contract change, in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §13.
+
+**`spawn_worker` takes a title AND a task, and they are different things.** The CLI form is
+
+```
+mainguard-agent spawn <agent-kind> --title "<short title>" --task <the task ...>
+```
+
+The **title is the brief** — the only thing the worker is given before its plan is approved (§3.1
+`brief`), and the headline the human reads on the approval card. The **task is withheld** until that
+approval. Both are required: a spawn missing either, or whose title *is* its task, is refused
+daemon-side rather than defaulted. This is stated in the contract because the alternative was tried and
+failed silently — the shim sent no title, the daemon derived one from the task, and "the brief is never
+the task" was false everywhere while every test was green.
+
+**`get_worker_status` must be able to say "done".** It is the coordinator's only window onto its own
+fan-out, so a status that can only ever describe the jail's liveness makes a coordinator structurally
+unable to report completion — which is what it was: the session's state word was written once by the
+sandbox attach ("Working") and no merge outcome ever moved it, so a worker whose branch had committed,
+verified green and reached `Verified` still reported "Working … actively working", permanently. A branch's
+merge state is therefore reported onto its agent as it moves, in `WorkerMergeState`'s own words
+(`Verifying`, `Verified`, `StaleVerified`, `AwaitingReview`, `Merged`, `Rejected`, `Discarded`, and back to
+`Working`). It is a report, not a second state machine: the merge queue remains the only thing that decides
+those words, and jail liveness remains the reconciler's axis.
+
+### 3.1 The WORKER's surface, which is a different exhaustive list
+
+A worker's jail carries `mainguard-plan`, never `mainguard-agent`, and the daemon dispatches on the
+endpoint's role — so the two lists are disjoint and neither role can reach the other's operations
+(phase 2 §2.7). The worker's list is exhaustive on the same terms, and `AgentIpcRequest.WorkerOps` is the
+object the daemon builds its handler table against.
+
+| op | purpose | gates applied |
+|---|---|---|
+| `brief` | what am I here to plan? | never yields the task prompt |
+| `task` | what am I here to do? | **approved plan** (`MayWork`) — or plan mode off |
+| `present_plan` | present the plan I authored, then block | one live plan per worker |
+| `revise_plan` | re-present after a **rejection**, then block | plan ownership · revision budget |
+| `rescope_plan` | widen an **approved** plan, then block | plan ownership · approved plan · one live re-scope · escalation is terminal |
+| `await_decision` | re-attach and block on my own plan | plan ownership |
+| `commit_work` | record my approved work on my own branch | **approved plan** (`MayWork`) |
+
+`rescope_plan` was added on **2026-08-30** and, like `spawn_worker`'s argument change, it is recorded as
+a contract change rather than an implementation detail — in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.
+
+**An approved scope can be changed, and only by asking.** Live testing found a worker that discovered
+mid-task it had to touch a neighbouring file and was refused by both existing ops — `present_plan`
+because one live plan per worker means an approved plan blocks a second, `revise_plan` because it acts
+only on a rejected one. Each refusal is correct about its own op; together they left a worker trying to
+stay legal with two moves, both bad: exceed its approved scope silently, or stop. `rescope_plan` is the
+third move. It presents a revised plan against the approval the worker already holds, and a human
+decides it exactly as they decided the first.
+
+Four properties of it are contract-level, because each of them is a thing the daemon must keep true
+rather than a way the code happens to be arranged:
+
+- **It is not a revision.** `revise_plan` answers a rejection and spends the revision budget;
+  `rescope_plan` follows an approval and spends none. A worker whose plan was rejected the maximum number
+  of times and *then* approved must still be able to widen it — charging the same budget would leave the
+  workers that had the hardest time agreeing a plan with no legal way to change it.
+- **The approved plan keeps authorising the worker until the human decides**, and is retired only when
+  the wider one is approved. A worker is never suspended for asking: steering, verification and
+  `commit_work` keep answering off the scope that was already approved. Blocking it would make the legal
+  move more expensive than the silent one.
+- **A worker has exactly one approved plan, or none.** `resolveApprovedPlan` hands that plan's scope to
+  the flagged-change gate, so this is what makes F6 measure against the *current* authorisation instead
+  of a stale or an absent one.
+- **Work already done outside the scope is not re-policed here.** The flagged-change gate already puts
+  every out-of-scope file in front of a human at verification and blocks the merge until it is
+  acknowledged; a re-scope asked late is accepted so that the human hears the reason before they see the
+  diff. There is one mechanism, not two.
+`task` was added on **2026-08-30** with the plan-mode toggle, and is recorded as a contract change in
+[`coordinator-phase-3-decisions.md`](coordinator-phase-3-decisions.md) §23.4. It is a second **door** onto
+the withheld task, never a second decision about it: it calls the same `WorkerPlanGate.TryReleaseTask` —
+with the same release-once audit record — that an approval fires, and is authorised by the same `MayWork`
+predicate as `commit_work`. It exists because with plan mode off there is no `present`, which until then
+was the only path that ever returned a task, and a worker would otherwise have no way to learn what it was
+spawned to do. The two alternatives were both worse: redefining `brief` would make "never yields the task
+prompt" conditionally false (§13's defect exactly), and putting the task in the launch argv would give up
+the structural guarantee that `AgentKickoffPrompt` *cannot* carry it.
+
+**Escalation is terminal, with one human-granted exception (owner decision, 2026-09-03).** After the
+rejection that spends the revision budget, the daemon refuses any further `present_plan` from that worker
+— until then it merely told the worker to stop, and a worker that presented anyway got a fresh budget
+(the loop the limit exists to bound, reopened from the worker's side). A human may send the escalated plan
+back for **one** fresh plan, with guidance, through the operator-only `RequestNewPlan` RPC (denied to the
+coordinator role, on the `ApprovePlan`/`RejectPlan` boundary). The guidance reaches the worker as the
+feedback on its escalated plan (`brief`, `await <id>`), exactly one more presentation is accepted, and a
+second escalation is terminal for good.
+
+`commit_work` is the step that makes a worker's work outlive its jail, and it is where the loop used to
+end one rung short: a worker finished, stopped on an uncommitted diff, and the worktree was deleted with
+the jail. It is gated by the same `MayWork` predicate as steering and verification, because a worker still
+at the gate has no authorised work to record.
+
+**The worker names only the message.** Which repository, which worktree and which branch are computed
+daemon-side from the endpoint's own identity — the same structure that stops an agent naming a ref at all
+(`AgentRefMediator`). It grants no capability a worker lacked: every agent already owns the repository its
+worktree is linked off, precisely so that committing stays available to it.
 
 ## 4. What the coordinator may never do
 

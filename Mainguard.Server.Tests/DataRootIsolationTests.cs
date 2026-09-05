@@ -131,6 +131,21 @@ public class DataRootIsolationTests
     /// step 3's "snapshot written BEFORE returning" wrote into an object that died with the process —
     /// which is the one process an emergency stop is followed by restarting. Giving it a file made it a
     /// store, and every daemon store belongs under this test.</para>
+    ///
+    /// <para><b>Why it grew again (2026-09-04):</b> <c>ResolveJailLimitsPath</c>, the operator's per-jail
+    /// memory/CPU ceiling. A test host that wrote a 512 MiB ceiling into the developer's real data root
+    /// would starve their next real spawn, silently, until they found the Settings page.</para>
+    ///
+    /// <para><b>Why it grew again (2026-08-30):</b> <c>ResolvePlanModePath</c>, for the operator's
+    /// plan-mode toggle. It is a one-boolean file and it is still a daemon store — and this one has a
+    /// sharper failure than most if it escapes isolation: an in-proc test host that turned plan mode off
+    /// in the developer's real data root would leave the human approval gate off on the next real
+    /// daemon start, silently.</para>
+    ///
+    /// <para><b>Why it grew again (2026-09-03):</b> <c>ResolveHeldTaskStorePath</c>, for the plan gate's
+    /// held tasks (<c>JsonHeldTaskStore</c>, beside the plan store). A gate whose held tasks lived only in
+    /// memory forgot every one of them on a daemon restart while the jails survived, so the merge backstop
+    /// opened for an unapproved worker and an approved one never received its task.</para>
     /// </summary>
     [Fact]
     public void Every_daemon_store_path_resolver_is_covered_by_the_fallback_test()
@@ -139,9 +154,12 @@ public class DataRootIsolationTests
         {
             "ResolveAgentIpcRoot",
             "ResolveDataPath",
+            "ResolveHeldTaskStorePath",
+            "ResolveJailLimitsPath",
             "ResolveKillJournalPath",
             "ResolveLeaderRegistryPath",
             "ResolveLogsDirectory",
+            "ResolvePlanModePath",
             "ResolvePlanStorePath",
         };
 

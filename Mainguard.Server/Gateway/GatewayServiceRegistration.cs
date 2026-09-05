@@ -124,7 +124,9 @@ public static class GatewayServiceRegistration
         // load-bearing detail — the SAME IMergeLeaseStore singleton the foreground merge, BeginMerge and
         // MergeDispatch contend for, since the one-outstanding-merge-per-repo invariant only spans origins
         // while they share one store (MG-23).
-        services.AddSingleton(sp => new MergeQueueProvisioner(
+        services.AddSingleton(sp =>
+        {
+            var provisioner = new MergeQueueProvisioner(
             registry: sp.GetRequiredService<MergeQueueRegistry>(),
             repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
             leases: sp.GetRequiredService<IMergeLeaseStore>(),
@@ -221,15 +223,83 @@ public static class GatewayServiceRegistration
             // holds at the plan gate and the same id the merge queue tracks the branch under — so this is
             // the exact binding, not an inference from a coordinator or a session field.
             //
-            // Read through `Approved` only: LatestForWorker answers with the worker's newest plan in ANY
-            // state, and a pending or rejected plan's scope has authorised nothing. An id with no approved
-            // plan (a manual-mode agent, an external-PR head, a seeded entry without with_plan) resolves
-            // null exactly as before, which reads as "unmanaged" and skips the scope comparison entirely.
-            resolveApprovedPlan: agentId =>
-                sp.GetRequiredService<PlanApprovalService>().LatestForWorker(agentId) is
-                { Status: PlanStatus.Approved } approved
-                    ? approved.Plan
-                    : null));
+            // Read through ApprovedForWorker, which is the ONE authority for "what is this worker cleared
+            // to do". An id with no approved plan (a manual-mode agent, an external-PR head, a seeded
+            // entry without with_plan) resolves null, which reads as "unmanaged" and skips the scope
+            // comparison entirely.
+            //
+            // This line used to be `LatestForWorker(...) is { Status: Approved }`, and that was correct
+            // only while a worker's newest plan was always its authorisation. The re-scope op ends that: a
+            // pending re-scope is NEWER than the plan it widens, so the filtered-latest read answers null
+            // — and null means "unmanaged", so a worker would have lost its F6 out-of-scope coverage by
+            // the act of asking to widen legally, silently, for as long as the human took to decide. The
+            // policy lives in PlanApprovalService now rather than here, so there is one copy of it.
+            // ApprovedWorkFor, not ApprovedPlanFor: the same lookup answers both halves of an approval —
+            // the SCOPE the diff is compared against, and the APPROACH the human is shown at review
+            // together with whatever the worker declared about departing from it. One call so the two can
+            // never name two different plans after a re-scope.
+            resolveApprovedWork: agentId =>
+                sp.GetRequiredService<PlanApprovalService>().ApprovedWorkFor(agentId),
+            // ---- "Let the agent resolve" needs a way to TELL the agent ---------------------------------
+            //
+            // The keep-alive cascade's conflict arm pauses a jail mid-rebase. Unpausing it is half an
+            // action: an agent frozen without explanation resumes whatever it was doing, on top of a
+            // half-finished rebase. So the hand-back sends an instruction, and it sends it through the
+            // SAME prompt-delivery path a coordinator's `send_worker_prompt` uses — the measured
+            // body-then-CR-as-a-separate-frame submission — rather than growing a second way to type at a
+            // worker. Two writers to a PTY is how one of them regresses to "the prompt accumulated
+            // unsubmitted in its input box" while the other stays fixed.
+            //
+            // Resolved lazily inside the delegate: the binder is registered by DaemonHost, and taking it
+            // as a constructor dependency here would tie the queue provisioner's construction to the
+            // terminal stack it has nothing else to do with.
+            promptAgent: async (repoHash, agentId, prompt, ct) =>
+                (await sp.GetRequiredService<Runtime.AgentCliBinder>()
+                    .TrySendPromptAsync(new Runtime.AgentSessionKey(repoHash, agentId), prompt, ct)
+                    .ConfigureAwait(false)).Submitted);
+
+            // ---- G1: the other half of "a queue row requires an approved plan" -------------------------
+            //
+            // MergeQueueProvisioner.EnsureEntry now WITHHOLDS the row for a worker still at the plan gate,
+            // which at spawn time is every coordinator-spawned worker there has ever been. Approval is the
+            // moment the gate's answer changes, and therefore the moment those withheld rows are owed — so
+            // this subscription is not a nicety, it is what keeps the normal path working. Without it a
+            // legitimately approved worker would simply never appear in the queue.
+            //
+            // Subscribed HERE because this factory is the one place that holds the provisioner instance; a
+            // wiring step in a hosted service would be a second thing to delete, and "registered but never
+            // running" is the defect class this whole subsystem exists to have repaired once (MG-10).
+            //
+            // The approved plan is deliberately ignored: the event says *a* plan was approved, and
+            // AdmitDeferredEntries re-asks the gate about each deferred candidate itself. Threading the id
+            // through as a hint would put the authorisation rule in two places, and MG-12 is the standing
+            // reason not to. Swallowing is the same posture as MergeQueue's onStateChanged — creating a
+            // queue row may never fail the human's plan approval.
+            sp.GetRequiredService<PlanApprovalService>().PlanApproved += _ =>
+            {
+                try
+                {
+                    provisioner.AdmitDeferredEntries();
+                }
+                catch (Exception ex)
+                {
+                    log?.Invoke($"merge queue — admitting plan-gated queue rows failed: {ex.Message}");
+                }
+            };
+
+            // The conflict hand-back's one exception to the mirror's fast-forward rule: a human chose "let the
+            // agent resolve", so the worker's finished rebase — a rewrite of published history — may reach the
+            // mirror ONCE. Wired here because the mediator lives inside the worktree manager and knows nothing
+            // of parked conflicts; the mark is the provisioner's, consumed on the publish it lets through.
+            if (sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager rewriteHost)
+            {
+                rewriteHost.PermitHandedBackRewrite(
+                    provisioner.ParkedConflicts.IsHandedBack,
+                    (repo, agent) => provisioner.ParkedConflicts.ClearHandedBack(repo, agent));
+            }
+
+            return provisioner;
+        });
 
         services.AddSingleton(sp =>
         {
@@ -268,7 +338,9 @@ public static class GatewayServiceRegistration
             listContainers: BuildContainerLister(),
             expected: sp.GetRequiredService<IExpectedAgentStore>(),
             worktrees: sp.GetRequiredService<IAgentEnvironment>().Worktrees,
-            policy: OrphanPolicy.Adopt));
+            policy: OrphanPolicy.Adopt,
+            // Exited jails are deleted at boot (2026-09-04): unadoptable, and until now never removed.
+            removeContainer: (id, ct) => sp.GetRequiredService<IAgentEnvironment>().Sandboxes.RemoveAsync(id, ct)));
 
         // Boot order: merge-reconcile (RT-D1, FIRST — before admission) → swarm (container) reconcile →
         // P2-09 leader reattach (containers → leaders → PTY reattach; mismatches resolved toward Docker
@@ -283,7 +355,12 @@ public static class GatewayServiceRegistration
                 journal: dbFactory is null
                     ? new Mainguard.Git.Services.NullOperationJournal()
                     : new Mainguard.Git.Services.OperationJournal(dbFactory),
-                resolveRepoPath: _ => null, // repos map in as their swarms come up; none at boot.
+                // No repo can be resolved at boot, so this slot reconciles NOTHING — and that was, for a
+                // long time, the only reconcile there was. The real one runs per repo in
+                // MergeQueueProvisioner.EnsureQueue's created branch (against the mirror) and on demand
+                // in BeginMerge (TryReconcileLandedLease). This task stays only because the boot sequence
+                // is ordered around its slot.
+                resolveRepoPath: _ => null,
                 onMerged: (repoHash, agentId, postSha) =>
                 {
                     // MG-29: this was `foreach (var handle in Array.Empty<string>())` — a hardcoded
@@ -291,7 +368,12 @@ public static class GatewayServiceRegistration
                     // branch stayed "Verified" against a main that had already moved. The reconcile task
                     // now hands us the lease's repo hash, so the owning queue is a direct lookup.
                     // Best-effort: a repo whose swarm has not come up yet simply has no queue to notify.
-                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(agentId, postSha);
+                    //
+                    // Attributed to the reconciler and never to a person: this records the daemon
+                    // reflecting a merge that landed before a crash, so a `by` naming whoever happened to
+                    // be signed in would put a human's name on a decision nobody made at boot.
+                    registry.Resolve(repoHash)?.Queue.ConfirmHumanMerge(
+                        agentId, postSha, MergeAuthorization.BootReconcile());
                 });
 
             // Both reconcile steps now RECORD what they did. Boot reconcile is the one pass that can
@@ -365,6 +447,32 @@ public static class GatewayServiceRegistration
                     queues: sp.GetRequiredService<IMergeQueueRegistry>(),
                     planGate: sp.GetRequiredService<WorkerPlanGate>(),
                     limits: sp.GetRequiredService<CoordinatorLimits>(),
+                    log: log,
+                    // The pause axis + the state word, the same predicate the prompt/verify guards ask.
+                    isFrozen: FrozenPredicate(sp.GetRequiredService<AgentSessionStore>()))
+                : null!);
+
+        static Func<string, string, bool> FrozenPredicate(AgentSessionStore sessions) =>
+            (repoHash, agentId) =>
+                sessions.Find(new AgentSessionKey(repoHash, agentId)) is { } session
+                && FrozenJailPolicy.IsFrozen(session.State, sessions.FrozenReason(session.Key));
+
+        // ...and the OTHER subscriber on that same sweep. The trigger above answers "when should this
+        // branch be verified"; this one answers "is the verification this branch already has still ABOUT
+        // this branch". Nothing answered the second question, so a locally-spawned agent's entry that
+        // reached Verified stayed Verified through every commit it pushed afterwards — Merge enabled,
+        // footer "ready to merge", for a tree that had never been tested. See BranchTipInvalidator for the
+        // live observation and for why it is not a branch of the trigger (the trigger debounces; a merge
+        // gate must not).
+        //
+        // Same substrate condition and the same degraded answer: no WorktreeManager means no watcher means
+        // no observation to make. The daemon still starts, and MergeQueue.CanMerge still compares the
+        // record's branch sha against the tip it knows, so the gate does not depend on this being present.
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager worktrees
+                ? new BranchTipInvalidator(
+                    source: worktrees.RefWatcher,
+                    queues: sp.GetRequiredService<IMergeQueueRegistry>(),
                     log: log)
                 : null!);
 
@@ -373,6 +481,14 @@ public static class GatewayServiceRegistration
         // registered and never constructed — registered-but-never-running is the exact defect this
         // subsystem exists to have repaired once.
         services.AddHostedService<Runtime.WorkerReadinessHostedService>();
+        // The mirror-freshness sweep (owner decision 2026-09-04): each live queue's mirror main is pulled
+        // forward from the checkout on an interval, so the rail's "refreshed N min ago" is a bound and a
+        // pull made outside Mainguard reaches the queue without waiting for the next repo-open.
+        services.AddHostedService<Runtime.MirrorMainRefreshHostedService>();
+        // The jail reaper (owner decision 2026-09-04): a jail whose entry is terminal, or that has had no
+        // CLI bound to it for the idle allowance, is stopped through the ordinary Stop path. Before this,
+        // only a human pressing Stop ever removed a jail.
+        services.AddHostedService<Runtime.JailReaperHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();
@@ -407,7 +523,11 @@ public static class GatewayServiceRegistration
             // listing. Passed here rather than given its own hosted service because the answer is the same
             // answer — a second Docker timer would poll the engine twice for one fact and then have to
             // decide which copy wins.
-            queues: sp.GetRequiredService<IMergeQueueRegistry>()));
+            queues: sp.GetRequiredService<IMergeQueueRegistry>(),
+            // An adopted jail still has its IPC directory mounted (the server no longer deletes it on
+            // shutdown); this re-binds the listener at that same path so the adopted agent's shim works.
+            // Resolved lazily, at call time, because AgentSpawnService sits above this in the graph.
+            onAdopted: session => sp.GetRequiredService<Runtime.AgentSpawnService>().TryReattachEndpoint(session)));
         services.AddHostedService<Runtime.AgentSessionReconcilerService>();
     }
 

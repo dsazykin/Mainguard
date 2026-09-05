@@ -95,25 +95,36 @@
     Rationale, the measured `localhostForwarding` exposure, and why a UDS + `SO_PEERCRED` was rejected
     for this topology: `docs/security-architecture.md`.
 - **`Auth/BearerTokenInterceptor.cs`** — authenticates **every** RPC (unary/all-streaming) via a constant-time compare (`CryptographicOperations.FixedTimeEquals`); no public-method allowlist (invariant 1); mismatch → `PermissionDenied`.
-- **`Auth/RoleInterceptor.cs`** (P2-14) — daemon-side role + terminal-lock enforcement at the gRPC
+- **`Auth/RoleInterceptor.cs`** (P2-14; 2026-09-04 adds `AgentService/SetJailLimits` to the coordinator's
+  deny list — the ceiling is the operator's lever over the machine's memory) — daemon-side role + terminal-lock enforcement at the gRPC
   layer (runs after auth, before the mask). **Role:** a `ConnectionRole.Coordinator` credential
   (looked up in `ConnectionRoleRegistry` by bearer token — role bound to the token, not
   client-asserted) is denied the merge RPCs (`BeginMerge`/`ConfirmMerge`/`AbandonMerge`/
-  `AcknowledgeFlaggedChange`), the human entry-lifecycle RPCs
-  (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the evidence
-  blocking its own branch instead of clearing the gate, and clearing a stalled verification puts a
-  branch into the state a re-verification starts from), **`AgentService/ResumeAgent`** (adoption is
+  `AcknowledgeFlaggedChange` — MG-11, merge power by another name), the human entry-lifecycle RPCs
+  (`DiscardEntry`/`RejectEntry`/`ClearStalledVerification` — a discard an agent could invoke erases the
+  evidence blocking its own branch instead of clearing the gate, and clearing a stalled verification puts
+  a branch into the state a re-verification starts from), the two parked-conflict actions
+  (`ResolveConflictWithAgent`/`AbortRebase` — the first is `UnpauseAgent` plus the terminal input lock's
+  whole purpose in one call, reached from a different service; the second rewrites a co-tenant branch's
+  parentage and resumes its jail), **`AgentService/ResumeAgent`** (adoption is
   strictly MORE power than the merge RPCs above: an agent able to adopt an arbitrary id could attach a
   writable jail to another agent's branch and have the daemon verify what it put there — and because
   this interceptor dispatches by METHOD, that is why resume is its own RPC rather than a field on
-  `SpawnAgentRequest`) and the human-only
-  plan-approval RPCs (`ApprovePlan`/`RejectPlan`) with `PermissionDenied` (the coordinator can't merge
-  or approve its own plans), and the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` —
-  the chain carries other agents' prompts/outputs and the human's decisions, none of it a
-  coordinator's to read), and every `QueueSeedingService` method unconditionally (seeding composes
-  EnsureEntry + a supplied verification outcome + the merge walk — every power this list denies
-  piecemeal, reachable at once; the boot flag decides whether the OPERATOR gets the surface, never
-  whether an agent does). **Terminal input lock:** wraps the `TerminalService.Attach` request
+  `SpawnAgentRequest`), the human-only plan-approval RPCs (`ApprovePlan`/`RejectPlan`/**`SetPlanMode`** — the last added
+  2026-08-30 with the plan-mode toggle: a coordinator that could turn the gate off would hold it
+  wholesale, for every worker it spawns from then on, with no card ever reaching a human), the scrollback
+  read (`GetScrollback` — MG-30: serves any agent's daemon-side scrollback ring, up to 1000 rows per
+  attach, which a coordinator could otherwise use to read another agent's terminal history it was never
+  attached to), the P2-15 audit RPCs (`AuditService/VerifyAudit` + `ReadAudit` — the chain carries other
+  agents' prompts/outputs and the human's decisions, none of it a coordinator's to read), and every
+  `QueueSeedingService` method unconditionally (seeding composes EnsureEntry + a supplied verification
+  outcome + the merge walk — every power this list denies piecemeal, reachable at once; the boot flag
+  decides whether the OPERATOR gets the surface, never whether an agent does) — all with `PermissionDenied`
+  (the coordinator can't merge, approve its own plans, or read what it shouldn't). **Note the honest
+  caveat recorded in `coordinator-phase-3-decisions.md` §6:** `ConnectionRoleRegistry.IssueCoordinatorToken`
+  has NO production callers, so this governs a credential class nothing currently mints — moot today only
+  because the in-jail coordinator has no gRPC route at all (its only channel is the IPC socket, which is
+  where phase 3 put the enforceable surface). **Terminal input lock:** wraps the `TerminalService.Attach` request
   stream so a `data` (input) frame toward a `TerminalLockRegistry`-locked (managed-worker) agent is
   rejected server-side while the read/output stream flows — never UI-only.
 - **`Auth/SeedingGateInterceptor.cs`** — the dev-only queue-seeding BELT (docs/design/queue-seeding.md
@@ -216,14 +227,28 @@
     seed arbitrary agent-home files), and `HarvestCliCredentialsAsync` reads those files back out of the
     jail's tmpfs `$HOME` (base64 over the exec pipe, best-effort — a failed harvest never blocks a stop)
     so `AgentSpawnService.StopAsync` can hand them to the client for the host OS keychain
-    (`AgentStopResult`). It owns the same two halves for the **CLI SETTINGS round-trip**:
+    (`AgentStopResult`). Both harvests ask `IsFrozenAsync` FIRST: `docker exec` into a paused container is
+    refused outright (`Conflict`), so a conflicted keep-alive rebase used to put one raw
+    `Docker.DotNet.DockerApiException` stack trace per declared path into the operator log — a warning
+    meaning "as expected", which is how the warnings that mean something stop being read. A frozen jail is
+    skipped with one Information line saying nothing was lost; an engine that cannot answer is read as NOT
+    frozen (guessing would skip a harvest that would have worked, costing the user their login), and a
+    genuine failure on a live jail is still a warning with its exception.
+    It owns the same two halves for the **CLI SETTINGS round-trip**:
     `FilterCliSettings` admits only (root, path) pairs the marker's `settingsPaths` declares and caps
     each file at `AdapterSettingsPolicy.MaxFileBytes` — the stakes are higher than for a login, because
     these files carry a permission allowlist and an unfiltered path would let a compromised client plant
     pre-approved commands anywhere in the home or the checkout — and `HarvestCliSettingsAsync` reads
     them back out (size-checked in the shell, so an oversized file never enters daemon memory),
     resolving each root through `DockerSandboxEngine.SettingsRootPath` so restore and harvest cannot
-    address different directories.
+    address different directories. It also owns what Mainguard WRITES into a worker's checkout:
+    `TryStageInstructionsFile` puts the role's operating instructions at the adapter's declared
+    `instructionsFile` — validated as a plain relative path, and **never over a file the worktree already
+    has**, because a git exclude does not cover a tracked file and the write would otherwise replace a
+    user's own `CLAUDE.md` — and `DeclaredWorkspaceIgnorePaths` is the union (settings paths + that
+    filename) the jail's `info/exclude` is built from, so what the daemon writes and what git ignores are
+    decided by one field. `Worktrees` exposes this daemon's own worktree manager for the in-daemon
+    caller that acts on a live agent's worktree (the worker's `commit_work`).
   - **`Runtime/PtyAgentSupervisor.cs`** (P2-09) — the real `IAgentSupervisor`:
     `PauseInput`/`ResumeInput` via the `SessionLeader`, `MarkState` via the `AgentSessionStore` (the
     P2-08↔P2-09 integration).
@@ -236,6 +261,10 @@
     `TerminalStreamer` pump drains the PTY into VT-safe frames kept in a bounded 512 KB replay ring and
     fanned out to subscribers (re-attach renders the missed output composed; a stalled attach is
     completed, never unbounded), input/resize forwarding, and `Kill` only on StopAgent/teardown.
+    `WriteInputAndAwaitOutputAsync` writes and then waits a bounded window for the CLI to produce
+    output — the only in-band evidence the daemon has that a write was CONSUMED rather than merely
+    accepted by the PTY master (necessary, not sufficient: a CLI already mid-turn satisfies it anyway;
+    its weight is negative — an idle CLI that emits nothing after a keystroke did not see one).
   - **`Runtime/AgentCliBinder.cs`** (PR3) — binds a launched jail's CLI to a real TTY: the default
     factory spawns `docker exec -i -t` under a daemon-side forkpty PTY from the pure `BuildPtyLaunch`
     plan (`CliPtyLaunch`: `SandboxCliLaunch` argv, interactive tty + attached stdin, explicit `TERM` on
@@ -246,6 +275,32 @@
     and marks the session `Dead` when the CLI exits — auditing `cli_exited` with the exit code + the
     VT-stripped output tail (`BoundTerminalSession.TailText`), the bound session staying registered so
     attaching to the dead agent's terminal still replays its final output (the why).
+    Also owns `TrySendPromptAsync` — the ONLY write path into a worker's CLI (coordinator contract §3
+    `send_worker_prompt`), returning `PromptDelivery(Submitted, Echoed, Reacted, Refusal)`. It encodes
+    through `TerminalSubmit` (**CR, not LF** — the shipped `prompt + "\n"` typed into the input box and
+    pressed nothing, so the tool had never once worked) and submits via
+    `BoundTerminalSession.SubmitLineAndAwaitOutputAsync`, which writes the body and the CR as **two
+    separate writes** — the CR appended to the body is read as pasted content, not Enter, so the CR-only
+    fix worked at 3 bytes and failed at 139 (defect J2, §17.8). The writes are separated causally by the
+    CLI's own echo (`PromptEchoWindow`, 250 ms) and by `TerminalSubmit.TerminatorSeparation` when there
+    is no echo. `Echoed`/`Reacted` are **observations, never proof** — a mid-turn CLI satisfies both
+    without reading anything.
+  - **`Runtime/MirrorMainRefreshHostedService.cs`** (2026-09-04, owner decision) — the mirror-freshness
+    sweep: every `CoordinatorLimits.MirrorRefreshSeconds` it calls
+    `MergeQueueProvisioner.RefreshMainFromCheckout` for each live queue, so a pull made on main outside
+    Mainguard reaches the queue without a repo-open and the rail's "refreshed N min ago" is a bound.
+    `SweepOnce()` is public for the wiring test; the on-demand `RefreshMirrorMain` RPC is the same call.
+  - **`Runtime/JailReaperHostedService.cs`** (2026-09-04, owner decision) — the jail reaper: every
+    `CoordinatorLimits.JailReapSweepSeconds` it walks `AgentSessionStore.List()`, asks `JailReapPolicy`
+    with the entry state, whether `TerminalSessionManager.TryGetBound` holds a live CLI, and how long it
+    has not, and stops what the policy names through the ordinary `AgentSpawnService.StopAsync` (harvest,
+    publish, teardown — nothing committed is lost). Audits `jail_reaped`. `SweepOnceAsync(now)` is public
+    and caller-clocked so the daemon-tier test drives the idle allowance without waiting it out.
+  - **`Runtime/FrozenJailPolicy.cs`** — the frozen-jail predicate behind `send_worker_prompt`,
+    `request_verification` and the human's Verify: the session state word (`Paused`/`Conflict`) OR the
+    session store's pause axis (`AgentSessionStore.MarkFrozen`/`FrozenReason`), which the merge queue's
+    state reflection cannot overwrite; plus the two refusal sentences an agent reads. Moved out of
+    `AgentSpawnService.cs` on 2026-09-03 when it gained the axis.
   - **`Runtime/AgentSpawnService.cs`** (PR3) — the ONE spawn/stop workflow behind BOTH entry points (the
     `SpawnAgent` RPC and the coordinator's in-jail `mainguard-agent` shim): kill-gate → session record
     (with role) → **the phase-2 task withhold** (`WorkerPlanGate.Hold`, armed the instant the id is
@@ -254,6 +309,63 @@
     failure) → worktree+jail
     (`SandboxAgentLauncher`) → CLI bind → managed-worker terminal lock (P2-14); stop tears down record,
     PTY, endpoint, lock, jail, worktree. Typed `AgentSpawnRefusedException` keeps it transport-agnostic.
+    **Phase 3 — the role lock (coordinator contract §8).** The coordinator shim handler now serves the
+    contract's four tools and nothing else: `spawn` / `status` (+`list`) / `prompt` / `verify`.
+    **The allow-list is the dispatcher**, not a comment above a `switch`: `BuildCoordinatorHandlers` /
+    `BuildWorkerHandlers` bind op → method and run both tables through `LockToContract`, which throws
+    unless the table set-equals `AgentIpcRequest.CoordinatorOps` / `WorkerOps`; they are built in the
+    **constructor**, so a handler registered for an op §3 does not list takes the daemon down at startup
+    instead of shipping an unreviewed fifth coordinator tool, and a listed op with no handler behind it is
+    caught in the same place. `ServedCoordinatorOps`/`ServedWorkerOps` publish the result so the role-lock
+    test can assert the surface rather than infer it from case labels. (It was a bare `switch` with a
+    deny-by-default `default:` until then; the deny was real, but "and the surface is exactly these five"
+    was a property of control flow, and adding one `case` served an unlisted op with the suite green.)
+    Every op naming an agent resolves it through `OwnedWorker`, scoped
+    `(RepoHash, AgentId)` to the caller's own fan-out — a stranger's worker is refused with the SAME string
+    as a nonexistent one, so the channel is not an existence oracle. A coordinator spawn now sets
+    `withoutRepositoryAccess`, so its jail gets no worktree, mirror, per-agent git dir or package cache,
+    and it never becomes a merge-queue member (it has no branch, and §4 denies it declaring its own work
+    merge-ready).
+    **`FrozenJailPolicy`** (in this file) is the guard `prompt` and `verify` ask AFTER the plan gate: a
+    worker whose jail is `docker pause`d — the state a conflicted keep-alive rebase leaves it in — is
+    refused, because a prompt delivered into a SIGSTOPped process succeeds and means nothing (the tool
+    answered `Ok` and the coordinator then polled a worker that could never reply), and verification runs
+    its test command in that same frozen jail. The predicate is the session's own state word
+    (`Paused` / `Conflict`), which is what `Row` and `ListAgents` already project — NOT
+    `HumanPauseLedger.IsHumanPaused`, which answers the narrower "did a person press pause" and says no
+    for exactly this case.
+    **`CommitWork`** is the worker table's fifth op (`commit_work`) and the rung the loop was missing: a
+    finished worker used to stop on an uncommitted diff that died with its worktree, leaving
+    `agent/<id>` empty and the readiness trigger — which fires on that ref advancing — with nothing to
+    observe. Pure transport: `WorkerPlanGate.MayWork` (the SAME predicate `prompt` and `verify` ask) then
+    `WorktreeManager.CommitAgentWork`, which owns what/where/onto-which-branch. The worker supplies only
+    a message; the (repo, agent) come from the endpoint, never from `request.AgentId`. `NothingToCommit`
+    answers `ok:true, committed:false` rather than a commit.
+    **(2026-08-31) It also settles the worker's DEVIATION DECLARATION** (`DeviationRefusal` /
+    `RecordDeviations`): a worker holding an approved plan must send exactly one of `noDeviations` or a
+    non-empty `deviations`, and a commit carrying neither — or both — is **refused BEFORE anything is
+    committed**, which is the only reason this is safe to make mandatory (the worktree is untouched by a
+    refusal, so it costs one re-run and no work). Required only where there is something to deviate from:
+    `PlanApprovalService.ApprovedForWorker` decides that, the same single authority the F6 scope
+    comparison uses, never a second reading of `PlanModeSwitch`. An ungated worker that volunteers a
+    declaration anyway COMMITS and is told in `feedback` that it was not recorded — quiet discarding is
+    what sits at the bottom of most of this subsystem's defects. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26.
+    **`RescopePlanAsync`** is the worker table's sixth op (`rescope_plan`, 2026-08-30 — contract §3.1 /
+    phase 3 §23): the worker names the APPROVED plan it is widening (required, never inferred — a guessed
+    target produces a plausible card for an authorisation nobody named, §13.3's call), passes the same
+    plan-ownership and schema checks `revise` does, and then **blocks on the human exactly as `present`
+    does**. What it deliberately does NOT touch is `MayWork`: a worker with a re-scope pending still holds
+    the approval it is asking to widen, so steering, verification and `commit_work` keep answering off the
+    old scope. Suspending it would make asking more expensive than widening quietly, and would refuse a
+    running worker the one call that lets its work outlive its jail (F1). It DOES ask
+    `WorkerPlanGate.RefusePlanPresentation` first, as `present`/`revise`/`await` do: without it an ungated
+    worker fell through to the plan lookup and was told `no plan '<id>'` — true of the lookup and a lie
+    about the world, since it reads as "you named the wrong id" and argues against the one correct
+    response. `PlanApprovalService.Rescope` cannot say it (a plan id that resolves to nothing names no
+    worker, and the mode lives on the worker), so it keeps `No plan` for a genuine miss. `DecisionResponse` carries
+    `RescopeOf` on every decision about a re-scope, not only the approval — a declined one has taken
+    nothing away, and the generic wording would send a still-authorised worker away from its work.
     Three optional parameters carry the external-PR intake's needs without forking the chain: `agentId`
     (the explicit `pr-<n>` id), `queueOrigin` (the merge-queue badge — the post-attach `EnsureEntry`
     overwrites the origin on every call, so a default `Local` stamp would silently undo the intake's
@@ -306,13 +418,67 @@
     it now serves both roles and being named for one of its two clients would mislead about which agents
     have a channel) — the agent→daemon control channel: one Unix-domain socket per agent served from a
     daemon-owned ext4 dir (12-char agent-id prefix — sockaddr_un limit) that also carries **the one shim
-    that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker.
+    that agent's role is allowed** — `mainguard-agent` for a coordinator, `mainguard-plan` for a worker —
+    and whose directory **outlives the daemon process** since 2026-09-03: `Dispose` (shutdown) only stops
+    the listeners, because the jail bind-mounts that directory by inode and deleting it orphaned every
+    surviving jail's channel; only `CloseEndpoint` (the stop path) removes it, and `CreateEndpoint` re-binds
+    at the same path when the reconciler adopts the jail back (`AgentSpawnService.TryReattachEndpoint`) —
+    **and beside it the role's `MAINGUARD.md` operating instructions**, written in the same call so the
+    shim and the text that makes it discoverable cannot be staged independently: a shim is useless to a
+    CLI that was never told it exists, which is what every jail was until now. Since **defect G2**
+    (2026-08-29) `CreateEndpoint` takes that text as a REQUIRED argument and this class renders nothing —
+    it used to call `AgentOperatingInstructions.For(role, shimPath)` and omit the then-optional
+    installed-kind argument, so one jail carried two disagreeing briefings. The string it is handed is the
+    one `SandboxAgentLauncher.InstructionsFor` put on the launch line.
+    **Every endpoint also serves an `outbox/`** — the same JSON, the same handler, the same
+    role, framed as request/response FILES the daemon polls every 100 ms — because on macOS the socket
+    half is unreachable from a jail (daemon on the host, jail in the engine's Linux VM; virtiofs does not
+    proxy AF_UNIX, so `connect()` is ECONNREFUSED against a listening daemon). Requests are claimed by
+    RENAME, so a handler parked on a human for hours is never re-dispatched by the next sweep; responses
+    are staged then renamed, so a shim can only observe a complete one; oversize requests are deleted
+    unread, which is the bound on the one thing a writable mount grants a jail. The directory is created
+    on every platform — whether the jail can WRITE it is the container spec's decision — so the code path
+    is exercised everywhere rather than only where it is load-bearing.
     The dir is created BEFORE the jail (it is a read-only mount source) and removed on stop. Identity is
+    **The outbox is jail-controlled, and treated that way (phase 3 §14).** The stated 64 KiB cap
+    inspected the wrong object: `FileInfo.Length` on a SYMLINK is the length of the link, so `ln -s
+    /dev/zero x.req` from inside a jail passed the cap, `File.Move` renamed the link, and the read
+    followed it — measured at 4.2 GB resident and still climbing, i.e. one symlink kills the daemon and
+    every running agent's control plane with it. A request is now claimed by renaming it into
+    `inflight/`, a daemon-only SIBLING of the outbox (inside the read-only IPC mount, outside the
+    read-write one), which removes the second writer and is what lets the checks that follow mean
+    anything: a symlink is refused unread, so is anything that is not a plain non-empty regular file (a
+    FIFO — creatable with no capability, indistinguishable from a file through every managed API — used
+    to park the poll loop in `open()` forever), and the byte cap is enforced by the READ rather than by
+    the stat that precedes it, which is what closes the grow-after-stat window. The directory is bounded
+    in aggregate too (`MaxOutboxFiles` / `MaxOutboxBytes`): past either, everything in it is deleted
+    unread and polling CONTINUES — a jail must not be able to fill the host's disk, and equally must not
+    be able to switch off a control plane the human depends on. Leftovers from a daemon that died
+    mid-call are cleared when the endpoint comes UP, never on a timer, because a claim that has sat for
+    hours is the normal shape of the plan gate. Every refusal goes through the existing capped
+    `ChannelObserver`, so there is no second reporting path.
+    Identity is
     positional — only that agent's jail has the mount — and the **role is fixed on the endpoint**, so a
     worker cannot reach a coordinator op by naming it and vice versa. One newline-delimited JSON request
     per connection (`AgentIpcProtocol`); malformed input gets an error response. Each connection is served
     on its own task, which is what lets a worker's plan presentation **park on the socket for hours**
     without blocking the accept loop or another agent's request.
+    **It also says things out loud now (defect C3).** This class had NO logger at all, so three refused
+    connections from a live jail produced zero daemon-side entries and the outage was indistinguishable
+    from a model sitting idle. `ChannelObserver` is the one place that changed, and the split inside it is
+    the honest part: a REFUSED `connect()` is refused by the jail's own kernel and can never be logged
+    here, so its only daemon-side shadow is **silence** — an endpoint that has served nothing after
+    `DefaultFirstContactGrace` (90 s) reports itself ONCE, naming the agent, its role, its shim and both
+    framings, and logs again if contact later arrives so a recovered channel is never left described as
+    dead. An endpoint torn down inside the grace window says nothing. Malformed / oversize /
+    handler-thrown requests that DO arrive are logged at Warning and audited (`ipc_request_rejected`),
+    **capped** at five lines and ONE audit event per endpoint — the outbox is jail-writable, so an
+    uncapped warning-per-rejection would be a log-flood and audit-flood primitive handed to a sandbox.
+    Jail-supplied text (the `op`) is control-stripped and truncated before it reaches a line, and
+    everything a healthy channel does stays at Debug. Registered from the DI provider (not
+    instance-registered) so it gets the daemon's `ILoggerFactory` + `IAuditLog`, under the same
+    `Coordinator` category `AgentSpawnService` already logs this subsystem's endpoint lifecycle to.
+    Pinned by `AgentIpcObservabilityTests`.
   - **`Runtime/AgentPauseService.cs`** — the human per-agent Pause/Resume bodies behind
     `AgentService.PauseAgent`/`UnpauseAgent`, plus **`HumanPauseLedger`** (the `IPauseArbiter`
     singleton every repo's `YieldProtocol` consults). Not containment: no terminal lock, one agent.
@@ -325,7 +491,10 @@
     docker pause→inspect→unpause leg) and the arbiter legs of `Mainguard.Tests/YieldProtocolTests`.
   - **`Runtime/AgentSessionReconciler.cs`** — **the live session store's reconcile against Docker**
     (ISSUES-LOG #18/#20), plus the `AgentSessionReconcilerService` `BackgroundService` that drives it at
-    startup and every 30 s. The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
+    startup and every 30 s. Adoption reads the parent off `mainguard.agent.parent` and hands each adopted
+    session to an `onAdopted` hook, which the composition root binds to
+    `AgentSpawnService.TryReattachEndpoint` so an adopted coordinator's tools and an adopted worker's plan
+    channel come back with it (before 2026-09-03 adoption rebuilt the record and nothing else). The two boot reconcilers (`SwarmReconciler` → the SQLite expected-agents
     table, `LeaderReattachTask` → the PTY leader registry) never wrote to `AgentSessionStore`, which is
     what `ListAgents`/`StreamAgentEvents`/the resource monitor/the kill switch actually render — so a
     restarted daemon reported zero agents while their jails kept running, and a `docker pause`/`unpause`
@@ -370,6 +539,27 @@
   the generic wording rather than asserting a cause it never checked. **It also has a second caller:
   `Runtime/ExternalPrWorkerHost.cs`**, so both daemon-driven spawn paths are admitted by one evaluator
   over one population.
+  **Defect D1 — `RefuseUnknownKind(agentKind, installedKinds)`.** A real coordinator's first move was
+  `mainguard-agent spawn coder "…"`; `coder` is no adapter id, so the launcher resolved no CLI, the jail
+  came up running `sleep infinity` and nothing else, and the shim answered `Ok, Status: AwaitingPlan` —
+  a dead worker the coordinator believed in, holding a slot against the worker cap. The refusal names the
+  kind and every installed one, rendered by the same `AgentOperatingInstructions.SpellKinds` the
+  coordinator's instructions use, so the text and the enforcement read one set. It is called ONLY from
+  `AgentSpawnService.SpawnWorkerAsync` and deliberately not from `SpawnAsync`: a CLI-less jail is a wanted
+  outcome of the operator path (a bare sandbox with a human on the PTY) and of `ExternalPrWorkerHost`
+  (kind `external-pr`, which no adapter answers to by design), and neither may be taken away. An EMPTY
+  catalog stays permissive — the documented meaning of `InstalledAdapterCatalog.HasAny`, and the only
+  honest behaviour when there is no list of alternatives to offer. Covered by
+  `Mainguard.Server.Tests/CoordinatorSpawnKindTests.cs`.
+  **Contract §3 change, 2026-08-29 — the brief is refused, never derived.** `SpawnWorkerAsync` calls
+  `WorkerPlanGate.RefuseBrief(request.Title, request.TaskPrompt)` before anything is minted, and
+  `SpawnAsync` re-checks it before `_store.Spawn` so a refusal leaves no session record. The old
+  `heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task"` was the defect: the shim sent no
+  title, so every worker's `mainguard-plan brief` returned its TASK. The channel check is required rather
+  than merely defensive — `SpawnAsync` reads "neither title nor task" as *not plan-gated* (the operator's
+  own spelling), so a title-less shim request would otherwise have produced an **ungated** Managed worker.
+  Covered by `WorkerPlanChannelIpcTests.ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing`
+  and `Agents/AgentIpcJailDockerTests.TheRealShimsSpawn_*` (the real shim, in a real jail).
 - **`Runtime/ExternalPrWorkerHost.cs`** — the daemon's `IPrWorkerHost`: gives an intake'd upstream
   pull request a REAL jail by running the ONE spawn chain (`AgentSpawnService.SpawnAsync`) under the
   id `pr-<n>`, kind `external-pr` (no installed adapter answers to it ⇒ no CLI, no launch command),
@@ -392,7 +582,14 @@
     keyed by `(repo, id)` to match, so two subscribed repositories that each have a pull request #n each
     get their own session and their own jail — the second is no longer `Failed` by name. Every lookup
     here carries the repo (`EnsureWorkerAsync`/`ReleaseWorkerAsync` both take `repoHash`), so one repo's
-    release can never stop, adopt or unlock another's worker.
+    release can never stop, adopt or unlock another's worker. It then calls
+    `IAgentWorktreeManager.DiscardAgentBranch` on **every** release path — the teardown itself now keeps
+    any branch carrying a commit, which is right for a worker whose work exists nowhere else and wrong
+    here twice over: an intake'd branch's commits were fetched FROM the pull request and still live
+    there, and `pr-<n>` is a reused id, so a kept branch would make the next intake of that number
+    collide with `CreateAgentWorktree`'s duplicate refusal on every poll forever. The early `return` on
+    the stopped-a-live-session path was removed for that reason: a discard behind it would have been
+    unreachable on exactly the case it exists for.
 - **`Runtime/ActiveRepoIndex.cs`** — which repositories this daemon has provisioned, and where the
   user's copy of each one is (`ActiveRepo(Handle, RepoPath)`; recorded by
   `RepoSyncGrpcService.ProvisionRepo` in the daemon-openable form). Everything daemon-side is keyed by
@@ -420,7 +617,16 @@
   launch argv of the CLI the user dynamically installed (returned on
   `SandboxLaunchResult.LaunchCommand`), and passes `AdaptersRootPath` so the jail bind-mounts the
   shared CLI root read-only whenever any CLI is installed. An unknown kind still spawns a correct jail
-  with no launch command rather than failing the spawn. **v1 spawn preflight (field failure
+  with no launch command rather than failing the spawn. **`BuildLaunchArgv` is the one place that knows
+  the launch line's ORDER** — `ApplyInitialPrompt` (the worker's first user turn,
+  `AgentKickoffPrompt`) FIRST, then the role's operating instructions on `systemPromptArg`, then
+  `ApplyShimPreApproval`'s single grant. The order is the fix, not a style choice: measured against
+  claude-code 2.1.250, a turn appended last is swallowed by the variadic `--allowedTools <tools...>`
+  and never reaches the model, so the CLI idles at an empty input box exactly as it did with no turn —
+  which is the deadlock that stopped phase 2's plan loop from ever starting (a worker cannot present a
+  plan without a first turn, and `send_worker_prompt` is refused until it has). All three channels are
+  gated on `ipcDirPath` + the adapter's own declaration, so a jail with no shim, and every CLI that
+  declares nothing, launches byte-identically to before. **v1 spawn preflight (field failure
   2026-07-17, twice):** before any worktree/jail work it verifies BOTH jail images present AND current
   — `ISandboxEngine.ImageExistsAsync` for presence, then `ISandboxEngine.ImageVersionAsync` (Docker
   `Config.Labels["mainguard.image.version"]`) vs `SandboxImageVersions.For(ref)` for staleness
@@ -485,14 +691,24 @@
   — P2-13 carried-in from P2-08 maps the proto `Budget`'s per-day caps
   (`usd_micros_cap_per_day`/`token_cap_per_day`) too, so per-day is displayable+editable over gRPC;
   `StreamSpend` bridges the ledger's `SpendRecorded` row feed — replay-then-live — to the server
-  stream) / **`MergeQueueGrpcService.cs`** (P2-10: `StreamQueue` re-pushes on the queue's `Changed`
+  stream) / **`MergeQueueGrpcService.cs`** (**`RunVerification` is FROZEN-JAIL guarded** — the human's Verify button reaches the merge queue by this path, which the sibling fix on the coordinator's `request_verification` op did not cover, so pressing it on a conflicted entry started a run whose `docker exec` answers "Container … is paused" and arrived as a provisioning failure on the one screen where that must never be confused with "your tests failed". The predicate is `FrozenJailPolicy.IsFrozen` — SHARED with that guard on purpose, so the two paths cannot drift apart on what "frozen" means — while the wording is this surface's own: the policy's sentences are written for an agent to act on in one turn, and this reader is a person, so the refusal names the two conflict controls beside it. An unknown or Working session is NOT refused: refusing from ignorance would strand every seeded row and every entry whose session died with a previous daemon. P2-10; **H3/H4: `RunVerification` now logs the RESULT** — it logged every
+  refusal and never a verdict — and **`GetVerificationLog`** serves the run's artifact CONTENT, bounded to
+  the last 256 KiB via `ReadTail` (the tail, because a runner prints its failures last) and answering "no
+  record" / "artifact gone" / the log as three distinct things; `Snapshot` carries the entry's verdict,
+  command and timestamp so a client can render what the state word stands for: `StreamQueue` re-pushes on the queue's `Changed`
   event, each `QueueEntry` carries the P2-12 `origin` (via `MergeQueue.GetOrigin`) so the activity
   list can badge external-PR entries, plus `verification_in_flight` (via
   `MergeQueue.IsVerificationInFlight`) — the one fact no client can derive, since a restart mid-run
   leaves a persisted `Verifying` row with nothing executing — plus `has_live_sandbox` (`optional`, from
   the injected `AgentSessionStore` keyed on `(repoHandle, agentId)`): whether the entry still HAS a jail,
   which is what lets the rail offer Resume on a stranded row and withhold Verify instead of leaving an
-  enabled button whose only behaviour is "has no live sandbox". `optional` because a proto3 `false`
+  enabled button whose only behaviour is "has no live sandbox". **(2026-08-31) `Snapshot` also carries
+  what a human APPROVED** — `approved_plan_id`/`_title`/`_approach` and the three-valued
+  `deviation_declaration`, read through `MergeQueueContext.ResolveApprovedWork`, i.e. the same callback
+  the provisioner arms the flagged review from. Without it the review cockpit rendered a diff and nothing
+  to compare it against, which is how a branch that shipped the opposite of its approved approach passed
+  review with an empty flagged list; left empty for an entry with no approved plan so the surface draws
+  no panel rather than an empty one. `optional` because a proto3 `false`
   meaning "this daemon does not report liveness" would render every entry of an older daemon as stranded;
   `Snapshot`'s entry order runs through `OrderForDisplay` (`internal static`, unit-tested in
   `Mainguard.Server.Tests/QueueDisplayOrderTests.cs`) — a stable partition putting actionable states
@@ -511,7 +727,30 @@
   `ChangedTestCommandGate` alone, so a branch the daemon blocked reached the human with nothing to
   clear — and `AcknowledgeFlaggedChange` routes any non-RT-D2 item id to that gate's store. Both use
   `PeekStore`, never `StoreFor`: creating a store from a read/ack would fabricate a fully-acknowledged
-  record and bypass the gate's default-DENY. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
+  record and bypass the gate's default-DENY. **L2/L4 audit (§20 of the phase-3 decisions doc):** `ConfirmMerge` derives the actor from
+  `IApproverIdentityResolver` and passes `MergeAuthorization.ConfirmRpc(actor, leaseId)` into
+  `TryConfirmHumanMerge` (which is where `queue_entry_merged` is appended), and `AcknowledgeFlaggedChange`
+  passes the same daemon-derived actor into `ChangedTestCommandGate.Acknowledge`. This service also owns
+  **`ConfirmRefusedEvent` (`merge_confirm_refused`)**, appended when a confirm is refused at either the
+  lease, identity or gate stage — the one merge-conversation fact knowable only here: by `ConfirmMerge` time the
+  git operation has ALREADY RUN on the user's checkout, so a refusal means the daemon and the user's
+  repository may now disagree about what main is. Best-effort (swallowed into the daemon log), unlike the
+  merge record itself, because the refusal reason must not be replaced by an audit-store error. A refused
+  `BeginMerge` is deliberately NOT audited — it is a merge that has not happened.
+  **K3/§23.4 merge identity:** `BeginMerge` puts BOTH halves of the identity on the lease — the queue's
+  `CurrentMainSha` and `LastVerification(agent)?.BranchSha`, the `agent/<id>` tip the verification was
+  measured on — and returns both to the client (`expected_branch_sha`), for the same reason
+  `expected_main_sha` already travelled there: the client's projection is a stream snapshot. `ConfirmMerge`
+  then SCREENS the `new_main_sha` the caller reports, which nothing used to look at even though the daemon
+  wrote it into the idempotency record, set the queue's authoritative main to it, and cascaded every
+  co-tenant onto it. Three checks, all before the transition and all against the daemon's own records:
+  shape (7–64 hex — deliberately a shape check, since the daemon cannot resolve a sha in a repo it does
+  not hold), non-triviality (a confirm reporting the main it was authorized against moved nothing), and —
+  for a `Local` entry only — that the reported sha IS `lease.ExpectedBranchSha`, because
+  `git merge --ff-only agent/<id>` leaves main AT the source's tip. Stated as a limit rather than
+  stretched: the P2-12 external leg lands the host's merge commit, which is not the PR head, so the same
+  equality would be false for every honest external merge (that path has its own head CAS, K4). Each
+  refusal releases the lease and audits `merge_confirm_refused` with `stage = "identity"`. **Post-confirm mirror refresh:** `ConfirmMerge` now pulls origin's main forward into the bare
   mirror (`MergeQueueProvisioner.TryRefreshMirrorMainAfterMerge`, best-effort) — without it, a spawn
   between a merge and the next repo-open based its worktree on the stale mirror main and
   `EnsureQueue`'s reconcile walked the queue's authoritative main BACKWARDS to it, leaving
@@ -560,7 +799,10 @@
     which could not distinguish "the worker will revise" from "the worker has stopped"; and `PlanUpdate`
     carries the **backpressure** counts + the daemon's rendered stall line, taken from the same
     `WorkerPlanGate` and Managed-session population that refuses the coordinator a spawn — a surface that
-    re-derived its own number could disagree with the gate it is rendering) and
+    re-derived its own number could disagree with the gate it is rendering. **The plan-mode toggle**
+    adds `GetPlanMode`/`SetPlanMode` — the actor on the audit event is the same daemon-derived peer
+    credential that records an approver, the response is read BACK from the switch rather than echoing the
+    request, and `PlanUpdate` carries the state on every update including the empty one) and
     **`Services/KillSwitchGrpcService.cs`** (`Engage`/`Resume` over the daemon `KillSwitch`).
   - **`Services/AuditGrpcService.cs`** (P2-15) — transport for `AuditService` (`VerifyAudit`/
     `ReadAudit`): the audit store's first production readers. Verification/decryption live in
@@ -597,8 +839,9 @@
     governance singletons (`ConnectionRoleRegistry`, `TerminalLockRegistry`,
     `IApproverIdentityResolver`, `CoordinatorLimits`, `PlanApprovalService` over a restart-safe
     `JsonPlanApprovalStore` (**limits injected** — the revision budget is enforced there, not prompted),
-    the phase-2 `WorkerPlanGate` (also wired into `MergeQueueProvisioner` as an `IMergeGate` by
-    `GatewayServiceRegistration`), the
+    the phase-2 `WorkerPlanGate` over a restart-safe `JsonHeldTaskStore` (`mainguard-held-tasks.json`
+    beside the plan store — a gate whose held tasks died with the process was a gate until the first daemon
+    update; also wired into `MergeQueueProvisioner` as an `IMergeGate` by `GatewayServiceRegistration`), the
     shared `KillSwitchGate`, `IKillTarget`, `KillSwitch`) + the `RoleInterceptor`, the P2-47
     `SandboxAgentLauncher` (real spawn chain) + `IMergeBranchDiffService` (merge-diff bridge)
     singletons, the PR3 CLI-agent singletons (shared `InstalledAdapterCatalog`, `SessionKeyCache`,

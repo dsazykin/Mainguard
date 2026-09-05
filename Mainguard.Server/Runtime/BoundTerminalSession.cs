@@ -5,11 +5,29 @@ using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Terminal;
 using Mainguard.Agents.Terminal.Vterm;
 using Mainguard.Protos.V1;
 using Mainguard.Server.Terminal;
 
 namespace Mainguard.Server.Runtime;
+
+/// <summary>
+/// What the daemon saw while submitting one line — the two halves of the act, kept apart because they
+/// are different evidence and because conflating them is how defect J2 hid for so long.
+/// </summary>
+/// <param name="Echoed">
+/// The CLI produced output after the message body and <i>before</i> Enter. It therefore read the body,
+/// which is what makes the following CR a separate keystroke rather than the tail of a paste — the
+/// runtime detector for a J2 regression.
+/// </param>
+/// <param name="Reacted">The CLI produced output after Enter.</param>
+/// <remarks>
+/// <b>Neither field is proof the line became a turn.</b> A CLI already mid-turn emits output
+/// continuously and would satisfy both observations without reading anything. The ground truth lives in
+/// the CLI's own transcript, which the daemon deliberately does not read. Report; never assert.
+/// </remarks>
+public readonly record struct SubmitObservation(bool Echoed, bool Reacted);
 
 /// <summary>
 /// A long-lived, agent-bound terminal session: the CLI's PTY outlives any single gRPC attach. One
@@ -184,6 +202,115 @@ public sealed class BoundTerminalSession : IDisposable
     {
         await _session.IO.WriteAsync(data, ct).ConfigureAwait(false);
         await _session.IO.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Writes toward the CLI and then waits up to <paramref name="window"/> for the CLI to produce
+    /// output — the only in-band evidence the daemon has that a write was <i>consumed</i> rather than
+    /// merely accepted by the PTY master.
+    ///
+    /// <para><b>What this proves and what it does not.</b> A write to a PTY master succeeds whether or
+    /// not the child ever reads it, so "the write returned" is evidence of nothing. A PTY-attached CLI,
+    /// by contrast, cannot consume a keystroke silently: it re-renders. So output arriving here means
+    /// the child read and reacted. It does <b>not</b> mean the CLI understood the text, and it is
+    /// <b>necessary but not sufficient</b> as a submission signal — a CLI already mid-turn emits output
+    /// continuously, and that output would satisfy this wait on its own. Its evidential weight is in the
+    /// negative direction: an idle CLI that produces nothing at all after a keystroke did not see one.
+    /// Callers must report it as an observation, never assert it as proof.</para>
+    ///
+    /// <para>The subscription is opened <i>before</i> the write, so no reaction can slip through the gap
+    /// between the two; it is dropped again on every path.</para>
+    /// </summary>
+    /// <returns>True when the CLI produced output within the window.</returns>
+    public async Task<bool> WriteInputAndAwaitOutputAsync(
+        ReadOnlyMemory<byte> data, TimeSpan window, CancellationToken ct)
+    {
+        var (_, live) = Subscribe(out var unsubscribe);
+        try
+        {
+            await WriteInputAsync(data, ct).ConfigureAwait(false);
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(window);
+            try
+            {
+                // False here means the stream COMPLETED (the CLI died) — also "no reaction", correctly.
+                return await live.WaitToReadAsync(deadline.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                ct.ThrowIfCancellationRequested(); // a caller's cancel is not an observation
+                return false;
+            }
+        }
+        finally
+        {
+            unsubscribe();
+        }
+    }
+
+    /// <summary>
+    /// Submits one line to the CLI as a human would: the text first, then Enter as a <b>separate
+    /// keystroke</b> — and reports the two things the daemon can actually observe about it.
+    ///
+    /// <para><b>Why the write is split (defect J2).</b> A TUI decides whether input was typed or pasted
+    /// from the read burst it arrives in, and inside a paste a CR is content, not Enter. Sending
+    /// <c>body + CR</c> as one buffer therefore submits a 3-byte poke but <i>not</i> a 139-byte steer —
+    /// the CR is absorbed into the message. Measured against the real CLI; see
+    /// <c>docs/design/coordinator-phase-3-decisions.md</c> §17.8.</para>
+    ///
+    /// <para><b>How the two writes are kept apart.</b> Preferentially by the CLI's own echo, which is
+    /// causal rather than timed: a CLI that has repainted in response to the body has already read those
+    /// bytes, so a CR written afterwards cannot arrive in the same read. Only when no echo is seen
+    /// within <paramref name="echoWindow"/> does it fall back to waiting
+    /// <see cref="TerminalSubmit.TerminatorSeparation"/> — because two back-to-back writes with nothing
+    /// between them are coalesced by the PTY into one read, which is the defect again.</para>
+    ///
+    /// <para><b>What the result proves, and what it does not.</b> <c>Echoed</c> means the CLI consumed
+    /// the body and repainted — genuinely stronger than "the write returned", and the runtime detector
+    /// for a J2 regression, since it is what establishes that Enter went as its own keystroke.
+    /// <c>Reacted</c> means it produced output after Enter. <b>Neither is proof the line became a
+    /// turn</b>: a CLI already mid-turn emits output continuously and would satisfy both waits on its
+    /// own. Their weight is in the negative direction — an idle CLI silent after a keystroke did not see
+    /// one. Callers must report these, never assert on them.</para>
+    ///
+    /// <para>Each subscription is opened <i>before</i> its write, so no reaction can slip through the
+    /// gap; the first is dropped before the second is opened, so the body's own repaint can never be
+    /// miscounted as a reaction to Enter.</para>
+    /// </summary>
+    public async Task<SubmitObservation> SubmitLineAndAwaitOutputAsync(
+        ReadOnlyMemory<byte> body,
+        ReadOnlyMemory<byte> terminator,
+        TimeSpan echoWindow,
+        TimeSpan reactionWindow,
+        CancellationToken ct)
+    {
+        var sinceBody = System.Diagnostics.Stopwatch.StartNew();
+        var echoed = await WriteInputAndAwaitOutputAsync(body, echoWindow, ct).ConfigureAwait(false);
+
+        // The separation is a FLOOR in every case, echo or no echo. It used to apply only when nothing
+        // echoed, on the argument that an echo is causal — a CLI that repainted has read the body. But
+        // `echoed` is true on ANY output frame inside the window, and a CLI mid-turn streams output
+        // continuously: it satisfies the wait within a millisecond without having read a byte, the CR
+        // goes out immediately behind the body, and the PTY can coalesce the two writes into one read
+        // — defect J2, on exactly the worker a coordinator most wants to steer (a busy one). The echo
+        // stays what it is, an observation reported to the caller; the gap is what keeps the terminator
+        // in a read of its own.
+        //
+        // Measured against the ELAPSED time rather than slept unconditionally: when the echo window
+        // lapsed there is already a 250 ms gap and nothing to add, but an instant return — an echo on the
+        // first frame, or a CLI whose output stream has completed — arrives here having waited no time at
+        // all. The FULL separation, not the remainder: the stopwatch starts marginally before the body
+        // actually reaches the PTY, so subtracting its reading would shave the write's own cost off the
+        // gap the CLI sees.
+        if (sinceBody.Elapsed < TerminalSubmit.TerminatorSeparation)
+        {
+            await Task.Delay(TerminalSubmit.TerminatorSeparation, ct).ConfigureAwait(false);
+        }
+
+        var reacted = await WriteInputAndAwaitOutputAsync(terminator, reactionWindow, ct)
+            .ConfigureAwait(false);
+        return new SubmitObservation(echoed, reacted);
     }
 
     /// <summary>

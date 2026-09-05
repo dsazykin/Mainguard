@@ -11,6 +11,10 @@ public static class ShutdownStatus
     /// <summary>Always shown first: releasing the VM keep-alive holder.</summary>
     public const string ReleasingKeepAlive = "Releasing the Mainguard OS environment…";
 
+    /// <summary>Only when StopVmOnExit is on, before the VM leg: every live agent is stopped through the
+    /// ordinary Stop path (owner decision 2026-09-04) so a jail never outlives the app.</summary>
+    public const string StoppingAgents = "Stopping agents…";
+
     /// <summary>Only when StopVmOnExit is on: terminating MainguardEnv (scoped, G-12).</summary>
     public const string StoppingVm = "Stopping Mainguard OS…";
 
@@ -53,6 +57,15 @@ public interface IAppShutdownEnvironment
 
     /// <summary>oobe.log breadcrumb sink.</summary>
     void Log(string message);
+
+    /// <summary>
+    /// Stops every live agent through the ordinary Stop path — harvest, publish, teardown. Runs only when
+    /// <see cref="StopVmOnExit"/> is on, BEFORE the VM leg (a terminate would kill the jails unpublished)
+    /// and regardless of a provisioning build in flight (stopping agents does not touch the build). This
+    /// is what makes the setting honest on macOS, where there is no VM to stop and every jail used to
+    /// outlive the app (owner decision 2026-09-04). Default no-op so a fake need not implement it.
+    /// </summary>
+    Task StopAgentsAsync(CancellationToken ct) => Task.CompletedTask;
 }
 
 /// <summary>
@@ -99,6 +112,17 @@ public sealed class AppShutdownSequence
 
         if (_env.StopVmOnExit)
         {
+            status?.Report(ShutdownStatus.StoppingAgents);
+            _env.Log("shutdown: stopping live agents (StopVmOnExit)");
+            try
+            {
+                await _env.StopAgentsAsync(ct).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _env.Log($"shutdown: stopping agents failed (non-fatal): {ex.Message}");
+            }
+
             // A provisioning build in flight outranks the StopVmOnExit convenience: terminating the
             // distro under it destroys minutes of work and leaves the images stale, so the NEXT launch
             // refuses to start the coordinator too. Leaving MainguardEnv up costs the user some idle

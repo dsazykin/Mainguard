@@ -103,12 +103,31 @@ public static class DaemonHost
             store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanApprovalStore(ResolvePlanStorePath(tokenPath)),
             audit: sp.GetRequiredService<IAuditLog>(),
             limits: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>()));
+        // The operator's plan-mode toggle. Registered BEFORE the gate that reads it, and persisted beside
+        // the plan store for the same reason that one is a file: the daemon must be able to answer "is
+        // the gate on?" before anything that needs a database is up. It fails CLOSED — an unreadable
+        // file, or none at all, is plan mode ON, because the default of a human-approval gate is that it
+        // is there.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.PlanModeSwitch(
+            store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanModeStore(ResolvePlanModePath(tokenPath)),
+            audit: sp.GetRequiredService<IAuditLog>()));
+        // The per-jail memory/CPU ceiling (owner decision 2026-09-04): a file beside the plan store because
+        // the launcher reads it at every spawn and must not need a database for it. Unreadable ⇒ the
+        // compiled defaults (2 GiB, 2 CPUs), never a ceiling of zero.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Sandbox.JailLimitsSettings(
+            new Mainguard.Agents.Agents.Sandbox.JsonJailLimitsStore(ResolveJailLimitsPath(tokenPath)),
+            sp.GetRequiredService<IAuditLog>()));
         // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
         // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
         // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
+        // Its held tasks are a FILE beside the plan store, for the same reason the plan store is one: the
+        // gate's claim is that the daemon withholds the task, and a daemon that forgot every held task on
+        // restart (while the jails it held them from survived) was withholding nothing — the merge
+        // backstop answered yes for an unapproved worker and an approved one never received its task.
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate(
             sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>(),
-            sp.GetRequiredService<IAuditLog>()));
+            sp.GetRequiredService<IAuditLog>(),
+            new Mainguard.Agents.Agents.Orchestrator.JsonHeldTaskStore(ResolveHeldTaskStorePath(tokenPath))));
         // P2-47 #9: the coordinator conversation the CoordinatorService streams. Registered with no reply
         // engine in the shipped daemon — the live LLM-backed CoordinatorAgent adapter is the one leg that
         // needs a real model (the documented un-verifiable leg); the transcript store + streaming are real
@@ -224,7 +243,16 @@ public static class DaemonHost
         builder.Services.AddSingleton(Terminal.TerminalEngineConfig.Resolve(options.TerminalEngine));
         builder.Services.AddSingleton<Runtime.AgentCliBinder>();
         // One endpoint per agent: the coordinator's spawn shim, and (phase 2) each worker's plan shim.
-        builder.Services.AddSingleton(new Runtime.AgentIpcServer(ResolveAgentIpcRoot(tokenPath)));
+        // Resolved from the provider rather than instance-registered so the channel gets the daemon's
+        // LOGGER and AUDIT CHAIN. It had neither, and that was a real outage: three refused connections
+        // from inside a jail produced ZERO daemon-side entries, so nothing could distinguish a dead
+        // control path from a model sitting idle. The Coordinator category is the one AgentSpawnService
+        // already logs this subsystem's endpoint lifecycle under, so one grep still follows the chain.
+        builder.Services.AddSingleton(sp => new Runtime.AgentIpcServer(
+            ResolveAgentIpcRoot(tokenPath),
+            sp.GetRequiredService<Microsoft.Extensions.Logging.ILoggerFactory>()
+                .CreateLogger(Logging.DaemonLogCategories.Coordinator),
+            sp.GetRequiredService<Mainguard.Git.Audit.IAuditLog>()));
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
         // The human-only resume path for a stranded merge-queue entry (AgentService.ResumeAgent). It
         // depends on the merge-queue registry registered by GatewayServiceRegistration below — DI resolves
@@ -459,6 +487,24 @@ public static class DaemonHost
     }
 
     /// <summary>
+    /// Where the operator's plan-mode setting lands — beside the (test-isolated) session token, exactly
+    /// like the plan store, so an in-proc test host never turns the real daemon's gate off.
+    /// </summary>
+    private static string ResolvePlanModePath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-plan-mode.json");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-plan-mode.json");
+    }
+
+    /// <summary>
     /// The P2-14 plan-approval JSON store path: next to the (test-isolated) session token so each in-proc
     /// host gets its own restart-safe store; otherwise the OS app-data default.
     /// </summary>
@@ -475,6 +521,27 @@ public static class DaemonHost
 
         return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-plans.json");
     }
+
+    /// <summary>The plan gate's held-task store: beside the plan store, isolated per in-proc host the same way.</summary>
+    /// <summary>The jail-limits file, beside the session token like the plan-mode file (and under the
+    /// data-root isolation test for the same reason: a test host that shrank the real ceiling would
+    /// starve the developer's next real spawn).</summary>
+    private static string ResolveJailLimitsPath(string? tokenPath)
+    {
+        if (!string.IsNullOrEmpty(tokenPath))
+        {
+            var dir = Path.GetDirectoryName(tokenPath);
+            if (!string.IsNullOrEmpty(dir))
+            {
+                return Path.Combine(dir, "mainguard-jail-limits.json");
+            }
+        }
+
+        return Path.Combine(Mainguard.Git.MainguardPaths.DataRoot(), "mainguard-jail-limits.json");
+    }
+
+    private static string ResolveHeldTaskStorePath(string? tokenPath) =>
+        Path.Combine(Path.GetDirectoryName(ResolvePlanStorePath(tokenPath))!, "mainguard-held-tasks.json");
 
     /// <summary>Where the durable kill journal lands — beside the (test-isolated) session token, exactly
     /// like the plan store, so an in-proc test host never appends to the real daemon's record.</summary>

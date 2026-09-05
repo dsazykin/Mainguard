@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Server.Tests.Fixtures;
 using Xunit;
@@ -546,8 +547,88 @@ public sealed class AgentRefMediationTests
     }
 
     /// <summary>
+    /// The same real sweep, the OTHER subscriber: a real commit in a real agent worktree, published by a
+    /// real sweep, takes a real <c>Verified</c> queue entry back to <c>Working</c> and makes it unmergeable.
+    ///
+    /// <para>This is the rung <c>VerifiedFreezeTests</c> deliberately cannot cover. That suite drives
+    /// <c>BranchTipInvalidator.NotifyAdvanced</c> directly, which proves every rule of the invalidation and
+    /// proves nothing about whether the invalidator is CONNECTED to anything — and an invalidator that is
+    /// constructed and never subscribed is the freeze itself, back in full: the entry stays green, the
+    /// cockpit says "ready to merge", and Merge stays enabled for a tip nothing ran against. Nothing below
+    /// calls <c>NotifyAdvanced</c>.</para>
+    ///
+    /// <para>The disposal half is asserted for the same reason it is for the trigger, and it matters more
+    /// here: an invalidator that kept listening after disposal would keep walking entries out of
+    /// <c>Verified</c> for a daemon that has shut down.</para>
+    /// </summary>
+    [Fact]
+    public async Task Watcher_AdvancedInvalidatesAVerifiedEntry_OnARealSweepOfARealCommit()
+    {
+        using var env = new MediationEnv();
+        var hash = env.Provision();
+        var worktree = env.Worktrees.CreateAgentWorktree(hash, "a1");
+        using var watcher = new AgentRefWatcher(
+            env.Worktrees.RefMediator, env.AgentRepos, AgentRefWatcher.DriveManually);
+
+        string MirrorTip() =>
+            AgentTestGit.RunChecked(env.BarePath(hash), "rev-parse", "refs/heads/agent/a1").Trim();
+
+        var registry = new Mainguard.Agents.Agents.Orchestrator.MergeQueueRegistry();
+        var queue = new Mainguard.Agents.Agents.Orchestrator.MergeQueue(
+            repoHash: hash,
+            currentMainSha: "main-0",
+            store: new Mainguard.Agents.Agents.Orchestrator.InMemoryMergeQueueStore(),
+            verifications: new Mainguard.Agents.Agents.Orchestrator.InMemoryVerificationStore(),
+            // Pinned to the mirror's REAL agent tip, exactly as MergeQueueProvisioner pins it.
+            runVerification: (id, _) => Task.FromResult(
+                new Mainguard.Agents.Agents.Orchestrator.VerificationRecord(
+                    id, "main-0", true, "log.txt", "npm test", "cfg", DateTimeOffset.UnixEpoch, MirrorTip())),
+            requeue: null,
+            gates: Array.Empty<Mainguard.Agents.Agents.Orchestrator.IMergeGate>(),
+            audit: new Mainguard.Git.Audit.InMemoryAuditLog());
+        registry.Register(
+            hash,
+            new Mainguard.Agents.Agents.Orchestrator.MergeQueueContext(
+                queue, new Mainguard.Agents.Agents.Orchestrator.InMemoryMergeLeaseStore()));
+
+        var invalidator = new Mainguard.Agents.Agents.Orchestrator.BranchTipInvalidator(watcher, registry);
+        try
+        {
+            watcher.Watch(hash, "a1");
+            watcher.PollOnce(); // the baseline publish of the branch as it stands
+
+            await queue.RunVerificationAsync("a1", CancellationToken.None);
+            Assert.Equal(WorkerMergeState.Verified, queue.GetState("a1"));
+            Assert.True(queue.CanMerge("a1", out _), "a fresh green entry should be mergeable");
+
+            // A real commit, carried into the mirror by the sweep itself.
+            env.CommitInWorktree(worktree, "one.txt", "one\n");
+            Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
+
+            Assert.Equal(WorkerMergeState.Working, queue.GetState("a1"));
+            Assert.False(queue.CanMerge("a1", out var reason));
+            Assert.Equal(
+                Mainguard.Agents.Agents.Orchestrator.MergeQueue.BranchMovedReason, reason);
+            Assert.Null(queue.LastVerification("a1"));
+
+            // Disposal unsubscribes: verify again, then advance again, and the entry stays put.
+            await queue.RunVerificationAsync("a1", CancellationToken.None);
+            Assert.Equal(WorkerMergeState.Verified, queue.GetState("a1"));
+            invalidator.Dispose();
+
+            env.CommitInWorktree(worktree, "two.txt", "two\n");
+            Assert.Equal(AgentRefPublishOutcome.Published, Assert.Single(watcher.PollOnce()).Outcome);
+            Assert.Equal(WorkerMergeState.Verified, queue.GetState("a1"));
+        }
+        finally
+        {
+            invalidator.Dispose();
+        }
+    }
+
+    /// <summary>
     /// The sweep's <see cref="AgentRefWatcher.Advanced"/> signal is real, and it is what arms the automatic
-    /// verification trigger. A REAL commit in a REAL agent worktree, published by a REAL sweep, is what puts
+    /// verification trigger.""" A REAL commit in a REAL agent worktree, published by a REAL sweep, is what puts
     /// the worker on the trigger's armed list; nothing here calls <c>NotifyAdvanced</c>.
     ///
     /// <para>This is the rung the unit suite deliberately cannot cover. <c>WorkerReadinessTriggerTests</c>

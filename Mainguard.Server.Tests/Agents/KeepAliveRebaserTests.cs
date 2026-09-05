@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Orchestrator;
+using Mainguard.Server.Runtime;
 using Mainguard.Server.Tests.Fixtures;
 using Xunit;
 
@@ -76,6 +77,65 @@ public sealed class KeepAliveRebaserTests
         Assert.Equal(0, AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
     }
 
+    /// <summary>
+    /// <b>K6/§23.6 — the guard's verdict is a snapshot, and this is the window it was blind to.</b>
+    ///
+    /// <para><c>CanMutate</c> reads the worktree once, at the top of the cycle; the mutations then run
+    /// after an <c>index.lock</c> backoff that re-checked only the lock — which was never one of the three
+    /// preconditions the verdict was made of. So an agent that started its OWN rebase after the guard
+    /// looked, and before the daemon acted, got <c>git add -A; git commit</c> and <c>git rebase main</c>
+    /// run against a worktree the guard would have refused.</para>
+    ///
+    /// <para>The window is opened here exactly where it is in production: the <c>Rebasing</c> state is set
+    /// after the guard and before the first mutation, so the state callback is the honest place to make
+    /// the worktree change underneath. Nothing about the cycle is stubbed.</para>
+    /// </summary>
+    [Fact]
+    public async Task KeepAlive_AgentStartsItsOwnRebase_AfterTheGuardLooked_MutatesNothing()
+    {
+        using var env = new RebaseEnv();
+
+        // The agent has uncommitted work, so the wip-commit leg runs first — the earliest mutation there
+        // is, and therefore the one that proves the re-check happens before ANY of them.
+        File.WriteAllText(Path.Combine(env.Worktree, "agent.txt"), "agent work\n");
+        env.AdvanceMain("human.txt", "human work\n", "human commit on main");
+
+        var rebaseMergeDir = Path.Combine(env.WorktreeGitDir, "rebase-merge");
+        var yield = new FakeYieldProtocol();
+        var states = new List<AgentRunState>();
+        var opened = false; // once — the second cycle is the control and must find a quiescent worktree.
+        var rebaser = new KeepAliveRebaser(yield, _ => env.Location, (_, s) =>
+        {
+            states.Add(s);
+            // The agent starts its own rebase in the window between the guard's read and the mutation.
+            if (s == AgentRunState.Rebasing && !opened)
+            {
+                opened = true;
+                Directory.CreateDirectory(rebaseMergeDir);
+            }
+        });
+
+        var result = await rebaser.RunCycleAsync("a1");
+
+        Assert.Equal(RebaseCycleKind.Skipped, result.Kind);
+        Assert.Contains("mid-rebase", result.Detail ?? "", StringComparison.Ordinal);
+
+        // NOTHING was mutated: no wip commit, and the branch was not reparented.
+        Assert.False(result.WipCommitCreated);
+        Assert.DoesNotContain("wip: sync", AgentTestGit.RunChecked(env.Worktree, "log", "--oneline"));
+        Assert.NotEqual(0,
+            AgentTestGit.Run(env.Worktree, "merge-base", "--is-ancestor", env.MirrorMainSha, "HEAD").Code);
+        // The agent is resumed so it can finish its own rebase; the next cycle retries.
+        Assert.True(yield.LastToken!.Resumed);
+        Assert.DoesNotContain(AgentRunState.Conflict, states);
+
+        // The control: once the agent's rebase is done, the same cycle does the work.
+        Directory.Delete(rebaseMergeDir, recursive: true);
+        var second = await rebaser.RunCycleAsync("a1");
+        Assert.Equal(RebaseCycleKind.Rebased, second.Kind);
+        Assert.True(second.WipCommitCreated);
+    }
+
     [Fact]
     public async Task KeepAlive_Conflict_SetsStatusConflict_RoutesToResolver_LeavesRebaseInProgress()
     {
@@ -106,6 +166,117 @@ public sealed class KeepAliveRebaserTests
         Assert.True(Directory.Exists(Path.Combine(env.WorktreeGitDir, "rebase-merge")));
         // PTY stays paused: the token was NOT resumed.
         Assert.False(yield.LastToken!.Resumed);
+        // ...but it WAS settled. See the ledger test below for what that buys.
+        Assert.True(yield.LastToken.ReleasedWithoutResuming);
+    }
+
+    /// <summary>
+    /// <b>The human's escape hatch has to keep working on a conflicted agent.</b>
+    ///
+    /// <para>The conflict arm deliberately leaves the jail frozen, and it used to do that by simply never
+    /// settling the yield token — which leaked the <c>HumanPauseLedger</c> machine hold that
+    /// <c>YieldProtocol</c> takes on the pause path, because the hold was released inside the resume.
+    /// <c>AgentPauseService.UnpauseAsync</c> refuses while a hold is outstanding, and it refuses with "the
+    /// daemon is briefly holding this agent for a queue update — try again in a moment": a sentence whose
+    /// whole promise is that it self-clears. On a conflicted agent it never did. So the one control a
+    /// human had left on a parked jail was permanently refused, by a message telling them to wait.</para>
+    ///
+    /// <para>This is the real <see cref="YieldProtocol"/> over the real <see cref="HumanPauseLedger"/>, and
+    /// it asserts the exact predicate the unpause RPC gates on. It also asserts the jail is still frozen —
+    /// releasing the hold must hand back the CLAIM, never the pause.</para>
+    /// </summary>
+    [Fact]
+    public async Task KeepAlive_Conflict_ReleasesTheMachineHold_SoAHumansUnpauseIsNotRefusedForever()
+    {
+        using var env = new RebaseEnv();
+
+        AgentTestGit.SetIdentity(env.Worktree);
+        File.WriteAllText(Path.Combine(env.Worktree, "shared.txt"), "agent version\n");
+        AgentTestGit.RunChecked(env.Worktree, "add", "shared.txt");
+        AgentTestGit.RunChecked(env.Worktree, "commit", "-m", "agent edits shared");
+        env.AdvanceMain("shared.txt", "human version\n", "human edits shared");
+
+        var ledger = new HumanPauseLedger();
+        var sandbox = new PauseCountingSandbox();
+        // The daemon's own composition: no cooperative transport exists, so every yield takes the
+        // docker-pause path — which is the path that takes the hold.
+        var yield = new YieldProtocol(
+            channelFor: _ => UnboundAgentControlChannel.Instance,
+            sandbox: sandbox,
+            containerIdFor: _ => "container-1",
+            arbiter: ledger);
+        var rebaser = new KeepAliveRebaser(yield, _ => env.Location);
+
+        var result = await rebaser.RunCycleAsync("a1");
+
+        Assert.Equal(RebaseCycleKind.Conflict, result.Kind);
+        // The jail IS still frozen — that part is deliberate and must not change.
+        Assert.Equal(1, sandbox.PauseCount);
+        Assert.Equal(0, sandbox.UnpauseCount);
+        // ...and the machine has let go of its claim on that pause, so the human's unpause reaches its
+        // own logic instead of being turned away by a refusal that never clears.
+        Assert.False(ledger.HasMachineHold("a1"),
+            "the conflict arm leaked the machine hold — a human unpause is refused forever");
+    }
+
+    /// <summary>The same leak on the other never-resumed path: a kill switch that fires mid-cycle. The
+    /// jail stays frozen until the operator resumes the queue, and the ledger must not be left claiming
+    /// the daemon is mid-update for the rest of the process's life.</summary>
+    [Fact]
+    public async Task KeepAlive_KillSwitchMidCycle_AlsoReleasesTheMachineHold()
+    {
+        using var env = new RebaseEnv();
+        env.AdvanceMain("human.txt", "human work\n", "human commit on main");
+
+        var ledger = new HumanPauseLedger();
+        var sandbox = new PauseCountingSandbox();
+        var killGate = new KillSwitchGate();
+        var yield = new YieldProtocol(
+            channelFor: _ => UnboundAgentControlChannel.Instance,
+            sandbox: sandbox,
+            containerIdFor: _ => "container-1",
+            arbiter: ledger);
+        // Frozen only AFTER the cycle starts — the start-of-cycle gate check cannot cover this race, which
+        // is the whole reason the finally re-reads the gate.
+        var rebaser = new KeepAliveRebaser(
+            yield, _ => { killGate.Freeze(); return env.Location; }, killGate: killGate);
+
+        await rebaser.RunCycleAsync("a1");
+
+        Assert.Equal(0, sandbox.UnpauseCount); // the kill wins: the jail stays frozen
+        Assert.False(ledger.HasMachineHold("a1"));
+    }
+
+    /// <summary>Counts freezes. The engine is otherwise unused — no jail is really spawned here.</summary>
+    private sealed class PauseCountingSandbox : Mainguard.Agents.Agents.Sandbox.ISandboxEngine
+    {
+        public int PauseCount { get; private set; }
+
+        public int UnpauseCount { get; private set; }
+
+        public Task<Mainguard.Agents.Agents.Sandbox.SandboxHandle> SpawnAsync(
+            Mainguard.Agents.Agents.Sandbox.SandboxSpawnRequest request, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task<Mainguard.Agents.Agents.Sandbox.SandboxExecResult> ExecAsync(
+            string containerId, IReadOnlyList<string> command, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task PauseAsync(string containerId, CancellationToken ct = default)
+        {
+            PauseCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task UnpauseAsync(string containerId, CancellationToken ct = default)
+        {
+            UnpauseCount++;
+            return Task.CompletedTask;
+        }
+
+        public Task StopAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
+
+        public Task RemoveAsync(string containerId, CancellationToken ct = default) => Task.CompletedTask;
     }
 
     [Fact]
@@ -286,11 +457,18 @@ public sealed class KeepAliveRebaserTests
 
         public bool Resumed { get; private set; }
 
-        public bool IsActive => !Resumed;
+        /// <summary>True once the cycle handed the critical section back WITHOUT waking the jail — the
+        /// conflict path's terminus. Recorded separately from <see cref="Resumed"/> because the whole
+        /// point is that they are different outcomes: one wakes the agent, one does not.</summary>
+        public bool ReleasedWithoutResuming { get; private set; }
+
+        public bool IsActive => !Resumed && !ReleasedWithoutResuming;
 
         public YieldOutcome Outcome => YieldOutcome.ByReady;
 
         public void Resume() => Resumed = true;
+
+        public void ReleaseWithoutResuming() => ReleasedWithoutResuming = true;
 
         public void Dispose() => Resume();
     }

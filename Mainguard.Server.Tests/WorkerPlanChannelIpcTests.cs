@@ -37,12 +37,26 @@ public sealed class PlanGateRig : IDisposable
     {
         _root = Path.Combine(Path.GetTempPath(), "mg-plangate-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(Path.Combine(_root, "repos", RepoHandle)); // "provisioned"
-        var environment = new AgentSessionRepoScopingTests.FakeAgentEnvironment(
+        Environment = new AgentSessionRepoScopingTests.FakeAgentEnvironment(
             _root, new AgentSessionRepoScopingTests.RecordingEngine());
+        var environment = Environment;
         _host = _daemon.WithWebHostBuilder(b => b.ConfigureTestServices(services =>
-            services.AddSingleton<IAgentEnvironment>(environment)));
+        {
+            services.AddSingleton<IAgentEnvironment>(environment);
+            // These classes drive several coordinators against one daemon (cross-coordinator plan
+            // ownership, the four-tool simulation). The shipped cap is ONE per daemon (contract §2.2), so
+            // the rig raises it explicitly; OneCoordinatorPerDaemonTests proves the default.
+            services.AddSingleton(new CoordinatorLimits(MaxLiveCoordinators: 16));
+        }));
         _ = _host.Services; // build once, here, not inside the first test
     }
+
+    /// <summary>The substrate this daemon was built over — the only way to see what the daemon asked it
+    /// to do (which worktree it committed on, and on whose behalf).</summary>
+    internal AgentSessionRepoScopingTests.FakeAgentEnvironment Environment { get; }
+
+    /// <summary>The host's container, for the services a single typed accessor would not justify.</summary>
+    public IServiceProvider Services => _host.Services;
 
     public AgentSpawnService Spawns => _host.Services.GetRequiredService<AgentSpawnService>();
 
@@ -55,6 +69,13 @@ public sealed class PlanGateRig : IDisposable
     public CoordinatorLimits Limits => _host.Services.GetRequiredService<CoordinatorLimits>();
 
     public AgentSessionStore Sessions => _host.Services.GetRequiredService<AgentSessionStore>();
+
+    /// <summary>
+    /// The bound-terminal registry, so a test can give a worker a writable session. Without one,
+    /// <c>send_worker_prompt</c> can only ever be observed FAILING on this substrate — which is part of
+    /// how two of the contract's four tools ended up with no positive coverage anywhere.
+    /// </summary>
+    public TerminalSessionManager Terminals => _host.Services.GetRequiredService<TerminalSessionManager>();
 
     public void Dispose()
     {
@@ -82,10 +103,19 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
 
     // ---- the daemon withholds the task -----------------------------------
 
+    /// <summary>
+    /// <b>The separation, at the worker's own channel.</b> The brief is the coordinator's <c>--title</c>
+    /// and it is NOT the task — the assertion this test could not previously make, because until
+    /// 2026-08-29 the daemon derived the brief from the task (<c>Title ?? TaskPrompt</c>) and this test's
+    /// own expectation was the task prompt it had just spawned with. It passed, and the thing it was
+    /// named for was false.
+    /// </summary>
     [Fact]
     public async Task ACoordinatorSpawnedWorker_GetsAPlanShimAndABrief_ButNotItsTask()
     {
-        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("fix the token clock");
+        const string title = "Fix the token clock";
+        const string task = "rewrite TokenClock so expiry is computed in UTC and add boundary tests";
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync(task, title);
 
         // The worker's jail carries mainguard-plan and NOT the coordinator's spawn shim.
         var dir = Rig.Ipc.DirFor(workerId);
@@ -96,9 +126,91 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         // `brief` tells it what to plan about — and carries no task prompt.
         var brief = await CallAsync(workerId, new AgentIpcRequest(AgentIpcRequest.BriefOp));
         Assert.True(brief.Ok);
-        Assert.Equal("fix the token clock", brief.Brief);
+        Assert.Equal(title, brief.Brief);
         Assert.True(string.IsNullOrEmpty(brief.TaskPrompt));
         Assert.Equal(Rig.Limits.MaxPlanRevisions, brief.MaxRevisions);
+
+        // The point: the brief is not the task, and does not contain it. Asserted both ways so a
+        // reinstated `Title ?? TaskPrompt` fallback fails here rather than passing quietly.
+        Assert.NotEqual(task, brief.Brief);
+        Assert.DoesNotContain(task, brief.Brief!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A coordinator that sends no title is <b>refused</b>, and no worker is minted for it.
+    ///
+    /// <para>This is the daemon half of the contract §3 change, and it is asserted through the socket
+    /// rather than against the shim, because the shim is a file in a read-only mount and the wire is what
+    /// a jail can actually speak. A shim-only check would be the convention MG-12 warns about.</para>
+    ///
+    /// <para><b>The refusal must also not fall through to an ungated spawn.</b> <c>SpawnAsync</c> reads
+    /// "neither title nor task" as "this spawn is not plan-gated" — the operator's own spelling — so the
+    /// dangerous failure mode is not a bad brief but a Managed worker with no gate at all. Hence the
+    /// worker-count assertion.</para>
+    /// </summary>
+    [Theory]
+    // The dangerous row, and the reason this check lives at the CHANNEL: with neither field,
+    // SpawnAsync would read the request as "not plan-gated" and mint an UNGATED managed worker.
+    [InlineData(null, null, "a task is required")]
+    [InlineData(null, "rewrite TokenClock", "a title is required")]
+    [InlineData("   ", "rewrite TokenClock", "a title is required")]
+    [InlineData("Fix the clock", null, "a task is required")]
+    [InlineData("Fix the clock", "   ", "a task is required")]
+    [InlineData("rewrite TokenClock", "rewrite TokenClock", "must not be the task")]
+    public async Task ASpawnWhoseBriefIsMissingOrIsTheTask_IsRefused_AndSpawnsNothing(
+        string? title, string? task, string expected)
+    {
+        var coordinatorId = await SpawnCoordinatorAsync();
+        var before = Rig.Sessions.List().Count;
+
+        var response = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: task, Title: title));
+
+        Assert.False(response.Ok);
+        Assert.Contains(expected, response.Error!, StringComparison.Ordinal);
+        Assert.Null(response.AgentId);
+        Assert.Equal(before, Rig.Sessions.List().Count);
+    }
+
+    /// <summary>
+    /// The same rule one layer down, at <c>SpawnAsync</c> itself — the entry point every future
+    /// plan-gated caller reaches, not just the shim channel. It refuses BEFORE <c>_store.Spawn</c>, so a
+    /// bad brief costs no session record; letting it reach <c>Hold</c>'s throw instead would leave an
+    /// orphan session behind. Asserting the session count is what makes the placement testable rather
+    /// than a comment.
+    /// </summary>
+    [Fact]
+    public async Task SpawnAsync_WithAPlanGatedTaskAndNoBrief_ThrowsBeforeMintingASession()
+    {
+        var before = Rig.Sessions.List().Count;
+
+        await Assert.ThrowsAsync<ArgumentException>(() => Rig.Spawns.SpawnAsync(
+            PlanGateRig.RepoHandle, "claude-code", null, AgentRoles.Managed, CancellationToken.None,
+            heldTaskTitle: null, heldTaskPrompt: "rewrite TokenClock"));
+
+        Assert.Equal(before, Rig.Sessions.List().Count);
+    }
+
+    /// <summary>
+    /// An over-long or multi-line title is refused too: it is the headline on a human's approval card,
+    /// and "paste the task in as the title" is the shape the fallback used to produce automatically.
+    /// </summary>
+    [Fact]
+    public async Task ATitleThatIsNotAHeadline_IsRefused()
+    {
+        var coordinatorId = await SpawnCoordinatorAsync();
+
+        var tooLong = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "do the work",
+            Title: new string('x', WorkerPlanGate.MaxBriefLength + 1)));
+        Assert.False(tooLong.Ok);
+        Assert.Contains("headline", tooLong.Error!, StringComparison.Ordinal);
+
+        var multiLine = await CallAsync(coordinatorId, new AgentIpcRequest(
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "do the work",
+            Title: "Fix the clock\nand everything else"));
+        Assert.False(multiLine.Ok);
+        Assert.Contains("single line", multiLine.Error!, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -277,6 +389,433 @@ public sealed class WorkerPlanChannelIpcTests : PlanGateIpcTestBase, IClassFixtu
         Assert.Contains("testStrategy is required", refused.PlanErrors!);
         Assert.Null(Rig.Plans.LiveForWorker(workerId)); // nothing reached the approval queue
     }
+
+    // ---- commit_work: the rung the loop was missing ------------------------
+    //
+    // The first end-to-end run ended with a worker holding a 20-line UNCOMMITTED diff. Its worktree was
+    // deleted with the jail, agent/<id> carried no commit, and the readiness trigger — which fires on
+    // that ref advancing and then going quiet — had nothing to observe. Everything below drives the same
+    // bytes an in-jail shim writes, over the real socket.
+
+    /// <summary>
+    /// The gate answers commit exactly as it answers steering and verification. A worker whose plan is
+    /// not approved has no authorised work, so it has nothing legitimate to record — and the refusal is
+    /// the same sentence a human reads elsewhere, because it is the same gate rather than a second
+    /// opinion about what "approved" means.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerStillAtThePlanGate_MayNotCommit()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("fix the clock");
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work nobody approved"));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("has not presented a plan yet", refused.Error);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count); // and nothing was committed
+    }
+
+    /// <summary>
+    /// The positive: once a human approves, the worker's own shim channel records the work. The daemon
+    /// commits on the worker's (repo, agent) and answers with the sha — which is what makes
+    /// <c>refs/heads/agent/&lt;id&gt;</c> move and therefore what the readiness trigger can see.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorker_CommitsItsWorkThroughItsOwnChannel()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite TokenClock");
+        await ApproveAsync(workerId);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: rewrite the clock", NoDeviations: true));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.True(response.Committed);
+        Assert.False(string.IsNullOrEmpty(response.CommitSha));
+        Assert.Equal("agent/" + workerId, response.Status);
+
+        var commit = Assert.Single(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+        Assert.Equal(PlanGateRig.RepoHandle, commit.RepoHash);
+        Assert.Equal("feat: rewrite the clock", commit.Message);
+    }
+
+    /// <summary>
+    /// <b>The worker names only the message.</b> <c>AgentIpcRequest.AgentId</c> exists because the
+    /// coordinator's ops need it, so a worker CAN put another agent's id on the wire — and it must have
+    /// no effect whatsoever. The commit's (repo, agent) come from the endpoint the request arrived on,
+    /// the same way <c>AgentRefMediator</c> refuses to let an agent name a ref at all.
+    ///
+    /// <para>Asserted behaviourally rather than by field-absence, for the reason
+    /// <c>QueueEntryResumeTests</c> writes down: a structural proof that stops being available has to be
+    /// replaced by one that survives the field existing.</para>
+    /// </summary>
+    [Fact]
+    public async Task ACommitIgnoresAnyAgentIdTheRequestCarries_AndLandsOnTheCallersOwnBranch()
+    {
+        var (_, mine) = await SpawnCoordinatorAndWorkerAsync("my task");
+        var (_, theirs) = await SpawnCoordinatorAndWorkerAsync("their task");
+        await ApproveAsync(mine);
+        await ApproveAsync(theirs);
+
+        var response = await CallAsync(mine, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, AgentId: theirs, Message: "feat: onto someone else's branch",
+            NoDeviations: true));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal("agent/" + mine, response.Status);
+        Assert.Contains(Rig.Environment.WorkerCommits, c => c.AgentId == mine);
+        Assert.DoesNotContain(Rig.Environment.WorkerCommits, c => c.AgentId == theirs);
+    }
+
+    /// <summary>
+    /// A clean tree answers truthfully. The worker asked correctly and there was nothing to record, so
+    /// the call succeeds — and says <c>committed: false</c>, because the branch did not move. Reporting
+    /// it as a commit would tell a worker its work is safe while its branch sits exactly where it was:
+    /// the original defect wearing a success message, and no longer visible to anyone.
+    /// </summary>
+    [Fact]
+    public async Task ACleanTree_AnswersNothingToCommit_RatherThanClaimingACommit()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("nothing to do");
+        await ApproveAsync(workerId);
+        Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.NothingToCommit;
+        try
+        {
+            var response = await CallAsync(workerId, new AgentIpcRequest(
+                AgentIpcRequest.CommitWorkOp, Message: "feat: nothing happened", NoDeviations: true));
+
+            Assert.True(response.Ok, response.Error);
+            Assert.False(response.Committed);
+            Assert.Null(response.CommitSha);
+        }
+        finally
+        {
+            Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.Committed;
+        }
+    }
+
+    /// <summary>
+    /// A worktree that has wandered off <c>agent/&lt;id&gt;</c> is a refusal the worker is told about, not
+    /// a silent success. A commit made on some other branch is reachable from nothing the mediator
+    /// publishes, the queue reads or the trigger watches — lost exactly as an uncommitted diff is.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedCommit_IsReportedAsAFailure_NotAsDone()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("work on the wrong branch");
+        await ApproveAsync(workerId);
+        Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.RefusedBranch;
+        try
+        {
+            var response = await CallAsync(workerId, new AgentIpcRequest(
+                AgentIpcRequest.CommitWorkOp, Message: "feat: somewhere else", NoDeviations: true));
+
+            Assert.False(response.Ok);
+            Assert.False(response.Committed);
+            Assert.False(string.IsNullOrEmpty(response.Error));
+        }
+        finally
+        {
+            Rig.Environment.NextCommitOutcome = AgentWorkCommitOutcome.Committed;
+        }
+    }
+
+    // ---- commit_work: the deviation declaration --------------------------
+    //
+    // The defect: a human approved a plan whose `approach` said the module had no validation idiom, so
+    // the worker would keep plain `a / b`. The worker shipped a throwing validation layer that changed
+    // three PRE-EXISTING helpers. The plan's scope was honoured, so the out-of-scope arm saw nothing and
+    // FlaggedItems was []; CanMerge was true and the state Verified, because the worker had also written
+    // the tests asserting its own new behaviour. Nothing anywhere held the approved approach against the
+    // diff, and nothing does now — what changed is that the worker must ANSWER, and cannot answer by
+    // saying nothing.
+
+    /// <summary>
+    /// <b>Silence is refused, and nothing is committed.</b> An optional declaration would be absent on
+    /// exactly the runs that needed it, so a plan-gated commit that carries neither answer does not
+    /// happen. The refusal is safe to make mandatory precisely because it lands BEFORE the commit: the
+    /// worktree is untouched, so it costs the worker one re-run and no work.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorkersCommitWithNoDeclaration_IsRefused_AndNothingIsCommitted()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide, with validation nobody asked for"));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("deviation declaration", refused.Error!, StringComparison.Ordinal);
+        // The refusal names the form, so the correction costs no round trip and no guessing. This is
+        // also the ONLY documentation a worker gets whose jail was created by a daemon predating the
+        // flags — its MAINGUARD.md never mentions them — so the refusal has to be self-sufficient.
+        Assert.Contains(WorkerPlanShim.CommitUsage, refused.Error!, StringComparison.Ordinal);
+        // ...and it must say the refusal cost nothing. Commit is the only way work leaves the jail and
+        // an uncommitted worktree dies with it, so a worker that read "refused" as "my diff is gone"
+        // could stop with the work still in it — which is worse than the divergence this gate surfaces.
+        Assert.Contains("nothing is lost", refused.Error!, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
+    /// <summary>
+    /// <b>The refusal is recoverable in the same turn.</b> The worker that was just refused re-runs the
+    /// identical command with an answer and its work lands — no lost diff, no lost turn beyond the one,
+    /// no state to clean up. Asserted as the SEQUENCE rather than as two independent facts, because
+    /// "refused" and "can still commit afterwards" being separately true is not the property that
+    /// matters; the property is that the second call, made immediately after the first, succeeds.
+    /// </summary>
+    [Fact]
+    public async Task ARefusedDeclaration_CostsATurnAndNotTheWork()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()"));
+        Assert.False(refused.Ok);
+        Assert.DoesNotContain(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+
+        // The very next call, same message, with the answer the refusal named.
+        var retried = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(retried.Ok, retried.Error);
+        Assert.True(retried.Committed);
+        var commit = Assert.Single(Rig.Environment.WorkerCommits, c => c.AgentId == workerId);
+        Assert.Equal("feat: divide()", commit.Message);
+    }
+
+    /// <summary>
+    /// A declared departure is recorded on the plan that AUTHORISED the work — the same record the
+    /// out-of-scope comparison resolves — so the approach shown at review and the deviation shown beside
+    /// it can never describe two different plans. The commit itself is unaffected: the declaration is
+    /// evidence, not a second gate on the work leaving the jail.
+    /// </summary>
+    [Fact]
+    public async Task ADeclaredDeviation_IsRecordedOnTheApprovedPlan_AndTheCommitStillLands()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp,
+            Message: "feat: divide()",
+            Deviations: new[] { "added RangeError on zero; the approach said keep plain a / b" }));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.True(response.Committed);
+
+        var work = Rig.Plans.ApprovedWorkFor(workerId)!;
+        Assert.Equal(DeviationDeclaration.Declared, work.Declaration);
+        Assert.Equal(
+            new[] { "added RangeError on zero; the approach said keep plain a / b" }, work.Deviations);
+    }
+
+    /// <summary>
+    /// The explicit "none" is recorded as the ASSERTION it is. This is the pair that makes the mechanism
+    /// mean anything: a branch whose worker said "I checked, none" and one nobody ever asked must not end
+    /// up in the same state, because the second is a question and only the first is an answer.
+    /// </summary>
+    [Fact]
+    public async Task AnAssertedNoDeviations_IsRecordedAsAnAnswer_NotAsSilence()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+
+        Assert.Equal(DeviationDeclaration.NotDeclared, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+
+        var response = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()", NoDeviations: true));
+
+        Assert.True(response.Ok, response.Error);
+        Assert.Equal(DeviationDeclaration.None, Rig.Plans.ApprovedWorkFor(workerId)!.Declaration);
+    }
+
+    /// <summary>
+    /// Both answers at once is refused rather than resolved by precedence — they say opposite things
+    /// about the same work, and a rule about which one wins would be invisible at the call site. Refused
+    /// at the daemon as well as at the shim, because the shim's refusal is an affordance and this is the
+    /// enforcement.
+    /// </summary>
+    [Fact]
+    public async Task ACommitThatBothDeclaresAndDeniesDeviations_IsRefused()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        await ApproveAsync(workerId);
+        var before = Rig.Environment.WorkerCommits.Count;
+
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: divide()",
+            NoDeviations: true, Deviations: new[] { "added RangeError" }));
+
+        Assert.False(refused.Ok);
+        Assert.Contains("opposite things", refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(before, Rig.Environment.WorkerCommits.Count);
+    }
+
+    // ---- rescope_plan: the worker's legal way to widen an approved scope ---
+    //
+    // Live testing found a worker that TRIED to widen legitimately and was refused — one live plan per
+    // worker, and no op that acted on an approved one. It had two moves left, both bad: exceed its scope
+    // silently, or stop. Everything below drives the same bytes an in-jail shim writes.
+
+    /// <summary>
+    /// The dead end, at the daemon, and the way out of it. Both refusals are asserted in the same test
+    /// because neither is wrong on its own — it is the PAIR that left the worker with nowhere to go, and a
+    /// test that only checked one would keep passing if the other lost its hint.
+    /// </summary>
+    [Fact]
+    public async Task AnApprovedWorker_IsToldHowToWiden_ByBothOpsThatRefuseIt()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var presentedAgain = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.PresentPlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+        Assert.False(presentedAgain.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, presentedAgain.Error!, StringComparison.Ordinal);
+
+        var revised = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RevisePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Wider"));
+        Assert.False(revised.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, revised.Error!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <b>The whole op, end to end, plus the property the design rests on.</b> The re-scope parks on the
+    /// human exactly as a presentation does — and while it is parked the worker is still authorised: it
+    /// commits, over its own channel, mid-wait. That is asserted here rather than only in the pure tests
+    /// because <c>commit_work</c> asks <c>WorkerPlanGate.MayWork</c>, and "the gate still says yes" is a
+    /// claim about the daemon's wiring, not about the plan store.
+    /// </summary>
+    [Fact]
+    public async Task ARescopeBlocksOnTheHuman_AndTheWorkerKeepsWorkingAndCommittingWhileItWaits()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Also the calculator"));
+        var pending = await WaitForAsync(() =>
+            Rig.Plans.LiveForWorker(workerId) is { IsRescope: true } p ? p : null);
+
+        // Parked: nothing but a human completes it.
+        Assert.False(await Task.WhenAny(call, Task.Delay(200)) == call, "the re-scope returned undecided");
+
+        // ...and the worker is NOT suspended. It still holds the approval it is asking to widen.
+        Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+        var commit = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: work the approved plan already covers",
+            NoDeviations: true));
+        Assert.True(commit.Ok, commit.Error);
+        Assert.True(commit.Committed);
+
+        Rig.Plans.Approve(pending.PlanId, "uid:1000");
+
+        var decided = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.True(decided.Ok, decided.Error);
+        Assert.Equal("Approved", decided.Status);
+        Assert.Equal(approvedId, decided.RescopeOf); // the shim needs this to report it as a widening
+        Assert.Equal(pending.PlanId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+    }
+
+    /// <summary>
+    /// A declined widening takes nothing away, and the answer says so — <c>rescopeOf</c> is what stops the
+    /// shim printing the generic "STOP: do not attempt another plan" at a worker that is still cleared for
+    /// its original scope and would otherwise abandon work it may legitimately finish.
+    /// </summary>
+    [Fact]
+    public async Task ADeclinedRescope_LeavesTheWorkerAuthorised_AndSaysWhichApprovalStands()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: approvedId,
+            PlanJson: PlanJson("src/calc.js"), Title: "Also the calculator"));
+        var pending = await WaitForAsync(() =>
+            Rig.Plans.LiveForWorker(workerId) is { IsRescope: true } p ? p : null);
+        Rig.Plans.Reject(pending.PlanId, "src/calc.js belongs to another worker");
+
+        var decided = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("Rejected", decided.Status);
+        Assert.Equal(approvedId, decided.RescopeOf);
+
+        Assert.Equal(approvedId, Rig.Plans.ApprovedForWorker(workerId)!.PlanId);
+        Assert.True(Rig.Gate.MayWork(workerId, out _));
+        var commit = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.CommitWorkOp, Message: "feat: carrying on inside the approved scope",
+            NoDeviations: true));
+        Assert.True(commit.Ok, commit.Error);
+    }
+
+    /// <summary>
+    /// Ownership is checked here exactly as it is for <c>revise</c>, and a stranger's plan id is answered
+    /// as a plan that does not exist — otherwise the re-scope op would be the one place on this channel
+    /// that told a worker which other workers' plans are approved.
+    /// </summary>
+    [Fact]
+    public async Task AWorkerCannotRescopeAnotherWorkersPlan()
+    {
+        var (_, mine) = await SpawnCoordinatorAndWorkerAsync("my task");
+        var (_, theirs) = await SpawnCoordinatorAndWorkerAsync("their task");
+        await ApproveAsync(mine);
+        var theirPlan = await ApproveAsync(theirs);
+
+        // BOUNDED, and the bound is part of the assertion. If the ownership check were removed this
+        // re-scope would be ACCEPTED — and then park on a human who is never coming, so the test would
+        // hang rather than fail. A guard whose absence produces a hang is a guard nothing reports on:
+        // mutation m13 was watched doing exactly that before this timeout was added.
+        var refused = await CallAsync(mine, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanId: theirPlan,
+            PlanJson: PlanJson("src/calc.js"), Title: "Wider")).WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.False(refused.Ok);
+        Assert.Equal($"no plan '{theirPlan}'", refused.Error); // the same answer as a plan that is not there
+        Assert.False(Rig.Plans.LiveForWorker(theirs)!.IsRescope); // and nothing was queued on their behalf
+    }
+
+    /// <summary>
+    /// A re-scope naming no plan is refused with the form to use, and nothing is queued. Deriving the plan
+    /// from "whatever this worker has approved" was the obvious alternative and is the same call §13.3
+    /// made about a missing <c>--title</c>: a guessed target produces a plausible card for an
+    /// authorisation nobody named.
+    /// </summary>
+    [Fact]
+    public async Task ARescopeThatNamesNoPlan_IsRefused_AndQueuesNothing()
+    {
+        var (_, workerId) = await SpawnCoordinatorAndWorkerAsync("rewrite the calculator");
+        var approvedId = await ApproveAsync(workerId);
+
+        // Bounded for the same reason as the ownership test above: a handler that INFERRED the plan id
+        // instead of refusing would accept this and then block on a decision nobody is going to make.
+        var refused = await CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.RescopePlanOp, PlanJson: PlanJson("src/calc.js"), Title: "Wider"))
+            .WaitAsync(TimeSpan.FromSeconds(15));
+
+        Assert.False(refused.Ok);
+        Assert.Contains(WorkerPlanShim.RescopeUsage, refused.Error!, StringComparison.Ordinal);
+        Assert.Equal(approvedId, Rig.Plans.LiveForWorker(workerId)!.PlanId);
+    }
+
+    /// <summary>Presents a plan and has a human approve it, so the worker is past the gate.</summary>
+    /// <returns>The approved plan's id — what a re-scope has to name.</returns>
+    private async Task<string> ApproveAsync(string workerId)
+    {
+        var call = CallAsync(workerId, new AgentIpcRequest(
+            AgentIpcRequest.PresentPlanOp, PlanJson: PlanJson("src/a.cs"), Title: "T"));
+        var pending = await WaitForAsync(() => Rig.Plans.LiveForWorker(workerId));
+        Rig.Plans.Approve(pending.PlanId, "uid:1000");
+        var approved = await call.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Equal("Approved", approved.Status);
+        return pending.PlanId;
+    }
 }
 
 /// <summary>
@@ -309,7 +848,7 @@ public sealed class WorkerCapDaemonEnforcementTests : PlanGateIpcTestBase, IClas
         await WaitForAsync(() => Rig.Gate.BlockedWorkerCount == max ? "ok" : null);
 
         var refused = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more"));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: "one more", Title: DefaultBrief));
 
         Assert.False(refused.Ok);
         Assert.Contains($"{max} workers are waiting on human plan approval", refused.Error!, StringComparison.Ordinal);
@@ -370,17 +909,27 @@ public abstract class PlanGateIpcTestBase : IAsyncLifetime
         return id;
     }
 
-    protected async Task<(string CoordinatorId, string WorkerId)> SpawnCoordinatorAndWorkerAsync(string taskPrompt)
+    /// <summary>
+    /// A stand-in brief for the tests that are not about the brief. Deliberately a DIFFERENT string from
+    /// every task prompt these tests spawn with, so no test here can pass on the two being equal — which
+    /// is how the pre-2026-08-29 defect survived a green suite: the daemon derived the brief from the
+    /// task, and every test that built its own request agreed with the derivation by construction.
+    /// </summary>
+    protected const string DefaultBrief = "Plan the auth-module work";
+
+    protected async Task<(string CoordinatorId, string WorkerId)> SpawnCoordinatorAndWorkerAsync(
+        string taskPrompt, string title = DefaultBrief)
     {
         var coordinatorId = await SpawnCoordinatorAsync();
-        return (coordinatorId, await ShimSpawnAsync(coordinatorId, taskPrompt));
+        return (coordinatorId, await ShimSpawnAsync(coordinatorId, taskPrompt, title));
     }
 
     /// <summary>Spawns a worker exactly as a coordinator CLI does — one JSON line on its own socket.</summary>
-    protected async Task<string> ShimSpawnAsync(string coordinatorId, string taskPrompt)
+    protected async Task<string> ShimSpawnAsync(
+        string coordinatorId, string taskPrompt, string title = DefaultBrief)
     {
         var response = await CallAsync(coordinatorId, new AgentIpcRequest(
-            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt));
+            AgentIpcRequest.SpawnOp, AgentKind: "claude-code", TaskPrompt: taskPrompt, Title: title));
         Assert.True(response.Ok, response.Error);
         Assert.Equal("AwaitingPlan", response.Status);
         _spawned.Add(response.AgentId!);

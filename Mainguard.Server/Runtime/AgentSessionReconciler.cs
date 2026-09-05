@@ -89,6 +89,7 @@ public sealed class AgentSessionReconciler
     private readonly Mainguard.Git.Audit.IAuditLog? _audit;
     private readonly ILogger _log;
     private readonly Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? _queues;
+    private readonly Action<AgentSession>? _onAdopted;
 
     /// <param name="store">The live session store this pass corrects.</param>
     /// <param name="listContainers">Lists the <c>mainguard.agent</c>-labelled containers. It is allowed —
@@ -110,14 +111,23 @@ public sealed class AgentSessionReconciler
     /// test that predates the queue sweep expects. Only queues this daemon has registered are visited, so
     /// the ownership question <paramref name="ownsRepo"/> answers for adoption is already settled here.
     /// </param>
+    /// <param name="onAdopted">
+    /// Called with each session this pass adopts, after its record exists. The composition root uses it to
+    /// re-bind the jail's IPC endpoint (<c>AgentSpawnService.TryReattachEndpoint</c>): adoption used to
+    /// rebuild the session record and nothing else, so an adopted coordinator's tools and an adopted
+    /// worker's plan channel stayed dead until the agent was restarted. A throwing hook is logged and does
+    /// not fail the pass.
+    /// </param>
     public AgentSessionReconciler(
         AgentSessionStore store,
         Func<CancellationToken, Task<IReadOnlyList<AgentContainerState>>> listContainers,
         Func<string, bool>? ownsRepo = null,
         Mainguard.Git.Audit.IAuditLog? audit = null,
         ILogger? log = null,
-        Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? queues = null)
+        Mainguard.Agents.Agents.Orchestrator.IMergeQueueRegistry? queues = null,
+        Action<AgentSession>? onAdopted = null)
     {
+        _onAdopted = onAdopted;
         _store = store ?? throw new ArgumentNullException(nameof(store));
         _listContainers = listContainers ?? throw new ArgumentNullException(nameof(listContainers));
         _ownsRepo = ownsRepo ?? (_ => true);
@@ -182,12 +192,16 @@ public sealed class AgentSessionReconciler
                 _store.Spawn(
                     kind: string.IsNullOrEmpty(container.Kind) ? "unknown" : container.Kind,
                     role: container.Role ?? string.Empty,
+                    // The parent comes off the label as well: a coordinator's four tools are scoped to
+                    // ParentAgentId, so a worker adopted without it is orphaned from its own coordinator.
+                    parentAgentId: string.IsNullOrEmpty(container.ParentAgentId) ? null : container.ParentAgentId,
                     agentId: container.AgentId,
                     repoHash: key.RepoHash);
                 _store.AttachSandbox(key, container.ContainerId);
                 if (container.Paused)
                 {
                     _store.MarkState(key, PausedState, AdoptedPausedReason);
+                    _store.MarkFrozen(key, DockerPausedFrozenReason);
                 }
                 else
                 {
@@ -200,6 +214,19 @@ public sealed class AgentSessionReconciler
             {
                 // A concurrent spawn won the (repo, id) — that session is the real one; leave it.
                 _log.LogDebug(ex, "agent-session reconcile: could not adopt {Agent}", container.AgentId);
+                continue;
+            }
+
+            if (_onAdopted is not null && _store.Find(key) is { } adoptedSession)
+            {
+                try
+                {
+                    _onAdopted(adoptedSession);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogWarning(ex, "agent-session reconcile: post-adoption hook failed for {Agent}", key.AgentId);
+                }
             }
         }
 
@@ -232,11 +259,13 @@ public sealed class AgentSessionReconciler
             if (container.Paused && !IsPaused(session.State))
             {
                 _store.MarkState(key, PausedState, DriftedToPausedReason);
+                _store.MarkFrozen(key, DockerPausedFrozenReason);
                 corrected.Add(session.Id);
             }
             else if (!container.Paused && IsPaused(session.State))
             {
                 _store.MarkState(key, WorkingState, DriftedToRunningReason);
+                _store.MarkFrozen(key, null);
                 corrected.Add(session.Id);
             }
         }
@@ -361,6 +390,9 @@ public sealed class AgentSessionReconciler
     /// recoverable-by-pressing-resume and this one is not.
     /// </summary>
     public const string LostState = "Unresponsive";
+
+    /// <summary>The pause-axis reason written from the container engine's own reading of the jail.</summary>
+    internal const string DockerPausedFrozenReason = "the jail is paused (the container engine reports it)";
 
     internal const string AdoptedReason =
         "Adopted after a daemon restart — this jail was already running.";

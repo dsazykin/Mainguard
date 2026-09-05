@@ -4,9 +4,11 @@ using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Headless;
 using Avalonia.Headless.XUnit;
+using Avalonia.Input;
 using Avalonia.Threading;
 using Avalonia.VisualTree;
 using Mainguard.Agents.Agents;
@@ -75,6 +77,35 @@ public class CoordinatorPlanGateRenderHarness
             Assert.NotNull(vm.PendingPlan);
             Assert.True(vm.PendingPlan!.NextRejectionEscalates);
             Assert.Equal("Reject — worker will stop", vm.PendingPlan.RejectButtonText);
+        });
+    }
+
+    /// <summary>
+    /// <b>The re-scope card renders, in every theme (phase 3 §23.7).</b> A card whose Adds/Drops rows
+    /// never appear is the UI equivalent of a gate that is never consulted: the human would be approving
+    /// a widening with no way to see what it widens, which is the one thing this card exists to show.
+    ///
+    /// <para>Also pins the three strings that differ by card kind, because each of them is FALSE on the
+    /// other kind: declining a re-scope does not stop the worker, so the button must not say it does.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void Rescope_ShowsWhatChanges_AndThatDecliningDoesNotStopTheWorker_AllThemes()
+    {
+        RenderAllThemes("plan_gate_rescope", () => Fake.Rescope(), vm =>
+        {
+            var card = Assert.Single(vm.PendingPlans);
+            Assert.True(card.IsRescope);
+
+            // What changed, both directions, kept apart.
+            Assert.True(card.HasAddedScope);
+            Assert.Equal("src/Auth/Clock/SystemClock.cs", card.AddedScopeText);
+            Assert.True(card.HasRemovedScope);
+            Assert.Equal("src/Auth/RefreshService.cs", card.RemovedScopeText);
+            Assert.Contains("Widening an approved plan", card.RescopeHeadlineText, StringComparison.Ordinal);
+
+            // ...and the wording that would otherwise lie about what Reject does here.
+            Assert.Equal("Decline the widening", card.RejectButtonText);
+            Assert.Contains("is not stopped", card.FactsText, StringComparison.Ordinal);
         });
     }
 
@@ -227,6 +258,358 @@ public class CoordinatorPlanGateRenderHarness
     }
 
     /// <summary>
+    /// <b>The decision must be clickable — all of it, at the window sizes people actually use.</b>
+    ///
+    /// <para>The reported defect: on the shipped surface roughly four screen points of Approve and Reject
+    /// were hittable, with the terminal appearing to sit on top of them. The cause was a literal
+    /// <c>MaxHeight="360"</c> on the plan-gate region. A constant cap does not move when the window does,
+    /// and the decision buttons are the LAST row of every card, so the overflow it cut was always the
+    /// decision — identically at 1296x759 and at 1700x1050. Measured on this harness before the fix, the
+    /// second blocked worker's Approve had <i>zero</i> visible pixels at both sizes.</para>
+    ///
+    /// <para>So the assertion is not "the button exists": it is that no decision button is left as a
+    /// sliver. A button is either wholly inside the gate's viewport or wholly scrolled out of it —
+    /// a partially clipped one is the four-point target, and it is the thing that must not come back.</para>
+    /// </summary>
+    [AvaloniaTheory]
+    [InlineData(1296, 759)]
+    [InlineData(1420, 920)]
+    [InlineData(1700, 1050)]
+    public void AnOverflowingGate_LeavesNoDecisionButtonAsASliver(int width, int height)
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+        Overfill(vm.Coordinator);
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = width, Height = height, Content = view };
+        win.Show();
+        Settle();
+
+        var gate = Assert.Single(view.GetVisualDescendants().OfType<PlanGateView>());
+        var host = gate.GetVisualAncestors().OfType<ScrollViewer>().First();
+        var (top, bottom) = VerticalSpan(host, view);
+
+        // The fixture has to actually overflow, or this measures a surface that never had the problem.
+        Assert.True(host.Extent.Height > host.Bounds.Height,
+            $"the fixture did not overflow the gate ({host.Extent.Height} in {host.Bounds.Height})");
+
+        var decisions = view.GetVisualDescendants().OfType<Button>()
+            .Where(b => b.Content is "Approve plan" or "Reject with feedback" or "Reject — worker will stop")
+            .ToList();
+        Assert.NotEmpty(decisions);
+
+        foreach (var button in decisions)
+        {
+            var (bTop, bBottom) = VerticalSpan(button, view);
+            var shown = Math.Max(0, Math.Min(bBottom, bottom) - Math.Max(bTop, top));
+            var full = bBottom - bTop;
+            Assert.True(
+                shown <= 0.5 || shown >= full - 0.5,
+                $"'{button.Content}' is clipped to {shown:0.#} of {full:0.#} points at {width}x{height} — "
+                + "a decision the human can only partly hit");
+        }
+
+        // …and the FRONT decision — the topmost one, the one the surface is asking about before any
+        // scrolling — is wholly there. This is the assertion the reported defect fails: with the gate
+        // capped at a constant and escalated cards ordered first, the front decision sat below the cut.
+        var first = decisions.OrderBy(b => VerticalSpan(b, view).Top).First();
+        var (fTop, fBottom) = VerticalSpan(first, view);
+        Assert.True(fTop >= top - 0.5 && fBottom <= bottom + 0.5,
+            $"the front decision '{first.Content}' sits at {fTop:0}..{fBottom:0} but the gate viewport is "
+            + $"{top:0}..{bottom:0} at {width}x{height} — the human's first decision is off the surface");
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// The cap is a <b>share of the pane</b>, not a number. This is the property the old constant could
+    /// never have: enlarging the window has to buy the gate room, or the operator's only recourse to a
+    /// clipped decision (make the window bigger) does nothing at all.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheGatesCap_GrowsWithTheWindow()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        double Measure(int width, int height)
+        {
+            using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+            using var vm = new ControlCenterViewModel(mock);
+            vm.FocusCoordinator();
+            Overfill(vm.Coordinator);
+
+            var view = new ControlCenterView { DataContext = vm };
+            var win = new Window { Width = width, Height = height, Content = view };
+            win.Show();
+            Settle();
+            var host = view.GetVisualDescendants().OfType<PlanGateView>().Single()
+                .GetVisualAncestors().OfType<ScrollViewer>().First();
+            var measured = host.Bounds.Height;
+            win.Content = null;
+            HarnessHygiene.Teardown(win);
+            return measured;
+        }
+
+        var small = Measure(1296, 700);
+        var large = Measure(1296, 1100);
+        Assert.True(large > small + 40,
+            $"the gate got {small:0} points in a 700-tall window and {large:0} in an 1100-tall one — "
+            + "the cap is not tracking the pane");
+    }
+
+    /// <summary>
+    /// The seam. "The pane is not resizable" was half the reported defect, and it was literally true: the
+    /// gate and the terminal were two grid rows with nothing between them. It appears with the gate and
+    /// disappears with it, so an idle coordinator surface grows no furniture.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheGateAndTheTerminal_AreSeparatedByADraggableSeam()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+        Assert.True(vm.Coordinator.HasGateContent);
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = 1296, Height = 759, Content = view };
+        win.Show();
+        Settle();
+
+        var gate = view.GetVisualDescendants().OfType<PlanGateView>().Single();
+        var host = gate.GetVisualAncestors().OfType<ScrollViewer>().First();
+        var seam = Assert.Single(view.GetVisualDescendants().OfType<GridSplitter>(), g => g.Name == "GateSeam");
+
+        Assert.True(seam.IsEffectivelyVisible, "the gate and the terminal have no handle between them");
+        Assert.Equal(GridResizeDirection.Rows, seam.ResizeDirection);
+        Assert.True(VerticalSpan(seam, view).Top >= VerticalSpan(host, view).Bottom - 1,
+            "the seam is not between the gate and the terminal");
+
+        // …and it goes away with the gate, rather than leaving a handle for a region that is not there.
+        vm.Coordinator.PendingPlans.Clear();
+        vm.Coordinator.EscalatedPlans.Clear();
+        vm.Coordinator.BackpressureText = "";
+        Settle();
+        Assert.False(seam.IsEffectivelyVisible);
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// Dragging the seam rewrites the gate's row from Auto to a PIXEL height, and a pixel row does not
+    /// collapse when its only child hides. Clearing the last plan must therefore give the terminal the
+    /// space back rather than leaving a dead band exactly as tall as the gate the human had just enlarged.
+    /// </summary>
+    [AvaloniaFact]
+    public void TheGateRow_ReturnsToAuto_WhenTheGateHides()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        using var mock = new MockOrchestrator(TimeSpan.FromHours(1));
+        using var vm = new ControlCenterViewModel(mock);
+        vm.FocusCoordinator();
+
+        var view = new ControlCenterView { DataContext = vm };
+        var win = new Window { Width = 1296, Height = 759, Content = view };
+        win.Show();
+        Settle();
+
+        var gate = view.GetVisualDescendants().OfType<PlanGateView>().Single();
+        var host = gate.GetVisualAncestors().OfType<ScrollViewer>().First();
+        var pane = Assert.IsType<Grid>(host.Parent);
+        var row = pane.RowDefinitions[Grid.GetRow(host)];
+        var seam = Assert.Single(view.GetVisualDescendants().OfType<GridSplitter>(), g => g.Name == "GateSeam");
+        Assert.True(row.Height.IsAuto, "the gate row must start Auto");
+
+        // A real drag, downward: the gate grows and the row becomes a pixel length — the precondition.
+        var origin = seam.TranslatePoint(new Point(seam.Bounds.Width / 2, seam.Bounds.Height / 2), win)!.Value;
+        win.MouseDown(origin, MouseButton.Left);
+        win.MouseMove(new Point(origin.X, origin.Y + 30));
+        win.MouseMove(new Point(origin.X, origin.Y + 60));
+        win.MouseUp(new Point(origin.X, origin.Y + 60), MouseButton.Left);
+        Settle();
+        Assert.True(row.Height.IsAbsolute, $"dragging the seam should leave a pixel row; got {row.Height}");
+
+        // The last plan clears → the gate hides → the row must be Auto again, not the dragged pixels.
+        vm.Coordinator.PendingPlans.Clear();
+        vm.Coordinator.EscalatedPlans.Clear();
+        vm.Coordinator.BackpressureText = "";
+        Settle();
+        Assert.False(host.IsEffectivelyVisible);
+        Assert.True(row.Height.IsAuto, $"a hidden gate must not reserve its dragged height; row is {row.Height}");
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// Escalated cards render <b>below</b> the decidable ones.
+    ///
+    /// <para>In the live run an escalated card sat on top and pushed the pending plan off the bottom of a
+    /// bounded region. An escalated card carries no approval — nothing on it unblocks a worker or relieves
+    /// the cap — so when the gate has to clip something, that is what it should reach first.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void EscalatedCards_RenderBelowTheDecidableOnes()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        var vm = new CoordinatorPanelViewModel(Fake.PendingAndEscalated(), endWorker: _ => Task.CompletedTask);
+        var gate = new PlanGateView { DataContext = vm };
+        var win = new Window { Width = 520, Height = 1200, Content = gate };
+        win.Show();
+        Settle();
+
+        var approve = gate.GetVisualDescendants().OfType<Button>()
+            .First(b => (b.Content as string) == "Approve plan");
+        var escalated = gate.GetVisualDescendants().OfType<TextBlock>()
+            .First(t => t.Text == "Escalated to you");
+
+        Assert.True(
+            VerticalSpan(approve, gate).Bottom <= VerticalSpan(escalated, gate).Top,
+            "the escalated card is above the decision — a bounded gate would clip the decision first");
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>
+    /// <b>The escalated card can release the slot its own copy promises.</b>
+    ///
+    /// <para>"It will not try again — steer it or end it" has always been on this card, and until now the
+    /// surface offered neither. An escalated worker keeps its jail and keeps counting against the worker
+    /// cap, and the only route to ending it was Resources → right-click → End task: a context menu on a
+    /// row that named no agent. This asserts the button is there, that it asks first, and that confirming
+    /// ends <i>that</i> worker.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void AnEscalatedCard_OffersTheEndItsCopyPromises_AndConfirmsFirst()
+    {
+        using var _seed = HarnessHygiene.SeedViewAssemblies(new Mainguard.Agents.UI.Editions.ProManifest());
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+
+        var ended = new List<string>();
+        var vm = new CoordinatorPanelViewModel(Fake.Escalated(), endWorker: id =>
+        {
+            ended.Add(id);
+            return Task.CompletedTask;
+        });
+
+        var gate = new PlanGateView { DataContext = vm };
+        var win = new Window { Width = 520, Height = 780, Content = gate };
+        win.Show();
+        Settle();
+
+        var card = Assert.Single(vm.EscalatedPlans);
+        Assert.True(card.ShowEndAction);
+
+        var end = gate.GetVisualDescendants().OfType<Button>()
+            .Single(b => (b.Content as string) == "End this worker");
+        Assert.True(end.IsEffectivelyVisible);
+
+        // Arming asks; nothing has happened yet.
+        card.BeginEndCommand.Execute(null);
+        Settle();
+        Assert.True(card.IsConfirmingEnd);
+        Assert.Empty(ended);
+        Assert.Contains("frees the slot", card.EndConfirmText, StringComparison.Ordinal);
+        Assert.Contains("branch is kept", card.EndConfirmText, StringComparison.Ordinal);
+
+        card.ConfirmEndCommand.Execute(null);
+        Settle();
+        Assert.Equal(new[] { "loom-4" }, ended);
+
+        win.Content = null;
+        HarnessHygiene.Teardown(win);
+    }
+
+    /// <summary>Without an ending seam the action is not offered — never a button that does nothing.</summary>
+    [AvaloniaFact]
+    public void WithNoWayToEndAWorker_TheEscalatedCardOffersNoButton()
+    {
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        var vm = new CoordinatorPanelViewModel(Fake.Escalated());
+        Assert.False(Assert.Single(vm.EscalatedPlans).ShowEndAction);
+    }
+
+    /// <summary>
+    /// <b>The banner and the cards cannot disagree.</b>
+    ///
+    /// <para>The reported state: an escalated worker's card stayed on the gate after its agent was ended
+    /// and its jail torn down, while the amber banner — counting a different population — had already
+    /// dropped it. Client-side, the fact both halves are read through is now derived from the collections
+    /// and the sentence rather than assigned after them, so there is no ordering in which the region can
+    /// be showing over an empty gate or collapsed over a full one.</para>
+    /// </summary>
+    [AvaloniaFact]
+    public void TheGatesVisibility_IsDerivedFromItsContents()
+    {
+        ThemeManager.Apply(ThemeManager.DefaultKey, persist: false);
+        var vm = new CoordinatorPanelViewModel(Fake.Escalated());
+        Assert.True(vm.HasGateContent);
+
+        var raised = 0;
+        vm.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(vm.HasGateContent)) raised++;
+        };
+
+        vm.EscalatedPlans.Clear();
+        vm.BackpressureText = "";
+        Assert.False(vm.HasGateContent);
+        Assert.True(raised > 0, "the host was never told the gate emptied");
+
+        vm.BackpressureText = "1 worker is waiting on your approval.";
+        Assert.True(vm.HasGateContent);
+    }
+
+    /// <summary>Vertical extent of a control in another control's coordinates.</summary>
+    private static (double Top, double Bottom) VerticalSpan(Visual control, Visual relativeTo)
+    {
+        var top = control.TranslatePoint(new Point(0, 0), relativeTo) ?? default;
+        var bottom = control.TranslatePoint(new Point(0, control.Bounds.Height), relativeTo) ?? default;
+        return (top.Y, bottom.Y);
+    }
+
+    /// <summary>
+    /// The live stress-run shape: an escalated worker plus more than one blocked one, which is more gate
+    /// than any window gives it. Built by hand rather than from the mock because the mock's scripted
+    /// fleet holds exactly one plan, and one card never overflowed.
+    /// </summary>
+    private static void Overfill(CoordinatorPanelViewModel gate)
+    {
+        gate.EscalatedPlans.Add(new EscalatedPlanViewModel(new WorkerPlanCard(
+            "plan-esc", "fad68b04fa5a429fab790d64fb807a9f", "coordinator", "multiply helper",
+            new[] { "calc.js", "test.js" }, "Add the multiply guard.", "node test.js",
+            1.00m, DateTimeOffset.Now.AddMinutes(-20), "Escalated", 3, 0, 3,
+            "Still not right: three new guards is more than test.js needs and -2*3 adds nothing once 6*7 "
+            + "and 0.5*8 are there. Keep exactly two guards, and put the multiply line before subtract in "
+            + "calc.js so the file reads alphabetically too.")));
+
+        foreach (var i in Enumerable.Range(1, 3))
+        {
+            gate.PendingPlans.Add(new PlanCardViewModel(new WorkerPlanCard(
+                $"plan-{i}", $"b3d2e7a48d09462fb9b6421bcd6da68{i}", "coordinator", $"divide helper {i}",
+                new[] { "calc.js", "test.js", "src/ops/divide.js", "src/ops/index.js", "docs/ops.md" },
+                "Add divide beside multiply, guarding divide-by-zero, and export it from the ops index.",
+                "node test.js plus two boundary cases", 1.25m, DateTimeOffset.Now.AddMinutes(-5),
+                "Pending", 0, 3, 3, ""), (_, _, _) => Task.CompletedTask));
+        }
+    }
+
+    /// <summary>
     /// The negative control for the mount test: with nothing waiting, the gate must take <b>no</b> vertical
     /// space on the coordinator surface. A region that is always there is a region the terminal has
     /// permanently lost.
@@ -246,11 +629,12 @@ public class CoordinatorPlanGateRenderHarness
         win.Show();
         Settle();
 
-        // Clear the gate the way approving everything would.
+        // Clear the gate the way approving everything would. HasGateContent is derived, so nothing sets
+        // it — which is the point: the region cannot be left showing over an empty gate.
         vm.Coordinator.PendingPlans.Clear();
         vm.Coordinator.EscalatedPlans.Clear();
         vm.Coordinator.BackpressureText = "";
-        vm.Coordinator.HasGateContent = false;
+        Assert.False(vm.Coordinator.HasGateContent);
         Settle();
 
         var gate = Assert.Single(view.GetVisualDescendants().OfType<PlanGateView>());
@@ -368,6 +752,33 @@ public class CoordinatorPlanGateRenderHarness
                     "the coordinator has stopped spawning until you clear plans."));
         }
 
+        public static Fake PendingAndEscalated() => new(
+            Lines("loom-9 is blocked on your approval; loom-4 escalated after 3 rejected plans."),
+            new[]
+            {
+                Card(revision: 0, remaining: 3, status: "Pending", feedback: "", worker: "loom-9"),
+                Card(revision: 3, remaining: 0, status: "Escalated", feedback: "not the right approach"),
+            },
+            new OrchestrationBackpressure(1, 1, 3, 6, 3,
+                "1 worker is waiting on your approval · 1 escalated after 3 rejected plans."));
+
+        /// <summary>
+        /// A RE-SCOPE (phase 3 §23): a worker asking to widen an approval it already holds. Its previous
+        /// scope both ADDS a path and DROPS one, because the drop is the direction that could take
+        /// something away from the human and a fake that only ever widened would never render that row.
+        /// </summary>
+        public static Fake Rescope() => new(
+            Lines("loom-4 is asking to widen the scope you already approved."),
+            new[]
+            {
+                Card(revision: 0, remaining: 3, status: "Pending", feedback: "",
+                     scope: new[] { "src/Auth/TokenClock.cs", "tests/AuthTests.cs", "src/Auth/Clock/SystemClock.cs" },
+                     supersedes: "plan-6",
+                     previousScope: new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
+                     rescopeCount: 1),
+            },
+            new OrchestrationBackpressure(1, 0, 2, 6, 3, "1 worker is waiting on your approval."));
+
         public static Fake Quiet() => new(
             Lines("Nothing is waiting on you."), Array.Empty<WorkerPlanCard>(), OrchestrationBackpressure.None);
 
@@ -382,12 +793,15 @@ public class CoordinatorPlanGateRenderHarness
         };
 
         private static WorkerPlanCard Card(
-            int revision, int remaining, string status, string feedback, string worker = "loom-4") => new(
+            int revision, int remaining, string status, string feedback, string worker = "loom-4",
+            string[]? scope = null, string supersedes = "", string[]? previousScope = null,
+            int rescopeCount = 0) => new(
             "plan-7", worker, "coordinator", "Fix token expiry off-by-one",
-            new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
+            scope ?? new[] { "src/Auth/TokenClock.cs", "src/Auth/RefreshService.cs", "tests/AuthTests.cs" },
             "Extract the clock behind ITokenClock; inject a fixed clock in tests; correct the expiry comparison.",
             "AuthTests green plus two new expiry-boundary cases.",
-            1.50m, DateTimeOffset.Now.AddMinutes(-2), status, revision, remaining, 3, feedback);
+            1.50m, DateTimeOffset.Now.AddMinutes(-2), status, revision, remaining, 3, feedback,
+            supersedes, previousScope, rescopeCount);
 
         public IReadOnlyList<ChatLine> GetTranscript() => _transcript;
 
@@ -402,10 +816,22 @@ public class CoordinatorPlanGateRenderHarness
 
         public OrchestrationBackpressure GetBackpressure() => _backpressure;
 
+        public PlanModeView PlanMode { get; set; } = new(true, "");
+
+        public PlanModeView GetPlanMode() => PlanMode;
+
+        public Task SetPlanModeAsync(bool enabled)
+        {
+            PlanMode = new PlanModeView(enabled, "");
+            return Task.CompletedTask;
+        }
+
         public event Action? Changed { add { } remove { } }
 
         public Task SendAsync(string text) => Task.CompletedTask;
 
         public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null) => Task.CompletedTask;
+
+        public Task RequestNewPlanAsync(string planId, string guidance) => Task.CompletedTask;
     }
 }

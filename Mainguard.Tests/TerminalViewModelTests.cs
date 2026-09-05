@@ -114,6 +114,81 @@ public sealed class TerminalViewModelTests
         Assert.Equal("agent-xyz", gateway.AttachedAgentId);
     }
 
+    /// <summary>
+    /// Stress S1 / G5 — the input forward is fire-and-forget, so a gateway failure used to become an
+    /// unobserved task: three characters gone with nothing said. It must reach the operator who typed
+    /// it, on the pane they typed it into.
+    /// </summary>
+    [Fact]
+    public async Task InputThatCannotBeDelivered_ShouldSurfaceOnThePane_NotVanish()
+    {
+        var view = new FakeTerminalView();
+        var gateway = new FakeTerminalGateway
+        {
+            FailInputWith = new InvalidOperationException(
+                "The terminal stream is closed — that input was not delivered."),
+        };
+        using var vm = new TerminalViewModel(gateway);
+        vm.AttachView(view);
+
+        view.RaiseInput("k"u8.ToArray());
+        await WaitForAsync(() => vm.HasInputDeliveryError);
+
+        Assert.Contains("not delivered", vm.InputDeliveryError!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Once input lands again the warning retires itself — a banner that never clears stops
+    /// meaning anything.</summary>
+    [Fact]
+    public async Task InputDeliveryError_ShouldClear_WhenInputLandsAgain()
+    {
+        var view = new FakeTerminalView();
+        var gateway = new FakeTerminalGateway { FailInputWith = new InvalidOperationException("nope") };
+        using var vm = new TerminalViewModel(gateway);
+        vm.AttachView(view);
+
+        view.RaiseInput("k"u8.ToArray());
+        await WaitForAsync(() => vm.HasInputDeliveryError);
+
+        gateway.FailInputWith = null;
+        view.RaiseInput("k"u8.ToArray());
+        await WaitForAsync(() => !vm.HasInputDeliveryError);
+
+        Assert.Null(vm.InputDeliveryError);
+    }
+
+    /// <summary>Detach/dispose is not a delivery failure the operator needs told about — the pane is
+    /// going away. Only a real "your keystroke did not arrive" earns the banner.</summary>
+    [Fact]
+    public async Task TeardownCancellation_ShouldNotRaiseTheBanner()
+    {
+        var view = new FakeTerminalView();
+        var gateway = new FakeTerminalGateway
+        {
+            FailInputWith = new Grpc.Core.RpcException(
+                new Grpc.Core.Status(Grpc.Core.StatusCode.Cancelled, "detached")),
+        };
+        using var vm = new TerminalViewModel(gateway);
+        vm.AttachView(view);
+
+        view.RaiseInput("k"u8.ToArray());
+        await Task.Delay(100);
+
+        Assert.False(vm.HasInputDeliveryError);
+        Assert.Null(vm.InputDeliveryError);
+    }
+
+    private static async Task WaitForAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.True(condition(), "the expected state was never reached");
+    }
+
     [Theory]
     [InlineData(Key.C, KeyModifiers.Control, new byte[] { 0x03 })] // Ctrl+C
     [InlineData(Key.D, KeyModifiers.Control, new byte[] { 0x04 })] // Ctrl+D
@@ -158,6 +233,9 @@ public sealed class TerminalViewModelTests
         public List<(int Cols, int Rows)> Resizes { get; } = new();
         public string? AttachedAgentId { get; private set; }
 
+        /// <summary>When set, every input send faults with it — the gateway refusing to deliver.</summary>
+        public Exception? FailInputWith { get; set; }
+
         public event Action<ReadOnlyMemory<byte>>? OutputReceived;
 
         public void PushOutput(byte[] data) => OutputReceived?.Invoke(data);
@@ -170,6 +248,11 @@ public sealed class TerminalViewModelTests
 
         public Task SendInputAsync(ReadOnlyMemory<byte> data)
         {
+            if (FailInputWith is { } ex)
+            {
+                return Task.FromException(ex);
+            }
+
             Inputs.Add(data.ToArray());
             return Task.CompletedTask;
         }

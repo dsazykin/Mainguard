@@ -35,8 +35,19 @@ public sealed class MockOrchestrator :
         public string Detail = "";
         public DateTimeOffset SpawnedAt;
         public int TestsPassed, TestsTotal = 58;
-        public VerificationRecord? Verification;
+        public VerificationVerdict? Verification;
+
+        /// <summary>The main@sha the mock's last verification ran against. It used to live inside the
+        /// verification record; the record was narrowed to the three facts the wire actually carries, and
+        /// the sha now travels where the daemon puts it — QueueEntry.VerifiedMainSha.</summary>
+        public string? VerifiedSha;
         public List<FlaggedItem> Flagged = new();
+
+        /// <summary>Set while this mock entry's worktree is "parked" mid-rebase on a conflict — the shape
+        /// the daemon produces when a merge moves main under a co-tenant branch. Modelled rather than
+        /// left permanently null so the demo surface renders (and can exercise) the two conflict
+        /// controls; nothing here touches a real worktree, which is exactly what the mock is.</summary>
+        public QueueRebaseConflict? Conflict;
         public List<string> Terminal = new();
         public List<(string Step, bool Done)> Plan = new();
         public List<string> QueuedPrompts = new();
@@ -132,7 +143,8 @@ public sealed class MockOrchestrator :
             Cpu = 2,
             Ram = 0.4,
             Spend = 0.71m,
-            Verification = new VerificationRecord("loom-3", "d4e1f9a", true, 58, 58, now.AddMinutes(-22)),
+            Verification = new VerificationVerdict(true, MockTestCommand, now.AddMinutes(-22)),
+            VerifiedSha = "d4e1f9a",
             Flagged =
             {
                 new FlaggedItem("f1", "package.json", "ExecutableConfig", "scripts block edited", false),
@@ -270,7 +282,8 @@ public sealed class MockOrchestrator :
                 {
                     SetMerge(a, WorkerMergeState.Verified, raised);
                     a.Life = AgentLifecycleState.AwaitingReview;
-                    a.Verification = new VerificationRecord(a.Id, _mainSha, true, a.TestsTotal, a.TestsTotal, now);
+                    a.Verification = new VerificationVerdict(true, MockTestCommand, now);
+                    a.VerifiedSha = _mainSha;
                     a.Detail = "verified against " + _mainSha;
                     a.Terminal.Add("Verification green — awaiting review.");
                     _transcript.Add(new ChatLine(ChatLineKind.SystemLine, $"{a.Name} verified against {_mainSha} — {a.TestsTotal} tests green", now));
@@ -295,7 +308,8 @@ public sealed class MockOrchestrator :
                 {
                     SetMerge(a, WorkerMergeState.Verified, raised);
                     a.Life = AgentLifecycleState.AwaitingReview;
-                    a.Verification = new VerificationRecord(a.Id, _mainSha, true, a.TestsTotal, a.TestsTotal, now);
+                    a.Verification = new VerificationVerdict(true, MockTestCommand, now);
+                    a.VerifiedSha = _mainSha;
                     a.Detail = "verified against " + _mainSha;
                 }
                 break;
@@ -485,6 +499,11 @@ public sealed class MockOrchestrator :
 
     // ---- IMergeQueueService -----------------------------------------------
 
+    /// <summary>The command the mock's verdicts claim to have been produced by. A verdict's provenance is
+    /// one of the three facts the wire carries, so the demo surface has to have one — and an obviously
+    /// scripted one, not a plausible invention.</summary>
+    private const string MockTestCommand = "dotnet test";
+
     public string MainSha { get { lock (_gate) return _mainSha; } }
 
     public IReadOnlyList<QueueEntry> GetQueue()
@@ -505,7 +524,14 @@ public sealed class MockOrchestrator :
                     // than left null so the demo surface exercises the stranded shape at all — and answered
                     // from the agent's OWN lifecycle rather than hardcoded, so a mock agent that dies while
                     // the demo runs stops claiming a sandbox it does not have.
-                    HasLiveSandbox: a.Life != AgentLifecycleState.Dead))
+                    HasLiveSandbox: a.Life != AgentLifecycleState.Dead,
+                    // Where the sha lives now: on the entry, exactly as the daemon sends it, rather than
+                    // inside a verification record that would have had to carry a verdict to carry a sha.
+                    VerifiedMainSha: a.VerifiedSha,
+                    // Null for every entry that is not parked mid-rebase, which is the ordinary case. The
+                    // mock never invents an empty conflict: an empty path list reads as "nothing
+                    // conflicts", which is the one thing a conflict card must never say.
+                    RebaseConflict: a.Conflict))
                 .ToList();
 
         static int RailOrder(WorkerMergeState s) => s switch
@@ -532,7 +558,7 @@ public sealed class MockOrchestrator :
         var a = Find(agentId);
         if (a.Merge is not (WorkerMergeState.Verified or WorkerMergeState.AwaitingReview))
         { reason = a.Merge == WorkerMergeState.StaleVerified ? "verification is stale — re-verifying" : "not verified yet"; return false; }
-        if (a.Verification is null || a.Verification.MainSha != _mainSha)
+        if (a.Verification is null || a.VerifiedSha != _mainSha)
         { reason = "verification is stale — re-verifying"; return false; }
         var unacked = a.Flagged.Count(f => !f.Acknowledged);
         if (unacked > 0) { reason = $"{unacked} flagged item{(unacked == 1 ? "" : "s")} unacknowledged"; return false; }
@@ -574,7 +600,8 @@ public sealed class MockOrchestrator :
             SetMerge(a, WorkerMergeState.Verifying, raised);
             SetMerge(a, WorkerMergeState.Verified, raised);
             a.Life = AgentLifecycleState.AwaitingReview;
-            a.Verification = new VerificationRecord(a.Id, _mainSha, true, a.TestsTotal, a.TestsTotal, now);
+            a.Verification = new VerificationVerdict(true, MockTestCommand, now);
+            a.VerifiedSha = _mainSha;
             a.Detail = "verified against " + _mainSha;
             _transcript.Add(new ChatLine(
                 ChatLineKind.SystemLine, $"{a.Name} verified against {_mainSha} (requested)", now));
@@ -584,6 +611,41 @@ public sealed class MockOrchestrator :
         foreach (var e in raised) EventReceived?.Invoke(e);
         Changed?.Invoke();
         return Task.FromResult(outcome);
+    }
+
+    /// <summary>
+    /// The scripted stand-in for <c>GetVerificationLog</c>. The shipped app reads the daemon's artifact;
+    /// this returns a short transcript so the design and render harnesses can drive the same seam.
+    ///
+    /// <para>It answers <c>HasRecord: false</c> for an agent with no verdict rather than an empty log —
+    /// the two are kept apart in the mock as well, because a harness that only ever sees "there is a log"
+    /// cannot catch a surface that renders never-run as a run which printed nothing.</para>
+    /// </summary>
+    public Task<VerificationLog> GetVerificationLogAsync(string agentId)
+    {
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Verification is not { } v)
+            {
+                return Task.FromResult(new VerificationLog(
+                    HasRecord: false, Passed: false, ResolvedCommand: "", MainSha: "", When: null,
+                    Text: "", Truncated: false, UnavailableReason: ""));
+            }
+
+            var text = string.Join('\n', new[]
+            {
+                $"$ {v.ResolvedCommand}",
+                $"  {a.Branch} against main@{a.VerifiedSha}",
+                "  Discovering tests…",
+                v.Passed ? "  All tests passed." : "  1 test failed. See above.",
+            });
+
+            return Task.FromResult(new VerificationLog(
+                HasRecord: true, Passed: v.Passed, ResolvedCommand: v.ResolvedCommand,
+                MainSha: a.VerifiedSha ?? string.Empty, When: v.When,
+                Text: text, Truncated: false, UnavailableReason: ""));
+        }
     }
 
     public Task<MergeOutcome> ConfirmMergeAsync(string agentId)
@@ -739,6 +801,64 @@ public sealed class MockOrchestrator :
         return Task.FromResult(outcome);
     }
 
+    /// <summary>
+    /// Mock hand-back — the same shape the daemon enforces: it is refused unless this entry really is
+    /// parked mid-rebase, and it clears the parking rather than leaving a card that describes a conflict
+    /// nobody is on any more.
+    /// </summary>
+    public Task ResolveConflictWithAgentAsync(string agentId)
+    {
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Conflict is null)
+            {
+                throw new InvalidOperationException(
+                    "Can't hand this back — this entry has no rebase parked for a human, so there is no "
+                    + "conflict to act on.");
+            }
+
+            if (a.Life == AgentLifecycleState.Dead)
+            {
+                throw new InvalidOperationException(
+                    "Can't hand this back — this entry's sandbox is gone, so there is no agent to hand the "
+                    + "conflict back to.");
+            }
+
+            a.Conflict = null;
+            a.Life = AgentLifecycleState.Working;
+            a.Detail = "resolving its own rebase conflict";
+        }
+
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Mock abort — refused unless a rebase is parked; on success the branch is "back where it
+    /// was" and the entry needs verifying again, which is the daemon's own terminus.</summary>
+    public Task AbortRebaseAsync(string agentId)
+    {
+        var raised = new List<AgentEvent>();
+        lock (_gate)
+        {
+            var a = Find(agentId);
+            if (a.Conflict is null)
+            {
+                throw new InvalidOperationException(
+                    "Can't abort — this entry has no rebase parked for a human, so there is nothing to abort.");
+            }
+
+            a.Conflict = null;
+            a.Life = AgentLifecycleState.Working;
+            SetMerge(a, WorkerMergeState.Working, raised);
+            a.Detail = "rebase aborted — needs verifying against the new main";
+        }
+
+        foreach (var e in raised) EventReceived?.Invoke(e);
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
     public Task AcknowledgeFlaggedChangeAsync(string agentId, string itemId)
     {
         lock (_gate)
@@ -786,6 +906,37 @@ public sealed class MockOrchestrator :
         }
     }
 
+    private bool _planModeEnabled = true;
+
+    /// <summary>
+    /// The prototype's plan-mode toggle. On by default, exactly like the daemon's: the mock is what the
+    /// design surfaces are demoed against, and demoing a gate that is off by default would teach the
+    /// wrong default.
+    /// </summary>
+    public PlanModeView GetPlanMode()
+    {
+        lock (_gate)
+        {
+            return new PlanModeView(
+                _planModeEnabled,
+                _planModeEnabled
+                    ? "Plan mode is ON — every worker authors a plan and blocks until you approve it."
+                    : "Plan mode is OFF — workers receive their task at spawn and start implementing "
+                      + "immediately. No plan is authored and nothing waits for your approval.");
+        }
+    }
+
+    public Task SetPlanModeAsync(bool enabled)
+    {
+        lock (_gate)
+        {
+            _planModeEnabled = enabled;
+        }
+
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
     private static string BuildMockSignal(int blocked, int escalated, int active)
     {
         var parts = new List<string>();
@@ -802,6 +953,35 @@ public sealed class MockOrchestrator :
     /// goes back to its worker, which revises and re-presents, until the revision budget is spent and the
     /// worker escalates. Approval is the only path that starts work.
     /// </summary>
+    public Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        AgentEvent? raised = null;
+        lock (_gate)
+        {
+            var card = _workerPlans.FirstOrDefault(c => c.PlanId == planId);
+            if (card is null || !card.IsEscalated)
+            {
+                throw new InvalidOperationException($"Plan '{planId}' is not an escalated plan.");
+            }
+
+            if (_workerPlans.Any(c => c.WorkerAgentId == card.WorkerAgentId && c.NewPlanRequested))
+            {
+                throw new InvalidOperationException(
+                    "This worker was already asked for a new plan once and escalated again — a second escalation is terminal.");
+            }
+
+            _workerPlans.Remove(card);
+            _workerPlans.Add(card with { NewPlanRequested = true, RejectionFeedback = guidance ?? "" });
+            _transcript.Add(new ChatLine(ChatLineKind.SystemLine,
+                $"You asked {card.WorkerAgentId} for one fresh plan.", DateTimeOffset.Now));
+            raised = NewEvent("plan_decided", "coordinator", $"{planId}=new-plan-requested");
+        }
+
+        EventReceived?.Invoke(raised);
+        Changed?.Invoke();
+        return Task.CompletedTask;
+    }
+
     public Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
     {
         var raised = new List<AgentEvent>();
@@ -957,7 +1137,12 @@ public sealed class MockOrchestrator :
                 .Select(a => new AgentResourceUsage(
                     a.Id, a.Name, a.Life.ToString(), a.Life == AgentLifecycleState.Paused,
                     Math.Round(a.Cpu, 1), Math.Round(a.Ram, 2), Math.Round(a.Spend, 2), a.Detail,
-                    IsMetered: true))
+                    IsMetered: true,
+                    // The scripted fleet is a coordinator's fan-out, so its rows carry the same role +
+                    // brief a live one does — otherwise the design captures would show an identity the
+                    // shipped surface never renders.
+                    Role: AgentRoles.Managed,
+                    Title: _workerPlans.FirstOrDefault(p => p.WorkerAgentId == a.Id)?.Title ?? ""))
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToList();
     }

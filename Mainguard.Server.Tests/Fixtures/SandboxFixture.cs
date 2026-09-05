@@ -65,6 +65,12 @@ public sealed class SandboxFixture : IAsyncDisposable
     /// every other suite's expectation; <see cref="NewTempToolchainRoot"/> makes one.</param>
     /// <param name="bareRepoPath">The shared mirror, bind-mounted READ-ONLY at its own VM path (MG-3).
     /// Null keeps the jail without it.</param>
+    /// <param name="ipcDirPath">The daemon's per-agent agent-IPC endpoint dir, bind-mounted READ-ONLY at
+    /// <see cref="Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SandboxMount"/> — the socket, the role's shim,
+    /// and the operating instructions. Null keeps the jail without the channel, which is every other
+    /// suite's expectation.</param>
+    /// <param name="ipcOutboxPath">That dir's <c>outbox/</c>, bind-mounted READ-WRITE. Supply it to
+    /// exercise the file-framed transport, which is the ONLY one that works on macOS.</param>
     public Task<SandboxHandle> SpawnAsync(
         string agentId = "agent-1", int agentUid = 1000, int supervisorUid = 1001,
         IReadOnlyDictionary<string, string>? agentEnv = null, byte[]? oobKey = null,
@@ -73,10 +79,14 @@ public sealed class SandboxFixture : IAsyncDisposable
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
         bool jailWritableWorktree = false,
         string? toolchainsRootPath = null,
-        string? bareRepoPath = null)
+        string? bareRepoPath = null,
+        string? ipcDirPath = null,
+        string? ipcOutboxPath = null,
+        string? worktreePath = null)
         => SpawnFromImageAsync(
             ImageRef, agentId, agentUid, supervisorUid, agentEnv, oobKey, packageCachePath, ct,
-            cliCredentials, cliSettings, jailWritableWorktree, toolchainsRootPath, bareRepoPath);
+            cliCredentials, cliSettings, jailWritableWorktree, toolchainsRootPath, bareRepoPath,
+            ipcDirPath, ipcOutboxPath, worktreePath);
 
     /// <summary>
     /// MG-42 — the same hardened spawn, but from an arbitrary image ref: the per-repo toolchain layer
@@ -91,14 +101,19 @@ public sealed class SandboxFixture : IAsyncDisposable
         IReadOnlyList<SandboxSettingsFile>? cliSettings = null,
         bool jailWritableWorktree = false,
         string? toolchainsRootPath = null,
-        string? bareRepoPath = null)
+        string? bareRepoPath = null,
+        string? ipcDirPath = null,
+        string? ipcOutboxPath = null,
+        string? worktreePath = null)
     {
         // Self-provision the default-deny network + proxy so a test that only spawns (the hardening
         // tests) does not depend on an egress test having run first — the `network mainguard-agents not
         // found` failure was pure test-ordering, not a product bug.
         await EnsureEgressReadyAsync(ct).ConfigureAwait(false);
 
-        var worktree = jailWritableWorktree ? NewJailWritableTempWorktree() : NewTempWorktree();
+        // A caller-supplied path is the reuse shape under test (the same worktree across spawns, or one
+        // deleted and re-created between them); the default is a fresh temp worktree per spawn.
+        var worktree = worktreePath ?? (jailWritableWorktree ? NewJailWritableTempWorktree() : NewTempWorktree());
         var secrets = new SandboxSecrets(
             agentEnv ?? new Dictionary<string, string> { ["ANTHROPIC_API_KEY"] = "sk-test-not-a-real-key" },
             OobKey: oobKey ?? RandomKey(),
@@ -118,7 +133,11 @@ public sealed class SandboxFixture : IAsyncDisposable
                 PackageCachePath: packageCachePath,
                 CliSettingsFiles: cliSettings,
                 ToolchainsRootPath: toolchainsRootPath,
-                BareRepoPath: bareRepoPath), ct).ConfigureAwait(false);
+                BareRepoPath: bareRepoPath,
+                // The agent-IPC channel: the read-only endpoint dir, and (where the substrate's mount
+                // cannot carry a Unix socket) its read-write outbox.
+                IpcDirPath: ipcDirPath,
+                IpcOutboxPath: ipcOutboxPath), ct).ConfigureAwait(false);
 
             _containerIds.Add(handle.ContainerId);
             return handle;

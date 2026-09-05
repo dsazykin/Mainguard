@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Mainguard.Agents.Agents;
 using Mainguard.Agents.Agents.Adapters;
+using Mainguard.Agents.Agents.Ipc;
 using Mainguard.Agents.Agents.Sandbox;
 using Mainguard.Server.Runtime;
 using Mainguard.Server.Tests.Fixtures;
@@ -58,9 +59,21 @@ public sealed class CliSettingsBoundaryTests
     /// records "don't ask again" grants, so the test rides the root that matters.</summary>
     private static readonly AdapterSettingsPath Declared = new("workspace", ".probe/settings.local.json");
 
-    private static SandboxSettingsFile NewGrant(string command) =>
+    /// <summary>The grant found in the reporting machine's per-repo store: the coordinator's shim, spelled
+    /// as claude-code records a "don't ask again" answer.</summary>
+    private const string CoordinatorShimGrant =
+        "Bash(" + AgentIpcPaths.SandboxMount + "/" + AgentIpcPaths.SpawnShimFileName + " *)";
+
+    private static SandboxSettingsFile NewGrant(string command) => NewGrants(command);
+
+    /// <summary>One stored settings file whose allowlist holds these commands — the shape the per-repo
+    /// store actually has (one file per declared path, many rules inside it).</summary>
+    private static SandboxSettingsFile NewGrants(params string[] commands) =>
         new(AdapterSettingsRoot.Workspace, Declared.Path,
-            Encoding.UTF8.GetBytes("{\"permissions\":{\"allow\":[\"" + command + "\"]}}"));
+            Encoding.UTF8.GetBytes(
+                "{\"permissions\":{\"allow\":["
+                + string.Join(",", System.Array.ConvertAll(commands, c => "\"" + c + "\""))
+                + "]}}"));
 
     // ---- gate 1: IN ---------------------------------------------------------------------------
 
@@ -148,6 +161,59 @@ public sealed class CliSettingsBoundaryTests
         Assert.False(CliSettingsHarvestPolicy.MayHarvest(AgentRoles.Managed));
     }
 
+    // ---- gate 3: ROLE — one role's tool grant never reaches another role's jail (D5b) ----------
+
+    /// <summary>
+    /// <b>The defect.</b> The per-repo store on the reporting machine held
+    /// <c>Bash(/opt/mainguard/ipc/mainguard-agent *)</c> — the COORDINATOR's shim — harvested from an
+    /// attended coordinator terminal where the owner answered "yes, don't ask again". That store seeds
+    /// every later jail in the repository, so a WORKER was being handed a standing grant for the
+    /// coordinator's tool. It also meant the live coordinator only worked because of a stale file rather
+    /// than because of its own per-role launch grant.
+    ///
+    /// <para>Restoring is scrubbed as well as harvesting, and that is the half that matters for an install
+    /// that already has one: the poisoned entry is on disk today, and scrubbing the way IN neutralises it
+    /// with no migration. The owner's own approval rides through untouched — carrying those is the whole
+    /// point of the store.</para>
+    /// </summary>
+    [Fact]
+    public async Task AStoredJailGrantForTheDaemonsOwnMount_NeverReachesAJail()
+    {
+        using var rig = SettingsRig.Create();
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None,
+            cliSettings: new[] { NewGrants("Bash(npm test:*)", CoordinatorShimGrant) });
+
+        var delivered = Assert.Single(rig.Engine.LastSpawn!.CliSettingsFiles!);
+        var text = Encoding.UTF8.GetString(delivered.Content);
+        Assert.DoesNotContain(AgentIpcPaths.SandboxMount, text, StringComparison.Ordinal);
+        Assert.Contains("npm test", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the store stops acquiring one: an attended stop harvests the file with the mount's grant
+    /// removed, so the very next stop repairs an already-poisoned store rather than rewriting it.
+    /// </summary>
+    [Fact]
+    public async Task StoppingAnAttendedJail_HarvestsTheApprovalsWithoutTheJailsOwnToolGrant()
+    {
+        const string WithGrant =
+            "{\"permissions\":{\"allow\":[\"Bash(git status:*)\",\"" + CoordinatorShimGrant + "\"]}}";
+        using var rig = SettingsRig.Create(WithGrant);
+        var agentId = await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: AgentRoles.Coordinator, CancellationToken.None);
+
+        var result = await rig.Spawns.StopAsync(agentId, CancellationToken.None);
+
+        var harvested = Assert.Single(result.CliSettings);
+        var text = Encoding.UTF8.GetString(harvested.Content);
+        Assert.DoesNotContain(AgentIpcPaths.SandboxMount, text, StringComparison.Ordinal);
+        // The negative control: the harvest still WORKS. Without this, a scrub that dropped the whole
+        // file — or a harvest that had quietly stopped running — would pass the assertion above.
+        Assert.Contains("git status", text, StringComparison.Ordinal);
+    }
+
     // ---- the filter the client's own paths pass through ----------------------------------------
 
     [Fact]
@@ -212,6 +278,54 @@ public sealed class CliSettingsBoundaryTests
         Assert.Equal(new[] { Declared.Path }, rig.Engine.LastSpawn!.WorkspaceIgnorePaths);
     }
 
+    /// <summary>
+    /// The settings path is not the only thing Mainguard writes into the tree the agent commits: the
+    /// launcher also stages the adapter's declared instructions file at the worktree root. Driven through
+    /// the REAL spawn, and asserting both halves of the same spawn, because the failure this closes is
+    /// exactly a disagreement between them — the file was written and the ignore list did not name it.
+    ///
+    /// <para>A test on <c>DeclaredWorkspaceIgnorePaths</c> alone would stay green while the spawn kept
+    /// sending the old list: phase 3's own M7 shape, a correct function nobody calls correctly.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheInstructionsFileTheLauncherStages_IsAlsoWhatTheJailIsToldToIgnore()
+    {
+        using var rig = SettingsRig.Create(instructionsFile: "PROBE_INSTRUCTIONS.md");
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None);
+
+        Assert.Equal(
+            new[] { Declared.Path, "PROBE_INSTRUCTIONS.md" }, rig.Engine.LastSpawn!.WorkspaceIgnorePaths);
+
+        // …and it really was written, at the root of the worktree that spawn created.
+        var staged = Path.Combine(rig.Engine.LastSpawn!.WorktreePath, "PROBE_INSTRUCTIONS.md");
+        Assert.True(File.Exists(staged), $"the launcher staged nothing at {staged}");
+    }
+
+    /// <summary>
+    /// The one case an exclude cannot cover, driven through the real spawn: the repository already has a
+    /// file of that name, so it is tracked, so <c>info/exclude</c> is inert for it and a write is a
+    /// modification <c>git add -A</c> stages. Mainguard replacing the user's own project instructions is
+    /// a worse outcome than the stray untracked file this change is about.
+    /// </summary>
+    [Fact]
+    public async Task AFileTheRepositoryAlreadyHas_IsNotReplacedByMainguardsBriefing()
+    {
+        var theirs = "# the user's own instructions\n";
+        // Every worktree this rig creates arrives already carrying that file — the way a real checkout of
+        // a repository that tracks one does.
+        using var rig = SettingsRig.Create(
+            instructionsFile: "PROBE_INSTRUCTIONS.md",
+            seedWorktreeFile: ("PROBE_INSTRUCTIONS.md", theirs));
+
+        await rig.Spawns.SpawnAsync(
+            RepoHandle, AgentKind, modelApiKey: null, role: string.Empty, CancellationToken.None);
+
+        var path = Path.Combine(rig.Engine.LastSpawn!.WorktreePath, "PROBE_INSTRUCTIONS.md");
+        Assert.Equal(theirs, File.ReadAllText(path));
+    }
+
     [Fact]
     public void OnlyWorkspaceRootedDeclarations_BecomeIgnoreEntries()
     {
@@ -264,7 +378,18 @@ public sealed class CliSettingsBoundaryTests
 
         public AgentSpawnService Spawns => Host.Services.GetRequiredService<AgentSpawnService>();
 
-        public static SettingsRig Create()
+        /// <param name="inJailSettings">What the fake jail's declared settings file holds. Defaults to the
+        /// ordinary allowlist; a test that cares about the role-scoped-grant boundary (D5b) puts a jail's
+        /// own IPC grant in it, which is exactly what the reporting machine's store was found holding.</param>
+        /// <param name="instructionsFile">The adapter's declared instructions file, if any — the second
+        /// thing Mainguard writes into <c>/workspace</c>. Null keeps the pre-existing shape (an adapter
+        /// with no file-side delivery), which is what every other test here wants.</param>
+        /// <param name="seedWorktreeFile">A file every created worktree already carries, so a test can
+        /// stand where the user's own repository tracks the name the adapter declares.</param>
+        public static SettingsRig Create(
+            string? inJailSettings = null,
+            string? instructionsFile = null,
+            (string Path, string Content)? seedWorktreeFile = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "mg-settings-gate-" + Guid.NewGuid().ToString("N")[..8]);
             Directory.CreateDirectory(Path.Combine(root, "repos", RepoHandle)); // "provisioned"
@@ -274,12 +399,13 @@ public sealed class CliSettingsBoundaryTests
             File.WriteAllText(
                 Path.Combine(registry, AgentKind + ".json"),
                 InstalledAdapterMarker.Serialize(new InstalledAdapterMarker(
-                    AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared })));
+                    AgentKind, "1.0.0", new[] { "/bin/true" }, SettingsPaths: new[] { Declared },
+                    InstructionsFile: instructionsFile)));
 
-            var engine = new RecordingSandboxEngine();
+            var engine = new RecordingSandboxEngine(inJailSettings ?? InJailSettings);
             var host = new DaemonFixture().WithWebHostBuilder(b => b.ConfigureTestServices(services =>
             {
-                services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine));
+                services.AddSingleton<IAgentEnvironment>(new FakeEnvironment(root, engine, seedWorktreeFile));
                 services.AddSingleton(new InstalledAdapterCatalog(registry));
                 services.AddSingleton(sp => new AgentCliBinder(
                     sp.GetRequiredService<TerminalSessionManager>(),
@@ -303,6 +429,10 @@ public sealed class CliSettingsBoundaryTests
         public sealed class RecordingSandboxEngine : ISandboxEngine
         {
             private readonly ConcurrentQueue<SandboxSpawnRequest> _spawns = new();
+            private readonly string _inJailSettings;
+
+            public RecordingSandboxEngine(string? inJailSettings = null) =>
+                _inJailSettings = inJailSettings ?? InJailSettings;
 
             /// <summary>The most recent spawn request — what the jail would really have received.</summary>
             public SandboxSpawnRequest? LastSpawn => _spawns.LastOrDefault();
@@ -322,7 +452,7 @@ public sealed class CliSettingsBoundaryTests
                 var wanted = ContainerSpecBuilder.WorkspaceTarget + "/" + Declared.Path;
                 return Task.FromResult(command.Contains(wanted)
                     ? new SandboxExecResult(
-                        0, Convert.ToBase64String(Encoding.UTF8.GetBytes(InJailSettings)), string.Empty)
+                        0, Convert.ToBase64String(Encoding.UTF8.GetBytes(_inJailSettings)), string.Empty)
                     : new SandboxExecResult(1, string.Empty, string.Empty));
             }
 
@@ -339,12 +469,13 @@ public sealed class CliSettingsBoundaryTests
         {
             private readonly string _root;
 
-            public FakeEnvironment(string root, ISandboxEngine sandboxes)
+            public FakeEnvironment(
+                string root, ISandboxEngine sandboxes, (string Path, string Content)? seedWorktreeFile = null)
             {
                 _root = root;
                 Sandboxes = sandboxes;
                 Repos = new FakeProvisioner(root);
-                Worktrees = new FakeWorktrees(root);
+                Worktrees = new FakeWorktrees(root, seedWorktreeFile);
             }
 
             public string SubstrateId => "fake";
@@ -376,13 +507,24 @@ public sealed class CliSettingsBoundaryTests
             private sealed class FakeWorktrees : IAgentWorktreeManager
             {
                 private readonly string _root;
+                private readonly (string Path, string Content)? _seed;
 
-                public FakeWorktrees(string root) => _root = root;
+                public FakeWorktrees(string root, (string Path, string Content)? seed = null)
+                {
+                    _root = root;
+                    _seed = seed;
+                }
 
                 public string CreateAgentWorktree(string repoHash, string agentId)
                 {
                     var path = Path.Combine(_root, "wt", repoHash, agentId);
                     Directory.CreateDirectory(path);
+                    if (_seed is { } seed)
+                    {
+                        // A checkout that already carries this file — i.e. the repository tracks it.
+                        File.WriteAllText(Path.Combine(path, seed.Path), seed.Content);
+                    }
+
                     return path;
                 }
 

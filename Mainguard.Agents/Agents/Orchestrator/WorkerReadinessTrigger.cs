@@ -100,12 +100,17 @@ public sealed record ReadinessDecision(
 ///   refused before it produced a verdict; the queue writes no record and settles the entry back to
 ///   <c>Working</c>, and this type logs and stops. See <see cref="RunAsync"/>.</item>
 ///   <item><b>It only fires from a state where <c>Verifying</c> is a legal transition</b> —
-///   <c>Working</c> or <c>StaleVerified</c>. In particular a worker that pushes while its entry sits at
-///   <c>Verified</c> is NOT auto-verified: the state machine has no <c>Verified → Verifying</c> edge, and
-///   inventing one (or calling <c>NotifyNewCommits</c> from here to walk it back to <c>Working</c>) would be
-///   this trigger changing the merge spine's behaviour instead of triggering it. The human button has the
-///   same limitation today; it is recorded in <c>docs/design/verification-trigger.md</c> rather than
-///   quietly worked around.</item>
+///   <c>Working</c>, <c>StaleVerified</c> or <c>VerificationFailed</c>. A worker that pushes while its
+///   entry sits at <c>Verified</c> is still not auto-verified FROM HERE, and that is deliberate: the state
+///   machine has no <c>Verified → Verifying</c> edge, and inventing one would be this trigger changing the
+///   merge spine's behaviour instead of triggering it.
+///
+///   <para>It is no longer a hole, which it was for the life of this type. <see cref="BranchTipInvalidator"/>
+///   — the other subscriber on the same sweep — walks such an entry to <c>Working</c> the moment the tip
+///   moves, and this trigger then fires from <c>Working</c> like any other. The split is the point: the
+///   queue decides what a state means, this type decides only when to ask. Before it existed, a green
+///   entry that received new commits was verified by nothing, re-classified by nothing, and still offered
+///   Merge (2026-08-30, agent <c>4c43d17a</c>).</para></item>
 /// </list>
 ///
 /// <para><see cref="PollOnce"/> is public and does one complete sweep against an injectable clock, so every
@@ -127,6 +132,10 @@ public sealed class WorkerReadinessTrigger : IDisposable
     private sealed record Pending(string Sha, DateTimeOffset At);
 
     private readonly object _gate = new();
+    /// <summary>(repoHash, agentId) → is the worker's jail frozen right now? A frozen jail runs nothing, so
+    /// firing would spend the once-per-tip attempt on a run that cannot happen; the tip stays armed instead.</summary>
+    private readonly Func<string, string, bool>? _isFrozen;
+
     private readonly Dictionary<(string RepoHash, string AgentId), Pending> _armed = new();
     private readonly Dictionary<(string RepoHash, string AgentId), string> _lastFiredSha = new();
     private readonly Dictionary<(string RepoHash, string AgentId), DateTimeOffset> _lastFiredAt = new();
@@ -162,8 +171,10 @@ public sealed class WorkerReadinessTrigger : IDisposable
         CoordinatorLimits? limits = null,
         TimeSpan? sweepInterval = null,
         Func<DateTimeOffset>? clock = null,
-        Action<string>? log = null)
+        Action<string>? log = null,
+        Func<string, string, bool>? isFrozen = null)
     {
+        _isFrozen = isFrozen;
         _source = source ?? throw new ArgumentNullException(nameof(source));
         _queues = queues ?? throw new ArgumentNullException(nameof(queues));
         _planGate = planGate ?? throw new ArgumentNullException(nameof(planGate));
@@ -336,11 +347,34 @@ public sealed class WorkerReadinessTrigger : IDisposable
         //    Verifying state means a row that SAYS verifying with no run behind it — the shape a daemon
         //    restart leaves. That belongs to ResumeAfterRestartAsync and to the human's Clear control, not
         //    to a trigger that would be guessing.
+        //
+        //    VerificationFailed is in the set, and it has to be. Nothing in the daemon calls
+        //    MergeQueue.NotifyNewCommits for a locally-spawned agent, so a push does not walk an entry back
+        //    to Working on its own — which means that without this arm, H2's new state would be a state a
+        //    worker's own fix could never get it out of: the entry would sit red forever while the agent
+        //    committed the repair, and only a human clicking Verify would ever find out. The trigger's
+        //    existing bounds do the containment: once-per-tip means this fires only for a tip that has
+        //    never been attempted, i.e. only for work the agent has actually pushed SINCE the failure, and
+        //    the cooldown bounds a grinder. (A Verified entry is still not re-fired on a push FROM HERE —
+        //    the state machine has no Verified → Verifying edge, and inventing one here would be this
+        //    trigger changing the merge spine rather than triggering it. It no longer needs to:
+        //    BranchTipInvalidator walks that entry to Working off the same sweep, and this arm then fires
+        //    for it on the next pass.)
         var merge = queue.GetState(key.AgentId);
-        if (merge is not (WorkerMergeState.Working or WorkerMergeState.StaleVerified))
+        if (merge is not (WorkerMergeState.Working or WorkerMergeState.StaleVerified
+            or WorkerMergeState.VerificationFailed))
         {
             return Drop(ReadinessOutcome.Ineligible,
-                $"the queue entry is {merge} — automatic verification starts only from Working or StaleVerified");
+                $"the queue entry is {merge} — automatic verification starts only from Working, "
+                + "StaleVerified or VerificationFailed");
+        }
+
+        // 6. A frozen jail (a human pause, a parked conflict) runs nothing. Deferred, not spent: the tip
+        //    stays armed and fires when the jail thaws, instead of the once-per-tip bound recording an
+        //    attempt that could never have produced a verdict.
+        if (_isFrozen?.Invoke(key.RepoHash, key.AgentId) == true)
+        {
+            return Keep("the worker's jail is frozen (paused, or parked on a conflict) — it runs nothing until a human resumes it");
         }
 
         lock (_gate)
@@ -360,19 +394,54 @@ public sealed class WorkerReadinessTrigger : IDisposable
             $"auto-verify repo={key.RepoHash} agent={key.AgentId} tip={Short(state.Sha)} — the worker's branch "
             + $"has been quiet for {_limits.AutoVerifyQuietSeconds}s and its plan is approved; verifying");
 
-        LastRun = RunAsync(key, queue);
+        LastRun = RunAsync(key, queue, state.Sha);
         return new ReadinessDecision(
             key.RepoHash, key.AgentId, state.Sha, ReadinessOutcome.Fired, "verification started");
     }
 
-    private async Task RunAsync((string RepoHash, string AgentId) key, MergeQueue queue)
+    private async Task RunAsync((string RepoHash, string AgentId) key, MergeQueue queue, string sha)
     {
         try
         {
+            // A STALE entry goes through the cascade's re-entry — reparent, then re-verify — and never
+            // through the direct run. Verifying a stale branch where it stands pins a pass to the new
+            // main for a branch that does not descend from it, which is the loop-forever `Verified` the
+            // cascade exists to end; this trigger was one of the doors back into it.
+            if (queue.GetState(key.AgentId) == WorkerMergeState.StaleVerified)
+            {
+                await queue.RequeueStaleAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+                var settled = queue.GetState(key.AgentId);
+                var reentry = settled is WorkerMergeState.Verified or WorkerMergeState.VerificationFailed
+                    ? $"re-entered through the cascade; the entry is now {settled}"
+                    : $"the cascade's re-entry ended at {settled}"
+                      + (queue.CanMerge(key.AgentId, out var blocked) ? string.Empty : $" — {blocked}");
+                _log?.Invoke($"auto-verify repo={key.RepoHash} agent={key.AgentId} — {reentry}");
+                return;
+            }
+
             // THE one call. Everything about what a verification is — the Verifying transition, the jail
             // execution, the gates armed from the committed trees, the immutable record, the settle to
-            // Verified or back to Working — belongs to this method and to nothing here.
-            await queue.RunVerificationAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+            // Verified or to VerificationFailed — belongs to this method and to nothing here.
+            var record = await queue.RunVerificationAsync(key.AgentId, _stop.Token).ConfigureAwait(false);
+
+            // H3 — the OUTCOME, logged. This method announced "verifying" and then said nothing at all,
+            // whichever way the run went: a red verification existed only as a row in SQLite and an
+            // artifact file nothing linked to, so the daemon log — the first place anyone looks when a
+            // swarm has gone quiet — recorded that six test runs were STARTED and not one of them
+            // finished. An automatic actor that spends a test suite on a human's behalf and does not say
+            // what it found is indistinguishable from one that hung.
+            //
+            // The verdict word comes from record.Passed, which is the daemon-observed container-runtime
+            // exit (OPS SA-1) and the same field the queue decided the state from — never a second
+            // opinion — and the line carries the artifact path so the output is one `cat` away rather
+            // than a directory to guess at. The resulting state is included because "PASSED" and
+            // "Verified" are not the same claim: a pass whose entry was discarded mid-run settles
+            // nowhere, and a log that asserted the transition would be wrong exactly then.
+            _log?.Invoke(
+                $"auto-verify repo={key.RepoHash} agent={key.AgentId} — the verification "
+                + $"{(record.Passed ? "PASSED" : "FAILED")} ({record.ResolvedCommand}) against "
+                + $"main@{Short(record.MainSha)}; the entry is now "
+                + $"{queue.GetState(key.AgentId)} — output: {record.LogArtifactPath}");
         }
         catch (InvalidOperationException ex) when (ex.Message.Contains("already in flight", StringComparison.Ordinal))
         {
@@ -384,6 +453,22 @@ public sealed class WorkerReadinessTrigger : IDisposable
         }
         catch (Exception ex)
         {
+            if (ex is not InvalidOperationException)
+            {
+                // A TRANSIENT refusal — the container engine did not answer, an exec failed, an IO error —
+                // says nothing about the tip, so the once-per-tip attempt is handed back: the tip is
+                // re-armed with a fresh quiet window and the cooldown still bounds the retry. Only the
+                // typed refusals (InvalidOperationException and its subclasses: a malformed verify
+                // command, no command, an illegal state) are a verdict about the tip that a retry cannot
+                // change, and those stay spent.
+                lock (_gate)
+                {
+                    _lastFiredSha.Remove(key);
+                }
+
+                NotifyAdvanced(key.RepoHash, key.AgentId, sha);
+            }
+
             // The throw is REPORTED and translated into nothing. A throw out of RunVerificationAsync means
             // the run was REFUSED before it produced a verdict — no live jail, a drifted branch, a missing
             // toolchain, or a verify command whose shell operators survived tokenisation

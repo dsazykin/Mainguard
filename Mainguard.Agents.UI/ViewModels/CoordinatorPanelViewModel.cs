@@ -53,7 +53,9 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     [ObservableProperty] private string _pressureText = "";
 
     /// <summary>The daemon's legible-stall line, e.g. "6 workers are waiting on your approval…".</summary>
-    [ObservableProperty] private string _backpressureText = "";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasGateContent))]
+    private string _backpressureText = "";
 
     /// <summary>True when blocked plans are the reason the coordinator has stopped spawning.</summary>
     [ObservableProperty] private bool _isCapSaturatedByBlockedWorkers;
@@ -65,14 +67,71 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
     /// or the daemon's backpressure sentence. Hosts bind their whole region to this, so an idle
     /// orchestration costs no vertical space at all — the gate appears because something is waiting, which
     /// is the only reason it should ever be on screen.
+    ///
+    /// <para><b>Computed, not assigned.</b> It used to be a settable flag written at the end of
+    /// <see cref="Refresh"/>, which made "is the gate showing?" and "what is in the gate?" two facts that
+    /// could disagree whenever one of them was updated and the other was not — the same species of drift
+    /// as the banner/card disagreement this surface was reported for. Derived from the collections and the
+    /// sentence themselves, the region cannot be visible while empty, or collapsed while something waits.</para>
     /// </summary>
-    [ObservableProperty] private bool _hasGateContent;
+    public bool HasGateContent =>
+        PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0
+        || !PlanModeEnabled;
 
-    public CoordinatorPanelViewModel(ICoordinatorService coordinator)
+    /// <summary>The daemon's plan-mode toggle. True while every worker must have an approved plan.</summary>
+    [ObservableProperty] private bool _planModeEnabled = true;
+
+    /// <summary>The daemon's own sentence for that state — rendered, never re-composed here.</summary>
+    [ObservableProperty] private string _planModeSummary = "";
+
+    /// <summary>
+    /// Why the last toggle did not reach the daemon (empty when nothing is wrong). Said on the gate,
+    /// beside the checkbox that snapped back, rather than escaping to the dispatcher's crash guard as a
+    /// generic notice: the human who clicked is looking here, and the fact they need is that the gate
+    /// is still in the state the box now shows.
+    /// </summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasPlanModeError))]
+    private string _planModeErrorText = "";
+
+    public bool HasPlanModeError => PlanModeErrorText.Length > 0;
+
+    /// <summary>The value a failed toggle asked for; cleared once the daemon is seen holding it.</summary>
+    private bool? _planModeRequested;
+
+    /// <summary>
+    /// Re-raise <see cref="HasGateContent"/> when the toggle moves.
+    ///
+    /// <para>This is the whole reason plan mode is part of that flag: with approvals off nothing is ever
+    /// pending, so a gate that only appeared for pending cards would go dark permanently — and a dark
+    /// gate is exactly what an IDLE orchestration looks like. The one state a human must not have to
+    /// guess at is the one where an approval step they think they have is switched off, so an off gate
+    /// stays on screen saying so.</para>
+    /// </summary>
+    partial void OnPlanModeEnabledChanged(bool value) => OnPropertyChanged(nameof(HasGateContent));
+
+    /// <param name="endWorker">
+    /// Ends an agent by id — the release an escalated card offers. Optional because the design harness and
+    /// the unit fakes have no agent to end; when it is null the card simply does not offer the action,
+    /// rather than offering a button that does nothing.
+    /// </param>
+    public CoordinatorPanelViewModel(ICoordinatorService coordinator, Func<string, Task>? endWorker = null)
     {
         _coordinator = coordinator;
+        _endWorker = endWorker;
+
+        // The one flag both halves of the gate are read through is derived, so it has to be re-raised
+        // whenever either collection moves — including the in-place reconciliation Refresh does.
+        PendingPlans.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasGateContent));
+        EscalatedPlans.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasGateContent));
+
         Refresh();
     }
+
+    private readonly Func<string, Task>? _endWorker;
+
+    /// <summary>The clock the cards' "presented N min ago" is measured against; injectable for tests.</summary>
+    internal Func<DateTimeOffset> Clock { get; set; } = () => DateTimeOffset.Now;
 
     public void Refresh()
     {
@@ -90,11 +149,15 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         // typing and the error text from a decision that just failed — on a surface whose whole job is to
         // let them retry. Cards are only created for plans that are new or newly revised.
         var kept = new List<PlanCardViewModel>(pending.Count);
+        var now = Clock();
         foreach (var plan in pending)
         {
             var existing = PendingPlans.FirstOrDefault(
                 c => c.PlanId == plan.PlanId && c.Revision == plan.Revision);
-            kept.Add(existing ?? new PlanCardViewModel(plan, DecideAsync));
+            // A kept instance keeps its typed feedback — and would otherwise keep the age it was born
+            // with, on the one surface whose job is to make waiting visible.
+            existing?.RefreshAge(now);
+            kept.Add(existing ?? new PlanCardViewModel(plan, DecideAsync, now));
         }
 
         for (int i = PendingPlans.Count - 1; i >= 0; i--)
@@ -110,9 +173,29 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
 
         PendingPlan = PendingPlans.FirstOrDefault();
 
-        EscalatedPlans.Clear();
-        foreach (var escalated in cards.Where(c => c.IsEscalated))
-            EscalatedPlans.Add(new EscalatedPlanViewModel(escalated));
+        // Escalated cards are reconciled in place by plan id, exactly as pending cards are. Rebuilding
+        // them each pass — which this used to do — collapsed the two-step End confirmation under the
+        // human's cursor on every queue push, and the in-flight latch it relied on lived on the instance
+        // being thrown away. A card is only replaced when the fact it renders changes (a new-plan request).
+        var escalatedNow = cards.Where(c => c.IsEscalated).ToList();
+        var keptEscalated = new List<EscalatedPlanViewModel>(escalatedNow.Count);
+        foreach (var plan in escalatedNow)
+        {
+            var existing = EscalatedPlans.FirstOrDefault(
+                c => c.PlanId == plan.PlanId && c.NewPlanRequested == plan.NewPlanRequested);
+            keptEscalated.Add(existing ?? new EscalatedPlanViewModel(plan, _endWorker, RequestNewPlanAsync));
+        }
+
+        for (int i = EscalatedPlans.Count - 1; i >= 0; i--)
+        {
+            if (!keptEscalated.Contains(EscalatedPlans[i])) EscalatedPlans.RemoveAt(i);
+        }
+
+        for (int i = 0; i < keptEscalated.Count; i++)
+        {
+            if (i >= EscalatedPlans.Count) EscalatedPlans.Add(keptEscalated[i]);
+            else if (!ReferenceEquals(EscalatedPlans[i], keptEscalated[i])) EscalatedPlans[i] = keptEscalated[i];
+        }
 
         PressureText = pending.Count > 2
             ? $"{pending.Count} plans pending — the oldest has waited {(int)(DateTimeOffset.Now - pending.Min(p => p.PresentedAt)).TotalMinutes} min."
@@ -122,12 +205,61 @@ public partial class CoordinatorPanelViewModel : ViewModelBase
         BackpressureText = backpressure.Signal;
         IsCapSaturatedByBlockedWorkers = backpressure.CapSaturatedByBlockedWorkers;
 
-        HasGateContent = PendingPlans.Count > 0 || EscalatedPlans.Count > 0 || BackpressureText.Length > 0;
+        // Read from the daemon on every pass, so the checkbox tracks the gate rather than the last click.
+        // A toggle that rendered the requested value would keep showing "on" after a Set that never
+        // arrived — the one disagreement where a human believes they have an approval step and do not.
+        var planMode = _coordinator.GetPlanMode();
+        // A failed toggle's error stands until the daemon is seen holding the value that was asked for.
+        if (_planModeRequested is { } requested && planMode.Enabled == requested)
+        {
+            _planModeRequested = null;
+            PlanModeErrorText = "";
+        }
+
+        PlanModeEnabled = planMode.Enabled;
+        PlanModeSummary = planMode.Summary;
+    }
+
+    /// <summary>
+    /// Flips the daemon's plan-mode toggle, then re-reads it.
+    ///
+    /// <para>The new value is computed from the property the checkbox has ALREADY moved (the control sets
+    /// its own <c>IsChecked</c> before the command runs), and the refresh afterwards puts the daemon's
+    /// answer back — so a failed call ends with the checkbox showing what the daemon actually holds.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task TogglePlanModeAsync()
+    {
+        var requested = PlanModeEnabled;
+        try
+        {
+            await _coordinator.SetPlanModeAsync(requested);
+            _planModeRequested = null;
+            PlanModeErrorText = "";
+        }
+        catch (Exception ex)
+        {
+            // Caught here rather than left to escape the RelayCommand onto the dispatcher: the box snaps
+            // back in the refresh below, and this is the sentence that says why it did.
+            _planModeRequested = requested;
+            PlanModeErrorText =
+                $"Plan mode was not changed — {ex.Message}. The gate is still as the checkbox now shows; try again.";
+        }
+        finally
+        {
+            Refresh();
+        }
     }
 
     private async Task DecideAsync(string planId, bool approve, string? feedback)
     {
         await _coordinator.SubmitPlanDecisionAsync(planId, approve, feedback);
+        Refresh();
+    }
+
+    private async Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        await _coordinator.RequestNewPlanAsync(planId, guidance);
         Refresh();
     }
 
@@ -181,7 +313,13 @@ public partial class PlanCardViewModel : ViewModelBase
     public string ScopeText { get; }
     public string Approach { get; }
     public string TestStrategy { get; }
-    public string FactsText { get; }
+
+    /// <summary>Who wrote it, its budget, and how long it has waited — re-measured on every refresh.</summary>
+    [ObservableProperty] private string _factsText = "";
+
+    private readonly DateTimeOffset _presentedAt;
+    private readonly decimal _budgetUsd;
+    private readonly string _worker;
 
     /// <summary>Which revision this is, e.g. "revision 2 of 3" — empty on the original presentation.</summary>
     public string RevisionText { get; }
@@ -194,6 +332,35 @@ public partial class PlanCardViewModel : ViewModelBase
     public bool HasFeedbackHistory { get; }
 
     /// <summary>
+    /// True when this card is a <b>re-scope</b>: the worker is asking to change what an approval it
+    /// already holds authorises.
+    ///
+    /// <para>The card has to say so, because the decision is not the one it looks like. Approving a first
+    /// presentation authorises work that has not started; approving this one CHANGES what a running worker
+    /// is cleared to touch — and rejecting it takes nothing away, which is the opposite of what Reject
+    /// means on every other card here. A human handed an identical-looking card would be answering a
+    /// different question from the one being asked.</para>
+    /// </summary>
+    public bool IsRescope { get; }
+
+    /// <summary>What kind of decision this is, and how many widenings have preceded it.</summary>
+    public string RescopeHeadlineText { get; }
+
+    /// <summary>The paths this plan ADDS to what was already approved — the substance of the widening.</summary>
+    public string AddedScopeText { get; }
+
+    public bool HasAddedScope { get; }
+
+    /// <summary>
+    /// The paths it DROPS. Shown separately and never folded into the added list: a re-scope that removes
+    /// a path the human already agreed to is the one shape of this op that takes something away, and a
+    /// card that rendered only additions is exactly where that would hide.
+    /// </summary>
+    public string RemovedScopeText { get; }
+
+    public bool HasRemovedScope { get; }
+
+    /// <summary>
     /// True when rejecting again would stop the worker rather than produce another plan. The card says so
     /// before the click, because "reject" and "give up on this worker" are different decisions and the
     /// human is the only one who can tell which they meant.
@@ -201,6 +368,13 @@ public partial class PlanCardViewModel : ViewModelBase
     public bool NextRejectionEscalates { get; }
 
     public string RejectButtonText { get; }
+
+    /// <summary>
+    /// What one more "no" would actually do, shown when this is the last round. The two card kinds have
+    /// different consequences and the text must not promise the wrong one: on a first plan the worker
+    /// stops, on a re-scope only the widening closes and the worker keeps its existing approval.
+    /// </summary>
+    public string LastRoundWarningText { get; }
 
     [ObservableProperty] private bool _isDeciding;
 
@@ -214,9 +388,11 @@ public partial class PlanCardViewModel : ViewModelBase
     /// <summary>What the human types back to the worker on a rejection.</summary>
     [ObservableProperty] private string _feedbackText = "";
 
-    public PlanCardViewModel(WorkerPlanCard plan, Func<string, bool, string?, Task> decide)
+    public PlanCardViewModel(WorkerPlanCard plan, Func<string, bool, string?, Task> decide, DateTimeOffset? now = null)
     {
         _decide = decide;
+        _presentedAt = plan.PresentedAt;
+        _budgetUsd = plan.BudgetUsd;
         PlanId = plan.PlanId;
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
@@ -229,10 +405,46 @@ public partial class PlanCardViewModel : ViewModelBase
         RevisedAgainstText = plan.RejectionFeedback.Length > 0 ? $"revised against: {plan.RejectionFeedback}" : "";
         HasFeedbackHistory = RevisedAgainstText.Length > 0;
         NextRejectionEscalates = plan.RevisionsRemaining <= 0;
-        RejectButtonText = NextRejectionEscalates ? "Reject — worker will stop" : "Reject with feedback";
-        var age = (int)Math.Max(0, (DateTimeOffset.Now - plan.PresentedAt).TotalMinutes);
         var worker = plan.WorkerAgentId.Length > 0 ? plan.WorkerAgentId : "worker";
-        FactsText = $"Written by {worker} · budget ${plan.BudgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
+        _worker = worker;
+
+        IsRescope = plan.IsRescope;
+        var added = plan.AddedScope;
+        var removed = plan.RemovedScope;
+        HasAddedScope = added.Count > 0;
+        HasRemovedScope = removed.Count > 0;
+        AddedScopeText = string.Join("\n", added);
+        RemovedScopeText = string.Join("\n", removed);
+        RescopeHeadlineText = IsRescope
+            ? plan.RescopeCount > 1
+                ? $"Widening an approved plan — this worker's scope has already been widened "
+                  + $"{plan.RescopeCount - 1} time(s)"
+                : "Widening an approved plan"
+            : "";
+
+        // The two decisions read differently, so they are worded differently. On a re-scope, Reject does
+        // not stop the worker and does not withdraw anything: it declines the widening and the worker
+        // carries on inside the scope already approved. A button reading "worker will stop" there would be
+        // false, and it is the kind of false that makes a human approve something to avoid a consequence
+        // that was never going to happen.
+        RejectButtonText = IsRescope
+            ? "Decline the widening"
+            : NextRejectionEscalates ? "Reject — worker will stop" : "Reject with feedback";
+        LastRoundWarningText = IsRescope
+            ? "This is the last round — declining again closes the widening for good. The worker is not "
+              + "stopped: it keeps working inside the scope you already approved."
+            : "This is the last revision — rejecting again stops the worker and escalates to you.";
+        RefreshAge(now ?? DateTimeOffset.Now);
+    }
+
+    /// <summary>Re-measures the "N min ago" against <paramref name="now"/>; the rest of the line is fixed.</summary>
+    public void RefreshAge(DateTimeOffset now)
+    {
+        var age = (int)Math.Max(0, (now - _presentedAt).TotalMinutes);
+        FactsText = IsRescope
+            ? $"Asked by {_worker} · budget ${_budgetUsd:0.00} · asked {age} min ago · it is still "
+              + "approved for its current scope and is not stopped"
+            : $"Written by {_worker} · budget ${_budgetUsd:0.00} · presented {age} min ago · the worker is blocked until you decide";
     }
 
     [RelayCommand] private Task ApproveAsync() => DecideAsync(approve: true, feedback: null);
@@ -271,22 +483,60 @@ public partial class PlanCardViewModel : ViewModelBase
         }
         catch (Exception ex)
         {
+            if (IsAlreadyDecided(ex))
+            {
+                // A second click raced the plan stream: the decision DID land, the card just has not been
+                // dropped yet. Rendering the daemon's "already Approved" as "not recorded — still blocked"
+                // would tell the human the opposite of what happened; the next refresh removes the card.
+                return;
+            }
+
             var verb = approve ? "Approval" : "Rejection";
-            DecisionErrorText = $"{verb} was not recorded — {ex.Message}. The worker is still blocked; try again.";
+            // The consequence differs by card kind and the sentence must not promise the wrong one: a
+            // re-scope's worker is not blocked by the pending widening (it keeps working under the scope
+            // already approved), so "still blocked" would be false there.
+            DecisionErrorText = IsRescope
+                ? $"{verb} was not recorded — {ex.Message}. The worker is not blocked by this: it keeps "
+                  + "working under its current approval. Try again."
+                : $"{verb} was not recorded — {ex.Message}. The worker is still blocked; try again.";
         }
         finally
         {
             IsDeciding = false;
         }
     }
+
+    /// <summary>
+    /// The daemon's refusal for a plan that is no longer pending — <c>PlanApprovalService.GetPendingLocked</c>'s
+    /// own sentence, carried through the RPC's FailedPrecondition. Matched on the sentence because that
+    /// is the only thing the client receives; the status code alone also covers gate refusals that ARE
+    /// failures the human must see.
+    /// </summary>
+    private static bool IsAlreadyDecided(Exception ex) =>
+        ex.Message.Contains("only a plan awaiting your decision", StringComparison.Ordinal);
 }
 
 /// <summary>
-/// A worker that spent its revision budget and stopped. Rendered as a distinct, non-actionable card: there
-/// is no button here on purpose — the loop is over and the next move is the human's.
+/// A worker that spent its revision budget and stopped. There is no plan decision on this card — the loop
+/// is over and there is nothing left to approve.
+///
+/// <para><b>There IS a release, and there has to be.</b> An escalated worker is still a live agent: it
+/// keeps its jail and it keeps counting against <c>MaxActiveWorkers</c>, so until someone ends it the
+/// coordinator has one fewer slot to spawn into. The card's own sentence has always said "steer it or end
+/// it" while offering neither, and the only route that existed — Resources → right-click → End task — is
+/// a context menu on a row that names no agent. A promise of an action, with the action reachable only by
+/// guessing, is how a user ends up with a cap they cannot get back.</para>
+///
+/// <para>It is deliberately the <b>same</b> act as the Resources one (<c>EndAgentAsync</c>), stated with
+/// the same consequences, rather than a gentler-sounding neighbour of it. Ending and discarding a queue
+/// entry are different things and this card must not blur them: discard drops a merge-queue row, ending
+/// stops the agent.</para>
 /// </summary>
-public sealed class EscalatedPlanViewModel : ViewModelBase
+public sealed partial class EscalatedPlanViewModel : ViewModelBase
 {
+    private readonly Func<string, Task>? _endWorker;
+    private readonly Func<string, string, Task>? _requestNewPlan;
+
     public string PlanId { get; }
     public string WorkerAgentId { get; }
     public string Title { get; }
@@ -294,16 +544,128 @@ public sealed class EscalatedPlanViewModel : ViewModelBase
     public string LastFeedbackText { get; }
     public bool HasLastFeedback { get; }
 
-    public EscalatedPlanViewModel(WorkerPlanCard plan)
+    /// <summary>Whether this card can actually end its worker. False when no ending seam was supplied
+    /// (harness/fakes) or the plan named no worker — an action that cannot run is not offered.</summary>
+    public bool ShowEndAction { get; }
+
+    /// <summary>What ending this worker does, in the C-pattern the other confirms use: the object, what
+    /// changes, what is kept.</summary>
+    public string EndConfirmText { get; }
+
+    /// <summary>The two-step guard. Nothing has been asked of the daemon while this is true.</summary>
+    [ObservableProperty] private bool _isConfirmingEnd;
+
+    /// <summary>True only while this card's own end request is in flight.</summary>
+    [ObservableProperty] private bool _isEnding;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasEndError))]
+    private string _endErrorText = "";
+
+    public bool HasEndError => EndErrorText.Length > 0;
+
+    /// <summary>True once a human has sent this escalation back for one fresh plan (owner decision,
+    /// 2026-09-03). Carried from the daemon; the worker's next <c>present</c> is the one it is waiting on.</summary>
+    public bool NewPlanRequested { get; }
+
+    /// <summary>The request is offered on an ordinary escalation that has not been sent back yet, when a
+    /// requesting seam exists. Never on a re-scope escalation — that worker is still approved and working.</summary>
+    public bool ShowRequestAction { get; }
+
+    /// <summary>What the human wants the fresh plan to answer. Delivered to the worker verbatim.</summary>
+    [ObservableProperty] private string _guidanceText = "";
+
+    [ObservableProperty] private bool _isRequesting;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasRequestError))]
+    private string _requestErrorText = "";
+
+    public bool HasRequestError => RequestErrorText.Length > 0;
+
+    public EscalatedPlanViewModel(
+        WorkerPlanCard plan, Func<string, Task>? endWorker = null, Func<string, string, Task>? requestNewPlan = null)
     {
+        _endWorker = endWorker;
+        _requestNewPlan = requestNewPlan;
+        NewPlanRequested = plan.NewPlanRequested;
+        ShowRequestAction = requestNewPlan is not null && !plan.IsRescope && !plan.NewPlanRequested;
         PlanId = plan.PlanId;
         WorkerAgentId = plan.WorkerAgentId;
         Title = plan.Title;
         var worker = plan.WorkerAgentId.Length > 0 ? plan.WorkerAgentId : "This worker";
-        HeadlineText =
-            $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. " +
-            "It will not try again — steer it or end it.";
+
+        // An escalated RE-SCOPE has not stopped the worker, and saying it has would be a lie that costs
+        // something: a human reading "it stopped" ends a worker that is still doing approved work. What
+        // actually happened is narrower — the widening was refused enough times that the worker may not
+        // ask again, and it carries on inside the scope that is still approved.
+        HeadlineText = plan.IsRescope
+            ? $"{worker} asked {plan.MaxRevisions} times to widen its approved scope and you declined each "
+              + "time, so it will not ask again. It is NOT stopped — it is still approved for its original "
+              + "scope and still working. Steer it if the answer should change."
+            : plan.NewPlanRequested
+                ? $"{worker} stopped after {plan.MaxRevisions} rejected plans and you asked it for one fresh "
+                  + "plan. It is waiting for the worker to present it; if that one escalates too, the worker is done."
+                : $"{worker} stopped after {plan.MaxRevisions} rejected plans and escalated to you. It will not "
+                  + "try again on its own — ask it for one fresh plan with guidance, or end it.";
         LastFeedbackText = plan.RejectionFeedback.Length > 0 ? $"your last feedback: {plan.RejectionFeedback}" : "";
         HasLastFeedback = LastFeedbackText.Length > 0;
+
+        ShowEndAction = endWorker is not null && plan.WorkerAgentId.Length > 0;
+        var named = plan.Title.Length > 0 ? plan.Title : worker;
+        EndConfirmText =
+            $"End {named}? Its work is rejected and its sandbox is torn down, which frees the slot it is "
+            + "holding against the worker cap. Its branch is kept until teardown, so nothing is silently lost.";
+    }
+
+    [RelayCommand]
+    private async Task RequestNewPlanAsync()
+    {
+        if (IsRequesting || _requestNewPlan is null) return;
+
+        IsRequesting = true;
+        RequestErrorText = "";
+        try
+        {
+            await _requestNewPlan(PlanId, GuidanceText.Trim());
+        }
+        catch (Exception ex)
+        {
+            // Said, never swallowed: a request that silently failed leaves a human waiting for a plan the
+            // worker was never asked for.
+            RequestErrorText = $"Could not ask for a new plan — {ex.Message}";
+        }
+        finally
+        {
+            IsRequesting = false;
+        }
+    }
+
+    [RelayCommand] private void BeginEnd() => IsConfirmingEnd = true;
+
+    [RelayCommand] private void CancelEnd() => IsConfirmingEnd = false;
+
+    [RelayCommand]
+    private async Task ConfirmEndAsync()
+    {
+        if (IsEnding || _endWorker is null) return;
+
+        IsEnding = true;
+        EndErrorText = "";
+        try
+        {
+            await _endWorker(WorkerAgentId);
+            IsConfirmingEnd = false;
+        }
+        catch (Exception ex)
+        {
+            // Said, never swallowed: the card looks identical whether the agent went away or the RPC
+            // failed, and the operator's next move depends entirely on which happened.
+            EndErrorText = $"Could not end this worker — {ex.Message}. It is still holding its slot; try again.";
+        }
+        finally
+        {
+            IsEnding = false;
+        }
     }
 }

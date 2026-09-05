@@ -24,6 +24,21 @@ public enum AdapterManifestError
     /// a path that is not a plain relative path under the adapters prefix.</summary>
     BadPlatformBinary,
 
+    /// <summary>The pre-approval pair (<c>preApprovedCommandArg</c> + <c>preApprovedCommandFormat</c>) is
+    /// half-declared, or the format carries no <c>{command}</c> placeholder. Its own code because this
+    /// pair GRANTS EXECUTION inside a sandbox. A half-declared pair must not degrade to "grant nothing"
+    /// (the jail's only tool then stalls on an approval prompt no human is watching), and a
+    /// placeholder-free format must not degrade to a literal (which would emit a grant naming something
+    /// other than the shim — possibly something much broader).</summary>
+    BadPreApproval,
+
+    /// <summary>The <c>initialPromptStyle</c> names a delivery this build does not know. Its own code
+    /// because this field decides whether a jailed worker is ever asked to START: an unrecognised value
+    /// degrading to "no first turn" restores the exact deadlock the field exists to close — a CLI idling
+    /// at an empty input box, in a jail whose terminal is input-locked, forever. A refusal at parse is
+    /// loud; a degraded reading is a feature that looks wired and is not.</summary>
+    BadInitialPrompt,
+
     /// <summary>The <c>provenance</c> rung is absent or names a level this build does not know (MG-9).
     /// Its own code because "the maintainer forgot to say what origin assurance this CLI carries" is a
     /// different failure from a malformed field — and it must be a REFUSAL, not a default, or an
@@ -38,6 +53,34 @@ public sealed class AdapterManifestException : Exception
 
     public AdapterManifestException(AdapterManifestError error, string message)
         : base(message) => Error = error;
+}
+
+/// <summary>
+/// How a CLI accepts the <b>first user turn</b> the daemon starts it with — the turn without which a
+/// jailed worker sits at an empty input box and the phase-2 plan loop never begins.
+///
+/// <para>Vendor knowledge, declared per adapter exactly like <c>systemPromptArg</c> and
+/// <c>preApprovedCommandArg</c>, because only the CLI's own author knows how it takes one.</para>
+/// </summary>
+public enum AdapterInitialPromptStyle
+{
+    /// <summary>This CLI is not started with a first turn (the default, and every adapter that declares
+    /// nothing). Such an agent launches byte-identically to before.</summary>
+    None,
+
+    /// <summary>
+    /// The turn is a bare positional argument placed <b>first</b>, immediately after the CLI's own launch
+    /// argv and before every flag the daemon appends — <c>claude "&lt;turn&gt;" --append-system-prompt …</c>.
+    ///
+    /// <para><b>"First" is the load-bearing half of the name, measured rather than assumed.</b> Against a
+    /// real claude-code 2.1.250, the same turn appended LAST — the position every other field on this
+    /// launch line uses — never reached the model at all: <c>--allowedTools</c> is variadic
+    /// (<c>&lt;tools...&gt;</c>), so it swallows every following positional, and the CLI idled at an empty
+    /// input box for the full 90-second probe exactly as it does with no turn. Placed first, the same
+    /// text ran the shim on the first action. A style that says only "positional" would therefore be a
+    /// declaration that is true and still does not work.</para>
+    /// </summary>
+    FirstPositional,
 }
 
 /// <summary>A file written into the VM before the health probe (e.g. a non-interactive config so the
@@ -148,6 +191,75 @@ public sealed record AdapterSpec(
     /// enforced fail-closed by <see cref="NpmProvenancePolicy"/>; the string is the wire form of
     /// <see cref="AdapterProvenanceLevel"/>.</summary>
     [property: JsonPropertyName("provenance")] string? Provenance = null,
+    /// <summary>
+    /// The file THIS CLI reads unprompted from its working directory (<c>CLAUDE.md</c> for claude-code).
+    /// The daemon writes the role's operating instructions there for agents whose working directory is a
+    /// real host path — i.e. workers, whose <c>/workspace</c> is the bind-mounted worktree.
+    ///
+    /// <para>Without this the instructions exist in the jail and are never opened, which is not
+    /// hypothetical: they are also staged at <c>/opt/mainguard/ipc/MAINGUARD.md</c>, a path no CLI reads
+    /// on its own, so that half of the delivery is inert until this names somewhere the CLI actually
+    /// looks. Null = this CLI reads no such file, and only <see cref="SystemPromptArg"/> can reach it.</para>
+    /// </summary>
+    [property: JsonPropertyName("instructionsFile")] string? InstructionsFile = null,
+    /// <summary>
+    /// The launch flag THIS CLI accepts instruction text on (<c>--append-system-prompt</c> for
+    /// claude-code), appended to the launch argv with the rendered instructions as its value.
+    ///
+    /// <para>Load-bearing for a COORDINATOR, and not interchangeable with
+    /// <see cref="InstructionsFile"/> there: the role lock gives a coordinator an empty tmpfs at
+    /// <c>/workspace</c> with no host side to write to, so a file cannot be pre-placed and the flag is
+    /// the only delivery that reaches it. Null = this CLI takes no such flag.</para>
+    /// </summary>
+    [property: JsonPropertyName("systemPromptArg")] string? SystemPromptArg = null,
+    /// <summary>
+    /// The launch flag THIS CLI takes a PRE-APPROVED COMMAND list on (<c>--allowedTools</c> for
+    /// claude-code). Paired with <see cref="PreApprovedCommandFormat"/>; declaring one without the other
+    /// is refused (<see cref="AdapterManifestError.BadPreApproval"/>).
+    ///
+    /// <para><b>Why this had to exist.</b> A jailed CLI that asks a human before running a command is
+    /// correct behaviour everywhere except a jail with no human in it. The coordinator's ENTIRE surface
+    /// is one command — its role's shim — and a real claude-code coordinator, following its operating
+    /// instructions exactly, ran it as its first action and got "This command requires approval". The
+    /// headline feature stalled on its first action, permanently, with nobody watching.</para>
+    ///
+    /// <para><b>What it may be used for, and nothing else.</b> The daemon renders exactly ONE grant from
+    /// this pair: the absolute in-jail path of the shim THIS agent's role was given
+    /// (<c>AgentIpcPaths.SandboxShimPath</c>), and only for a jail that actually has an IPC dir. It is
+    /// not a hook for adapter-declared allowlists — nothing in a manifest names the granted command, so a
+    /// manifest edit cannot widen the grant, only change how a grant is spelled for that CLI.</para>
+    /// </summary>
+    [property: JsonPropertyName("preApprovedCommandArg")] string? PreApprovedCommandArg = null,
+    /// <summary>
+    /// How THIS CLI spells "this one command needs no approval" — a template containing the literal
+    /// <c>{command}</c>, which the daemon replaces with the shim's absolute in-jail path.
+    /// <c>Bash({command}:*)</c> for claude-code, whose permission rules are
+    /// <c>&lt;Tool&gt;(&lt;pattern&gt;)</c> and whose <c>cmd:*</c> form is a prefix match on that command.
+    ///
+    /// <para>A template rather than a hardcoded string because the tool name and the pattern syntax are
+    /// the vendor's, exactly like <see cref="SystemPromptArg"/>. The placeholder is MANDATORY: a format
+    /// without it would produce a fixed grant that does not name the shim, which is the one way this
+    /// field could widen a jail's capability rather than narrow it.</para>
+    /// </summary>
+    [property: JsonPropertyName("preApprovedCommandFormat")] string? PreApprovedCommandFormat = null,
+    /// <summary>
+    /// How THIS CLI takes the daemon's <b>first user turn</b> — the wire spelling of
+    /// <see cref="AdapterInitialPromptStyle"/> (<c>"first-positional"</c> for claude-code). Absent or
+    /// <c>"none"</c> = this CLI is started with no first turn, exactly as before.
+    ///
+    /// <para><b>Why this exists.</b> A vendor CLI does not act on a system prompt. Started with the
+    /// operating instructions and nothing else, claude-code renders its banner and waits at an empty
+    /// input box — so a jailed worker never ran its shim, never presented a plan, and could never be sent
+    /// a first turn either, because <c>send_worker_prompt</c> is refused until a plan is approved. The
+    /// loop could not start once. This field is the channel that starts it.</para>
+    ///
+    /// <para><b>What it may carry, and nothing else.</b> The daemon renders the turn itself
+    /// (<see cref="Ipc.AgentKickoffPrompt"/>) from the agent's ROLE and its shim path — nothing in a
+    /// manifest names or influences the text, so a manifest edit can change how a turn is delivered but
+    /// never what it says. The task the worker was spawned for is not in scope at the point the text is
+    /// built and stays where phase 2 put it: behind the plan gate.</para>
+    /// </summary>
+    [property: JsonPropertyName("initialPromptStyle")] string? InitialPromptStyle = null,
     /// <summary>For a CLI whose npm package is only a launcher: where the real executable actually
     /// lives after a script-free install, so <see cref="AdapterChannel.EnsureAsync"/> can place it over
     /// the vendor's placeholder itself instead of running the vendor's postinstall. Null = this CLI's
@@ -161,6 +273,15 @@ public sealed record AdapterSpec(
     /// nothing, rather than to anything that would read as verified.</summary>
     public AdapterProvenanceLevel ProvenanceLevel =>
         AdapterManifest.TryParseProvenance(Provenance, out var level) ? level : AdapterProvenanceLevel.None;
+
+    /// <summary>The parsed <see cref="InitialPromptStyle"/>. Only ever reached after
+    /// <see cref="AdapterManifest.Parse"/> refused every unrecognised spelling, so a miss here means the
+    /// adapter declared nothing — which is <see cref="AdapterInitialPromptStyle.None"/>, the reading that
+    /// changes no launch line.</summary>
+    public AdapterInitialPromptStyle InitialPromptDelivery =>
+        AdapterManifest.TryParseInitialPromptStyle(InitialPromptStyle, out var style)
+            ? style
+            : AdapterInitialPromptStyle.None;
 }
 
 /// <summary>The <c>adapters.json</c> channel manifest: the full set of pinned agent CLIs.
@@ -265,6 +386,41 @@ public sealed record AdapterManifest(
                         $"Adapter '{a.Id}' platformBinary target '{platform.Target}' must be a plain relative path under the adapters prefix.");
             }
 
+            // The pre-approval pair. Both-or-neither, and the format must carry the placeholder —
+            // enforced rather than tolerated because every degraded reading of a half-declared pair is
+            // worse than a refusal. Missing FORMAT would append a flag with no value (or a value the CLI
+            // reads as its next positional); missing ARG would compute a grant and drop it, so the jail's
+            // only tool goes back to stalling on an approval prompt; a placeholder-free FORMAT would emit
+            // a constant grant that does not name this role's shim. This is the one manifest field that
+            // grants execution inside a sandbox, so it fails closed and loudly.
+            var hasPreApprovalArg = !string.IsNullOrWhiteSpace(a.PreApprovedCommandArg);
+            var hasPreApprovalFormat = !string.IsNullOrWhiteSpace(a.PreApprovedCommandFormat);
+            if (hasPreApprovalArg != hasPreApprovalFormat)
+                throw new AdapterManifestException(AdapterManifestError.BadPreApproval,
+                    $"Adapter '{a.Id}' declares only "
+                    + (hasPreApprovalArg ? "'preApprovedCommandArg'" : "'preApprovedCommandFormat'")
+                    + " — the two are a pair: the flag alone has no value to carry, and the format alone "
+                    + "has no flag to travel on. Declare both or neither.");
+            if (hasPreApprovalFormat
+                && !a.PreApprovedCommandFormat!.Contains(PreApprovedCommandPlaceholder, StringComparison.Ordinal))
+                throw new AdapterManifestException(AdapterManifestError.BadPreApproval,
+                    $"Adapter '{a.Id}' preApprovedCommandFormat '{a.PreApprovedCommandFormat}' contains no "
+                    + $"'{PreApprovedCommandPlaceholder}' placeholder. The daemon substitutes the shim's "
+                    + "own in-jail path there; without it the CLI would be handed a fixed grant naming "
+                    + "something other than this agent's shim.");
+
+            // The first-turn delivery. Refused rather than defaulted for the same reason the pair above
+            // is: a declaration this build cannot read must not quietly become "no first turn", because
+            // that is the deadlock — a worker idling at an empty input box in a jail whose terminal is
+            // input-locked, with the coordinator's only steering tool refused until it presents the plan
+            // it will never present. An unreadable value is a manifest bug and says so at parse.
+            if (a.InitialPromptStyle is not null
+                && !TryParseInitialPromptStyle(a.InitialPromptStyle, out _))
+                throw new AdapterManifestException(AdapterManifestError.BadInitialPrompt,
+                    $"Adapter '{a.Id}' initialPromptStyle '{a.InitialPromptStyle}' is not a delivery this "
+                    + "build knows. Use 'first-positional' (the turn is a bare positional argument placed "
+                    + "before every flag the daemon appends) or 'none'.");
+
             if (a.Launch is not null && (a.Launch.Count == 0 || a.Launch.Any(string.IsNullOrWhiteSpace)))
                 throw new AdapterManifestException(AdapterManifestError.MissingField,
                     $"Adapter '{a.Id}' has an empty 'launch' command.");
@@ -283,6 +439,18 @@ public sealed record AdapterManifest(
                             $"Adapter '{a.Id}' credentialPaths entry '{path}' must be a $HOME-relative file path (no leading '/', '~', '..' segments, backslashes, or control characters).");
                 }
             }
+
+            // The instructions file is a path the daemon WRITES, at the root of the user's own checkout,
+            // and whose name is also what gets excluded from the agent's commits. Both halves need it to
+            // be a plain relative path: `Path.Combine(worktree, "../../x")` writes outside the worktree,
+            // and a name git cannot match as a pattern is an exclusion that silently covers nothing.
+            // Refused rather than sanitized — a quietly rewritten name would be delivered to a path the
+            // CLI does not read, which is the exact inert delivery this field was added to fix.
+            if (a.InstructionsFile is not null && !IsHomeRelativeFilePath(a.InstructionsFile))
+                throw new AdapterManifestException(AdapterManifestError.Malformed,
+                    $"Adapter '{a.Id}' instructionsFile '{a.InstructionsFile}' must be a plain relative file "
+                    + "path inside the worktree (no leading '/', '~', '..' segments, backslashes, or control "
+                    + "characters) — the daemon writes it at the worktree root and excludes it by that name.");
 
             if (a.SettingsPaths is not null)
             {
@@ -336,6 +504,28 @@ public sealed record AdapterManifest(
         return manifest;
     }
 
+    /// <summary>The literal an adapter's <see cref="AdapterSpec.PreApprovedCommandFormat"/> must contain,
+    /// and which the daemon replaces with the shim's absolute in-jail path. One constant, shared by the
+    /// parser that requires it and the launcher that substitutes it, so the two cannot disagree about
+    /// what a template looks like.</summary>
+    public const string PreApprovedCommandPlaceholder = "{command}";
+
+    /// <summary>
+    /// Renders the ONE pre-approval grant for <paramref name="command"/> in <paramref name="format"/>'s
+    /// spelling — or null when the adapter declares no pre-approval channel, or when the caller has no
+    /// command to grant.
+    ///
+    /// <para>The single substitution point, used by the daemon and asserted by its tests. Null rather
+    /// than a bare format string when anything is missing: "no grant" is a working agent that asks a
+    /// human, while a mis-rendered grant is a permission rule whose contents nobody chose.</para>
+    /// </summary>
+    public static string? RenderPreApproval(string? format, string? command) =>
+        string.IsNullOrWhiteSpace(format)
+        || string.IsNullOrWhiteSpace(command)
+        || !format.Contains(PreApprovedCommandPlaceholder, StringComparison.Ordinal)
+            ? null
+            : format.Replace(PreApprovedCommandPlaceholder, command, StringComparison.Ordinal);
+
     /// <summary>The wire spellings of <see cref="AdapterProvenanceLevel"/>. Ordinal and exact — a
     /// case-insensitive or fuzzy match here would let a typo'd rung become a weaker one.</summary>
     private static readonly IReadOnlyDictionary<string, AdapterProvenanceLevel> ProvenanceNames =
@@ -352,6 +542,25 @@ public sealed record AdapterManifest(
     {
         level = AdapterProvenanceLevel.None;
         return value is not null && ProvenanceNames.TryGetValue(value, out level);
+    }
+
+    /// <summary>The wire spellings of <see cref="AdapterInitialPromptStyle"/>. Ordinal and exact, for the
+    /// same reason as the provenance rungs: a fuzzy match would let a typo become a different
+    /// behaviour.</summary>
+    private static readonly IReadOnlyDictionary<string, AdapterInitialPromptStyle> InitialPromptStyleNames =
+        new Dictionary<string, AdapterInitialPromptStyle>(StringComparer.Ordinal)
+        {
+            ["first-positional"] = AdapterInitialPromptStyle.FirstPositional,
+            ["none"] = AdapterInitialPromptStyle.None,
+        };
+
+    /// <summary>Maps a manifest <c>initialPromptStyle</c> string to its delivery. False for anything
+    /// unrecognised — including null, which the caller reads as "not declared" rather than as a
+    /// refusal.</summary>
+    public static bool TryParseInitialPromptStyle(string? value, out AdapterInitialPromptStyle style)
+    {
+        style = AdapterInitialPromptStyle.None;
+        return value is not null && InitialPromptStyleNames.TryGetValue(value, out style);
     }
 
     /// <summary>A version is pinned iff it is concrete: has a digit, and carries no range/wildcard/tag.</summary>

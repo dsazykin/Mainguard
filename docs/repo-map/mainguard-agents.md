@@ -21,6 +21,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `VtBoundaryDetector.cs` (pure `SafeFlushLength`: Ground/Esc/Csi/Osc/Dcs/Ss3 + UTF-8 continuation
     counting; returns the largest prefix that never splits a VT sequence or UTF-8 codepoint — the
     correctness heart, split-at-every-offset tested).
+  - `TerminalSubmit.cs` (**how a line is SUBMITTED to a PTY-attached CLI**: `TryEncodeSubmission`
+    returns the body and the terminator as **two separate buffers** — never concatenated, because the
+    split IS the fix (defect J2): a TUI classifies input as typed or pasted by the read burst it arrives
+    in, so a CR appended to a realistic message is read as pasted *content* and submits nothing. `go`
+    submitted; a 139-byte steer did not. `TerminatorSeparation` (50 ms) is the fallback gap for callers
+    with no echo to wait on — two back-to-back writes are coalesced by the PTY into one read and the
+    defect returns. It also normalises
+    embedded CR→LF — an embedded CR submits a *prefix* as its own turn — trims trailing whitespace,
+    refuses an empty message rather than writing a bare CR (which is Enter, pressed at whatever the CLI
+    has focused), and terminates with **CR (0x0D), never LF**. Measured against a real CLI under a
+    forkpty, not reasoned: a TUI runs the tty in raw mode so ICRNL translates nothing and LF is merely a
+    newline typed into its input box. Deliberately NOT a per-adapter manifest field — see
+    `docs/design/coordinator-phase-3-decisions.md` §17.2. Consumed by `AgentCliBinder`).
 - **`Terminal/Vterm/`** — the **P2-18 server-side terminal engine** (daemon-only at runtime; the
   client never loads native terminal code).
   - `VtermNative.cs` (P/Invoke over the pinned libvterm 0.3.3 — `build/libvterm/`; resolver:
@@ -59,7 +72,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   Docker, no real agents).
   - `OrchestrationModels.cs` (enums/records shaped like the future gRPC contract: `AgentLifecycleState`
     per OPS §4.1, `WorkerMergeState` per P2-10,
-    `AgentInfo`/`QueueEntry`/`VerificationRecord`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`,
+    `AgentInfo`/`QueueEntry`/`VerificationVerdict`/`FlaggedItem`/`TaskPlan`/`ChatLine`/`AgentEvent`/`SandboxEvent`/`ResourceSample`/`Checkpoint`/`DeployStatus`
+    (**H4:** `VerificationVerdict` replaced a `VerificationRecord` that carried `TestsPassed`/`TestsTotal`
+    — counts no wire has ever carried and nothing in this system measures, since verification observes a
+    process exit code in a jail and parses nobody's test runner. It is narrowed to the three real
+    `QueueEntry.last_verification_*` fields; a null `QueueEntry.Verification` means NO RECORD, which is a
+    different answer from a failure and must never render as one),
     plus the **phase-2** `WorkerPlanCard` (a worker-authored plan as the approval card needs it —
     authorship, revision-against-budget, and the feedback the last rejection sent back) and
     `OrchestrationBackpressure` (blocked/escalated/active counts + the daemon's rendered stall line;
@@ -69,7 +87,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     UI-facing verification trigger** — the rung whose absence left the whole verification mechanism
     without a production caller, so queue entries sat at `not verified yet` forever. It is a *trigger*
     only: every decision stays in the daemon's `MergeQueue.RunVerificationAsync`, which an automatic
-    phase-2 caller drives directly for identical gates/jail execution/transitions),
+    phase-2 caller drives directly for identical gates/jail execution/transitions;
+    **`GetVerificationLogAsync`** (+ `VerificationLog`) is its counterpart — it READS the recorded output
+    of the last run and starts nothing, because a re-run costs minutes of real jail time and can answer
+    differently, and until it existed "why did this fail?" was spelled "run it again". It keeps the
+    daemon's three answers apart: no record / the log / a record whose artifact could not be read),
     (+ `ResumeEntryAsync`/`QueueEntryResumeOutcome` — the human's way out for a STRANDED entry: the daemon
     spawns a jail onto that entry's existing agent id and branch, so it can be verified and merged instead
     of only discarded. Adoption, not re-creation — same id, same branch, same row; see
@@ -91,7 +113,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     via `App.CreateOrchestratorServices`; the design render harness explicitly injects a mock bundle via
     `App.OrchestratorServicesFactory`), `Mock/MockOrchestrator.cs` (the scripted in-memory stand-in: 4
     seeded agents, a live stale cascade on `ConfirmMergeAsync`, CanMerge gate reasons, plan approval
-    that spawns a worker, freeze-first kill switch, telemetry random walk, scripted deploy phases;
+    that spawns a worker, freeze-first kill switch, telemetry random walk, scripted deploy phases, and a
+    scripted `GetVerificationLogAsync` that answers "no record" — not an empty log — for an agent with no
+    verdict;
     timer-threaded — consumers marshal). Also `PtyProcessShim.cs` (P2-03): the real cross-platform PTY
     shim — `PtySession` (bidirectional `IO` stream, `Resize`/`Kill`/`ExitCode`, idempotent dispose that
     reaps the child) + `PtyProcessShim.Spawn` (ConPTY on Windows / forkpty on Linux via the `Porta.Pty`
@@ -102,16 +126,196 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - `AgentRoles.cs` — the shared role-string contract (""/`coordinator`/`managed`) for
     `SpawnAgentRequest.role`; and `Agents/Ipc/` — the coordinator→daemon spawn channel's pure pieces:
     `AgentIpcProtocol.cs` (fixed in-jail layout `AgentIpcPaths` — `/opt/mainguard/ipc` read-only mount
-    with `daemon.sock` + **the one shim that agent's role is allowed** — plus `AgentIpcEndpointRole`
+    with `daemon.sock` + **the one shim that agent's role is allowed**, and — **macOS fix** — the nested
+    read-write `outbox/` plus its request/claim/response suffixes, the daemon-only `inflight/` claim dir
+    that is its sibling rather than its child (renaming a claim ACROSS that line is what takes it out of
+    the jail's reach, so the daemon's checks about it hold until it is read), and the three bounds on a
+    jail-controlled directory — `MaxOutboxRequestBytes` per request, `MaxOutboxFiles` and
+    `MaxOutboxBytes` in aggregate) — plus `AgentIpcEndpointRole`
     (`Coordinator`/`Worker`) and the newline-delimited JSON request/response codec; the phase-2 ops
-    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`),
+    `brief`/`present_plan`/`revise_plan`/`await_decision` live on the same wire alongside `spawn`/`list`,
+    and **`commit_work`** — the rung the loop was missing: a worker records its approved work on its own
+    branch (message on the wire, repo/worktree/branch computed daemon-side), because the readiness trigger
+    observes `refs/heads/agent/<id>` advancing and a finished worker used to stop on an uncommitted diff
+    that died with its worktree. **`rescope_plan`** (2026-08-30, contract §3.1) is the sixth and newest
+    worker op: a worker that finds mid-task that the job needs a file its approved scope does not cover
+    presents a wider plan against the approval it already holds. It is deliberately NOT `revise_plan` —
+    a revision answers a rejection and spends the revision budget, a re-scope follows an approval and
+    spends none — and the two are refused in complementary states (`revise` needs `Rejected`, this needs
+    `Approved`), so a mis-picked verb is always refused rather than plausibly accepted and each refusal
+    names the other. `AgentIpcResponse.RescopeOf` carries the widened plan's id back, which is what lets
+    the shim report a DECLINED re-scope truthfully: nothing was taken away, and the generic "stop" would
+    send a still-authorised worker away from its work.
+    that died with its worktree, and — **the plan-mode toggle, 2026-08-30** — **`task`**, a second DOOR
+    onto the gate's one exit for the withheld task (it calls the same `TryReleaseTask`, with the same
+    release-once audit record, and is authorised by the same `MayWork` predicate as `commit_work`). It
+    exists because with plan mode off there is no `present`, until then the only path that ever returned a
+    task; redefining `brief` instead would have made "never yields the task prompt" conditionally false,
+    which is §13's defect exactly.
+    **Phase 3** adds `status`/`prompt`/`verify` and, more importantly, makes the surface an ALLOW-LIST
+    object: `AgentIpcRequest.CoordinatorOps` IS coordinator contract §3, `WorkerOps` is the worker's, the
+    two are disjoint, and the daemon dispatches against the set rather than against whatever a `switch`
+    happens to reach — so "the list is exhaustive" is one testable thing instead of a property of control
+    flow. Adding a member is a deliberate contract change. **That claim was decorative until it was made
+    true**: the set was referenced by nothing but a test while `HandleShimRequestAsync` dispatched on a
+    bare `switch`, so an added `case` served an unlisted fifth coordinator tool with the suite green.
+    `AgentSpawnService` now builds its handler tables against these sets at construction and **throws**
+    on an unlisted handler),
+    `AgentIpcShimTransport.cs` (**macOS fix** — the ONE python3 `call(request, timeout)` both shims embed.
+    The socket is the channel; on macOS it is not one, because the daemon runs natively on the Mac while
+    jails run in the container engine's Linux VM and Docker's file sharing does not proxy AF_UNIX across
+    that boundary — the bind-mounted `daemon.sock` stat()s as a socket and every `connect()` returns
+    ECONNREFUSED with the daemon listening, which made all four coordinator tools and the whole worker
+    plan gate unreachable on that platform with the suite green. So the shim tries the socket and, only
+    when it fails AND `/opt/mainguard/ipc/outbox` is WRITABLE, re-frames the same JSON as a file drop it
+    polls for an answer. The writability gate is load-bearing: where the socket is real the outbox sits
+    inside the read-only mount, so a dead daemon still reports as a dead daemon instead of parking the CLI
+    on a poll loop. Shared rather than duplicated because the two copies of `call()` had already drifted),
     `AgentSpawnShim.cs` (the `mainguard-agent` python3 shim script the daemon writes into the
     **coordinator's** IPC dir; python3 is pre-baked jail toolchain, so nothing new is baked into the image —
-    G-16) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
-    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>`.
-    `present`/`revise` **block on the socket until a human decides** and print the decision; on approval
-    the response carries the task prompt the daemon had been withholding, which is what makes "the worker
-    does not start before approval" a property of the system rather than a request in a prompt).
+    G-16. **Phase 3**: its CLI is now the contract's four tools — `spawn` / `status [id]` / `prompt <id>
+    <text>` / `verify <id>`, with `list` kept as an alias of `status` — and its docstring says plainly that
+    there is no fifth. **Contract §3 change, 2026-08-29:** `spawn` takes `SpawnUsage` —
+    `spawn <agent-kind> --title "<short title>" --task "<the task ...>"` — a single-sourced constant
+    interpolated into the shim's `--help`, its refusals, and `AgentOperatingInstructions.Coordinator`, so
+    the three places a model reads this command cannot disagree. It used to send NO title, which is what
+    made the daemon's `Title ?? TaskPrompt` fallback hand every worker its task as its "brief". Both flags
+    are required and ordered, and `spawn_request` refuses rather than derives: named flags cannot be
+    swapped, and an unquoted `--title` leaves stray words where `--task` must be — so that quoting slip is
+    *detected* rather than silently mis-split. **Defect G3 (2026-08-29) quoted `--task` and made a refused
+    spawn visible.** The usage used to end `--task <the task ...>` and the instructions said the long
+    argument "needs no quotes at all" — true of the parser, false of the world: the coordinator reaches
+    this command through its CLI's Bash tool, so `--task rewrite add() …` dies at `bash: syntax error near
+    unexpected token '('` with nothing in the daemon's log, which is how two of three first spawns
+    vanished in a stress run. The taught form is now shell-safe (the parser still joins a multi-word tail,
+    so the old form keeps working where the text happens to be), and `report_refused_spawn` sends every
+    spawn the shim could NOT build over the channel — nothing derived, so the daemon's channel check
+    refuses it and the failure leaves a warning and a `shim_spawn_refused` audit entry instead of only
+    this jail's stderr) and `WorkerPlanShim.cs` (**phase 2** — the `mainguard-plan` python3 shim written into a
+    **worker's** IPC dir: `brief` / `present <plan.json>` / `revise <id> <plan.json>` /
+    `rescope <approved-plan-id> <plan.json>` / `await <id>` /
+    **worker's** IPC dir: `brief` / **`task`** / `present <plan.json>` / `revise <id> <plan.json>` / `await <id>` /
+    **`commit "<message>"`** (the only route a jailed CLI has to a commit — measured against claude-code
+    2.1.251 under the jail's real posture, a worker asked to commit could not even run `git status`.
+    **G4:** ONE quoted argument, and a second positional is REFUSED rather than joined — `' '.join(argv[2:])`
+    rejoined with single spaces whatever a shell had already split, so a subject/blank-line/body arrived
+    flat and nothing could tell a structure had been lost).
+    `present`/`revise`/`rescope` **block on the socket until a human decides** and print the decision; on
+    approval the response carries the task prompt the daemon had been withholding, which is what makes
+    "the worker does not start before approval" a property of the system rather than a request in a
+    prompt. **The deviation declaration (2026-08-31)** rides `commit`: exactly one of `--no-deviations`
+    or one-or-more `--deviated "<what and why>"`, parsed by the real `main()` and mapped to the wire's
+    `noDeviations` / `deviations`, which are sent ONLY when given so "answered none" and "said nothing"
+    stay different bytes. The shim refuses locally only what is malformed however the run is gated (both
+    flags, a bare `--deviated`, an unknown option, a second positional message) — whether THIS worker
+    owes a declaration depends on holding an approved plan, which only the daemon knows, so a shim that
+    guessed would deny an ungated worker a commit it is entitled to make. Three things are single-sourced
+    out of the script: `RescopeUsage` (interpolated into the usage
+    text, the shim's own id-less refusal, the worker's operating instructions and both daemon refusals
+    that point at it — five spellings of one command is how they come to disagree, §13.2), `CommitUsage`
+    (the same treatment for the declaration form, named by the shim's refusals, the instructions and the
+    daemon's), and `Verbs`,
+    the op→verb map, which is the object `AgentOperatingInstructionsTests` set-equals against
+    `AgentIpcRequest.WorkerOps` so an op the worker is never taught fails a test — and which the generated
+    dispatch is interpolated from for EVERY verb. `brief`/`present`/`await`/`commit` were literals in both
+    their `argv[1] ==` comparison and their payload op until they were routed back through the map; nothing
+    failed because the literals equalled the map, which is precisely the state a drift starts from. No
+    runtime assertion can see it — the script is composed FROM the map — so
+    `AgentIpcProtocolTests.TheWorkerShimsDispatch_IsGeneratedFromTheVerbMap_NeverWrittenOutAsALiteral`
+    scans this file's SOURCE and fails on a bare literal. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26).
+    `AgentOperatingInstructions.cs` (**the delivery phase 3 left missing** —
+    `Coordinator(InstalledAdapterCatalog, WorkerPlanMode)` / `Worker(WorkerPlanMode)` /
+    `For(role, InstalledAdapterCatalog, WorkerPlanMode)` /
+    `SpellKinds(installedKinds)`, written as `MAINGUARD.md` into each agent's IPC dir beside its shim by
+    `AgentIpcServer`. **Defect G2 (2026-08-29) made the catalog structural**: the installed set used to be
+    an OPTIONAL list and the shim path a caller-supplied string, so the launcher's `--append-system-prompt`
+    copy named every installed kind while `AgentIpcServer`'s file copy — rendered from the same function
+    with the argument omitted — told the same coordinator `(none installed on this machine)`. No entry
+    point can now be reached without the catalog the `spawn` refusal itself reads, and the shim path is
+    derived from the role, so a third call site gets the machine's real state whatever it forgets. Phase 3 §1.2 recorded that the coordinator's boundary prompt "is never delivered";
+    it was worse — **nothing ran at spawn for either role**, so neither was told its shim existed, and
+    since a worker's approved task arrives as the RETURN VALUE of the blocking `mainguard-plan` call, a
+    worker that never runs the shim never presents a plan and correctly receives nothing, forever.
+    Describes, never enforces — same standing rule as `CoordinatorAgent.SystemPrompt`, and deliberately
+    NOT that string, which is written for the in-process `spawn_worker(...)` API the shipped coordinator
+    does not have. `AgentOperatingInstructionsTests` pins the coordinator text against
+    `AgentIpcRequest.CoordinatorOps` in both directions, so a tool the contract grants but the text omits
+    — a capability the agent would then never use — fails a test, and (2026-08-29) pins that the
+    coordinator text carries `AgentSpawnShim.SpawnUsage` verbatim plus what `--title`/`--task` MEAN: the
+    title is the whole brief, the task is withheld until approval, and the title is the headline on the
+    human's approval card. **(2026-08-30) The WORKER text is now pinned the same way** — it was pinned
+    against nothing, so an op could be added to `WorkerOps`, served, spelled by the shim and never
+    mentioned to the only reader who can run it, which is how the loop once ended one rung short of
+    `commit_work`. `TheWorkerIsToldAboutEveryOpTheDaemonServesIt` walks `WorkerOps` through
+    `WorkerPlanShim.Verbs`, and the re-scope section is held to three claims a worker gets wrong by
+    default: `rescope` is not `revise`, asking costs it nothing because its existing approval stands
+    while the human decides, and it should ask even if it has already touched the file. **(2026-08-31)
+    The worker text carries a mode-dependent deviation-declaration section**: a GATED worker is taught
+    `WorkerPlanShim.CommitUsage` verbatim plus the reason — its own tests pass either way, so the
+    declaration is the only thing that can tell a human its approval and its diff came apart — while an
+    UNGATED worker is taught none of it, because with no approved `approach` the daemon neither requires
+    nor records one and text describing a mechanism this jail is not under is the MG-12 shape one layer
+    up. **Delivered two ways, neither
+    redundant**, via `AdapterSpec`/`InstalledAdapterMarker` `instructionsFile` + `systemPromptArg`
+    (claude-code: `CLAUDE.md` + `--append-system-prompt`): the launcher appends the FLAG to the launch
+    argv, which is the ONLY channel that reaches a coordinator — the role lock leaves it an empty tmpfs
+    at `/workspace` with no host side to write a file to — and writes the FILE into a worker's worktree,
+    which is what a CLI opens unprompted. The `MAINGUARD.md` staged beside the shim is inspectable but
+    is NOT a delivery: nothing reads that path on its own, which is why naming the CLI's own convention
+    is load-bearing rather than cosmetic. Both fields optional; an adapter declaring neither spawns
+    exactly as before. `instructionsFile` is **refused at manifest parse** unless it is a plain relative
+    path (`Path.Combine(worktree, "../../x")` writes outside the worktree) and re-checked in the launcher,
+    because an installed marker is a JSON file on disk that no manifest parse re-reads. The name is also
+    what gets excluded from the agent's commits — one field decides both — and the launcher **never
+    overwrites** a file the worktree already has: a git exclude does not cover a TRACKED file, so in any
+    repository that keeps its own `CLAUDE.md` the write would replace the user's project instructions and
+    `git add -A` would stage it.
+    **Telling a CLI its shim exists is not the same as letting it run one (defect C2).** A real
+    claude-code coordinator followed these instructions exactly, ran `/opt/mainguard/ipc/mainguard-agent`
+    as its first action, and got "This command requires approval" — in a jail with no human to answer,
+    for the one command that IS its whole surface. So the same pattern gained a second pair,
+    `preApprovedCommandArg` + `preApprovedCommandFormat` (claude-code: `--allowedTools` +
+    `Bash({command}:*)`), and `SandboxAgentLauncher.ApplyShimPreApproval` renders exactly ONE grant from
+    it: the absolute in-jail path of the shim THIS agent's role was given, via the same
+    `AgentIpcPaths.SandboxShimPath` that decided which shim the daemon WROTE. A jail with no IPC dir gets
+    nothing. The manifest never names the granted command, so no manifest edit can widen it — only change
+    how a grant is spelled. A launch flag rather than a merge into `.claude/settings.local.json` on
+    purpose: that file is harvested back into the per-repo host store, so a grant written there would be
+    re-injected into every later jail for the repository, workers and untrusted PR heads included — and a
+    store written before that reasoning existed already held exactly such a grant, which `CliSettingsGrantScrub`
+    now removes in both directions (defect D5b).
+    **A coordinator is also told which agent kinds exist (defect D1).** The text said
+    `spawn <agent-kind>` and never said what a kind was, so a real coordinator's first move was
+    `spawn coder` — no such adapter, a jail created with no CLI in it, and `Ok, Status: AwaitingPlan`
+    returned. `Coordinator(shimPath, installedKinds)` renders the list per spawn from
+    `InstalledAdapterCatalog.InstalledKinds()` via the shared `SpellKinds`, which is the same set
+    `CoordinatorSpawnGate.RefuseUnknownKind` enumerates — the text and the enforcement cannot say
+    different things, and no list is hardcoded anywhere to rot (MG-12)).
+    `AgentKickoffPrompt.cs` (**the FIRST USER TURN — the defect that stopped the loop starting at all**.
+    `Worker(shimPath)` / `WorkerUngated(shimPath)` / `For(role, shimPath, WorkerPlanMode)`, and a
+    coordinator gets NULL. A vendor CLI does not act on
+    a system prompt: a live worker jail launched `claude --append-system-prompt <instructions>` and sat
+    at an empty input box — six minutes, empty outbox, no transcript, `mainguard-plan` never run — and
+    nothing could start it, because the only writer to a worker's CLI is the coordinator's
+    `send_worker_prompt`, which `WorkerPlanGate` refuses until a plan is approved. No first turn without
+    a plan; no plan without a first turn. The turn is a compile-time constant of `(role, shimPath)`:
+    there is no task/title/agent-id parameter, so it CANNOT carry the work, and what it says is "run
+    `mainguard-plan brief`" — the one thing phase 2 §2.2 gives a worker up front. **The plan-mode toggle
+    adds a second constant**, `WorkerUngated`, selected by an ENUM: it says "run `mainguard-plan task`"
+    instead, and keeps the property intact — passing the task in as a parameter was the obvious
+    implementation and would have traded a structural guarantee for a conditional one, in the one place
+    the task would then sit in a process argument list. Every gate is untouched
+    and still answers no. A coordinator gets none deliberately: its terminal is not input-locked, so a
+    human can type into it, and its real first turn is the operator's request, which the daemon does not
+    have and must not invent. Delivered by the third per-adapter field, `initialPromptStyle`
+    (`AdapterInitialPromptStyle`; claude-code: `first-positional`), rendered by
+    `SandboxAgentLauncher.BuildLaunchArgv` — which is the one place that knows the argv ORDER, because
+    the turn must precede every flag the daemon appends: measured against claude-code 2.1.250, appended
+    LAST it is swallowed by the variadic `--allowedTools <tools...>` and never reaches the model at all,
+    so the obvious spelling of this fix ships the fix and keeps the bug. Gated on `ipcDirPath` like the
+    pre-approval beside it, and an unreadable style is REFUSED at parse (`BadInitialPrompt`) rather than
+    defaulted, because degrading to "no first turn" is the deadlock).
   - **`Agents/` (P2-06 repo provisioner — daemon-side, no UI).**
     - `RepoPathHasher.cs` (pure: a normalized Windows repo path → a stable lowercase-hex SHA-256;
       case-folds + unifies slashes + strips the trailing separator so `C:\Repo\` and `c:/repo` map to one
@@ -194,7 +398,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Unchanged`), because the loop discarded `PollOnce`'s return value and so "this agent's work moved"
       was computed once a second and reachable by nothing. `WorkerReadinessTrigger` is the subscriber; the
       mediator's own observer is deliberately NOT the seam, since it also sees the merge queue's
-      pre-verification publish and would feed a trigger the consequences of its own runs).
+      pre-verification publish and would feed a trigger the consequences of its own runs. Also
+      `MayReap(repoHash, agentId)` → `AgentBranchReapVerdict`/`AgentBranchReapOutcome` — the question a
+      teardown asks before `branch -D`: is this branch's tip already contained in the mirror's own
+      integration branch, i.e. would deleting the ref destroy nothing? `Reapable`/`NoBranch` permit the
+      delete; `CarriesWork` and `Undecidable` refuse it, the second because an unanswerable safety
+      question gating a destructive operation is a "no". Lives here because this class already owns both
+      halves of the arithmetic — rule 2's `merge-base --is-ancestor` and rule 4's "the mirror's own
+      default branch, never the literal name" — and a second copy of either is how one becomes
+      decorative).
     - `MirrorMaintenance.cs` (**MG-3 §4** — the object-lifetime policy for a mirror other repos borrow
       from: **pruning breaks borrowers, repacking does not**. `ApplyGcPolicy` (`gc.auto=0` +
       `maintenance.auto=false` — BOTH checked: the second exists because a newer git's background
@@ -208,6 +420,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `CountLooseObjects`/`MeasureObjectStoreBytes` + the `SizeWarningBytes` guard, and
       `AfterAgentDetached` (the teardown hook: a fast path below the loose-object threshold so a stop
       never scales with repository size)).
+    - `AgentCommitMessage.cs` (**defect G4, 2026-08-29** — the one place a worker-supplied commit message
+      is normalised and judged. `Normalize` folds CRLF, trims trailing whitespace per line and strips
+      leading/trailing blank lines, and does **nothing else**: no reflowing, no collapsing of blank lines,
+      no truncation. `Refuse` applies git's own convention — subject ≤ `MaxSubjectLength` (72), a BLANK
+      second line when there is a body, no control characters, `MaxLength` 8 KiB — and returns the reason,
+      which becomes `AgentWorkCommitOutcome.RefusedMessage`. It replaces a `CommitSubject` that replaced
+      every newline with a space and cut the result at 200 characters mid-word while reporting success:
+      two of three commits in a stress run were destroyed that way, `%b` empty. An ABSENT message is still
+      a default naming the agent (`DefaultFor`) rather than a refusal — nothing structured is being
+      discarded there, and §11.2's "refusing would lose the work" still holds)
     - `WorktreeManager.cs` (`IAgentWorktreeManager`: `CreateAgentWorktree` creates the agent's OWN
       repository (**MG-3**) then `git worktree add -b agent/<id> <path> <defaultBranch>` **off that**,
       then the **quarantine remote** — remove any inherited `origin`,
@@ -218,8 +440,32 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       runner delegate + warning sink); `AgentRepoPathFor` (the read-write mount the jail gets) and
       `PublishAgentBranch` (the daemon-side carry of `refs/heads/agent/<id>` from the agent's repo into
       the mirror — the daemon names BOTH refs, so the agent never proposes a ref update at all);
-      `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force` +
-      `branch -D` + delete the whole per-agent repo + the `MirrorMaintenance` idle hook, no residue);
+      **`CommitAgentWork(repoHash, agentId, rawMessage)`** → `AgentWorkCommitResult` /
+      `AgentWorkCommitOutcome` (`git add -A` + `commit --cleanup=verbatim` onto `agent/<id>`, refused
+      unless `CheckAgentBranch` says HEAD really is that branch, refused with `RefusedMessage` when
+      `AgentCommitMessage` cannot record what the worker sent (**G4** — checked FIRST, before any git
+      runs, so the worktree is untouched and a corrected message is a retry), `NothingToCommit` kept
+      distinct from `Committed` so a clean tree is never reported as recorded work, and pointedly NOT
+      publishing —
+      `AgentRefWatcher` raises `Advanced` only on `Published`, so an eager publish here would disarm
+      `WorkerReadinessTrigger` for the very commit it exists to react to);
+      `RemoveAgentWorktree(force)` (dirty non-force → typed refusal; force → `remove --force`, then
+      `ReapBranch` — `branch -D` **only when `AgentRefMediator.MayReap` proves the delete destroys
+      nothing**, i.e. the tip is already contained in the mirror's integration branch — then delete the
+      whole per-agent repo + the `MirrorMaintenance` idle hook. That conditional IS defect F1: the
+      `branch -D` was unconditional, so the documented end of a worker's life (commit, report, stop)
+      deleted the commit it had just published and verified, leaving it dangling for the prune that runs
+      two lines later while the queue row still said `Verified` and still offered Review. "No residue"
+      survives for the case it was written about — a branch that never left the base, which is every
+      coordinator, every failed spawn and every worker that did nothing — and a KEPT branch is not
+      silent: it warns and raises the G-17 `agent_branch_kept` event);
+      **`DiscardAgentBranch(repoHash, agentId)`** (the ONE deletion taken on a caller's word rather than
+      on a proof that it costs nothing — the external-PR intake's release, where the commits provably
+      live in the pull request they were fetched from and `pr-<n>` is a REUSED id, so a kept branch would
+      make the next intake of that number collide with `CreateAgentWorktree`'s duplicate refusal on every
+      poll forever. Audited with the sha it removed (`agent_branch_discarded`); idempotent — an already
+      absent branch is success; interface default returns false, since a manager with no mirror deleted
+      nothing and residue here is residue, never lost work);
       **`AdoptAgentWorktree`** (the RESUME half — `worktree add <path> agent/<id>` with **no `-b`**, so a
       jail spawned for a stranded queue entry starts on that entry's existing branch with its commits
       intact: rescue-publish the dead jail's own repo into the mirror first (a crash can leave commits the
@@ -248,7 +494,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `IAgentEnvironment.cs` (the substrate facade + `SyncRemote`/`SubstrateCapabilities` records: holds
       `Repos`/`Worktrees` and — **added by P2-07** — `Sandboxes` (`ISandboxEngine`) + `Egress`
       (`IEgressPolicy`), plus `ResolveSyncRemote(hash)`; the Health/Upgrade/Teardown lifecycle stays
-      deferred to a future task — documented on the interface).
+      deferred to a future task — documented on the interface. `SubstrateCapabilities` also carries
+      **`SupportsBindMountedUnixSockets`** (default `true`): whether a Unix socket the daemon binds is
+      REACHABLE from a jail that bind-mounts it. False only on macOS, where the daemon is on the host and
+      jails are in the engine's Linux VM and virtiofs does not proxy AF_UNIX — the flag the agent-IPC
+      spawn path reads to decide whether the jail also needs the file-framed outbox).
     - `Wsl2AgentEnvironment.cs` (the WSL2 impl: `SubstrateId="wsl2"`, capabilities
       `(false,false,"9p","wsl")`, resolves the sync remote to a `\\wsl.localhost\…\repos\<hash>.git` UNC
       handle — **the only place the `mainguard-vm` name literal lives**, SC-2; the substrate-neutral
@@ -260,7 +510,9 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       allowlist-persistence invariants are documented HERE and bind both substrates. The Docker
       client is lazily created via `DockerEndpointResolver`, so construction needs no live engine).
     - `MacHostAgentEnvironment.cs` (the macos-host impl: `SubstrateId="macos-host"`, capabilities
-      `(false,false,"virtiofs","docker")`, daemon natively on the Mac with state under `~/mainguard`,
+      `(false,false,"virtiofs","docker", SupportsBindMountedUnixSockets: false)` — the last one measured,
+      not assumed: a daemon-bound Unix socket bind-mounted from this host is inert inside a jail
+      (ECONNREFUSED against a listening daemon), which is why the agent-IPC channel ships an outbox, daemon natively on the Mac with state under `~/mainguard`,
       sandboxes through the resolved Docker engine — Docker Desktop / OrbStack / Colima. Resolves the
       sync remote to the plain local bare path — **the only place the `mainguard-local` name literal
       lives**, SC-2. `Toolchains` installs through `ContainerAdapterInstallHost` (in-jail CLIs and
@@ -360,6 +612,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       concurrent request JOIN the run already in flight (same images, same sources) instead of starting a
       rival build, and `IsProvisioning` is the signal `AppShutdownSequence` (and the framework-Exit
       backstop in `ProDesktopHost`) vetoes the VM terminate on.)
+    - `AppShutdownSequence.cs` (the visualized exit teardown: release the keep-alive; when StopVmOnExit is
+      on, `IAppShutdownEnvironment.StopAgentsAsync` — every live agent through the ordinary Stop, added
+      2026-09-04 (owner decision), run BEFORE the VM leg and even when an image build vetoes that leg —
+      then the scoped terminate. `ShutdownStatus` holds the exact status lines the ordering test pins.)
     - `DaemonConnectDiagnosis.cs` (the app→daemon connect path's per-leg verdict: `DaemonConnectStage`
       (distro not running / daemon process down / no session token / transport credentials missing /
       not listening / token rejected / undiagnosed), the `DaemonConnectDiagnosis` record whose `Banner`
@@ -534,7 +790,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Sandbox/`** (P2-07 sandbox hardening + default-deny egress — daemon-side, no UI; the
     launch-tier prompt-injection exfiltration control). Adds `Docker.DotNet` to `Mainguard.Agents`
     (never referenced from `Mainguard.App.Shell` — G-18). **Pure, unit-tested heart:**
-    - `ContainerSpecBuilder.cs` (**P2-48**: also mounts the dynamic-CLI root `AdapterPaths.VmRoot`
+    - `JailLimitsSettings.cs` (2026-09-04, owner decision — the per-jail memory/CPU ceiling as an OPERATOR
+      setting: `IJailLimitsStore` (`InMemoryJailLimitsStore` / `JsonJailLimitsStore`, a one-file JSON beside
+      the plan store because the launcher reads it at every spawn), and `JailLimitsSettings` — `Current`
+      is the persisted document clamped over `SandboxLimits.Default`, `Set` clamps to [512 MiB, 64 GiB] ×
+      [0.5, 64] CPUs, persists, audits `jail_limits_changed` and answers AS PERSISTED. Read-side clamp too,
+      so a hand-edited zero is never a ceiling of zero. Defaults kept at 2 GiB / 2 CPUs; no fleet cap.)
+    - `ContainerSpecBuilder.cs` (**macOS agent-IPC fix**: `IpcOutboxPath` adds a READ-WRITE mount at
+      `/opt/mainguard/ipc/outbox`, **nested inside** the read-only IPC mount so the shim and the operating
+      instructions stay the daemon's files. It is the coordinator jail's only writable bind mount, so the
+      guard is exact rather than shaped — the source must be the `outbox/` child of THIS request's IPC dir
+      (`AgentIpcPaths.OutboxIn`), the same MG-3 reasoning as the package cache's `caches/` gate.
+      **P2-48**: also mounts the dynamic-CLI root `AdapterPaths.VmRoot`
       **read-only** at `/opt/mainguard/adapters` when `AdaptersRootPath` is supplied (same G-11 ext4
       rejection as the worktree), and the `/home/agent` tmpfs now carries `uid=`/`gid=` — **without them
       the tmpfs is root-owned and mode 0700 locked the agent out of its OWN $HOME**, so every agent CLI
@@ -719,14 +986,18 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `$HOME` and report success while the container sees nothing, and write-if-absent stops the host's
       older copy clobbering a live jail's fresher tokens or approvals. **`SettingsRootPath(root)`** is the
       ONE `AdapterSettingsRoot`→in-jail-directory mapping, shared with the harvest side so the two legs of
-      the round trip cannot drift apart. **`ApplyWorkspaceSettingsIgnoreAsync`** appends the WORKSPACE
-      settings paths to `$GIT_DIR/info/exclude` — `/workspace` IS the agent's git worktree and agents run
-      `git add -A`, so without this the feature would commit the user's permission allowlist into their
-      repository and merge it to main. Driven by `SandboxSpawnRequest.WorkspaceIgnorePaths` (the
-      adapter's DECLARATION) unioned with anything restored, because the session that most needs the
-      ignore is the FIRST one — nothing to restore, and the CLI creates the file itself. The exclude file
-      lives in the per-agent repo the daemon deletes at teardown, so nothing tracked is touched and no
-      state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
+      the round trip cannot drift apart. **`ApplyWorkspaceIgnoreAsync`** (was
+      `ApplyWorkspaceSettingsIgnoreAsync`; renamed because it is no longer about settings) appends
+      EVERYTHING MAINGUARD WRITES INTO `/workspace` to `$GIT_DIR/info/exclude` — `/workspace` IS the
+      agent's git worktree and agents run `git add -A`, so without this the daemon commits the user's
+      permission allowlist, and its own operating-instructions file, into their branch. Driven by
+      `SandboxSpawnRequest.WorkspaceIgnorePaths` (the adapter's DECLARATION — settings paths **and**
+      `instructionsFile`) unioned with anything restored, because the session that most needs the ignore
+      is the FIRST one — nothing to restore, and the CLI creates the file itself. This method learns no
+      filename: the union is `SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths`. The instructions half
+      was found in production — `git check-ignore CLAUDE.md` answered rc=1 in a live worker jail and the
+      worker's own report flagged the stray `?? CLAUDE.md`. The exclude file lives in the per-agent repo
+      the daemon deletes at teardown, so nothing tracked is touched and no state outlives the agent) and `EgressProxyConfigurator.cs` (internal `mainguard-agents` network + egress leg +
       the `mainguard-egress-proxy` container (image `DefaultImageRef` — the ref the v1 spawn preflight
       probes); renders + pushes the allowlist config; a `gatewayUpstream` ctor arg pushes the P2-08
       model-host fronting, and an `installedAdapterHosts` provider unions each installed CLI's declared
@@ -790,7 +1061,10 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       because the daemon's live session store is in-memory, so after a restart the labels are the ONLY
       record of what an agent IS and a surviving coordinator was otherwise adopted back as an anonymous,
       role-less worker. `mainguard.agent.role` is deliberately not `mainguard.role`, which already means
-      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. The record now also
+      which KIND of container this is — `agent` vs the egress proxy's `egress-proxy`. `mainguard.agent.parent`
+      (the spawning coordinator) joined them on 2026-09-03: contract §7 ownership is keyed on
+      `ParentAgentId`, so a worker adopted without it was one its coordinator could no longer see, steer or
+      verify after a restart. The record now also
       carries `Paused` and a computed `Live` (`Running || Paused`): Docker reports a frozen container as
       `"paused"`, not `"running"`, so reading `Running` as "still here" made a daemon restart during an
       engaged kill switch declare the agent dead and force-remove its worktree). Seccomp/proxy images live under
@@ -1094,22 +1368,48 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     - `GitMutationGuard.cs` (the **pure**, unit-tested heart: `CanMutate(GitDirState)` → skip verdict when
       the worktree is mid-`rebase-merge`/`rebase-apply`, on a detached HEAD, or mid-merge (`MERGE_HEAD`);
       `Inspect(worktreePath)` reads those preconditions off the resolved per-worktree gitdir;
-      `RunGuarded<T>(IYieldToken, isLockHeld, action, …)` runs the mutation once `.git/index.lock` clears
-      with injectable exponential backoff (base 100 ms ×2, cap 5) and **requires an active yield token**
-      so no worktree mutation is reachable without a completed yield (invariant 2) — a persistent lock →
-      typed `GitMutationLockException`; spawns nothing, the action routes through the shared runner).
+      `RunGuarded<T>(IYieldToken, isLockHeld, action, …, recheck)` runs the mutation once
+      `.git/index.lock` clears with injectable exponential backoff (base 100 ms ×2, cap 5) and
+      **requires an active yield token** so no worktree mutation is reachable without a completed yield
+      (invariant 2) — a persistent lock → typed `GitMutationLockException`; spawns nothing, the action
+      routes through the shared runner. **K6/§23.6: `recheck` re-reads the `GitDirState` the verdict was
+      MADE of, once the lock is clear and immediately before the action.** The backoff used to re-check
+      only the lock — the one precondition that was never part of the verdict — while the three that were
+      are exactly the states a worktree enters while a lock is held, so a snapshot decision was acted on
+      against a worktree it was no longer true of; a refusing re-check raises
+      `GitMutationStateChangedException` and the cycle skips).
     - `YieldProtocol.cs` (`IYieldProtocol.RequestYieldAsync` sends `[IPC_UPDATE_REQUESTED]` on the
       dedicated `IAgentControlChannel` — a named pipe / second channel, **not** the interactive PTY —
       awaits `[IPC_UPDATE_READY]` ≤ 10 s, else `ISandboxEngine.PauseAsync`; always returns an
       `IYieldToken` (the sole mutation gateway) whose `Resume`/`Dispose` unpauses the jail / signals
-      resume; `YieldOutcome` ByReady/ByPause).
+      resume; `YieldOutcome` ByReady/ByPause). **The token OWNS the `IPauseArbiter` machine hold** and
+      settles it on either exit: `Resume` (in a `finally`, so a failed unpause still hands the critical
+      section back) or **`ReleaseWithoutResuming`** — the conflict path's terminus, which hands the claim
+      back and leaves the jail frozen. Holding it in the resume closure alone meant a token that is never
+      resumed leaked it forever, and `AgentPauseService.UnpauseAsync` refuses while one is outstanding with
+      "the daemon is briefly holding this agent for a queue update — try again in a moment": a sentence
+      whose whole promise is that it self-clears, refusing the HUMAN's unpause button indefinitely on
+      exactly the agents that need a human.
     - `KeepAliveRebaser.cs` (`IKeepAliveRebaser`: one cycle = yield → `GitMutationGuard` check (skip on
       the agent's own mid-rebase) → dirty? `add -A` + `commit -m "wip: sync"` → `git rebase <main>` onto
       the already-fetched mirror main → conflict? status `Conflict` + route the worktree to the T-04
       resolver via `ConflictHandoff`, keep the PTY paused, **no automatic `rebase --abort`** (rejection
-      trigger) → success? resume; `NotifyMainMoved` is the P2-10 hook; human edits reach worktrees ONLY
+      trigger) → success? resume; both never-resumed paths (a conflict, and a kill switch that fires
+      mid-cycle) still SETTLE the token via `ReleaseWithoutResuming`, so the jail stays frozen without the
+      machine keeping its claim on that pause; `NotifyMainMoved` is the P2-10 hook; human edits reach worktrees ONLY
       via this Git cycle (invariant 1); records `AgentWorktreeLocation`/`RebaseCycleResult`; git via the
       shared `AgentGitCommand` — not a second runner).
+    - `RebaseConflictParking.cs` (what the cascade MEASURED about a worktree it parked mid-rebase, so the
+      conflict is data rather than one log line: `ParkedRebaseConflict` (worktree, main branch, the
+      repo-relative unmerged paths from `diff --diff-filter=U`, when — **an empty path list means NOT
+      MEASURED, never "nothing conflicts"**), the `(repo, agent)`-keyed in-memory
+      `RebaseConflictParkingStore` the provisioner owns and the gRPC projection reads, and
+      `ConflictActionResult` — refusal-as-result, like `AgentResumeResult`. Not persisted, deliberately: it
+      is a measurement of one worktree at one instant, and the durable record of the handoff is the audit
+      event. Since 2026-09-04 it also holds the **hand-back mark** (`MarkHandedBack`/`IsHandedBack`/
+      `ClearHandedBack`): "let the agent resolve" sets it, the composition root installs it on the ref
+      mediator as `RewritePermitted`, and the worker's finished rebase — a rewrite of published history —
+      is published exactly once before rule 2 is absolute again).
     - `AgentLifecycle.cs` (`AgentContext : IDisposable`/`IAsyncDisposable` — ordered, idempotent,
       failure-tolerant teardown from an injected `TeardownPlan`: kill PTY (leader) → stop container (per
       policy) → `RemoveAgentWorktree(force:true)` (also deletes `agent/<id>`) → emit the terminal event →
@@ -1130,7 +1430,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
   - **`Agents/Orchestrator/` (P2-10 merge queue + verification runs + stale invalidation — the
     product spine, daemon-side, no UI).**
     - `MergeQueue.cs` (the exhaustive, persisted `IMergeQueue` state machine —
-      `GetState`/`LastChangedAt`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      `GetState`/`LastChangedAt`/`LastVerification`/`RunVerificationAsync`/`NotifyMainMoved`/`CanMerge`;
+      **H2: a FAILED run settles to `WorkerMergeState.VerificationFailed`, not to `Working`** — `Working`
+      is where a NEVER-verified entry sits, so red and never-run used to be the same value and every
+      surface said "not verified yet" about a branch whose tests had just failed; the new state is
+      non-terminal (retry / the agent's fix / discard), is reachable ONLY from the arm holding a red
+      record (a run REFUSED before it produced a verdict still settles to `Working` — "we could not run
+      your tests" is not "your tests failed"), and `CanMerge` renders the verdict plus the resolved
+      command instead of the generic reason. `LastVerification(agentId)` exposes the settled record —
+      pass or fail — so a transport can carry the verdict the state word stands for (H4);
       `LastChangedAt` mirrors the row's persisted `UpdatedUtc` in memory (rehydrated on restart, never
       restamped) so the rail can order its permanent history by when a verdict was GIVEN rather than by
       spawn order — ISSUES-LOG #13; every legal transition enumerated,
@@ -1142,7 +1450,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       as `AgentSession.State` was, so an entry kept saying `Working` about an agent whose jail had been
       gone for days, with Verify offered on it. A pass marks/unmarks entries whose sandbox is gone, swaps
       `CanMerge`'s wording to `StrandedReason` for `Working`/`StaleVerified` (both of the old sentences
-      promise something that cannot happen without a sandbox), audits each move as `JailReconciledEvent`
+      promise something that cannot happen without a sandbox) — **except where the cascade's own measured
+      reason already established the missing sandbox (L3)**: `_workingReasons` now carries a
+      `WorkingReason(Reason, AccountsForMissingSandbox)` and the sandbox-aware ones outrank
+      `StrandedReason`, because "this branch needs rebasing onto the new main AND its agent has no live
+      sandbox — resume the agent" says everything the generic line says and also why the branch is at
+      `Working`; a reason measured with a LIVE jail in hand (a parked rebase conflict) still loses to it,
+      or a human would be sent into a container that no longer exists. It is deliberately NOT persisted,
+      for the reason `_branchTip` is not — after a restart the re-measured `_stranded` mark answers
+      instead. Audits each move as `JailReconciledEvent`
       by `ReconcilerActor` (`system:reconciler`, never a person), and republishes via `NotifyGateChanged`
       — the stream re-pushes only on `Changed`, so without it the rail keeps serving the liveness the
       client last heard. **It moves no merge state, deliberately**: `AgentResumeService` exists to give a
@@ -1160,7 +1476,16 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`stale_override_used` audit; `CanMerge` stays false); the `Orchestrator`-namespace
       `VerificationRecord` (with RT-D2 `ResolvedCommand`/`ConfigHash`) is distinct from the UI-prototype
       `Agents.VerificationRecord`; reuses `Agents.WorkerMergeState`;
-      `IMergeQueueStore`/`InMemoryMergeQueueStore`; **P2-12** adds a per-entry `MergeEntryOrigin`
+      `IMergeQueueStore`/`InMemoryMergeQueueStore`; **`onStateChanged(agentId, newState)`** is the
+      report seam the daemon reflects a branch's merge state back onto its AGENT through — fired from
+      `SetStateLocked` after the row is persisted and only for a REAL move, and wrapped so a throwing
+      sink can never abort a transition mid-write. It is defect F2: an agent session's state word is a
+      liveness word ("Working", written once by the sandbox attach), so a coordinator asking
+      `get_worker_status` after a green verification was told "Working" permanently while the queue said
+      `Verified` — a status that cannot ever say "done" makes a coordinator structurally unable to report
+      the completion of its own fan-out. Not a second state machine: the words are `WorkerMergeState`'s
+      own and this queue stays the only thing that decides them; **P2-12** adds a per-entry
+      `MergeEntryOrigin`
       (`EnsureEntry(agentId, origin)` enters a new PR at `Working` + stamps origin, `GetOrigin`, `Cancel`
       — the closed-PR path that forgets an entry rather than reaching a terminal state — and
       `IMergeQueueStore.Delete`; origin is persisted + hydrated so the merge dispatch routes correctly
@@ -1206,22 +1531,49 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Discarded → Verifying` left the id in the in-flight set permanently and `IsVerificationInFlight`
       answered true forever for an entry with no run (this subsystem's own defect shape, since every path
       that removes an id is downstream of that throw).
+      **L2 — every merge is now audited** (§20 of the phase-3 decisions doc): `MergedEvent`
+      (`queue_entry_merged`) is appended by BOTH confirm entry points, so the invariant is "no transition
+      to `Merged`, by any path, without exactly one record" — the RPC, the RT-D1 boot reconcile, the
+      external-PR dispatch and dev seeding all funnel through `MarkMergedLocked`. There was previously no
+      merge event type in the product at all, while `queue_entry_discarded` existed. The record carries
+      `by`/`source`/`lease` (from the new `MergeAuthorization`, since the queue cannot know who drove it),
+      `from_state`, `pre_main_sha`/`post_main_sha`, the verification block it rode on (or
+      `verification = none recorded`), and `gates` — the per-gate `IMergeGate.MergeEvidence(agentId)`
+      lines, a default-null seam added because `Allows` returning true is equally true of every merge that
+      ever happened. The payload is built BEFORE the transition, under the deciding lock.
       `VerificationRunner.cs` (runs the configured test command in the worker sandbox
       via `ISandboxEngine.ExecAsync` — pass/fail is the **daemon-observed container-runtime exit code (OPS
       SA-1), never a supervisor `VerifyResult` frame**; captures the full log artifact; the RT-D2
       `VerificationCommandResolver` (resolve from the main-side baseline, SHA-256 the config, detect
-      drift, honor a human command pin) + the composable `ChangedTestCommandGate : IMergeGate`).
+      drift, honor a human command pin) + the composable `ChangedTestCommandGate : IMergeGate` —
+      which now **audits every acknowledgment** (L2/L4, §20 of the phase-3 decisions doc): its
+      `Acknowledge(agentId, acknowledgedBy)` appends one `acknowledged_flagged_change` per waived item
+      carrying the config `path`, the `from`/`to` excerpt + full SHA-256, and the daemon-derived actor —
+      it previously recorded the waiver in a plain `HashSet` and wrote nothing, for the one click that
+      lets a branch self-green. `SetFlagged` takes an optional `CommandDrift(ConfigPath, FromMain,
+      ToBranch)` (supplied by `MergeQueueProvisioner` from the two committed trees) and `MergeEvidence`
+      reports what it established for the merge record).
       `VerificationStore.cs` (`IVerificationStore` — **insert-only, no update** (invariant 2);
       `InMemoryVerificationStore`/`DbVerificationStore`). `MergeQueuePersistence.cs` (`DbMergeQueueStore`
       + the RT-D1 `IMergeLeaseStore`/`InMemoryMergeLeaseStore`/`DbMergeLeaseStore` — one outstanding lease
-      per repo). `MergeReconcileTask.cs` (the RT-D1 `IBootTask` in the boot merge-reconcile slot: replays
-      the T-19 journal for an outstanding lease → synthesizes a missing `ConfirmMerge` + fires
-      `NotifyMainMoved` for a committed-but-unrecorded merge, else releases the lease + surfaces the
-      interrupted attempt — exactly once or none). `MergeQueueRegistry.cs`
+      per repo; K3/§23.4 `TryBegin` also records `ExpectedBranchSha`, the `agent/<id>` tip the queue's
+      verification was measured on, so the lease states the IDENTITY it authorizes and not merely that a
+      merge is in flight). `MergeReconcileTask.cs` (the RT-D1 `IBootTask` in the boot merge-reconcile slot:
+      **K1/§23.2** — synthesizes a missing `ConfirmMerge` + fires `NotifyMainMoved` only when the merge is
+      proved to be THIS lease's, asked of git (main moved forward from the lease's expected sha AND now
+      contains `agent/<id>`); falls back to the T-19 journal only when the branch ref is gone, and then
+      only to an identity-bound entry (this lease's window, naming this branch, its own snapshots recording
+      main moving from the expected sha to now). Three verdicts — `Merged`, `NeverCommitted`, and
+      `Undecidable`, which releases the lease and records NOTHING. It used to fire on "main moved at all"
+      AND "any `Merge` entry anywhere in the repo", which a `git pull` plus a month-old merge satisfied). `MergeQueueRegistry.cs`
       (`IMergeQueueRegistry`/`MergeQueueRegistry` + `MergeQueueContext` — the per-repo queue+leases the
       gRPC service resolves through; `Handles()` snapshots the active handles on the READ interface, so
       the ISSUES-LOG #24 jail sweep can enumerate every live queue without being handed the concrete
-      registry and thereby the ability to Register/Remove queues it has no business creating). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
+      registry and thereby the ability to Register/Remove queues it has no business creating.
+      `MergeQueueContext.ResolveApprovedWork` (2026-08-31) is the callback the queue PROJECTION reads the
+      approved plan's `approach` from — the same one the provisioner arms the flagged review with, so the
+      approach a reviewer is shown and the scope the diff was measured against are always the same
+      plan's). Models `MergeQueueRow`/`VerificationRow`/`MergeLeaseRow` (in
       `Models/`). **`MergeBranchDiffService.cs`** (P2-47 #7 — `IMergeBranchDiffService`: the daemon-side
       bridge behind `GetMergeDiff` that reuses the audited git path (`git diff main...agent/<id>` in the
       bare mirror via `AgentGitCommand`) + the pure T-06 `PatchParser`, returning the parsed `FilePatch`
@@ -1231,11 +1583,75 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       daemon's whole lifetime and every merge-queue RPC answered NOT_FOUND — the P2-10 guarantees were
       neither enforced nor bypassable, they simply were not running. Builds a repo's queue on the events
       that make a repo active (ProvisionRepo / CreateWorktree / a jailed spawn) over the same persisted
-      stores and, load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
+      stores. **G1: `EnsureEntry` now asks the plan gate before creating a row.** Three `scripted` probes
+      that made zero plan calls each got a merge-queue row while `get_worker_status` said "no work is
+      authorised"; a row is a claim on human attention that arrives carrying Verify, so it requires an
+      approved plan. Only the ROW is withheld — `EnsureQueue` still runs, because this call is what BUILDS a
+      coordinator-spawned worker's repo queue (its worktree is created inside the launcher, not through the
+      RepoSync RPC). A withheld row is REMEMBERED (`DeferredEntries()`) and created by
+      `AdmitDeferredEntries()` — subscribed in the composition root to `PlanApprovalService.PlanApproved`,
+      the moment the gate's answer changes — which RE-ASKS the gate per candidate rather than trusting the
+      event. Ids the gate never held (manual agents, external-PR heads, seeded entries) are permitted
+      exactly as before; default-deny there would silently empty the queue. `MarkMergeState` gained a
+      `VerificationFailed` sentence, so a coordinator's `get_worker_status` learns its worker's tests
+      failed instead of hearing "Back at work". **S5 — the parked conflict, and the two things a human can
+      do about it:** `OnRebaseConflict` now records a `ParkedRebaseConflict` (worktree, branch, the
+      measured unmerged paths) in the owned `ParkedConflicts` store and carries the paths into the audit
+      event, and `RebaseConflictReason` is the named sentence the card renders verbatim.
+      `LetAgentResolveConflictAsync` unpauses the jail, moves the session's state word OFF the frozen
+      one (to `Rebasing`) and only THEN delivers an instruction through the injected
+      `promptAgent` seam (the daemon passes `AgentCliBinder.TrySendPromptAsync` — the same path a
+      coordinator's `send_worker_prompt` uses); with no prompt path wired it REFUSES rather than waking an
+      agent that is told nothing. `AbortParkedRebaseAsync` unpauses, takes a real P2-09 yield (so the
+      mutation is gated by a token, invariant 2 — a yield over an already-paused container would
+      `docker pause` a paused jail), runs `git rebase --abort` under `GitMutationGuard.RunGuarded`, and
+      resumes. Both refuse and forget the parking once the rebase is no longer in progress. Neither is the
+      T-04 resolver.
+      **The conflict arm re-asserts `AgentRunState.Conflict` AFTER `Block`**, because the queue transition
+      `Block` performs reflects the MERGE word onto the same session field the run state uses
+      (`MarkMergeState` and `MarkRunState` are one field, two vocabularies) — so a `docker pause`d worktree
+      parked mid-rebase used to end up reporting `Working`, the word an agent making progress reports.
+      Every frozen-jail guard in the daemon keys on that word (`FrozenJailPolicy`: `Paused` or
+      `Conflict`), so `Working` was the one answer that waved a prompt or a verification through into a
+      SIGSTOPped process until the session reconciler's interval-driven pause pass corrected it. Found by
+      composing this branch against the coordinator-op guards; the ordering is pinned on both sides of the
+      assembly seam. Load-bearingly, the **same `IMergeLeaseStore` singleton** the foreground merge,
       `BeginMerge` and `MergeDispatch` contend for — the one-outstanding-merge-per-repo invariant only
       spans origins while they share one store (MG-23). **P2-11 wiring:** `Build` now composes BOTH gates
       into the queue (`ChangedTestCommandGate` AND `FlaggedChangeGate`) and hangs the latter off
-      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it; `ArmFlaggedChangeReview` runs the
+      `MergeQueueContext.FlaggedChanges` so the ack RPC can reach it. **The restart pair (L1)**, started
+      on `EnsureQueue`'s `created` branch beside `BeginResumeAfterRestart`:
+      **`PrimeBranchTipsAfterRestart`** runs INLINE and FIRST — one `rev-parse` per entry in
+      `RearmableStates`, handed to `MergeQueue.NotifyBranchAdvanced`, which compares it against the
+      rehydrated record's own `BranchSha` (J1) and walks any entry whose evidence is about a different
+      tree to `Working`. It is the DURABLE half of the branch-side freshness compare: `_branchTip` is not
+      persisted (§19.7) and `AgentRefWatcher` only sweeps agents with a live sandbox, so a branch that
+      moved while the daemon was down and whose agent was then stopped is announced by nothing.
+      (Backgrounding it, or dropping its state filter, announces a tip into a live run as a mid-run move
+      and demotes the run's own green — measured: 20 of 44 `MergeQueueProvisionerTests` red.)
+      **`RearmAfterRestart`** / `BeginRearmAfterRestart` / `LastRearm` then re-derives the flagged-change
+      classification for what survives, in background, and republishes via `NotifyGateChanged`. It
+      RE-DERIVES and never restores: acks are content-bound and are not brought back, the set is computed
+      from today's mirror trees, `PeekStore` (never `StoreFor`) decides whether a store is missing, and a
+      diff that cannot be computed still leaves the entry denied. `RearmableStates` is public and asserted
+      equal to `CanMerge`'s admit set over the whole enum
+      (`EveryStateThatCanMerge_IsAStateTheRestartRearmCovers`). `NoLiveSandboxReason` is the cascade's
+      no-jail sentence, passed to `Block(..., sandboxIsGone: true)` so `CanMerge` renders it verbatim
+      instead of the generic `StrandedReason` (L3). **The cascade's two main-side guards (§22):**
+      `RequeueStaleAsync` calls **`TryAlignMirrorMain`** BEFORE the rebase and
+      **`BranchDescendsFromMain`** before the re-verify. `ConfirmMerge` fires the cascade from inside
+      `TryConfirmHumanMerge` and pulls the mirror's main forward AFTERWARDS, so a cascade that got there
+      first carried the PRE-merge main into the agent's repo, `git rebase main` exited 0 having moved
+      nothing, `CleanNoop` reported `BranchIsOnTopOfMain`, and the entry went `Verified` against a main
+      its branch does not descend from — green rail, enabled Merge, and a `--ff-only` that refuses
+      forever. The first catches the mirror up (the same one-refspec `TryRefreshMirrorMainAfterMerge`,
+      idempotent here so the cascade never has to win the race) and blocks if it still disagrees; it
+      deliberately leaves a mirror that already CONTAINS the queue's main alone, because that fetch is
+      FORCED and would drag an ahead mirror backwards. The second is the belt: it asks git whether the
+      published `agent/<id>` really contains the queue's main — the one predicate the whole re-entry
+      exists to establish, and the answer no cycle-kind can fake. Both refuse only on a POSITIVE
+      mismatch; an unreadable mirror or an empty sha answers nothing, and refusing from ignorance would
+      strand every substrate-less caller. `ArmFlaggedChangeReview` runs the
       required `IMergeBranchDiffService` + `FlaggedChangeDetector.DetectFlagged` at verification time (the
       same cadence the RT-D2 gate is armed at, so a re-push re-classifies and drops stale acks). A diff
       that cannot be computed leaves the store **unset** — an empty set reads as fully acknowledged, so
@@ -1254,7 +1670,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       agent→approved-plan binding existed, and phase-2's worker-authored plans supply that binding
       exactly (a plan is keyed by the worker's own agent id), so the composition root now passes it
       reading APPROVED plans only — an agent with no approved plan still resolves null and is
-      classified as unmanaged, exactly as before. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
+      classified as unmanaged, exactly as before. **(2026-08-30) That lambda is now one call to
+      `PlanApprovalService.ApprovedPlanFor`**, because the shape it used to have —
+      `LatestForWorker(...) is { Status: Approved }` — was correct only while a worker's newest plan was
+      always its authorisation, and the re-scope op ends that: a pending re-scope is newer than the plan
+      it widens, so the filtered-latest read answers null, and null means *unmanaged* here. A worker would
+      have lost its F6 out-of-scope coverage by the act of asking to widen legally. **Phase 2** adds a third, optional `planGate` `IMergeGate`,
       ANDed in beside those two — the backstop that stops a worker whose own plan was never approved from
       merging, whatever it verified. All three gates are independent and all three must say yes, and the
       gate array is built ONCE (`var gates`) and passed to `MergeQueue`: composing a fresh literal at the
@@ -1284,7 +1705,14 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       REQUIRED `[seeded — not executed]` provenance marker + an honest artifact log; `RequeueStaleAsync`
       likewise ends a seeded entry at one of the two real termini — Hold (rest at `StaleVerified`) or the
       no-jail `Block` to `Working` — never the null-rebaser re-verify, which would mint fresh evidence
-      for a branch not on top of main.)
+      for a branch not on top of main.) **Merge state, reported onto the agent:** `MarkMergeState` is
+      passed to every queue it builds as `onStateChanged`, and marks the agent session with the
+      `WorkerMergeState` name plus the sentence a human reads ("Verified against the current main —
+      waiting for a human to review and merge it"). Same sink and same posture as the keep-alive
+      `MarkRunState` beside it: through the optional `agentStates` `IAgentSupervisor`, wrapped so a
+      reporting failure can never fail a transition. This is what makes a coordinator's
+      `get_worker_status` — and the client's agent stream — able to say a branch is done; before it, a
+      worker whose branch verified green kept the liveness word its sandbox attach wrote.)
     - `QueueSeeder.cs` (the dev-only merge-queue seeder — docs/design/queue-seeding.md; only caller
       is the flag-gated `QueueSeedingService`. `SeedAsync` walks each spec to its target state through
       the REAL `MergeQueue` public transitions over a REAL plumbing-fabricated `agent/seed-<n>` branch
@@ -1318,7 +1746,22 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       outside its `TaskPlan.Scope` (plan-less runs skip the scope compare); `FromLockfileDeltas` folds
       §3.6 CVE/script/advisory-unknown rows in by delegating to `Review.LockfileReview.ItemsFor` — one
       definition, so the cockpit-composed and daemon-armed sets cannot disagree; plus the pure
-      `ScopeMatcher` glob (`**`/`*`/`?`)).
+      `ScopeMatcher` glob (`**`/`*`/`?`), and `HashDiff(mergeDiff)` — a content hash over the WHOLE diff,
+      the seed a branch-level flagged row uses so invariant 2 (a new push resets every ack) holds for it
+      the way it holds for per-file rows).
+    - `DeviationReview.cs` (**the APPROACH half of an approved plan**, 2026-08-31 — the sibling of the
+      out-of-approved-scope arm, for the half of an approval that is not a file list. Pure, no IO:
+      `ItemsFor(declaration, deviations, diffHash)` turns a worker's commit-time
+      `DeviationDeclaration` into `FlaggedChange` rows — one `DeclaredDeviation` row per declared
+      departure carrying the worker's own words, **nothing** for an explicit `None` (that assertion is
+      rendered beside the approach instead), and one `DeviationDeclarationMissing` row for
+      `NotDeclared`, because an omitted item is an acknowledged item and silence must not read as "we
+      checked". Armed daemon-side by `MergeQueueProvisioner.ArmFlaggedChangeReview`, into the store the
+      merge gate actually reads. **Not** an approach-vs-diff comparison: nothing here reads the diff. The
+      defect it closes — an approved approach saying "keep plain `a / b`" against a shipped throwing
+      validation layer, with the scope honoured, `FlaggedItems` empty and verification green because the
+      worker wrote the tests — is written out in its own doc comment. Design:
+      `docs/design/coordinator-phase-3-decisions.md` §26).
     - `FlaggedChangeGate.cs` (the P2-11 `IMergeGate` ANDed into `CanMerge` — holds a per-agent
       `Review.AcknowledgmentStore`; blocks until every flagged item for the current hash is acked
       item-by-item; the security boundary against hostile agent code. Fails closed on an agent it has
@@ -1327,7 +1770,15 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       on demand and is for the review that classifies a diff; every READ path (the daemon's flagged-item
       projection, the ack RPC) uses **`PeekStore`**, which never creates — a fresh store holds no items and
       an empty set is `AllAcknowledged`, so creating one from a read would manufacture the "reviewed and
-      clean" record the default-DENY exists to refuse.)
+      clean" record the default-DENY exists to refuse. **L1: `_stores` is in-memory, so a daemon restart
+      wipes every one of them — and `ArmFlaggedChangeReview`, its only writer, runs solely inside a
+      verification.** A `Verified` row therefore came back denied ("flagged-change review has not run for
+      this branch") with Verify withheld (§19.7) and `Verified` outside the readiness trigger's eligible
+      set: unmergeable forever, observed live on three rows. The default-DENY is right; the exit is
+      `MergeQueueProvisioner.RearmAfterRestart`, which RE-DERIVES the classification from the mirror
+      rather than persisting anything — acknowledgments are never restored, so a restart can only ever
+      increase the review a human owes. `MergeEvidence` reports acknowledged/total plus the flagged-set
+      hash into the `queue_entry_merged` record, and uses `PeekStore` for the same reason.)
     - `AgentTraceEmitter.cs` (orchestrator-side provenance: `EmitTrace`/`SerializeTrace` write the
       Cognition/Cursor-style Agent Trace JSON artifact that `Review.ProvenanceReader` reads back, + the
       pure `BuildTrailers` that appends idempotent `Agent:`/`Task:`/`Plan:` commit trailers as the durable
@@ -1403,11 +1854,19 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       triple; **unknown top-level fields are rejected** (forward-compat honesty) + oversized guards; the
       fields combine into the ONE canonical `Mainguard.Agents.Agents.TaskPlan` the whole stack shares —
       there is deliberately no second `TaskPlan` type).
+    - `JailReapPolicy.cs` (2026-09-04, owner decision — the pure rule behind the daemon's jail reaper:
+      a jail is stopped when its merge-queue entry is terminal (Merged/Rejected/Discarded — the work has
+      left it) or when no CLI has been bound to it for `CoordinatorLimits.IdleJailReapMinutes`; a jail
+      with a live CLI is never touched, whatever it is doing. `JailReapVerdict` carries the cause the
+      audit event records. Before this only a human pressing Stop ever removed a jail — the 26 GB of
+      idle 2 GiB jails an owner measured.)
     - `CoordinatorLimits.cs` (**phase 2** — the daemon-side caps record, lifted out of `CoordinatorTools.cs`
       now that four call sites consume it: `MaxActiveWorkers` (6; **counts workers blocked on plan
       approval** — it is a resource cap and a blocked worker still holds its jail/tmpfs/network
       segment/worktree) and `MaxPlanRevisions` (3; the reject→revise budget, with the arithmetic pinned in
-      prose: reject → revise ×3, and the **4th rejection escalates**), plus the automatic-verify tunables
+      prose: reject → revise ×3, and the **4th rejection escalates**), `MaxLiveCoordinators` (1; owner
+      decision 2026-09-03 — one coordinator per daemon, refused at `AgentSpawnService.SpawnAsync`, never at
+      adoption), plus the automatic-verify tunables
       `AutoVerifyQuietSeconds` (90 — how long a worker's branch must stop advancing before it is read as
       ready) and `AutoVerifyCooldownSeconds` (600 — the floor between two AUTOMATIC runs for one worker; it
       never throttles a human's Verify). Never in a prompt — a limit an agent
@@ -1424,10 +1883,58 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       worker replaces the removed S-8 per-coordinator caps (keeping those would have deadlocked the Nth
       worker the worker cap admitted). `PressureSignal` renders the "N plans pending" fact line;
       `PlanApproved`/`PlanRejected`/`PlanEscalated` events; `PlanStatus{Pending,Approved,Rejected,
-      Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+      Escalated,Superseded}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`.
+      **`Rescope` (2026-08-30, contract §3.1 / phase 3 §23)** is how an APPROVED plan's scope changes: it
+      lands a NEW plan carrying `SupersedesPlanId`, the copied `PreviousScope` the card diffs against, and
+      `RescopeCount`. The plan it widens keeps authorising the worker until the human decides, and moves
+      to `Superseded` in the same lock that approves the wider one — so a worker has exactly one approved
+      plan or none, which is what `ApprovedForWorker`/`ApprovedPlanFor`/`ApprovedWorkFor` (**the single
+      authority the composition root's `resolveApprovedWork` is now a call to**) rest on. That mattered immediately: the
+      old `LatestForWorker`-filtered-on-`Approved` read answers `null` while a re-scope is pending — and
+      `null` means *unmanaged* to the flagged-change detector, so a worker would have lost its F6
+      out-of-scope coverage by the act of asking to widen legally. A re-scope spends no revision (the
+      budget bounds bad plans, not a growing job); its own reject→revise loop is bounded by a fresh
+      budget, and the loop AROUND that is closed by one live re-scope at a time plus escalation being
+      terminal for the path).
+      **`DeclareDeviations(workerAgentId, deviations)` + `DeviationDeclaration{NotDeclared,None,Declared}`
+      + `ApprovedWork` (2026-08-31)** record the worker's commit-time answer about departing from the
+      approved `approach`, ON the plan record — the deviation is a deviation *from that plan*, so it
+      persists with it (`PlanDto.Deviation`/`DeclaredDeviations`, name-serialized; an unparseable or
+      absent value rehydrates as `NotDeclared`, the fail-closed direction) and is resolved by the same
+      `ApprovedForWorker` the scope comparison uses. **Three outcomes, never two** — silence and "I
+      checked, none" are different facts, the call `MergeEvidence` already makes. Declaration is
+      **sticky**: later texts accumulate ordinal-distinct and a later "none" cannot clear an earlier
+      departure, because a final `--no-deviations` erasing the first commit's disclosure is the rubber
+      stamp the mechanism must not become. `ApprovedWorkFor` is the one lookup that answers both halves
+      of an approval (scope + approach/declaration) so the two can never name different plans after a
+      re-scope. Bounded like every sibling agent-authored field, and **loud rather than closed** because
+      closed is a dead end here: `MaxDeclaredDeviations` (20) drops the excess but records an explicit
+      "…and N further" row, and one over-long text is truncated with a marker at
+      `TaskPlanSchema.MaxFieldLength` rather than refusing a commit over prose. `Escalated}`; `InMemoryPlanApprovalStore`/`IPlanApprovalStore`).
+    - `PlanModeSwitch.cs` (**the operator's plan-mode toggle**, 2026-08-30 — whether a coordinator-delegated
+      worker must have a human-approved plan before it is given its task. `Enabled` /
+      `ModeForNewWorker` / `Set(enabled, actor)` / `Summary` (the one sentence a human reads, rendered
+      daemon-side so the screen and the gate cannot disagree), plus the `IPlanModeStore` seam with
+      `JsonPlanModeStore` (a one-boolean file beside the plan store — a daemon must answer "is the gate
+      on?" before anything needing a database is up) and `InMemoryPlanModeStore`. **Fail-closed**: a
+      missing or unreadable store is plan mode ON, because the default of a human-approval gate is that it
+      is there. Read ONCE per spawn into the worker's own `WorkerPlanMode`, never re-read, so a toggle
+      never retroactively authorises a worker blocked at the gate nor strands one already working. Set
+      over `PlanApprovalService.SetPlanMode`, which `RoleInterceptor` denies to a coordinator on the same
+      boundary as `ApprovePlan`. Design: `docs/design/coordinator-phase-3-decisions.md` §23).
     - `WorkerPlanGate.cs` (**phase 2 — the daemon-side enforcement**, separate from the queue above because
       a blocking call an agent can decline to make is a convention, not a boundary (MG-12). `Hold` records
-      a spawned worker's task **without giving it to the worker**; `TryReleaseTask` yields it only against
+      a spawned worker's task **without giving it to the worker** (persisted through `IHeldTaskStore` —
+      `JsonHeldTaskStore` beside the plan store in the daemon, `InMemoryHeldTaskStore` in tests — because
+      a held task that lived only in memory was forgotten by every daemon restart while the jail it was
+      withheld from survived: `Allows` then opened for an unapproved worker and `TryReleaseTask` refused an
+      approved one; the release latch is persisted with it so a re-attach after a restart does not
+      re-audit or re-announce) — and, since 2026-08-29, refuses to
+      record one at all unless the brief is a brief (`RefuseBrief`/`MaxBriefLength`: a title is required,
+      is one line, is at most 120 characters, and **must not equal the task**). That check lives here
+      because this is the one object holding both strings and the sole source of `PlanningBriefFor`; the
+      fallback it replaces (`Title ?? TaskPrompt`, plus `?? "Untitled task"`) is what made
+      `mainguard-plan brief` return the task verbatim; `TryReleaseTask` yields it only against
       an approved plan (no override parameter — an override is how a gate becomes decorative) and is
       **idempotent in both directions**: it keeps answering with the task on a repeat call, because
       `mainguard-plan await <id>` is the documented re-attach after a worker crash or daemon restart and an
@@ -1440,9 +1947,20 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       `Allows`'s permissive default exists so manual-mode agents and external-PR heads are not blocked from
       merging, and reading it as consent would start spending test-suite runs on every agent in the daemon;
       and the type is an **`IMergeGate`**, ANDed into every repo's queue, so a branch whose worker never had a plan
-      approved cannot merge even if it verified green. Also owns the legible-stall text —
+      approved cannot merge even if it verified green — and, since G1, the same `Allows` decides whether the
+      worker gets a merge-queue ROW at all (`MergeQueueProvisioner.EnsureEntry`). What it does NOT gate is
+      PUBLICATION: `AgentRefMediator` never asks it, deliberately, because F1 requires an agent's branch to
+      survive teardown. Also owns the legible-stall text —
       `BlockedWorkerCount`/`EscalatedWorkerCount`/`BackpressureSignal` render "6 workers are waiting on
-      your approval … the coordinator has stopped spawning", which the contract makes a requirement).
+      your approval … the coordinator has stopped spawning", which the contract makes a requirement.
+      **The plan-mode toggle (2026-08-30)** adds `WorkerPlanMode{Gated,Ungated}` (declared in this file),
+      a `mode` argument on `Hold` defaulting to `Gated`, and `ModeFor`/`IsUngated`/`RefusePlanPresentation`.
+      OFF does not remove this gate from any path: the worker is still held, still counted, still asked
+      about by the queue and the readiness trigger — `MayWork` simply answers yes from the start and every
+      predicate that delegates to it follows, `TryReleaseTask` now asks `MayWork` rather than reading
+      `HasApprovedPlan` a second time (one authority), and `MergeEvidence` gains a THIRD outcome
+      ("plan gate: OFF at spawn …") so a merge record never claims a human approval that never
+      happened).
     - `WorkerReadinessTrigger.cs` (**phase 2's AUTOMATIC verification trigger**, and nothing more than a
       trigger: it calls `MergeQueue.RunVerificationAsync` and owns no gate, no jail execution and no
       transition, because two paths that can disagree about what "verified" means is the defect this area
@@ -1459,11 +1977,34 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       error. **A refusal never becomes a result:** a throw out of the run means the verification was refused
       before it produced a verdict, the queue wrote no record, and this type logs and stops — it holds no
       verification store, so it cannot turn "we could not run your tests" into "your tests failed" (the
-      defect PR #322 fixes). Fires only from `Working` / `StaleVerified`, never creates a queue, and returns
+      defect PR #322 fixes). **H3: it now logs the OUTCOME too** — it announced `…verifying` and logged both
+      of its catch arms while saying nothing at all on the path that completes, so a live run left six
+      "verifying" lines and zero results in the daemon log; the completion line carries the verdict, the
+      resolved command, the resulting state and the ARTIFACT PATH, so the output is one `cat` away.
+      Fires from `Working` / `StaleVerified` / **`VerificationFailed`** — the last one is required, not
+      optional: nothing calls `NotifyNewCommits` for a local agent, so without it a worker that repaired
+      its own red branch would sit failed forever; the once-per-tip bound means it fires only for work
+      pushed SINCE the failure. Never creates a queue, and returns
       a `ReadinessDecision`/`ReadinessOutcome` per examined worker so "why did this NOT fire" is answerable.
       `PollOnce()` + an injected clock + `DriveManually` make every timing rule assertable without sleeping.
-      Rationale, the rejected candidates and the stated known limitation live in
-      `docs/design/verification-trigger.md`).
+      Rationale and the rejected candidates live in `docs/design/verification-trigger.md`; the "known
+      limitation" that file used to record — a `Verified` entry is never re-fired on a push — is closed by
+      `BranchTipInvalidator` below, not by anything here).
+    - `BranchTipInvalidator.cs` (**the second subscriber on the same `AgentRefWatcher.Advanced` sweep, and
+      the missing caller for `MergeQueue.NotifyBranchAdvanced`.** `MergeQueue.NotifyNewCommits` had exactly
+      two callers — `ExternalPrIntake` and the dev queue seeder — and neither fires for a worker in a jail,
+      so a locally-spawned agent's entry that reached `Verified` **froze there**: nothing re-verified (the
+      trigger starts only from `Working`/`StaleVerified`/`VerificationFailed`), the Verify button was still
+      offered and threw `Verified → Verifying` on every press, and `ArmFlaggedChangeReview` — which runs
+      only inside a verification — kept the F6 out-of-scope classification and every acknowledgment pinned
+      to the diff of two commits ago. Observed 2026-08-30: agent `4c43d17a` verified at 01:35, committed at
+      01:41/01:59/02:13, and the cockpit still read "verified", "ready to merge", **Merge enabled**. This
+      type is deliberately NOT a branch of `WorkerReadinessTrigger`: the trigger DEBOUNCES, and the
+      debounce window is exactly the window in which a human can merge a verdict that has already gone
+      void. It decides nothing — it forwards the observation and the queue turns it into a transition;
+      resolves queues and never creates one; swallows and LOGS a throw rather than dropping it silently.
+      Wired in `GatewayServiceRegistration` and resolved at boot by `WorkerReadinessHostedService`, both
+      asserted by `WorkerReadinessTriggerWiringTests`).
     - `WorkerPlanAuthor.cs` (**phase 2 — the worker side.** `IWorkerPlanDrafter` (author a plan from the
       repo, and from the human's feedback on a revision), `IWorkerPlanChannel` (present/revise/await —
       `LocalWorkerPlanChannel` in-process, the `mainguard-plan` shim in a jail), and `WorkerPlanAuthor`,
@@ -1528,7 +2069,32 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       (`latest`/`@latest`/a range → refused; `@latest` can't even parse). Also validates
       `settingsPaths`: an unknown `root`, an escaping path, a duplicate entry, or a path shared with
       `credentialPaths` are all refused — the last because credentials go to the OS keychain and
-      settings to a plaintext per-repo file, so one path in both lists would divert a credential).
+      settings to a plaintext per-repo file, so one path in both lists would divert a credential.
+      **`BadPreApproval`** guards the one field pair that grants EXECUTION inside a sandbox
+      (`preApprovedCommandArg` + `preApprovedCommandFormat`, defect C2): half-declaring the pair is
+      refused, and so is a format missing the `{command}` placeholder — a flag with no value would be
+      read by the CLI as its next positional, a format with no flag would compute a grant and drop it
+      (back to the stall), and a placeholder-free format would emit a constant grant naming something
+      other than this agent's shim. `PreApprovedCommandPlaceholder` + `RenderPreApproval` are the single
+      substitution point, shared by the parser that requires the placeholder and the launcher that fills
+      it in, and `RenderPreApproval` answers null rather than something half-formed for every missing
+      input — "no grant" is a working agent that asks a human; a mis-rendered grant is a permission rule
+      nobody chose).
+    - `CliSettingsGrantScrub.cs` (**defect D5b — role-scoped tool grants never persist**. A CLI's settings
+      file is harvested out of a human-attended jail into a PER-REPO host store that seeds every later jail
+      for that repository, and the owner's store was found holding
+      `Bash(/opt/mainguard/ipc/mainguard-agent *)` — the COORDINATOR's shim — which was then being restored
+      into worker jails. `AgentIpcPaths.SandboxMount` is Mainguard's own mount and its grants are issued
+      per jail and per role at launch (`SandboxAgentLauncher.ApplyShimPreApproval`), so nothing a jail
+      writes about that directory may persist: `Scrub` removes every JSON string naming the mount and every
+      property keyed by one, at any depth, in ALLOW and DENY alike (what replaces a dropped rule is the
+      daemon's own one-path per-role grant, not "anything goes"). A file that never names the mount is
+      returned BYTE-IDENTICAL; one that names it and will not parse as JSON does not travel at all.
+      Applied in BOTH directions by `SandboxAgentLauncher` — on restore (`FilterCliSettings`), which
+      neutralises an already-poisoned store with no migration, and on harvest
+      (`HarvestCliSettingsAsync`), which stops the store re-acquiring one and makes it self-heal at the
+      next attended stop. Covered by `Mainguard.Tests/CliSettingsGrantScrubTests.cs` +
+      `CliSettingsBoundaryTests` gate 3).
     - `AdapterSettingsPath.cs` (the `settingsPaths` declaration — the NON-credential twin of
       `credentialPaths`, so a CLI's permission allowlist survives a spawn instead of the user
       re-approving every command. `AdapterSettingsRoot` (`home` = the tmpfs `$HOME`, `workspace` = the
@@ -1590,7 +2156,24 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       runs; caching would make a new CLI unlaunchable until restart) to answer `TryGetLaunch(agentKind)` →
       the argv the daemon execs in the jail. This is the `agentKind`→CLI wiring `SandboxAgentLauncher`
       used to ignore. The marker also carries `credentialPaths` and `settingsPaths` across the host/VM
-      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail).
+      boundary — the ONLY declarations of what the daemon may restore into / harvest from a jail — plus
+      `instructionsFile`/`systemPromptArg` and (defect C2) `preApprovedCommandArg`/
+      `preApprovedCommandFormat`. **Defect D5a — the marker is no longer a second source of truth.**
+      Those fields being null on an older marker was documented as "re-install to backfill", and on a real
+      install nobody does: `~/mainguard/adapters/registry/claude-code.json` carried none of
+      `preApprovedCommandArg`, `preApprovedCommandFormat` or `initialPromptStyle`, so two shipped fixes
+      were completely inert on the only install that mattered while every test stayed green. `List()` now
+      PROJECTS the shipped `adapters.starter.json` over every marker it reads
+      (`InstalledAdapterMarker.WithShippedDescription`): the marker keeps the two facts only the install
+      knows — the `version` that probed green and the `launch` argv that probed green — and every
+      manifest-declared field comes from the manifest, nulls included, so a withdrawn grant is really
+      withdrawn. Projection is by adapter ID and NOT gated on version, because the reporting install had
+      been updated forward of the shipped pin (2.1.234 vs 2.1.218) and a version gate would have repaired
+      nothing there; an adapter the shipped manifest does not name is returned exactly as written.
+      `InstalledAdapterMarker.FromSpec` is the one spec→marker mapping, shared by the projector and by
+      `AdapterChannel`'s writer. `InstalledKinds()` is the ordinal-sorted set of launchable `agentKind`s —
+      the single set the coordinator's instructions name and its `spawn` refusal enforces (defect D1).
+      Covered by `Mainguard.Tests/AdapterMarkerProjectionTests.cs`).
     - `AgentCliInstaller.cs` (the user-facing service the OOBE picker + the settings 'add more later'
       surface both drive: `ListAsync` (offered CLIs × live installed state via the same probe the
       channel's idempotence uses, so the picker never lies) and `InstallAsync` (per-CLI
@@ -1692,7 +2275,12 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
     (`ClassifyFailedFfMerge`): the old code discarded git's exit detail and reported every non-zero exit
     as "verification is stale" with `CasLost: true`, which is wrong — and expensively wrong — for
     `index.lock` contention, a refusing pre-merge hook, a full disk or unrelated histories, since it
-    also told the queue to throw the verification away. It now asks
+    also told the queue to throw the verification away. **K2/§23.3: what the merge CONSUMES is now the
+    ref identified by the lease** — `ResolveMergeSource` preferred the local `refs/heads/agent/<id>` over
+    the tracking ref the fatal-if-failed fetch had just updated, merging exactly the "unknown-age copy"
+    that fetch exists to prevent. It now requires the source to BE the `ExpectedBranchSha` the queue
+    verified (refusing with `CasLost` when neither spelling is), and falls back to the freshly fetched
+    tracking ref — never the stale local one — only when no sha was measured. It now asks
     `merge-base --is-ancestor main <source>`: still an ancestor ⇒ report git's own stderr with `CasLost`
     false, not an ancestor ⇒ the staleness message, earned; a probe that cannot answer ⇒ "cause could
     not be established". `ExternalPrMergeService` does the same at its local leg. Wrapped in one T-19
@@ -1710,8 +2298,11 @@ Built ON `Mainguard.Git`. Orchestration, sandbox/container control (`Docker.DotN
       PR, merge a PR — so this path structurally cannot close/comment/review, P2-12 invariant 1) over the
       ONE audited T-23 transport; it is also what lets tests drive a fake host instead of live GitHub.
       Order: local preconditions first (clean tree, host remote resolvable, HEAD on main, main still ==
-      the lease's expected sha, verified head read from the sync mirror) **because an upstream merge
-      cannot be taken back**; then the upstream state check (already merged / closed unmerged / draft /
+      the lease's expected sha, and — **K4/§23.5** — the verified head READ from the lease rather than
+      re-derived from `refs/heads/agent/pr-<n>`, which `PrHeadFetcher` hard-resets forward before the
+      intake re-queues the entry, so both sides of the head compare were the new head and the CAS could
+      not fail; the local ref is now only asked whether the RECORDED head is present, and an entry with
+      no recorded verified head refuses outright) **because an upstream merge cannot be taken back**; then the upstream state check (already merged / closed unmerged / draft /
       `mergeable_state` `dirty`=conflict, `blocked`=required checks, `behind`; head moved since
       verification ⇒ CasLost); then the merge under the host's own `sha` head-CAS; then the reconcile.
       **"Merged" requires all three: the host merged and named a commit, that commit is provably reachable

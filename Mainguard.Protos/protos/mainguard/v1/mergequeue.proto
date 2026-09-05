@@ -15,6 +15,11 @@ service MergeQueueService {
   rpc RunVerification(RunVerificationRequest) returns (RunVerificationResponse);
   // The CanMerge gate query (false unless Verified & fresh & no unacknowledged flagged item).
   rpc CanMerge(CanMergeRequest) returns (CanMergeResponse);
+  // Pull the daemon-side mirror's main forward from the user's checkout NOW (the daemon also does this on
+  // an interval) and report what it holds. Owner decision 2026-09-04: the mirror's freshness was invisible
+  // — refreshed only at repo-open, merge-confirm, cascade and reconcile moments, with nothing on any
+  // surface saying how old it was. Denied to the coordinator role: it can fire the stale cascade.
+  rpc RefreshMirrorMain(RefreshMirrorMainRequest) returns (MirrorMainState);
   // RT-D1 step 1: take the per-repo merge lease.
   rpc BeginMerge(BeginMergeRequest) returns (BeginMergeResponse);
   // RT-D1 step 3: record the merge outcome, release the lease, fire the stale cascade.
@@ -54,6 +59,46 @@ service MergeQueueService {
   // has no production caller, so the entry reports "verifying" to a human forever. Refused outright while
   // a run really is executing: the honest answer there is "wait".
   rpc ClearStalledVerification(ClearStalledVerificationRequest) returns (ClearStalledVerificationResponse);
+  // The stdout/stderr the entry's last verification actually produced.
+  //
+  // Until this existed a failed verification was UNREADABLE. The daemon wrote the real output to an
+  // artifact file under its own data directory, recorded the path in SQLite, and carried none of it on any
+  // wire: QueueEntry had no verification field at all, so the most a human could be shown was a one-line
+  // gate reason ("tests failed — node test.js"). A human cannot act on a failure they cannot read, and the
+  // only workaround was to open the daemon's database, read a path out of it, and cat the file.
+  //
+  // It returns CONTENT and never the path. The artifact lives under the daemon's data directory and G-14
+  // keeps daemon filesystem paths off the wire; a path would also be useless to a client that is not on
+  // the same machine as the daemon. Bounded server-side (see GetVerificationLogResponse.truncated) — a
+  // pathological test suite can emit megabytes, and a stream frame is not the place to find that out.
+  rpc GetVerificationLog(GetVerificationLogRequest) returns (GetVerificationLogResponse);
+  // ---- The two things a human can do about a rebase parked on a conflict --------------------------
+  //
+  // When a merge moves main, the daemon auto-rebases every co-tenant branch. A rebase that CONFLICTS
+  // parks the worktree mid-rebase and `docker pause`s the agent's jail, deliberately — there is no
+  // automatic `rebase --abort` (a rejection trigger) — and blocks the queue entry with a reason that
+  // names a required human action. Until these two rpcs existed the surface had no operation that could
+  // perform it: the jail was paused, so nothing could be exec'd in it, and the entry's only controls were
+  // Verify (which cannot run in a paused jail), the verification log, and Discard. A gate reason that
+  // asks a human for something the product cannot do is the same defect class as a gate the daemon can
+  // evaluate and no human can clear.
+  //
+  // Neither of these is the T-04 conflict resolver, and neither is a step toward replacing it: T-04 is
+  // the staging/diff surface where a human resolves hunks. These are the two operations composable from
+  // machinery that already ships — hand it back to the agent that wrote half of it, or undo it.
+  //
+  // Both are on RoleInterceptor's coordinator denial list: unpausing a co-tenant's jail, steering it, and
+  // rewriting its branch's parentage are each merge-adjacent power over work an agent competes with.
+
+  // Unpause the parked jail and instruct the worker to finish resolving its own rebase, through the SAME
+  // prompt-delivery path a coordinator's send_worker_prompt uses. Decides nothing about the conflict and
+  // touches no index; the branch stays exactly as it was, mid-rebase.
+  rpc ResolveConflictWithAgent(ResolveConflictWithAgentRequest) returns (ResolveConflictWithAgentResponse);
+  // `git rebase --abort` in the parked worktree, then let the jail run again. The branch returns to its
+  // pre-rebase tip (the cycle's `wip: sync` snapshot included) and the entry returns to the queue needing
+  // verification against the new main. It loses replay progress and no committed work, which is why it is
+  // the deterministic option and why the client puts it behind the same confirmation Discard uses.
+  rpc AbortRebase(AbortRebaseRequest) returns (AbortRebaseResponse);
 }
 
 message StreamQueueRequest {
@@ -63,6 +108,22 @@ message StreamQueueRequest {
 message QueueUpdate {
   repeated QueueEntry entries = 1;
   string main_sha = 2;
+  // The mirror's freshness (2026-09-04). refreshed_at is ISO-8601 of the last attempt to pull the mirror's
+  // main forward from the user's checkout; refresh_error is that attempt's failure, empty on success. Both
+  // empty when nothing has tried yet. The client renders the age; the daemon states the facts.
+  string mirror_main_refreshed_at = 3;
+  string mirror_main_refresh_error = 4;
+}
+
+message RefreshMirrorMainRequest {
+  string repo_handle = 1;
+}
+
+message MirrorMainState {
+  string main_sha = 1;       // the mirror's main after the attempt
+  string refreshed_at = 2;   // ISO-8601
+  string error = 3;          // empty on success
+  bool moved = 4;            // the queue's main advanced (and the stale cascade fired) on this attempt
 }
 
 message QueueEntry {
@@ -98,6 +159,85 @@ message QueueEntry {
   // render as stranded. Explicit presence lets "unknown" be a value on the wire, and unknown leaves the
   // surface exactly as it was.
   optional bool has_live_sandbox = 9;
+  // ---- The entry's last verification VERDICT (H2/H4) ------------------------------------------------
+  //
+  // `state` above now distinguishes a red run (`VerificationFailed`) from one that never happened
+  // (`Working`), which is the fix for the row being unable to tell them apart. These three carry the
+  // FACTS behind that word, because a state name is not a result: which command was run, when, and
+  // whether it passed. Without them a client could render "the tests failed" and could not say what was
+  // run or how long ago, and had no way to render a PASSING record's provenance either.
+  //
+  // `optional` on the verdict for the same reason has_live_sandbox is optional: proto3 scalars default to
+  // false, and a false meaning "this entry has never been verified" is indistinguishable from one meaning
+  // "the tests failed" — which is precisely the conflation H2 exists to end, and reintroducing it on the
+  // wire would undo the fix one layer down. Absent means NO RECORD; present means a real verdict.
+  optional bool last_verification_passed = 10;
+  // The RT-D2 resolved command the record was produced by (empty when there is no record). It is the
+  // provenance half of the verdict: a branch that rewrote its own test command produces a green record
+  // that means nothing, and the reviewer has to be able to see WHAT passed.
+  string last_verification_command = 11;
+  // When that record was produced, ISO-8601 round-trip ("O"); empty when there is no record. A verdict
+  // with no timestamp cannot be told from a stale one, and a week-old red is a different fact from one
+  // that landed thirty seconds ago.
+  string last_verification_at = 12;
+  // ---- What a human APPROVED for this branch, so the review can be a comparison (13–16) -------------
+  //
+  // The review surface showed the diff and nothing else. The approved plan's `approach` — the paragraph
+  // the human actually said yes to — existed on the daemon, was decided on, and then never appeared
+  // again anywhere, so "does this diff match what was approved" was a question the reviewer had no way
+  // to ask. Measured: an approved plan said it would keep plain `a / b` because the module had no
+  // validation idiom; the branch shipped a throwing validation layer that changed three pre-existing
+  // functions. `flagged_items` was EMPTY (the file scope was honoured), `can_merge` was true, and the
+  // tests were green because the worker had written them.
+  //
+  // Empty for an entry with no approved plan (a manual agent, an external-PR head, a worker spawned
+  // with plan mode off) — the surface then renders no approval panel at all rather than an empty one,
+  // because "nothing was approved" and "an approval with no approach" are different things.
+  string approved_plan_id = 13;
+  string approved_plan_title = 14;
+  string approved_plan_approach = 15;
+  // The worker's own commit-time answer about departing from that approach: "NotDeclared" / "None" /
+  // "Declared" (DeviationDeclaration name), empty when the entry has no approved plan.
+  //
+  // THREE values on the wire and not a bool, for the reason the whole mechanism exists: "the worker
+  // asserted it followed the approach" and "nobody ever asked it" are different facts, and the review
+  // surface has to be able to say which one it is looking at. Declared deviations themselves travel as
+  // flagged_items (they are must-acknowledge); this field is what lets the panel render the assertion
+  // that produced NO item, and tell it apart from the absence of any answer.
+  string deviation_declaration = 16;
+  // Present ONLY while this entry's worktree is parked mid-rebase on a conflict — see RebaseConflict.
+  // Absent is the ordinary case and means "nothing is parked", which is why it is a message field rather
+  // than a set of scalars: a blank path and an empty file list would be indistinguishable from a conflict
+  // nobody measured.
+  RebaseConflict rebase_conflict = 17;
+}
+
+// What the daemon measured about a worktree it parked mid-rebase. The gate reason already told the human
+// that a conflict needs them; this is WHERE it is and WHAT conflicts, which is the difference between a
+// sentence and something a person can act on.
+message RebaseConflict {
+  // The parked worktree, verbatim.
+  //
+  // This is a daemon-side filesystem path, which G-14 keeps off client-facing messages, and it is carried
+  // anyway for a stated reason rather than by oversight. G-14's rule is about ADDRESSING: a handle a
+  // client uses to name a resource must not be a path, because a path means nothing to a client that is
+  // not on the daemon's machine (that is why repo_handle is opaque and why GetVerificationLog returns
+  // content instead of a path). This is not an address — no rpc takes it, and nothing is looked up by it.
+  // It is a measured fact about a hand-off to a person, and the identical string already reaches a
+  // human-facing client verbatim inside AuditService.ReadAudit's decrypted payload for the
+  // `keepalive_rebase_conflict` event. Withholding it from the card while shipping it in the audit reader
+  // would not be a boundary, only an inconvenience. Clients render it as provenance, never as a link.
+  string worktree = 1;
+  // The mirror branch the rebase was onto.
+  string main_branch = 2;
+  // The repo-relative paths git reported as unmerged, measured at parking time (`git diff --name-only
+  // --diff-filter=U`) rather than at render time: an agent with a shell in that worktree can `git add` a
+  // path out of the unmerged set, and the answer a human reads should be the answer the daemon blocked
+  // the entry on. EMPTY MEANS NOT MEASURED, never "no files conflict" — a surface must not render an
+  // empty list as reassurance over a real conflict.
+  repeated string paths = 3;
+  // When the cascade parked it, ISO-8601 round-trip ("O").
+  string parked_at = 4;
 }
 
 // One must-acknowledge review item (P2-11 §6.3). Mirrors the client-side FlaggedItem projection; the
@@ -148,6 +288,13 @@ message BeginMergeResponse {
   // sha, so it comes from the daemon that granted the lease — never from the client's own cached
   // projection of the queue, which may already be a revision behind.
   string expected_main_sha = 4;
+  // K3 — the BRANCH-side half of the identity this lease authorizes: the agent/<id> tip the queue's
+  // verification was measured ON (VerificationRecord.BranchSha). expected_main_sha alone says which main
+  // may be fast-forwarded and nothing about which commits get fast-forwarded onto it, so the merge could
+  // consume a ref the queue never verified and still satisfy the lease. Empty means the daemon has no
+  // measured branch sha for this entry (a seeded row, or a record from before the field existed); it is
+  // read as "not measured" and never as a mismatch.
+  string expected_branch_sha = 5;
 }
 
 message AbandonMergeRequest {
@@ -173,6 +320,10 @@ message ConfirmMergeRequest {
 
 message ConfirmMergeResponse {
   bool confirmed = 1;
+  // Set when the merge was recorded LATE: the daemon's gate refused this confirm, but the reported sha is
+  // exactly the branch tip the lease authorized, so the reviewed bytes had already landed on the user's
+  // main. Says what the gate said, so the caller can show why the row moved without a clean pass.
+  string note = 2;
 }
 
 message AcknowledgeFlaggedChangeRequest {
@@ -239,6 +390,60 @@ message ClearStalledVerificationResponse {
   // for this entry right now", which is a refusal and not a failure.
   string reason = 2;
   string state = 3; // the resulting WorkerMergeState name
+}
+
+message GetVerificationLogRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+}
+
+message GetVerificationLogResponse {
+  // False when this entry has no verification record at all — which is a materially different answer from
+  // an empty log, and the one the surface must render as "not verified yet" rather than as "the tests
+  // printed nothing". Everything below is empty when this is false.
+  bool has_record = 1;
+  bool passed = 2;
+  string resolved_command = 3;
+  string main_sha = 4;
+  string when = 5;            // ISO-8601 round-trip ("O")
+  // The artifact's content — the header the runner writes plus the run's stdout and stderr. Empty with
+  // has_record true means the artifact could not be read (deleted, or a daemon whose data directory
+  // moved); `unavailable_reason` says which, rather than letting a missing file render as a test suite
+  // that produced no output.
+  string log = 6;
+  // True when `log` is the TAIL of a longer artifact. Named rather than silently elided: a human reading
+  // a failure needs to know they are looking at the end of something.
+  bool truncated = 7;
+  // Verbatim when the record exists and its artifact could not be read. Empty otherwise.
+  string unavailable_reason = 8;
+}
+
+message ResolveConflictWithAgentRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+  // Deliberately NO prompt field. The instruction the worker receives is composed daemon-side from what
+  // the daemon measured (the branch, the unmerged paths) — a client-supplied prompt on this rpc would be
+  // an unlogged way to type arbitrary text into another agent's CLI, which is exactly the power the
+  // terminal input lock exists to withhold.
+}
+
+message ResolveConflictWithAgentResponse {
+  // False when the daemon declined — no parking for this entry, its jail is gone, the rebase already
+  // ended, or the instruction could not be delivered. `reason` is rendered verbatim.
+  bool handed_back = 1;
+  string reason = 2;
+}
+
+message AbortRebaseRequest {
+  string repo_handle = 1;
+  string agent_id = 2;
+}
+
+message AbortRebaseResponse {
+  // False when the daemon declined — no parking, the rebase already ended, the jail could not be
+  // quiesced, or `git rebase --abort` itself refused. On every false the worktree is unchanged.
+  bool aborted = 1;
+  string reason = 2;
 }
 
 message GetMergeDiffRequest {

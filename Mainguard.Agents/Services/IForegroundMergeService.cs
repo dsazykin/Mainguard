@@ -11,6 +11,13 @@ namespace Mainguard.Agents.Services;
 /// <param name="MainBranch">The local main branch the merge lands on.</param>
 /// <param name="AllowStaleOverride">Loud, separate override path: merge a stale/unverified branch anyway (journaled + audited).</param>
 /// <param name="OverrideReason">Why the override was used (recorded in the audit event).</param>
+/// <param name="ExpectedBranchSha">
+/// K3/K2 — the <c>agent/&lt;id&gt;</c> tip the queue's verification was measured ON, carried from the
+/// lease the daemon granted. It is what makes the merge source identifiable: the ref this repository
+/// happens to hold under that name is a NAME, and a name is not an identity. Empty means the daemon has
+/// no measured branch sha for this entry, in which case the merge falls back to preferring the ref it
+/// just fetched — never to trusting a stale local copy.
+/// </param>
 public sealed record ForegroundMergeRequest(
     string RepoPath,
     string RepoHash,
@@ -18,7 +25,8 @@ public sealed record ForegroundMergeRequest(
     string ExpectedMainSha,
     string MainBranch = "main",
     bool AllowStaleOverride = false,
-    string? OverrideReason = null);
+    string? OverrideReason = null,
+    string ExpectedBranchSha = "");
 
 /// <summary>The outcome of a foreground merge attempt.</summary>
 /// <param name="Merged">True iff the merge landed on main.</param>

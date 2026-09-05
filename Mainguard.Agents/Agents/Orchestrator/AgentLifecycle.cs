@@ -9,7 +9,7 @@ namespace Mainguard.Agents.Agents.Orchestrator;
 /// The P2-09 orchestrator-side run state for one agent. Deliberately narrower than the design-layer
 /// <see cref="AgentLifecycleState"/> (which drives the activity-bar iconography): this is the set the
 /// yield/keep-alive/teardown machinery actually transitions through, and it adds the
-/// <see cref="Conflict"/> state the keep-alive rebase parks an agent in until the T-04 resolver clears it.
+/// <see cref="Conflict"/> state the keep-alive rebase parks an agent in until a human clears it.
 /// </summary>
 public enum AgentRunState
 {
@@ -25,7 +25,21 @@ public enum AgentRunState
     /// <summary>A keep-alive rebase is committing/replaying against fresh main.</summary>
     Rebasing,
 
-    /// <summary>A keep-alive rebase hit a conflict; the worktree is parked for the T-04 resolver, PTY paused.</summary>
+    /// <summary>
+    /// A keep-alive rebase hit a conflict: the worktree is parked mid-rebase and the jail is frozen, both
+    /// deliberately — there is no automatic <c>rebase --abort</c> (a rejection trigger).
+    ///
+    /// <para>It used to say "parked for the T-04 resolver", which named a surface that does not exist and
+    /// left the state reading as a queue for something that was never coming. T-04 — where a human resolves
+    /// hunks against a diff — is still unbuilt. What an entry in this state now HAS is two operations built
+    /// from machinery that already ships (<c>MergeQueueService.ResolveConflictWithAgent</c> and
+    /// <c>AbortRebase</c>): hand the conflict back to the agent that wrote half of it, or undo the rebase.
+    /// Neither is T-04 and neither is a step toward replacing it.</para>
+    ///
+    /// <para>The jail staying frozen is the point of the state; the machine does NOT keep a claim on that
+    /// pause — the cycle settles its yield token on this path (see <c>IYieldToken.ReleaseWithoutResuming</c>),
+    /// so the human's own Pause/Unpause control still works on a conflicted agent.</para>
+    /// </summary>
     Conflict,
 
     /// <summary>Teardown is in progress.</summary>

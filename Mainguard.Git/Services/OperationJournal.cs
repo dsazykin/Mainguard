@@ -297,6 +297,49 @@ public sealed class OperationJournal : IOperationJournal
     private static RefSnapshot Deserialize(string json) =>
         JsonSerializer.Deserialize<RefSnapshot>(json, JsonOpts) ?? new RefSnapshot();
 
+    /// <summary>
+    /// Reads one ref's sha out of a <see cref="JournalEntry"/>'s <c>PreStateJson</c>/<c>PostStateJson</c>.
+    ///
+    /// <para>Exposed because a journal entry is the only durable record of <b>which refs an operation
+    /// moved, and from what to what</b> — and the RT-D1 boot reconcile has to answer exactly that about
+    /// one specific merge lease. Reading it here rather than re-parsing the snapshot shape at the call
+    /// site keeps the serialized layout in the one file that owns it; <see cref="RefSnapshot"/> stays
+    /// internal so nothing outside can grow a second opinion about what a snapshot contains.</para>
+    ///
+    /// <para>False for a snapshot that cannot be parsed or does not name the ref — an <b>unanswerable</b>
+    /// question, which is not the same as "the ref was at nothing". Every caller of this is one that has
+    /// to decline rather than guess when it cannot get an answer.</para>
+    /// </summary>
+    /// <param name="stateJson">A journal entry's serialized pre- or post-operation ref snapshot.</param>
+    /// <param name="canonicalRefName">The canonical ref name, e.g. <c>refs/heads/main</c>.</param>
+    /// <param name="sha">The ref's sha at snapshot time, when it was recorded.</param>
+    public static bool TryReadRef(string? stateJson, string canonicalRefName, out string sha)
+    {
+        sha = string.Empty;
+        if (string.IsNullOrWhiteSpace(stateJson) || string.IsNullOrWhiteSpace(canonicalRefName))
+        {
+            return false;
+        }
+
+        RefSnapshot snapshot;
+        try
+        {
+            snapshot = Deserialize(stateJson!);
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+
+        if (!snapshot.Refs.TryGetValue(canonicalRefName, out var value) || string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        sha = value;
+        return true;
+    }
+
     // ---- Scope -----------------------------------------------------------
 
     private sealed class OperationScope : IDisposable

@@ -216,6 +216,46 @@ public class CoordinatorPlanDecisionTests
         Assert.Contains("daemon unreachable", card.DecisionErrorText, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A re-scope's worker is NOT blocked by the pending widening — it keeps working under the scope already
+    /// approved — so the generic "the worker is still blocked" would be false on that card.
+    /// </summary>
+    [Fact]
+    public async Task AFailedDecisionOnARescope_DoesNotSayTheWorkerIsBlocked()
+    {
+        var panel = new CoordinatorPanelViewModel(
+            new FakeCoordinator { Rescope = true, Throw = new InvalidOperationException("daemon unreachable") });
+        var card = panel.PendingPlan!;
+        Assert.True(card.IsRescope);
+
+        await card.ApproveCommand.ExecuteAsync(null);
+
+        Assert.True(card.HasDecisionError);
+        Assert.DoesNotContain("still blocked", card.DecisionErrorText, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("not blocked", card.DecisionErrorText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// A double-click that races the plan stream gets the daemon's "already Approved" refusal back. That
+    /// decision LANDED; rendering it as "not recorded — the worker is still blocked" says the opposite.
+    /// </summary>
+    [Fact]
+    public async Task AnAlreadyDecidedRefusal_IsNotRenderedAsAFailure()
+    {
+        var panel = new CoordinatorPanelViewModel(new FakeCoordinator
+        {
+            Throw = new InvalidOperationException(
+                "Plan 'plan-7' is Approved — only a plan awaiting your decision can be approved or rejected."),
+        });
+        var card = panel.PendingPlan!;
+
+        await card.ApproveCommand.ExecuteAsync(null);
+
+        Assert.False(card.HasDecisionError);
+        Assert.Equal("", card.DecisionErrorText);
+        Assert.False(card.IsDeciding);
+    }
+
     /// <summary>A retry after a failure must clear the stale error, or the card lies about the new attempt.</summary>
     [Fact]
     public async Task ARetryThatSucceeds_ClearsTheError()
@@ -233,6 +273,75 @@ public class CoordinatorPlanDecisionTests
         Assert.False(card.HasDecisionError);
         Assert.Equal("", card.DecisionErrorText);
         Assert.False(card.IsDeciding);
+    }
+
+    // ---- The card's age --------------------------------------------------
+
+    /// <summary>
+    /// The reconciliation keeps a card's instance while its (id, revision) is unchanged — which is right
+    /// for the feedback the human is typing, and wrong for "presented N min ago", which was computed once
+    /// in the constructor and then never moved on the one surface whose purpose is to make waiting visible.
+    /// </summary>
+    [Fact]
+    public void AKeptCardsAge_AdvancesOnRefresh()
+    {
+        var panel = new CoordinatorPanelViewModel(new FakeCoordinator());
+        var card = panel.PendingPlan!;
+        Assert.Contains("presented 2 min ago", card.FactsText, StringComparison.Ordinal);
+
+        panel.Clock = () => DateTimeOffset.Now.AddMinutes(7);
+        panel.Refresh();
+
+        Assert.Same(card, panel.PendingPlan); // still the same decision, not a rebuilt card
+        Assert.Contains("presented 9 min ago", card.FactsText, StringComparison.Ordinal);
+    }
+
+    // ---- The plan-mode toggle --------------------------------------------
+
+    /// <summary>
+    /// A toggle that never reached the daemon used to escape the command onto the dispatcher, where the
+    /// crash guard turned it into a generic notice. The checkbox snapped back correctly, but nothing on
+    /// the gate said why — and this is the one disagreement where the human believes they have (or have
+    /// switched off) an approval step and the daemon disagrees.
+    /// </summary>
+    [Fact]
+    public async Task AFailedPlanModeToggle_SaysSoOnTheGate_AndShowsTheDaemonsValue()
+    {
+        var coordinator = new FakeCoordinator { SetPlanModeThrow = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        Assert.True(panel.PlanModeEnabled);
+
+        panel.PlanModeEnabled = false; // the checkbox moved before the command ran
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+
+        Assert.True(panel.HasPlanModeError);
+        Assert.Contains("daemon unreachable", panel.PlanModeErrorText, StringComparison.Ordinal);
+        Assert.True(panel.PlanModeEnabled, "the box must show the daemon's value, not the requested one");
+        Assert.Empty(coordinator.PlanModeSets);
+    }
+
+    /// <summary>The error is cleared by success — a retry that lands, or the daemon seen holding the value.</summary>
+    [Fact]
+    public async Task APlanModeError_ClearsWhenTheDaemonHoldsTheRequestedValue()
+    {
+        var coordinator = new FakeCoordinator { SetPlanModeThrow = new InvalidOperationException("daemon unreachable") };
+        var panel = new CoordinatorPanelViewModel(coordinator);
+        panel.PlanModeEnabled = false;
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+        Assert.True(panel.HasPlanModeError);
+
+        // An unrelated refresh with the daemon unchanged keeps the error: nothing has been resolved.
+        panel.Refresh();
+        Assert.True(panel.HasPlanModeError);
+
+        coordinator.SetPlanModeThrow = null;
+        panel.PlanModeEnabled = false;
+        await panel.TogglePlanModeCommand.ExecuteAsync(null);
+
+        Assert.False(panel.HasPlanModeError);
+        Assert.Equal("", panel.PlanModeErrorText);
+        Assert.False(panel.PlanModeEnabled);
+        Assert.Equal(new[] { false }, coordinator.PlanModeSets);
     }
 
     // ---- The silent failure ----------------------------------------------
@@ -302,6 +411,9 @@ public class CoordinatorPlanDecisionTests
         /// <summary>Set to hold the decision open, so the in-flight latch is observable.</summary>
         public TaskCompletionSource? Gate { get; set; }
 
+        /// <summary>Set to present the plan as a RE-SCOPE of an already-approved plan.</summary>
+        public bool Rescope { get; set; }
+
         /// <summary>
         /// Every decision, in order, with the arguments it carried. This replaces a bare
         /// <c>DecisionCalls</c> counter that no test ever read — and which therefore let an inverted
@@ -318,7 +430,9 @@ public class CoordinatorPlanDecisionTests
                 new[] { "src/Auth/TokenClock.cs" },
                 "Extract the clock behind ITokenClock.",
                 "AuthTests green plus expiry-boundary cases.",
-                1.50m, DateTimeOffset.Now.AddMinutes(-2), _status, 0, 3, 3, ""),
+                1.50m, DateTimeOffset.Now.AddMinutes(-2), _status, 0, 3, 3, "",
+                SupersedesPlanId: Rescope ? "plan-6" : "",
+                PreviousScope: Rescope ? new[] { "src/Auth/ITokenClock.cs" } : null),
         };
 
         public IReadOnlyList<TaskPlan> GetPendingPlans() => GetWorkerPlans()
@@ -330,9 +444,33 @@ public class CoordinatorPlanDecisionTests
 
         public OrchestrationBackpressure GetBackpressure() => OrchestrationBackpressure.None;
 
+        /// <summary>The plan-mode toggle this fake reports, and every value it was asked to set.</summary>
+        public PlanModeView PlanMode { get; set; } = new(true, "Plan mode is ON — every worker authors a plan.");
+
+        public List<bool> PlanModeSets { get; } = new();
+
+        public PlanModeView GetPlanMode() => PlanMode;
+
+        /// <summary>Set to make the toggle fail the way an unreachable daemon does.</summary>
+        public Exception? SetPlanModeThrow { get; set; }
+
+        public Task SetPlanModeAsync(bool enabled)
+        {
+            if (SetPlanModeThrow is not null)
+            {
+                throw SetPlanModeThrow;
+            }
+
+            PlanModeSets.Add(enabled);
+            PlanMode = new PlanModeView(enabled, enabled ? "ON" : "OFF");
+            return Task.CompletedTask;
+        }
+
         public event Action? Changed { add { } remove { } }
 
         public Task SendAsync(string text) => Task.CompletedTask;
+
+        public Task RequestNewPlanAsync(string planId, string guidance) => Task.CompletedTask;
 
         public async Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
         {

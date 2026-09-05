@@ -44,6 +44,10 @@ public interface IProToolsSurface
     /// also why the page shipped unreachable — it had a complete dialog and nowhere real to write.</para></summary>
     object CreatePrIntakePage();
 
+    /// <summary>Settings → Agent Jails: the per-jail memory/CPU ceiling every spawn is created with (owner
+    /// decision 2026-09-04). Daemon state over gRPC, like PR Intake — the daemon is what spawns.</summary>
+    object CreateJailLimitsPage();
+
     /// <summary>Settings → Mainguard OS: the repo-onboarding + rebuild-sandbox-images page content,
     /// parented to <paramref name="owner"/> for its folder-picker dialogs. <c>null</c> if the factory
     /// seam isn't wired (mirrors the pre-migration null-tolerant behavior).</summary>

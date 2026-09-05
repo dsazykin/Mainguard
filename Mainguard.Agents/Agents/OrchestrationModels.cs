@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace Mainguard.Agents.Agents;
 
@@ -19,7 +20,8 @@ public enum AgentLifecycleState
 
 /// <summary>
 /// Branch merge-eligibility lifecycle — the P2-10 enum (OPS §4.2), plus the human's
-/// <see cref="Discarded"/> terminal.
+/// <see cref="Discarded"/> terminal and the red half of a verification
+/// (<see cref="VerificationFailed"/>).
 ///
 /// <para><b><see cref="Discarded"/> is deliberately its own member rather than a reuse of
 /// <see cref="Rejected"/>.</b> <c>Rejected</c> means a human read this branch's diff in review and turned
@@ -29,8 +31,27 @@ public enum AgentLifecycleState
 /// queue's own record say something that did not happen, which is the failure this queue exists to
 /// prevent. Neither is <see cref="Merged"/>, and nothing in this enum lets a discard be mistaken for
 /// one.</para>
+///
+/// <para><b><see cref="VerificationFailed"/> exists because a verification has two outcomes and this enum
+/// only had a word for one of them (H2).</b> A pass settled the entry to <see cref="Verified"/>; a FAIL
+/// settled it back to <see cref="Working"/> — the same state an entry that has never been verified at all
+/// sits in — so the row and the worker pane both told the human "not verified yet" about a branch whose
+/// tests had just gone red, with Verify still offered. RED and NEVER-RUN were literally the same value,
+/// and the only way to see the failure was to pay for a second, redundant run.</para>
+///
+/// <para>It is <b>not terminal</b>, and that is the whole shape of it: the branch is still the agent's to
+/// fix. The legal moves out of it are the three honest ones — verify again (the human's retry, or the
+/// automatic trigger on a NEW tip), back to <see cref="Working"/> when the agent pushes a fix
+/// (<c>NotifyNewCommits</c>), and <see cref="Discarded"/> when the human drops it. It can never reach
+/// <see cref="Merged"/> or <see cref="Rejected"/>: <c>Rejected</c> is a verdict on reviewed work and
+/// there is nothing to review, and merging requires a passing record this entry by definition does not
+/// have.</para>
 /// </summary>
-public enum WorkerMergeState { Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded }
+public enum WorkerMergeState
+{
+    Working, Verifying, Verified, StaleVerified, AwaitingReview, Merged, Rejected, Discarded,
+    VerificationFailed,
+}
 
 /// <summary>
 /// Where a merge-queue entry came from (P2-12). <see cref="Local"/> is a locally-spawned agent whose
@@ -69,8 +90,31 @@ public sealed record AgentInfo(
     DateTimeOffset SpawnedAt,
     string Role = AgentRoles.Manual); // "", "coordinator", or "managed" (subagent)
 
-/// <summary>P2-10: immutable verification record tied to a main SHA.</summary>
-public sealed record VerificationRecord(string AgentId, string MainSha, bool Passed, int TestsPassed, int TestsTotal, DateTimeOffset When);
+/// <summary>
+/// The <b>verdict</b> of an entry's last verification, in exactly the three facts the wire carries (H4:
+/// <c>QueueEntry.last_verification_passed</c> / <c>_command</c> / <c>_at</c>).
+///
+/// <para><b>It deliberately has no test counts.</b> It replaced a <c>VerificationRecord</c> carrying
+/// <c>TestsPassed</c>/<c>TestsTotal</c> — two numbers no wire has ever carried and the daemon has never
+/// measured. Verification observes a process EXIT CODE in the worker's jail; nothing parses anyone's test
+/// runner, so there is no "58 of 58" anywhere in this system to project. Filling those fields to satisfy
+/// the old shape would have printed invented counts into a review surface, which is strictly worse than
+/// printing none: a reviewer who reads "58/58 green" believes a measurement that was never taken. The type
+/// was narrowed to the real fields rather than the projection inventing values for it.</para>
+///
+/// <para>The <c>main@sha</c> the run was measured against is <b>not</b> here either — it is
+/// <see cref="QueueEntry.VerifiedMainSha"/>, straight off the wire's own <c>verified_main_sha</c>. One
+/// fact, one home.</para>
+/// </summary>
+/// <param name="Passed">The verdict itself. A <see cref="QueueEntry.Verification"/> of <c>null</c> is the
+/// materially different answer <i>no record</i> — never-run and failed must not share a representation,
+/// which is exactly why the wire field is <c>optional</c> rather than a plain bool.</param>
+/// <param name="ResolvedCommand">The RT-D2 command the verdict was produced by; empty when the daemon sent
+/// none. Provenance, not decoration — a branch that rewrote its own test command produces a green that
+/// means nothing, and the reviewer has to see WHAT passed.</param>
+/// <param name="When">When the record was written; null when the daemon sent no timestamp. A week-old red
+/// is a different fact from one that landed thirty seconds ago.</param>
+public sealed record VerificationVerdict(bool Passed, string ResolvedCommand, DateTimeOffset? When);
 
 /// <summary>P2-11: one must-acknowledge flagged item; acks bind to the diff hash daemon-side.</summary>
 public sealed record FlaggedItem(string Id, string Path, string Category, string Fact, bool Acknowledged);
@@ -99,10 +143,38 @@ public sealed record FlaggedItem(string Id, string Path, string Category, string
 /// only thing that tells a reviewer whether the green they are looking at was measured against today's
 /// main or a week-old one.
 ///
-/// <para>Deliberately NOT folded into <see cref="VerificationRecord"/>: that record also carries
-/// <c>Passed</c> and the test counts, and the wire has none of them. Constructing one here would have
-/// meant inventing a pass/fail verdict to carry a sha, which is exactly the kind of fabricated
-/// reassurance this surface exists to prevent. Null means the daemon did not say.</para>
+/// <para>Deliberately its own field rather than folded into <see cref="Verification"/>: the sha is known
+/// for entries that have no verdict at all, and a verdict-shaped wrapper around it would have meant
+/// inventing a pass/fail to carry a sha — the kind of fabricated reassurance this surface exists to
+/// prevent. Null means the daemon did not say.</para>
+/// </param>
+/// <param name="Verification">
+/// The entry's last verification VERDICT, or <c>null</c> for <b>no record at all</b>. Those two answers are
+/// kept apart at every layer — the wire field is <c>optional</c>, this is nullable, and the surfaces render
+/// three outcomes (green / red / never run) rather than the two the old projection could express.
+/// </param>
+/// <param name="ApprovedApproach">
+/// The <c>approach</c> text of the plan a human approved for this branch — the paragraph the diff was
+/// supposed to match. Null/empty when the entry has no approved plan.
+///
+/// <para><b>Why this travels at all.</b> It existed only on the daemon: written by the worker, read once
+/// by the human at approval, and never surfaced again. So the review surface could show a diff and
+/// nothing to hold it against — which is how a branch that shipped the opposite of its approved approach
+/// passed review with an empty flagged list and a green verification (the file scope was honoured, and
+/// the worker had written the tests).</para>
+/// </param>
+/// <param name="DeviationDeclaration">
+/// The worker's commit-time answer about departing from <paramref name="ApprovedApproach"/>:
+/// <c>"NotDeclared"</c> / <c>"None"</c> / <c>"Declared"</c>, or null/empty when the entry has no approved
+/// plan. Three values, because "asserted none" and "never answered" must not render alike — the declared
+/// departures themselves arrive as must-acknowledge <paramref name="FlaggedItems"/>, so this field's job
+/// is exactly to carry the two answers that produce no item.
+/// </param>
+/// <param name="RebaseConflict">
+/// Set only while this entry's worktree is parked mid-rebase on a conflict; <c>null</c> — the ordinary
+/// case — means nothing is parked. Nullable rather than a set of fields on this record for the same reason
+/// <see cref="Verification"/> is: a blank worktree and an empty path list are indistinguishable from a
+/// conflict nobody measured, and the two answers must not share a representation.
 /// </param>
 public sealed record QueueEntry(
     string AgentId,
@@ -110,11 +182,42 @@ public sealed record QueueEntry(
     string Branch,
     WorkerMergeState State,
     string Detail,
-    VerificationRecord? Verification,
+    VerificationVerdict? Verification,
     IReadOnlyList<FlaggedItem> FlaggedItems,
     bool VerificationInFlight = false,
     bool? HasLiveSandbox = null,
-    string? VerifiedMainSha = null);
+    string? VerifiedMainSha = null,
+    string? ApprovedPlanId = null,
+    string? ApprovedPlanTitle = null,
+    string? ApprovedApproach = null,
+    string? DeviationDeclaration = null,
+    QueueRebaseConflict? RebaseConflict = null);
+
+/// <summary>
+/// The facts behind a conflict card: a worktree the daemon parked mid-rebase, and what git said conflicts
+/// in it.
+///
+/// <para><b>Why the card needs this at all.</b> The gate reason already told the human that a rebase
+/// conflict needs them and named no location and no file, so the one row on the rail asking for human
+/// judgment was the one row carrying the least evidence. These are the daemon's measurements, carried
+/// rather than re-derived — a client cannot see into the daemon's worktrees, and a client that guessed
+/// would be describing a conflict it never observed.</para>
+/// </summary>
+/// <param name="Worktree">The parked worktree, verbatim. Rendered as provenance — where this happened —
+/// never as something the client opens: on every substrate but a Mac host it is a path inside the
+/// daemon's environment, not the user's filesystem.</param>
+/// <param name="MainBranch">The branch the rebase was onto.</param>
+/// <param name="Paths">
+/// The repo-relative unmerged paths, measured when the cascade parked the worktree. <b>Empty means NOT
+/// MEASURED</b>, never "no files conflict" — a surface that rendered an empty list as reassurance would be
+/// contradicting the very state it is rendering.
+/// </param>
+/// <param name="ParkedAt">When it was parked; null when the daemon sent no timestamp.</param>
+public sealed record QueueRebaseConflict(
+    string Worktree,
+    string MainBranch,
+    IReadOnlyList<string> Paths,
+    DateTimeOffset? ParkedAt);
 
 /// <summary>P2-14: the schema-validated plan a managed worker spawns from. Scope is load-bearing.</summary>
 public sealed record TaskPlan(
@@ -135,9 +238,23 @@ public sealed record TaskPlan(
 /// notification — a human rejecting a plan for the third time needs to see that the next rejection stops
 /// the worker.</para>
 /// </summary>
-/// <param name="Status">PlanStatus name: Pending / Approved / Rejected / Escalated.</param>
+/// <param name="Status">PlanStatus name: Pending / Approved / Rejected / Escalated / Superseded.</param>
 /// <param name="Revision">0 for the original presentation.</param>
 /// <param name="RevisionsRemaining">Revisions still permitted before the worker must escalate.</param>
+/// <param name="SupersedesPlanId">
+/// Set only on a <b>re-scope</b>: the approved plan this one asks to replace. It is what makes this card a
+/// different decision from a first presentation — the human is approving a WIDENING of something they
+/// already said yes to.
+/// </param>
+/// <param name="PreviousScope">
+/// The superseded plan's scope, so the card can show what CHANGED rather than only what is now being asked
+/// for. A human cannot judge a widening against a list they are expected to remember.
+/// </param>
+/// <param name="RescopeCount">
+/// How many widenings this worker has already had approved. Rendered, not enforced: runaway scope creep is
+/// meant to be visible to the person paying for it rather than silently capped at a number nobody could
+/// justify — see <c>PlanApprovalService.Rescope</c>.
+/// </param>
 public sealed record WorkerPlanCard(
     string PlanId,
     string WorkerAgentId,
@@ -152,11 +269,33 @@ public sealed record WorkerPlanCard(
     int Revision,
     int RevisionsRemaining,
     int MaxRevisions,
-    string RejectionFeedback)
+    string RejectionFeedback,
+    string SupersedesPlanId = "",
+    IReadOnlyList<string>? PreviousScope = null,
+    int RescopeCount = 0,
+    bool NewPlanRequested = false)
 {
     public bool IsPending => string.Equals(Status, "Pending", StringComparison.OrdinalIgnoreCase);
 
     public bool IsEscalated => string.Equals(Status, "Escalated", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when this card asks to widen an approval the worker already holds.</summary>
+    public bool IsRescope => SupersedesPlanId.Length > 0;
+
+    /// <summary>Paths this plan adds to what was already approved (empty on an ordinary plan).</summary>
+    public IReadOnlyList<string> AddedScope => IsRescope
+        ? Scope.Except(PreviousScope ?? Array.Empty<string>(), StringComparer.Ordinal).ToList()
+        : Array.Empty<string>();
+
+    /// <summary>
+    /// Paths the approved plan covered that this one drops. Rendered because a "re-scope" is not
+    /// necessarily a widening: a plan that quietly removes a path the human already agreed to is the one
+    /// shape of this op that could take something away, and a card that only ever showed additions would
+    /// be the place it hid.
+    /// </summary>
+    public IReadOnlyList<string> RemovedScope => IsRescope
+        ? (PreviousScope ?? Array.Empty<string>()).Except(Scope, StringComparer.Ordinal).ToList()
+        : Array.Empty<string>();
 }
 
 /// <summary>
@@ -224,9 +363,18 @@ public sealed record ResourceSample(DateTimeOffset At, double? CpuPercent, doubl
 /// for BYOK CLIs that declare no base-URL/model-host pair (codex, qwen-code, opencode), and when the
 /// gateway is off. When false the UI must show no spend figure rather than <c>$0.00</c>, which would read
 /// as "you have spent nothing". See <c>docs/design/oauth-budgeting.md</c>.</param>
+/// <param name="Name">The agent's CLI kind — "claude-code", "codex". <b>Not an identity.</b> Four agents
+/// of the same kind produce four identical values, which is exactly the row the resource monitor used to
+/// render: four lines reading <c>claude-code</c>, with no way to tell a worker from the coordinator whose
+/// death ends the session.</param>
+/// <param name="Role">Coordinator / managed worker / manual (<see cref="AgentRoles"/>) — the first thing a
+/// human actually recognises about an agent, and the one that decides how bad ending it is.</param>
+/// <param name="Title">The worker's brief: the headline its plan was written against. Empty for a
+/// coordinator (it has no brief) and for a worker that has not presented a plan yet.</param>
 public sealed record AgentResourceUsage(
     string AgentId, string Name, string StateWord, bool IsPaused,
-    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false);
+    double? CpuPercent, double? RamGb, decimal? SpendUsd, string Task, bool IsMetered = false,
+    string Role = AgentRoles.Manual, string Title = "");
 
 /// <summary>P2-13/P2-08 spend caps, UI-facing shape (Core DTO — no proto/UI coupling). The per-agent
 /// and per-day caps the gateway <c>BudgetLedger</c> enforces daemon-side, surfaced so the Resource

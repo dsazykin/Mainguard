@@ -21,8 +21,22 @@ internal static class FixtureRepo
     public const string PassMarker = "fixture verification passed";
 
     /// <summary>An UNTRACKED, worktree-only dwell knob. Untracked on purpose: anything in the tree
-    /// would differ between a branch and main and arm the RT-D2 gate, which is a different test.</summary>
+    /// would differ between a branch and main and arm the RT-D2 gate, which is a different test.
+    ///
+    /// <para><b>Git-IGNORED is what makes "untracked" hold</b>, and the seed writes the
+    /// <see cref="GitIgnore"/> that does it. Leaving the knob merely unadded is not enough once a stale
+    /// cascade runs over the same worktree: <c>KeepAliveRebaser</c> preserves an agent's uncommitted work
+    /// across the reparent by committing <c>git add -A</c> as <c>wip: sync</c> BEFORE it rebases, and
+    /// <c>add -A</c> stages untracked files. The knob was therefore swept into the agent's tree — the one
+    /// thing this constant's own doc says must never happen — and a test that then removed it from the
+    /// worktree turned it into an unstaged deletion, which <c>git rebase</c> refuses outright ("cannot
+    /// rebase: You have unstaged changes"). The cascade reported the branch un-reparented and the entry
+    /// never came back to <c>Verified</c>. See the phase-3 decisions doc §22.</para></summary>
     public const string DelayFile = ".verify-delay-ms";
+
+    /// <summary>The seeded ignore list. Committed on <c>main</c> before any branch exists, so it is
+    /// byte-identical on every branch and arms no gate.</summary>
+    public const string GitIgnore = ".gitignore";
 
     public const string CalcJs =
         "exports.add = (a, b) => a + b;\n" +
@@ -53,6 +67,8 @@ internal static class FixtureRepo
 
     public static void Seed(string repoPath)
     {
+        // First, because everything else about the dwell knob rests on it — see DelayFile.
+        WriteFile(repoPath, GitIgnore, DelayFile + "\n");
         WriteFile(repoPath, ".mainguard/verify", VerifyCommand + "\n");
         WriteFile(repoPath, ".mainguard/verify.js", VerifyJs);
         WriteFile(repoPath, "src/calc.js", CalcJs);

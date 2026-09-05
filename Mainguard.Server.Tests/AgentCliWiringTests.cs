@@ -59,8 +59,14 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         }, rig.Auth);
 
         // The launcher resolved the marker's argv and the binder got the container + launch command.
+        // A PREFIX rather than an equality: `claude-code` is a shipped adapter, and the daemon projects
+        // the shipped manifest's description over an installed marker (D5a), so this jail's line also
+        // carries the delivery flags that manifest declares — the worker's operating instructions here.
+        // The marker's own argv is what this test is about, and it is what the line starts with.
         var session = Assert.Single(rig.Sessions.Values);
-        Assert.Equal(new[] { "claude", "--permission-mode", "plan" }, rig.LastSpec!.Launch);
+        Assert.Equal(
+            new[] { "claude", "--permission-mode", "plan" },
+            rig.LastSpec!.Launch!.Take(3).ToArray());
         Assert.StartsWith("ctr-", rig.LastSpec.ContainerId, StringComparison.Ordinal);
 
         // The TTY contract for the EXACT spec the composition root produced (field, 2026-07-17: a
@@ -331,7 +337,7 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         // The shim's wire protocol: one JSON line in, one out — a managed worker spawns through the
         // SAME chain (session store → jail → bound CLI) and streams to the UI as a subagent.
         var response = await ShimRoundTripAsync(dir,
-            """{"op":"spawn","agentKind":"claude-code","taskPrompt":"split the work"}""");
+            """{"op":"spawn","agentKind":"claude-code","title":"Plan the split","taskPrompt":"split the work"}""");
         Assert.Contains("\"ok\":true", response, StringComparison.Ordinal);
 
         var list = await agents.ListAgentsAsync(new ListAgentsRequest(), rig.Auth);
@@ -383,7 +389,7 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // Run the REAL shim the daemon wrote, exactly as a coordinator CLI would (socket path
         // overridden to the host-side dir — inside a jail the fixed mount path is the default).
-        var psi = new System.Diagnostics.ProcessStartInfo("python3", $"\"{shim}\" spawn claude-code do the thing")
+        var psi = new System.Diagnostics.ProcessStartInfo("python3", $"\"{shim}\" spawn claude-code --title \"Do the thing\" --task \"do the thing\"")
         {
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -416,7 +422,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         try
         {
             var refused = await spawns.HandleShimRequestAsync(
-                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "more work"),
+                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                    "spawn", "claude-code", "more work", Title: "Plan the extra work"),
                 coordinatorId, default);
             Assert.False(refused.Ok);
             Assert.Contains("frozen", refused.Error, StringComparison.OrdinalIgnoreCase);
@@ -431,7 +438,12 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task ShimList_IsScopedToTheCallersOwnWorkers()
     {
-        using var rig = WiringRig.Create(_daemon);
+        using var rig = WiringRig.Create(
+            _daemon,
+            // Two coordinators on one daemon, to prove list scoping between them; the shipped cap is ONE
+            // (contract §2.2), so the rig raises it and the scoping stays as defence in depth.
+            configureServices: c => c.AddSingleton(
+                new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits(MaxLiveCoordinators: 16)));
         var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
 
         // Two independent coordinators, each spawning a worker through its OWN shim socket.
@@ -439,9 +451,11 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var coordB = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
 
         var a = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordA, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coordA, default);
         var b = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coordB, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coordB, default);
         Assert.True(a.Ok, a.Error);
         Assert.True(b.Ok, b.Error);
 
@@ -506,7 +520,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         var coord = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
 
         var refused = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), coord, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), coord, default);
         Assert.False(refused.Ok);
         Assert.Contains("memory", refused.Error!, StringComparison.OrdinalIgnoreCase);
 
@@ -519,13 +534,19 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
     [Fact]
     public async Task ShimList_ForACoordinatorWithNoWorkers_IsEmpty_NotEveryAgent()
     {
-        using var rig = WiringRig.Create(_daemon);
+        using var rig = WiringRig.Create(
+            _daemon,
+            // Two coordinators on one daemon, to prove list scoping between them; the shipped cap is ONE
+            // (contract §2.2), so the rig raises it and the scoping stays as defence in depth.
+            configureServices: c => c.AddSingleton(
+                new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits(MaxLiveCoordinators: 16)));
         var spawns = rig.Host.Services.GetRequiredService<AgentSpawnService>();
 
         // Another coordinator with a worker exists on this daemon...
         var other = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
         await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"), other, default);
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "work", Title: "Plan the work"), other, default);
 
         // ...but a coordinator that has spawned nothing must see nothing (previously it saw everything).
         var idle = await spawns.SpawnAsync(RepoHandle, "claude-code", null, AgentRoles.Coordinator, default);
@@ -553,7 +574,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
         for (var i = 0; i < 2; i++)
         {
             var ok = await spawns.HandleShimRequestAsync(
-                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "work"),
+                new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                    "spawn", "claude-code", "work", Title: "Plan the work"),
                 coordinatorId, default);
             Assert.True(ok.Ok, ok.Error);
         }
@@ -562,7 +584,8 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // The third is refused by the server-side cap — and no worker record leaks.
         var refused = await spawns.HandleShimRequestAsync(
-            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest("spawn", "claude-code", "too much"),
+            new Mainguard.Agents.Agents.Ipc.AgentIpcRequest(
+                "spawn", "claude-code", "too much", Title: "Plan too much"),
             coordinatorId, default);
         Assert.False(refused.Ok);
         Assert.Contains("cap", refused.Error, StringComparison.OrdinalIgnoreCase);

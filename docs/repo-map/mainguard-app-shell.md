@@ -338,7 +338,22 @@
       on the front one — behind a two-step confirm whose question states that the entry will not be
       merged and the branch is left alone, plus a `Button.Secondary` "Clear stalled run" shown only when
       the daemon reports no run behind a `Verifying` state. The rail's ONE accent stays the Review CTA:
-      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
+      nothing added here is `Button.Accent`, and the destructive action reads destructive by hue. Each row
+      also hosts `VerificationPanelView` — see below), **`VerificationPanelView.axaml`** (H4 — the verdict
+      line plus the recorded test output, expandable in place. It lives ON THE ROW because the row is the
+      only surface every entry has: an entry whose agent is gone has no worker document, and one that
+      never verified cannot reach the review cockpit, so a log reachable only from either would be missing
+      for exactly the entries that failed. Collapsed by default and fetched on first expand — the output is
+      a daemon-side file read per entry and the rail re-projects on every queue event. The reader is
+      BOUNDED rather than the log being shortened: a `MaxHeight` cap with its own scroll, so a 256 KiB tail
+      cannot push the row's actions off the surface, and horizontal scrolling is ON here (unlike the rail's
+      wrapping identifiers) for the reason `ReviewCockpitView` scrolls its diff sideways — wrapping a stack
+      trace destroys the alignment that makes it readable. `SelectableTextBlock` in `FontMono`, because the
+      reason a person opens a failing log is usually to copy the assertion out of it. The verdict line has
+      three readings by token: `TextMuted` for a current pass or a never-run, `WarningBrush` for a STALE
+      record (a pass the branch has moved out from under must not read like a current one), `DangerBrush`
+      for a failure — `.stale` is declared BEFORE `.failed` so a stale red still reads as a failure. The
+      same control is hosted by `AgentDocumentView`'s review section),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line; **harness-only** — constructed solely by
       `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (the coordinator
@@ -349,9 +364,27 @@
       workers, and one Approve/Reject card per blocked worker with Scope + Approach + the feedback box.
       Split out of `CoordinatorPanelView` because the coordinator conversation moved into a real PTY and a
       PTY cannot render a button: the gate is a decision about a *worker*, taken out of band from whatever
+      the coordinator is saying, so it has to be hostable without the chat. **(2026-08-30) A card can now
+      be a RE-SCOPE** (contract §3.1 / phase 3 §23) — a worker asking to change what an approval it
+      already holds authorises. That is a materially different decision from a first presentation and the
+      card says so above the title, shows **Adds** and **Drops** against the previously approved scope
+      (Drops in `DangerBrush` and never folded into Adds — it is the one direction this op can take
+      something away in), and re-words the three strings that would otherwise be FALSE on it: Reject reads
+      "Decline the widening" because declining stops nothing, the last-round warning says the widening
+      closes rather than that the worker stops, and an escalated re-scope's card says the worker is still
+      working under its original approval instead of "stopped after N rejected plans" — a human who reads
+      the generic sentence ends a worker that is doing approved work. No new tokens (phase 2 §2.9).
+      **Mounted by `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
+      that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
       the coordinator is saying, so it has to be hostable without the chat. **Mounted by
       `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
-      that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
+      that pane — collapsed entirely by `HasGateContent` when nothing is waiting. **The plan-mode toggle
+      (2026-08-30) lives at the top of this view**: a checkbox bound `OneWay` plus a `Command` (a two-way
+      binding would render a setting the daemon rejected or never received) over the daemon's own summary
+      sentence, in `WarningBrush` when approvals are OFF. `HasGateContent` now also includes
+      `!PlanModeEnabled`, because with approvals off nothing is ever pending and a gate that only appeared
+      for pending cards would go permanently dark — which is exactly what an IDLE orchestration looks
+      like), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47
@@ -609,7 +642,8 @@
     #4 and #13 were both filed against rows that were rendering), the verified-against stamp (from the wire's
     `VerifiedMainSha`), the one Review accent on the front-most fresh Verified entry PLUS a
     non-accent `ShowSecondaryReview` button on every other reviewable row (the cockpit is the only
-    home of the Merge button, so a verified branch without a Review path is unmergeable), and the
+    home of the Merge button, so a verified branch without a Review path is unmergeable), a per-row
+    **`Verification`** child (`VerificationPanelViewModel` — the verdict and its output, see below), and the
     per-row **`VerifyCommand`** — the human verification trigger. The command is
     deliberately thin: one call to `IMergeQueueService.RunVerificationAsync`, then it renders the answer
     (`VerifyMessage`) — it transitions nothing and judges no pass/fail, because all of that is the
@@ -622,8 +656,15 @@
     the same fact now withholds `CanVerify` instead of leaving an enabled button whose only behaviour is
     "has no live sandbox". Not two-step, unlike Discard: it adds a sandbox and destroys nothing. The CLI
     to run comes from the injected `resumeAgentKind` callback, read at press time, because the picker
-    lives on `ControlCenterViewModel`), each an equally thin drive of a daemon RPC through
-    `MergeActionRunner`.
+    lives on `ControlCenterViewModel`), and — for an entry whose worktree the daemon has parked mid-rebase
+    (`QueueEntry.RebaseConflict`, never inferred from the state word, which cannot tell a parked conflict
+    from a branch nobody ever verified) — **`ResolveConflictWithAgent`** ("Let the agent resolve": one
+    press, not two-step, because it changes nothing that cannot be undone) and **`BeginAbortRebase` /
+    `CancelAbortRebase` / `ConfirmAbortRebase`** (two-step, on the Discard idiom, because it throws away
+    the replay progress) plus the fact lines `ConflictPathsText` / `ConflictWorktree` — the card used to
+    name a required human action and no file, no branch and no location. `ConflictPathsText` renders an
+    empty daemon path list as "not measured", never as "no files conflict". Each is an equally thin drive
+    of a daemon RPC through `MergeActionRunner`.
     The class can neither remove a row nor invent an outcome — a local "remove from list" would clear
     the rail until the next `StreamQueue` snapshot silently refilled it. `IsVerificationStalled` comes
     from the daemon's `QueueEntry.VerificationInFlight`, never inferred from `Verifying`, which is wrong
@@ -648,7 +689,23 @@
     every daemon-flagged row but one arrived mislabelled `RiskCategory`; and
     `ReviewCockpitContext.LockfileFlags` is **local-composition only** — production always supplies
     `live:`, so the §3.6 lockfile rows are armed daemon-side by
-    `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection),
+    `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection.
+    **(2026-08-31) `ReviewCockpitContext.ApprovedPlanId`/`ApprovedPlanTitle`/`ApprovedApproach`/
+    `DeviationDeclaration` → `HasApprovedApproach`/`ApprovedPlanHeading`/`ApprovedApproachText`/
+    `DeviationDeclarationText`/`DeviationNeedsAttention`**, rendered by `ReviewCockpitView.axaml` as a
+    card ABOVE the diff: a review is a comparison and this surface only ever had one side of it, so a
+    branch that shipped the opposite of its approved approach read as an ordinary green review. The
+    approach is rendered verbatim in a scrolling region rather than truncated (the elided sentence is the
+    one the diff disagrees with), and **no card is drawn at all** when nothing was approved. The
+    declaration is projected as THREE sentences, never two — an asserted "none" says it is a claim and
+    not a check, a missing declaration reads as an open question — and a daemon that says nothing gets no
+    sentence invented for it. Carried as distinct properties rather than folded into
+    `ApprovedPlan` (a full `TaskPlan` whose `Scope` is F6-load-bearing): the wire carries no scope here,
+    and minting one with an empty scope would put a fabricated authorisation somewhere that reads it as
+    real. `FlaggedChangesPanelViewModel.DeviationHeading` names the worker-declared rows as their own
+    group (`WORKER-DECLARED DEVIATIONS (n)`) — every other row in that panel is something the daemon
+    detected in the diff, and these are the one claim in the review that nothing verifies. Design:
+    `docs/design/coordinator-phase-3-decisions.md` §26),
     `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel`/`EscalatedPlanViewModel`
     (the coordinator conversation + the **worker-authored** plan approval card; Approve is the panel's
     accent. The conversation half is no longer mounted (the coordinator surface is the inline terminal
@@ -669,10 +726,32 @@
     a card that latched its buttons disabled — on a throw, or on a decision that returned while the plan
     stayed pending with the same id/revision and `Refresh` therefore kept the same instance mounted — took
     away the operator's only means of clearing backpressure. Built entirely from existing theme tokens — a
-    warning, a stop and a failure are things the design system already has words for), `AgentDocumentViewModel` +
+    warning, a stop and a failure are things the design system already has words for),
+    **`VerificationPanelViewModel.cs`** (H4 — one entry's verification VERDICT and its recorded output on
+    demand, composed identically into `QueueEntryViewModel` and `AgentDocumentViewModel` so the two
+    surfaces cannot drift into saying different things about one record. Three outcomes and never two:
+    green, red, and *no record at all* — the collapse of red into never-run is the defect it exists to end.
+    `ToggleCommand` fetches the log through `IMergeQueueService.GetVerificationLogAsync` on FIRST expand
+    only, caches it against the verdict it belongs to and drops it when a new verdict arrives; it never
+    calls `RunVerificationAsync`, because charging a human a minutes-long jail run to find out why a run
+    failed is the problem, not the fix. `LogNotice` keeps the daemon's distinct answers distinct —
+    truncated tail / artifact gone / run printed nothing / daemon unreachable — so none of them renders as
+    an empty box. `IsStale` is the fourth distinction and the one a live run found missing: a conflicted
+    keep-alive rebase parks an entry back at `Working` WITHOUT clearing its verdict, so a card read
+    `Tests passed · node test.js · <timestamp>` directly above "rebasing this branch onto the new main
+    hit a conflict…". The record is qualified, never rewritten — `IsPassed` stays true and `CanMerge` is
+    untouched, since the authorisation was right and only the sentence was wrong — and the qualifier goes
+    INSIDE the verdict clause so a reader who stops at the first three words has already been told.
+    `VerdictStillStands` is the positive list (`Working`/`Verifying`/`StaleVerified` are the states that
+    moved the branch or its main out from under a run; `Merged`/`Rejected`/`Discarded` did not), written
+    that way so a state added later is stale until someone decides it is not),
+    `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
-    Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
+    Merge button, plus the shared `Verification` panel and a `VerifiedAgainstText` main@sha stamp — these
+    replaced a single `ReviewFactsText` line that printed either an invented `{TestsPassed}/{TestsTotal}
+    tests green` or, for everything else including a branch whose tests had just failed, "no verification
+    record yet"), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
     `QueueSeedingPanelViewModel` (the DEV-ONLY seeding card, docs/design/queue-seeding.md §6-7 — a thin
     driver over `IQueueSeedingGateway` whose scenario presets are CLIENT-side compositions of the RPC
     primitives ("Stale pair" is literally two specs in one ordered batch; "Merge during verify" holds
@@ -696,7 +775,15 @@
   - `TerminalViewModel` (P2-03) wires the engine (`ITerminalView`) to the daemon stream
     (`ITerminalGateway`): forwards engine keystrokes (incl. Ctrl+C→0x03) to the daemon, feeds daemon
     `raw` output into the engine, and debounces (~50 ms) layout resizes before propagating them
-    (SIGWINCH) — it touches only the interface, so P2-18 swaps the engine with no VM change. Derives
+    (SIGWINCH) — it touches only the interface, so P2-18 swaps the engine with no VM change. The
+    keystroke forward (`ForwardInputAsync`) is necessarily fire-and-forget — a key event cannot block
+    the UI thread on a round-trip — so it OBSERVES every outcome: a genuine delivery failure sets
+    `InputDeliveryError`, which `TerminalView` renders as a banner over the pane, and the next input
+    that lands clears it. Teardown exceptions (cancel/dispose, including the transport's
+    `RpcException(Cancelled)` and anything the gateway wrapped one in) are classified out. It used to
+    catch only `OperationCanceledException`, which is how three characters typed at a jailed CLI
+    vanished with nothing said (stress S1 / G5). A dropped SIGWINCH is deliberately NOT surfaced —
+    self-correcting, and not something the operator typed — but it is no longer left unobserved. Derives
     from `ViewModelBase` (not bare `ObservableObject`) so `ViewLocator` resolves it to `TerminalView`
     inside a `ContentControl` — the coordinator surface and the agent dock both rely on that resolution.
   - `BootstrapProgressViewModel` (P2-05: drives the `MainguardOsBootstrapper` off the UI thread,
@@ -777,7 +864,11 @@
     launchd toggle; Continue gates only on engine + daemon, marks `MacOobeState` completed and
     hands off to the SAME startup-window path the control-center route takes.
     `ProDesktopHost.DecideLaunchRoute` routes macOS by the completed marker, and the keep-alive /
-    resume-task-sweep Windows machinery no-ops there), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
+    resume-task-sweep Windows machinery no-ops there), `JailLimitsSettingsViewModel` (+ `Views/JailLimitsSettingsView`,
+    a `UserControl` page — 2026-09-04, owner decision: the Settings **Agent Jails** page, memory GiB and CPUs
+    per jail over `IJailLimitsGateway`; a save re-renders from what the daemon PERSISTED (clamped), a refused
+    save is an error on the page, `FleetNote` words what six workers could take, and Reset restores the
+    defaults on the page only until Save), `PrIntakeSettingsViewModel`/`PrIntakeSourceRowViewModel` (P2-12: the
     Settings **PR Intake** page — the on/off switch, poll cadence, shared bot-author list and the
     subscribed `(host, owner, repo, author-filter)` sources. **All of it is DAEMON state, edited over
     gRPC through `IPrIntakeGateway`** — `Load`/`Save`/`AddSource` are round trips, `Save` re-renders from
@@ -865,7 +956,12 @@
   is a rejection).
 - **`ViewModels/Agents/`** — the P2-13 activity-bar/docking primitives (App-only): `AgentStatus.cs`
   (the nine-value UI badge status + pure total `AgentStatusMap` from
-  `AgentLifecycleState`/`WorkerMergeState`), `AttentionPolicy.cs` (pure attention derivation —
+  `AgentLifecycleState`/`WorkerMergeState` — "total" is a claim its `_ =>` fallback cannot falsify, so
+  `WorkerMergeState.VerificationFailed` maps to `Conflict` EXPLICITLY (the badge this enum reserves for
+  "needs human intervention"; not `Dead` — the branch is still the agent's to fix) rather than sliding
+  into the `Working` default and badging a failed branch as ordinary live work, and
+  `EveryMergeState_HasADeliberateBadge_NotTheWorkingFallback` pins that exactly one state badges
+  `Working`), `AttentionPolicy.cs` (pure attention derivation —
   AwaitingReview/Conflict/plan-pending, + the waiting/blocked transition test the notifier uses),
   `AgentListProjection.cs` (pure LIFO ordering the rail and its test share),
   `AgentWorkspaceViewModel.cs` (per-agent **Dock.Avalonia** workspace: Terminal + agent-diff + staging
@@ -882,6 +978,14 @@
     seam: composes via Core's pure `DaemonRefreshToast.TryCompose` (Refreshed/RefreshFailed only) and
     posts the shell toast onto the UI thread into `MainWindowViewModel.Toasts`; no main window or no
     toast-worthy outcome means nothing happens.
+  - `JailText.cs` — renders sandbox-produced text safe to DISPLAY, the client-side twin of the daemon's
+    `AgentIpcServer.Echo` (which does the same before anything is logged). `GetVerificationLog` is the one
+    path that hands jail bytes straight to a human surface — an artifact written by a test runner inside
+    the worker's own jail — so `DaemonBackedOrchestrator` sanitizes at the projection boundary and no
+    consumer can forget: newlines and tabs kept (structure in a test log), other control characters made
+    visible as `.` rather than silently dropped, CR/CRLF collapsed to one break, and ANSI escape sequences
+    consumed WHOLE (CSI/OSC/two-character, including one the daemon's tail cut in half) so a coloured
+    reporter's output arrives as the plain text underneath it instead of a smear of `.[31m`.
   - `BrowserLauncher.cs` — the single open-a-URL-in-the-browser path (validates via Core's `SafeWebUrl`,
     then platform-dispatches; best-effort, never throws); ViewModels take it as their default `_openUrl`
     delegate instead of private copies.
@@ -916,10 +1020,30 @@
     bearer token to a port squatter)** — P2-03 adds `AttachTerminal` (the long-lived
     `TerminalService.Attach` bidi call); P2-06 adds `ProvisionRepoAsync` (→
     `ProvisionedRepo(RepoHandle, SyncRemoteName, SyncRemoteUrl)`); PR3 adds `ListInstalledAdaptersAsync`
-    and a `role` parameter on `SpawnAgentAsync`.
+    and a `role` parameter on `SpawnAgentAsync`; H4 adds `GetVerificationLogAsync` (the CONTENT of an
+    entry's last verification artifact — never its daemon path, G-14).
   - `ITerminalGateway.cs` (P2-03) — the ViewModel-facing seam onto that stream: `DaemonTerminalGateway`
     writes the first `agent_id` frame then forwards input/resize and raises `OutputReceived` for each
-    `raw` frame; a fake backs the ViewModel tests.
+    `raw` frame; a fake backs the ViewModel tests. **Every frame it sends — selector, input, resize —
+    goes through the one `TerminalWriteQueue` below** (stress S1 / G5: gRPC permits a single in-flight
+    `WriteAsync` per request stream, and this class has three concurrent writers, so a keystroke
+    landing inside another frame's round-trip threw `Can't write the message because the previous
+    write is in progress` into a fire-and-forget task and the character was silently gone). Two
+    consequences of that: `SendInputAsync`/`SendResizeAsync` return a task that completes only once
+    the frame is actually written and FAULTS when it is not, and input sent before an attach (or
+    after a dispose) now says so instead of returning `Task.CompletedTask` for bytes that went
+    nowhere. `AttachOverride`/`WriteQueueCapacity` are the internal test seams
+    (`TerminalInputSerializationTests`).
+  - `TerminalWriteQueue.cs` — the serializing writer behind `DaemonTerminalGateway`: a bounded
+    (4096-frame) channel plus one pump task, so a concurrent caller QUEUES instead of throwing.
+    Ordering is the order `EnqueueAsync` was called (a synchronous `TryWrite` under the lock — the
+    caller's position is fixed before it ever awaits), because out-of-order keystrokes would turn
+    character loss into character transposition. Backpressure is the bound: a stream slow enough to
+    bank the whole queue is refused loudly rather than growing without limit. Teardown (`Close`)
+    fails everything queued and every later enqueue immediately — a write posted after detach must
+    not hang on a stream nobody will read — and a write that genuinely fails poisons the queue, so
+    every frame after the break reports failure rather than reporting success for bytes that go
+    nowhere.
   - `AutoDetectScan.cs` — the pure directory walk behind the sidebar's "auto-detect repositories"
     folder browse, split out of `MainWindowViewModel.ScanAutoDetectFolderAsync` so the walk is
     unit-pinned (`AutoDetectScanTests`) while the ViewModel keeps only the persistence around it.
@@ -962,6 +1086,10 @@
     than re-typing the clamp) serves the render harness/preview only — deliberately not a default
     anywhere, because a settings surface silently defaulting to storage the daemon never reads IS the
     defect this seam exists to remove.)
+  - `IJailLimitsGateway.cs` / `DaemonJailLimitsGateway.cs` (2026-09-04: the Agent Jails page's seam onto the
+    daemon's per-jail ceiling — `JailLimitsView` in GiB/CPUs plus the band the daemon clamps to; the shipped
+    gateway is `AgentService.GetJailLimits`/`SetJailLimits` over the same lazy loopback `DaemonClient` as
+    intake, built via `ProComposition.JailLimitsGatewayFactory`.)
   - `DaemonPrIntakeGateway.cs` (the SHIPPED `IPrIntakeGateway`, over `PrIntakeService`'s
     `GetPrIntakeSettings`/`UpdatePrIntakeSettings`/`SubscribePrIntakeSource`. Stateless — every load is a
     fresh read, and a save returns the daemon's PERSISTED values (clamped cadence, defaulted bot list),
@@ -1014,7 +1142,13 @@
     costs a round of the revision budget either way — and it **propagates a failure** instead of the
     blanket `catch (Exception) {}` it used to end in: that swallow made a decision which never reached the
     daemon indistinguishable from one that landed, so the panel could not tell the human their approval was
-    lost while the worker stayed blocked. `CreateBundle()` is the shipped-app factory
+    lost while the worker stayed blocked. **(2026-08-31) `ApplyQueueUpdate` also projects what a human
+    APPROVED** — `ApprovedPlanId`/`ApprovedPlanTitle`/`ApprovedApproach`/`DeviationDeclaration` onto
+    `QueueEntry`, through `NullIfEmpty` so proto3's empty-string default becomes `null`: "never approved
+    against anything" and "approved, with nothing written down" are different, and the review surface
+    decides whether to draw an approval panel from exactly this. Same shape of defect as
+    `VerifiedMainSha`, which the daemon had always sent and this projection had always dropped.
+    `CreateBundle()` is the shipped-app factory
     (`OrchestratorServices` over a loopback `DaemonClient`). **PR3:** it also implements `ICliAgentHost`
     — `ListInstalledClisAsync` (the `ListInstalledAdapters` RPC), `StartCoordinatorAsync` (keystore key
     resolved via `ApiKeyProviderMap` from the adapter's declared env-var name — no provider mapping

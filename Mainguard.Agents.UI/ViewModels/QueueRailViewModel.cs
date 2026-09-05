@@ -25,6 +25,23 @@ public partial class QueueRailViewModel : ViewModelBase
     public ObservableCollection<QueueEntryViewModel> Entries { get; } = new();
 
     [ObservableProperty] private string _mainShaText = "";
+
+    /// <summary>The mirror's freshness (2026-09-04): "mirror refreshed N min ago", or the daemon's error
+    /// when its last pull from the checkout failed. Empty until the daemon has tried once.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMirrorError))]
+    [NotifyPropertyChangedFor(nameof(HasMirrorNote))]
+    private string _mirrorText = "";
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMirrorError))]
+    [NotifyPropertyChangedFor(nameof(HasMirrorNote))]
+    private bool _mirrorRefreshFailed;
+
+    public bool HasMirrorError => MirrorRefreshFailed && MirrorText.Length > 0;
+
+    /// <summary>The quiet form of the line — a successful refresh, rendered muted.</summary>
+    public bool HasMirrorNote => !MirrorRefreshFailed && MirrorText.Length > 0;
     [ObservableProperty] private string _gateText = "";
     [ObservableProperty] private bool _isEmpty;
 
@@ -57,10 +74,30 @@ public partial class QueueRailViewModel : ViewModelBase
         Refresh();
     }
 
+    /// <summary>The freshness line, from the daemon's two facts. Pure so the wording is testable.</summary>
+    internal static (string Text, bool Failed) MirrorFreshness(DateTimeOffset? refreshedAt, string? error, DateTimeOffset now)
+    {
+        if (refreshedAt is null)
+        {
+            return ("", false);
+        }
+
+        var age = now - refreshedAt.Value;
+        var ago = age < TimeSpan.FromMinutes(1) ? "just now"
+            : age < TimeSpan.FromHours(1) ? $"{(int)age.TotalMinutes} min ago"
+            : $"{(int)age.TotalHours} h ago";
+
+        return string.IsNullOrEmpty(error)
+            ? ($"mirror refreshed from your checkout {ago}", false)
+            : ($"mirror could not be refreshed from your checkout ({ago}) — {error}", true);
+    }
+
     public void Refresh()
     {
         var snapshot = _queue.GetQueue();
         MainShaText = "main " + _queue.MainSha;
+        (MirrorText, MirrorRefreshFailed) = MirrorFreshness(
+            _queue.MirrorMainRefreshedAt, _queue.MirrorMainRefreshError, DateTimeOffset.UtcNow);
 
         // In-place sync so unchanged rows keep their visuals (no churn, no reflow).
         for (int i = Entries.Count - 1; i >= 0; i--)
@@ -148,6 +185,14 @@ public partial class QueueEntryViewModel : ViewModelBase
 
     public string AgentId { get; }
 
+    /// <summary>
+    /// This row's verification verdict and its on-demand output (H4). A child VM rather than more
+    /// properties here because the worker pane composes the identical one: the two surfaces were both
+    /// saying "not verified yet" about a red run, and sharing the projection is what keeps them from
+    /// drifting apart again.
+    /// </summary>
+    public VerificationPanelViewModel Verification { get; }
+
     [ObservableProperty] private string _name = "";
     [ObservableProperty] private string _branch = "";
     [ObservableProperty] private string _stateWord = "";
@@ -196,7 +241,59 @@ public partial class QueueEntryViewModel : ViewModelBase
     [ObservableProperty] private bool _isVerificationStalled;
 
     /// <summary>The two-step guard on the destructive action: the row asks before it drops anything.</summary>
-    [ObservableProperty] private bool _isConfirmingDiscard;
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsConfirming))]
+    private bool _isConfirmingDiscard;
+
+    // ---- The parked rebase conflict, and the two things a human can do about it ----------------------
+    //
+    // The daemon blocks a conflicted entry with a reason naming a required human action ("the agent is
+    // paused with the rebase in progress and needs a human to resolve it") and, until these existed, the
+    // row offered no operation that could perform it: the jail was paused, so Verify could not run in it,
+    // Review was absent (the entry is not Verified — which is precisely what a conflict makes it), and the
+    // only remaining control threw the work away. A card that names an action the product does not have
+    // reads as the recovery the human is looking for, and teaches them the product is broken.
+
+    /// <summary>True while the daemon reports a worktree parked mid-rebase for this entry. Gates the two
+    /// conflict controls and the fact lines beneath them — never inferred from the state word, which
+    /// cannot tell a conflicted entry from any other <c>Working</c> one.</summary>
+    [ObservableProperty] private bool _hasRebaseConflict;
+
+    /// <summary>Where the parked worktree is, as provenance. Rendered, never opened: on every substrate
+    /// but a Mac host this is a path inside the daemon's environment rather than the user's filesystem.</summary>
+    [ObservableProperty] private string _conflictWorktree = "";
+
+    /// <summary>
+    /// The conflicting files, or the honest admission that they could not be measured.
+    ///
+    /// <para>An empty path list from the daemon means NOT MEASURED, and this is where that distinction
+    /// has to survive: rendering an empty list as "no files conflict" would contradict the card it sits
+    /// on.</para>
+    /// </summary>
+    [ObservableProperty] private string _conflictPathsText = "";
+
+    /// <summary>True only while this row's own conflict action is in flight — the same latch Verify and
+    /// Resume keep, for the same reason: a refused action moves no queue state and therefore pushes no
+    /// stream update, so a double press fires two RPCs and the second reports a failure for the action the
+    /// human just performed.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(ResolveConflictButtonText))]
+    private bool _isConflictRequestInFlight;
+
+    public string ResolveConflictButtonText =>
+        IsConflictRequestInFlight ? "Handing back…" : "Let the agent resolve";
+
+    /// <summary>The two-step guard on the abort. It throws away rebase progress and cannot be undone, so
+    /// it asks first — the same idiom Discard uses, and for the same reason.</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsConfirming))]
+    private bool _isConfirmingAbortRebase;
+
+    /// <summary>True while EITHER confirmation is showing — what the action row hides behind. One property
+    /// rather than two negated bindings in the view: with two guards on one row, an <c>IsVisible</c> that
+    /// only knew about one of them would leave the action row and a confirmation prompt on screen
+    /// together, each offering to do something to the same entry.</summary>
+    public bool IsConfirming => IsConfirmingDiscard || IsConfirmingAbortRebase;
 
     /// <summary>
     /// True for a <b>stranded</b> entry: non-terminal, and the daemon positively reports that it has no
@@ -250,6 +347,7 @@ public partial class QueueEntryViewModel : ViewModelBase
         _queue = queue ?? throw new ArgumentNullException(nameof(queue));
         _report = report;
         _resumeAgentKind = resumeAgentKind;
+        Verification = new VerificationPanelViewModel(agentId, _queue);
         // Decide the affordance up front rather than leaving it on `bool`'s default false: a row that
         // renders before its first Update would otherwise show a dead Verify button.
         RecomputeCanVerify();
@@ -271,14 +369,20 @@ public partial class QueueEntryViewModel : ViewModelBase
             WorkerMergeState.Verifying when IsVerificationStalled => "Stalled",
             WorkerMergeState.StaleVerified => "Stale",
             WorkerMergeState.AwaitingReview => "Awaiting review",
+            // H2's red verdict, in words a person reads rather than an enum name. The state itself is what
+            // makes the row honest — before it, a failed verification was persisted as `Working` and this
+            // row said the same thing about it as about a branch nobody had ever tested.
+            WorkerMergeState.VerificationFailed => "Tests failed",
             var s => s.ToString(),
         };
-        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in a
-        // VerificationRecord, which would fabricate a pass/fail verdict the daemon didn't send. The old
-        // read looked only at Verification, which the daemon projection never populates, so the stamp
-        // could never render in the shipped app.
-        var verifiedSha = entry.VerifiedMainSha is { Length: > 0 } wireSha ? wireSha : entry.Verification?.MainSha;
-        VerifiedAgainst = verifiedSha is { Length: > 0 } sha
+        // H4: the verdict and its output, from the same projection both surfaces read.
+        Verification.Update(entry);
+
+        // The wire carries the sha as its own field (VerifiedMainSha) — deliberately NOT wrapped in the
+        // verdict, which would have meant fabricating a pass/fail to carry a sha. The old read fell back to
+        // a client-side record the daemon projection never populated, so the stamp could never render in
+        // the shipped app.
+        VerifiedAgainst = entry.VerifiedMainSha is { Length: > 0 } sha
             && entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview
             ? $"main@{Shorten(sha)}" : "";
         IsReviewable = entry.State is WorkerMergeState.Verified or WorkerMergeState.AwaitingReview;
@@ -297,6 +401,24 @@ public partial class QueueEntryViewModel : ViewModelBase
         if (!CanDiscard)
         {
             IsConfirmingDiscard = false;
+        }
+
+        // The conflict facts, straight from the daemon's measurement. Nothing here is derived from the
+        // state word: a parked rebase leaves the entry at `Working`, which is also where every branch that
+        // has simply never been verified sits, so the two are indistinguishable without this field.
+        HasRebaseConflict = entry.RebaseConflict is not null;
+        ConflictWorktree = entry.RebaseConflict?.Worktree ?? "";
+        ConflictPathsText = entry.RebaseConflict is not { } conflict
+            ? ""
+            : conflict.Paths.Count == 0
+                // NOT "no files conflict". An empty list is the daemon saying it could not measure them,
+                // and rendering that as reassurance would contradict the card it is printed on.
+                ? "Conflicting files: not measured — open the worktree to see them."
+                : $"Conflicting {(conflict.Paths.Count == 1 ? "file" : "files")}: "
+                    + string.Join(", ", conflict.Paths);
+        if (!HasRebaseConflict)
+        {
+            IsConfirmingAbortRebase = false;
         }
 
         // Stranded: a non-terminal entry the daemon says has no jail. `== false` rather than `!= true` on
@@ -320,6 +442,10 @@ public partial class QueueEntryViewModel : ViewModelBase
             // arrive (a mock, a future projection) it reads as the muted, finished, not-merged thing it is
             // — never borrowing Merged's success green.
             WorkerMergeState.Discarded => ("DismissIcon", false, true, false, false, false, false),
+            // A failed verification is a DANGER, not the muted fallback: it is the one row on the rail
+            // that is red for a reason the human has to act on. It keeps Verify (retry) and Discard —
+            // RecomputeCanVerify and CanDiscard both exclude only the terminal states, and this is not one.
+            WorkerMergeState.VerificationFailed => ("DismissIcon", false, false, false, false, false, true),
             _ => ("AgentWorkingIcon", false, true, false, false, false, false),
         };
     }
@@ -370,10 +496,27 @@ public partial class QueueEntryViewModel : ViewModelBase
     /// <summary>The single place the Verify affordance is decided, so the command and the stream
     /// refresh can never disagree about it.</summary>
     private void RecomputeCanVerify() =>
-        // Offered on every state a run can legally start from — including Verified, because
-        // RE-verifying against a moved main is the normal way a stale entry gets fresh again. Withheld
-        // while a run is in flight (the daemon refuses a concurrent one) and on the terminal states,
-        // where there is nothing left to verify.
+        // Offered on exactly the states the daemon's transition table can start a run FROM — Working,
+        // StaleVerified and VerificationFailed — and on nothing else.
+        //
+        // It used to be offered on Verified and AwaitingReview too, on the belief that "re-verifying
+        // against a moved main is the normal way a stale entry gets fresh again". That belief was about a
+        // state this button was not being offered for: a moved main puts the entry at StaleVerified, which
+        // IS a legal source. Verified and AwaitingReview are not, and never were — MergeQueue's Legal
+        // table has no Verified → Verifying edge — so pressing Verify there did the same thing every time
+        // for the life of the feature: `RunVerification refused … Illegal merge-state transition
+        // Verified → Verifying`, straight into the row's message slot (observed live 2026-08-30 02:18 on
+        // agent 4c43d17a, whose branch had by then moved three commits past its green). An action that is
+        // offered and always fails is worse than an absent one: it reads as the recovery the human is
+        // looking for, and it teaches them the product is broken rather than that the entry is fine.
+        //
+        // A Verified entry needs no Verify: it is green against its current tip. When that stops being
+        // true — the worker pushes again — the daemon walks the entry to Working
+        // (MergeQueue.NotifyBranchAdvanced) and this button comes back on its own, which is the recovery
+        // the old comment was reaching for.
+        //
+        // Withheld while a run is in flight (the daemon refuses a concurrent one) and on the terminal
+        // states, where there is nothing left to verify.
         //
         // …and withheld when the daemon says this entry has NO JAIL. Verification runs in the worker's own
         // sandbox and never on the host, so pressing Verify there can only ever produce "Agent 'x' has no
@@ -382,9 +525,8 @@ public partial class QueueEntryViewModel : ViewModelBase
         // strength of a fact the projection never supplied would be the worse mistake.
         CanVerify = !IsVerifyRequestInFlight
             && _hasLiveSandbox != false
-            && _lastState is not (
-                WorkerMergeState.Verifying or WorkerMergeState.Merged or WorkerMergeState.Rejected
-                or WorkerMergeState.Discarded);
+            && _lastState is WorkerMergeState.Working or WorkerMergeState.StaleVerified
+                or WorkerMergeState.VerificationFailed;
 
     /// <summary>Arms the destructive action. Nothing has been asked of the daemon yet.</summary>
     [RelayCommand]
@@ -447,6 +589,67 @@ public partial class QueueEntryViewModel : ViewModelBase
             // resume the daemon refused moves no queue state, so it pushes no snapshot, so a button left
             // latched would stay dead for the session.
             IsResumeRequestInFlight = false;
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>
+    /// "Let the agent resolve": asks the daemon to unpause the parked jail and instruct the worker to
+    /// finish resolving its own rebase.
+    ///
+    /// <para><b>Not confirmed first, unlike the abort beside it.</b> It changes nothing that cannot be
+    /// undone — the branch stays exactly as it is, mid-rebase — and the entry can still be aborted or
+    /// discarded afterwards. Ceremony on the recovery action while the irreversible one asks is the wrong
+    /// way round, which is the same call <see cref="ResumeAsync"/> makes.</para>
+    /// </summary>
+    [RelayCommand]
+    private async Task ResolveConflictWithAgentAsync()
+    {
+        if (_lifecycleRequestInFlight || IsConflictRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        IsConflictRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner
+                .ResolveConflictWithAgentAsync(_queue, AgentId, _report)
+                .ConfigureAwait(true);
+        }
+        finally
+        {
+            // Re-armed here rather than from the next stream update, for the reason Verify and Resume are:
+            // a refused request moves no queue state, pushes no snapshot, and would leave the button dead
+            // for the session.
+            IsConflictRequestInFlight = false;
+            _lifecycleRequestInFlight = false;
+        }
+    }
+
+    /// <summary>Arms the abort. Nothing has been asked of the daemon yet.</summary>
+    [RelayCommand]
+    private void BeginAbortRebase() => IsConfirmingAbortRebase = true;
+
+    /// <summary>Disarms it.</summary>
+    [RelayCommand]
+    private void CancelAbortRebase() => IsConfirmingAbortRebase = false;
+
+    /// <summary>The confirmed abort: <c>git rebase --abort</c> in the parked worktree, then the jail runs
+    /// again. Every decision is the daemon's, including whether the rebase is still there to abort.</summary>
+    [RelayCommand]
+    private async Task ConfirmAbortRebaseAsync()
+    {
+        IsConfirmingAbortRebase = false;
+        if (_lifecycleRequestInFlight || IsConflictRequestInFlight) return;
+
+        _lifecycleRequestInFlight = true;
+        IsConflictRequestInFlight = true;
+        try
+        {
+            await MergeActionRunner.AbortRebaseAsync(_queue, AgentId, _report).ConfigureAwait(true);
+        }
+        finally
+        {
+            IsConflictRequestInFlight = false;
             _lifecycleRequestInFlight = false;
         }
     }

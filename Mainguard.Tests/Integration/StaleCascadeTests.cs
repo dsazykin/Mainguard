@@ -102,7 +102,7 @@ public class StaleCascadeTests
     }
 
     [Fact]
-    public async Task VerificationFailsAfterRebase_ReturnsToWorking_NotSilentlyRetried()
+    public async Task VerificationFailsAfterRebase_SurfacesTheFailure_NotSilentlyRetried()
     {
         var b = new Builder();
         var q = b.Build();
@@ -115,7 +115,10 @@ public class StaleCascadeTests
         b.ReleaseRequeue();
         await q.LastCascade;
 
-        Assert.Equal(WorkerMergeState.Working, q.GetState("B")); // surfaced back to Working
-        Assert.False(q.CanMerge("B", out _));
+        // H2: the cascade's re-verification failed, and a failure is now its own state rather than the
+        // Working an unverified branch sits in. Still surfaced, never silently retried.
+        Assert.Equal(WorkerMergeState.VerificationFailed, q.GetState("B"));
+        Assert.False(q.CanMerge("B", out var reason));
+        Assert.Contains("FAILED", reason);
     }
 }

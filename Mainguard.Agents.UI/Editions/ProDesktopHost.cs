@@ -138,7 +138,9 @@ public static class ProDesktopHost
             window.Show();
 
             var env = new ProductionShutdownEnvironment(ReleaseKeepAlive, StopVmScopedAsync, ProComposition.LogOobe);
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+            // 60 s, not 15: the sequence now stops every live agent first, and each stop harvests logins
+            // and publishes a branch before the jail goes.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             await new AppShutdownSequence(env).RunAsync(vm, cts.Token).ConfigureAwait(true);
         }
         catch (Exception ex)

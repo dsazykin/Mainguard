@@ -17,11 +17,49 @@
          · backpressure  — blocked workers filled the worker cap, so the coordinator has STOPPED spawning.
                            Indistinguishable from a hang unless this says so; the sentence is the daemon's
                            own, not re-derived, so the number that refuses the spawn is the number read.
-         · escalated     — the revision budget is spent and the worker stopped. Deliberately no button.
          · pending       — one card PER BLOCKED WORKER, with Scope and Approach, Approve, and Reject
-                           carrying feedback the worker revises against. -->
+                           carrying feedback the worker revises against.
+         · escalated     — the revision budget is spent and the worker stopped. No plan decision, because
+                           there is no plan left to decide; the one action is the release its own copy
+                           promises ("steer it or end it").
+
+       ORDER IS DELIBERATE: backpressure, then the DECIDABLE cards, then the escalated ones. The gate is
+       bounded by its host, so something has to be first out of view when it overflows, and it must not be
+       the decision. -->
 
   <StackPanel Spacing="8">
+
+    <!-- THE TOGGLE, and the one state it must never let a human guess at.
+
+         The checkbox is the operator's plan-mode switch; the line under it is the DAEMON's own sentence
+         for the state, not a second wording of it. It is rendered at the top of the gate because this is
+         the surface the decisions arrive on, so it is where a missing decision is noticed.
+
+         Read-only binding plus a Command, deliberately: a two-way binding would let the screen show a
+         setting the daemon rejected or never received. The click moves the box, the command tells the
+         daemon, and the refresh puts the daemon's answer back — so what is ticked is what is enforced. -->
+    <Border Classes="Card" Padding="10,8" CornerRadius="8" BorderThickness="1"
+            BorderBrush="{DynamicResource BorderHairline}">
+      <StackPanel Spacing="3">
+        <CheckBox Content="Require plan approval before a worker starts"
+                  IsChecked="{Binding PlanModeEnabled, Mode=OneWay}"
+                  Command="{Binding TogglePlanModeCommand}"
+                  ToolTip.Tip="On: every worker inspects the repository, writes a plan, and blocks here until you approve it. Off: workers are given their task at spawn and start implementing straight away."/>
+        <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource TextMuted}"
+                   IsVisible="{Binding PlanModeEnabled}"/>
+        <!-- Off is the state that costs something, so it is the state that gets the warning hue: an
+             approval step the human may still believe they have is not there. -->
+        <TextBlock Text="{Binding PlanModeSummary}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource WarningBrush}"
+                   IsVisible="{Binding !PlanModeEnabled}"/>
+        <!-- A toggle the daemon refused or never received. The box has already snapped back to the
+             daemon's answer; this is the reason, on the surface the click happened on. -->
+        <TextBlock Text="{Binding PlanModeErrorText}" FontSize="11" TextWrapping="Wrap"
+                   Foreground="{DynamicResource DangerBrush}"
+                   IsVisible="{Binding HasPlanModeError}"/>
+      </StackPanel>
+    </Border>
 
     <!-- The legible stall. Bordered and named when the cap is saturated by blocked plans, because at that
          point it is not a status line — it is the explanation for why nothing is happening. -->
@@ -41,29 +79,6 @@
       </StackPanel>
     </Border>
 
-    <!-- Escalated workers: the revision budget is spent, so there is deliberately no decision button.
-         The loop is over; what is left is a human choosing to steer the worker or end it. -->
-    <ItemsControl ItemsSource="{Binding EscalatedPlans}">
-      <ItemsControl.ItemTemplate>
-        <DataTemplate x:DataType="vm:EscalatedPlanViewModel">
-          <Border Classes="Card" Padding="10" Margin="0,0,0,6" CornerRadius="8"
-                  BorderThickness="1" BorderBrush="{DynamicResource DangerBrush}">
-            <StackPanel Spacing="4">
-              <TextBlock Text="Escalated to you" FontSize="10" FontWeight="SemiBold"
-                         Foreground="{DynamicResource DangerBrush}"/>
-              <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
-                         Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
-              <TextBlock Text="{Binding HeadlineText}" FontSize="11" TextWrapping="Wrap"
-                         Foreground="{DynamicResource TextPrimary}"/>
-              <TextBlock Text="{Binding LastFeedbackText}" FontSize="11" TextWrapping="Wrap"
-                         Foreground="{DynamicResource TextMuted}"
-                         IsVisible="{Binding HasLastFeedback}"/>
-            </StackPanel>
-          </Border>
-        </DataTemplate>
-      </ItemsControl.ItemTemplate>
-    </ItemsControl>
-
     <!-- One worker-authored plan card per blocked worker. Scope is the load-bearing field (§5.2): it is
          what the human is actually consenting to, and it is the field that proves the worker read the
          repository rather than guessed at it. -->
@@ -73,6 +88,14 @@
           <Border Classes="Card" Padding="10" Margin="0,0,0,6" CornerRadius="8"
                   BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1">
             <StackPanel Spacing="6">
+              <!-- A re-scope is a materially DIFFERENT decision from a first presentation: the human is
+                   changing what an already-running worker is cleared to touch, having said yes once
+                   already. The card names that above the title, because the two are otherwise
+                   indistinguishable and the wrong reading of "Reject" here — that it stops the worker —
+                   is the one that pressures a yes. -->
+              <TextBlock Text="{Binding RescopeHeadlineText}" FontSize="10" FontWeight="SemiBold"
+                         TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"
+                         IsVisible="{Binding IsRescope}"/>
               <Grid ColumnDefinitions="*,Auto">
                 <TextBlock Grid.Column="0" Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
                            TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
@@ -83,6 +106,23 @@
               <TextBlock Text="{Binding RevisedAgainstText}" FontSize="11" TextWrapping="Wrap"
                          Foreground="{DynamicResource TextMuted}"
                          IsVisible="{Binding HasFeedbackHistory}"/>
+              <!-- WHAT CHANGED, above the full scope. Approving a widening against a list the human is
+                   expected to be holding in their head is not a decision they can actually make. Drops is
+                   its own row in its own colour: a re-scope that removes a path already agreed to is the
+                   one direction this op can take something away in, and a card rendering only additions
+                   is exactly where that would hide. -->
+              <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto" IsVisible="{Binding IsRescope}">
+                <TextBlock Grid.Row="0" Grid.Column="0" Text="Adds" FontSize="11"
+                           Foreground="{DynamicResource TextMuted}" IsVisible="{Binding HasAddedScope}"/>
+                <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding AddedScopeText}" FontSize="11"
+                           TextWrapping="Wrap" Foreground="{DynamicResource WarningBrush}"
+                           IsVisible="{Binding HasAddedScope}"/>
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="Drops" FontSize="11"
+                           Foreground="{DynamicResource TextMuted}" IsVisible="{Binding HasRemovedScope}"/>
+                <TextBlock Grid.Row="1" Grid.Column="1" Classes="Mono" Text="{Binding RemovedScopeText}" FontSize="11"
+                           TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
+                           IsVisible="{Binding HasRemovedScope}"/>
+              </Grid>
               <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto,Auto">
                 <TextBlock Grid.Row="0" Grid.Column="0" Text="Scope" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
                 <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding ScopeText}" FontSize="11"
@@ -101,7 +141,10 @@
                    revises against it and presents again. An empty box costs a round of the budget. -->
               <TextBox Text="{Binding FeedbackText}" FontSize="11" AcceptsReturn="True" MaxHeight="72"
                        Watermark="What should the worker change? This text goes back to it."/>
-              <TextBlock Text="This is the last revision — rejecting again stops the worker and escalates to you."
+              <!-- The consequence of one more no, and it is NOT the same consequence on both card kinds:
+                   on a first plan it stops the worker, on a re-scope it only closes the widening. The VM
+                   owns the wording so the card cannot promise the wrong one. -->
+              <TextBlock Text="{Binding LastRoundWarningText}"
                          FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource DangerBrush}"
                          IsVisible="{Binding NextRejectionEscalates}"/>
 
@@ -117,6 +160,83 @@
                 <!-- Approve is the panel's one accent: it is the product thesis, and it is not destructive. -->
                 <Button Classes="Accent" Content="Approve plan" FontSize="12"
                         Command="{Binding ApproveCommand}" IsEnabled="{Binding !IsDeciding}"/>
+              </StackPanel>
+            </StackPanel>
+          </Border>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
+
+    <!-- Escalated workers: the revision budget is spent, so there is no plan left to approve.
+
+         ORDERED LAST, BELOW the decidable cards, and that ordering is the point. These cards carry no
+         approval, so nothing here unblocks a worker or relieves the cap — while every card above does.
+         When the gate overflows its share of the pane the clip therefore lands on the cards with the
+         least to lose, instead of pushing the one decision that matters off the bottom (which is exactly
+         what the live run hit: an escalated card stacked on top, and the pending plan below it unreachable).
+
+         It DOES carry the release its own sentence promises. "Steer it or end it" described two moves, and
+         until now the surface offered neither: the only route to ending an escalated worker was the
+         Resources tab's right-click menu on an unlabelled row, so a worker that escalated held a slot
+         against the worker cap with no discoverable way to give it back. Ending is confirmed in place, and
+         the confirm states the same consequences the Resources one does — this is a second door onto that
+         action, not a softer version of it. -->
+    <ItemsControl ItemsSource="{Binding EscalatedPlans}">
+      <ItemsControl.ItemTemplate>
+        <DataTemplate x:DataType="vm:EscalatedPlanViewModel">
+          <Border Classes="Card" Padding="10" Margin="0,0,0,6" CornerRadius="8"
+                  BorderThickness="1" BorderBrush="{DynamicResource DangerBrush}">
+            <StackPanel Spacing="4">
+              <TextBlock Text="Escalated to you" FontSize="10" FontWeight="SemiBold"
+                         Foreground="{DynamicResource DangerBrush}"/>
+              <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold"
+                         Foreground="{DynamicResource TextPrimary}" TextWrapping="Wrap"/>
+              <TextBlock Text="{Binding HeadlineText}" FontSize="11" TextWrapping="Wrap"
+                         Foreground="{DynamicResource TextPrimary}"/>
+              <TextBlock Text="{Binding LastFeedbackText}" FontSize="11" TextWrapping="Wrap"
+                         Foreground="{DynamicResource TextMuted}"
+                         IsVisible="{Binding HasLastFeedback}"/>
+
+              <!-- The one human act that reopens an escalation (contract §3.1, 2026-09-03): guidance, then
+                   ONE fresh plan. Not offered once it has been used, and never on a re-scope escalation. -->
+              <StackPanel Spacing="4" IsVisible="{Binding ShowRequestAction}">
+                <TextBox Text="{Binding GuidanceText}" Watermark="What should the fresh plan do differently?"
+                         FontSize="11" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="44"/>
+                <TextBlock Text="{Binding RequestErrorText}" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{DynamicResource DangerBrush}"
+                           IsVisible="{Binding HasRequestError}"/>
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                  <Button Classes="Secondary" Content="Request a new plan" FontSize="12"
+                          Command="{Binding RequestNewPlanCommand}" IsEnabled="{Binding !IsRequesting}"
+                          ToolTip.Tip="Sends your guidance to the worker and accepts exactly one fresh plan from it. A second escalation is terminal."/>
+                </StackPanel>
+              </StackPanel>
+
+              <!-- A failed end is said out loud, for the same reason a failed decision is: the card looks
+                   identical either way, and a human who is not told waits on a slot they think they freed. -->
+              <TextBlock Text="{Binding EndErrorText}" FontSize="11" TextWrapping="Wrap"
+                         Foreground="{DynamicResource DangerBrush}"
+                         IsVisible="{Binding HasEndError}"/>
+
+              <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right"
+                          IsVisible="{Binding ShowEndAction}">
+                <Button Classes="DangerQuiet" Content="End this worker" FontSize="12"
+                        Command="{Binding BeginEndCommand}"
+                        IsVisible="{Binding !IsConfirmingEnd}"
+                        ToolTip.Tip="Rejects this worker's work and tears its sandbox down, freeing its slot against the worker cap. Its branch is kept until teardown."/>
+              </StackPanel>
+
+              <!-- The two-step guard, worded the way the Resources confirm is: the object, what changes,
+                   what is kept. Ending is not discarding a queue entry and must not read like it. -->
+              <StackPanel Spacing="4" IsVisible="{Binding IsConfirmingEnd}">
+                <TextBlock Text="{Binding EndConfirmText}" FontSize="11" TextWrapping="Wrap"
+                           Foreground="{DynamicResource TextPrimary}"/>
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                  <Button Classes="Secondary" Content="Keep it" FontSize="12"
+                          Command="{Binding CancelEndCommand}"/>
+                  <Button Classes="Danger" Content="End task" FontSize="12"
+                          Command="{Binding ConfirmEndCommand}" IsEnabled="{Binding !IsEnding}"/>
+                </StackPanel>
               </StackPanel>
             </StackPanel>
           </Border>

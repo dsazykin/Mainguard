@@ -2,6 +2,7 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
              xmlns:conv="using:Mainguard.Agents.UI.Converters"
+             xmlns:views="using:Mainguard.Agents.UI.Views"
              x:Class="Mainguard.Agents.UI.Views.QueueRailView"
              x:DataType="vm:QueueRailViewModel">
 
@@ -25,6 +26,15 @@
       <!-- "main <sha>" is another identifier that must not lose characters — wrap, don't clip. -->
       <TextBlock Classes="Mono" Text="{Binding MainShaText}" FontSize="12" TextWrapping="Wrap"
                  Foreground="{DynamicResource TextMuted}"/>
+      <!-- The mirror's age (2026-09-04): the daemon's main is a copy of the checkout, refreshed on an
+           interval and when this window regains focus; a human reading "main <sha>" needs to know how
+           old that claim is. A failed refresh is a warning, not a footnote. -->
+      <TextBlock Text="{Binding MirrorText}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource TextMuted}"
+                 IsVisible="{Binding HasMirrorNote}"/>
+      <TextBlock Text="{Binding MirrorText}" FontSize="11" TextWrapping="Wrap"
+                 Foreground="{DynamicResource WarningBrush}"
+                 IsVisible="{Binding HasMirrorError}"/>
       <!-- The list scrolls behind a thin, low-contrast thumb, and terminal history sorts to the bottom:
            without a count, a row rendering below the fold reads as an entry that vanished (ISSUES-LOG
            #4, #13 — the second of those was filed as a HIGH data-loss regression against a row that was
@@ -83,10 +93,34 @@
                   <TextBlock Classes="Mono" Text="{Binding VerifiedAgainst}" FontSize="11" TextWrapping="Wrap"
                              Foreground="{DynamicResource TextMuted}"
                              IsVisible="{Binding VerifiedAgainst, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                  <!-- The parked-conflict facts. The gate reason above already says a rebase conflict
+                       needs a human; these two lines say WHERE it is parked and WHAT conflicts, which is
+                       the difference between a sentence and something a person can act on. The worktree is
+                       provenance, not a link: on every substrate but a Mac host it is a path inside the
+                       daemon's environment. Mono because both are identifiers, and wrapped because losing
+                       characters off the end of a path or a filename is exactly the case where an ellipsis
+                       is useless. -->
+                  <StackPanel Spacing="2" IsVisible="{Binding HasRebaseConflict}">
+                    <TextBlock Text="{Binding ConflictPathsText}" FontSize="11" TextWrapping="Wrap"
+                               Foreground="{DynamicResource TextPrimary}"
+                               IsVisible="{Binding ConflictPathsText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                    <TextBlock Classes="Mono" Text="{Binding ConflictWorktree}" FontSize="11" TextWrapping="Wrap"
+                               ToolTip.Tip="The worktree the daemon parked mid-rebase. It lives inside the agent environment, not in your checkout."
+                               Foreground="{DynamicResource TextMuted}"
+                               IsVisible="{Binding ConflictWorktree, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                  </StackPanel>
+
                   <!-- The verification trigger's message line (#307), above the action row. -->
                   <TextBlock Text="{Binding VerifyMessage}" FontSize="11" Foreground="{DynamicResource TextMuted}"
                              TextWrapping="Wrap"
                              IsVisible="{Binding VerifyMessage, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+                  <!-- H4 — the verdict of the last run, and its actual output on demand. It sits on the ROW
+                       because the row is the only surface every entry has: an entry whose agent is gone has
+                       no worker document, and one that never verified cannot reach the review cockpit, so a
+                       log reachable only from either would be missing for exactly the entries that failed.
+                       It reads the recorded output; it never re-runs anything. -->
+                  <views:VerificationPanelView DataContext="{Binding Verification}"/>
 
                   <!-- The row's actions. The rail's ONE accent stays the Review CTA, so nothing else here
                        is Accent: Verify is Secondary (asking for a check is a supporting action) and the
@@ -96,7 +130,7 @@
                        would push the last one off the edge, which is the clipping #306 just fixed above.
                        Every row that can be acted on has a control: the defect this answers was an entry
                        left with NONE, so Discard is on every non-terminal row rather than the front one. -->
-                  <WrapPanel Orientation="Horizontal" IsVisible="{Binding !IsConfirmingDiscard}">
+                  <WrapPanel Orientation="Horizontal" IsVisible="{Binding !IsConfirming}">
                     <Button Classes="Accent" Content="Review" FontSize="12" Padding="10,3" Margin="0,2,6,0"
                             Command="{Binding OpenReviewCommand}" IsVisible="{Binding ShowReviewAccent}"/>
                     <!-- Reviewable rows behind the front one: same action, non-accent (the rail keeps its
@@ -118,10 +152,40 @@
                             Command="{Binding ClearStalledVerificationCommand}"
                             IsVisible="{Binding IsVerificationStalled}"
                             ToolTip.Tip="This entry says Verifying but the daemon is not running anything for it. Clearing puts it back to Working so it can be verified again."/>
+                    <!-- Only for an entry whose worktree the daemon has parked mid-rebase. Secondary, not
+                         Accent: the rail's one accent stays the Review CTA, and a recovery action that
+                         out-shouted the merge CTA would move the surface's emphasis onto cleanup. -->
+                    <Button Classes="Secondary" Content="{Binding ResolveConflictButtonText}" FontSize="12"
+                            Padding="10,3" Margin="0,2,6,0"
+                            Command="{Binding ResolveConflictWithAgentCommand}"
+                            IsEnabled="{Binding !IsConflictRequestInFlight}"
+                            IsVisible="{Binding HasRebaseConflict}"
+                            ToolTip.Tip="Unpause this agent and ask it to finish resolving the rebase itself. It wrote half of the conflict, so it has the context; nothing is decided here and the branch is left exactly as it is."/>
+                    <!-- Destructive by hue rather than by mass, beside the Discard it sits next to: it
+                         throws away the rebase progress (and nothing else — no committed work is lost). -->
+                    <Button Classes="DangerQuiet" Content="Abort rebase" FontSize="12" Padding="10,3" Margin="0,2,6,0"
+                            Command="{Binding BeginAbortRebaseCommand}"
+                            IsEnabled="{Binding !IsConflictRequestInFlight}"
+                            IsVisible="{Binding HasRebaseConflict}"
+                            ToolTip.Tip="Run git rebase --abort in the parked worktree and let the agent run again. The branch goes back exactly where it was — still behind main, so it needs verifying again."/>
                     <Button Classes="DangerQuiet" Content="Discard" FontSize="12" Padding="10,3" Margin="0,2,0,0"
                             Command="{Binding BeginDiscardCommand}" IsVisible="{Binding CanDiscard}"
                             ToolTip.Tip="Drop this entry from the merge queue. The branch and its commits are untouched."/>
                   </WrapPanel>
+
+                  <!-- The abort's two-step guard, on the same idiom the discard uses. It states what is
+                       lost (the replay progress) and what is not (the commits), because "abort" alone
+                       reads as though it might throw the branch away. -->
+                  <StackPanel Spacing="4" IsVisible="{Binding IsConfirmingAbortRebase}">
+                    <TextBlock Text="Abort this rebase? The replay progress is thrown away. The branch and its commits are untouched — it goes back where it was, still behind main, and needs verifying again."
+                               FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
+                    <WrapPanel Orientation="Horizontal">
+                      <Button Classes="Danger" Content="Yes, abort" FontSize="12" Padding="10,3" Margin="0,2,6,0"
+                              Command="{Binding ConfirmAbortRebaseCommand}"/>
+                      <Button Classes="Secondary" Content="Keep it" FontSize="12" Padding="10,3" Margin="0,2,0,0"
+                              Command="{Binding CancelAbortRebaseCommand}"/>
+                    </WrapPanel>
+                  </StackPanel>
 
                   <!-- The two-step guard. A discard is terminal and daemon-recorded, so the row asks
                        first and says exactly what it will and will not do — "not merged" is stated

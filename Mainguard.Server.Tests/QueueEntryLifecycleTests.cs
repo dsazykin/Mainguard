@@ -397,13 +397,37 @@ public sealed class QueueEntryLifecycleTests
             .OrderBy(x => x)
             .ToArray();
 
+        // `rescope_plan` joined the list on 2026-08-30 (coordinator contract §3.1): a worker asks a HUMAN
+        // to widen the scope its own approved plan authorises. It sits on the safe side of the line drawn
+        // below for the same reason `present_plan` does — it queues a card for a person and moves no queue
+        // entry — and it can only ever make an approval NARROWER in effect, never a merge easier: the
+        // scope it changes is the one the flagged-change gate measures the diff against, and every widening
+        // it lands was consented to by the person the gate exists to protect.
         Assert.Equal(
-            new[] { "await_decision", "brief", "list", "present_plan", "revise_plan", "spawn" },
+            new[]
+            {
+                "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
+                "rescope_plan", "revise_plan", "spawn", "status", "task", "verify",
+            },
             ops);
 
         // The actual control, asserted against the shipped op set rather than against the literal above —
         // so it keeps holding after someone edits that list.
-        foreach (var forbidden in new[] { "discard", "clear", "stalled", "resume", "merge", "verif" })
+        //
+        // `verify` is deliberately NOT forbidden, and the line between it and the terms below is the
+        // whole phase-3 contract rather than an oversight. Requesting verification ASKS the daemon to run
+        // the repo's own command in the WORKER's jail and report what happened; the coordinator cannot
+        // choose the command, the jail, or the verdict, and a red result blocks it exactly as it blocks a
+        // human. Every term below instead lets a caller change an entry's fate directly — discarding
+        // erases the evidence blocking its own branch, clearing a stalled verification puts a branch back
+        // into the state a re-verification starts from, and merging is the decision this whole subsystem
+        // exists to keep with a person. Asking for a measurement is safe; editing the record of one is not.
+        //
+        // `commit_work` sits on the same side of that line as `verify`, for the same reason. It records a
+        // worker's own work on the worker's OWN branch — the INPUT this queue reads — and changes no
+        // entry's state, no verification record, and nothing on main. It is what gives a human something
+        // to decide about; it decides nothing.
+        foreach (var forbidden in new[] { "discard", "clear", "stalled", "resume", "merge" })
         {
             Assert.DoesNotContain(ops, op => op.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
         }
@@ -520,6 +544,38 @@ public sealed class QueueEntryLifecycleTests
     /// the checks under test are the real ones. "merging" is always tracked (the lease cases verify it);
     /// callers add whatever else they need.
     /// </summary>
+    /// <summary>
+    /// The <c>verified_main_sha</c> the daemon projects is the main the RECORD ran against, not the main
+    /// of this instant.
+    ///
+    /// <para>The wire has always documented the field as "the main@sha this branch's verification ran
+    /// against" and the daemon has always filled it with <c>queue.CurrentMainSha</c>, so the review
+    /// cockpit's "verified @ &lt;sha&gt;" stamp named today's main whatever the evidence was measured on.
+    /// A <c>StaleVerified</c> entry is where the two are guaranteed to differ, and it is exactly where the
+    /// stamp asserted the freshness the state exists to deny — the header a human read as "verified @
+    /// ffbc3bc" while the verdict behind it belonged to a different moment.</para>
+    /// </summary>
+    [Fact]
+    public async Task TheProjectedVerifiedSha_IsTheMainTheRecordRanAgainst_NotTodays()
+    {
+        using var host = new DaemonFixture();
+        var queue = SeedQueue(host, host.Services.GetRequiredService<IAuditLog>());
+        queue.EnsureEntry("verified-once", MergeEntryOrigin.Local);
+        await queue.RunVerificationAsync("verified-once", CancellationToken.None);
+
+        // A co-tenant merges: main moves, and this entry's evidence stays pinned to the old one.
+        queue.NotifyMainMoved("main-sha-moved");
+        await queue.LastCascade;
+
+        var client = new MergeQueueService.MergeQueueServiceClient(host.CreateChannel());
+        var headers = new Metadata { { "authorization", "Bearer " + host.Token } };
+        var entry = Assert.Single(
+            (await SnapshotAsync(client, headers)).Entries, e => e.AgentId == "verified-once");
+
+        Assert.Equal(MainSha, entry.VerifiedMainSha);
+        Assert.NotEqual("main-sha-moved", entry.VerifiedMainSha);
+    }
+
     private MergeQueue SeedQueue(DaemonFixture host, IAuditLog audit, IMergeQueueStore? store = null)
     {
         var registry = host.Services.GetRequiredService<MergeQueueRegistry>();

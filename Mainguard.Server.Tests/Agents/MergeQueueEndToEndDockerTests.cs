@@ -141,9 +141,19 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         Assert.False(verified.Passed, "the jail must report the fixture suite's real non-zero exit");
         Assert.NotEqual(WorkerMergeState.Verified.ToString(), verified.State);
 
+        // H2 — over a REAL jail exit, the entry lands on the state that says the tests failed. This used
+        // to be `Working`, which is where an entry nobody has ever verified sits, so the end-to-end loop
+        // could not distinguish this test's whole subject (a branch that broke its own suite) from a
+        // branch that had never been run.
+        Assert.Equal(WorkerMergeState.VerificationFailed.ToString(), verified.State);
+        Assert.Equal(WorkerMergeState.VerificationFailed, loop.Queue.GetState(agent.Id));
+
         var refusal = await Assert.ThrowsAsync<InvalidOperationException>(
             () => loop.Adapter.ConfirmMergeAsync(agent.Id).WaitAsync(Timeout));
-        Assert.Contains("not verified", refusal.Message, StringComparison.OrdinalIgnoreCase);
+        // The refusal NAMES the failure rather than saying "not verified yet" — which was true of this
+        // branch only in the sense that it is true of every branch that is not Verified, and told the
+        // human nothing about the run that had just gone red in their jail.
+        Assert.Contains("FAILED", refusal.Message, StringComparison.Ordinal);
 
         Assert.Equal(loop.MainSha0, Rev(loop.Checkout, "main"));
         Assert.NotEqual(WorkerMergeState.Merged, loop.Queue.GetState(agent.Id));
@@ -272,6 +282,9 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
 
         // Make B's re-verification dwell, so the invalidated window is a fact rather than a race. The file
         // is untracked: it is not in either tree, so `.mainguard/verify` is identical on B and on main.
+        // It is also git-IGNORED, and that half is what keeps the first half true through a cascade — the
+        // keep-alive rebase commits `git add -A` as `wip: sync` before it reparents, which stages untracked
+        // files. See FixtureRepo.DelayFile and §22.
         b.WriteUntracked(FixtureRepo.DelayFile, "6000");
 
         // A merges for real: main moves on the user's checkout.
@@ -301,11 +314,38 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
         Assert.NotEqual(WorkerMergeState.Merged, loop.Queue.GetState(b.Id));
 
         // ---- and then the auto re-queue really re-verifies it, in its own jail, against the NEW main ----
-        b.DeleteUntracked(FixtureRepo.DelayFile);
+        // The dwell knob is deliberately LEFT in the worktree. Removing it here to shorten the re-verify
+        // is what used to make this test race the cascade it is measuring: the keep-alive rebase commits
+        // `git add -A` as `wip: sync` before reparenting, so a delete landing between that commit and the
+        // rebase became an unstaged deletion and git refused the rebase outright. Leaving it costs one
+        // dwell and makes the seeded .gitignore's job — the knob is in no tree — a fact this test can
+        // assert rather than a window it can win.
         await loop.Queue.LastCascade.WaitAsync(Timeout);
+        var returnedToVerified =
+            await WaitUntilAsync(() => loop.Queue.GetState(b.Id) == WorkerMergeState.Verified);
+
+        // The cascade's own terminus, said out loud on failure. "Still Working" is the symptom of every
+        // way a re-entry can end (no jail, no worktree, a conflict, a refused publish, a rebase that would
+        // not run) and the gate reason is the one place that names WHICH — a bare timeout sent three
+        // separate agents hunting a regression that was never in the product.
+        loop.Queue.CanMerge(b.Id, out var cascadeTerminus);
         Assert.True(
-            await WaitUntilAsync(() => loop.Queue.GetState(b.Id) == WorkerMergeState.Verified),
-            "the cascade's auto re-verification never returned B to Verified");
+            returnedToVerified,
+            "the cascade's auto re-verification never returned B to Verified — the queue's own reason was: "
+            + cascadeTerminus);
+
+        // The re-verification measured a branch that is REALLY on top of the new main. Without this the
+        // test could not tell a reparent-then-verify from the loop-forever defect TryReturnToWorking
+        // exists to end: a branch that never moved, re-verified green against the current main, fresh by
+        // every check CanMerge makes — and refused by the --ff-only merge.
+        Assert.Equal(0, Contains(loop.MirrorPath, aTip, $"refs/heads/agent/{b.Id}"));
+
+        // ...and the dwell knob is in no tree, which is the fixture invariant the seeded .gitignore keeps
+        // and the thing whose absence broke this test. Asserted on the mirror's agent branch because that
+        // is the ref the queue verifies and the merge consumes.
+        Assert.Equal(
+            "",
+            Tree(loop.MirrorPath, $"refs/heads/agent/{b.Id}", FixtureRepo.DelayFile));
 
         // CanMerge is the assertion that a NEW record exists, not the old one re-labelled: the gate
         // compares the record's own MainSha to the queue's current main, and a VerificationRecord is
@@ -926,17 +966,10 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
             File.WriteAllText(full, content);
         }
 
-        /// <summary>An UNTRACKED file in the worktree — present to the jail, absent from every git tree.</summary>
+        /// <summary>An UNTRACKED file in the worktree — present to the jail, absent from every git tree.
+        /// It stays absent only because the fixture's seeded <c>.gitignore</c> names it; see
+        /// <see cref="FixtureRepo.DelayFile"/> for what swept it into a tree when it did not.</summary>
         public void WriteUntracked(string relPath, string content) => Write(relPath, content);
-
-        public void DeleteUntracked(string relPath)
-        {
-            var full = Path.Combine(WorktreePath, relPath);
-            if (File.Exists(full))
-            {
-                File.Delete(full);
-            }
-        }
 
         /// <summary>Commits in the AGENT's own repository (MG-3) and returns the new tip.</summary>
         public string Commit(string relPath, string content, string message)
@@ -1090,6 +1123,12 @@ public sealed class MergeQueueEndToEndDockerTests : IAsyncLifetime
     /// from <paramref name="from"/>. Asserted on directly so the reachability check is git's, not ours.</summary>
     private static int Contains(string repo, string commit, string from)
         => AgentTestGit.Run(repo, "merge-base", "--is-ancestor", commit, from).Code;
+
+    /// <summary>The paths matching <paramref name="path"/> in <paramref name="reference"/>'s tree — empty
+    /// when the ref does not carry that file at all. Asked of git rather than of the worktree, because
+    /// "is it in the TREE" is the question the merge consumes and the worktree cannot answer.</summary>
+    private static string Tree(string repo, string reference, string path)
+        => AgentTestGit.Run(repo, "ls-tree", "-r", "--name-only", reference, "--", path).Out.Trim();
 
     private string NewDir(string prefix)
     {

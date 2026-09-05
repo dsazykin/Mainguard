@@ -89,13 +89,21 @@ public sealed class QueueEntryResumeTests
     /// by accident. Asserted separately from the interceptor because the interceptor cannot see this
     /// channel at all.
     ///
-    /// <para><b>Phase 2 widens this set and the widening is the point of re-reading it.</b> It was two ops
-    /// about spawning; the worker plan shim adds four — <c>brief</c>, <c>present_plan</c>,
-    /// <c>revise_plan</c>, <c>await_decision</c>. None of the four names an agent id or a branch: they
-    /// carry a plan through the human decision and back, and a worker's endpoint is fixed to the plan role
-    /// so it cannot reach <c>spawn</c> at all. Pinning the exact list rather than relaxing to "contains no
-    /// resume" is deliberate — the guarantee this test exists for is that nobody adds an adoption op here
-    /// quietly, and a substring check would pass for one named anything else.</para>
+    /// <para><b>Phases 2 and 3 each widen this set, and the widening is the point of re-reading it.</b> It
+    /// was two ops about spawning. Phase 2's worker plan shim adds four — <c>brief</c>,
+    /// <c>present_plan</c>, <c>revise_plan</c>, <c>await_decision</c> — which carry a plan through the
+    /// human decision and back. Phase 3's role lock adds the rest of the coordinator's four permitted
+    /// tools: <c>status</c>, <c>prompt</c>, <c>verify</c> (alongside the existing <c>spawn</c>). The plan-mode
+    /// toggle adds <c>task</c> — a second DOOR onto the gate's one exit for the withheld task, gated by
+    /// the same <c>MayWork</c> predicate as <c>commit_work</c>, and the op a worker uses when the operator
+    /// has turned plan approvals off and there is therefore no <c>present</c> to return one.</para>
+    ///
+    /// <para>None of the seven names an agent id to adopt or a branch to attach to, and each endpoint is
+    /// fixed to ONE role — a worker cannot reach <c>spawn</c>, a coordinator cannot reach the plan ops.
+    /// The list grew because the contract deliberately grew; it did not grow an adoption. Pinning the
+    /// exact list rather than relaxing to "contains no resume" is what makes that reviewable: a substring
+    /// check would pass for an adoption op named anything else, and this assertion has now caught the
+    /// surface changing under two separate forward merges, which is precisely what it is for.</para>
     /// </summary>
     [Fact]
     public void AgentIpcSurface_HasNoResumeOp()
@@ -107,16 +115,36 @@ public sealed class QueueEntryResumeTests
             .OrderBy(x => x, StringComparer.Ordinal)
             .ToArray();
 
+        // `rescope_plan` joined the list on 2026-08-30 (coordinator contract §3.1): a worker asks a HUMAN
+        // to widen the scope its own approved plan authorises. It sits on the safe side of the line drawn
+        // below for the same reason `present_plan` does — it queues a card for a person and moves no queue
+        // entry — and it can only ever make an approval NARROWER in effect, never a merge easier: the
+        // scope it changes is the one the flagged-change gate measures the diff against, and every widening
+        // it lands was consented to by the person the gate exists to protect.
         Assert.Equal(
-            new[] { "await_decision", "brief", "list", "present_plan", "revise_plan", "spawn" },
+            new[]
+            {
+                "await_decision", "brief", "commit_work", "list", "present_plan", "prompt",
+                "rescope_plan", "revise_plan", "spawn", "status", "task", "verify",
+            },
             ops);
 
-        // …and the shim request carries no agent id to adopt with, which is the structural half of the
-        // same guarantee: the coordinator's spawn always mints.
+        // No property here may name a resume. `AgentId` is deliberately NOT in this check any more, and
+        // the change is worth stating rather than burying.
+        //
+        // This clause used to read "…|| p.Name == "AgentId"", on the reasoning that a request carrying no
+        // agent id structurally cannot ask to adopt one. Phase 3 ends that: `get_worker_status`,
+        // `send_worker_prompt` and `request_verification` each name the worker they act on, so the field
+        // exists and must. The structural proof is therefore GONE, and deleting the clause without
+        // replacing it would have quietly retired the guarantee rather than the mechanism.
+        //
+        // What replaces it is behavioural and lives where it can actually be exercised:
+        // CoordinatorRoleLockTests.ShimSpawn_IgnoresAnyAgentIdTheRequestCarries drives a real `spawn`
+        // over the real socket with a hostile AgentId and proves the daemon mints its own instead. That
+        // is a stronger assertion than field-absence ever was — it survives the field existing.
         Assert.DoesNotContain(
             typeof(Mainguard.Agents.Agents.Ipc.AgentIpcRequest).GetProperties(),
-            p => p.Name.Contains("Resume", StringComparison.OrdinalIgnoreCase)
-                 || p.Name.Equals("AgentId", StringComparison.Ordinal));
+            p => p.Name.Contains("Resume", StringComparison.OrdinalIgnoreCase));
     }
 
     // ---- 2. scoping: the (repo, agent) pair, never the id alone ----------------------------------

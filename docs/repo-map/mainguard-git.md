@@ -34,8 +34,10 @@ The all-editions base. Git logic goes here.
   columns `UsdMicrosCapPerDay`/`TokenCapPerDay` alongside the per-agent caps), and the P2-10
   merge-queue tables (`MergeQueueRows` — one persisted state row per (repo, agent), written in the
   same transaction as every state-machine transition so a restart resumes; `VerificationRows` —
-  immutable verification records keyed to `main@sha`, insert-only; `MergeLeaseRows` — the RT-D1
-  per-repo merge lease + idempotency record), and the P2-12 external-PR-intake tables
+  immutable verification records keyed to **both** shas a verdict is only true between, `MainSha` and
+  (since `AddVerificationBranchSha`) `BranchSha`, insert-only; `MergeLeaseRows` — the RT-D1
+  per-repo merge lease + idempotency record, carrying since `AddMergeLeaseExpectedBranchSha` **both**
+  halves of the identity the merge is authorized for, `ExpectedMainSha` and `ExpectedBranchSha`), and the P2-12 external-PR-intake tables
   (`PrIntakeSubscriptions` — one row per `(host, owner, repo, filter)` subscription, unique so a
   duplicate subscribe is idempotent; `PrIntakeHeads` — the last-seen head SHA per
   `(source, PR number)`, the "seen PR heads" store + tracked-PR set) — with the
@@ -60,7 +62,18 @@ The all-editions base. Git logic goes here.
   `AddAuditAnchors` adds `AuditAnchors` (`Models/AuditAnchorRow.cs` — one row per RFC 3161-anchored
   chain head: head seq/hash, request/anchor times, the DER token or null while pending; NOT
   append-only — a forged anchor only invalidates itself, the TSA signature cannot be re-made to
-  match a rewritten chain)).
+  match a rewritten chain); `AddVerificationBranchSha` adds `VerificationRows.BranchSha` — the
+  `refs/heads/agent/<id>` tip a run was measured ON. A record pinned `main@sha` and nothing else, so
+  the queue could ask whether main had moved under its evidence and structurally could not ask whether
+  the BRANCH had; a green row survived three further commits and went on offering Merge. Existing rows
+  take `""`, which is the correct value rather than a backfill — nothing knows what tip they ran on —
+  and every freshness comparison reads empty as "not measured" and declines to answer);
+  `AddMergeLeaseExpectedBranchSha` adds `MergeLeaseRows.ExpectedBranchSha` — K3/§23.4, the branch-side
+  half of the identity a merge lease is granted for. The lease pinned the `main@sha` a merge could
+  fast-forward and could not say which COMMITS were authorized to land on it, so the branch could move
+  between the grant and the merge, a namesake ref could be merged instead, and the confirmed post-merge
+  sha could be anything the client reported — and all of it still satisfied the lease. Existing rows take
+  `""`, read everywhere as "not measured" rather than as a mismatch).
 - **`Actions/`** — the UI-free command surface for the command palette + keyboard shortcuts (T-18);
   pure and unit-tested, and the seam that later becomes the agent command surface.
   - `AppAction.cs` (one invokable action: `Id`/`Title`/`Category` + `Func<bool> CanExecute` +
@@ -160,7 +173,14 @@ The all-editions base. Git logic goes here.
   - `AcknowledgmentStore.cs` (`FlaggedChange`/`FlaggedKind`; the per-branch item-by-item ack ledger
     bound to the **SHA-256 of the canonical flagged set** — a new push resets every ack (invariant 2),
     `LastResetCount` for the "N items reset" copy, `acknowledged_flagged_change` audit events for P2-15;
-    **no bulk-ack method** so a global checkbox is impossible by construction).
+    **no bulk-ack method** so a global checkbox is impossible by construction. `FlaggedKind` gained
+    `DeclaredDeviation` and `DeviationDeclarationMissing` (2026-08-31) — the APPROACH half of an approved
+    plan, the sibling of `OutOfApprovedScope`: a scope is machine-comparable and is compared, an
+    `Approach` is prose and is not, so a worker shipped the opposite of its approved approach with the
+    scope honoured and every gate green. The MISSING kind exists for the reason
+    `LockfileAdvisoryUnknown` does — an omitted item is an acknowledged item, so silence would report
+    "nobody established whether this follows the approved approach" as "it does". Produced by
+    `Agents.Orchestrator.DeviationReview`).
   - `LockfileSemanticDiff.cs` (`LockfileKind`/`DependencyDelta`; `Parse(old,new,kind,osv,asOf)` for
     package-lock.json/pnpm-lock.yaml/`*.csproj` PackageReference/poetry.lock → per-dep rows with
     major-jump/install-scripts/registry-change + offline OSV CVE ids; script/CVE rows feed the flagged
@@ -429,7 +449,10 @@ The all-editions base. Git logic goes here.
   or non-allowlisted prefix); `DeclaredDependencyDeniedException` — P2-07 F5 out-of-scope module
   fetch; `GitMutationLockException` — P2-09 keep-alive worktree `index.lock` stayed held across the
   bounded backoff cap (the agent is yielded/paused, so a persistent lock is a typed failure, not
-  retried forever); `SandboxImageMissingException` — v1 spawn-preflight refusal: a required jail image
+  retried forever); `GitMutationStateChangedException` — K6/§23.6, the sibling of the above: the lock DID
+  clear and the worktree underneath had moved on (the agent started its own rebase, detached, or opened a
+  merge during the backoff), so the guard's snapshot verdict no longer describes it and the action never
+  runs; `SandboxImageMissingException` — v1 spawn-preflight refusal: a required jail image
   (`mainguard-agent-base`/`mainguard-egress-proxy`) is absent from the VM's docker store (fresh import
   / post-tier-2-upgrade), thrown before any worktree/jail work, names exactly the missing image(s) +
   the repair; mapped to `FailedPrecondition` in `AgentGrpcService.SpawnAgent`;

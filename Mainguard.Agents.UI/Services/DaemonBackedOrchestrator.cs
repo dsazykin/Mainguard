@@ -5,6 +5,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Grpc.Core;
 using Mainguard.Agents.Agents;
+using Mainguard.Agents.Terminal;
 using Proto = Mainguard.Protos.V1;
 
 namespace Mainguard.Agents.UI.Services;
@@ -150,6 +151,7 @@ public sealed class DaemonBackedOrchestrator :
     private readonly List<TaskPlan> _plans = new();
     private readonly List<WorkerPlanCard> _workerPlans = new();
     private OrchestrationBackpressure _backpressure = OrchestrationBackpressure.None;
+    private PlanModeView _planMode = PlanModeView.Unknown;
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly Dictionary<string, (long Tokens, long UsdMicros)> _agentSpend = new(StringComparer.Ordinal);
@@ -830,6 +832,14 @@ public sealed class DaemonBackedOrchestrator :
         lock (_gate)
         {
             _mainSha = update.MainSha ?? string.Empty;
+            _mirrorMainRefreshedAt = DateTimeOffset.TryParse(
+                update.MirrorMainRefreshedAt, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.RoundtripKind, out var refreshedAt)
+                ? refreshedAt
+                : null;
+            _mirrorMainRefreshError = string.IsNullOrEmpty(update.MirrorMainRefreshError)
+                ? null
+                : update.MirrorMainRefreshError;
             _queue.Clear();
             _gate_.Clear();
             _origins.Clear();
@@ -856,9 +866,31 @@ public sealed class DaemonBackedOrchestrator :
                         .Select(f => new FlaggedItem(f.Id, f.Path, f.Category, f.Fact, f.Acknowledged))
                         .ToArray();
 
+                // H4 — the entry's last verification VERDICT. This was hardcoded to `null`, which is this
+                // projection's own way of saying "never verified": every entry the daemon served, the ones
+                // whose tests had just gone red included, reached the rail claiming no verification had
+                // ever happened. Three real wire fields, and only three.
+                //
+                // `HasLastVerificationPassed` is protobuf's field-presence test, and it is the whole
+                // mechanism here: proto3 would default the bool to false, and a false meaning "never
+                // verified" is indistinguishable from one meaning "the tests failed" — the exact
+                // conflation this change exists to end. Unset stays null, i.e. no record.
+                //
+                // Note what is NOT built here. The old client-side record carried TestsPassed/TestsTotal,
+                // which no wire has ever carried and nothing in this system measures — verification watches
+                // a process exit code in a jail and parses nobody's test runner. There is no honest source
+                // for those numbers, so the type lost them rather than this projection inventing them; a
+                // fabricated "58 of 58 green" in a review surface is worse than no number at all.
+                var verdict = entry.HasLastVerificationPassed
+                    ? new VerificationVerdict(
+                        entry.LastVerificationPassed,
+                        entry.LastVerificationCommand ?? string.Empty,
+                        ParseTimestamp(entry.LastVerificationAt))
+                    : null;
+
                 _queue.Add(new QueueEntry(
                     entry.AgentId, entry.AgentId, $"agent/{entry.AgentId}", state,
-                    entry.GateReason ?? string.Empty, Verification: null, FlaggedItems: flagged,
+                    entry.GateReason ?? string.Empty, Verification: verdict, FlaggedItems: flagged,
                     // Carried from the daemon rather than inferred from the state: a client that guessed
                     // "Verifying ⇒ a run is happening" would be wrong for exactly the entries this matters
                     // for — the ones a restart left frozen mid-verification.
@@ -871,7 +903,26 @@ public sealed class DaemonBackedOrchestrator :
                     // The daemon has always sent this and the client has always thrown it away, which is
                     // why the review cockpit's "verified @ <sha>" stamp never rendered: the value existed
                     // on the wire and stopped here.
-                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha));
+                    VerifiedMainSha: string.IsNullOrEmpty(entry.VerifiedMainSha) ? null : entry.VerifiedMainSha,
+                    // What the human APPROVED for this branch — the half of the review that is not the
+                    // diff. Empty means the entry has no approved plan (manual agent, external-PR head,
+                    // plan mode off), and the surface then draws no approval panel at all rather than an
+                    // empty one asserting an approval nobody gave.
+                    ApprovedPlanId: NullIfEmpty(entry.ApprovedPlanId),
+                    ApprovedPlanTitle: NullIfEmpty(entry.ApprovedPlanTitle),
+                    ApprovedApproach: NullIfEmpty(entry.ApprovedPlanApproach),
+                    DeviationDeclaration: NullIfEmpty(entry.DeviationDeclaration),
+                    // The facts behind a conflict card. `RebaseConflict` is a MESSAGE field, so protobuf's
+                    // presence test is exact: absent means nothing is parked, and it must not be mapped to
+                    // an empty conflict — an empty path list renders as "nothing conflicts", which is the
+                    // one thing a conflict card must never say.
+                    RebaseConflict: entry.RebaseConflict is null
+                        ? null
+                        : new QueueRebaseConflict(
+                            entry.RebaseConflict.Worktree ?? string.Empty,
+                            entry.RebaseConflict.MainBranch ?? string.Empty,
+                            entry.RebaseConflict.Paths.ToArray(),
+                            ParseTimestamp(entry.RebaseConflict.ParkedAt))));
                 _gate_[entry.AgentId] = (entry.CanMerge, entry.GateReason ?? string.Empty);
             }
         }
@@ -912,7 +963,11 @@ public sealed class DaemonBackedOrchestrator :
                 _workerPlans.Add(new WorkerPlanCard(
                     p.PlanId, p.WorkerAgentId, p.CoordinatorId, p.Title, p.Scope.ToArray(),
                     p.Approach, p.TestStrategy, (decimal)p.BudgetUsd, DateTimeOffset.UtcNow,
-                    p.Status, p.Revision, p.RevisionsRemaining, update.MaxPlanRevisions, p.RejectionFeedback));
+                    p.Status, p.Revision, p.RevisionsRemaining, update.MaxPlanRevisions, p.RejectionFeedback,
+                    // Carried, never re-derived. What the previous scope WAS is a fact the daemon captured
+                    // when the re-scope was presented; a client that looked it up from whatever plan that
+                    // id names *now* would render a different claim as soon as a second re-scope existed.
+                    p.SupersedesPlanId, p.PreviousScope.ToArray(), p.RescopeCount, p.NewPlanRequested));
             }
 
             // Carried verbatim from the daemon rather than re-derived here: the number that refuses the
@@ -920,6 +975,11 @@ public sealed class DaemonBackedOrchestrator :
             _backpressure = new OrchestrationBackpressure(
                 update.BlockedWorkerCount, update.EscalatedWorkerCount, update.ActiveWorkerCount,
                 update.MaxActiveWorkers, update.MaxPlanRevisions, update.BackpressureSignal);
+
+            // Carried on the plan stream, so the state and the cards it explains arrive together. A
+            // separate poll would let the screen say "no plans waiting" and "plan mode is on" out of step
+            // with each other, which is the pair of facts a human reads as "nothing is running".
+            _planMode = new PlanModeView(update.PlanModeEnabled, update.PlanModeSummary);
         }
 
         Changed?.Invoke();
@@ -1363,14 +1423,26 @@ public sealed class DaemonBackedOrchestrator :
     /// Delivers the agent document's composer prompt into the agent's LIVE PTY — a short-lived attach
     /// on the same <c>TerminalService.Attach</c> bidi stream the terminal pane uses (a bound session
     /// multiplexes subscribers, so this never steals the pane's attach): frame 1 selects the agent
-    /// (raw mode), frame 2 writes the prompt + CR, then the write side completes and the call closes.
-    /// A managed worker's daemon-side input lock arrives as <c>PermissionDenied</c> and is PROPAGATED —
-    /// the caller renders the refusal; for most of this method's life it was a hardcoded no-op that
-    /// reported success and typed nothing.
+    /// (raw mode), frame 2 writes the prompt body, frame 3 writes the CR that submits it, then the write
+    /// side completes and the call closes. A managed worker's daemon-side input lock arrives as
+    /// <c>PermissionDenied</c> and is PROPAGATED — the caller renders the refusal; for most of this
+    /// method's life it was a hardcoded no-op that reported success and typed nothing.
+    ///
+    /// <para><b>Why the CR is a frame of its own, with a wait in front of it (defect J2).</b> This wrote
+    /// <c>prompt + "\r"</c> in one frame, so the daemon wrote body and terminator to the PTY in one go
+    /// and the CLI — which classifies input as typed or pasted by the read burst it arrives in — took the
+    /// CR as pasted content rather than Enter. Short prompts submitted, realistic ones silently did not.
+    /// Splitting the frames is necessary but not sufficient: two frames written back to back are still
+    /// coalesced into one read, measured. The wait is what puts them in separate reads. Unlike the
+    /// daemon's own path this side cannot watch for the CLI's echo, so it uses the fixed
+    /// <see cref="TerminalSubmit.TerminatorSeparation"/> fallback. See
+    /// <c>docs/design/coordinator-phase-3-decisions.md</c> §17.8.</para>
     /// </summary>
     public async Task SendPromptAsync(string agentId, string prompt)
     {
-        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrEmpty(prompt))
+        // Whitespace, not merely empty: TryEncodeSubmission below refuses a blank line anyway, but by then
+        // the attach has been opened for a prompt that was never going to be written.
+        if (string.IsNullOrWhiteSpace(agentId) || string.IsNullOrWhiteSpace(prompt))
         {
             return;
         }
@@ -1394,11 +1466,26 @@ public sealed class DaemonBackedOrchestrator :
 
         try
         {
+            if (!TerminalSubmit.TryEncodeSubmission(prompt, out var body, out var terminator))
+            {
+                return;
+            }
+
             await call.RequestStream.WriteAsync(new Proto.TerminalInput { AgentId = agentId })
                 .ConfigureAwait(false);
             await call.RequestStream.WriteAsync(new Proto.TerminalInput
             {
-                Data = Google.Protobuf.ByteString.CopyFromUtf8(prompt + "\r"),
+                Data = Google.Protobuf.ByteString.CopyFrom(body),
+            }).ConfigureAwait(false);
+
+            // The whole point of the split: without this the two frames reach the PTY back to back, the
+            // CLI reads them as one burst, and the CR is absorbed into the message instead of submitting
+            // it — which is the defect, not a nicety.
+            await Task.Delay(TerminalSubmit.TerminatorSeparation, cts.Token).ConfigureAwait(false);
+
+            await call.RequestStream.WriteAsync(new Proto.TerminalInput
+            {
+                Data = Google.Protobuf.ByteString.CopyFrom(terminator),
             }).ConfigureAwait(false);
             await call.RequestStream.CompleteAsync().ConfigureAwait(false);
         }
@@ -1421,6 +1508,43 @@ public sealed class DaemonBackedOrchestrator :
     // ---- IMergeQueueService (LIVE via StreamQueue) ----------------------
 
     public string MainSha { get { lock (_gate) return _mainSha; } }
+
+    private DateTimeOffset? _mirrorMainRefreshedAt;
+    private string? _mirrorMainRefreshError;
+
+    public DateTimeOffset? MirrorMainRefreshedAt { get { lock (_gate) return _mirrorMainRefreshedAt; } }
+
+    public string? MirrorMainRefreshError { get { lock (_gate) return _mirrorMainRefreshError; } }
+
+    /// <summary>The on-demand half of the mirror refresh (2026-09-04): one RPC, and the answer arrives on the
+    /// queue stream like every other queue fact. Failures are logged, never thrown — the stream's error
+    /// field is where a human reads them.</summary>
+    public async Task RefreshMirrorMainAsync()
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return;
+        }
+
+        try
+        {
+            using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+            await _client.RefreshMirrorMainAsync(repoHandle, cts.Token, deadline: TimeSpan.FromSeconds(30))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Swallowed on purpose: the request is a nudge. Whether the mirror could be refreshed, and why
+            // not, arrives on the queue stream's own error field, which is the surface a human reads.
+            _ = ex;
+        }
+    }
 
     public IReadOnlyList<QueueEntry> GetQueue()
     {
@@ -1509,6 +1633,83 @@ public sealed class DaemonBackedOrchestrator :
     /// toolchain image; it is the longest-running RPC the surface issues.</summary>
     private static readonly TimeSpan VerificationDeadline = TimeSpan.FromMinutes(30);
 
+    /// <summary>
+    /// H4 — <b>reads</b> the last verification's output. It runs nothing: this is the whole reason it is a
+    /// separate call from <see cref="RunVerificationAsync"/>. Before it existed, the only way for a human
+    /// to find out why a branch had gone red was to press Verify again, which spends minutes of real test
+    /// time in a jail and can legitimately answer differently — so the surface charged the human a second
+    /// run for information the daemon already had on disk.
+    ///
+    /// <para>The three answers the daemon keeps apart are kept apart here too: no record at all, the log,
+    /// and a record whose artifact could not be read. A daemon we could not reach is a FOURTH answer and is
+    /// reported as such — never as "no record", which is a claim about the entry rather than about the
+    /// call.</para>
+    ///
+    /// <para>The text is jail-produced, so it goes through <see cref="JailText.Sanitize"/> here rather than
+    /// at each surface: sanitizing at the projection boundary is what makes it impossible for a consumer to
+    /// forget.</para>
+    /// </summary>
+    public async Task<VerificationLog> GetVerificationLogAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            return VerificationLog.Unreachable("no repository is active for agents yet");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        try
+        {
+            var response = await _client
+                .GetVerificationLogAsync(repoHandle!, agentId, cts.Token)
+                .ConfigureAwait(false);
+
+            if (!response.HasRecord)
+            {
+                return new VerificationLog(
+                    HasRecord: false, Passed: false, ResolvedCommand: "", MainSha: "", When: null,
+                    Text: "", Truncated: false, UnavailableReason: "");
+            }
+
+            return new VerificationLog(
+                HasRecord: true,
+                Passed: response.Passed,
+                ResolvedCommand: response.ResolvedCommand ?? string.Empty,
+                MainSha: response.MainSha ?? string.Empty,
+                When: ParseTimestamp(response.When),
+                Text: JailText.Sanitize(response.Log),
+                Truncated: response.Truncated,
+                UnavailableReason: response.UnavailableReason ?? string.Empty);
+        }
+        catch (Grpc.Core.RpcException ex)
+        {
+            return VerificationLog.Unreachable($"the daemon didn't answer ({ex.StatusCode})");
+        }
+    }
+
+    /// <summary>
+    /// The daemon's ISO-8601 round-trip ("O") timestamps, or null when it sent none. Null rather than a
+    /// sentinel date: "the daemon did not say when" and "this happened at the epoch" are different facts,
+    /// and only one of them should ever reach a surface that ages a verdict.
+    /// </summary>
+    private static DateTimeOffset? ParseTimestamp(string? value) =>
+        DateTimeOffset.TryParse(
+            value, System.Globalization.CultureInfo.InvariantCulture,
+            System.Globalization.DateTimeStyles.RoundtripKind, out var parsed)
+            ? parsed : null;
+
+    /// <summary>
+    /// proto3's empty string mapped to "the daemon said nothing". Used for the approved-plan fields,
+    /// where an empty approach and an absent approval must not render the same: one is a panel with a
+    /// blank paragraph in it, the other is no panel.
+    /// </summary>
+    private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
+
     private static string Short(string sha) =>
         string.IsNullOrEmpty(sha) ? "—" : (sha.Length > 8 ? sha[..8] : sha);
 
@@ -1573,14 +1774,18 @@ public sealed class DaemonBackedOrchestrator :
             throw new InvalidOperationException($"Can't merge — {begun.Reason}.");
         }
 
-        // The CAS old-OID comes from the grant, not from our own queue projection: the projection is a
-        // stream snapshot and may be a revision behind the main the daemon just authorized against.
+        // BOTH halves of the identity come from the grant, not from our own queue projection: the
+        // projection is a stream snapshot and may be a revision behind the main — and the branch tip — the
+        // daemon just authorized against. K3: the branch sha is what makes `agent/<id>` in this checkout an
+        // identity rather than a name, and it is what ConfirmMerge compares the reported post-merge main
+        // against.
         var lease = new Mainguard.Git.Models.MergeLeaseRow
         {
             RepoHash = repoHandle!,
             LeaseId = begun.LeaseId,
             AgentId = agentId,
             ExpectedMainSha = begun.ExpectedMainSha ?? string.Empty,
+            ExpectedBranchSha = begun.ExpectedBranchSha ?? string.Empty,
             MainBranch = MainBranchName,
         };
 
@@ -1589,7 +1794,8 @@ public sealed class DaemonBackedOrchestrator :
             RepoHash: repoHandle!,
             AgentId: agentId,
             ExpectedMainSha: lease.ExpectedMainSha,
-            MainBranch: MainBranchName);
+            MainBranch: MainBranchName,
+            ExpectedBranchSha: lease.ExpectedBranchSha);
 
         Mainguard.Agents.Services.ForegroundMergeResult result;
         try
@@ -1824,6 +2030,71 @@ public sealed class DaemonBackedOrchestrator :
         if (!response.Cleared)
         {
             throw new InvalidOperationException($"Can't clear this verification — {response.Reason}.");
+        }
+    }
+
+    /// <summary>
+    /// Hands a parked rebase conflict back to the worker that produced half of it: the daemon unpauses the
+    /// jail and delivers an instruction through its own prompt path.
+    ///
+    /// <para><b>This adapter asserts nothing</b>, exactly like <see cref="ResumeEntryAsync"/>. Whether a
+    /// rebase is really parked, whether it is still in progress, whether a jail exists and whether the
+    /// instruction was actually submitted to the CLI are all daemon-side facts; a client that guessed at
+    /// them would be building the control in the UI layer again.</para>
+    ///
+    /// <para><b>A refusal is thrown, never swallowed</b> — the daemon answers a decline with
+    /// <c>handed_back=false</c> and a reason on an otherwise successful RPC, so "no exception" is not
+    /// evidence an agent woke up.</para>
+    /// </summary>
+    public async Task ResolveConflictWithAgentAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't hand this back — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .ResolveConflictWithAgentAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.HandedBack)
+        {
+            throw new InvalidOperationException($"Can't hand this back — {response.Reason}.");
+        }
+    }
+
+    /// <summary>Aborts a parked rebase. Same refusal discipline: the daemon's "no" carries its reason and
+    /// leaves the worktree exactly as it was.</summary>
+    public async Task AbortRebaseAsync(string agentId)
+    {
+        string? repoHandle;
+        lock (_gate)
+        {
+            repoHandle = _repoHandle;
+        }
+
+        if (string.IsNullOrWhiteSpace(repoHandle))
+        {
+            throw new InvalidOperationException(
+                "Can't abort this rebase — no repository is active for agents yet.");
+        }
+
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var response = await _client
+            .AbortRebaseAsync(repoHandle!, agentId, cts.Token)
+            .ConfigureAwait(false);
+
+        if (!response.Aborted)
+        {
+            throw new InvalidOperationException($"Can't abort this rebase — {response.Reason}.");
         }
     }
 
@@ -2068,6 +2339,39 @@ public sealed class DaemonBackedOrchestrator :
         }
     }
 
+    /// <summary>Asks an escalated worker for one fresh plan. Refusals propagate, like a decision's.</summary>
+    public async Task RequestNewPlanAsync(string planId, string guidance)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        await _client.RequestNewPlanAsync(planId, guidance, cts.Token).ConfigureAwait(false);
+    }
+
+    /// <summary>The plan-mode toggle as the last plan update reported it.</summary>
+    public PlanModeView GetPlanMode()
+    {
+        lock (_gate) return _planMode;
+    }
+
+    /// <summary>
+    /// Turns the plan gate on or off, and adopts the DAEMON's answer rather than the requested value.
+    ///
+    /// <para>Not swallowed, for the same reason <see cref="SubmitPlanDecisionAsync"/> is not: a toggle
+    /// that failed to reach the daemon would otherwise render as the state the operator asked for while
+    /// the gate kept doing the opposite — and this particular disagreement is the one where the human
+    /// believes there is an approval step and there is not.</para>
+    /// </summary>
+    public async Task SetPlanModeAsync(bool enabled)
+    {
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var state = await _client.SetPlanModeAsync(enabled, cts.Token).ConfigureAwait(false);
+        lock (_gate)
+        {
+            _planMode = new PlanModeView(state.Enabled, state.Summary);
+        }
+
+        Changed?.Invoke();
+    }
+
     // ---- ICliAgentHost (PR3: coordinator-as-CLI) --------------------------
 
     /// <summary>The live coordinator's agent id (from the snapshot's role field), or null.</summary>
@@ -2223,6 +2527,15 @@ public sealed class DaemonBackedOrchestrator :
     {
         lock (_gate)
         {
+            // The worker briefs, taken from the plan stream the surface is already receiving rather than
+            // from a new wire field: the plan's Title IS the brief a worker was spawned against, and it is
+            // the only human-legible name any of these sessions has. Without it the resource monitor can
+            // only print the CLI kind, which is identical for every agent of that kind.
+            var titles = _workerPlans
+                .Where(p => p.WorkerAgentId.Length > 0 && p.Title.Length > 0)
+                .GroupBy(p => p.WorkerAgentId, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Last().Title, StringComparer.Ordinal);
+
             return _agents.Values
                 .Select(a =>
                 {
@@ -2239,7 +2552,9 @@ public sealed class DaemonBackedOrchestrator :
                         RamGb: haveReading && res.RamBytes is { } bytes ? bytes / (1024.0 * 1024.0 * 1024.0) : null,
                         SpendUsd: spendUsd,
                         Task: a.Detail,
-                        IsMetered: haveReading && res.Metered);
+                        IsMetered: haveReading && res.Metered,
+                        Role: a.Role,
+                        Title: titles.TryGetValue(a.AgentId, out var title) ? title : string.Empty);
                 })
                 .OrderBy(a => a.Name, StringComparer.Ordinal)
                 .ToArray();

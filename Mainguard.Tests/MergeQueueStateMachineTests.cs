@@ -28,14 +28,38 @@ public class MergeQueueStateMachineTests
         public MergeQueue Queue = null!;
         private long _tick;
         private readonly HashSet<string> _fails = new(StringComparer.Ordinal);
+        private readonly HashSet<string> _refusals = new(StringComparer.Ordinal);
 
         public void FailFor(string agentId) => _fails.Add(agentId);
+
+        /// <summary>Undoes <see cref="FailFor"/> — this agent's next run passes (a retry after a fix).</summary>
+        public void PassFor(string agentId) => _fails.Remove(agentId);
+
+        /// <summary>
+        /// Makes the run THROW instead of returning a record — the "refused before it produced a verdict"
+        /// path (no jail, a drifted branch, a malformed verify command). Materially different from
+        /// <see cref="FailFor"/>, and keeping the two apart in the harness is what lets a test assert the
+        /// queue keeps them apart too: only one of them is a test failure.
+        /// </summary>
+        public void RefuseFor(string agentId) => _refusals.Add(agentId);
+
+        /// <summary>Every transition reported through the queue's <c>onStateChanged</c> seam, in order.</summary>
+        public List<(string Agent, WorkerMergeState State)> Notices = new();
+
+        /// <summary>Makes the reporting sink throw, so "reporting a state may never fail a transition" is
+        /// a property under test rather than a comment.</summary>
+        public bool NoticeSinkThrows;
 
         public MergeQueue Build(bool withRequeue = true, bool withChangedGate = false)
         {
             MergeQueue queue = null!;
             Func<string, CancellationToken, Task<VerificationRecord>> run = (id, ct) =>
             {
+                if (_refusals.Contains(id))
+                {
+                    throw new NoVerificationCommandException("this repo configures no verification command");
+                }
+
                 var when = DateTimeOffset.UnixEpoch.AddSeconds(Interlocked.Increment(ref _tick));
                 var passed = !_fails.Contains(id);
                 return Task.FromResult(new VerificationRecord(
@@ -46,10 +70,18 @@ public class MergeQueueStateMachineTests
             // for the gate/override/immutability assertions (production always re-verifies).
             Func<string, CancellationToken, Task> requeue = withRequeue
                 ? (id, ct) => { RequeueOrder.Add(id); return queue.RunVerificationAsync(id, ct); }
-            : (id, ct) => Task.CompletedTask;
+            : (id, ct) => { RequeueOrder.Add(id); return Task.CompletedTask; };
 
             var gates = withChangedGate ? new IMergeGate[] { ChangedGate } : Array.Empty<IMergeGate>();
-            queue = new MergeQueue("repo", "sha0", StateStore, VerStore, run, requeue, gates, Audit);
+            queue = new MergeQueue("repo", "sha0", StateStore, VerStore, run, requeue, gates, Audit,
+                onStateChanged: (id, state) =>
+                {
+                    Notices.Add((id, state));
+                    if (NoticeSinkThrows)
+                    {
+                        throw new InvalidOperationException("the reporting sink is unavailable");
+                    }
+                });
             Queue = queue;
             return queue;
         }
@@ -60,6 +92,48 @@ public class MergeQueueStateMachineTests
         await h.Queue.RunVerificationAsync(agentId, CancellationToken.None);
         Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState(agentId));
         return h.Queue;
+    }
+
+    // ---- The stale re-entry door -----------------------------------------
+
+    /// <summary>
+    /// <see cref="MergeQueue.RequeueStaleAsync"/> is the door the human's Verify and the readiness trigger
+    /// take for a <c>StaleVerified</c> entry: it invokes the SAME requeue delegate the cascade's FIFO walk
+    /// uses (reparent, then re-verify), never the direct run. Built with a requeue that records and holds,
+    /// so the entry rests at StaleVerified and the delegate call is the observable.
+    /// </summary>
+    [Fact]
+    public async Task RequeueStaleAsync_FromStaleVerified_TakesTheCascadesRequeue_NotTheDirectRun()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        await VerifiedAsync(h, "a");
+
+        h.Queue.NotifyMainMoved("sha1");
+        await h.Queue.LastCascade;
+        Assert.Equal(WorkerMergeState.StaleVerified, h.Queue.GetState("a"));
+        Assert.Equal(new[] { "a" }, h.RequeueOrder); // the cascade's own walk
+
+        await h.Queue.RequeueStaleAsync("a", CancellationToken.None);
+
+        Assert.Equal(new[] { "a", "a" }, h.RequeueOrder);                 // the door went through the delegate
+        Assert.Equal(WorkerMergeState.StaleVerified, h.Queue.GetState("a")); // ...and not through a direct run
+    }
+
+    /// <summary>A stale re-entry is refused for an entry that is not stale — the caller asked for a
+    /// reparent-then-verify and there is nothing to reparent. Refused, never silently redirected.</summary>
+    [Fact]
+    public async Task RequeueStaleAsync_FromAnyOtherState_IsRefused_AndRunsNothing()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+
+        var refused = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => h.Queue.RequeueStaleAsync("a", CancellationToken.None));
+
+        Assert.Contains("Working", refused.Message);
+        Assert.Empty(h.RequeueOrder);
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
     }
 
     // ---- Legal transitions ----------------------------------------------
@@ -78,8 +152,17 @@ public class MergeQueueStateMachineTests
         Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState("a"));
     }
 
+    /// <summary>
+    /// H2 — a failed verification settles to <see cref="WorkerMergeState.VerificationFailed"/>, not to
+    /// <c>Working</c>.
+    ///
+    /// <para>This assertion used to read <c>Working</c>, and that was the defect written down as a test:
+    /// <c>Working</c> is also where an entry that has NEVER been verified sits, so the state could not
+    /// distinguish a branch whose tests had just gone red from one nobody had ever run. The failure is
+    /// still surfaced rather than silently retried (edge row 2) — it is surfaced as itself.</para>
+    /// </summary>
     [Fact]
-    public async Task RunVerification_Fail_ReturnsToWorking_NotSilentlyRetried()
+    public async Task RunVerification_Fail_SettlesToVerificationFailed_NotWorking_AndNotSilentlyRetried()
     {
         var h = new Harness();
         h.Build(withRequeue: false);
@@ -88,7 +171,190 @@ public class MergeQueueStateMachineTests
         var record = await h.Queue.RunVerificationAsync("a", CancellationToken.None);
 
         Assert.False(record.Passed);
+        Assert.Equal(WorkerMergeState.VerificationFailed, h.Queue.GetState("a"));
+
+        // …and the fact that makes it actionable: the gate reason is the verdict, not "not verified yet".
+        Assert.False(h.Queue.CanMerge("a", out var reason));
+        Assert.Contains("FAILED", reason);
+        Assert.Contains("npm test", reason);
+        Assert.DoesNotContain("not verified yet", reason);
+
+        // The record the state was decided from is reachable, so the surface can never disagree with it.
+        Assert.False(h.Queue.LastVerification("a")!.Passed);
+    }
+
+    /// <summary>
+    /// The paired negative: a run REFUSED before it produced a verdict still settles to <c>Working</c>,
+    /// and must never wear the failure state.
+    ///
+    /// <para>This is the one distinction the merge decision rests on — "we could not run your tests" is
+    /// not "your tests failed" — and it is exactly what a careless spelling of the fix above would break,
+    /// because both paths end in the same <c>SettleAfterVerificationLocked</c> call. No record is written
+    /// either, so there is nothing for a surface to render a verdict from.</para>
+    /// </summary>
+    [Fact]
+    public async Task RunVerification_RefusedBeforeItRan_StaysWorking_AndIsNotAFailure()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.RefuseFor("a");
+
+        await Assert.ThrowsAsync<NoVerificationCommandException>(
+            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
+
         Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
+        Assert.Null(h.Queue.LastVerification("a"));
+        Assert.False(h.Queue.CanMerge("a", out var reason));
+
+        // ...and the refusal is what the entry SAYS, not only what the daemon logged. This assertion
+        // used to read `Assert.Equal("not verified yet", reason)`, which is the sentence for a branch
+        // nobody has asked anything of — so a human who pressed Verify and was refused got back a row
+        // that had forgotten being asked. The daemon's own words are already sent verbatim as gRPC
+        // FailedPrecondition; recording them on the entry is what makes them survive the next queue
+        // snapshot instead of living in one transient message slot.
+        Assert.Equal("this repo configures no verification command", reason);
+        Assert.DoesNotContain("not verified yet", reason);
+    }
+
+    /// <summary>
+    /// The half of the same defect that made the human's one available action tell them LESS: a refused
+    /// verification must not DELETE the reason the stale cascade measured.
+    ///
+    /// <para>Traced live on a rebase-conflict entry. <c>RunVerificationAsync</c> transitions to
+    /// <c>Verifying</c> first, <c>SetStateLocked</c> retires the cascade's measured reason on any move off
+    /// <c>Working</c>, and the run then refuses (the parked worktree is on a detached HEAD mid-rebase, so
+    /// the branch-alignment guard throws) and settles the entry straight back to <c>Working</c> with
+    /// nothing left to say. The card went from "the agent is paused with the rebase in progress and needs
+    /// a human to resolve it" to "not verified yet" — pressing the one button the card offered erased the
+    /// one sentence that explained the card.</para>
+    ///
+    /// <para>The prior measurement wins over the refusal's own message because nothing ran: the world did
+    /// not change, so the more specific true statement is still the true one.</para>
+    /// </summary>
+    [Fact]
+    public async Task RunVerification_Refused_KeepsTheMeasuredWorkingReason_RatherThanClobberingIt()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+
+        // The cascade's conflict terminus, exactly as MergeQueueProvisioner writes it.
+        Assert.True(h.Queue.TryReturnToWorking("a", MergeQueueProvisioner.RebaseConflictReason, "conflict"));
+        Assert.False(h.Queue.CanMerge("a", out var beforeVerify));
+        Assert.Equal(MergeQueueProvisioner.RebaseConflictReason, beforeVerify);
+
+        h.RefuseFor("a");
+        await Assert.ThrowsAsync<NoVerificationCommandException>(
+            () => h.Queue.RunVerificationAsync("a", CancellationToken.None));
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
+        Assert.False(h.Queue.CanMerge("a", out var afterVerify));
+        Assert.Equal(MergeQueueProvisioner.RebaseConflictReason, afterVerify);
+    }
+
+
+    /// <summary>
+    /// The three ways out of a red verification, and the two that are refused. This is the shape of the
+    /// state: it is not terminal (the branch is still the agent's to fix) and it is not mergeable.
+    /// </summary>
+    [Fact]
+    public async Task VerificationFailed_OffersRetryAndDiscard_AndRefusesRejectAndMerge()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.FailFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        // Reject is a verdict on REVIEWED work, and nothing here has been reviewed.
+        Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var rejectRefusal));
+        Assert.Contains("only a verified branch", rejectRefusal);
+
+        // Merge cannot be reached by a HUMAN: the gate refuses, and the transition is not in the table
+        // either. (ConfirmHumanMerge is the reconcile's entry since 2026-09-03 — it records a merge git
+        // already holds and force-walks the row — so the strict path under test is TryConfirmHumanMerge.)
+        Assert.False(h.Queue.CanMerge("a", out _));
+        Assert.False(h.Queue.TryConfirmHumanMerge("a", "sha1", h.Queue.CurrentMainSha, out var mergeRefusal));
+        Assert.Equal(WorkerMergeState.VerificationFailed, h.Queue.GetState("a"));
+        Assert.NotEmpty(mergeRefusal);
+
+        // Retry IS available — the human's Verify button walks VerificationFailed → Verifying.
+        h.PassFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState("a"));
+    }
+
+    /// <summary>The agent pushes a fix: the entry returns to <c>Working</c> like any other invalidation,
+    /// and the red record goes with it rather than outliving the commits it was about.</summary>
+    [Fact]
+    public async Task VerificationFailed_NewCommits_ReturnToWorking_AndClearTheRedRecord()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.FailFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(WorkerMergeState.VerificationFailed, h.Queue.GetState("a"));
+
+        h.Queue.NotifyNewCommits("a");
+
+        Assert.Equal(WorkerMergeState.Working, h.Queue.GetState("a"));
+        Assert.Null(h.Queue.LastVerification("a"));
+    }
+
+    /// <summary>The human's other action: a red entry can be dropped from the queue.</summary>
+    [Fact]
+    public async Task VerificationFailed_CanBeDiscarded()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.FailFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        Assert.True(h.Queue.TryDiscard("a", "uid:1000", "superseded", out _));
+        Assert.Equal(WorkerMergeState.Discarded, h.Queue.GetState("a"));
+    }
+
+    /// <summary>
+    /// Every <see cref="WorkerMergeState"/> has a deliberate badge, and adding a member must not let one
+    /// slip into the <c>Working</c> fallback.
+    ///
+    /// <para><c>AgentStatusMap</c>'s own doc claims it is "total by construction (every input has a case)",
+    /// and its <c>_ =></c> arm is what makes that claim unfalsifiable — <c>VerificationFailed</c> landed in
+    /// it and badged a branch whose tests had just failed as ordinary live work, which is the exact
+    /// conflation this state exists to end. This asserts the mapping the fallback would otherwise hide.</para>
+    /// </summary>
+    [Fact]
+    public void EveryMergeState_HasADeliberateBadge_NotTheWorkingFallback()
+    {
+        Assert.Equal(
+            Mainguard.Agents.UI.ViewModels.Agents.AgentStatus.Conflict,
+            Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromMergeState(
+                WorkerMergeState.VerificationFailed));
+
+        // The control: exactly one state is badged Working, and it is Working.
+        var badgedWorking = Enum.GetValues<WorkerMergeState>()
+            .Where(s => Mainguard.Agents.UI.ViewModels.Agents.AgentStatusMap.FromMergeState(s)
+                == Mainguard.Agents.UI.ViewModels.Agents.AgentStatus.Working)
+            .ToArray();
+        Assert.Equal(new[] { WorkerMergeState.Working }, badgedWorking);
+    }
+
+    /// <summary>The state survives a daemon restart: it is persisted per transition like every other, and
+    /// a rehydrated queue answers the verdict rather than "not verified yet".</summary>
+    [Fact]
+    public async Task VerificationFailed_SurvivesARestart()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.FailFor("a");
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        var rebuilt = new MergeQueue(
+            "repo", "sha0", h.StateStore, h.VerStore,
+            (id, ct) => throw new InvalidOperationException("no run should be needed"));
+
+        Assert.Equal(WorkerMergeState.VerificationFailed, rebuilt.GetState("a"));
+        Assert.False(rebuilt.CanMerge("a", out var reason));
+        Assert.Contains("FAILED", reason);
     }
 
     [Fact]
@@ -814,13 +1080,13 @@ public class MergeQueueStateMachineTests
     }
 
     [Fact]
-    public async Task TryReject_Working_IsRefused_PointingAtDiscard()
+    public void TryReject_Working_IsRefused_PointingAtDiscard()
     {
         var h = new Harness();
         h.Build();
-        // Track the entry without verifying it (a run that fails leaves it Working).
-        h.FailFor("a");
-        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+        // Track the entry WITHOUT verifying it: since H2 a failed run no longer rests at Working, so
+        // reaching Working through a failure would now be testing a different state than this asserts.
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
 
         Assert.False(h.Queue.TryReject("a", "uid:1000", "", out var refusal));
         Assert.Contains("only a verified branch", refusal);
@@ -866,5 +1132,58 @@ public class MergeQueueStateMachineTests
         Assert.Equal(new[] { "npm", "run", "verify" }, pinned.Command);
 
         Assert.Throws<NoVerificationCommandException>(() => VerificationCommandResolver.Resolve(null, "npm test"));
+    }
+
+    // ---- the state-report seam (F2) --------------------------------------
+    //
+    // The queue is the only thing that decides a branch's merge state, so it is the only thing that may
+    // announce one. These pin the two properties that make the announcement trustworthy: it describes
+    // REAL transitions, and it can never damage one.
+
+    /// <summary>
+    /// One notice per real move, in order, and none for a write that moved nothing — seeding an entry
+    /// writes a row without transitioning. A report for a transition that did not happen is a report
+    /// about something other than the state machine.
+    /// </summary>
+    [Fact]
+    public async Task StateNotices_DescribeRealTransitions_AndNothingElse()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+
+        h.Queue.EnsureEntry("a", MergeEntryOrigin.Local);
+        Assert.Empty(h.Notices);
+
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+        Assert.Equal(
+            new[] { WorkerMergeState.Verifying, WorkerMergeState.Verified },
+            h.Notices.Where(n => n.Agent == "a").Select(n => n.State).ToArray());
+
+        // A second agent's transitions are its own — the notice carries the id, so two workers under one
+        // coordinator cannot be told each other's outcome.
+        await h.Queue.RunVerificationAsync("b", CancellationToken.None);
+        Assert.Equal(2, h.Notices.Count(n => n.Agent == "a"));
+        Assert.Equal(2, h.Notices.Count(n => n.Agent == "b"));
+    }
+
+    /// <summary>
+    /// Reporting a state may never fail a transition. The row is already persisted when the sink runs, so
+    /// an exception escaping would leave the store and memory disagreeing about a branch's merge
+    /// eligibility — a worse outcome than the report nobody got.
+    /// </summary>
+    [Fact]
+    public async Task AThrowingStateSink_CannotBreakATransition()
+    {
+        var h = new Harness();
+        h.Build(withRequeue: false);
+        h.NoticeSinkThrows = true;
+
+        await h.Queue.RunVerificationAsync("a", CancellationToken.None);
+
+        Assert.Equal(WorkerMergeState.Verified, h.Queue.GetState("a"));
+        // ...and the persisted row agrees, which is the half a failure escaping mid-write would break.
+        Assert.Equal(
+            nameof(WorkerMergeState.Verified),
+            Assert.Single(h.StateStore.LoadAll("repo"), r => r.AgentId == "a").State);
     }
 }

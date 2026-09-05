@@ -69,6 +69,111 @@ public class RoleInterceptorTests
         Assert.Contains(RoleDenialMarker, ex2.Status.Detail);
     }
 
+    /// <summary>
+    /// Phase 3, contract §4 — the two merge-power RPCs the existing cases never covered.
+    /// <c>AbandonMerge</c> is the third leg of the merge conversation, and
+    /// <c>AcknowledgeFlaggedChange</c> is the human review act that unblocks a merge, i.e. merge power by
+    /// another name. Both were in <c>CoordinatorDeniedMethods</c> and neither had a test, so nothing would
+    /// have noticed either being dropped from the set.
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesTheRestOfTheMergeConversationToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+        var coordinatorHeaders = fixture.AuthHeaders(CoordinatorToken);
+
+        var abandon = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AbandonMergeAsync(
+                new AbandonMergeRequest { RepoHandle = "repo", AgentId = "a" }, coordinatorHeaders).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, abandon.StatusCode);
+        Assert.Contains(RoleDenialMarker, abandon.Status.Detail);
+
+        // MG-11: acknowledging a flagged change unblocks a merge, so it is merge power by another name.
+        var ack = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AcknowledgeFlaggedChangeAsync(
+                new AcknowledgeFlaggedChangeRequest { RepoHandle = "repo", AgentId = "a", ItemId = "i" },
+                coordinatorHeaders).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, ack.StatusCode);
+        Assert.Contains(RoleDenialMarker, ack.Status.Detail);
+    }
+
+    /// <summary>
+    /// §4 plan approval, the REJECT half. <c>ApprovePlan</c> had a test; <c>RejectPlan</c> did not — and a
+    /// coordinator that can reject plans holds the gate just as surely as one that can approve them (it can
+    /// burn a worker's revision budget to escalation at will).
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesPlanRejectionToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            plans.RejectPlanAsync(
+                new RejectPlanRequest { PlanId = "any", Reason = "no" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task RoleInterceptor_DeniesRequestNewPlanToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            plans.RequestNewPlanAsync(
+                new RequestNewPlanRequest { PlanId = "any", Guidance = "try again" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task RoleInterceptor_DeniesMirrorRefreshToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.RefreshMirrorMainAsync(
+                new RefreshMirrorMainRequest { RepoHandle = "any" },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task RoleInterceptor_DeniesSetJailLimitsToCoordinator_ButLetsItRead()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var agents = new AgentService.AgentServiceClient(fixture.CreateChannel());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            agents.SetJailLimitsAsync(
+                new SetJailLimitsRequest { MemoryBytes = 64L * 1024 * 1024 * 1024, Cpus = 64 },
+                fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+        Assert.True((await agents.GetJailLimitsAsync(new GetJailLimitsRequest(), fixture.AuthHeaders(CoordinatorToken))).IsDefault);
+    }
+
     [Fact]
     public async Task RoleInterceptor_DeniesRejectToCoordinator()
     {
@@ -85,6 +190,35 @@ public class RoleInterceptorTests
                 fixture.AuthHeaders(CoordinatorToken)).ResponseAsync);
         Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
         Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task RoleInterceptor_DeniesBothParkedConflictActionsToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var merge = new MergeQueueService.MergeQueueServiceClient(fixture.CreateChannel());
+        var headers = fixture.AuthHeaders(CoordinatorToken);
+
+        // Handing a parked conflict back UNPAUSES a co-tenant's jail and then types into its CLI — the
+        // PauseAgent/UnpauseAgent denial above plus the terminal input lock's whole purpose, reachable in
+        // one call from a different service. An agent must not be able to get at it by the side door.
+        var handBack = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.ResolveConflictWithAgentAsync(
+                new ResolveConflictWithAgentRequest { RepoHandle = "repo", AgentId = "a" },
+                headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, handBack.StatusCode);
+        Assert.Contains(RoleDenialMarker, handBack.Status.Detail);
+
+        // Aborting rewrites a co-tenant branch's parentage and resumes its jail — merge-adjacent power
+        // over work the calling agent competes with.
+        var abort = await Assert.ThrowsAsync<RpcException>(() =>
+            merge.AbortRebaseAsync(
+                new AbortRebaseRequest { RepoHandle = "repo", AgentId = "a" },
+                headers).ResponseAsync);
+        Assert.Equal(StatusCode.PermissionDenied, abort.StatusCode);
+        Assert.Contains(RoleDenialMarker, abort.Status.Detail);
     }
 
     [Fact]
@@ -140,6 +274,52 @@ public class RoleInterceptorTests
 
         Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
         Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    /// <summary>
+    /// Phase 3 §6: <c>StreamPlans</c> filters on a client-asserted <c>coordinator_id</c>, so a caller may
+    /// name any coordinator — or omit the field and receive EVERY pending plan on the daemon, across
+    /// every repository. That is the disclosure <c>GetScrollback</c> is denied for, arriving by another
+    /// door: plans carry other agents' scope, approach and task prompts, and the human's decisions about
+    /// work this coordinator competes with.
+    ///
+    /// <para>The durable fix is a DERIVED caller identity rather than a trusted field, which is a change
+    /// to the authentication model; this closes the coordinator-shaped half. The test matters more than
+    /// usual because the RPC is unreachable by the in-jail coordinator today (it has no gRPC route), and
+    /// an untested denial on an unreachable path is exactly how the previous one quietly stopped being
+    /// true (MG-12).</para>
+    /// </summary>
+    [Fact]
+    public async Task RoleInterceptor_DeniesPlanStreamToCoordinator()
+    {
+        using var fixture = new DaemonFixture();
+        fixture.Services.GetRequiredService<ConnectionRoleRegistry>().RegisterCoordinatorToken(CoordinatorToken);
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        using var call = plans.StreamPlans(new StreamPlansRequest(), fixture.AuthHeaders(CoordinatorToken));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => call.ResponseStream.MoveNext(CancellationToken.None));
+
+        Assert.Equal(StatusCode.PermissionDenied, ex.StatusCode);
+        Assert.Contains(RoleDenialMarker, ex.Status.Detail);
+    }
+
+    /// <summary>The paired positive: the operator drives the plan gate in the UI and must still receive
+    /// the stream. Without it the denial above could be a broken RPC rather than a role boundary.</summary>
+    [Fact]
+    public async Task Operator_MayStreamPlans()
+    {
+        using var fixture = new DaemonFixture();
+
+        var plans = new PlanApprovalService.PlanApprovalServiceClient(fixture.CreateChannel());
+
+        using var call = plans.StreamPlans(new StreamPlansRequest(), fixture.AuthHeaders());
+
+        Assert.True(
+            await call.ResponseStream.MoveNext(CancellationToken.None),
+            "the operator's plan stream produced no snapshot");
     }
 
     // The operator drives the UI and legitimately reads any agent's scrollback.

@@ -89,8 +89,19 @@ public sealed class DbMergeQueueStore : IMergeQueueStore
 /// </summary>
 public interface IMergeLeaseStore
 {
-    /// <summary>Takes a lease for a repo. Fails (returns null) if an unconfirmed lease is already outstanding.</summary>
-    MergeLeaseRow? TryBegin(string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch);
+    /// <summary>
+    /// Takes a lease for a repo. Fails (returns null) if an unconfirmed lease is already outstanding.
+    ///
+    /// <para>K3 — the lease records the IDENTITY the merge is authorized for, not merely the fact that one
+    /// is in flight: the agent, the <c>main@sha</c> it may fast-forward, and
+    /// <paramref name="expectedBranchSha"/>, the <c>agent/&lt;id&gt;</c> tip the queue's verification was
+    /// measured on. Every leg of the conversation re-checks that identity at the moment it acts, which is
+    /// what makes this a compare-and-swap rather than a mutex. Pass <c>""</c> when the caller genuinely has
+    /// no verified branch sha — it is read everywhere as "not measured", never as a mismatch.</para>
+    /// </summary>
+    MergeLeaseRow? TryBegin(
+        string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch,
+        string expectedBranchSha = "");
 
     /// <summary>The outstanding (unconfirmed) lease for a repo, or null.</summary>
     MergeLeaseRow? GetOutstanding(string repoHash);
@@ -112,7 +123,9 @@ public sealed class InMemoryMergeLeaseStore : IMergeLeaseStore
     private readonly List<MergeLeaseRow> _rows = new();
     private long _nextId;
 
-    public MergeLeaseRow? TryBegin(string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch)
+    public MergeLeaseRow? TryBegin(
+        string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch,
+        string expectedBranchSha = "")
     {
         lock (_gate)
         {
@@ -128,6 +141,7 @@ public sealed class InMemoryMergeLeaseStore : IMergeLeaseStore
                 LeaseId = leaseId,
                 AgentId = agentId,
                 ExpectedMainSha = expectedMainSha,
+                ExpectedBranchSha = expectedBranchSha ?? string.Empty,
                 MainBranch = mainBranch,
                 Confirmed = false,
                 BeginUtc = DateTime.UtcNow,
@@ -184,6 +198,7 @@ public sealed class InMemoryMergeLeaseStore : IMergeLeaseStore
         LeaseId = r.LeaseId,
         AgentId = r.AgentId,
         ExpectedMainSha = r.ExpectedMainSha,
+        ExpectedBranchSha = r.ExpectedBranchSha,
         MainBranch = r.MainBranch,
         Confirmed = r.Confirmed,
         PostMergeSha = r.PostMergeSha,
@@ -202,7 +217,9 @@ public sealed class DbMergeLeaseStore : IMergeLeaseStore
         _contextFactory = contextFactory ?? throw new ArgumentNullException(nameof(contextFactory));
     }
 
-    public MergeLeaseRow? TryBegin(string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch)
+    public MergeLeaseRow? TryBegin(
+        string repoHash, string leaseId, string agentId, string expectedMainSha, string mainBranch,
+        string expectedBranchSha = "")
     {
         lock (_gate)
         {
@@ -218,6 +235,7 @@ public sealed class DbMergeLeaseStore : IMergeLeaseStore
                 LeaseId = leaseId,
                 AgentId = agentId,
                 ExpectedMainSha = expectedMainSha,
+                ExpectedBranchSha = expectedBranchSha ?? string.Empty,
                 MainBranch = mainBranch,
                 Confirmed = false,
                 BeginUtc = DateTime.UtcNow,

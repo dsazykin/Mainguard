@@ -104,6 +104,10 @@ public partial class SettingsViewModel : ViewModelBase
             // orphaned Window nothing constructed, so intake was unconfigurable in the shipped app.
             Pages.Add(new SettingsPageRowViewModel("PrIntake", "PR Intake", "PullRequestIcon",
                 proTools.CreatePrIntakePage, ActivateRow));
+            // The per-jail memory/CPU ceiling (owner decision 2026-09-04): daemon state, so a weaker
+            // machine can shrink what every spawn is created with.
+            Pages.Add(new SettingsPageRowViewModel("AgentJails", "Agent Jails", "ShieldIcon",
+                proTools.CreateJailLimitsPage, ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("MainguardOs", "Mainguard OS", "FolderIcon",
                 () => proTools.CreateMainguardOsPage(OwnerWindow!) ?? new object(), ActivateRow));
             Pages.Add(new SettingsPageRowViewModel("DaemonLogs", "Daemon Logs", "TerminalIcon",

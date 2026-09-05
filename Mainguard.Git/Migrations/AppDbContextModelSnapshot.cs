@@ -237,6 +237,10 @@ namespace Mainguard.Git.Migrations
                     b.Property<bool>("Confirmed")
                         .HasColumnType("INTEGER");
 
+                    b.Property<string>("ExpectedBranchSha")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("ExpectedMainSha")
                         .IsRequired()
                         .HasColumnType("TEXT");
@@ -500,6 +504,10 @@ namespace Mainguard.Git.Migrations
                         .HasColumnType("INTEGER");
 
                     b.Property<string>("AgentId")
+                        .IsRequired()
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("BranchSha")
                         .IsRequired()
                         .HasColumnType("TEXT");
 

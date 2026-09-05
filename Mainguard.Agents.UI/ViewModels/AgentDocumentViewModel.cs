@@ -38,9 +38,24 @@ public partial class AgentDocumentViewModel : ViewModelBase
     public ObservableCollection<FlaggedItemViewModel> FlaggedItems { get; } = new();
 
     [ObservableProperty] private bool _hasFlaggedItems;
-    [ObservableProperty] private string _reviewFactsText = "";
+
+    /// <summary>The <c>main@sha</c> the record was measured against — kept when the fabricated test counts
+    /// beside it were removed, because this one is real and is the only thing that says whether a verdict
+    /// was taken against today's main. Empty when the daemon sent no sha.</summary>
+    [ObservableProperty] private string _verifiedAgainstText = "";
+
     [ObservableProperty] private bool _canMerge;
     [ObservableProperty] private string _mergeGateReason = "";
+
+    /// <summary>
+    /// The verification verdict and its on-demand output (H4) — the SAME child VM the merge-queue row
+    /// composes. It replaced a <c>ReviewFactsText</c> that read
+    /// <c>"verified @ {sha} · {TestsPassed}/{TestsTotal} tests green"</c> or, for everything else,
+    /// <c>"no verification record yet"</c>. Both halves of that were wrong: the counts came from a
+    /// client-side record no wire has ever carried, and the fallback said "no record" about a branch whose
+    /// tests had just failed. The pane now reads the same three-way projection as the rail.
+    /// </summary>
+    public VerificationPanelViewModel Verification { get; }
 
     public AgentDocumentViewModel(string agentId, IAgentService agents, IMergeQueueService queue, ITelemetryService telemetry)
     {
@@ -48,6 +63,7 @@ public partial class AgentDocumentViewModel : ViewModelBase
         _agents = agents;
         _queue = queue;
         _telemetry = telemetry;
+        Verification = new VerificationPanelViewModel(agentId, queue);
         Refresh();
     }
 
@@ -87,7 +103,22 @@ public partial class AgentDocumentViewModel : ViewModelBase
     private void RefreshReview()
     {
         var entry = _queue.GetQueue().FirstOrDefault(q => q.AgentId == AgentId);
-        if (entry is null) { FlaggedItems.Clear(); HasFlaggedItems = false; CanMerge = false; MergeGateReason = "not in the merge queue"; return; }
+
+        // Updated for the null case too: an agent that left the queue must not keep rendering the verdict
+        // of a run it no longer has an entry for.
+        Verification.Update(entry);
+
+        if (entry is null)
+        {
+            FlaggedItems.Clear();
+            HasFlaggedItems = false;
+            VerifiedAgainstText = "";
+            CanMerge = false;
+            MergeGateReason = "not in the merge queue";
+            return;
+        }
+
+        VerifiedAgainstText = entry.VerifiedMainSha is { Length: > 0 } sha ? $"measured against main@{sha}" : "";
 
         // Sync flagged items in place so ack checkmarks don't flicker.
         for (int i = FlaggedItems.Count - 1; i >= 0; i--)
@@ -100,10 +131,6 @@ public partial class AgentDocumentViewModel : ViewModelBase
             else existing.Update(item);
         }
         HasFlaggedItems = FlaggedItems.Count > 0;
-
-        ReviewFactsText = entry.Verification is { } v
-            ? $"verified @ {v.MainSha} · {v.TestsPassed}/{v.TestsTotal} tests green"
-            : "no verification record yet";
 
         CanMerge = _queue.CanMerge(AgentId, out var reason);
         MergeGateReason = CanMerge ? "ready to merge" : reason;

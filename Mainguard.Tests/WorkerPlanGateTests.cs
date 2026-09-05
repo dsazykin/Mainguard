@@ -31,6 +31,82 @@ public class WorkerPlanGateTests
         return (plans, new WorkerPlanGate(plans, audit));
     }
 
+    // ---- The brief is a brief, not the task (contract §3 change, 2026-08-29) ----------------
+
+    /// <summary>
+    /// <b>The defect, at the object that produced it.</b> Until 2026-08-29 the coordinator's shim sent no
+    /// title and the daemon filled the hole with <c>Title ?? TaskPrompt</c>, so
+    /// <see cref="WorkerPlanGate.PlanningBriefFor"/> returned the task verbatim to every worker —
+    /// MAINGUARD.md's "what you are here to plan (never the task itself)" made false by a fallback, with
+    /// nothing red anywhere. There is no fallback left: a hold without a real brief is refused, and each
+    /// refusal names its own cause so a coordinator can retry correctly rather than guess.
+    /// </summary>
+    [Theory]
+    [InlineData(null, "rewrite TokenClock", "a title is required")]
+    [InlineData("", "rewrite TokenClock", "a title is required")]
+    [InlineData("   ", "rewrite TokenClock", "a title is required")]
+    [InlineData("Fix the clock", null, "a task is required")]
+    [InlineData("Fix the clock", "   ", "a task is required")]
+    [InlineData("rewrite TokenClock", "rewrite TokenClock", "must not be the task")]
+    [InlineData("  rewrite TokenClock  ", "rewrite TokenClock", "must not be the task")]
+    [InlineData("Fix\nthe clock", "rewrite TokenClock", "single line")]
+    public void ABriefThatIsMissingOrIsTheTask_IsRefused(string? title, string? task, string expected)
+    {
+        var refusal = WorkerPlanGate.RefuseBrief(title, task);
+        Assert.NotNull(refusal);
+        Assert.Contains(expected, refusal!, StringComparison.Ordinal);
+
+        // Every refusal carries the form to use — this text is read by a model that has to fix it.
+        Assert.Contains(
+            Mainguard.Agents.Agents.Ipc.AgentSpawnShim.SpawnUsage, refusal!, StringComparison.Ordinal);
+    }
+
+    /// <summary>The title is a card headline, so a pasted task is refused by length even when it differs
+    /// from the task string — with the boundary pinned on both sides, so the cap is the cap.</summary>
+    [Fact]
+    public void AnOverLongTitle_IsRefused_AndTheBoundaryItselfIsNot()
+    {
+        Assert.Null(WorkerPlanGate.RefuseBrief(new string('x', WorkerPlanGate.MaxBriefLength), "the work"));
+
+        var over = WorkerPlanGate.RefuseBrief(new string('x', WorkerPlanGate.MaxBriefLength + 1), "the work");
+        Assert.NotNull(over);
+        Assert.Contains("headline", over!, StringComparison.Ordinal);
+    }
+
+    /// <summary>The paired positive: a real brief and a real task are accepted, and the brief that comes
+    /// back is the title — never the task. Without this every assertion above would hold on a validator
+    /// that refused everything.</summary>
+    [Fact]
+    public void ARealBrief_IsHeld_AndIsWhatTheWorkerIsGiven()
+    {
+        var (_, gate) = Rig();
+        Assert.Null(WorkerPlanGate.RefuseBrief("Fix the clock", "rewrite TokenClock and add boundary tests"));
+
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock and add boundary tests", 2m);
+
+        Assert.Equal("Fix the clock", gate.PlanningBriefFor("w-1"));
+        Assert.False(gate.TryReleaseTask("w-1", out _)); // …and the task is still not on offer
+    }
+
+    /// <summary>
+    /// The gate itself refuses, not only its callers. <c>Hold</c> is the one place both strings are
+    /// stored and the sole source of <see cref="WorkerPlanGate.PlanningBriefFor"/>, so it is where the
+    /// rule lives; a check that existed only at the spawn service would be the second copy that goes
+    /// decorative (MG-12) the first time another caller appears.
+    /// </summary>
+    [Fact]
+    public void HoldRefusesABriefThatIsTheTask_AndHoldsNothing()
+    {
+        var (_, gate) = Rig();
+
+        var ex = Assert.Throws<ArgumentException>(
+            () => gate.Hold("w-1", "coord-1", "rewrite TokenClock", "rewrite TokenClock", 1m));
+        Assert.Contains("must not be the task", ex.Message, StringComparison.Ordinal);
+
+        Assert.Equal(0, gate.HeldTaskCount);
+        Assert.Null(gate.PlanningBriefFor("w-1"));
+    }
+
     // ---- The daemon holds the task ---------------------------------------
 
     [Fact]
@@ -59,6 +135,57 @@ public class WorkerPlanGateTests
         Assert.True(gate.TryReleaseTask("w-1", out var released));
         Assert.Equal("rewrite TokenClock and add boundary tests", released);
         Assert.True(gate.TaskWasReleased("w-1"));
+    }
+
+    // ---- K5/§23.7: the merge record has to say WHICH plan ------------------------------------
+
+    /// <summary>
+    /// <c>IMergeGate.MergeEvidence</c> is the half of §21's <c>gates</c> field that answers "what did this
+    /// gate have ESTABLISHED", and this one said <c>plan gate: plan approved</c> — naming no plan. A
+    /// worker presents, is sent back, revises and re-presents, so "some plan was approved for this worker"
+    /// is not a reference to anything: the one question a person reading a bad merge asks — which
+    /// decision authorised this — was unanswerable from the record that exists to answer it.
+    ///
+    /// <para>Scope is deliberately untouched here (a concurrent change owns re-scoping); this is only the
+    /// identity.</para>
+    /// </summary>
+    [Fact]
+    public void TheMergeEvidence_NamesTheApprovedPlan_NotMerelyThatSomePlanWasApproved()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock", 2m);
+
+        // The plan a human actually approved is the SECOND one; the first was sent back. A record that
+        // said only "plan approved" could not tell them apart.
+        var planId = plans.Present("w-1", "coord-1", "Fix the clock", Fields(), "", 2m).PlanId!;
+        plans.Reject(planId, "narrow it");
+        plans.Revise(planId, "Narrow the clock fix", Fields("src/Clock.cs"));
+        plans.Approve(planId, "uid:1000");
+
+        var evidence = gate.MergeEvidence("w-1");
+
+        Assert.NotNull(evidence);
+        Assert.Contains("plan approved", evidence!, StringComparison.Ordinal);
+        Assert.Contains(planId, evidence!, StringComparison.Ordinal);
+        Assert.Contains("Narrow the clock fix", evidence!, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The two answers that are NOT "approved", kept apart from each other and from the one above. An
+    /// agent this gate never held is not governed by it at all — that is why <c>Allows</c> is true for a
+    /// manual-mode agent — and saying so is different from saying a plan was approved.
+    /// </summary>
+    [Fact]
+    public void TheMergeEvidence_SeparatesAnUngatedAgentFromAWorkerStillAtTheGate()
+    {
+        var (plans, gate) = Rig();
+        Assert.Equal("plan gate: not a plan-gated worker", gate.MergeEvidence("manual-agent"));
+
+        gate.Hold("w-1", "coord-1", "Fix the clock", "rewrite TokenClock", 2m);
+        plans.Present("w-1", "coord-1", "Fix the clock", Fields(), "", 2m);
+        var held = gate.MergeEvidence("w-1");
+        Assert.NotNull(held);
+        Assert.Contains("NOT satisfied", held!, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -255,6 +382,115 @@ public class WorkerPlanGateTests
         Assert.False(gate.TryReleaseTask("w-1", out _));
     }
 
+    // ---- phase 3 · the held task is keyed by (RepoHash, AgentId), never the bare id -----------
+
+    /// <summary>
+    /// Two repositories, each with a worker called <c>pr-7</c> — the id collision the external-PR intake
+    /// produces, and the one this codebase has already fixed three times elsewhere (#281, #284, #286).
+    ///
+    /// <para>Keyed by the bare id, <see cref="WorkerPlanGate.Hold"/> is idempotent per id, so repo B's
+    /// <c>pr-7</c> would silently inherit repo A's held task and repo B's own task would be dropped on the
+    /// floor. Keyed by (repo, id) they are two distinct holds, which is what this asserts.</para>
+    /// </summary>
+    [Fact]
+    public void TwoRepositoriesMayEachHoldATaskForTheSameAgentId()
+    {
+        var (_, gate) = Rig();
+
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        gate.Hold("pr-7", "coord-b", "Repo B title", "repo B task", 1m, repoHash: "repo-b");
+
+        // Both holds exist independently. Under the bare-id key the second Hold returned early and repo
+        // B's task never existed at all — HeldTaskCount would be 1.
+        Assert.Equal(2, gate.HeldTaskCount);
+    }
+
+    /// <summary>
+    /// The fail-closed half. An id held by two repos is <b>ambiguous</b>, and every question about it is
+    /// answered "not authorised" rather than answered from whichever repo happened to be found first.
+    ///
+    /// <para>This is the security-relevant direction: approving repo B's plan must never release repo A's
+    /// withheld task. Resolving an ambiguous id to an arbitrary candidate is the aliasing bug wearing a
+    /// lookup's clothes, so the resolver returns nothing and the gate refuses.</para>
+    /// </summary>
+    [Fact]
+    public void AnAmbiguousAgentId_FailsClosed_RatherThanResolvingToEitherRepo()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        gate.Hold("pr-7", "coord-b", "Repo B title", "repo B task", 1m, repoHash: "repo-b");
+
+        // A plan approved for the *bare* id must not hand either repo's task over.
+        var planId = plans.Present("pr-7", "coord-b", "Repo B title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        Assert.False(
+            gate.TryReleaseTask("pr-7", out var released),
+            "an ambiguous agent id released a withheld task — one repo's approval authorised another's worker.");
+        Assert.Equal(string.Empty, released);
+
+        // And the brief/budget lookups refuse too, rather than serving repo A's title to repo B.
+        Assert.Null(gate.PlanningBriefFor("pr-7"));
+        Assert.Null(gate.CoordinatorFor("pr-7"));
+    }
+
+    /// <summary>
+    /// The paired positive, so the test above cannot pass by the gate simply refusing everything: an
+    /// UNambiguous id still resolves and still releases on approval.
+    /// </summary>
+    [Fact]
+    public void AnUnambiguousAgentId_StillResolvesAndReleasesNormally()
+    {
+        var (plans, gate) = Rig();
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+
+        var planId = plans.Present("pr-7", "coord-a", "Repo A title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        Assert.True(gate.TryReleaseTask("pr-7", out var released));
+        Assert.Equal("repo A task", released);
+        Assert.Equal("Repo A title", gate.PlanningBriefFor("pr-7"));
+    }
+
+    /// <summary>
+    /// <b>Where the release-exactly-once fix and the (RepoHash, AgentId) re-key meet.</b>
+    ///
+    /// <para>Every other release-once test holds at the DEFAULT empty repo hash, where the composite key
+    /// is <c>("", id)</c> — so a write-back that used <c>("", id)</c> instead of the resolved key would be
+    /// indistinguishable from a correct one, and all of them would stay green. This test holds under a real
+    /// repo hash, which is the only arrangement where the two keys differ and the wrong one is visible: the
+    /// <c>Released</c> flag would never latch on the held entry, every repeat call would look like a first
+    /// release, and the task would be audited and announced once per call.</para>
+    ///
+    /// <para>It exists because merging phase 3 onto the idempotence fix put both changes on the same three
+    /// lines, and a conflict resolution is exactly the moment an enforcement quietly re-opens.</para>
+    /// </summary>
+    [Fact]
+    public void ReleasingTwiceForARepoScopedWorker_StillAuditsAndAnnouncesOnce()
+    {
+        var audit = new InMemoryAuditLog();
+        var (plans, gate) = Rig(audit);
+        var announced = new List<string>();
+        gate.TaskReleased += (workerId, prompt) => announced.Add($"{workerId}:{prompt}");
+
+        gate.Hold("pr-7", "coord-a", "Repo A title", "repo A task", 1m, repoHash: "repo-a");
+        var planId = plans.Present("pr-7", "coord-a", "Repo A title", Fields(), "", 1m).PlanId!;
+        plans.Approve(planId, "uid:1000");
+
+        // The re-attach, under a repo-scoped hold: same answer every time…
+        Assert.True(gate.TryReleaseTask("pr-7", out var first));
+        Assert.Equal("repo A task", first);
+        Assert.True(gate.TryReleaseTask("pr-7", out var second));
+        Assert.Equal("repo A task", second);
+        Assert.True(gate.TryReleaseTask("pr-7", out var third));
+        Assert.Equal("repo A task", third);
+
+        // …authorised, recorded and announced exactly once.
+        Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+        Assert.Equal(new[] { "pr-7:repo A task" }, announced);
+        Assert.True(gate.TaskWasReleased("pr-7"));
+    }
+
     // ---- Release happens exactly once ------------------------------------
 
     /// <summary>
@@ -349,6 +585,99 @@ public class WorkerPlanGateTests
             // …and exactly one of them was the release.
             Assert.Equal(1, announced);
             Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+        }
+    }
+
+    // ---- The held task outlives the daemon ---------------------------------
+
+    /// <summary>
+    /// <b>The gate's claim is that the DAEMON holds the task — and it held it in memory only.</b> The plan
+    /// store beside it was a file, so a restart with jails alive rehydrated every plan and forgot every
+    /// held task. Two lies followed, in opposite directions: <see cref="WorkerPlanGate.Allows"/> answered
+    /// yes for a worker whose plan was still pending (the merge backstop opened), and
+    /// <see cref="WorkerPlanGate.TryReleaseTask"/> answered no for a worker whose plan was approved (it
+    /// never received its task). This drives two gates over one file and asserts both directions, plus
+    /// that the release latch survives — the re-attach after a restart is exactly the repeat call the
+    /// once-only audit exists for.
+    /// </summary>
+    [Fact]
+    public void AHeldTask_SurvivesARestart_InBothDirections_AndTheReleaseLatchWithIt()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"mg-held-{Guid.NewGuid():N}");
+        var plansPath = Path.Combine(dir, "mainguard-plans.json");
+        var heldPath = Path.Combine(dir, "mainguard-held-tasks.json");
+        var audit = new InMemoryAuditLog();
+        try
+        {
+            var plans1 = new PlanApprovalService(new JsonPlanApprovalStore(plansPath), audit);
+            var gate1 = new WorkerPlanGate(plans1, audit, new JsonHeldTaskStore(heldPath));
+            gate1.Hold("approved-w", "coord-1", "Fix the clock", "rewrite TokenClock", 2m, repoHash: "repo-a");
+            gate1.Hold("pending-w", "coord-1", "Fix the docs", "rewrite README", 0m, repoHash: "repo-a");
+            gate1.Hold("ungated-w", "coord-1", "Fix the tests", "rewrite tests", 0m, repoHash: "repo-a", mode: WorkerPlanMode.Ungated);
+            plans1.Approve(plans1.Present("approved-w", "coord-1", "Fix the clock", Fields(), "", 2m).PlanId!, "uid:1000");
+            plans1.Present("pending-w", "coord-1", "Fix the docs", Fields(), "", 0m);
+            Assert.True(gate1.TryReleaseTask("approved-w", out _));
+
+            // The restart: fresh service and gate over the same two files, the previous ones discarded.
+            var plans2 = new PlanApprovalService(new JsonPlanApprovalStore(plansPath), audit);
+            var gate2 = new WorkerPlanGate(plans2, audit, new JsonHeldTaskStore(heldPath));
+            var announced = 0;
+            gate2.TaskReleased += (_, _) => announced++;
+
+            // The approved worker is still held and still authorised — and still gets its task on re-attach.
+            Assert.Equal("Fix the clock", gate2.PlanningBriefFor("approved-w"));
+            Assert.Equal(2m, gate2.BudgetFor("approved-w"));
+            Assert.Equal("coord-1", gate2.CoordinatorFor("approved-w"));
+            Assert.True(gate2.TryReleaseTask("approved-w", out var task));
+            Assert.Equal("rewrite TokenClock", task);
+            Assert.True(gate2.MayAutoVerify("approved-w", out _));
+            Assert.StartsWith("plan gate: plan approved", gate2.MergeEvidence("approved-w")!, StringComparison.Ordinal);
+
+            // …and the latch survived: the release was audited and announced by the FIRST daemon, once.
+            Assert.Equal(0, announced);
+            Assert.Single(audit.Read(), e => e.Type == "worker_task_released");
+            Assert.True(gate2.TaskWasReleased("approved-w"));
+
+            // The pending worker is still held, so the merge backstop still says no — the dangerous direction.
+            Assert.False(gate2.Allows("pending-w", out var reason));
+            Assert.Contains("waiting on your approval", reason, StringComparison.Ordinal);
+            Assert.False(gate2.TryReleaseTask("pending-w", out _));
+            Assert.Equal("Fix the docs", gate2.PlanningBriefFor("pending-w"));
+
+            // The plan-mode-off worker keeps its recorded mode; it is not re-gated by a restart.
+            Assert.True(gate2.IsUngated("ungated-w"));
+            Assert.True(gate2.TryReleaseTask("ungated-w", out var ungatedTask));
+            Assert.Equal("rewrite tests", ungatedTask);
+            Assert.Equal(3, gate2.HeldTaskCount);
+
+            // Forget is durable too: a third daemon does not resurrect a stopped worker's task.
+            gate2.Forget("pending-w");
+            var gate3 = new WorkerPlanGate(plans2, audit, new JsonHeldTaskStore(heldPath));
+            Assert.Null(gate3.PlanningBriefFor("pending-w"));
+            Assert.Equal(2, gate3.HeldTaskCount);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { }
+        }
+    }
+
+    /// <summary>An unreadable held-task file rehydrates as nothing held — the pre-existing behaviour,
+    /// never as a task handed to a worker whose approval cannot be established.</summary>
+    [Fact]
+    public void AnUnreadableHeldTaskFile_RehydratesAsNothingHeld()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"mg-held-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, "{ not json");
+            var (plans, _) = Rig();
+            var gate = new WorkerPlanGate(plans, store: new JsonHeldTaskStore(path));
+            Assert.Equal(0, gate.HeldTaskCount);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
         }
     }
 }

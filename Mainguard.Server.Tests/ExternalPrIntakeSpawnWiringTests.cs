@@ -397,6 +397,49 @@ public sealed class ExternalPrIntakeSpawnWiringTests
         Assert.Null(world.Resolver.Resolve(new ExternalPrSource("github.com", "acme", "app", null)));
     }
 
+    // ================= the withdrawn pull request's branch =================
+
+    /// <summary>
+    /// A teardown now KEEPS a branch that carries a commit, which is right for a worker whose work exists
+    /// nowhere else and wrong for an intake'd pull request: those commits were fetched from the pull
+    /// request and still live there, and <c>pr-&lt;n&gt;</c> is a REUSED id — a branch left standing makes
+    /// the next intake of that number collide with <c>CreateAgentWorktree</c>'s duplicate refusal on every
+    /// poll, forever. So the release path says so explicitly, and it is the only path that may.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseWorker_DiscardsTheBranch_WhenTheJailIsAlreadyGone()
+    {
+        using var daemon = new DaemonFixture();
+        var worktrees = new RecordingWorktrees();
+        var host = NewHost(daemon, resolveRunningJail: (_, _) => null, worktrees: worktrees);
+
+        await host.ReleaseWorkerAsync("repo-a", "pr-9", CancellationToken.None);
+
+        Assert.Equal(("repo-a", "pr-9"), Assert.Single(worktrees.Discarded));
+    }
+
+    /// <summary>
+    /// …and on the path that DID stop a live session too. This is the one the intake actually takes when a
+    /// pull request closes while its worker is running, and it used to <c>return</c> before anything else
+    /// could happen — so a discard added after that early exit would have been unreachable on exactly the
+    /// case it exists for.
+    /// </summary>
+    [Fact]
+    public async Task ReleaseWorker_DiscardsTheBranch_AlsoWhenItStoppedALiveSession()
+    {
+        using var daemon = new DaemonFixture();
+        var store = daemon.Services.GetRequiredService<AgentSessionStore>();
+        store.Spawn(ExternalPrIntake.WorkerAgentKind, AgentRoles.Managed, agentId: "pr-9", repoHash: "repo-a");
+
+        var worktrees = new RecordingWorktrees();
+        var host = NewHost(daemon, resolveRunningJail: (_, _) => null, worktrees: worktrees);
+
+        await host.ReleaseWorkerAsync("repo-a", "pr-9", CancellationToken.None);
+
+        Assert.Empty(store.List());
+        Assert.Equal(("repo-a", "pr-9"), Assert.Single(worktrees.Discarded));
+    }
+
     // ================= helpers =================
 
     /// <summary>
@@ -530,14 +573,23 @@ public sealed class ExternalPrIntakeSpawnWiringTests
 
     /// <summary>Records every <c>(repo, agent)</c> handed to the MG-3 ref sweep — the same seam
     /// <c>SandboxAgentLauncher</c> registers a SPAWNED agent through, so watching it here asserts the real
-    /// wiring rather than a bookkeeping list this host keeps for itself.</summary>
+    /// wiring rather than a bookkeeping list this host keeps for itself. Also records the explicit branch
+    /// discards, which is the OTHER thing this host has to reach the substrate for.</summary>
     private sealed class RecordingWorktrees : IAgentWorktreeManager
     {
         public List<(string Repo, string Agent)> Watched { get; } = new();
 
+        public List<(string Repo, string Agent)> Discarded { get; } = new();
+
         public string CreateAgentWorktree(string repoHash, string agentId) => $"/wt/{repoHash}/{agentId}";
 
         public void RemoveAgentWorktree(string repoHash, string agentId, bool force) { }
+
+        public bool DiscardAgentBranch(string repoHash, string agentId)
+        {
+            Discarded.Add((repoHash, agentId));
+            return true;
+        }
 
         public void Prune(string repoHash) { }
 

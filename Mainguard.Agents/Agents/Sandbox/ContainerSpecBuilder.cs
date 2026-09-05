@@ -142,6 +142,14 @@ public sealed record CredTmpfsSpec(
 /// <param name="IpcDirPath">The VM-side per-agent IPC dir (coordinator jails only), bind-mounted
 /// READ-ONLY at <see cref="Ipc.AgentIpcPaths.SandboxMount"/>; same G-11 ext4-only rejection as every
 /// other mount. Null/empty = no IPC mount (workers).</param>
+/// <param name="IpcOutboxPath">The <c>outbox/</c> child of <paramref name="IpcDirPath"/>, bind-mounted
+/// READ-WRITE at <see cref="Ipc.AgentIpcPaths.SandboxOutboxPath"/> — nested inside the read-only IPC
+/// mount, which leaves the shim and the instructions unwritable while giving the jail a mailbox.
+/// <para>Supplied ONLY where the substrate cannot carry a Unix socket across the container mount
+/// boundary — which today is macOS, where the daemon runs on the host and jails run in the engine's
+/// Linux VM, and Docker's file sharing does not proxy AF_UNIX: the socket bind-mounts in as an inert
+/// inode and every <c>connect()</c> fails ECONNREFUSED. Null/empty everywhere else, and then the jail
+/// has no writable bind mount at all, exactly as before.</para></param>
 /// <param name="BareRepoPath">The VM-side <b>shared mirror</b>, bind-mounted at its <b>identical</b> VM
 /// path so the per-agent repo's <c>objects/info/alternates</c> (an absolute VM path into
 /// <c>&lt;bare&gt;/objects</c>) resolves inside the jail — without it in-jail git cannot read a single
@@ -183,10 +191,12 @@ public sealed record ContainerSpecRequest(
     string UsernsMode = UsernsRemapPolicy.InheritDaemonRemap,
     string? AdaptersRootPath = null,
     string? IpcDirPath = null,
+    string? IpcOutboxPath = null,
     string? BareRepoPath = null,
     string? DnsServerAddress = null,
     string? AgentRepoPath = null,
     string? PackageCachePath = null,
+    bool WithoutRepositoryAccess = false,
     string? ToolchainsRootPath = null,
     IReadOnlyList<string>? ToolchainIds = null,
     // ESC-I1: the substrate's daemon-owned roots; when supplied, every bind-mount source must sit
@@ -196,7 +206,10 @@ public sealed record ContainerSpecRequest(
     // adopt this jail back as the agent it actually is. Default "" keeps every existing caller (and the
     // ad-hoc harnesses) compiling and simply yields an unlabelled jail, which adopts as a role-less worker.
     string AgentKind = "",
-    string AgentRole = "");
+    string AgentRole = "",
+    // The spawning coordinator, stamped as mainguard.agent.parent for the same reason as the role: after a
+    // restart the label is the only record of whose fan-out this worker belongs to.
+    string AgentParentId = "");
 
 /// <summary>
 /// The pure, unit-testable heart of P2-07: turns an agent request into a hardened Docker
@@ -256,6 +269,42 @@ public static class ContainerSpecBuilder
     /// </summary>
     private static List<Mount> BuildMounts(ContainerSpecRequest request)
     {
+        // Coordinator contract §2/§8: "The coordinator has no worktree, no git credentials and no view of
+        // repository contents." A coordinator is only an orchestrator, so its jail carries NO path into the
+        // repository at all — not the worktree, not the shared mirror, not its own git dir, not the package
+        // cache (nothing in it builds anything). /workspace becomes an empty tmpfs so the CLI still has a
+        // working directory to exec into.
+        //
+        // This is fail-closed, and deliberately so. §5 is the reason the whole contract exists: a system
+        // prompt is not a security boundary, and the shipped coordinator's prompt ("you never write code,
+        // touch a worktree, or merge") was never even delivered to the in-jail CLI. Refusing the paths here
+        // — rather than trusting a caller to pass null — means a future caller that starts supplying a
+        // worktree for a coordinator gets a typed spawn failure instead of silently handing back the
+        // capability the role-lock removed.
+        if (request.WithoutRepositoryAccess)
+        {
+            foreach (var (name, path) in new[]
+                     {
+                         (nameof(request.WorktreePath), request.WorktreePath),
+                         (nameof(request.BareRepoPath), request.BareRepoPath),
+                         (nameof(request.AgentRepoPath), request.AgentRepoPath),
+                         (nameof(request.PackageCachePath), request.PackageCachePath),
+                     })
+            {
+                if (!string.IsNullOrEmpty(path))
+                {
+                    throw new SandboxSpecException(
+                        $"Coordinator contract §3: a repository-less jail was asked to mount {name} ('{path}'). "
+                        + "A coordinator has no worktree, no git credentials and no view of repository contents — "
+                        + "it orchestrates and nothing else. Refusing to create the container.");
+                }
+            }
+
+            // Only the read-only capability mounts survive: the adapters root (the CLI it runs) and the
+            // IPC dir (its four tools). Both are added below.
+            return BuildCapabilityOnlyMounts(request);
+        }
+
         var mounts = new List<Mount>
         {
             new() { Type = "bind", Source = request.WorktreePath, Target = WorkspaceTarget, ReadOnly = false },
@@ -335,6 +384,8 @@ public static class ContainerSpecBuilder
             });
         }
 
+        AddIpcOutboxMount(request, mounts);
+
         if (!string.IsNullOrEmpty(request.PackageCachePath))
         {
             RejectNonExt4Source(request.PackageCachePath);
@@ -384,6 +435,143 @@ public static class ContainerSpecBuilder
         return mounts;
     }
 
+    /// <summary>
+    /// The mounts a repository-less (coordinator) jail gets: the read-only adapters root and the
+    /// read-only IPC dir, and <b>nothing else</b>. Both are read-only, so this jail has no writable bind
+    /// mount at all — its only writable storage is its own tmpfs, which dies with the container.
+    /// </summary>
+    private static List<Mount> BuildCapabilityOnlyMounts(ContainerSpecRequest request)
+    {
+        var mounts = new List<Mount>();
+
+        if (!string.IsNullOrEmpty(request.AdaptersRootPath))
+        {
+            RejectNonExt4Source(request.AdaptersRootPath);
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = request.AdaptersRootPath,
+                Target = Adapters.AdapterPaths.SandboxMount,
+                ReadOnly = true,
+            });
+        }
+
+        if (!string.IsNullOrEmpty(request.IpcDirPath))
+        {
+            RejectNonExt4Source(request.IpcDirPath);
+            mounts.Add(new Mount
+            {
+                Type = "bind",
+                Source = request.IpcDirPath,
+                Target = Ipc.AgentIpcPaths.SandboxMount,
+                ReadOnly = true,
+            });
+        }
+
+        AddIpcOutboxMount(request, mounts);
+
+        return mounts;
+    }
+
+    /// <summary>
+    /// The read-write outbox, nested inside the read-only IPC mount. On the substrates that need it this
+    /// is the coordinator jail's ONLY writable bind mount, which is why the guard is exact rather than
+    /// shaped: the source must be the <c>outbox/</c> child of THIS request's IPC dir, so the field can
+    /// never be edited into a second writable path at the mirror, the per-agent git dir, or anywhere else
+    /// under the daemon's home (MG-3, and the same reasoning as the package cache's <c>caches/</c> gate).
+    ///
+    /// <para>Nested rather than a separate top-level target so the read-only mount keeps covering the
+    /// shim and the operating instructions: an agent that could rewrite its own shim would be harming
+    /// only itself, but "the thing the CLI executes is the daemon's file" is worth keeping structural.
+    /// The engine sorts mounts by target depth, so the nesting resolves regardless of list order.</para>
+    /// </summary>
+    private static void AddIpcOutboxMount(ContainerSpecRequest request, List<Mount> mounts)
+    {
+        if (string.IsNullOrEmpty(request.IpcOutboxPath))
+        {
+            return;
+        }
+
+        RejectNonExt4Source(request.IpcOutboxPath);
+
+        var expected = string.IsNullOrEmpty(request.IpcDirPath)
+            ? null
+            : Ipc.AgentIpcPaths.OutboxIn(request.IpcDirPath);
+        if (expected is null || !SamePath(request.IpcOutboxPath, expected))
+        {
+            throw new SandboxSpecException(
+                $"Refusing '{request.IpcOutboxPath}' as an IPC outbox source. The outbox mount is "
+                + "READ-WRITE, so it may only ever name the '" + Ipc.AgentIpcPaths.OutboxDirName
+                + "' directory inside THIS agent's own IPC dir"
+                + (expected is null ? " — and this request names no IPC dir at all." : $" ('{expected}').")
+                + " Any other source would be a second writable path into daemon-owned state (MG-3).");
+        }
+
+        mounts.Add(new Mount
+        {
+            Type = "bind",
+            Source = request.IpcOutboxPath,
+            Target = Ipc.AgentIpcPaths.SandboxOutboxPath,
+            // READ-WRITE by definition: this IS the channel on a substrate whose mount cannot carry a
+            // socket. The jail drops a request file here and polls for its answer.
+            ReadOnly = false,
+        });
+    }
+
+    private static bool SamePath(string left, string right) =>
+        string.Equals(
+            Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar),
+            Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar),
+            Mainguard.Git.Services.FileSystemPaths.Comparison);
+
+    /// <summary>
+    /// The writable surfaces, all tmpfs (the rootfs is read-only and every bind mount that is not the
+    /// worktree/agent-repo/cache is read-only).
+    /// </summary>
+    private static Dictionary<string, string> BuildTmpfs(ContainerSpecRequest request)
+    {
+        var tmpfs = new Dictionary<string, string>
+        {
+            ["/dev/shm"] = "",
+            ["/tmp"] = "size=256m,mode=1777",
+            // uid/gid MUST name the agent: a tmpfs without them is created root-owned, and mode
+            // 0700 then locks the agent out of its OWN $HOME — every agent CLI that writes state
+            // under ~/.local or ~/.config (verified: opencode) dies with EACCES on first run.
+            // (Same class as the /run/secrets 0711 note below; unhit until a CLI actually ran.)
+            [AgentHome] = $"size=256m,mode=0700,uid={request.Credentials.AgentUid},gid={request.Credentials.AgentUid}",
+            // 0711 (traverse-only, not listable): each uid can reach its OWN secret directory
+            // below, and nothing is ever created directly here — so this stays root-owned with
+            // no write bit for anyone but root, and no exec ever needs to write it.
+            [CredTmpfsSpec.SecretsRoot] = "size=1m,mode=0711",
+
+            // One tmpfs per secret owner, mounted BY THE DAEMON (real root) already owned by the
+            // uid that will write into it. This is what removes the impossible chown from the
+            // secret-write path — see the CredTmpfsSpec remarks for the measurement. `uid=`/`gid=`
+            // on a tmpfs are interpreted in the container's user namespace, so these are correct
+            // whether or not dockerd is userns-remapped, exactly as $HOME above already relies on.
+            //
+            // The DIRECTORIES are the structural constants while the UIDS come from the request,
+            // and that split is deliberate: AssertSecretDirsOwned below re-derives the directory
+            // from each secret's actual path in the spec, so the mount list and the secret list are
+            // two independent statements that have to agree. Deriving both from the same expression
+            // would make the assertion true by construction and prove nothing.
+            [CredTmpfsSpec.AgentSecretsDir] = OwnedSecretDirOptions(request.Credentials.AgentUid),
+            [CredTmpfsSpec.SupervisorSecretsDir] = OwnedSecretDirOptions(request.Credentials.SupervisorUid),
+        };
+
+        if (request.WithoutRepositoryAccess)
+        {
+            // A coordinator has no worktree to mount at /workspace, but `WorkingDir` is still
+            // /workspace and `docker exec -w /workspace` must land somewhere — an absent working
+            // directory fails the exec outright. An empty, agent-owned tmpfs gives the CLI a cwd that
+            // contains no repository content and does not survive the container.
+            tmpfs[WorkspaceTarget] =
+                $"size=64m,mode=0700,uid={request.Credentials.AgentUid},gid={request.Credentials.AgentUid}";
+        }
+
+        return tmpfs;
+    }
+
     /// <summary>True when <paramref name="path"/> equals a root or sits inside one (textual, in the
     /// daemon's own namespace — mount sources are daemon-produced paths, never user input).</summary>
     private static bool IsUnderAnyRoot(string path, IReadOnlyList<string> roots)
@@ -407,7 +595,15 @@ public static class ContainerSpecBuilder
         // G-11 enforced at CONSTRUCTION: the ONLY mount source is an ext4 worktree path. A drvfs
         // (/mnt/c/...), UNC (\\wsl.localhost\...), or drive-letter (C:\...) source is rejected here
         // so the container is never created.
-        RejectNonExt4Source(request.WorktreePath);
+        //
+        // A repository-less (coordinator) jail has NO worktree at all, so there is no source to vet —
+        // BuildMounts refuses a non-empty WorktreePath for that role instead, which is the stricter
+        // check of the two. Running this one first would reject the role lock with "an ext4 worktree
+        // path is required", i.e. demand the very capability the lock removes.
+        if (!request.WithoutRepositoryAccess)
+        {
+            RejectNonExt4Source(request.WorktreePath);
+        }
 
         // G2 control 1 is enforced inside CredTmpfsSpec.Create; assert again defensively in case a
         // spec was constructed directly.
@@ -476,34 +672,7 @@ public static class ContainerSpecBuilder
             Mounts = BuildMounts(request),
 
             // Writable scratch + the secrets tmpfs (contents written post-start, never here).
-            Tmpfs = new Dictionary<string, string>
-            {
-                ["/dev/shm"] = "",
-                ["/tmp"] = "size=256m,mode=1777",
-                // uid/gid MUST name the agent: a tmpfs without them is created root-owned, and mode
-                // 0700 then locks the agent out of its OWN $HOME — every agent CLI that writes state
-                // under ~/.local or ~/.config (verified: opencode) dies with EACCES on first run.
-                // (Same class as the /run/secrets 0711 note below; unhit until a CLI actually ran.)
-                [AgentHome] = $"size=256m,mode=0700,uid={request.Credentials.AgentUid},gid={request.Credentials.AgentUid}",
-                // 0711 (traverse-only, not listable): each uid can reach its OWN secret directory
-                // below, and nothing is ever created directly here — so this stays root-owned with
-                // no write bit for anyone but root, and no exec ever needs to write it.
-                [CredTmpfsSpec.SecretsRoot] = "size=1m,mode=0711",
-
-                // One tmpfs per secret owner, mounted BY THE DAEMON (real root) already owned by the
-                // uid that will write into it. This is what removes the impossible chown from the
-                // secret-write path — see the CredTmpfsSpec remarks for the measurement. `uid=`/`gid=`
-                // on a tmpfs are interpreted in the container's user namespace, so these are correct
-                // whether or not dockerd is userns-remapped, exactly as $HOME above already relies on.
-                //
-                // The DIRECTORIES are the structural constants while the UIDS come from the request,
-                // and that split is deliberate: AssertSecretDirsOwned below re-derives the directory
-                // from each secret's actual path in the spec, so the mount list and the secret list are
-                // two independent statements that have to agree. Deriving both from the same expression
-                // would make the assertion true by construction and prove nothing.
-                [CredTmpfsSpec.AgentSecretsDir] = OwnedSecretDirOptions(request.Credentials.AgentUid),
-                [CredTmpfsSpec.SupervisorSecretsDir] = OwnedSecretDirOptions(request.Credentials.SupervisorUid),
-            },
+            Tmpfs = BuildTmpfs(request),
 
             NetworkMode = request.NetworkName,
 
@@ -531,6 +700,7 @@ public static class ContainerSpecBuilder
                 ["mainguard.role"] = "agent",
                 [DockerAgentLister.KindLabel] = request.AgentKind,
                 [DockerAgentLister.AgentRoleLabel] = request.AgentRole,
+                [DockerAgentLister.AgentParentLabel] = request.AgentParentId,
             },
             HostConfig = hostConfig,
         };

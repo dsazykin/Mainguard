@@ -44,6 +44,34 @@ public class SwarmReconcilerTests
     private static AgentContainerState Live(string agentId, string repo = "repo1") =>
         new(agentId, repo, $"cid-{agentId}", Running: true);
 
+    private static AgentContainerState Exited(string agentId, string repo = "repo1") =>
+        new(agentId, repo, $"cid-{agentId}", Running: false);
+
+    /// <summary>
+    /// An exited jail is unadoptable (its tmpfs home died with it) and, until 2026-09-04, immortal: no
+    /// pass ever deleted one, so every crash, OOM kill and engine restart left a container behind. The
+    /// boot reconcile now removes them — and only them; a live jail is never touched by this arm.
+    /// </summary>
+    [Fact]
+    public async Task ExitedContainers_AreRemovedAtBoot_AndLiveOnesAreNot()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repo1", "alive", "Live");
+        expected.Upsert("repo1", "crashed", "Live");
+        var removed = new List<string>();
+
+        var reconciler = new SwarmReconciler(
+            Docker(Live("alive"), Exited("crashed"), Exited("stranger", repo: "repo2")),
+            expected, new FakeWorktreeManager(),
+            removeContainer: (id, _) => { removed.Add(id); return Task.CompletedTask; });
+
+        var report = await reconciler.ReconcileAsync();
+
+        Assert.Equal(new[] { "cid-crashed", "cid-stranger" }, removed);
+        Assert.Equal(new[] { "crashed", "stranger" }, report.RemovedContainers);
+        Assert.DoesNotContain("cid-alive", removed);
+    }
+
     /// <summary>
     /// The boot step must leave an ARTIFACT of what it did. It used to be
     /// <c>=&gt; _reconciler.ReconcileAsync(ct)</c>, narrowing the <see cref="ReconcileReport"/> to a bare

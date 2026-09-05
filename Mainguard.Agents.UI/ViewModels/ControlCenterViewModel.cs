@@ -292,7 +292,10 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         // press time — a value captured here would be whatever was selected when the repo was opened, and
         // an empty one (no CLI installed yet) is answered by the daemon rather than guessed at.
         Queue = new QueueRailViewModel(_queue, OpenReview, resumeAgentKind: () => SelectedCli?.Id);
-        Coordinator = new CoordinatorPanelViewModel(_coordinator);
+        // The escalated card's "End this worker" is the SAME act as Resources -> End task, handed over as a
+        // seam rather than reimplemented: an escalated worker still holds a jail and a slot against the
+        // worker cap, and until now the only route to releasing it was a context menu on an unlabelled row.
+        Coordinator = new CoordinatorPanelViewModel(_coordinator, endWorker: id => _agents.EndAgentAsync(id));
         Telemetry = new TelemetryPanelViewModel(_telemetry);
         // Vibe is headed for its own app (decision 2026-07-11); the VM stays alive here so
         // the render harness and the future shell keep a working surface, but nothing in
@@ -301,6 +304,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
 
         // The rail is a thin view over this VM; the shell hosts it as AgentRailContent (2d).
         _agentRail = new AgentRailViewModel(this);
+
+        // The mirror's main is pulled forward from the checkout on the daemon's interval; a human coming
+        // back to this window is the other moment they are about to read it, so it is asked once more then
+        // (owner decision 2026-09-04). Best-effort: no window yet means the interval sweep still covers it.
+        if ((Application.Current?.ApplicationLifetime
+                as Avalonia.Controls.ApplicationLifetimes.IClassicDesktopStyleApplicationLifetime)?
+                .MainWindow is { } mainWindow)
+        {
+            mainWindow.Activated += (_, _) => _ = _queue.RefreshMirrorMainAsync();
+        }
 
         // P2-13 §6, finally wired: a transition INTO a waiting/blocked state raises an OS-level
         // notification (Notification Center on macOS, shell toast elsewhere), suppressed only when
@@ -570,6 +583,30 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
         }
 
         await window.ShowDialog(owner);
+    }
+
+    /// <inheritdoc/>
+    public async Task StopAllAgentsAsync(CancellationToken ct)
+    {
+        // A snapshot, not the live list: a stop that lands raises Changed and rewrites the projection
+        // under us. Coordinator last — it is the one that would otherwise react to its workers going.
+        var live = _agents.ListAgents()
+            .Where(a => !IsTerminalState(a.State))
+            .OrderBy(a => a.Role == AgentRoles.Coordinator ? 1 : 0)
+            .ToList();
+        Editions.ProComposition.LogOobe($"exit: stopping {live.Count} live agent(s)");
+        foreach (var agent in live)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                await _agents.EndAgentAsync(agent.AgentId).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Editions.ProComposition.LogOobe($"exit: stopping agent {agent.AgentId} failed (continuing): {ex.Message}");
+            }
+        }
     }
 
     /// <summary>Terminal lifecycle states — the same set <see cref="LiveAgentCount"/> excludes.</summary>
@@ -1275,6 +1312,16 @@ public partial class ControlCenterViewModel : ViewModelBase, IDisposable, Maingu
                     // the daemon never attested.
                     ChangedTestCommand = entry?.FlaggedItems.Any(
                         f => f.Id == Services.DaemonFlaggedChangeSource.ChangedTestCommandItemId) == true,
+
+                    // The other half of a review: what a human APPROVED. Real daemon data, like the sha
+                    // above — the approved approach has always existed and the client had nowhere to put
+                    // it, so a reviewer comparing a diff against what was agreed had only the diff. Null
+                    // for an entry with no approved plan; the panel then does not render at all, which is
+                    // the honest answer for a manual agent or an external PR.
+                    ApprovedPlanId = entry?.ApprovedPlanId,
+                    ApprovedPlanTitle = entry?.ApprovedPlanTitle,
+                    ApprovedApproach = entry?.ApprovedApproach,
+                    DeviationDeclaration = entry?.DeviationDeclaration,
                 };
 
                 // The overlay is built on the DAEMON's flagged items and the daemon's ack RPC — the same

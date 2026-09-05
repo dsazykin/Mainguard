@@ -27,6 +27,27 @@ public class MergeLeaseRow
     /// <summary>The <c>main@sha</c> the merge was expected to fast-forward from (the verified sha).</summary>
     public string ExpectedMainSha { get; set; } = string.Empty;
 
+    /// <summary>
+    /// K3 — the <c>agent/&lt;id&gt;</c> tip the queue's verification was measured ON
+    /// (<c>VerificationRecord.BranchSha</c>), read from the daemon's own record at grant time.
+    ///
+    /// <para><b>The other half of the identity a merge is authorized for.</b>
+    /// <see cref="ExpectedMainSha"/> alone says which main this merge may fast-forward; it says nothing
+    /// about WHICH COMMITS get fast-forwarded onto it. With only that half recorded, the lease was a
+    /// mutex over a repository rather than a claim about a merge: the branch could move between the
+    /// grant and the merge, the merge could consume a different ref that happened to carry the same
+    /// name, and the confirmed post-merge sha could be anything the client cared to report — and every
+    /// one of those still satisfied the lease.</para>
+    ///
+    /// <para><b>Empty means unknown, and unknown never manufactures a refusal.</b> Rows written before
+    /// this field existed, and the seeded/substrate-less paths, carry <c>""</c>; every comparison against
+    /// it reads empty as "not measured" and declines to answer rather than blocking a merge on ignorance.
+    /// The one exception is the P2-12 external leg, which refuses — see
+    /// <c>ExternalPrMergeService</c>: there the sha is the ONLY record of which upstream head was
+    /// verified, and re-deriving it at merge time is the defect (K4).</para>
+    /// </summary>
+    public string ExpectedBranchSha { get; set; } = string.Empty;
+
     /// <summary>The local main branch the merge lands on (the boot reconcile reads its current tip).</summary>
     public string MainBranch { get; set; } = "main";
 

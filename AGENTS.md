@@ -322,7 +322,21 @@ Skim sibling views for the same element and match them. If you catch yourself ty
 - Secrets live in `.env` (see `.env.example`, e.g. `GITHUB_CLIENT_ID`). Never hardcode credentials or paste them into committed files/docs.
 - Commit messages follow the existing `type: summary` style (`feat:`, `fix:`, `ui:`, `docs:`).
 
-### Branching & commits (mandatory)
+#### One agent per worktree, when agents commit
+
+Concurrent agents MUST NOT share a working tree. Git's index is per-worktree, so a second agent's
+`git add` between the first's status check and its `git commit` silently sweeps unrelated staged
+files into that commit. This happened on 2026-08-30 with three agents in one tree: `817d5de6` is
+titled for a two-file UI change and also carries the entire prompt-submission fix
+(`TerminalSubmit.cs`, `AgentCliBinder`, `RawModeCliDouble`, 208 lines of design doc), and two more
+edits landed in `8a346f18`. Nothing was lost and every tier stayed green — the cost was attribution,
+on a branch whose commit messages carry the reasoning for review.
+
+`git commit -o <paths>` narrows the blast radius but does not close the window. The fix is
+isolation: `git worktree add ~/mg-work/<task>/` per agent, and remove it when the work lands
+(see the worktree rule above). Sequential agents in one tree are fine.
+
+## Branching & commits (mandatory)
 
 - **No direct pushes to `main`.** `main` is protected. Every change lands via a Pull Request.
 - **One branch per feature/fix.** Branch off the latest `main` (e.g. `feat/agent-executor`, `fix/index-lock`), open a PR, get it reviewed, and merge only when complete and green.

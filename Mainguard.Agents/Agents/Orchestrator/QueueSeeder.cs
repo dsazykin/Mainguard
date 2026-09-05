@@ -230,7 +230,9 @@ public sealed class QueueSeeder
             //    path, and a later human Verify click on the entry takes the seeded arm rather than
             //    refusing on the missing jail.
             var plan = new SyntheticVerificationPlan(
-                passed: !spec.VerificationFails,
+                // The target and the verdict cannot disagree: asking for a VerificationFailed entry IS
+                // asking for a failing run, whether or not the caller also set verification_fails.
+                passed: !spec.VerificationFails && spec.TargetState != WorkerMergeState.VerificationFailed,
                 holdSeconds: spec.TargetState == WorkerMergeState.Verifying ? Math.Max(1, spec.HoldSeconds) : spec.HoldSeconds,
                 staleBehavior: spec.StaleBehavior);
             _synthetic.Register(repoHandle, agentId, plan);
@@ -289,7 +291,11 @@ public sealed class QueueSeeder
     }
 
     private static bool NeedsVerification(SeedSpec spec) => spec.TargetState is not
-        (WorkerMergeState.Working or WorkerMergeState.Discarded);
+        (WorkerMergeState.Working or WorkerMergeState.Discarded)
+        // A Working seed that is asked to FAIL still runs a verification — and since H2 lands at
+        // VerificationFailed. Reading `Working` as "no verification needed" would skip the very setup the
+        // spec exists to arrange.
+        || (spec.TargetState == WorkerMergeState.Working && spec.VerificationFails);
 
     /// <summary>
     /// The phase-2 plan pipeline, driven for real for a synthetic id (design §9): the daemon
@@ -342,6 +348,18 @@ public sealed class QueueSeeder
 
         // (3) ...and the operator who called the RPC approves it, attributably.
         _plans.Approve(presented.PlanId, string.IsNullOrWhiteSpace(actor) ? "queue-seeder" : actor);
+
+        // (4) The worker's own commit-time deviation declaration, supplied here for the same reason its
+        // authorship is: there is no worker, and this record already says so of itself in the two
+        // free-text fields a human reads.
+        //
+        // Left at DeviationDeclaration.NotDeclared it would arm a must-acknowledge row on EVERY seeded
+        // plan-gated entry, forever — a row whose real cause is "a dev tool made this entry" rather than
+        // anything about the branch. A blocker that is always present for a whole class of entries and
+        // never means anything is exactly how a gate teaches people to click through it, which is what
+        // the declaration mechanism must not become. The fail-closed default stays where it matters: on
+        // a real worker, which is the only thing that can actually answer.
+        _plans.DeclareDeviations(agentId, deviations: null);
         planId = presented.PlanId;
         _log?.Invoke(
             $"queue seeder agent={agentId} plan={planId} — the REAL plan pipeline ran "
@@ -359,11 +377,23 @@ public sealed class QueueSeeder
             case WorkerMergeState.Working:
                 if (spec.VerificationFails)
                 {
-                    // The verify-FAIL entry: run the (synthetic) verification and let the REAL settle
-                    // path return it to Working carrying a failed record.
+                    // The verify-FAIL entry: run the (synthetic) verification and let the REAL settle path
+                    // decide where it lands. Since H2 that destination is VerificationFailed, not Working —
+                    // a red run is its own state now — so this spec reaches the same entry it always meant
+                    // to seed and the reported `reached` state says so. Seeding the failure by its own name
+                    // is the `VerificationFailed` target below; this arm is kept because it is the spelling
+                    // the seeding UI and the RPC already send.
                     await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
                 }
 
+                return "";
+
+            case WorkerMergeState.VerificationFailed:
+                // The red verdict, seeded by name. The synthetic plan is forced to fail for this target
+                // (see the `passed:` argument at the call site) so the target and the outcome cannot
+                // disagree — a "seed me a failed entry" that produced a green one would be exactly the
+                // fabricated state this tool refuses to make.
+                await queue.RunVerificationAsync(agentId, ct).ConfigureAwait(false);
                 return "";
 
             case WorkerMergeState.Verifying:
@@ -482,7 +512,11 @@ public sealed class QueueSeeder
 
             // Gate + CAS + the Merged transition, atomically, daemon-side — the MG-11 enforcement
             // point, evaluated for a seeded branch exactly as for a real one.
-            if (!queue.TryConfirmHumanMerge(agentId, newMainSha, expectedMainSha, out var reason))
+            // Labelled `seeded` in the merge audit for the same reason a seeded verification carries its
+            // SeededProvenanceMarker: a synthetic merge that recorded itself as a human one would be a
+            // forged entry in the one chain that has to be trustworthy.
+            if (!queue.TryConfirmHumanMerge(
+                    agentId, newMainSha, expectedMainSha, out var reason, MergeAuthorization.Seeded()))
             {
                 // The merge has landed on origin main but the queue refused to record it — surface
                 // the reason verbatim; the mirror refresh below still reconciles main so the queue

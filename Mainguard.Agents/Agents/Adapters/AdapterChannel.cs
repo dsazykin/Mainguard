@@ -399,10 +399,12 @@ public sealed class AdapterChannel
         {
             await _host.WriteFileAsync(
                 AdapterPaths.RegistryMarkerPath(spec.Id),
-                InstalledAdapterMarker.Serialize(
-                    new InstalledAdapterMarker(
-                        spec.Id, spec.Version, spec.Launch, spec.ApiKeyEnvVar, spec.EgressHosts,
-                        spec.CredentialPaths, spec.BaseUrlEnvVar, spec.ModelHost, spec.SettingsPaths)),
+                // One mapping, named once (InstalledAdapterMarker.FromSpec). This used to be a
+                // 14-argument positional call — which is how a manifest field reaches the daemon only by
+                // being copied correctly at exactly one site nobody reviews; phase 3's mutation K6 caught
+                // one such omission already. The daemon now ALSO projects the shipped manifest over a
+                // marker on read, so a copy missed here no longer decides anything.
+                InstalledAdapterMarker.Serialize(InstalledAdapterMarker.FromSpec(spec)),
                 ct).ConfigureAwait(false);
         }
 

@@ -171,10 +171,19 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             // land — then passed once the stale container was gone.
             var staleSecretLayout =
                 !await HasOwnedSecretDirsAsync(existing.ID, credentials, ct).ConfigureAwait(false);
+            // A bind mount binds the source INODE at create time. A worktree deleted and re-created at the
+            // same path since this container was created — a teardown whose container removal lagged,
+            // followed by a resume; a manual clean — leaves /workspace pointing at a directory that no
+            // longer exists, and the first exec into it dies with runc's "chdir to cwd (/workspace) …
+            // no such file or directory" (measured: the resume Docker flake, phase-3 decisions §27.3).
+            // The mount table cannot show it — destination and source path both still read the same —
+            // so the host's arithmetic and the jail itself are asked instead.
+            var staleWorkspace =
+                !await WorkspaceMountAliveAsync(existing, request, ct).ConfigureAwait(false);
             // MG-27: the ref is now a content digest, and Docker's container LIST reports a short image
             // id — compare through the matcher, never with `!=`, or every reuse would look like an
             // upgrade and recreate a perfectly good jail on every spawn.
-            if (staleSecretLayout
+            if (staleSecretLayout || staleWorkspace
                 || !SandboxImageDigest.SameImage(existing.Image, request.ImageRef)
                 || missingBareMount || missingAgentRepoMount || writableMirror || stalePin || wrongNetwork
                 || missingCacheMount)
@@ -184,77 +193,123 @@ public sealed class DockerSandboxEngine : ISandboxEngine
             }
             else
             {
-                if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
-                    await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
-                // A restarted jail's tmpfs $HOME came back empty — restore the CLI's saved login
-                // state. Write-if-absent, so a still-running jail's fresher tokens are never
-                // clobbered by the host keychain's older copy.
-                await RestoreCliCredentialsAsync(existing.ID, request, ct).ConfigureAwait(false);
-                // Same reason, same write-if-absent rule: a relaunched jail's home came back empty, so
-                // the user's approved-command list has to be put back or every command is re-prompted.
-                await RestoreCliSettingsAsync(existing.ID, request, ct).ConfigureAwait(false);
-                await ApplyWorkspaceSettingsIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
-                // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
-                // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
-                // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
-                // reused jail is exactly the path that never re-checks anything.
-                await AssertPackageCacheUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
-                return new SandboxHandle(existing.ID, Reused: true);
+                try
+                {
+                    if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
+                        await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+                    // A restarted jail's tmpfs $HOME came back empty — restore the CLI's saved login
+                    // state. Write-if-absent, so a still-running jail's fresher tokens are never
+                    // clobbered by the host keychain's older copy.
+                    await RestoreCliCredentialsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    // Same reason, same write-if-absent rule: a relaunched jail's home came back empty, so
+                    // the user's approved-command list has to be put back or every command is re-prompted.
+                    await RestoreCliSettingsAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    await ApplyWorkspaceIgnoreAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    // MG-43: re-prove the cache on the REUSE path too. The mount survived (mounts are fixed
+                    // at create), but the tree behind it may not have — an eviction, a manual cleanup, or a
+                    // failed VM boot can leave the bind mount pointing at a directory that is gone, and a
+                    // reused jail is exactly the path that never re-checks anything.
+                    await AssertPackageCacheUsableAsync(existing.ID, request, ct).ConfigureAwait(false);
+                    return new SandboxHandle(existing.ID, Reused: true);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    // A reused jail that fails any of its re-checks — an exec that dies on a chdir into a
+                    // stale bind, a cache probe that produces no frame — is a jail to REBUILD, not a spawn to
+                    // fail: every re-check is about a mount fixed at create, and a fresh create is the only
+                    // way to take a fresh one (the resume flake, phase-3 decisions §27.3).
+                    await TryForceRemoveAsync(existing.ID).ConfigureAwait(false);
+                }
             }
         }
 
+        // Named, not positional: this is the one production caller of a record whose optional
+        // parameters have grown five times, and a positional call here silently re-binds every argument
+        // after the one that was inserted.
         var spec = new ContainerSpecRequest(
-            request.RepoHash, request.AgentId, request.WorktreePath, request.ImageRef,
-            request.Limits, networkName, credentials, proxyUrl, _options.UsernsMode,
-            request.AdaptersRootPath, request.IpcDirPath, request.BareRepoPath, dnsServer, request.AgentRepoPath,
-            request.PackageCachePath, request.ToolchainsRootPath, request.ToolchainIds,
-            _options.AllowedMountRoots,
+            RepoHash: request.RepoHash,
+            AgentId: request.AgentId,
+            WorktreePath: request.WorktreePath,
+            ImageRef: request.ImageRef,
+            Limits: request.Limits,
+            NetworkName: networkName,
+            Credentials: credentials,
+            ProxyUrl: proxyUrl,
+            UsernsMode: _options.UsernsMode,
+            AdaptersRootPath: request.AdaptersRootPath,
+            IpcDirPath: request.IpcDirPath,
+            IpcOutboxPath: request.IpcOutboxPath,
+            BareRepoPath: request.BareRepoPath,
+            DnsServerAddress: dnsServer,
+            AgentRepoPath: request.AgentRepoPath,
+            PackageCachePath: request.PackageCachePath,
+            WithoutRepositoryAccess: request.WithoutRepositoryAccess,
+            ToolchainsRootPath: request.ToolchainsRootPath,
+            ToolchainIds: request.ToolchainIds,
+            AllowedMountRoots: _options.AllowedMountRoots,
             // Carried onto the jail's labels: what this agent IS, so a restarted daemon can adopt it back
             // as itself rather than as an anonymous worker.
-            request.AgentKind, request.AgentRole);
+            AgentKind: request.AgentKind,
+            AgentRole: request.AgentRole,
+            AgentParentId: request.AgentParentId);
 
         var create = ContainerSpecBuilder.Build(spec);
-        var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
-        await _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
-
-        // Deliver secrets to their per-owner 0400 tmpfs files (content only via stdin — never argv/env).
         var envContent = CredentialInjector.BuildEnvFileContent(request.Secrets.AgentEnv);
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            // MG-43: before anything else touches this container, prove the package cache is really
-            // there and really writable FROM INSIDE IT. The daemon asked for the mount; that is not
-            // evidence about the container (MG-42 paid for that conflation once already). Ordered first
-            // so a jail with no usable cache is destroyed on the same path a failed secret write uses,
-            // rather than being handed out to run a verification that would die at ENOSPC.
-            await AssertPackageCacheUsableAsync(created.ID, request, ct).ConfigureAwait(false);
+            var created = await _docker.Containers.CreateContainerAsync(create, ct).ConfigureAwait(false);
+            await _docker.Containers.StartContainerAsync(created.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+            try
+            {
+                // The two daemon-managed bind mounts are PROBED before anything is written. A directory
+                // deleted and re-created at one path moments before the create — the resume's worktree,
+                // the teardown-released and re-prepared package cache — can bind to the stale inode on a
+                // substrate whose guest caches the host's directory entries (virtiofs), and the first exec
+                // into it then dies on runc's chdir (the resume flake, phase-3 decisions §27.3). That class
+                // is rebuilt ONCE, after a settle, and only then reported.
+                if (!string.IsNullOrEmpty(request.WorktreePath)
+                    && !await WorkspaceVisibleAsync(created.ID, ct).ConfigureAwait(false))
+                {
+                    throw new StaleBindMountException(
+                        $"the jail cannot see its worktree: '{request.WorktreePath}' is bound at "
+                        + $"{ContainerSpecBuilder.WorkspaceTarget} but does not resolve inside the container");
+                }
 
-            await WriteSecretFileAsync(created.ID, credentials.CredentialPath,
-                Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
-            await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
-                request.Secrets.OobKey, credentials.SupervisorUid, ct).ConfigureAwait(false);
-            await RestoreCliCredentialsAsync(created.ID, request, ct).ConfigureAwait(false);
-            // The CLI's saved settings — the approved-command list the user built in an earlier jail.
-            // Ordered after the credential restore purely so a failure in the security-bearing write is
-            // never masked by one in the convenience write; both share the same failure handling below.
-            await RestoreCliSettingsAsync(created.ID, request, ct).ConfigureAwait(false);
-            // Driven by the adapter's DECLARATION, so it also covers the first-ever session — the one
-            // with nothing to restore, where the CLI creates the file itself the moment the user
-            // approves something. That is the session the ignore matters most in.
-            await ApplyWorkspaceSettingsIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
+                await AssertPackageCacheUsableAsync(created.ID, request, ct).ConfigureAwait(false);
+
+                await WriteSecretFileAsync(created.ID, credentials.CredentialPath,
+                    Encoding.UTF8.GetBytes(envContent), credentials.AgentUid, ct).ConfigureAwait(false);
+                await WriteSecretFileAsync(created.ID, credentials.OobKeyPath,
+                    request.Secrets.OobKey, credentials.SupervisorUid, ct).ConfigureAwait(false);
+                await RestoreCliCredentialsAsync(created.ID, request, ct).ConfigureAwait(false);
+                await RestoreCliSettingsAsync(created.ID, request, ct).ConfigureAwait(false);
+                await ApplyWorkspaceIgnoreAsync(created.ID, request, ct).ConfigureAwait(false);
+                return new SandboxHandle(created.ID, Reused: false);
+            }
+            catch (Exception ex) when (attempt == 1
+                && ex is StaleBindMountException or PackageCacheUnavailableException
+                && !ct.IsCancellationRequested)
+            {
+                await TryForceRemoveAsync(created.ID).ConfigureAwait(false);
+                // Long enough for a guest's directory-entry cache to revalidate against the host before the
+                // second bind is taken.
+                await Task.Delay(TimeSpan.FromSeconds(1), ct).ConfigureAwait(false);
+            }
+            catch
+            {
+                await TryForceRemoveAsync(created.ID).ConfigureAwait(false);
+                throw;
+            }
         }
-        catch
+    }
+
+    /// <summary>A daemon-managed bind mount that does not resolve inside the jail it was created for —
+    /// the directory behind it was replaced after the guest last looked. Rebuilt once, then reported.</summary>
+    public sealed class StaleBindMountException : InvalidOperationException
+    {
+        public StaleBindMountException(string message) : base(message)
         {
-            // Secret delivery failed (a timeout on a wedged endpoint, a dead container, anything). Each
-            // write already unlinks its own partial file in-jail, but that is best effort against the
-            // same endpoint that just failed. THIS container was created moments ago by this call and
-            // has never been handed to anyone, so destroying it is available and is the only cleanup
-            // that needs nothing from the exec channel: the tmpfs holding every half-written secret goes
-            // with it. Never swallow the original failure — that is the whole point of the fix.
-            await TryForceRemoveAsync(created.ID).ConfigureAwait(false);
-            throw;
         }
-
-        return new SandboxHandle(created.ID, Reused: false);
     }
 
     public async Task<bool> ImageExistsAsync(string imageRef, CancellationToken ct = default)
@@ -411,6 +466,101 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// <para>A container that vanished under us counts as satisfying this, so the caller's own recreate
     /// path — not this probe — decides what to do about it. Same convention as the sibling probes.</para>
     /// </summary>
+    /// <summary>
+    /// Whether an existing container's <c>/workspace</c> still IS the worktree this spawn names.
+    ///
+    /// <para>Two answers, both cheap, and either one refuses. (1) The host's own arithmetic: a worktree
+    /// directory whose birth time is after the container's creation is a different inode than the one
+    /// the container bound, whatever the mount table says — this is the resume shape (teardown deletes
+    /// the worktree, the resume re-creates it, the old container was still listed). (2) The jail's own
+    /// answer, <c>test -d /workspace</c> run with an explicit working directory of <c>/</c> (an exec
+    /// without one inherits the container's <c>/workspace</c> and dies on the very chdir being probed):
+    /// on a virtiofs substrate a stale bind reads ENOENT, and this is what catches it.</para>
+    ///
+    /// <para>A container that vanished under us counts as alive, so the caller's own recreate path — not
+    /// this probe — reports it; any other failure counts as stale, because recreating a good jail costs
+    /// seconds and reusing a bad one cost a resume that could never verify.</para>
+    /// </summary>
+    private async Task<bool> WorkspaceMountAliveAsync(
+        ContainerListResponse existing, SandboxSpawnRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrEmpty(request.WorktreePath))
+        {
+            return true; // a repository-less jail: /workspace is its own tmpfs, bound to nothing
+        }
+
+        try
+        {
+            if (!System.IO.Directory.Exists(request.WorktreePath))
+            {
+                return false;
+            }
+
+            // (1) applies only when the container's /workspace really is bound to THIS path — the
+            // production case, where the worktree path is a pure function of (repo, agent). A container
+            // bound elsewhere (the test fixtures' fresh temp worktree per spawn) keeps the behaviour it
+            // always had and is judged by (2) alone.
+            var boundHere = existing.Mounts is not null && existing.Mounts.Any(m =>
+                string.Equals(m.Destination, ContainerSpecBuilder.WorkspaceTarget, StringComparison.Ordinal)
+                && string.Equals(m.Source, request.WorktreePath, StringComparison.Ordinal));
+            if (boundHere)
+            {
+                var born = System.IO.Directory.GetCreationTimeUtc(request.WorktreePath);
+                var created = existing.Created.ToUniversalTime();
+                // A small tolerance, because the container's clock is the engine's and the directory's is
+                // the host's; the resume shape is separated by seconds to minutes, a fresh spawn by the
+                // other sign.
+                if (born > created.AddSeconds(2))
+                {
+                    return false;
+                }
+            }
+
+            if (!string.Equals(existing.State, "running", StringComparison.OrdinalIgnoreCase))
+            {
+                await _docker.Containers.StartContainerAsync(existing.ID, new ContainerStartParameters(), ct).ConfigureAwait(false);
+            }
+
+            return await WorkspaceVisibleAsync(existing.ID, ct).ConfigureAwait(false);
+        }
+        catch (DockerContainerNotFoundException)
+        {
+            return true;
+        }
+        catch (Exception) when (!ct.IsCancellationRequested)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The jail's own answer to "is /workspace there?": a real <c>cd /workspace</c>, run with an explicit
+    /// working directory of <c>/</c>, because an exec without one inherits the container's
+    /// <c>/workspace</c> and dies on the very chdir being probed. A <c>test -d</c> is NOT enough — measured:
+    /// the mount point's own entry still stats while traversing INTO a stale virtiofs bind fails with
+    /// ENOENT, which is exactly what runc's chdir does. Throws for a control-plane failure; callers decide.
+    /// </summary>
+    private async Task<bool> WorkspaceVisibleAsync(string containerId, CancellationToken ct)
+    {
+        var exec = await RunBoundedAsync(
+            token => _docker.Exec.ExecCreateContainerAsync(containerId, new ContainerExecCreateParameters
+            {
+                AttachStdout = true,
+                AttachStderr = true,
+                WorkingDir = "/",
+                Cmd = new List<string> { "sh", "-c", "cd " + ContainerSpecBuilder.WorkspaceTarget + " && ls . >/dev/null" },
+            }, token),
+            ControlPlaneTimeout, "workspace probe create", containerId, ct).ConfigureAwait(false);
+        using var stream = await RunBoundedAsync(
+            token => _docker.Exec.StartAndAttachContainerExecAsync(exec.ID, tty: false, token),
+            ControlPlaneTimeout, "workspace probe attach", containerId, ct).ConfigureAwait(false);
+        await stream.ReadOutputToEndAsync(ct).ConfigureAwait(false);
+        var inspect = await RunBoundedAsync(
+            token => _docker.Exec.InspectContainerExecAsync(exec.ID, token),
+            ControlPlaneTimeout, "workspace probe inspect", containerId, ct).ConfigureAwait(false);
+        return inspect.ExitCode == 0;
+    }
+
     private async Task<bool> HasOwnedSecretDirsAsync(string containerId, CredTmpfsSpec credentials, CancellationToken ct)
     {
         try
@@ -614,15 +764,23 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     }
 
     /// <summary>
-    /// Keeps the CLI's WORKSPACE settings file out of the agent's commits.
+    /// Keeps <b>everything Mainguard itself writes into <c>/workspace</c></b> out of the agent's commits:
+    /// the CLI's workspace settings file, and the operating-instructions file the launcher stages at the
+    /// worktree root.
     ///
-    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so that
-    /// file is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c>
-    /// (their own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the
-    /// user's permission allowlist would start committing it into their repository and merging it to
-    /// main: a convenience feature quietly writing to the user's history. The MG-43 package cache was
-    /// moved out of the worktree for exactly this reason; this file cannot move, because it is where
-    /// the CLI reads it from.</para>
+    /// <para><b>Why this is not optional.</b> <c>/workspace</c> is the agent's git worktree, so each of
+    /// those is an UNTRACKED file in the tree the agent commits — and agents run <c>git add -A</c> (their
+    /// own commits, and the keep-alive cycle's dirty-tree path). Without this, persisting the user's
+    /// permission allowlist would start committing it into their repository and merging it to main: a
+    /// convenience feature quietly writing to the user's history. The MG-43 package cache was moved out
+    /// of the worktree for exactly this reason; neither of these files can move, because they are where
+    /// the CLI reads them from.</para>
+    ///
+    /// <para><b>The instructions file is here because it was missed, and it was found in production.</b>
+    /// In a live worker jail <c>info/exclude</c> carried only the settings path, <c>git check-ignore
+    /// CLAUDE.md</c> answered rc=1, and the worker's own report flagged the stray <c>?? CLAUDE.md</c>.
+    /// The caller (<c>SandboxAgentLauncher.DeclaredWorkspaceIgnorePaths</c>) is what unions the two, so
+    /// this method stays a list-of-paths applier and never learns any filename.</para>
     ///
     /// <para><b>Why it is driven by the DECLARATION and not by the restore.</b> On a first-ever session
     /// there is nothing to restore — the CLI creates the file itself the moment the user approves
@@ -640,7 +798,7 @@ public sealed class DockerSandboxEngine : ISandboxEngine
     /// here must never fail a spawn — the settings are already in place, which is the user-visible
     /// half.</para>
     /// </summary>
-    private async Task ApplyWorkspaceSettingsIgnoreAsync(
+    private async Task ApplyWorkspaceIgnoreAsync(
         string containerId, SandboxSpawnRequest request, CancellationToken ct)
     {
         var workspacePaths = (request.WorkspaceIgnorePaths ?? Array.Empty<string>())

@@ -57,6 +57,14 @@ public static class ProComposition
     /// <summary>The gateway the intake settings page runs on — the factory's current value.</summary>
     public static IPrIntakeGateway CreatePrIntakeGateway() => PrIntakeGatewayFactory();
 
+    /// <summary>The Agent Jails page's seam onto the daemon's per-jail ceiling (2026-09-04) — same shape and
+    /// same reason as the intake factory above: the page edits daemon state, and what "the daemon" means
+    /// for a run is decided here where a harness can replace it.</summary>
+    public static Func<IJailLimitsGateway> JailLimitsGatewayFactory { get; set; } =
+        () => new DaemonJailLimitsGateway(SharedIntakeClient.Value);
+
+    public static IJailLimitsGateway CreateJailLimitsGateway() => JailLimitsGatewayFactory();
+
     /// <summary>
     /// One process-lifetime loopback client for the intake page's unary calls. Deliberately shared and
     /// never disposed: Settings pages are cached per Settings window and nothing disposes them, so a
@@ -71,6 +79,13 @@ public static class ProComposition
     /// <summary>The app settings service (was <c>App.Settings</c>) — the control center reads/writes its
     /// workspace-layout preset through it. Null until wired (falls back to defaults, as before).</summary>
     public static ISettingsService? Settings { get; set; }
+
+    /// <summary>
+    /// The window's live agent surface, set by <see cref="ProManifest.CreateControlCenter"/> so the exit
+    /// teardown (<c>ProductionShutdownEnvironment</c>) can stop every live agent through it without the
+    /// shell naming Pro types. Null before a window exists and in the tests that never make one.
+    /// </summary>
+    public static IAgentPlatformSurface? LiveAgentSurface { get; set; }
 
     /// <summary>The <c>oobe.log</c> breadcrumb sink (was <c>App.LogOobe</c>) — shared with the shell so a
     /// Pro Tools action leaves a trace in the one log. No-op until wired.</summary>

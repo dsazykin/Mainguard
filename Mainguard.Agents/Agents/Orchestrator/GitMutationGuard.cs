@@ -120,13 +120,33 @@ public static class GitMutationGuard
     /// <see cref="GitMutationLockException"/> — <paramref name="action"/> never runs in that case.
     /// <paramref name="isLockHeld"/> and <paramref name="sleep"/> are injected so the backoff is
     /// deterministically testable without wall-clock timing.
+    ///
+    /// <para><b>K6 — <paramref name="recheck"/> is the state the decision was made from, re-read at the
+    /// moment of action.</b> The caller reaches here having already run <see cref="CanMutate"/> over an
+    /// <see cref="Inspect"/> snapshot. This method then waits — up to the full backoff schedule, ~1.5 s by
+    /// default — and used to re-check <b>only the lock</b>, which is the one precondition that was never
+    /// part of the verdict. The three that WERE (mid-rebase, detached HEAD, an in-progress merge) went
+    /// unlooked-at, and they are precisely the states a worktree enters while a lock is held: the usual
+    /// reason the backoff is running at all is that git is busy establishing one of them. So the guard's
+    /// answer was measured at one instant and acted on at another, and an agent that started its own
+    /// rebase during the wait got a <c>git add -A; git commit</c> and a <c>git rebase main</c> run against
+    /// it anyway.</para>
+    ///
+    /// <para>Re-reading the state is <b>required</b> rather than optional in spirit: the parameter is
+    /// nullable only because a caller with no worktree to inspect (the pure-backoff tests) must still be
+    /// able to exercise the lock loop, and a re-check that cannot be performed must not fabricate a
+    /// refusal. A refusing verdict raises <see cref="GitMutationStateChangedException"/> and
+    /// <paramref name="action"/> never runs.</para>
     /// </summary>
+    /// <param name="recheck">Re-reads the guard verdict immediately before the action. Evaluated once the
+    /// lock is clear, so it observes the worktree as the action will find it.</param>
     public static T RunGuarded<T>(
         IYieldToken token,
         Func<bool> isLockHeld,
         Func<T> action,
         IReadOnlyList<TimeSpan>? delays = null,
-        Action<TimeSpan>? sleep = null)
+        Action<TimeSpan>? sleep = null,
+        Func<MutationVerdict>? recheck = null)
     {
         ArgumentNullException.ThrowIfNull(token);
         ArgumentNullException.ThrowIfNull(isLockHeld);
@@ -146,6 +166,15 @@ public static class GitMutationGuard
         {
             if (!isLockHeld())
             {
+                // The last thing before the mutation, and after the last thing that could have delayed it.
+                var verdict = recheck?.Invoke() ?? MutationVerdict.Allowed;
+                if (!verdict.CanMutate)
+                {
+                    throw new GitMutationStateChangedException(
+                        "The worktree changed while this mutation waited for index.lock, and is no longer "
+                        + $"the worktree the guard allowed: {verdict.Reason}");
+                }
+
                 return action();
             }
 
