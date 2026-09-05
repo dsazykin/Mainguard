@@ -22,8 +22,7 @@ public sealed class CoordinatorConversationTests
     public async Task SendAsync_DrivesRealCoordinatorAgent_AndProjectsReply()
     {
         // A real CoordinatorAgent over a scripted model + the real (capped) tool surface.
-        var plans = new PlanApprovalService(new InMemoryPlanApprovalStore(), new InMemoryAuditLog());
-        var tools = new CoordinatorTools("coordinator-1", plans, new AdmissionController(), new FakeWorkers());
+        var tools = new CoordinatorTools("coordinator-1", new AdmissionController(), new FakeWorkers());
         var agent = new CoordinatorAgent("coordinator-1", new ScriptedModel("Two independent tasks — on it."), tools);
 
         var conversation = new CoordinatorConversationService(new CoordinatorAgentReplyEngine(agent));
@@ -66,6 +65,8 @@ public sealed class CoordinatorConversationTests
     {
         public IReadOnlyList<string> ActiveWorkerIds => Array.Empty<string>();
         public string? WorkerStatus(string agentId) => null;
+        public Task<string> SpawnWorkerAsync(string title, string taskPrompt, decimal budgetUsd, CancellationToken ct) =>
+            Task.FromResult("w-1");
         public Task SendPromptAsync(string agentId, string prompt, CancellationToken ct) => Task.CompletedTask;
         public Task RequestVerificationAsync(string agentId, CancellationToken ct) => Task.CompletedTask;
     }

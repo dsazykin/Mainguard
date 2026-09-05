@@ -4,23 +4,26 @@ package mainguard.v1;
 
 option csharp_namespace = "Mainguard.Protos.V1";
 
-// P2-14 plan-approval + dual-mode orchestration surface: the coordinator chat bridge, the two-phase
+// Plan-approval + dual-mode orchestration surface: the coordinator chat bridge, the worker-authored
 // TaskPlan approval RPCs, and the kill switch.
 //
 // SECURITY (SA-1/F2 — binding): there is deliberately NO client-supplied approver / osIdentity field
 // anywhere in this file. The recorded approver is derived daemon-side from the authenticated
 // connection's OS peer credential — a client cannot influence it. Adding such a field is a rejection.
 
-// The human plan-approval surface. The coordinator's `spawn_worker` tool lands a pending plan; the
-// human approves/rejects it here. Approve carries ONLY the plan id — the approver identity is
-// daemon-derived (SA-1/F2). BeginMerge/ConfirmMerge live on MergeQueueService and are denied to the
-// coordinator role by the RoleInterceptor (they are NOT reachable from this surface).
+// The human plan-approval surface. In phase 2 the plan on the card is the WORKER's: the coordinator
+// spawns freely within the caps, and each worker inspects its repository, authors its own plan, presents
+// it and BLOCKS until this surface decides. Approve carries ONLY the plan id — the approver identity is
+// daemon-derived (SA-1/F2). Reject is not terminal: its reason is FEEDBACK the worker revises against,
+// bounded by the daemon-side MaxPlanRevisions, after which the worker escalates.
+// BeginMerge/ConfirmMerge live on MergeQueueService and are denied to the coordinator role by the
+// RoleInterceptor (they are NOT reachable from this surface).
 service PlanApprovalService {
   // Snapshot-then-deltas of the pending + recently-decided plans.
   rpc StreamPlans(StreamPlansRequest) returns (stream PlanUpdate);
   // Approve a pending plan. NO identity field — the approver is the connection's OS peer credential.
   rpc ApprovePlan(ApprovePlanRequest) returns (ApprovePlanResponse);
-  // Reject a pending plan. Nothing spawns; no worktree residue.
+  // Send a plan back to its worker with feedback. The worker revises and re-presents.
   rpc RejectPlan(RejectPlanRequest) returns (RejectPlanResponse);
 }
 
@@ -30,7 +33,18 @@ message StreamPlansRequest {
 
 message PlanUpdate {
   repeated PlanEntry plans = 1;
-  string pressure_signal = 2; // the S-8 "N plans pending" fact line, or empty
+  string pressure_signal = 2; // the "N plans pending" fact line, or empty
+
+  // BACKPRESSURE (contract §2 — a requirement, not a nicety). A worker blocked on plan approval counts
+  // against MaxActiveWorkers, so a saturated cap means the coordinator has stopped spawning. The UI must
+  // be able to SAY that ("6 workers waiting on your approval") rather than going quiet, because a silent
+  // stall is indistinguishable from a hang.
+  int32 blocked_worker_count = 3;    // workers currently held at the plan gate
+  int32 escalated_worker_count = 4;  // workers that spent the revision budget and stopped
+  int32 active_worker_count = 5;     // the population counted against the cap
+  int32 max_active_workers = 6;      // CoordinatorLimits.MaxActiveWorkers
+  int32 max_plan_revisions = 7;      // CoordinatorLimits.MaxPlanRevisions
+  string backpressure_signal = 8;    // the rendered fact line, or empty when there is nothing to say
 }
 
 message PlanEntry {
@@ -40,11 +54,17 @@ message PlanEntry {
   repeated string scope = 4;    // the load-bearing field (SA-1/F6 compares diffs against it)
   string approach = 5;
   string test_strategy = 6;
-  string status = 7;            // PlanStatus name: Pending / Approved / Rejected
+  string status = 7;            // PlanStatus name: Pending / Approved / Rejected / Escalated
   double budget_usd = 8;
   // The daemon-derived approver identity, present only on an approved plan (SA-1/F2). This is an
   // OUTPUT field the daemon fills — never a client input.
   string approver_identity = 9;
+
+  // Phase 2: authorship and the revise loop.
+  string worker_agent_id = 10;   // the worker that inspected the repo and wrote this plan
+  int32 revision = 11;           // 0 = the original presentation
+  int32 revisions_remaining = 12;// revisions still permitted before the worker must escalate
+  string rejection_feedback = 13;// the human's most recent rejection text (what the worker revises against)
 }
 
 message ApprovePlanRequest {
@@ -59,11 +79,15 @@ message ApprovePlanResponse {
 
 message RejectPlanRequest {
   string plan_id = 1;
-  string reason = 2;
+  string reason = 2; // FEEDBACK: delivered to the worker, which revises against it and re-presents
 }
 
 message RejectPlanResponse {
   bool rejected = 1;
+  // True when this rejection spent the revision budget: the worker stopped and escalated rather than
+  // revising again. The UI renders a different card for that, because it needs a human, not a decision.
+  bool escalated = 2;
+  int32 revisions_remaining = 3;
 }
 
 // The always-visible emergency stop (SA-1/F4 + RT-D4). Engage freezes the queue FIRST, then fans out

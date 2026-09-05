@@ -148,6 +148,8 @@ public sealed class DaemonBackedOrchestrator :
     private readonly Dictionary<string, (bool CanMerge, string Reason)> _gate_ = new(StringComparer.Ordinal);
     private readonly Dictionary<string, MergeEntryOrigin> _origins = new(StringComparer.Ordinal);
     private readonly List<TaskPlan> _plans = new();
+    private readonly List<WorkerPlanCard> _workerPlans = new();
+    private OrchestrationBackpressure _backpressure = OrchestrationBackpressure.None;
     private readonly List<ChatLine> _transcript = new();
     private readonly List<ResourceSample> _samples = new();
     private readonly Dictionary<string, (long Tokens, long UsdMicros)> _agentSpend = new(StringComparer.Ordinal);
@@ -887,18 +889,37 @@ public sealed class DaemonBackedOrchestrator :
         lock (_gate)
         {
             _plans.Clear();
+            _workerPlans.Clear();
             foreach (var p in update.Plans)
             {
-                // Only pending plans are approvable cards; decided ones stay in the daemon's history.
-                if (!string.Equals(p.Status, "Pending", StringComparison.OrdinalIgnoreCase))
+                // Pending plans are approvable cards; ESCALATED ones are kept too, because a worker that
+                // stopped after spending its revision budget is the one state that most needs a human and
+                // would otherwise vanish from the surface entirely. Approved/Rejected stay in daemon history.
+                var pending = string.Equals(p.Status, "Pending", StringComparison.OrdinalIgnoreCase);
+                var escalated = string.Equals(p.Status, "Escalated", StringComparison.OrdinalIgnoreCase);
+                if (!pending && !escalated)
                 {
                     continue;
                 }
 
-                _plans.Add(new TaskPlan(
-                    p.PlanId, p.Title, p.Scope.ToArray(), p.Approach, p.TestStrategy,
-                    (decimal)p.BudgetUsd, DateTimeOffset.UtcNow));
+                if (pending)
+                {
+                    _plans.Add(new TaskPlan(
+                        p.PlanId, p.Title, p.Scope.ToArray(), p.Approach, p.TestStrategy,
+                        (decimal)p.BudgetUsd, DateTimeOffset.UtcNow));
+                }
+
+                _workerPlans.Add(new WorkerPlanCard(
+                    p.PlanId, p.WorkerAgentId, p.CoordinatorId, p.Title, p.Scope.ToArray(),
+                    p.Approach, p.TestStrategy, (decimal)p.BudgetUsd, DateTimeOffset.UtcNow,
+                    p.Status, p.Revision, p.RevisionsRemaining, update.MaxPlanRevisions, p.RejectionFeedback));
             }
+
+            // Carried verbatim from the daemon rather than re-derived here: the number that refuses the
+            // coordinator a spawn and the number the human reads must be the same number.
+            _backpressure = new OrchestrationBackpressure(
+                update.BlockedWorkerCount, update.EscalatedWorkerCount, update.ActiveWorkerCount,
+                update.MaxActiveWorkers, update.MaxPlanRevisions, update.BackpressureSignal);
         }
 
         Changed?.Invoke();
@@ -2001,21 +2022,50 @@ public sealed class DaemonBackedOrchestrator :
         catch (Exception) { /* daemon unreachable — surfaced via ConnectionState. */ }
     }
 
-    public async Task SubmitPlanDecisionAsync(string planId, bool approve)
+    public IReadOnlyList<WorkerPlanCard> GetWorkerPlans()
+    {
+        lock (_gate)
+        {
+            return _workerPlans.ToArray();
+        }
+    }
+
+    public OrchestrationBackpressure GetBackpressure()
+    {
+        lock (_gate)
+        {
+            return _backpressure;
+        }
+    }
+
+    /// <summary>
+    /// Submits the human's decision — and <b>lets a failure be seen</b>.
+    ///
+    /// <para>This used to end in <c>catch (Exception) { }</c>, justified as "surfaced via ConnectionState".
+    /// It was not surfaced anywhere the operator was looking: a decision that never reached the daemon
+    /// completed the same way a successful one did, so the panel had no way to distinguish "approved" from
+    /// "silently lost" and no way to say which had happened. And the cost of guessing wrong is specific —
+    /// the worker on that plan stays blocked, holding its jail and its slot against the worker cap, while
+    /// the human believes they just unblocked it. "Already decided" deserves a message too, for the same
+    /// reason. The caller reports it; swallowing it here made that impossible.</para>
+    /// </summary>
+    public async Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
-        try
+        if (approve)
         {
-            if (approve)
-            {
-                await _client.ApprovePlanAsync(planId, cts.Token).ConfigureAwait(false);
-            }
-            else
-            {
-                await _client.RejectPlanAsync(planId, "rejected by operator", cts.Token).ConfigureAwait(false);
-            }
+            await _client.ApprovePlanAsync(planId, cts.Token).ConfigureAwait(false);
         }
-        catch (Exception) { /* daemon unreachable / already decided — surfaced via ConnectionState. */ }
+        else
+        {
+            // The reason is delivered to the worker as the feedback it revises against, so an empty
+            // one is a wasted round of the revision budget. The placeholder is honest about that
+            // rather than pretending the operator said something useful.
+            var reason = string.IsNullOrWhiteSpace(feedback)
+                ? "Rejected without written feedback — revise the plan and be more specific."
+                : feedback!;
+            await _client.RejectPlanAsync(planId, reason, cts.Token).ConfigureAwait(false);
+        }
     }
 
     // ---- ICliAgentHost (PR3: coordinator-as-CLI) --------------------------

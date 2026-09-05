@@ -108,7 +108,13 @@ public static class GatewayServiceRegistration
             registry: sp.GetRequiredService<IMergeQueueRegistry>(),
             synthetic: sp.GetRequiredService<SyntheticVerificationRegistry>(),
             repos: sp.GetRequiredService<IAgentEnvironment>().Repos,
-            log: log));
+            log: log,
+            // The phase-2 plan dimension (docs/design/queue-seeding.md §9). The SAME two singletons the
+            // spawn path holds and the merge queue ANDs in as a gate — a seeder holding its own copies
+            // would arm a hold nothing reads, which is the "complete, tested, wired nowhere" defect this
+            // contract exists to catch rather than reproduce.
+            plans: sp.GetRequiredService<PlanApprovalService>(),
+            planGate: sp.GetRequiredService<WorkerPlanGate>()));
 
         // MG-10: the missing constructor call. `new MergeQueue(...)` and `registry.Register(...)` existed
         // ONLY in the test projects, so the registry stayed empty for the daemon's whole lifetime and every
@@ -140,6 +146,10 @@ public static class GatewayServiceRegistration
             // there — immediately before verification, so the verified bytes are current (design §7).
             publishAgentRef: (repoHash, agentId) =>
                 sp.GetRequiredService<IAgentEnvironment>().Worktrees.PublishAgentBranch(repoHash, agentId),
+            // Phase 2 backstop: a worker whose own plan was never approved cannot merge, whatever it
+            // verified. ANDed into every repo's queue alongside the RT-D2 changed-test-command gate and the
+            // P2-11 flagged-change gate — the three are independent, and all three must say yes.
+            planGate: sp.GetRequiredService<WorkerPlanGate>(),
             // ...and the other half of the same question. The publish above carries ONLY
             // refs/heads/agent/<id>; this establishes whether the agent's worktree is actually on that
             // branch, so that work committed elsewhere is refused with the measurement instead of
@@ -200,15 +210,26 @@ public static class GatewayServiceRegistration
                     ?.PublishRebasedAgentBranch(repoHash, agentId) ?? false,
             // The dev-only seeding seam — always passed, empty in production (see the registration
             // above and the parameter's own doc; the exact-set composition test pins this line).
-            syntheticVerifications: sp.GetRequiredService<SyntheticVerificationRegistry>()));
-        // NOTE: `resolveApprovedPlan` is deliberately NOT passed, and its absence is load-bearing
-        // information rather than an oversight. The SA-1/F6 out-of-approved-scope arm needs an
-        // agent→approved-plan lookup, and the daemon has none to give: PlanApprovalService.PlanApproved has
-        // no production subscriber, no spawn path accepts or records a plan id, and AgentSession carries
-        // none. Passing a lambda that guessed (say, "any approved plan from this worker's coordinator")
-        // would compare diffs against the wrong scope and report it as enforcement — worse than the honest
-        // gap. The arm is wired and tested; it lights up when the plan-authorship pipeline supplies the
-        // binding. Everything else the flagged-change gate blocks on is live now.
+            syntheticVerifications: sp.GetRequiredService<SyntheticVerificationRegistry>(),
+            // ---- SA-1/F6: the out-of-approved-scope arm, LIT ------------------------------------------
+            //
+            // This argument was deliberately absent, with a stated reason: the daemon had no
+            // agent→approved-plan binding to give, so any lambda here would have compared diffs against a
+            // guessed scope and reported that as enforcement. Phase 2 is the pipeline that note was
+            // waiting on. A plan is now keyed by the WORKER's own agent id (PendingPlan.WorkerAgentId,
+            // written by the worker that presented it), and that id is the same session id the spawn path
+            // holds at the plan gate and the same id the merge queue tracks the branch under — so this is
+            // the exact binding, not an inference from a coordinator or a session field.
+            //
+            // Read through `Approved` only: LatestForWorker answers with the worker's newest plan in ANY
+            // state, and a pending or rejected plan's scope has authorised nothing. An id with no approved
+            // plan (a manual-mode agent, an external-PR head, a seeded entry without with_plan) resolves
+            // null exactly as before, which reads as "unmanaged" and skips the scope comparison entirely.
+            resolveApprovedPlan: agentId =>
+                sp.GetRequiredService<PlanApprovalService>().LatestForWorker(agentId) is
+                { Status: PlanStatus.Approved } approved
+                    ? approved.Plan
+                    : null));
 
         services.AddSingleton(sp =>
         {
@@ -324,7 +345,34 @@ public static class GatewayServiceRegistration
             BaseUrl: BuildGatewayBaseUrl(options),
             Enabled: options is not null && !string.IsNullOrWhiteSpace(options.GatewayBindAddress)));
 
+        // Phase 2's automatic verification trigger. Until now the ONLY production callers of
+        // MergeQueue.RunVerificationAsync were the human Verify button, the restart resume and the stale
+        // cascade — so nothing fired when a delegated worker finished its approved work, and the whole
+        // phase-2 flow required a human to press Verify on every worker. This is that missing caller, and
+        // it is deliberately nothing more than a caller: it watches the ref watcher's own sweep, waits for
+        // the worker's branch to go quiet, asks the plan gate, and then calls the SAME method the button
+        // calls. See docs/design/verification-trigger.md.
+        //
+        // Registered as a factory over the concrete WorktreeManager because the trigger must observe the
+        // watcher the daemon actually runs. Absent that substrate (a manager that is not a WorktreeManager)
+        // there is no observation to make, so the service simply does not exist and the daemon keeps the
+        // human path — GetService in WorkerReadinessHostedService is what makes that a supported state
+        // rather than a boot failure.
+        services.AddSingleton(sp =>
+            sp.GetRequiredService<IAgentEnvironment>().Worktrees is WorktreeManager worktrees
+                ? new WorkerReadinessTrigger(
+                    source: worktrees.RefWatcher,
+                    queues: sp.GetRequiredService<IMergeQueueRegistry>(),
+                    planGate: sp.GetRequiredService<WorkerPlanGate>(),
+                    limits: sp.GetRequiredService<CoordinatorLimits>(),
+                    log: log)
+                : null!);
+
         services.AddHostedService<GatewayHostedService>();
+        // ...and the slot that RESOLVES the trigger at boot. Without it the singleton above would be
+        // registered and never constructed — registered-but-never-running is the exact defect this
+        // subsystem exists to have repaired once.
+        services.AddHostedService<Runtime.WorkerReadinessHostedService>();
         // P2-13 carried-in from P2-12 (b): the external-PR intake poll loop runs from the daemon
         // scheduler. With IExternalPrIntake registered above (P2-47) it now runs the poll loop.
         services.AddHostedService<Runtime.PrIntakeHostedService>();

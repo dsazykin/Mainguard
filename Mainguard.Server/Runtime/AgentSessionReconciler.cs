@@ -431,7 +431,10 @@ public sealed class AgentSessionReconcilerService : BackgroundService
     /// into the machine's live state. Production coverage of this pass is the RequiresDocker tier, which
     /// drives the reconciler directly against containers it created itself.</para>
     /// </summary>
-    public const string DisableVariable = "MAINGUARD_DISABLE_SESSION_RECONCILE";
+    /// <remarks>Defined once and shared: the boot-time <see cref="SwarmReconcileTask"/> reads the same
+    /// switch for the same reason, and two copies of a policy is how one of them becomes decorative
+    /// (MG-12) — which is exactly what had happened, the boot pass having never read this at all.</remarks>
+    public const string DisableVariable = SwarmReconcileTask.DisableVariable;
 
     /// <summary>Whether the pass is switched off for this process.</summary>
     public static bool Disabled =>

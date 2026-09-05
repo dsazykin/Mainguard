@@ -132,6 +132,26 @@
   - `SpawnImagePreflightTests` asserts the `Spawn` step sequence + the image-missing failure.
   - **`Mainguard.Tests/Headless/DaemonLogsRenderHarness.cs`** — the Daemon logs window in all five
     themes × populated/spawn/loading/empty → `artifacts_headless/daemon_logs_<Theme>_<state>.png`.
+  - **`Mainguard.Tests/Headless/CoordinatorPlanGateRenderHarness.cs`** (**phase 2**) — the coordinator
+    panel's four plan-gate states in all five themes → `artifacts_headless/plan_gate_<state>_<Theme>.png`
+    (`pending`, `revising`, `last_revision`, `escalated`, `backpressure`). Each state **asserts the fact
+    the human is supposed to read off the surface** — that the plan names its author and says the worker
+    is blocked, that the revision counter reads "revision 2 of 3", that the last permitted revision warns
+    rejecting again stops the worker, that an escalated card offers no decision, and that the
+    backpressure banner names the count and the stopped coordinator — so a render that silently loses one
+    fails here rather than in a screenshot nobody opened. Paired with a negative
+    (`NoBlockedWorkers_ShowsNoBackpressureLine`): an always-on warning is the same as no warning.
+    **`TheShippedControlCenterSurface_MountsThePlanGate`** is the one that matters most, and it is here
+    because its absence let phase 2 ship undriveable: the five state renders above build
+    `CoordinatorPanelView`, a control **the application never constructs**, so the entire gate could be
+    complete, daemon-tested and pinned in five themes while the operator had no button to press anywhere
+    in the product. It builds the real `ControlCenterView` off a real `ControlCenterViewModel` and
+    requires a visible, non-zero-sized `PlanGateView` bound to the coordinator's own state with a live
+    Approve on it — verified red by deleting the mount. Its negative
+    (`WithNothingWaiting_TheGateTakesNoSpaceOnTheShippedSurface`) requires the region to collapse when
+    idle, and `EveryBlockedWorker_GetsItsOwnDecidableCard` counts **six** enabled Approve buttons for six
+    blocked workers off the visual tree, because "the ViewModel holds six" and "the human can clear six"
+    are different claims and only the second one unblocks the cap.
 - **`Mainguard.Tests/`** — xUnit tests for Core (`MockOrchestratorTests` — the Lane E mock daemon's
   invariants: stale cascade on merge, gate reasons, freeze-first kill switch, plan-approval spawn,
   prompt queue, deploy phases; `Headless/ControlCenterRenderHarness` — the P2-13 pattern: the
@@ -175,10 +195,13 @@
   `SeedingCompatibilityTests` (in `Mainguard.Server.Tests` — **the queue-seeding COMPATIBILITY
   CONTRACT**, docs/design/queue-seeding.md §9: the gate defaults seeding depends on pinned in BOTH
   directions (`ChangedTestCommandGate` passes unknown ids, `FlaggedChangeGate` MG-40-denies them —
-  i.e. seeding depends on the mirror-read half running); the coordinator-branch TRIPWIRE — fails the
-  moment a `WorkerPlanGate`/`*ReadinessTrigger` type lands, with the doc comment addressed to whoever
-  merges those branches (extend the seeder with plan seeding via `SeedEntrySpec`'s reserved fields
-  8/9, re-pin directly, only then remove); the lifecycle verbs refusing unknown ids; the boot-flag
+  i.e. seeding depends on the mirror-read half running); the coordinator plan gate in BOTH of its
+  directions, which replaced the pre-merge tripwire once its three demands were discharged —
+  `WorkerPlanGate.Allows` permissive for an id it never held, `MayAutoVerify` refusing that same id,
+  a `seed-` id armed on a REAL `WorkerReadinessTrigger` dropped `Ineligible` over a queue whose
+  runner throws if entered, and the structural pin that `QueueSeeder` holds no handle on the trigger
+  or the ref machinery (which is what carries the guarantee to the `with_plan` seeds, whose
+  `MayAutoVerify` legitimately answers true); the lifecycle verbs refusing unknown ids; the boot-flag
   wire contract — flagless daemon ⇒ UNIMPLEMENTED, flagged ⇒ status answers while a coordinator token
   stays PermissionDenied; and the `SeedingGateInterceptor` belt driven directly over a method-only
   `ServerCallContext`),
@@ -186,7 +209,9 @@
   seeding-enabled in-proc daemon + the shipped `ProvisionRepo`: batch seeding whose entries the
   ordinary `CanMerge` RPC then serves, the auto-provisioned verify config reported loudly, the
   over-the-wire stale pair whose merge really advances origin main, `PushCommits` invalidation,
-  the clear round-trip, and typed NOT_FOUND / InvalidArgument refusals),
+  the clear round-trip, the `with_plan`/`scope` plan dimension (both entries really held → presented →
+  approved, the in-scope one merging and the out-of-scope one blocked by the shipped `CanMerge`), and
+  typed NOT_FOUND / InvalidArgument refusals),
   `QueueSeederTests` (the dev-only queue seeder over a REAL bare mirror + REAL origin checkout — the
   `MergeQueueProvisionerTests` fixture posture, because the property under test is that seeded entries
   travel the production wiring. The sandbox engine THROWS on any use and `resolveContainerId` answers
@@ -197,8 +222,12 @@
   refusal and the drain-before-Cancel non-resurrection; the [Verified, Merged] stale pair whose merge
   REALLY advances origin main and whose cascade REALLY stales-and-holds the co-seed; the
   origin-not-on-main verbatim refusal with the lease handed back; `PushCommits` really invalidating a
-  Verified seed; the loud verify-config auto-provision; and the registry refusing a plan for a
-  non-`seed-` id),
+  Verified seed; the loud verify-config auto-provision; the registry refusing a plan for a
+  non-`seed-` id; and the PLAN dimension — a plan-less seed staying outside the gate
+  (permitted-to-merge / auto-verify-ineligible), `WithPlan` driving the real Hold → Present → Approve
+  walk with the seeded-authorship marker on the record, `Scope` arming the real out-of-approved-scope
+  must-ack item, clearing releasing the hold while keeping the decided plan as history, and a
+  plan-pipeline-less substrate refusing `WithPlan` while seeding nothing at all),
   `MergeQueueRestartResumeTests` (**the decisive proof that the resume has a production caller.** The
   older coverage called `ResumeAfterRestartAsync` directly and asserted it works — already true, and not
   the defect, which was that nothing called it. These kill a daemon *during* a real run (a gated fake
@@ -967,6 +996,13 @@
   not-mergeable); the MG-11 gate and MG-23 lease refusing before the host is touched at all; no
   double-merge after a confirmed one; and local preconditions (main moved, dirty tree) refusing
   **before** the irreversible upstream merge.
+- **`Mainguard.Server.Tests/WorkerReadinessTriggerWiringTests.cs`** — phase 2's automatic verification
+  trigger is actually RUNNING in the daemon. Two facts, and they are not the same fact: a hosted service
+  resolves `WorkerReadinessTrigger` at boot (a DI singleton nobody asks for is never constructed, so it
+  would never subscribe and never sweep while every unit test of its rules stayed green), and the trigger
+  observes **the very `AgentRefWatcher` instance** the daemon's `WorktreeManager` sweeps with — a trigger
+  wired to a second, unwatched watcher passes everything else in this repository and never fires once in
+  production. Both run through the real `DaemonFixture` composition root.
 - **`Mainguard.Server.Tests/Agents/SubstrateConformanceTests.cs`** — the ESC §4 rows run against
   THIS host's substrate composition: `SubstrateConformanceTests` (#1 git-objects round-trip through
   the opaque `ResolveSyncRemote` handle, byte-identical; git-only, macOS leg — the WSL2 handle needs
@@ -1354,17 +1390,67 @@
   `MergeDispatchTests` (the origin-routed merge step — local→foreground service, external→host merge
   API, both fire `NotifyMainMoved`). **P2-14 governance tests (Core):** `TaskPlanSchemaTests` (the
   schema corpus — valid + every invalid shape → exact error sets, unknown-field rejection, oversized
-  guard), `PlanApprovalTests` (reject→no spawn/no worktree residue; approve persists the
-  daemon-derived identity + survives restart; the S-8 pending-cap → `ResourceExhausted` +
-  `plan_draft_rejected` audit + pressure signal), `CoordinatorToolCapTests` (`SpawnWorker` capped by
-  admission/budget/worker-cap → rejected-without-drafting, the two-phase never-spawn-directly path,
-  S-8 exhaustion, frozen-refusal, and the manual-mode-bypasses-coordinator-but-not-admission rule),
+  guard), `PlanApprovalTests` (reject→nothing released/no residue; approve persists the
+  daemon-derived identity + survives restart; the pressure signal and its coordinator scoping),
+  `CoordinatorToolCapTests` (**phase 2** — `SpawnWorkerAsync` capped by admission/budget/worker-cap →
+  rejected-without-spawning; the inversion itself (a spawn happens immediately and the coordinator
+  authors NO plan); **workers blocked on plan approval count against the cap**, with the refusal naming
+  the count — and a paired negative proving the ordinary wording survives when nothing is blocked;
+  steering and verification refused at the gate; and the
+  manual-mode-bypasses-coordinator-but-not-admission rule),
+  **`WorkerAuthoredPlanTests`** (phase 2 — authorship attribution, one-live-plan-per-worker,
+  `AwaitDecisionAsync` genuinely not returning before a human decides, rejection delivering feedback and
+  being non-terminal, the pinned arithmetic *three rejections give three revisions and the **fourth**
+  escalates* with a higher-budget negative control proving the escalation comes from the limit, the
+  `WorkerPlanAuthor` loop end to end, and revision state surviving a restart so the budget is not handed
+  back), **`WorkerPlanGateTests`** (phase 2 — the daemon-side enforcement: the task withheld at every
+  stage before approval and released only after, the brief being available but not being the task, an
+  escalated worker never getting its task, `MayWork` at each stage, the **`IMergeGate` backstop blocking
+  a branch that verified GREEN**, the paired negative that agents the gate never held are NOT blocked,
+  and the backpressure text — including a negative that refuses to claim a saturated cap when there is
+  headroom, plus the **release-exactly-once** pair: a repeat `TryReleaseTask` still hands back the task —
+  `mainguard-plan await <id>` is the documented crash re-attach, and answering it with an empty prompt
+  would strand a worker holding an approved plan — while auditing `worker_task_released` and raising
+  `TaskReleased` only on the first call, asserted sequentially and under 25 rounds of 32 racing threads),
+  **`WorkerReadinessTriggerTests`** (phase 2's automatic verification trigger, driven on a virtual clock
+  with the sweep hand-cranked so the debounce and the cooldown are asserted rather than slept on. Every fire
+  is observed as a REAL `MergeQueue` state walk driven by `RunVerificationAsync`, never as a call count on a
+  seam of the trigger's own. Covers: a quiet branch verifying with nobody pressing Verify; a failing run
+  settling back through the queue **with the run count asserted alongside the state**, since `Working` is
+  the default and a trigger that ran nothing would land there too; **a REFUSED verification recording
+  nothing at all** — not a passing row and emphatically not a failing one, the control being the failing-run
+  test that DOES produce a row, so "we could not run your tests" and "your tests failed" stay
+  distinguishable (PR #322) — and not being retried on the same tip; five commits inside the window costing
+  ONE run, measured from the LAST advance; the same tip never attempted twice; a grinder held off by the
+  cooldown and staying armed; a worker still at the plan gate and an agent the gate never held both refused
+  — the latter paired with the positive that the *merge* gate still allows that id, which is what makes the
+  stricter predicate deliberate; an in-flight run deferred rather than fought over; a `Verified` entry left
+  alone because no legal edge to `Verifying` exists; and a repo with no queue skipped rather than
+  provisioned. All sixteen mutations of the fix were watched go red),
+  **`CoordinatorPlanDecisionTests`** (phase 2 — the human half of the same gate: Approve/Reject must never
+  latch disabled, since the blocked worker on the card holds its jail and its slot against the worker cap
+  and the click is the only thing that clears it. Covers the decision throwing, the decision returning
+  while the plan stays pending with the same id/revision — the case where `Refresh` keeps the *same*
+  `PlanCardViewModel` mounted — the card naming a failure instead of reverting silently, a successful retry
+  clearing the stale message, and the shipped `DaemonBackedOrchestrator` **propagating** a failed decision
+  rather than swallowing it. **It also pins what each button SENDS**, which it did not: inverting
+  `ApproveAsync`/`RejectAsync` and dropping `FeedbackText` altogether left the whole suite green, because
+  the fake counted into a `DecisionCalls` nobody read and three tests rested on
+  `Assert.False(IsDeciding)` — the field's own default. The fake now records every decision as
+  *(plan id, approve, feedback)* and each is asserted; the feedback string is pinned separately because
+  the daemon hands it to the worker verbatim, so a dropped binding costs one of three revisions and tells
+  the worker nothing while the operator's box still shows what they typed; and the latch is asserted as a
+  **transition** through a held `TaskCompletionSource`, since only a transition can fail),
   `KillSwitchTests` (`FanOutUnder5s`+snapshot+frozen; the **RT-D4 `HardCeiling_IndependentOfRtt`**
   clamp with the A3 spike; the **SA-1/F4 `FreezesQueueBeforeFanOut`** timeline; the **RT-D3
   audit-outage→recovery `killswitch_audit_gap`**), and `Integration/ScriptedCoordinatorEndToEndTests`
-  (the scripted-coordinator
-  two-tasks→two-plans→approvals→parallel-workers→verify→sequential-merge-with-stale-reverify story
-  asserted through the audit trail; the real-container leg is `MergeQueueDockerTests`). **MG-42
+  (**phase 2, rewritten**: the whole loop deterministically — the coordinator spawns two workers with
+  no human approval and no plan of its own → each worker authors and presents ITS OWN plan and blocks →
+  neither can be steered, verified, or handed its task → the human approves one and rejects the other
+  **with feedback**, which that worker revises against and re-presents → the daemon releases the tasks
+  **only then** → verify → the stale cascade → sequential human merges, all asserted through the
+  audit trail; plus the saturated-cap case, where the third spawn is refused and the refusal names the
+  waiting plans. The real-container leg is `MergeQueueDockerTests`). **MG-42
   user-managed toolchains (Agents):** `ToolchainChannelTests` (the shipped manifest parses and curates
   `python-3`; a manifest that weakens the pin — plaintext URL, short hash, path-shaped id, empty expected
   version — is refused at parse; the install verifies the checksum BEFORE unpacking and refuses to unpack
@@ -1536,9 +1622,14 @@
   module initializer: PR #287 flagged this assembly as "likely" affected without proving it, and it
   was — every `DaemonHost.Resolve*` store path falls back to `MainguardPaths.DataRoot()` when handed
   no token path, and one clean run rewrote the real mTLS identity, held `mainguard-daemon.db` open and
-  left 13 live agent-IPC sockets in the user's data root) and
+  left 13 live agent-IPC sockets in the user's data root; `ResolveSandboxRoot` also keeps the root short
+  enough to BIND a socket in — `%TEMP%` where it fits, a short home container where it does not, which
+  on macOS is always, since `/var/folders/<..>/T/` costs 49 characters against a 104-byte `sun_path` and
+  used to take out every socket-binding test at once) and
   **`Mainguard.Server.Tests/DataRootIsolationTests.cs`** (its teeth, and more: besides proving the run
-  is not on the real root, `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
+  is not on the real root, `The_isolated_root_leaves_room_to_bind_an_agent_ipc_socket` holds whatever
+  root is in force to that budget — the Linux default clears `sun_path` by three characters nobody
+  chose — and `Every_daemon_store_path_resolver_follows_the_session_token` asserts over
   the SHIPPED resolver set that each one both TAKES and USES a token path — the case a hand-widened
   exact-set list would wave through, and the one that would make every concurrent in-proc host share a
   single file). Test classes: `DaemonAuthTests` (auth
@@ -1567,7 +1658,23 @@
   its own jail socket); `AgentSession.ParentAgentId` records the spawning coordinator;** the
   Unix-socket legs — coordinator IPC endpoint + locked managed-worker spawn via the socket, and the
   REAL python3 `mainguard-agent` shim round-trip — are `LinuxOnly`, authoritative in the Linux CI
-  leg),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
+  leg),** **`WorkerPlanChannelIpcTests` (phase 2 — the plan gate AT THE DAEMON, over the real
+  Unix-socket channel a jail uses, through the production `AgentSpawnService` handlers. This is the file
+  that answers "is the gate enforced, or merely described?", so nothing in it asserts a prompt: a
+  coordinator-spawned worker gets `mainguard-plan` and a brief but **not its task**; `present_plan`
+  genuinely parks on the socket and only an approval yields the withheld prompt; a rejection comes back
+  as feedback and the revision blocks again; the rejection that spends the budget answers `Escalated` and
+  a defiant revision after it is refused; a worker cannot reach a coordinator op (nor a coordinator a
+  plan op) because the ROLE is fixed on the endpoint; a worker cannot await or revise another worker's
+  plan, and a foreign plan id gets the same answer as a nonexistent one so the channel is not an
+  existence oracle; a schema-invalid plan never reaches a human; and a Managed session the gate is NOT
+  holding — an external-PR head, a manual worker — gets **no channel at all**, and is not merge-blocked
+  either. Over a shared `PlanGateRig` (one in-proc host per class; each test stops the agents it spawned,
+  because `MaxActiveWorkers` is daemon-global and leaked workers make a later test hit the cap — which is
+  how the first run failed, and a pleasant way to be reminded the cap is real). **`WorkerCapDaemonEnforcementTests`**
+  is its own class, and therefore its own rig, because it asserts a daemon-global population: the cap is
+  refused **in the daemon's shim handler, on the wire, counting workers that are doing nothing but
+  waiting on the human**, with the refusal naming that),** `LoggingMaskTests` (secret-field mask), `DaemonClientReconnectTests` (restart→resume state
   sequence), `FixtureAcceptanceTests` (the TI-P2-00 fixture smokes),
   **`DockerSuiteDiagnosticsTests` (the RequiresDocker sweep's diagnosis contract, all daemon-free: the
   refusal names the engine, the evidence (`/etc/mainguardos-release`), what it would have destroyed by
@@ -1884,7 +1991,10 @@
   integration branch untouched; the rule-4 check reached on its own by pointing the mirror's HEAD at
   the agent branch; one agent's forged copy of another's ref not carried across; no quarantine ref
   left behind on success OR refusal; and the watcher driven through `PollOnce` — publishes on a move,
-  silent while still, KEEPS refusing rather than recording the snapshot and going quiet, and
+  silent while still, publishing an `Advanced` signal that ARMS the readiness trigger on a real commit (and
+  stops the moment the trigger is disposed — the rung the unit suite cannot reach, since a trigger with
+  perfect rules and no subscription passes every one of them), KEEPS refusing rather than
+  recording the snapshot and going quiet, and
   SELF-EVICTS an agent whose repository is gone (`SwarmReconciler` disposes an orphan by calling
   `RemoveAgentWorktree` directly and never unwatches it, and a vanished repo never publishes
   `Current`, so the entry would otherwise spawn a git process every tick for the life of the daemon) —

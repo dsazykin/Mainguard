@@ -65,15 +65,16 @@ public sealed class AuditTouchpointCoverageTests : IDisposable
     {
         var audit = OpenLog();
 
-        // ---- Plans: draft two, approve one, reject one (P2-14 → plan_approved / plan_rejected) ----
+        // ---- Plans: two workers present, one approved, one rejected (phase 2 → plan_presented ×2,
+        // then plan_approved / plan_rejected). One live plan per WORKER, so two distinct worker ids. ----
         var plans = new PlanApprovalService(audit: audit);
         var fields = new TaskPlanFields(new[] { "src/one/**" }, "do the thing", "tests green");
-        var draft1 = plans.Draft("coord-1", "task-1", fields, "implement task-1", 1.5m);
-        var draft2 = plans.Draft("coord-1", "task-2", fields, "implement task-2", 1.5m);
-        Assert.True(draft1.IsDrafted);
-        Assert.True(draft2.IsDrafted);
-        plans.Approve(draft1.PlanId!, "uid:501");
-        plans.Reject(draft2.PlanId!, "out of scope");
+        var present1 = plans.Present("worker-1", "coord-1", "task-1", fields, "implement task-1", 1.5m);
+        var present2 = plans.Present("worker-2", "coord-1", "task-2", fields, "implement task-2", 1.5m);
+        Assert.True(present1.IsPresented);
+        Assert.True(present2.IsPresented);
+        plans.Approve(present1.PlanId!, "uid:501");
+        plans.Reject(present2.PlanId!, "out of scope");
 
         // ---- Merge queue: verify green, stale override, review verdict "no" (P2-10) ----
         MergeQueue queue = null!;
@@ -101,6 +102,8 @@ public sealed class AuditTouchpointCoverageTests : IDisposable
         var types = audit.Read().Select(e => e.Type).ToArray();
         Assert.Equal(new[]
         {
+            "plan_presented",
+            "plan_presented",
             "plan_approved",
             "plan_rejected",
             "stale_override_used",

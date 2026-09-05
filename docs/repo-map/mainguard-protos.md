@@ -99,14 +99,27 @@
     `UNIMPLEMENTED`, plus a `SeedingGateInterceptor` prefix-deny as the belt), and every method is
     on the coordinator's denied list unconditionally. Ids are daemon-assigned `seed-<n>` — the
     prefix is the clear-scope boundary; no actor fields (daemon-derived identity); refusals are
-    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are RESERVED for
-    the coordinator phase-2/3 plan dimension per the compat contract),
+    per-entry verbatim strings, never status codes. Fields 8/9 of `SeedEntrySpec` are the coordinator
+    phase-2/3 plan dimension the compat contract reserved them for: `with_plan` drives the REAL
+    `WorkerPlanGate.Hold` → `PlanApprovalService.Present` → approve walk for the synthetic id, and
+    `scope` is the approved `TaskPlan.Scope` — empty meaning "the seed's own path", anything else
+    arming the real out-of-approved-scope must-ack item),
     `orchestrator.proto` (P2-14: `PlanApprovalService`
     `StreamPlans`/`ApprovePlan`/`RejectPlan` — **`ApprovePlanRequest` carries only `plan_id`; there is
     NO client approver/`osIdentity` field by design (SA-1/F2)**, the approver is daemon-derived — and
     `KillSwitchService` `Engage`/`Resume`; **P2-47 #9 adds `CoordinatorService`
     `StreamConversation`/`SendMessage`** — the coordinator chat bridge, snapshot-then-deltas
-    conversation turns + a send-message RPC, carrying no merge/git/worktree capability).
+    conversation turns + a send-message RPC, carrying no merge/git/worktree capability.
+    **Phase 2** (worker-authored plans): `PlanEntry` gains `worker_agent_id` (the plan is the
+    *worker's* now — it wrote it after inspecting the repo), `revision`, `revisions_remaining` and
+    `rejection_feedback`; `RejectPlanRequest.reason` becomes load-bearing — it is **delivered to the
+    worker** as the feedback it revises against — and `RejectPlanResponse` gains `escalated` +
+    `revisions_remaining`, because a bare `rejected: true` could not distinguish "the worker will
+    revise" from "the worker has stopped". `PlanUpdate` gains the **backpressure** block
+    (`blocked_worker_count`, `escalated_worker_count`, `active_worker_count`, `max_active_workers`,
+    `max_plan_revisions`, `backpressure_signal`) — a blocked worker counts against the worker cap, so a
+    saturated cap means the coordinator has stopped spawning, and the contract makes saying so a
+    requirement rather than a nicety).
   - `Mainguard.Protos.csproj` runs `Grpc.Tools` with `GrpcServices="Both"`.
 
 ## Role in the solution

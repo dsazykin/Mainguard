@@ -62,7 +62,17 @@ public sealed class AuditRpcTests
         }));
 
         var client = new AuditService.AuditServiceClient(host.CreateChannel());
-        var response = await client.ReadAuditAsync(new ReadAuditRequest { FromSeq = 1, Take = 500 }, host.AuthHeaders());
+
+        // Read a window that ENDS at the head rather than one that starts at seq 1. The in-proc hosts
+        // share one run-scoped chained log (see _marker above), and `FromSeq = 1, Take = 500` asserts
+        // against the OLDEST 500 records — so once the assembly has written more than that, this test's
+        // own append is off the end of the window and Assert.Single fails having found nothing. That is
+        // a property of how many other tests ran first, which is why it failed in a full run and passed
+        // in isolation. Anchoring to the head keeps the assertion about this test's record.
+        var head = (await client.VerifyAuditAsync(new VerifyAuditRequest(), host.AuthHeaders())).HeadSeq;
+        var response = await client.ReadAuditAsync(
+            new ReadAuditRequest { FromSeq = Math.Max(1, head - 499), Take = 500 },
+            host.AuthHeaders());
 
         Assert.True(response.Persistent);
         var record = Assert.Single(response.Records, r => r.PayloadJson.Contains(_marker, StringComparison.Ordinal));

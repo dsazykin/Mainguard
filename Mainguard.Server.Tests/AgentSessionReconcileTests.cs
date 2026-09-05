@@ -18,6 +18,19 @@ namespace Mainguard.Server.Tests;
 /// </summary>
 public sealed class AgentSessionReconcileTests
 {
+    /// <summary>
+    /// One switch, not two. This assembly's module initializer sets exactly one variable to keep a test
+    /// daemon off the machine's live containers, and for a long time only the periodic pass read it — the
+    /// boot-time <see cref="SwarmReconcileTask"/> went on adopting the developer's real jails and naming
+    /// them in the test audit log. Pinning the two names together is what stops that reopening: let
+    /// either drift and the harness silently covers half of what it claims to.
+    /// </summary>
+    [Fact]
+    public void TheReconcileDisableSwitch_IsOneStringSharedWithTheBootPass()
+        => Assert.Equal(
+            SwarmReconcileTask.DisableVariable,
+            AgentSessionReconcilerService.DisableVariable);
+
     private const string Repo = "repohash";
 
     private static AgentSessionReconciler Build(

@@ -159,15 +159,32 @@ public sealed record QueueEntryDiscardOutcome(
 public sealed record QueueEntryRejectOutcome(
     string AgentId, string RejectedBy, DateTimeOffset? RejectedAt);
 
-/// <summary>P2-14: the coordinator conversation + two-phase plan approval.</summary>
+/// <summary>The coordinator conversation + the worker-authored plan gate (contract §2).</summary>
 public interface ICoordinatorService
 {
     IReadOnlyList<ChatLine> GetTranscript();
     IReadOnlyList<TaskPlan> GetPendingPlans();
     TaskPlan? GetPlan(string planId);
+
+    /// <summary>
+    /// The worker-authored plans the human still has to act on: those awaiting a decision, and those whose
+    /// worker escalated after spending its revision budget. Richer than
+    /// <see cref="GetPendingPlans"/> because the card has to show authorship and the revise loop.
+    /// </summary>
+    IReadOnlyList<WorkerPlanCard> GetWorkerPlans();
+
+    /// <summary>The daemon's backpressure fact — how many workers are held at the gate, and whether that
+    /// is why the coordinator has stopped spawning.</summary>
+    OrchestrationBackpressure GetBackpressure();
+
     event Action? Changed;
     Task SendAsync(string text);
-    Task SubmitPlanDecisionAsync(string planId, bool approve);
+
+    /// <param name="feedback">
+    /// On a rejection this is <b>delivered to the worker</b>, which revises against it and re-presents —
+    /// so an empty string is a real cost to the human, not just a missing field.
+    /// </param>
+    Task SubmitPlanDecisionAsync(string planId, bool approve, string? feedback = null);
 }
 
 /// <summary>P2-14 kill switch: freeze-queue-first, then yield fan-out. Recoverable by design.</summary>

@@ -97,6 +97,14 @@ public sealed class MergeQueueProvisioner
     private readonly string _artifactDir;
     private readonly SyntheticVerificationRegistry? _synthetic;
 
+    /// <summary>
+    /// The phase-2 plan gate, ANDed into every repo's queue: a worker whose own plan was never approved
+    /// cannot merge, whatever it verified. This is the <i>backstop</i> half of "a worker does not start
+    /// work before its plan is approved" — the primary half is that the daemon never handed it the task.
+    /// Shared across repos on purpose: it is keyed by agent id and every agent id is daemon-global.
+    /// </summary>
+    private readonly IMergeGate? _planGate;
+
     /// <param name="registry">The registry the gRPC layer resolves repo handles through.</param>
     /// <param name="repos">Locates the daemon-side bare mirror for a repo hash (main sha + config trees).</param>
     /// <param name="leases">The RT-D1 merge-lease store. <b>Must be the same singleton</b> the foreground
@@ -123,12 +131,17 @@ public sealed class MergeQueueProvisioner
     /// agent has none. Supplying it turns on the <c>out-of-approved-scope</c> arm of the detector: every
     /// file the branch touches outside <c>TaskPlan.Scope</c> becomes its own must-acknowledge item.
     ///
-    /// <para><b>Null in the daemon today, and that is a statement of fact rather than a default.</b> There is
-    /// no agent→approved-plan binding anywhere in the running daemon: <c>PlanApprovalService.PlanApproved</c>
-    /// has no production subscriber, no spawn path accepts or records a plan id, and <c>AgentSession</c>
-    /// carries none — so no honest implementation of this callback exists yet to pass. The scope comparison
-    /// is therefore wired, tested and inert, waiting on the plan-authorship pipeline; it is NOT reported as
-    /// enforced. See the PR body and <c>docs/design/coordinator-phase-2-decisions.md</c> §3a.</para>
+    /// <para><b>Wired by the daemon since phase 2, and the history is the point.</b> It used to be null for
+    /// a stated reason: there was no agent→approved-plan binding anywhere in the running daemon, so any
+    /// callback passed here would have compared diffs against a GUESSED scope and reported that as
+    /// enforcement — worse than the honest gap. Worker-authored plans supply the exact binding, because a
+    /// plan is keyed by the WORKER's own agent id, which is the same id the plan gate holds and the same
+    /// id the merge queue tracks the branch under. The composition root reads it through
+    /// <c>PlanStatus.Approved</c> only (a pending or rejected plan's scope has authorised nothing), and an
+    /// agent with no approved plan still resolves null — unmanaged, scope comparison skipped, exactly as
+    /// before. See <c>docs/design/coordinator-phase-2-decisions.md</c> §3a and
+    /// <c>docs/design/queue-seeding.md</c> §9 (the seeder's <c>with_plan</c>/<c>scope</c> specs are how
+    /// this arm is exercised without spawning an agent).</para>
     /// </param>
     /// <param name="publishAgentRef">
     /// MG-3 — (repoHash, agentId) → carry the agent's branch from its own repository into the mirror.
@@ -221,6 +234,7 @@ public sealed class MergeQueueProvisioner
         Action<string>? log = null,
         Func<string, string, bool>? publishAgentRef = null,
         Func<string, TaskPlan?>? resolveApprovedPlan = null,
+        IMergeGate? planGate = null,
         Func<string, string, AgentBranchAlignment>? checkAgentBranch = null,
         Func<string, IYieldProtocol>? yieldProtocolFor = null,
         Func<string, string, string?>? locateAgentWorktree = null,
@@ -244,6 +258,7 @@ public sealed class MergeQueueProvisioner
         _log = log;
         _publishAgentRef = publishAgentRef;
         _resolveApprovedPlan = resolveApprovedPlan;
+        _planGate = planGate;
         _checkAgentBranch = checkAgentBranch;
         _yieldFor = yieldProtocolFor;
         _locateAgentWorktree = locateAgentWorktree;
@@ -419,6 +434,13 @@ public sealed class MergeQueueProvisioner
         // a merge precondition rather than a rendering.
         var flaggedChanges = new FlaggedChangeGate(_audit);
 
+        // Every gate here is independent and they AND: the RT-D2 changed-test-command gate, the P2-11
+        // flagged-change review, and (when the daemon supplied one) the phase-2 plan gate. Adding a gate is
+        // always additive — dropping one to make a set "simpler" silently deletes a merge precondition.
+        var gates = _planGate is null
+            ? new IMergeGate[] { changedTestCommand, flaggedChanges }
+            : new IMergeGate[] { changedTestCommand, flaggedChanges, _planGate };
+
         // P2-09's keep-alive rebaser, per repo because its `locate` closes over the repo handle. Built
         // here and not once per provisioner so a repo whose mirror the daemon cannot resolve simply has
         // no rebaser, rather than one that throws on every cascade.
@@ -432,14 +454,17 @@ public sealed class MergeQueueProvisioner
             verifications: _verificationStore(repoHandle),
             runVerification: (agentId, ct) =>
                 RunVerificationAsync(repoHandle, agentId, queue, changedTestCommand, flaggedChanges, ct),
-            // P2-10 §3.3 step 2, and the whole point of this change: "yield → keep-alive rebase onto new
+            // P2-10 §3.3 step 2, and the whole point of that change: "yield → keep-alive rebase onto new
             // main → RunVerificationAsync". This argument was `null` — i.e. re-verify only — which reads
             // like a lighter cascade and is not one. `git merge --ff-only` is the merge, so the instant
             // any agent merges, every co-tenant branch stops descending from main; re-verifying them
             // re-establishes a PASS against work that was never rebased, the entry returns to Verified,
             // and the merge is then refused as stale. Nothing in the daemon could break that loop.
             requeue: (agentId, ct) => RequeueStaleAsync(repoHandle, agentId, queue, rebaser, ct),
-            gates: new IMergeGate[] { changedTestCommand, flaggedChanges },
+            // `gates`, NOT a fresh literal: the phase-2 plan gate is only present when the daemon supplied
+            // one, and rebuilding the array inline here would drop it — the exact silent-deletion this
+            // forward merge had to resolve, since both sides edited this argument list.
+            gates: gates,
             audit: _audit);
 
         return new MergeQueueContext(queue, _leases)

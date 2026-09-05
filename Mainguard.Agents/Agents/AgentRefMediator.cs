@@ -496,6 +496,25 @@ public sealed class AgentRefWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// Raised, off any lock, for every sweep in which an agent's <c>refs/heads/agent/&lt;id&gt;</c> ACTUALLY
+    /// advanced in the mirror (<see cref="AgentRefPublishOutcome.Published"/> — never
+    /// <see cref="AgentRefPublishOutcome.Unchanged"/>, which is the steady state of an idle agent).
+    ///
+    /// <para><b>This is the one readiness-adjacent signal the daemon observes rather than is told.</b> It
+    /// exists because <see cref="PollOnce"/> already computed it and then threw it away: the loop discarded
+    /// its own return value, so "this agent's work moved" was known once per second and reachable by
+    /// nothing. <c>WorkerReadinessTrigger</c> is the subscriber.</para>
+    ///
+    /// <para>Deliberately NOT raised by <see cref="AgentRefMediator"/>'s own observer, which also sees the
+    /// merge queue's pre-verification publish. A trigger fed by that would be fed by the consequences of
+    /// its own decisions. This event fires only for movement the sweep discovered on its own.</para>
+    ///
+    /// <para>A throwing subscriber is swallowed for the same reason the sweep itself is wrapped: a watcher
+    /// must never be the thing that takes the daemon down.</para>
+    /// </summary>
+    public event Action<AgentRefPublishResult>? Advanced;
+
     /// <summary>Start watching an agent. Idempotent. The first tick after this always publishes, because
     /// the recorded snapshot starts empty — so an agent that committed before the watch began is not
     /// missed.</summary>
@@ -557,6 +576,20 @@ public sealed class AgentRefWatcher : IDisposable
             if (result.Current)
             {
                 _watched.TryUpdate(key, snapshot, previous);
+            }
+
+            // Announce only real movement, and only after the snapshot decision above: a subscriber that
+            // acted on a refused or failed publish would be acting on a mirror that did not change.
+            if (result.Outcome == AgentRefPublishOutcome.Published)
+            {
+                try
+                {
+                    Advanced?.Invoke(result);
+                }
+                catch
+                {
+                    // A subscriber must never be the thing that stops the sweep.
+                }
             }
         }
 

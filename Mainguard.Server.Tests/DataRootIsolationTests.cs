@@ -60,6 +60,34 @@ public class DataRootIsolationTests
     }
 
     /// <summary>
+    /// The isolated root must leave room for a socket to be BOUND inside it, not merely to exist.
+    ///
+    /// <para>Without this the budget holds by accident. The default temp root comes to 105 characters on
+    /// Linux against a 108-byte <c>sun_path</c> — three characters of margin nobody chose — and on macOS
+    /// the per-user <c>/var/folders/&lt;..&gt;/T/</c> prefix blows straight past 104, which took out every
+    /// socket-binding test in this assembly at once. Neither failure names the data root: both surface as
+    /// <c>ArgumentOutOfRangeException</c> from <c>UnixDomainSocketEndPoint</c>, far from the code that
+    /// chose the path. Asserting the budget fails one test with the reason instead.</para>
+    ///
+    /// <para>This checks whatever root is actually in force, so a deliberately pinned
+    /// <c>MAINGUARD_DATA_ROOT</c> is held to the same limit.</para>
+    /// </summary>
+    [Fact]
+    public void The_isolated_root_leaves_room_to_bind_an_agent_ipc_socket()
+    {
+        var root = MainguardPaths.DataRoot();
+        var longest = Path.Combine(root, "agent-ipc", new string('a', 12), "daemon.sock");
+        var limit = TestDataRootIsolation.MaxUnixSocketPathLength;
+
+        Assert.True(
+            longest.Length <= limit,
+            $"The data root '{root}' leaves no room to bind an agent-IPC socket: the longest path the "
+            + $"daemon builds under it is {longest.Length} characters ('{longest}') and this platform's "
+            + $"sun_path holds {limit}. Every socket-binding test in this assembly would fail with an "
+            + "ArgumentOutOfRangeException that never mentions the root. See TestDataRootIsolation.");
+    }
+
+    /// <summary>
     /// The consumers that actually caused the damage. Every <c>DaemonHost.Resolve*</c> store path prefers
     /// sitting next to the (already temp-isolated) session token, and FALLS BACK to
     /// <see cref="MainguardPaths.DataRoot"/> when no token path is supplied. That fallback is what wrote

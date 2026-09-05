@@ -341,9 +341,17 @@
       nothing added here is `Button.Accent`, and the destructive action reads destructive by hue),
       `MergeQueueView` (P2-10: the merge-queue rail bound to the real `MergeQueueViewModel` — per-row
       Merge/Override, gate reason line; **harness-only** — constructed solely by
-      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (conversation + plan-approval card —
-      **retained for a possible future surface but no longer rendered**; since 2026-07-22 the coordinator
-      is driven from its inline terminal, not this bespoke GUI), `ReviewCockpitView` (P2-11: the review
+      `MergeQueueRenderHarness`, never by the app), `CoordinatorPanelView` (the coordinator
+      conversation — **retained for a possible future surface but no longer rendered**; since 2026-07-22
+      the coordinator is driven from its inline terminal, not this bespoke GUI. It no longer *defines* the
+      plan cards: it hosts `PlanGateView` like everyone else), `PlanGateView` (**the phase-2 plan gate,
+      the one definition of the approval card** — the daemon's backpressure sentence, the escalated
+      workers, and one Approve/Reject card per blocked worker with Scope + Approach + the feedback box.
+      Split out of `CoordinatorPanelView` because the coordinator conversation moved into a real PTY and a
+      PTY cannot render a button: the gate is a decision about a *worker*, taken out of band from whatever
+      the coordinator is saying, so it has to be hostable without the chat. **Mounted by
+      `ControlCenterView` above the coordinator's terminal** — the silence it explains is the silence in
+      that pane — collapsed entirely by `HasGateContent` when nothing is waiting), `ReviewCockpitView` (P2-11: the review
       cockpit — risk-ranked file/hunk list (ordering only, nothing hidden), per-hunk provenance chips, the
       pinned item-by-item flagged gate panel, the test-delta strip, footer Bring-local/Merge; bound to the
       real `ReviewCockpitViewModel`, **mounted in `ControlCenterView` as a dismissable overlay (P2-47
@@ -354,7 +362,8 @@
       composer/prompt queue), `TelemetryPanelView` (sandbox-health fact table; its trimmed Detail column
       carries a full-value tooltip — a blocked host you cannot read is a blocked host you cannot act on),
       `QueueSeedingPanelView` (the DEV-ONLY seeding card under the telemetry card in the right rail —
-      warning-hued "dev" pill, state/flavor/count pickers, hold + verify-fails, the preset buttons and
+      warning-hued "dev" pill, state/flavor/count pickers, hold + verify-fails, the preset buttons
+      (incl. "Plan-gated": one in-scope + one out-of-scope entry through the REAL plan pipeline) and
       the DangerQuiet Clear; the hosting `Border` in `ControlCenterView` is `IsVisible`-bound to
       `QueueSeeding` not-null, so a daemon without the seeding boot flag never shows a trace of it),
       `ResourceMonitorView` (the
@@ -640,16 +649,36 @@
     `ReviewCockpitContext.LockfileFlags` is **local-composition only** — production always supplies
     `live:`, so the §3.6 lockfile rows are armed daemon-side by
     `MergeQueueProvisioner.ReviewLockfiles` and arrive through the ordinary projection),
-    `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel` (P2-14 conversation + the
-    TaskPlan approval card; Approve is the panel's accent — **retained but no longer mounted on the
-    coordinator surface, which is the inline terminal now**), `AgentDocumentViewModel` +
+    `CoordinatorPanelViewModel`/`ChatLineViewModel`/`PlanCardViewModel`/`EscalatedPlanViewModel`
+    (the coordinator conversation + the **worker-authored** plan approval card; Approve is the panel's
+    accent. The conversation half is no longer mounted (the coordinator surface is the inline terminal
+    now), but the **plan-gate half is** — `ControlCenterView` binds this same VM into `PlanGateView`
+    above the coordinator's terminal, so `PendingPlans`/`EscalatedPlans`/`BackpressureText` are live
+    shipped state rather than harness-only state. `PendingPlans` is a **collection, one card per blocked
+    worker** (reconciled in place on `(PlanId, Revision)` so a refresh never eats half-typed feedback or a
+    just-raised error), with `PendingPlan` kept as its head; `HasGateContent` is what lets a host collapse
+    the whole region when nothing is waiting. **Phase 2** renders the three states the plan gate otherwise makes invisible: the card names
+    the worker that wrote the plan and says it is *blocked until you decide*; Reject carries a feedback
+    box, because that text is delivered back to the worker to revise against, plus the revision counter
+    against the daemon's budget and a warning when the next rejection would stop the worker rather than
+    produce another plan; an `EscalatedPlanViewModel` card has **deliberately no buttons** — the loop is
+    over and the next move is the human's; and `BackpressureText`/`IsCapSaturatedByBlockedWorkers` render
+    the daemon's stall line, since a coordinator that has quietly stopped spawning is indistinguishable
+    from a hang. Both decisions run through one `PlanCardViewModel.DecideAsync` that resets `IsDeciding` in
+    a `finally` and reports a failure in `DecisionErrorText`/`HasDecisionError`: this gate is *blocking*, so
+    a card that latched its buttons disabled — on a throw, or on a decision that returned while the plan
+    stayed pending with the same id/revision and `Refresh` therefore kept the same instance mounted — took
+    away the operator's only means of clearing backpressure. Built entirely from existing theme tokens — a
+    warning, a stop and a failure are things the design system already has words for), `AgentDocumentViewModel` +
     `PlanStepViewModel`/`QueuedPromptViewModel`/`FlaggedItemViewModel` (terminal tail, plan tree, health
     strip, composer + visible prompt queue, and the review section: item-by-item flagged acks gating the
     Merge button), `TelemetryPanelViewModel`/`SandboxEventRowViewModel` (P2-44 fact table, no accent),
     `QueueSeedingPanelViewModel` (the DEV-ONLY seeding card, docs/design/queue-seeding.md §6-7 — a thin
     driver over `IQueueSeedingGateway` whose scenario presets are CLIENT-side compositions of the RPC
     primitives ("Stale pair" is literally two specs in one ordered batch; "Merge during verify" holds
-    one entry mid-run while a sibling's real merge fires the real cascade); refusals render the
+    one entry mid-run while a sibling's real merge fires the real cascade; "Plan-gated" seeds both arms
+    of the phase-2 plan dimension — an approved scope that covers the seed's own commit, and one that
+    does not, blocking on the real out-of-approved-scope item); refusals render the
     daemon's words verbatim; `ControlCenterViewModel.QueueSeeding` stays null — card absent, not
     disabled — unless the daemon's one-shot `ProbeQueueSeedingAsync` availability probe answered yes,
     which a daemon without the boot flag never does),
@@ -924,7 +953,7 @@
     queue seeder — `IsAvailableAsync` (false, never a throw, for UNIMPLEMENTED/PermissionDenied: the
     unmapped service IS the visibility contract, no capability flag travels) + `SeedAsync`/
     `PushCommitsAsync`/`ClearAsync` over `SeedEntryRequestItem`/`SeedResultItem`/`SeedBatchResult`,
-    wire vocabulary verbatim. Built via `DaemonBackedOrchestrator.CreateQueueSeedingGateway()` — the
+    wire vocabulary verbatim (incl. the plan dimension's `WithPlan`/`Scope`). Built via `DaemonBackedOrchestrator.CreateQueueSeedingGateway()` — the
     same factory shape as the intake/egress gateways — with the repo handle read LIVE so the panel
     always seeds the repo the rail is showing.)
   - `IPrIntakeGateway.cs` (P2-12: the App's seam to the **daemon-owned** external-PR-intake
@@ -975,7 +1004,17 @@
     `ListAgents()`, and routes `EndAgentAsync`→`StopAgent`; construction never blocks on the daemon. It
     is NOT a mock — surfaces whose gRPC contract does not exist yet (merge-queue projection, coordinator
     conversation, kill switch, telemetry, Vibe) return empty/neutral state with a marked
-    `P2-47 residual` and light up as their RPCs are added. `CreateBundle()` is the shipped-app factory
+    `P2-47 residual` and light up as their RPCs are added. **Phase 2:** `ApplyPlanUpdate` also keeps
+    **escalated** plans in the projection (a worker that stopped after spending its revision budget is
+    the state that most needs a human and would otherwise vanish from the surface), exposes
+    `GetWorkerPlans()`/`GetBackpressure()`, and carries the daemon's backpressure numbers verbatim rather
+    than re-deriving them — a client-side count can disagree with the number that actually refuses the
+    coordinator. `SubmitPlanDecisionAsync`'s rejection reason is now the worker's feedback; an empty one
+    is sent as an explicit "rejected without written feedback" rather than a silent blank, because it
+    costs a round of the revision budget either way — and it **propagates a failure** instead of the
+    blanket `catch (Exception) {}` it used to end in: that swallow made a decision which never reached the
+    daemon indistinguishable from one that landed, so the panel could not tell the human their approval was
+    lost while the worker stayed blocked. `CreateBundle()` is the shipped-app factory
     (`OrchestratorServices` over a loopback `DaemonClient`). **PR3:** it also implements `ICliAgentHost`
     — `ListInstalledClisAsync` (the `ListInstalledAdapters` RPC), `StartCoordinatorAsync` (keystore key
     resolved via `ApiKeyProviderMap` from the adapter's declared env-var name — no provider mapping

@@ -100,6 +100,53 @@ public class SwarmReconcilerTests
         Assert.Contains(lines, l => l.Contains("swarm reconcile", StringComparison.Ordinal));
     }
 
+    /// <summary>
+    /// The boot pass must honour the same switch the periodic session reconciler does.
+    ///
+    /// <para>It did not, and the exposure was real rather than theoretical: the container engine is
+    /// machine-wide, so an in-proc test daemon on an isolated data root still sees a developer's live
+    /// jails. <c>Mainguard.Server.Tests</c>' module initializer set the variable expecting it to hold for
+    /// the whole assembly; the boot pass ignored it, adopted two of the developer's real containers and
+    /// wrote them into the test audit log by name. The pruning direction of the same pass force-removes
+    /// worktrees, so this is what stood between a test run and someone's overnight work.</para>
+    ///
+    /// <para>The setup deliberately has agents to prune: a disabled pass that merely found nothing would
+    /// pass a weaker assertion, so the test only holds if the pass genuinely did not run.</para>
+    /// </summary>
+    [Fact]
+    public async Task BootStep_HonoursTheDisableSwitch_AndDoesNotTouchTheEngine()
+    {
+        var expected = new InMemoryExpectedAgentStore();
+        expected.Upsert("repo1", "someones-live-agent", "Live");
+        var worktrees = new FakeWorktreeManager();
+        var audit = new InMemoryAuditLog();
+        var lines = new List<string>();
+
+        var task = new SwarmReconcileTask(
+            new SwarmReconciler(
+                _ => throw new InvalidOperationException(
+                    "the disabled boot pass reached the container engine"),
+                expected,
+                worktrees),
+            audit,
+            lines.Add);
+
+        var previous = Environment.GetEnvironmentVariable(SwarmReconcileTask.DisableVariable);
+        Environment.SetEnvironmentVariable(SwarmReconcileTask.DisableVariable, "1");
+        try
+        {
+            await task.RunAsync(CancellationToken.None);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(SwarmReconcileTask.DisableVariable, previous);
+        }
+
+        Assert.Null(task.LastReport);
+        Assert.DoesNotContain(audit.Read(), e => e.Type == SwarmReconcileTask.ReconciledEvent);
+        Assert.Contains(lines, l => l.Contains("disabled", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task DeadContainer_IsPrunedAndMarkedDead_LiveAgentsRetained()
     {

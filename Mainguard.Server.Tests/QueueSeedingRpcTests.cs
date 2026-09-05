@@ -103,6 +103,59 @@ public sealed class QueueSeedingRpcTests
         Assert.False(can.CanMerge);
     }
 
+    /// <summary>
+    /// The plan dimension over the WIRE (design §9): <c>with_plan</c> and <c>scope</c> reach the daemon's
+    /// real plan pipeline, so a plan-gated seed whose approved scope covers its own commit merges, and a
+    /// sibling whose scope does not is blocked by the SHIPPED CanMerge — the SA-1/F6 out-of-approved-scope
+    /// arm, exercised with no agent, no jail and no tokens.
+    /// </summary>
+    [Fact]
+    public async Task WithPlan_DrivesTheRealPlanPipeline_AndScopeArmsTheRealOutOfScopeBlock_OverTheWire()
+    {
+        using var repos = new TempRepos();
+        using var host = NewSeedingHost(repos.VmRoot);
+        var (seeding, merge, sync, headers) = NewClients(host);
+        var repoHandle = (await sync.ProvisionRepoAsync(
+            new ProvisionRepoRequest { OriginUrl = repos.Source }, headers)).RepoHandle;
+
+        var response = await seeding.SeedQueueEntriesAsync(new SeedQueueEntriesRequest
+        {
+            RepoHandle = repoHandle,
+            Entries =
+            {
+                // No scope named ⇒ the seed's own path ⇒ in scope.
+                new SeedEntrySpec { TargetState = "Verified", WithPlan = true },
+                // A scope covering something else entirely ⇒ the branch reaches outside it.
+                new SeedEntrySpec { TargetState = "Verified", WithPlan = true, Scope = { "docs/" } },
+            },
+        }, headers, deadline: DateTime.UtcNow + Timeout);
+
+        Assert.All(response.Results, r => Assert.Equal("", r.Refusal));
+        Assert.All(response.Results, r => Assert.Equal("Verified", r.ReachedState));
+
+        // Both plans are REAL records with real approvals — presented and approved through the same
+        // service the human's approval card drives — and both say of themselves that no worker wrote them.
+        var plans = host.Services
+            .GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>();
+        foreach (var result in response.Results)
+        {
+            var plan = plans.LatestForWorker(result.AgentId);
+            Assert.NotNull(plan);
+            Assert.Equal(Mainguard.Agents.Agents.Orchestrator.PlanStatus.Approved, plan!.Status);
+            Assert.Contains(
+                Mainguard.Agents.Agents.Orchestrator.QueueSeeder.SeededPlanMarker, plan.Plan.Approach);
+        }
+
+        // ...and the shipped gate decides the two differently, because their approved scopes differ.
+        var inScope = await merge.CanMergeAsync(
+            new CanMergeRequest { RepoHandle = repoHandle, AgentId = response.Results[0].AgentId }, headers);
+        Assert.True(inScope.CanMerge, inScope.Reason);
+
+        var outOfScope = await merge.CanMergeAsync(
+            new CanMergeRequest { RepoHandle = repoHandle, AgentId = response.Results[1].AgentId }, headers);
+        Assert.False(outOfScope.CanMerge);
+    }
+
     [Fact]
     public async Task PushCommits_InvalidatesAVerifiedSeed_OverTheWire()
     {

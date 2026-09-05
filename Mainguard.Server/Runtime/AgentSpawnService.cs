@@ -63,24 +63,31 @@ public sealed class AgentSpawnRefusedException : Exception
 /// <summary>
 /// The ONE spawn/stop workflow behind both entry points — <c>AgentService.SpawnAgent</c> (the
 /// operator/UI path) and the coordinator's in-jail <c>mainguard-agent</c> shim (the
-/// <see cref="CoordinatorIpcServer"/> path) — so a coordinator-spawned worker takes exactly the
-/// same chain as an RPC spawn: session record → (coordinator only: IPC endpoint) → worktree +
-/// hardened jail (<see cref="SandboxAgentLauncher"/>) → CLI under a real TTY
+/// <see cref="AgentIpcServer"/> path) — so a coordinator-spawned worker takes exactly the
+/// same chain as an RPC spawn: session record → IPC endpoint (spawn shim for a coordinator, plan shim
+/// for a worker) → worktree + hardened jail (<see cref="SandboxAgentLauncher"/>) → CLI under a real TTY
 /// (<see cref="AgentCliBinder"/>) → (managed only: terminal input lock, P2-14). Kept out of the
 /// gRPC class per the P2-02 rejection trigger (no business logic in transports).
+///
+/// <para><b>Phase 2.</b> A coordinator's shim spawn no longer carries the worker's task into the jail: the
+/// prompt is handed to <see cref="Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate"/>, which withholds
+/// it until the worker's own plan is approved. The worker's endpoint serves the plan-gate ops
+/// (<c>brief</c> / <c>present_plan</c> / <c>revise_plan</c> / <c>await_decision</c>) and nothing else.</para>
 /// </summary>
 public sealed class AgentSpawnService
 {
     private readonly AgentSessionStore _store;
     private readonly SandboxAgentLauncher _launcher;
     private readonly AgentCliBinder _binder;
-    private readonly CoordinatorIpcServer _ipc;
+    private readonly AgentIpcServer _ipc;
     private readonly SessionKeyCache _keys;
     private readonly TerminalLockRegistry _locks;
     private readonly KillSwitchGate _killGate;
     private readonly AdmissionController _admission;
     private readonly Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits _limits;
     private readonly Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner _mergeQueues;
+    private readonly Mainguard.Agents.Agents.Orchestrator.PlanApprovalService _plans;
+    private readonly Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate _planGate;
     private readonly IAuditLog _audit;
     private readonly Gateway.AgentGatewayCredentials _gatewayCredentials;
     private readonly ILogger _spawnLog;
@@ -90,13 +97,15 @@ public sealed class AgentSpawnService
         AgentSessionStore store,
         SandboxAgentLauncher launcher,
         AgentCliBinder binder,
-        CoordinatorIpcServer ipc,
+        AgentIpcServer ipc,
         SessionKeyCache keys,
         TerminalLockRegistry locks,
         KillSwitchGate killGate,
         AdmissionController admission,
         Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits limits,
         Mainguard.Agents.Agents.Orchestrator.MergeQueueProvisioner mergeQueues,
+        Mainguard.Agents.Agents.Orchestrator.PlanApprovalService plans,
+        Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate planGate,
         IAuditLog audit,
         Gateway.AgentGatewayCredentials gatewayCredentials,
         ILoggerFactory loggerFactory)
@@ -111,6 +120,8 @@ public sealed class AgentSpawnService
         _admission = admission;
         _limits = limits;
         _mergeQueues = mergeQueues;
+        _plans = plans;
+        _planGate = planGate;
         _audit = audit;
         // MG-4. Required, not optional: this is the only thing that revokes a stopped agent's gateway
         // token and drops the daemon's custody of its provider key. Registered unconditionally by
@@ -165,6 +176,9 @@ public sealed class AgentSpawnService
         string? agentId = null,
         Mainguard.Agents.Agents.MergeEntryOrigin queueOrigin = Mainguard.Agents.Agents.MergeEntryOrigin.Local,
         bool withoutHostCredentials = false,
+        string? heldTaskTitle = null,
+        string? heldTaskPrompt = null,
+        decimal heldBudgetUsd = 0m,
         bool adoptExistingBranch = false,
         IReadOnlyList<Mainguard.Agents.Agents.Sandbox.SandboxSettingsFile>? cliSettings = null)
     {
@@ -220,6 +234,16 @@ public sealed class AgentSpawnService
         var session = _store.Spawn(agentKind, role, parentAgentId, agentId, repoHandle);
         var key = session.Key;
 
+        // Phase 2 — withhold the task BEFORE the jail exists. Holding it after the spawn returned would
+        // leave a window in which the worker's own plan shim could ask for its brief and be told the
+        // session was unknown; more importantly, the gate must be armed before anything inside the jail
+        // can run, or "the daemon holds the task" is only true most of the time.
+        var planGated = heldTaskTitle is not null || heldTaskPrompt is not null;
+        if (planGated)
+        {
+            _planGate.Hold(session.Id, parentAgentId ?? "", heldTaskTitle ?? "Untitled task", heldTaskPrompt ?? "", heldBudgetUsd);
+        }
+
         // Correlation: every Spawn/Egress/Terminal line for this agent shares its id — the scope
         // renders as (agentId) in the file format, so one grep follows the whole chain.
         using var scope = _spawnLog.BeginScope(session.Id);
@@ -231,22 +255,42 @@ public sealed class AgentSpawnService
         string? ipcDir = null;
         try
         {
-            if (role == AgentRoles.Coordinator)
+            if (role == AgentRoles.Coordinator || planGated)
             {
                 // The endpoint is a container mount source, so it must exist before the jail does.
-                // Best-effort: a box where the Unix socket cannot bind still gets a working
-                // coordinator (terminal + jail), just without the in-jail spawn tool — audited.
+                // Best-effort: a box where the Unix socket cannot bind still gets a working agent
+                // (terminal + jail), just without its in-jail tool — audited.
+                //
+                // A coordinator gets the spawn shim; a PLAN-GATED worker gets the plan shim (phase 2).
+                // The role is fixed on the endpoint, so a worker cannot reach a spawn op and a
+                // coordinator cannot reach a plan op, whatever either sends.
+                //
+                // Least privilege, deliberately: a Managed session the plan gate is NOT holding gets no
+                // channel at all. That is every external-PR head (untrusted code from outside this
+                // machine) and every manually spawned worker — neither is governed by the plan gate, and
+                // handing an untrusted head a socket that queues cards in front of the human would be a
+                // capability granted for no reason.
+                var endpointRole = role == AgentRoles.Coordinator
+                    ? Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Coordinator
+                    : Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Worker;
                 try
                 {
-                    ipcDir = _ipc.CreateEndpoint(session.Id, HandleShimRequestAsync);
-                    _coordLog.LogInformation("coordinator IPC endpoint created: {Dir}", ipcDir);
+                    ipcDir = _ipc.CreateEndpoint(
+                        session.Id,
+                        endpointRole == Mainguard.Agents.Agents.Ipc.AgentIpcEndpointRole.Coordinator
+                            ? HandleShimRequestAsync
+                            : HandleWorkerPlanRequestAsync,
+                        endpointRole);
+                    _coordLog.LogInformation(
+                        "{Role} IPC endpoint created: {Dir}", endpointRole, ipcDir);
                 }
                 catch (Exception ex)
                 {
-                    _coordLog.LogWarning(ex, "coordinator IPC endpoint failed — degrading to no spawn-shim");
+                    _coordLog.LogWarning(ex, "{Role} IPC endpoint failed — degrading to no shim", endpointRole);
                     _audit.Append(new AuditEvent("ipc_endpoint_failed", new Dictionary<string, string>
                     {
                         ["agent_id"] = session.Id,
+                        ["role"] = endpointRole.ToString(),
                         ["reason"] = ex.Message,
                     }));
                 }
@@ -351,6 +395,9 @@ public sealed class AgentSpawnService
                 }
 
                 _locks.Unlock(session.Id);
+                // A spawn that failed leaves no held task behind: the id names nothing now, and a stale
+                // hold would keep counting toward the backpressure the operator is asked to act on.
+                _planGate.Forget(session.Id);
             }
 
             throw;
@@ -467,6 +514,9 @@ public sealed class AgentSpawnService
             _binder.ReleaseLeader(agentId);
             _ipc.CloseEndpoint(agentId);
             _locks.Unlock(agentId);
+            // The withheld task dies with the worker: nothing should be releasable to an id that no
+            // longer names a session (and the gate must not grow for the daemon's lifetime).
+            _planGate.Forget(agentId);
 
             // MG-4: drop this agent's gateway token AND the daemon's custody of its provider key.
             // `Revoke` had no production callers at all — the spawn path minted a credential on every
@@ -570,8 +620,15 @@ public sealed class AgentSpawnService
                 // (repo, id) key — List() still returns one entry per session. It is now strictly more
                 // accurate: a second repo's `pr-7` is a real session that consumes a slot, where before it
                 // could not be recorded at all and so was invisible to the cap.
+                //
+                // Phase 2: a worker blocked on plan approval is a live Managed session, so it is already
+                // inside this count — which is exactly the decided behaviour (the cap is a RESOURCE cap and
+                // a blocked worker still holds its jail). What was missing is legibility: a coordinator
+                // refused here used to be told only "let one finish", which is wrong and unactionable when
+                // the truth is "six plans are sitting in front of you".
                 var activeManaged = _store.List().Count(s => s.Role == AgentRoles.Managed);
-                var refusal = CoordinatorSpawnGate.Evaluate(activeManaged, _limits.MaxActiveWorkers, _admission);
+                var refusal = CoordinatorSpawnGate.Evaluate(
+                    activeManaged, _limits.MaxActiveWorkers, _admission, _planGate);
                 if (refusal is not null)
                 {
                     _coordLog.LogWarning(
@@ -581,6 +638,7 @@ public sealed class AgentSpawnService
                         ["coordinator_id"] = coordinatorAgentId,
                         ["active_managed"] = activeManaged.ToString(),
                         ["max_active_workers"] = _limits.MaxActiveWorkers.ToString(),
+                        ["blocked_on_plan_approval"] = _planGate.BlockedWorkerCount.ToString(),
                         ["reason"] = refusal,
                     }));
                     return new AgentIpcResponse(Ok: false, Error: refusal);
@@ -588,11 +646,22 @@ public sealed class AgentSpawnService
 
                 try
                 {
+                    // The task the coordinator described goes to the plan gate, NOT into the jail. Before
+                    // phase 2 this field was parsed off the wire and then silently dropped — the worker
+                    // never received the task at all. It now has a home, and a gate: the daemon hands it
+                    // over only once a human has approved the worker's own plan.
                     var agentId = await SpawnAsync(
                         repoHandle, request.AgentKind, _keys.TryGet(repoHandle, request.AgentKind),
                         AgentRoles.Managed, ct, _keys.TryGetExtraEnv(repoHandle),
-                        parentAgentId: coordinatorAgentId).ConfigureAwait(false);
-                    return new AgentIpcResponse(Ok: true, AgentId: agentId);
+                        parentAgentId: coordinatorAgentId,
+                        heldTaskTitle: request.Title ?? request.TaskPrompt ?? "Untitled task",
+                        heldTaskPrompt: request.TaskPrompt ?? "").ConfigureAwait(false);
+
+                    return new AgentIpcResponse(
+                        Ok: true,
+                        AgentId: agentId,
+                        Status: "AwaitingPlan",
+                        Error: null);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -602,8 +671,9 @@ public sealed class AgentSpawnService
             case AgentIpcRequest.ListOp:
                 // MG-37: this returned EVERY session on the daemon — a coordinator could enumerate other
                 // coordinators' workers (and other repos' agents) through its own jail's IPC socket.
-                // Scope it to the sessions this coordinator actually spawned. Only coordinators get an IPC
-                // endpoint, so managed workers never spawn and "children" is the full descendant set.
+                // Scope it to the sessions this coordinator actually spawned. A worker's endpoint serves
+                // only the plan ops (phase 2), so a worker still cannot spawn anything and "children"
+                // remains the full descendant set.
                 var agents = _store.List()
                     .Where(s => string.Equals(s.ParentAgentId, coordinatorAgentId, StringComparison.Ordinal))
                     .Select(s => $"{s.Id}\t{s.Kind}\t{s.State}\t{s.Role}")
@@ -613,6 +683,231 @@ public sealed class AgentSpawnService
             default:
                 return new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'");
         }
+    }
+
+    /// <summary>
+    /// The <b>worker</b> plan shim's request handler — the daemon side of the phase-2 plan gate
+    /// (coordinator contract §2).
+    ///
+    /// <para>Identity is positional (only that worker's jail has this socket), so a worker can only ever
+    /// present, revise or await <i>its own</i> plan; there is no agent-id field on the wire to forge. The
+    /// endpoint's role is fixed at creation, so the coordinator ops are not reachable here at all — a
+    /// worker that sends <c>{"op":"spawn"}</c> gets "unknown op", not a worker.</para>
+    ///
+    /// <para><b>The block lives here.</b> <c>present_plan</c> and <c>revise_plan</c> do not return when the
+    /// plan is queued — they return when a human decides. On approval the response carries the task prompt
+    /// the daemon has been withholding since the spawn. That is what makes "the worker does not start work
+    /// until its plan is approved" a property of the system rather than a request in a prompt.</para>
+    /// </summary>
+    internal async Task<AgentIpcResponse> HandleWorkerPlanRequestAsync(
+        AgentIpcRequest request, string workerAgentId, CancellationToken ct)
+    {
+        _coordLog.LogInformation(
+            "plan-shim request: op={Op} from worker={Worker}", request.Op, workerAgentId);
+
+        // One method per op. Each plan-gate op has real branching, and a braced `case { … }` block is
+        // both harder to read and (per .editorconfig) indented two levels deeper than the code around it.
+        // The switch stays a routing table.
+        return request.Op switch
+        {
+            AgentIpcRequest.BriefOp => Brief(workerAgentId),
+            AgentIpcRequest.PresentPlanOp => await PresentPlanAsync(request, workerAgentId, ct).ConfigureAwait(false),
+            AgentIpcRequest.RevisePlanOp => await RevisePlanAsync(request, workerAgentId, ct).ConfigureAwait(false),
+            AgentIpcRequest.AwaitDecisionOp => await AwaitDecisionAsync(request, workerAgentId, ct).ConfigureAwait(false),
+            _ => new AgentIpcResponse(Ok: false, Error: $"unknown op '{request.Op}'"),
+        };
+    }
+
+    /// <summary>What am I here to plan? The brief and the live plan's state — never the task prompt.</summary>
+    private AgentIpcResponse Brief(string workerAgentId)
+    {
+        var brief = _planGate.PlanningBriefFor(workerAgentId);
+        if (brief is null)
+        {
+            return new AgentIpcResponse(Ok: false, Error: "this worker session is no longer live");
+        }
+
+        var live = _plans.LiveForWorker(workerAgentId);
+        return new AgentIpcResponse(
+            Ok: true,
+            Brief: brief,
+            PlanId: live?.PlanId,
+            Status: live?.Status.ToString(),
+            Feedback: live?.RejectionFeedback,
+            Revision: live?.RevisionCount,
+            MaxRevisions: _plans.MaxPlanRevisions);
+    }
+
+    /// <summary>The worker presents the plan it authored — then blocks here until a human decides.</summary>
+    private async Task<AgentIpcResponse> PresentPlanAsync(
+        AgentIpcRequest request, string workerAgentId, CancellationToken ct)
+    {
+        if (!TryValidatePlan(request.PlanJson, out var fields, out var invalid))
+        {
+            return invalid;
+        }
+
+        var presentation = _plans.Present(
+            workerAgentId,
+            _planGate.CoordinatorFor(workerAgentId) ?? _store.Find(workerAgentId)?.ParentAgentId ?? "",
+            request.Title ?? _planGate.PlanningBriefFor(workerAgentId) ?? "Untitled plan",
+            fields!,
+            taskPrompt: string.Empty, // the task lives in the gate, never in the plan record
+            budgetUsd: _planGate.BudgetFor(workerAgentId));
+
+        if (!presentation.IsPresented)
+        {
+            return new AgentIpcResponse(Ok: false, Error: presentation.Message, PlanId: presentation.PlanId);
+        }
+
+        return await BlockForDecisionAsync(workerAgentId, presentation.PlanId!, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>The worker re-presents a plan revised against the human's feedback — and blocks again.</summary>
+    private async Task<AgentIpcResponse> RevisePlanAsync(
+        AgentIpcRequest request, string workerAgentId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.PlanId))
+        {
+            return new AgentIpcResponse(Ok: false, Error: "a plan id is required (mainguard-plan revise <id> <plan.json>)");
+        }
+
+        if (!OwnsPlan(workerAgentId, request.PlanId, out var ownershipError))
+        {
+            return ownershipError;
+        }
+
+        if (!TryValidatePlan(request.PlanJson, out var fields, out var invalid))
+        {
+            return invalid;
+        }
+
+        var revision = _plans.Revise(
+            request.PlanId,
+            request.Title ?? _planGate.PlanningBriefFor(workerAgentId) ?? "Untitled plan",
+            fields!);
+
+        if (revision.Outcome == Mainguard.Agents.Agents.Orchestrator.PlanRevisionOutcome.Escalated)
+        {
+            return DecisionResponse(workerAgentId, request.PlanId, revision.Plan, revision.Message);
+        }
+
+        if (!revision.IsRevised)
+        {
+            return new AgentIpcResponse(Ok: false, Error: revision.Message, PlanId: request.PlanId);
+        }
+
+        return await BlockForDecisionAsync(workerAgentId, request.PlanId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Re-attach after a crash or a daemon restart: block on an already-presented plan.</summary>
+    private async Task<AgentIpcResponse> AwaitDecisionAsync(
+        AgentIpcRequest request, string workerAgentId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.PlanId))
+        {
+            return new AgentIpcResponse(Ok: false, Error: "a plan id is required (mainguard-plan await <id>)");
+        }
+
+        if (!OwnsPlan(workerAgentId, request.PlanId, out var ownershipError))
+        {
+            return ownershipError;
+        }
+
+        return await BlockForDecisionAsync(workerAgentId, request.PlanId, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>Parks the connection until the human decides, then answers with the decision.</summary>
+    private async Task<AgentIpcResponse> BlockForDecisionAsync(string workerAgentId, string planId, CancellationToken ct)
+    {
+        Mainguard.Agents.Agents.Orchestrator.PlanDecision decision;
+        try
+        {
+            decision = await _plans.AwaitDecisionAsync(planId, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Daemon shutting down, or the worker went away. The plan stays pending; a re-attached worker
+            // picks the decision back up with `mainguard-plan await <id>` — nothing is lost.
+            return new AgentIpcResponse(Ok: false, Error: "the daemon is shutting down — re-await this plan", PlanId: planId);
+        }
+
+        var plan = _plans.Get(planId);
+        var response = DecisionResponse(workerAgentId, planId, plan, message: null);
+
+        // Ask the gate on EVERY decision, not only on an approval, and let it decide.
+        //
+        // The obvious shape here is `if (decision.Approved) { release }`. That was the first cut, and
+        // mutation testing rejected it: with the rule written down in two places, breaking the gate's own
+        // check changed nothing observable through this channel — the `if` was quietly doing the work,
+        // and the gate's check was never reached by anything a test could see. Two copies of a policy is
+        // how one of them becomes decorative (MG-12). One authority, always consulted, is the version
+        // whose failure is visible.
+        var released = _planGate.TryReleaseTask(workerAgentId, out var taskPrompt);
+        return response with { TaskPrompt = released ? taskPrompt : string.Empty };
+    }
+
+    private AgentIpcResponse DecisionResponse(
+        string workerAgentId,
+        string planId,
+        Mainguard.Agents.Agents.Orchestrator.PendingPlan? plan,
+        string? message) =>
+        new(Ok: true,
+            AgentId: workerAgentId,
+            Error: null,
+            PlanId: planId,
+            Status: plan?.Status.ToString() ?? "Unknown",
+            Feedback: message ?? plan?.RejectionFeedback,
+            Revision: plan?.RevisionCount ?? 0,
+            RevisionsRemaining: Math.Max(0, _plans.MaxPlanRevisions - (plan?.RevisionCount ?? 0)),
+            MaxRevisions: _plans.MaxPlanRevisions);
+
+    /// <summary>A worker may only act on a plan it authored — checked daemon-side, not assumed.</summary>
+    private bool OwnsPlan(string workerAgentId, string planId, out AgentIpcResponse error)
+    {
+        var plan = _plans.Get(planId);
+        if (plan is null)
+        {
+            error = new AgentIpcResponse(Ok: false, Error: $"no plan '{planId}'");
+            return false;
+        }
+
+        if (!string.Equals(plan.WorkerAgentId, workerAgentId, StringComparison.Ordinal))
+        {
+            _audit.Append(new AuditEvent("plan_ownership_denied", new Dictionary<string, string>
+            {
+                ["plan_id"] = planId,
+                ["requesting_worker"] = workerAgentId,
+                ["owning_worker"] = plan.WorkerAgentId,
+            }));
+            error = new AgentIpcResponse(Ok: false, Error: $"no plan '{planId}'"); // no existence oracle
+            return false;
+        }
+
+        error = null!;
+        return true;
+    }
+
+    /// <summary>Validates the worker's plan against the shared schema before it reaches a human.</summary>
+    private static bool TryValidatePlan(
+        string? planJson,
+        out Mainguard.Agents.Agents.Orchestrator.TaskPlanFields? fields,
+        out AgentIpcResponse error)
+    {
+        var validation = Mainguard.Agents.Agents.Orchestrator.TaskPlanSchema.Validate(planJson);
+        if (!validation.IsValid)
+        {
+            fields = null;
+            error = new AgentIpcResponse(
+                Ok: false,
+                Error: "the plan does not satisfy the plan schema",
+                PlanErrors: validation.Errors.ToArray());
+            return false;
+        }
+
+        fields = validation.Fields;
+        error = null!;
+        return true;
     }
 
     /// <summary>An <see cref="IProgress{T}"/> that invokes on the reporting thread. <see cref="Progress{T}"/>

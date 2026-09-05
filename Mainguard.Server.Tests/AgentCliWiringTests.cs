@@ -322,9 +322,9 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
 
         // The endpoint dir exists (it was the jail's mount source) with the shim + socket, and the
         // jail spec carried it read-only at the fixed mount point.
-        var ipc = rig.Host.Services.GetRequiredService<CoordinatorIpcServer>();
+        var ipc = rig.Host.Services.GetRequiredService<AgentIpcServer>();
         var dir = ipc.DirFor(coordinator.AgentId);
-        Assert.True(File.Exists(Path.Combine(dir, Mainguard.Agents.Agents.Ipc.AgentIpcPaths.ShimFileName)));
+        Assert.True(File.Exists(Path.Combine(dir, Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SpawnShimFileName)));
         Assert.True(File.Exists(Path.Combine(dir, Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SocketFileName)));
         Assert.Equal(dir, rig.Engine.Requests.Single().IpcDirPath);
 
@@ -377,9 +377,9 @@ public sealed class AgentCliWiringTests : IClassFixture<DaemonFixture>
             Role = AgentRoles.Coordinator,
         }, rig.Auth);
 
-        var ipc = rig.Host.Services.GetRequiredService<CoordinatorIpcServer>();
+        var ipc = rig.Host.Services.GetRequiredService<AgentIpcServer>();
         var dir = ipc.DirFor(coordinator.AgentId);
-        var shim = Path.Combine(dir, Mainguard.Agents.Agents.Ipc.AgentIpcPaths.ShimFileName);
+        var shim = Path.Combine(dir, Mainguard.Agents.Agents.Ipc.AgentIpcPaths.SpawnShimFileName);
 
         // Run the REAL shim the daemon wrote, exactly as a coordinator CLI would (socket path
         // overridden to the host-side dir — inside a jail the fixed mount path is the default).

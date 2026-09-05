@@ -40,8 +40,19 @@ install lives in the VM at `/home/mainguard/mainguard/toolchains`, so it survive
 `$env:MAINGUARD_DATA_ROOT` and you only do it once across all three phases.
 
 **Where everything below happens:** left rail → **Coordinator**. Its tooltip reads *"Coordinator —
-plan approvals, chat, and the merge queue"*. The panel header says *"The Coordinator plans and
-delegates — it never touches code or merges."*
+plan approvals, chat, and the merge queue"*.
+
+You talk to the coordinator in its **terminal** — the big pane in the middle, the real CLI in its own
+sandbox. The **plan gate sits directly above that terminal**, between the Start/Stop toolbar and the
+terminal itself, and it is **not there when nothing is waiting**. It appears when a worker presents a
+plan, when a worker escalates, or when the daemon reports backpressure — and it collapses again once
+you have cleared everything, so if you see no gate, nothing is waiting on you.
+
+It is above the terminal on purpose: the thing the gate exists to explain is a *silence in that
+terminal*. When blocked workers fill the worker cap the coordinator stops spawning, and the pane you
+are staring at goes quiet with no explanation. The decision and the reason for the silence belong in
+the same field of view. (The merge queue on the right is the wrong home for it — that rail is work
+already finished, and approval is the gate *before* work starts.)
 
 ---
 
@@ -129,15 +140,20 @@ them" is wrong: the cap is a *resource* cap and a blocked worker still holds its
 network segment and worktree. Exempting them lets the coordinator spawn unboundedly many
 resource-consuming workers exactly when you're too busy to approve.
 
-**Specifically check the stall is legible.** A silent stall is indistinguishable from a hang. The
-panel shows a pressure line — but note two things I'd want your opinion on:
+**Specifically check the stall is legible.** A silent stall is indistinguishable from a hang. At the
+top of the gate you should get a bordered banner reading *"The coordinator has stopped spawning — it
+is waiting on you"* over the daemon's own sentence, e.g. *"6 workers are waiting on your approval.
+The worker cap (6/6) is full — the coordinator has stopped spawning until you clear plans."* That
+sentence is **carried from the daemon, not recomputed in the UI**, deliberately: the number that
+refuses the coordinator its next spawn and the number you read have to be the same number.
 
-- it appears only at **3 or more** pending plans, so with 1–2 waiting you get nothing;
-- it reads *"N plans pending — the oldest has waited M min"*, whereas the contract's wording was
-  *"6 workers waiting on your approval"*. Plans pending and workers blocked aren't the same count
-  if a worker can be blocked without a presented plan.
+Below it there is a second, quieter line — *"N plans pending — the oldest has waited M min"* — which
+only appears at **3 or more**. That one is the ageing line, not the stall line; it is fine for it to
+stay quiet at 1–2 because the cards themselves are right there. Say if you disagree.
 
-Decide whether that's what you want. It's a deliberate wording, not an accident.
+**And check you can actually clear it.** With six workers blocked you should get **six cards**, each
+with its own Scope, its own worker name and its own Approve/Reject — not one card for the head of the
+queue. Five unreachable decisions holding the cap shut would be the same stall with extra steps.
 
 ---
 

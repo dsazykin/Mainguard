@@ -97,10 +97,14 @@ public class ApproverIdentityDaemonDerivedTests
             services.AddSingleton<IApproverIdentityResolver>(new FakeIdentityResolver("peer-uid-1000"));
         }));
 
-        // Draft a pending plan directly on the daemon's service (the coordinator's spawn_worker lands here).
+        // Present a plan directly on the daemon's service (where a worker's plan shim lands it). The
+        // worker id is unique per run: the whole assembly shares one test data root (and therefore one
+        // restart-safe plan store), so a literal id shared with another test trips the daemon's
+        // one-live-plan-per-worker invariant.
         var svc = isolated.Services.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>();
         var fields = new Mainguard.Agents.Agents.Orchestrator.TaskPlanFields(new[] { "src/a.cs" }, "approach", "tests");
-        var draft = svc.Draft("coord-1", "Refactor", fields, "prompt", 1.5m);
+        var draft = svc.Present("worker-" + Guid.NewGuid().ToString("N")[..8], "coord-1", "Refactor", fields, "prompt", 1.5m);
+        Assert.True(draft.IsPresented, draft.Message);
 
         var token = isolated.Services.GetRequiredService<SessionTokenFile>().Token;
         var headers = new Metadata { { "authorization", $"bearer {token}" } };

@@ -44,13 +44,25 @@ public interface ICoordinatorModel
 /// </summary>
 public sealed class CoordinatorAgent
 {
-    /// <summary>The system prompt that states the trust model to the model itself.</summary>
+    /// <summary>
+    /// The system prompt that states the trust model to the model itself.
+    ///
+    /// <para>It <b>describes</b> the boundaries; it does not create them. Every limit named here is
+    /// enforced daemon-side and has a test that fails when the check is removed (contract §5). If this
+    /// string and the daemon ever disagree, the daemon wins and the string is the bug.</para>
+    /// </summary>
     public const string SystemPrompt =
-        "You are the Mainguard Coordinator. You plan and delegate; you never write code, touch a worktree, " +
-        "or merge. Decompose the operator's request into independent tasks and draft a TaskPlan " +
-        "(scope files, approach, test strategy) per task via spawn_worker — a human approves each plan " +
-        "before any worker starts. Use get_worker_status, send_worker_prompt, and request_verification " +
-        "to steer. Serialize dependent tasks; parallelize independent ones.";
+        "You are the Mainguard Coordinator. You plan the shape of the work and delegate it; you never " +
+        "write code, touch a worktree, or merge. Decompose the operator's request into independent tasks " +
+        "and start one worker per task via spawn_worker(title, task_prompt, budget_usd) — no human " +
+        "approval is needed to spawn, only the caps. You do NOT write task plans: each worker inspects " +
+        "the repository, authors its own plan, presents it to the human and blocks until it is approved, " +
+        "so do not describe scope, approach or test strategy yourself — you cannot see the code. " +
+        "A worker waiting on plan approval still occupies a worker slot, so if spawn_worker is refused " +
+        "for the worker cap, report that plans are waiting on the human instead of retrying. " +
+        "Use get_worker_status, send_worker_prompt, and request_verification to steer; both of the latter " +
+        "are refused for a worker whose plan is not yet approved. Serialize dependent tasks; parallelize " +
+        "independent ones.";
 
     private readonly string _coordinatorId;
     private readonly ICoordinatorModel _model;
@@ -134,7 +146,7 @@ public sealed class CoordinatorAgent
         switch (call.Tool)
         {
             case "spawn_worker":
-                return DispatchSpawn(call);
+                return await DispatchSpawnAsync(call, ct).ConfigureAwait(false);
             case "get_worker_status":
                 return _tools.GetWorkerStatus(Str(call, "agent_id"));
             case "send_worker_prompt":
@@ -146,14 +158,17 @@ public sealed class CoordinatorAgent
         }
     }
 
-    private CoordinatorToolResult DispatchSpawn(CoordinatorToolCall call)
+    /// <summary>
+    /// <c>spawn_worker</c> now takes only (title, task_prompt, budget_usd). Any plan fields the model
+    /// supplies are <b>discarded, not honoured</b> — plan authorship belongs to the worker (contract §2),
+    /// and silently accepting a coordinator-authored scope here would reinstate the inverted gate through
+    /// the back door.
+    /// </summary>
+    private async Task<CoordinatorToolResult> DispatchSpawnAsync(CoordinatorToolCall call, CancellationToken ct)
     {
-        var scope = call.Arguments.TryGetValue("scope", out var s) && s is IEnumerable<object?> items
-            ? items.Select(i => i?.ToString() ?? "").Where(x => x.Length > 0).ToList()
-            : new List<string>();
-        var fields = new TaskPlanFields(scope, Str(call, "approach") ?? "", Str(call, "test_strategy") ?? "");
         var budget = call.Arguments.TryGetValue("budget_usd", out var b) && b is not null && decimal.TryParse(b.ToString(), out var d) ? d : 0m;
-        return _tools.SpawnWorker(Str(call, "title") ?? "Untitled plan", fields, Str(call, "task_prompt") ?? "", budget);
+        return await _tools.SpawnWorkerAsync(
+            Str(call, "title") ?? "Untitled task", Str(call, "task_prompt") ?? "", budget, ct).ConfigureAwait(false);
     }
 
     private static string? Str(CoordinatorToolCall call, string key) =>

@@ -96,9 +96,19 @@ public static class DaemonHost
         builder.Services.AddSingleton<Auth.ConnectionRoleRegistry>();
         builder.Services.AddSingleton<Auth.TerminalLockRegistry>();
         builder.Services.AddSingleton<Auth.IApproverIdentityResolver, Auth.PeerCredentialIdentityResolver>();
+        // MG-2 / contract §2: the daemon-side caps. Registered BEFORE the plan service because the plan
+        // service enforces the revision budget out of it — the limit lives here, never in a prompt.
+        builder.Services.AddSingleton(new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits());
         builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.PlanApprovalService(
             store: new Mainguard.Agents.Agents.Orchestrator.JsonPlanApprovalStore(ResolvePlanStorePath(tokenPath)),
-            audit: sp.GetRequiredService<IAuditLog>()));
+            audit: sp.GetRequiredService<IAuditLog>(),
+            limits: sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits>()));
+        // Phase 2: the daemon-side plan gate — it withholds each worker's task until that worker's own
+        // plan is approved, denies steering/verification at the gate, and is ANDed into the merge queue as
+        // an IMergeGate so unauthorised work cannot reach main even if it somehow got written.
+        builder.Services.AddSingleton(sp => new Mainguard.Agents.Agents.Orchestrator.WorkerPlanGate(
+            sp.GetRequiredService<Mainguard.Agents.Agents.Orchestrator.PlanApprovalService>(),
+            sp.GetRequiredService<IAuditLog>()));
         // P2-47 #9: the coordinator conversation the CoordinatorService streams. Registered with no reply
         // engine in the shipped daemon — the live LLM-backed CoordinatorAgent adapter is the one leg that
         // needs a real model (the documented un-verifiable leg); the transcript store + streaming are real
@@ -213,10 +223,8 @@ public static class DaemonHost
         // yields working (interim) terminals. New bound sessions pick this up via AgentCliBinder.
         builder.Services.AddSingleton(Terminal.TerminalEngineConfig.Resolve(options.TerminalEngine));
         builder.Services.AddSingleton<Runtime.AgentCliBinder>();
-        builder.Services.AddSingleton(new Runtime.CoordinatorIpcServer(ResolveAgentIpcRoot(tokenPath)));
-        // MG-2: the active-Managed-worker ceiling the wired shim spawn path (AgentSpawnService) enforces
-        // server-side, so a coordinator agent cannot fan out unlimited workers via mainguard-agent spawn.
-        builder.Services.AddSingleton(new Mainguard.Agents.Agents.Orchestrator.CoordinatorLimits());
+        // One endpoint per agent: the coordinator's spawn shim, and (phase 2) each worker's plan shim.
+        builder.Services.AddSingleton(new Runtime.AgentIpcServer(ResolveAgentIpcRoot(tokenPath)));
         builder.Services.AddSingleton<Runtime.AgentSpawnService>();
         // The human-only resume path for a stranded merge-queue entry (AgentService.ResumeAgent). It
         // depends on the merge-queue registry registered by GatewayServiceRegistration below — DI resolves

@@ -373,9 +373,19 @@ public sealed class QueueEntryLifecycleTests
     }
 
     /// <summary>
-    /// The in-jail agent surface cannot address these operations either, and cannot grow them by accident:
-    /// the coordinator→daemon channel speaks two ops, both about spawning. This is the layer BELOW the role
-    /// interceptor — an agent does not hold a gRPC channel at all — so it is asserted separately.
+    /// The in-jail agent surface cannot address these operations either, and cannot grow them by accident.
+    /// This is the layer BELOW the role interceptor — an agent does not hold a gRPC channel at all — so it
+    /// is asserted separately.
+    ///
+    /// <para><b>The exact-set assertion is a tripwire, not the invariant.</b> Phase 2 legitimately grew
+    /// this surface from two spawn ops to six, adding the worker plan gate's
+    /// <c>brief</c>/<c>present_plan</c>/<c>revise_plan</c>/<c>await_decision</c>. So the list below is
+    /// expected to be edited when the surface genuinely changes — and editing it is exactly the moment
+    /// someone must look at what was added. What must NEVER change is the second assertion: no operation
+    /// that moves a queue entry through its lifecycle (discard, clear-stalled, resume, merge) is reachable
+    /// from inside a jail, whatever else the channel learns to speak. That one is stated on its own rather
+    /// than left implicit in a list, because a list can be widened without anybody noticing what slipped
+    /// in with it.</para>
     /// </summary>
     [Fact]
     public void AgentIpcSurface_HasNoEntryLifecycleOp()
@@ -387,7 +397,16 @@ public sealed class QueueEntryLifecycleTests
             .OrderBy(x => x)
             .ToArray();
 
-        Assert.Equal(new[] { "list", "spawn" }, ops);
+        Assert.Equal(
+            new[] { "await_decision", "brief", "list", "present_plan", "revise_plan", "spawn" },
+            ops);
+
+        // The actual control, asserted against the shipped op set rather than against the literal above —
+        // so it keeps holding after someone edits that list.
+        foreach (var forbidden in new[] { "discard", "clear", "stalled", "resume", "merge", "verif" })
+        {
+            Assert.DoesNotContain(ops, op => op.Contains(forbidden, StringComparison.OrdinalIgnoreCase));
+        }
     }
 
     // ---- 4. the end-to-end: the shipped rail, through the shipped adapter, into the real daemon ---

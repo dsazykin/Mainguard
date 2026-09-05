@@ -9,32 +9,45 @@ using Mainguard.Agents.Agents.Ipc;
 
 namespace Mainguard.Server.Runtime;
 
-/// <summary>Handles one shim request arriving on a coordinator's IPC socket.</summary>
+/// <summary>Handles one shim request arriving on an agent's IPC socket.</summary>
 public delegate Task<AgentIpcResponse> AgentIpcHandler(
-    AgentIpcRequest request, string coordinatorAgentId, CancellationToken ct);
+    AgentIpcRequest request, string agentId, CancellationToken ct);
 
 /// <summary>
-/// The daemon side of the coordinator→daemon spawn channel: one Unix-domain socket per
-/// coordinator, served from a daemon-owned ext4 dir that is bind-mounted READ-ONLY into that
-/// coordinator's jail (<see cref="AgentIpcPaths.SandboxMount"/>). The dir also carries the
-/// executable <c>mainguard-agent</c> shim (<see cref="AgentSpawnShim"/>) the launch wrapper puts on
-/// PATH. The endpoint must exist BEFORE the container is created (it is a mount source), so
-/// <see cref="CreateEndpoint"/> runs first in the spawn chain and <see cref="CloseEndpoint"/> is
-/// part of teardown.
+/// The daemon side of the agent→daemon control channel: one Unix-domain socket per agent, served from a
+/// daemon-owned ext4 dir that is bind-mounted READ-ONLY into that agent's jail
+/// (<see cref="AgentIpcPaths.SandboxMount"/>). The dir also carries the one executable shim that agent's
+/// role is allowed, which the launch wrapper puts on PATH:
 ///
-/// <para>Identity is positional: requests arriving on <c>&lt;agentId&gt;/daemon.sock</c> ARE that
-/// coordinator's — only its jail has the mount. The protocol is one newline-delimited JSON request
-/// per connection (<see cref="AgentIpcProtocol"/>); malformed input gets an honest error response,
-/// never a dropped connection.</para>
+/// <list type="bullet">
+/// <item><b>coordinator</b> → <see cref="AgentSpawnShim"/> (<c>mainguard-agent</c>): start workers.</item>
+/// <item><b>worker</b> → <see cref="WorkerPlanShim"/> (<c>mainguard-plan</c>): present its own plan and
+/// block on the human's decision (phase 2). A worker had no IPC endpoint at all before phase 2 — it has
+/// one now because the plan gate is a real block on a real channel, not a prompt.</item>
+/// </list>
+///
+/// <para>The endpoint must exist BEFORE the container is created (it is a mount source), so
+/// <see cref="CreateEndpoint"/> runs first in the spawn chain and <see cref="CloseEndpoint"/> is part of
+/// teardown.</para>
+///
+/// <para>Identity is positional: requests arriving on <c>&lt;agentId&gt;/daemon.sock</c> ARE that agent's
+/// — only its jail has the mount. Role is likewise a property of the endpoint, not of the request, so a
+/// worker cannot reach a coordinator op by naming it (and vice versa). The protocol is one
+/// newline-delimited JSON request per connection (<see cref="AgentIpcProtocol"/>); malformed input gets an
+/// honest error response, never a dropped connection.</para>
+///
+/// <para><b>Long-blocking calls are expected here.</b> A worker's plan presentation parks on the socket
+/// until a human decides, which may be hours. Each connection is served on its own task, so a parked
+/// worker never blocks the accept loop or another agent's request.</para>
 /// </summary>
-public sealed class CoordinatorIpcServer : IDisposable
+public sealed class AgentIpcServer : IDisposable
 {
     private readonly string _root;
     private readonly ConcurrentDictionary<string, Endpoint> _endpoints = new(StringComparer.Ordinal);
     private bool _disposed;
 
-    /// <param name="root">The VM-side base dir for per-coordinator IPC dirs (ext4, daemon-owned).</param>
-    public CoordinatorIpcServer(string root)
+    /// <param name="root">The VM-side base dir for per-agent IPC dirs (ext4, daemon-owned).</param>
+    public AgentIpcServer(string root)
     {
         if (string.IsNullOrWhiteSpace(root))
         {
@@ -44,17 +57,18 @@ public sealed class CoordinatorIpcServer : IDisposable
         _root = root;
     }
 
-    /// <summary>The per-coordinator IPC dir (the container mount source). The dir name is the
-    /// agent id's 12-char prefix — Unix socket paths have a hard ~104-byte limit, and live-session
-    /// prefix collisions are not a real risk.</summary>
+    /// <summary>The per-agent IPC dir (the container mount source). The dir name is the agent id's
+    /// 12-char prefix — Unix socket paths have a hard ~104-byte limit, and live-session prefix
+    /// collisions are not a real risk.</summary>
     public string DirFor(string agentId) =>
         Path.Combine(_root, agentId.Length > 12 ? agentId[..12] : agentId);
 
     /// <summary>
-    /// Materializes the coordinator's IPC dir (shim written 0755, socket bound + listening) and
-    /// returns the dir path to bind-mount. Idempotent per agent id.
+    /// Materializes the agent's IPC dir (role's shim written 0755, socket bound + listening) and returns
+    /// the dir path to bind-mount. Idempotent per agent id.
     /// </summary>
-    public string CreateEndpoint(string agentId, AgentIpcHandler handler)
+    public string CreateEndpoint(
+        string agentId, AgentIpcHandler handler, AgentIpcEndpointRole role = AgentIpcEndpointRole.Coordinator)
     {
         if (string.IsNullOrWhiteSpace(agentId))
         {
@@ -64,11 +78,15 @@ public sealed class CoordinatorIpcServer : IDisposable
         ArgumentNullException.ThrowIfNull(handler);
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        var endpoint = _endpoints.GetOrAdd(agentId, id => Endpoint.Start(DirFor(id), id, handler));
+        var endpoint = _endpoints.GetOrAdd(agentId, id => Endpoint.Start(DirFor(id), id, handler, role));
         return endpoint.Dir;
     }
 
-    /// <summary>Stops the coordinator's listener and removes its IPC dir. Idempotent.</summary>
+    /// <summary>The role an existing endpoint was created with (null when there is no such endpoint).</summary>
+    public AgentIpcEndpointRole? RoleOf(string agentId) =>
+        agentId is not null && _endpoints.TryGetValue(agentId, out var endpoint) ? endpoint.Role : null;
+
+    /// <summary>Stops the agent's listener and removes its IPC dir. Idempotent.</summary>
     public void CloseEndpoint(string agentId)
     {
         if (agentId is not null && _endpoints.TryRemove(agentId, out var endpoint))
@@ -86,6 +104,13 @@ public sealed class CoordinatorIpcServer : IDisposable
         }
     }
 
+    /// <summary>The shim file name + script for one endpoint role (least privilege: exactly one shim).</summary>
+    private static (string FileName, string Script) ShimFor(AgentIpcEndpointRole role) => role switch
+    {
+        AgentIpcEndpointRole.Worker => (AgentIpcPaths.PlanShimFileName, WorkerPlanShim.Script),
+        _ => (AgentIpcPaths.SpawnShimFileName, AgentSpawnShim.Script),
+    };
+
     private sealed class Endpoint : IDisposable
     {
         private readonly Socket _listener;
@@ -93,18 +118,22 @@ public sealed class CoordinatorIpcServer : IDisposable
 
         public string Dir { get; }
 
-        private Endpoint(string dir, Socket listener)
+        public AgentIpcEndpointRole Role { get; }
+
+        private Endpoint(string dir, Socket listener, AgentIpcEndpointRole role)
         {
             Dir = dir;
             _listener = listener;
+            Role = role;
         }
 
-        public static Endpoint Start(string dir, string agentId, AgentIpcHandler handler)
+        public static Endpoint Start(string dir, string agentId, AgentIpcHandler handler, AgentIpcEndpointRole role)
         {
             Directory.CreateDirectory(dir);
 
-            var shimPath = Path.Combine(dir, AgentIpcPaths.ShimFileName);
-            File.WriteAllText(shimPath, AgentSpawnShim.Script.Replace("\r\n", "\n"));
+            var (shimName, shimScript) = ShimFor(role);
+            var shimPath = Path.Combine(dir, shimName);
+            File.WriteAllText(shimPath, shimScript.Replace("\r\n", "\n"));
 
             var socketPath = Path.Combine(dir, AgentIpcPaths.SocketFileName);
             File.Delete(socketPath); // a stale socket from a crashed daemon blocks bind
@@ -128,7 +157,7 @@ public sealed class CoordinatorIpcServer : IDisposable
                     | UnixFileMode.OtherRead | UnixFileMode.OtherWrite);
             }
 
-            var endpoint = new Endpoint(dir, listener);
+            var endpoint = new Endpoint(dir, listener, role);
             _ = endpoint.AcceptLoopAsync(agentId, handler);
             return endpoint;
         }

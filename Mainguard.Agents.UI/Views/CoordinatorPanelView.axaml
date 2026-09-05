@@ -1,19 +1,24 @@
 <UserControl xmlns="https://github.com/avaloniaui"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:vm="using:Mainguard.Agents.UI.ViewModels"
+             xmlns:views="using:Mainguard.Agents.UI.Views"
              x:Class="Mainguard.Agents.UI.Views.CoordinatorPanelView"
              x:DataType="vm:CoordinatorPanelViewModel">
 
-  <!-- The Coordinator conversation + TaskPlan approval (ControlCenterDesign.md §5): no bubbles,
-       no avatars — an instrument, not a companion. Cards are decisions, lines are history.
-       Approve is the panel's one accent (the product thesis; not destructive). -->
+  <!-- The Coordinator conversation + worker-authored TaskPlan approval (ControlCenterDesign.md §5):
+       no bubbles, no avatars — an instrument, not a companion. Cards are decisions, lines are history.
+       Approve is the panel's one accent (the product thesis; not destructive).
+
+       Phase 2 adds three states this surface must be able to show, because each is otherwise silent:
+       the plan is the WORKER's and it is blocked on you; a rejection is feedback it revises against
+       (with a visible revision budget); and when blocked workers fill the worker cap, the coordinator
+       has stopped spawning — which a human cannot distinguish from a hang unless we say it. -->
 
   <Grid RowDefinitions="Auto,*,Auto,Auto" Margin="10">
     <StackPanel Grid.Row="0" Margin="0,0,0,8" Spacing="3">
       <TextBlock Text="Coordinator" FontSize="16" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-      <TextBlock Text="{Binding PressureText}" FontSize="11" Foreground="{DynamicResource WarningBrush}"
-                 IsVisible="{Binding PressureText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
-      <TextBlock Text="The Coordinator plans and delegates — it never touches code or merges."
+
+      <TextBlock Text="The Coordinator plans and delegates — it never touches code or merges. Each worker writes its own plan and waits for you."
                  FontSize="11" Foreground="{DynamicResource TextMuted}" TextWrapping="Wrap"
                  IsVisible="{Binding IsEmpty}"/>
     </StackPanel>
@@ -47,28 +52,13 @@
       </ItemsControl>
     </ScrollViewer>
 
-    <!-- The TaskPlan approval card (§5.2): Scope is the load-bearing field -->
-    <Border Grid.Row="2" Classes="Card" Padding="10" Margin="0,8,0,8"
-            BorderBrush="{DynamicResource BorderHairline}" BorderThickness="1" CornerRadius="8"
-            IsVisible="{Binding PendingPlan, Converter={x:Static ObjectConverters.IsNotNull}}">
-      <StackPanel Spacing="6" DataContext="{Binding PendingPlan}" x:DataType="vm:PlanCardViewModel">
-        <TextBlock Text="{Binding Title}" FontSize="13" FontWeight="SemiBold" Foreground="{DynamicResource TextPrimary}"/>
-        <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto,Auto">
-          <TextBlock Grid.Row="0" Grid.Column="0" Text="Scope" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="0" Grid.Column="1" Classes="Mono" Text="{Binding ScopeText}" FontSize="11"
-                     TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-          <TextBlock Grid.Row="1" Grid.Column="0" Text="Approach" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="1" Grid.Column="1" Text="{Binding Approach}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-          <TextBlock Grid.Row="2" Grid.Column="0" Text="Test" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-          <TextBlock Grid.Row="2" Grid.Column="1" Text="{Binding TestStrategy}" FontSize="11" TextWrapping="Wrap" Foreground="{DynamicResource TextPrimary}"/>
-        </Grid>
-        <TextBlock Text="{Binding FactsText}" FontSize="11" Foreground="{DynamicResource TextMuted}"/>
-        <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
-          <Button Classes="Secondary" Content="Reject" FontSize="12" Command="{Binding RejectCommand}" IsEnabled="{Binding !IsDeciding}"/>
-          <Button Classes="Accent" Content="Approve plan" FontSize="12" Command="{Binding ApproveCommand}" IsEnabled="{Binding !IsDeciding}"/>
-        </StackPanel>
-      </StackPanel>
-    </Border>
+    <!-- The gate itself, from the single shared definition in PlanGateView: backpressure, escalations,
+         and one approval card per blocked worker. The shipped Control Center hosts the same control above
+         the coordinator's terminal, so there is exactly one place the card is described. -->
+    <ScrollViewer Grid.Row="2" MaxHeight="420" Margin="0,8,0,8"
+                  IsVisible="{Binding HasGateContent}">
+      <views:PlanGateView/>
+    </ScrollViewer>
 
     <Grid Grid.Row="3" ColumnDefinitions="*,Auto">
       <TextBox Grid.Column="0" Text="{Binding ComposerText}" Watermark="Message the Coordinator…"
