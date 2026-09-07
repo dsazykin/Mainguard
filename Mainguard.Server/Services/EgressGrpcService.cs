@@ -60,6 +60,18 @@ public sealed class EgressGrpcService : EgressService.EgressServiceBase
             throw new RpcException(new Status(StatusCode.InvalidArgument, "A host pattern is required."));
         }
 
+        // F31 — VALIDATE AT THE INGRESS. This RPC is the only path a host pattern takes from outside the
+        // daemon into the allowlist, and from there into a tinyproxy regex, a dnsmasq config line, and
+        // an iptables rule, none of which quote it. Unvalidated, `a|.*` renders as an alternation that
+        // allows every host on the internet, `(` breaks the filter for the whole fleet, and a `/` (or a
+        // newline) injects dnsmasq directives that can re-open the DNS-exfiltration channel. Refusing
+        // here means the value never reaches the persisted store, which is what makes a bad one a failed
+        // call instead of a permanent policy change.
+        if (!EgressHostPattern.IsValid(host))
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, EgressHostPattern.Reason(host)));
+        }
+
         var kind = Enum.TryParse<EgressEntryKind>(request.Kind, ignoreCase: true, out var k) ? k : EgressEntryKind.Custom;
         var name = string.IsNullOrWhiteSpace(request.Name) ? host : request.Name.Trim();
         // The audit actor comes from the connection, never from the message (SA-1/F2).

@@ -86,7 +86,9 @@ public static class EgressProxyConfig
 
         foreach (var entry in allowlist.Entries)
         {
-            if (entry.Kind == EgressEntryKind.ModelApi)
+            // F31: an `upstream … "<pattern>"` directive is another rendering of the same untrusted
+            // string; the same validity gate applies.
+            if (entry.Kind == EgressEntryKind.ModelApi && EgressHostPattern.IsValid(entry.HostPattern))
             {
                 sb.Append("upstream http ").Append(gatewayHostPort)
                   .Append(" \"").Append(entry.HostPattern).Append("\"\n");
@@ -340,7 +342,38 @@ public static class EgressProxyConfig
     /// <param name="proxyPort">The tinyproxy CONNECT port to admit.</param>
     /// <param name="proxyAddresses">Every address the proxy answers on across the agent segments.
     /// Empty falls back to port-only rules (the pure tests and the pre-MG-7 paths).</param>
-    public static string RenderIptablesScript(int proxyPort, IReadOnlyCollection<string> proxyAddresses)
+    public static string RenderIptablesScript(int proxyPort, IReadOnlyCollection<string> proxyAddresses) =>
+        RenderIptablesScript(proxyPort, proxyAddresses, gatewayHostPort: null);
+
+    /// <summary>
+    /// F26 — the same backstop, plus an <c>OUTPUT</c> constraint that bounds the model gateway's
+    /// allowlist entry to the GATEWAY PORT instead of the whole daemon host.
+    ///
+    /// <para><b>The finding.</b> tinyproxy's <c>Filter</c> matches a destination HOSTNAME; it has no
+    /// notion of a port, and <c>ConnectPort</c> bounds only the CONNECT verb. Allowlisting the gateway's
+    /// host — which MG-4 must do, or a confined jail cannot reach the gateway at all — therefore handed
+    /// every jail a plain-HTTP proxy to <i>every TCP port on the daemon host</i>:
+    /// <c>curl -x $HTTP_PROXY http://&lt;gateway&gt;:11434/</c> reaches a local Ollama, a dev server, or
+    /// Docker's own TCP API where it is enabled. The jail is on an internal network and the proxy is the
+    /// only thing that can dial the host, so the proxy's netns is exactly where that route can be
+    /// bounded — and unlike a hostname filter, an <c>-d addr --dport</c> rule is a port constraint that
+    /// covers CONNECT and plain HTTP alike.</para>
+    ///
+    /// <para>Only traffic TO the gateway host is constrained; <c>OUTPUT</c>'s policy stays ACCEPT, so
+    /// tinyproxy's and dnsmasq's upstream traffic is untouched. DNS to that address is still admitted
+    /// because on some topologies the host is also the container's resolver, and taking DNS out would
+    /// be a fleet-wide outage rather than a containment.</para>
+    ///
+    /// <para>The address is resolved <b>inside the script</b>, at apply time. The gateway is named to
+    /// the proxy as <c>host.docker.internal</c> (an <c>/etc/hosts</c> entry Docker writes from
+    /// <c>--add-host=…:host-gateway</c>), so there is no address to render daemon-side — and a name that
+    /// does not resolve yields no rules rather than a broken table, which matches the existing "a proxy
+    /// that cannot reach the gateway simply does not confine" behaviour.</para>
+    /// </summary>
+    /// <param name="gatewayHostPort">The model gateway's <c>host:port</c>, or null when no gateway is
+    /// configured (then nothing is constrained and the rendered table is byte-identical to before).</param>
+    public static string RenderIptablesScript(
+        int proxyPort, IReadOnlyCollection<string> proxyAddresses, string? gatewayHostPort)
     {
         var destinations = (proxyAddresses ?? Array.Empty<string>())
             .Where(a => !string.IsNullOrWhiteSpace(a))
@@ -365,7 +398,12 @@ public static class EgressProxyConfig
         sb.Append("# APPLIED ATOMICALLY. iptables-restore loads the whole table in ONE netlink\n");
         sb.Append("# transaction, so the chain goes straight from the old policy to the new one with no\n");
         sb.Append("# state in between. See the C# summary for the measurement that forced this.\n");
+        sb.Append("#\n");
+        sb.Append("# F26: OUTPUT bounds the model gateway's route to the gateway PORT. tinyproxy's filter\n");
+        sb.Append("# is host-based and cannot do it, so allowlisting the gateway host otherwise hands a\n");
+        sb.Append("# jail every TCP port on the daemon host through the proxy.\n");
         sb.Append("set -eu\n");
+        sb.Append(RenderGatewayOutputPrelude(gatewayHostPort));
 
         // The table is REPLACED, not edited: iptables-restore without --noflush swaps the whole filter
         // table in a single transaction. That is what makes reloads idempotent (the chain after N
@@ -376,7 +414,12 @@ public static class EgressProxyConfig
         // OUTPUT out would not preserve it — it would reset it to this file's idea of the default. The
         // backstop has never filtered outbound traffic (dnsmasq's upstream queries and tinyproxy's
         // upstream connections both leave through it) and must not start now.
-        sb.Append("iptables-restore <<'MAINGUARD_BACKSTOP_EOF'\n");
+        //
+        // The table is piped in from a group rather than a bare heredoc so the F26 gateway rules — whose
+        // address is only known once the script runs — can be appended before COMMIT. It is still ONE
+        // iptables-restore, i.e. still one netlink transaction; the atomicity argument above is intact.
+        sb.Append("{\n");
+        sb.Append("cat <<'MAINGUARD_BACKSTOP_EOF'\n");
         sb.Append("*filter\n");
         sb.Append(":INPUT DROP [0:0]\n");
         sb.Append(":FORWARD DROP [0:0]\n");
@@ -402,11 +445,72 @@ public static class EgressProxyConfig
         }
 
         sb.Append("-A FORWARD -j DROP\n");
-        sb.Append("COMMIT\n");
         sb.Append("MAINGUARD_BACKSTOP_EOF\n");
+        // Rendered at apply time from the resolved gateway address (empty when there is none).
+        sb.Append("if [ -n \"$mg_gateway_rules\" ]; then printf '%s\\n' \"$mg_gateway_rules\"; fi\n");
+        sb.Append("echo COMMIT\n");
+        sb.Append("} | iptables-restore\n");
         return sb.ToString();
     }
 
+    /// <summary>
+    /// The shell prologue that resolves the gateway host and builds its <c>OUTPUT</c> rules, or a plain
+    /// <c>mg_gateway_rules=""</c> when there is no gateway (or its endpoint is not one this will
+    /// interpolate). The host is constrained to a validated hostname/IPv4 and the port to 1-65535 before
+    /// either reaches a shell line — this string is executed as root inside the proxy.
+    /// </summary>
+    internal static string RenderGatewayOutputPrelude(string? gatewayHostPort)
+    {
+        const string none = "mg_gateway_rules=\"\"\n";
+        if (string.IsNullOrWhiteSpace(gatewayHostPort))
+        {
+            return none;
+        }
+
+        var value = gatewayHostPort.Trim();
+        var colon = value.LastIndexOf(':');
+        if (colon <= 0 || colon == value.Length - 1)
+        {
+            return none;
+        }
+
+        var host = value[..colon];
+        if (!EgressHostPattern.IsValid(host)
+            || !int.TryParse(value[(colon + 1)..], out var port)
+            || port is < 1 or > 65535)
+        {
+            return none;
+        }
+
+        var sb = new StringBuilder();
+        sb.Append("mg_gateway_rules=\"\"\n");
+        sb.Append("# F26: the ONE port of the daemon host a jail may reach through this proxy.\n");
+        sb.Append("mg_gw_addr=\"$(getent ahostsv4 ").Append(host)
+          .Append(" 2>/dev/null | awk 'NR==1{print $1}')\"\n");
+        sb.Append("if [ -n \"$mg_gw_addr\" ]; then\n");
+        sb.Append("  mg_gateway_rules=\"-A OUTPUT -d $mg_gw_addr -p tcp --dport ").Append(port)
+          .Append(" -j ACCEPT\n");
+        sb.Append("-A OUTPUT -d $mg_gw_addr -p udp --dport 53 -j ACCEPT\n");
+        sb.Append("-A OUTPUT -d $mg_gw_addr -p tcp --dport 53 -j ACCEPT\n");
+        sb.Append("-A OUTPUT -d $mg_gw_addr -j DROP\"\n");
+        sb.Append("fi\n");
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// The hosts that are actually rendered.
+    ///
+    /// <para>F31 — the validity filter is the LAST line of defence, and it is here rather than only at
+    /// the ingress because this is the function whose output becomes a tinyproxy regex, a dnsmasq
+    /// <c>server=/host/resolver</c> line, and (via the entries) an iptables destination. An entry that
+    /// somehow reached the allowlist without passing <see cref="EgressHostPattern"/> — a hand-edited
+    /// store, a future caller that forgets — must not be able to turn the whole allowlist into
+    /// <c>a|.*</c> or inject a config directive. A refused entry simply is not allowed, which is the
+    /// default-deny direction.</para>
+    /// </summary>
     private static IEnumerable<string> HostsOf(EgressAllowlist allowlist) =>
-        allowlist.Entries.Select(e => e.HostPattern).Distinct();
+        allowlist.Entries
+            .Select(e => e.HostPattern)
+            .Where(EgressHostPattern.IsValid)
+            .Distinct();
 }

@@ -349,6 +349,18 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
             await TryRemoveContainerAsync(proxy.ID, ct).ConfigureAwait(false);
             proxyId = null;
         }
+        else if (proxy is not null && !await HasGatewayHostAliasAsync(proxy.ID, ct).ConfigureAwait(false))
+        {
+            // F25: a proxy created before the gateway alias existed carries no
+            // `host.docker.internal` entry, so it cannot resolve — and therefore cannot reach — a
+            // gateway bound to the daemon's own loopback. `CanProxyReachAsync` would answer false and
+            // every BYOK spawn would quietly skip confinement, i.e. hand the jail the raw provider key,
+            // for the life of that container. An /etc/hosts entry can only be set at create time, so
+            // the container is replaced — once per proxy generation, on exactly the same policy as an
+            // image upgrade above.
+            await TryRemoveContainerAsync(proxy.ID, ct).ConfigureAwait(false);
+            proxyId = null;
+        }
         else if (proxy is not null && !string.Equals(proxy.State, "running", StringComparison.OrdinalIgnoreCase))
         {
             // The VM shutdown (StopVmOnExit) leaves the proxy Exited; exec'ing config into a stopped
@@ -982,6 +994,33 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         return inspect?.State;
     }
 
+    /// <summary>
+    /// F25 — does this (already existing) proxy carry the <c>host.docker.internal</c> mapping the model
+    /// gateway is reached through? An inspect that fails answers TRUE: refusing to answer must not
+    /// become a reason to destroy a working proxy, and a proxy that genuinely lacks the entry will be
+    /// caught on the next pass.
+    /// </summary>
+    private async Task<bool> HasGatewayHostAliasAsync(string containerId, CancellationToken ct)
+    {
+        try
+        {
+            var inspect = await TryInspectAsync(containerId, ct).ConfigureAwait(false);
+            if (inspect is null)
+            {
+                return true; // gone underneath us — not a verdict about its /etc/hosts.
+            }
+
+            // Docker reports NO extra hosts as a null list, which is exactly the pre-F25 container this
+            // check exists to find.
+            return inspect.HostConfig?.ExtraHosts is { } extras
+                && extras.Any(h => h.StartsWith(GatewayHostAlias + ":", StringComparison.Ordinal));
+        }
+        catch (DockerApiException)
+        {
+            return true;
+        }
+    }
+
     /// <summary>The container's inspect response, or null when it no longer exists.</summary>
     private async Task<ContainerInspectResponse?> TryInspectAsync(string containerId, CancellationToken ct)
     {
@@ -1116,7 +1155,14 @@ public sealed class EgressProxyConfigurator : IEgressPolicy
         var upstreamResolvers = await ReadProxyResolversAsync(proxyId, ct).ConfigureAwait(false);
 
         await WriteFileAsync(proxyId, ConfDir + "/dnsmasq.conf", EgressProxyConfig.RenderDnsmasqConfig(effective, proxyAddress, upstreamResolvers), ct).ConfigureAwait(false);
-        await WriteFileAsync(proxyId, ConfDir + "/backstop.sh", EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddresses), ct).ConfigureAwait(false);
+        // F26: the backstop also bounds the gateway route to the gateway PORT. The allowlist entry added
+        // above is host-based (tinyproxy has no port filter), so without this a jail could proxy plain
+        // HTTP to ANY port on the daemon host — Ollama, a dev server, Docker's TCP API.
+        await WriteFileAsync(
+            proxyId,
+            ConfDir + "/backstop.sh",
+            EgressProxyConfig.RenderIptablesScript(ProxyPort, proxyAddresses, _gatewayReachableAt),
+            ct).ConfigureAwait(false);
         // The image's entrypoint reloads tinyproxy/dnsmasq and (re)applies the backstop from these paths.
         await ExecAsync(proxyId, new[] { "sh", ReloadScript }, ct).ConfigureAwait(false);
     }
